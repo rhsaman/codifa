@@ -198,8 +198,8 @@ textarea {
 
 /* ---- sidebar ---- */
 .sidebar {
-  flex: 0 0 260px;
-  width: 260px;
+  flex: 0 0 264px;
+  width: 264px;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -221,7 +221,7 @@ textarea {
 }
 
 .sidebar-new {
-  padding: 10px;
+  padding: 12px 10px 8px;
   flex: 0 0 auto;
 }
 
@@ -230,31 +230,43 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 7px;
   padding: 9px 0;
-  border-radius: 8px;
+  border-radius: 14px;
   border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   font-size: 13px;
   font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
   transition:
     background 0.15s,
-    border-color 0.15s;
+    border-color 0.15s,
+    transform 0.1s,
+    box-shadow 0.15s;
+}
+
+.sidebar-new-btn svg {
+  color: var(--accent);
 }
 
 .sidebar-new-btn:hover {
   background: var(--accent-dim);
-  border-color: var(--text-dim);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
+}
+
+.sidebar-new-btn:active {
+  transform: scale(0.98);
 }
 
 .sidebar-list {
   flex: 1 1 auto;
   overflow-y: auto;
-  padding: 4px 8px 8px;
+  padding: 2px 8px 8px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
 }
 
 .sidebar-empty {
@@ -265,16 +277,17 @@ textarea {
 }
 
 .chat-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
+  padding: 7px 9px 7px 12px;
+  border-radius: 11px;
   cursor: pointer;
   color: var(--text-dim);
   transition:
-    background 0.12s,
-    color 0.12s;
+    background 0.14s ease,
+    color 0.14s ease;
 }
 
 .chat-item:hover {
@@ -285,6 +298,18 @@ textarea {
 .chat-item.active {
   background: var(--accent-dim);
   color: var(--text);
+  font-weight: 500;
+}
+
+.chat-item.active::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 22%;
+  bottom: 22%;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--ws, var(--accent));
 }
 
 .chat-item-icon {
@@ -305,15 +330,16 @@ textarea {
 .chat-item-edit,
 .chat-item-remove {
   flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
   display: none;
   align-items: center;
   justify-content: center;
-  font-size: 17px;
+  font-size: 16px;
   line-height: 1;
   color: var(--text-dim);
+  transition: background 0.12s, color 0.12s;
 }
 
 .chat-item-edit svg {
@@ -341,9 +367,9 @@ textarea {
 .chat-rename-input {
   flex: 1 1 auto;
   min-width: 0;
-  padding: 2px 6px;
+  padding: 3px 7px;
   border: 1px solid var(--accent);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--bg-panel);
   color: var(--text);
   font-size: 13px;
@@ -353,6 +379,7 @@ textarea {
 .sidebar-group {
   display: flex;
   flex-direction: column;
+  gap: 2px;
 }
 
 .sidebar-group.dragging {
@@ -376,8 +403,8 @@ textarea {
   display: flex;
   align-items: center;
   width: 100%;
-  padding: 3px 6px 3px 8px;
-  border-radius: 8px;
+  padding: 4px 6px 4px 8px;
+  border-radius: 10px;
   transition:
     background 0.12s,
     color 0.12s;
@@ -425,11 +452,12 @@ textarea {
 .sidebar-group-btn {
   width: 24px;
   height: 24px;
-  border-radius: 6px;
+  border-radius: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--text-dim);
+  transition: background 0.12s, color 0.12s;
 }
 
 .sidebar-group-btn svg {
@@ -504,8 +532,8 @@ textarea {
   padding: 8px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  border-radius: 14px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
   animation: popover-in 0.12s ease;
 }
 
@@ -557,18 +585,87 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding-left: 6px;
-  margin-left: 8px;
-  border-left: 2px solid color-mix(in srgb, var(--ws, var(--border)) 70%, transparent);
+  padding-left: 8px;
+  margin-left: 14px;
+  border-left: 2px solid color-mix(in srgb, var(--ws, var(--border)) 45%, transparent);
 }
 
 .sidebar-footer {
   flex: 0 0 auto;
   border-top: 1px solid var(--border);
-  padding: 8px;
+  padding: 10px 8px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
+}
+
+/* Live plan checklist of the active chat, shown above the theme/settings buttons */
+.sidebar-todos {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  margin-bottom: 6px;
+}
+
+.sidebar-todos-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.sidebar-todos-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.sidebar-todos-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.sidebar-todo-item {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+.sidebar-todo-item.done {
+  color: var(--text);
+}
+
+.sidebar-todo-item.done .sidebar-todo-mark {
+  color: var(--accent);
+}
+
+.sidebar-todo-item.running .sidebar-todo-mark {
+  color: var(--accent);
+  animation: pulse 1.2s infinite;
+}
+
+.sidebar-todo-mark {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.sidebar-todo-content {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sidebar-foot-btn {
@@ -576,10 +673,11 @@ textarea {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: 11px;
   color: var(--text-dim);
   font-size: 13px;
   text-align: left;
+  transition: background 0.13s, color 0.13s;
 }
 
 .sidebar-foot-btn:hover {
@@ -651,7 +749,7 @@ textarea {
 /* ----- ensure RTL/LTR correctness for mixed scripts ----- */
 .chat-message {
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   font-size: var(--chat-font-size);
 }
 
@@ -667,6 +765,12 @@ textarea {
 
 .markdown-body {
   line-height: 1.55;
+}
+
+/* Latin/English glyphs render airier than Persian at the same line-height, so
+   tighten the line spacing in LTR mode only (RTL stays as-is). */
+.chat-messages[data-dir="ltr"] .markdown-body {
+  line-height: 1.35;
 }
 
 /* Tight, consistent vertical rhythm for rendered markdown. The browser's
@@ -1056,6 +1160,97 @@ textarea {
   color: var(--success);
 }
 
+/* ---- context summary (compacted conversation) ---- */
+.summary-block {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg));
+  overflow: hidden;
+}
+
+.summary-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px dashed var(--border);
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.summary-icon {
+  font-size: 12px;
+}
+
+.summary-label {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 10.5px;
+  color: var(--accent);
+}
+
+.summary-hint {
+  margin-left: auto;
+  opacity: 0.7;
+  font-size: 10.5px;
+  text-align: right;
+}
+
+.summary-body {
+  padding: 8px 12px 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+/* ---- folded (compacted) old messages ---- */
+.msg.compacted {
+  opacity: 0.62;
+}
+
+.compacted-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  background: color-mix(in srgb, var(--bg-input) 55%, var(--bg));
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-dim);
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.compacted-toggle:hover {
+  opacity: 1;
+  background: var(--bg-input);
+}
+
+.compacted-toggle .chev {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  transition: transform 0.15s;
+}
+
+.compacted-toggle .chev.open {
+  transform: rotate(90deg);
+}
+
+.compacted-preview {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-messages[data-dir="rtl"] .compacted-toggle {
+  text-align: right;
+}
+
 .empty-state {
   margin: auto;
   text-align: center;
@@ -1071,28 +1266,31 @@ textarea {
 .composer {
   position: relative;
   flex: 0 0 auto;
-  border-top: 1px solid var(--border);
-  padding: 8px 16px 14px;
-  background: var(--bg-panel);
+  padding: 10px 16px 16px;
+  background: linear-gradient(to bottom, transparent, var(--bg-panel) 45%);
   transition: box-shadow 0.15s;
 }
 
-.composer.dragover {
-  box-shadow: inset 0 0 0 2px var(--accent);
-  border-radius: 10px;
+.composer.dragover .composer-inner {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    var(--shadow);
 }
 
 .drop-overlay {
   position: absolute;
-  inset: 0;
+  inset: 6px 16px;
   z-index: 20;
   display: flex;
   align-items: center;
   justify-content: center;
+  border-radius: 26px;
   font-size: 13px;
   font-weight: 600;
   color: var(--accent);
-  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 90%, transparent);
+  border: 1.5px dashed var(--accent);
   pointer-events: none;
 }
 
@@ -1101,26 +1299,44 @@ textarea {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  padding: 10px 12px 8px;
+  box-shadow: var(--shadow);
+  transition:
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.composer-inner:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent),
+    var(--shadow);
 }
 
 .composer-input {
   width: 100%;
   resize: none;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  padding: 10px 14px;
-  line-height: 1.45;
-  min-height: 42px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 6px 6px 4px;
+  line-height: 1.5;
+  min-height: 26px;
   max-height: 200px;
   outline: none;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s;
+  transition: color 0.15s;
   font-size: var(--chat-font-size);
+}
+
+.composer-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.75;
 }
 
 /* Keep the textarea's scrollbar out of sight until the user interacts with
@@ -1139,17 +1355,9 @@ textarea {
   background: var(--border);
 }
 
-.composer-input:hover {
-  scrollbar-color: var(--border) transparent;
-}
-
+.composer-input:hover,
 .composer-input:focus {
   scrollbar-color: var(--border) transparent;
-}
-
-.composer-input:focus {
-  border-color: var(--text-dim);
-  box-shadow: var(--focus-ring);
 }
 
 .composer-row {
@@ -1157,7 +1365,8 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
 }
 
 .composer-left {
@@ -1204,27 +1413,30 @@ textarea {
 .composer-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 3px;
 }
 
 .icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   border: none;
   cursor: pointer;
   transition:
-    filter 0.15s,
-    opacity 0.15s,
-    background 0.15s;
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s;
 }
 
 .icon-btn svg {
-  width: 18px;
-  height: 18px;
+  width: 17px;
+  height: 17px;
 }
 
 .icon-btn:disabled {
@@ -1232,19 +1444,24 @@ textarea {
   cursor: default;
 }
 
-.icon-btn:not(:disabled):hover {
-  filter: brightness(1.1);
+.icon-btn:not(:disabled):active {
+  transform: scale(0.92);
 }
 
 .attach-btn {
-  background: var(--bg-input);
+  background: transparent;
   color: var(--text-dim);
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
 }
 
 .attach-btn:not(:disabled):hover {
   color: var(--text);
-  border-color: var(--text-dim);
+  background: var(--accent-dim);
+}
+
+.attach-btn.has-chips {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .mic-btn.recording {
@@ -1319,18 +1536,29 @@ textarea {
 }
 
 .send-btn {
+  width: 34px;
+  height: 34px;
   background: var(--accent);
   color: var(--on-accent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.send-btn:not(:disabled):hover {
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .send-btn:disabled {
   background: var(--bg-input);
   color: var(--text-dim);
   border: 1px solid var(--border);
+  box-shadow: none;
 }
 
 .stop-btn {
-  background: var(--bg-input);
+  width: 34px;
+  height: 34px;
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-input));
   color: var(--danger);
   border: 1px solid var(--danger);
   animation: stop-pulse 1.1s ease-in-out infinite;
@@ -1340,6 +1568,7 @@ textarea {
   animation: none;
   background: var(--danger);
   color: #fff;
+  transform: translateY(-1px);
 }
 
 @keyframes stop-pulse {
@@ -1581,113 +1810,7 @@ textarea {
   background: var(--bg) !important;
 }
 
-/* ---- sidebar / explorer ---- */
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  background: var(--bg-alt);
-}
 
-.sidebar-head {
-  flex: 0 0 auto;
-  padding: 10px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.sidebar-head .root-path {
-  flex: 1;
-  font-size: 11px;
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tree {
-  flex: 1;
-  overflow-y: auto;
-  padding: 4px 0;
-}
-
-.tree-node {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
-  cursor: pointer;
-  user-select: none;
-  color: var(--text-dim);
-  white-space: nowrap;
-}
-
-.tree-node:hover {
-  background: var(--bg-input);
-  color: var(--text);
-}
-
-.tree-node.selected {
-  background: var(--accent-dim);
-  color: #fff;
-}
-
-.tree-node.dir>.label {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.caret {
-  width: 14px;
-  transition: transform 0.12s ease;
-  color: var(--text-dim);
-}
-
-.caret.open {
-  transform: rotate(90deg);
-}
-
-.icon {
-  width: 16px;
-  text-align: center;
-}
-
-.chat-list {
-  max-height: 240px;
-  overflow-y: auto;
-  border-top: 1px solid var(--border);
-  padding: 6px;
-}
-
-.chat-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-}
-
-.chat-item:hover {
-  background: var(--bg-input);
-}
-
-.chat-item.active {
-  background: var(--accent-dim);
-  color: #fff;
-}
-
-.chat-item .title {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* ---- settings / modal ---- */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -2418,44 +2541,107 @@ textarea {
   overflow-wrap: anywhere;
 }
 
-/* ---- @mention popup ---- */
+/* ---- @mention popup (slash commands / skill & MCP picker) ---- */
 .composer-input-wrap {
   position: relative;
 }
 
 .mention-popup {
   position: absolute;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + 8px);
   left: 0;
   right: 0;
   z-index: 30;
-  max-height: 220px;
+  max-height: 280px;
   overflow-y: auto;
   background: var(--bg-alt);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  border-radius: 18px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.3);
   text-align: left;
+  padding: 6px;
+  animation: ask-slide-up 0.14s ease-out;
+}
+
+.mention-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  margin: 0 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  position: sticky;
+  top: 0;
+  transition: border-color 0.14s;
+}
+
+.mention-search:focus {
+  border-color: var(--accent);
 }
 
 .mention-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 11px;
   cursor: pointer;
   font-size: 13px;
   color: var(--text);
+  transition: background 0.12s;
 }
 
 .mention-item:hover,
-.mention-item.active {
+.mention-item.active,
+.mention-item.kbd {
   background: var(--accent-dim);
+}
+
+.mention-item.kbd:not(:hover) {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .mention-icon {
   color: var(--text-dim);
   font-weight: 700;
+}
+
+/* Circular tinted badge in front of each mention/skill/mcp row, colour-coded
+   by kind so the three sources (commands, skills, MCP tools) read apart at a
+   glance without needing to parse the hint text. */
+.mention-icon-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1;
+  background: var(--bg-input);
+  color: var(--text-dim);
+}
+
+.mention-icon-badge.cmd {
+  color: var(--accent);
+  font-weight: 800;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
+}
+
+.mention-icon-badge.skill {
+  background: color-mix(in srgb, #f5a524 16%, var(--bg-input));
+  color: #f5a524;
+}
+
+.mention-icon-badge.mcp {
+  background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
+  color: var(--link);
 }
 
 .mention-rel {
@@ -2464,23 +2650,24 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
 }
 
 .mention-empty {
-  padding: 10px;
+  padding: 12px 10px;
   font-size: 12px;
   color: var(--text-dim);
 }
 
 .mention-group {
-  padding: 6px 10px 2px;
+  padding: 8px 9px 4px;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
   color: var(--text-dim);
   position: sticky;
-  top: 0;
+  top: 44px;
   background: var(--bg-alt);
 }
 
@@ -2496,7 +2683,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  background: var(--bg-input);
+  background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 3px 8px;
@@ -2507,6 +2694,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
 .chip-x {
@@ -2524,8 +2712,34 @@ textarea {
 }
 
 .attachment-chip.skill-chip {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  border-color: color-mix(in srgb, #f5a524 45%, var(--border));
+  background: color-mix(in srgb, #f5a524 12%, var(--bg-panel));
+  color: var(--text);
+  gap: 5px;
+  padding: 3px 9px 3px 4px;
+}
+
+.attachment-chip.skill-chip.mcp-chip {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
+  background: color-mix(in srgb, var(--link) 12%, var(--bg-panel));
+}
+
+.chip-icon-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  font-size: 9px;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, #f5a524 30%, transparent);
+  color: #f5a524;
+}
+
+.mcp-chip .chip-icon-badge {
+  background: color-mix(in srgb, var(--link) 30%, transparent);
+  color: var(--link);
 }
 
 /* ---- retry banner ---- */
@@ -2594,6 +2808,23 @@ textarea {
   overflow: hidden;
 }
 
+/* Live thinking pinned to the top of the chat while the agent is reasoning.
+   Stays in view as the scrollback grows; hidden once streaming ends. */
+.thinking-pin {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+
+.thinking-pin .thinking-block {
+  border: none;
+  margin: 0;
+}
+
 .thinking-head {
   display: flex;
   align-items: center;
@@ -2629,6 +2860,12 @@ textarea {
 }
 
 /* ---- tool cards ---- */
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .tool-card {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -3081,69 +3318,56 @@ textarea {
   transform: none;
 }
 
-/* Outside-workspace permission dialog */
-.perm-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 80;
-}
-
-.perm-dialog {
-  width: 380px;
-  background: var(--bg);
+/* Permission card — Claude Code style, anchored above the composer (matches .ask-card) */
+.perm-card {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: var(--bg-alt);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px;
+  border-radius: 12px;
+  padding: 12px 14px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  animation: ask-slide-up 0.16s ease-out;
 }
 
-.perm-dialog-title {
-  font-weight: 700;
-  font-size: 14px;
-  margin-bottom: 10px;
-}
-
-.perm-dialog-action {
-  font-size: 13px;
-  color: var(--text);
-  word-break: break-word;
-}
-
-.perm-dialog-path {
+.perm-path {
   display: block;
   margin-top: 6px;
   padding: 6px 8px;
   background: var(--bg-muted, rgba(0, 0, 0, 0.04));
   border-radius: 6px;
   font-size: 12px;
+  direction: ltr;
+  text-align: left;
+  word-break: break-all;
 }
 
-.perm-dialog-reason {
+.perm-reason {
   margin-top: 8px;
   font-size: 12px;
   color: var(--text-dim);
+  word-break: break-word;
 }
 
-.perm-dialog-note {
+.perm-note {
   margin-top: 8px;
   font-size: 11px;
   color: var(--text-dim);
 }
 
-.perm-dialog-buttons {
+.perm-buttons {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
 }
 
-.perm-dialog-buttons .btn {
+.perm-buttons .btn {
   padding: 6px 12px;
-  border-radius: 6px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
@@ -3151,19 +3375,182 @@ textarea {
   cursor: pointer;
 }
 
-.perm-dialog-buttons .perm-deny {
+.perm-buttons .perm-deny {
   color: var(--danger, #e53e3e);
 }
 
-.perm-dialog-buttons .perm-allow {
+.perm-buttons .perm-allow {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.perm-dialog-buttons .perm-allow-always {
+.perm-buttons .perm-allow-always {
   background: var(--accent);
   border-color: var(--accent);
-  color: var(--accent-text, #fff);
+  color: var(--on-accent, #111);
+}
+
+/* ask_user card — Claude Code style, anchored above the composer */
+.ask-card {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  max-height: min(46vh, 420px);
+  overflow-y: auto;
+  animation: ask-slide-up 0.16s ease-out;
+}
+
+@keyframes ask-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ask-card-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+.ask-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.ask-card-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ask-card-question {
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.ask-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  padding: 8px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, transform 0.08s ease;
+}
+
+.ask-option:hover {
+  border-color: var(--accent);
+  background: var(--bg-muted, rgba(0, 0, 0, 0.04));
+}
+
+.ask-option:active {
+  transform: scale(0.99);
+}
+
+.ask-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ask-option-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+
+.ask-option:hover .ask-option-mark {
+  color: var(--accent);
+}
+
+.ask-option-text {
+  direction: inherit;
+  text-align: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ask-freetext {
+  margin-top: 10px;
+}
+
+.ask-input {
+  width: 100%;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.ask-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ask-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.ask-send {
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent, #111);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.12s ease;
+}
+
+.ask-send:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.ask-send:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 /* Plan checklist rendered on the assistant message */
@@ -3249,7 +3636,7 @@ textarea {
   margin-top: 8px;
   align-self: flex-start;
   max-width: 100%;
-  background: var(--bg-input);
+  background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 3px 10px;
@@ -3257,6 +3644,7 @@ textarea {
   font-family: var(--font-mono);
   color: var(--text);
   cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
 
 .nvim-label:hover {

@@ -31,6 +31,7 @@ let mainWindow: BrowserWindow | null = null
 let lastNvimAbs: string | null = null
 let lastNvimDiags: unknown[] = []
 let nvimPollTimer: ReturnType<typeof setInterval> | null = null
+let nvimIdleTicks = 0
 
 /** Unix sockets listening for nvim RPC, found via `lsof` (matches any process
  *  whose command name contains "nvim" — the `--listen` socket lives wherever
@@ -43,12 +44,20 @@ function findNvimSockets(): Promise<string[]> {
       { timeout: 5000 },
       (err, stdout) => {
         if (err || !stdout) return resolve([])
+        // `lsof -c nvim` matches ANY process named nvim — including this app's
+        // own `nvim --server ... --remote-expr` polling subprocesses — so it
+        // also surfaces unrelated sockets (cmux, ssh-agent, launchd, Chrome,
+        // etc.). Polling those with `nvim --server` hangs for the full timeout
+        // each, which stacked up into 40+ stuck nvim subprocesses and starved
+        // the real server socket. Keep only genuine nvim server sockets, whose
+        // path follows nvim's `nvim.<pid>.0` convention.
         const out: string[] = []
         for (const rec of stdout.split('\0')) {
           if (!rec.startsWith('n')) continue
           let p = rec.slice(1)
           if (p.startsWith('->')) p = p.slice(2) // connected socket form
           if (!p.startsWith('/')) continue
+          if (!/nvim\.\d+\.0$/.test(p)) continue
           try {
             if (fs.statSync(p).isSocket()) out.push(p)
           } catch {
@@ -68,7 +77,7 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
     execFile(
       'nvim',
       ['--server', socket, '--remote-expr', 'expand("%:p")'],
-      { timeout: 5000 },
+      { timeout: 1500 },
       (err, stdout) => {
         if (err) return resolve(null)
         const v = String(stdout ?? '').trim()
@@ -104,7 +113,7 @@ function queryNvimDiagnostics(socket: string): Promise<unknown[]> {
     execFile(
       'nvim',
       ['--server', socket, '--remote-expr', `luaeval('(${body})()')`],
-      { timeout: 5000 },
+      { timeout: 1500 },
       (err, stdout) => {
         if (err) return resolve([])
         const raw = String(stdout ?? '').trim()
@@ -144,10 +153,36 @@ async function pollNvimFile(): Promise<void> {
 
 function watchNvimFile(): void {
   if (nvimPollTimer) return
-  const tick = (): void => void pollNvimFile()
-  nvimPollTimer = setInterval(tick, 1500)
-  nvimPollTimer.unref?.()
-  tick()
+  const tick = async (): Promise<void> => {
+    const sockets = await findNvimSockets()
+    // Back off when nothing is open so an idle app doesn't keep spawning
+    // `lsof` + `nvim --remote-expr` subprocesses every 1.5 s (this churn was
+    // the top suspect for system-wide sluggishness/freezes while the app ran).
+    if (sockets.length === 0) {
+      nvimIdleTicks += 1
+      if (nvimIdleTicks > 0 && nvimPollTimer) {
+        clearInterval(nvimPollTimer)
+        nvimPollTimer = setInterval(tick, 5000)
+        nvimPollTimer.unref?.()
+      }
+    } else if (nvimIdleTicks > 0 && nvimPollTimer) {
+      nvimIdleTicks = 0
+      clearInterval(nvimPollTimer)
+      nvimPollTimer = setInterval(tick, 1500)
+      nvimPollTimer.unref?.()
+    } else {
+      nvimIdleTicks = 0
+    }
+    await pollNvimFile()
+  }
+  // Start lazy: a grace delay after the window is up, so app launch never has
+  // to contend with a burst of subprocess spawns on top of first-paint work.
+  setTimeout(() => {
+    if (nvimPollTimer) return
+    nvimPollTimer = setInterval(tick, 1500)
+    nvimPollTimer.unref?.()
+    void tick()
+  }, 5000)
 }
 
 function createWindow(): void {
@@ -157,6 +192,7 @@ function createWindow(): void {
     minWidth: 980,
     minHeight: 640,
     title: 'CODEFA',
+    icon: path.join(import.meta.dirname, '../build/icon.png'),
     backgroundColor: '#1e1e1e',
     autoHideMenuBar: !isDev,
     webPreferences: {

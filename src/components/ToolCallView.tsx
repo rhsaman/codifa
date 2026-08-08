@@ -215,7 +215,9 @@ export function ToolCallView({
   activity: ToolActivity
   onReverted?: () => void
 }) {
-  const [open, setOpen] = useState(() => activity.tool === 'write_file')
+  const [open, setOpen] = useState(
+    () => activity.tool === 'write_file' || activity.tool === 'edit_file'
+  )
   const [reverting, setReverting] = useState(false)
   const root = useStore((s) => s.root)
 

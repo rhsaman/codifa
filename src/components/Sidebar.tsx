@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useStore, workspaceKey } from '../lib/store'
-import type { Chat, Workspace } from '../types'
+import type { Chat, ChatMessage, Workspace } from '../types'
 import { api } from '../lib/fs'
+import { fixMixedText } from '../lib/bidi'
 
 const WORKSPACE_COLORS = [
   '#ef4444',
@@ -117,9 +118,26 @@ export function Sidebar() {
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
 
   const open = useStore((s) => s.sidebarOpen)
+  const dir = useStore((s) => s.dir)
   if (!open) return null
 
   const groups = buildGroups(chats, workspaces, pinnedWorkspaces)
+
+  // Live plan checklist of the ACTIVE chat surfaced in the sidebar footer. Uses
+  // the latest message that carries a non-empty plan; hidden once every item is
+  // completed or no plan exists.
+  const activeChat = chats.find((c) => c.id === activeChatId)
+  const todos: ChatMessage['plan'] = []
+  if (activeChat) {
+    for (let i = activeChat.messages.length - 1; i >= 0; i--) {
+      const plan = activeChat.messages[i].plan
+      if (plan && plan.length > 0) {
+        todos.push(...plan)
+        break
+      }
+    }
+  }
+  const todosDone = todos.length > 0 && todos.every((t) => t.status === 'completed')
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder()
@@ -352,6 +370,31 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar-footer">
+        {todos.length > 0 && !todosDone && (
+          <div className="sidebar-todos" dir={dir}>
+            <div className="sidebar-todos-head">
+              <span className="sidebar-todos-title">Todos</span>
+              <span className="sidebar-todos-count">
+                {todos.filter((t) => t.status === 'completed').length}/{todos.length}
+              </span>
+            </div>
+            <ul className="sidebar-todos-list">
+              {todos.map((t, i) => (
+                <li
+                  key={i}
+                  className={`sidebar-todo-item ${t.status === 'completed' ? 'done' : t.status === 'in_progress' ? 'running' : ''}`}
+                >
+                  <span className="sidebar-todo-mark">
+                    {t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '●' : '○'}
+                  </span>
+                  <span className="sidebar-todo-content">
+                    {dir === 'rtl' ? fixMixedText(t.content) : t.content}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button
           className="sidebar-foot-btn"
           title="Toggle theme"

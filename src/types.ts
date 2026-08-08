@@ -144,6 +144,9 @@ export interface ChatMessage {
   usage?: TokenUsage
   error?: boolean
   retry?: { attempt: number; maxAttempts: number; delay: number; reason: string } | null
+  /** True once this message has been folded into a compact summary (kept in the
+   *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
+  compacted?: boolean
   createdAt: number
 }
 
@@ -168,7 +171,7 @@ export interface Chat {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'compact' | 'plan' | 'permission'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'compact' | 'plan' | 'permission' | 'ask'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -177,9 +180,14 @@ export interface SidecarEvent {
   path?: string
   /** update_plan items: [{ content, status }] */
   items?: Array<{ content: string; status: string }>
-  /** permission request id (echoed back via /permission/respond) */
+  /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string
+  /** 'confirm' for a generic confirm_action request; absent/'outside' for the original outside-workspace permission prompt */
+  scope?: string
+  /** ask_user: the question text and, when multiple-choice, its options */
+  question?: string
+  options?: string[]
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number

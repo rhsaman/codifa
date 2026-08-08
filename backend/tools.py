@@ -17,8 +17,9 @@ import signal
 import subprocess
 import unicodedata
 import uuid
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
-from typing import Any, Callable, Sequence
+from typing import Any
 
 MAX_READ_BYTES = 2_000_000  # 2 MB
 MAX_SEARCH_RESULTS = 200
@@ -178,17 +179,23 @@ class PathEscapeError(ValueError):
     """Raised when a path attempts to escape the sandboxed root."""
 
 
-def resolve_safe(root: str, rel_path: str) -> str:
+def resolve_safe(root: str, rel_path: str, allow_coder: bool = False) -> str:
     """Resolve ``rel_path`` against ``root`` and reject any escape.
 
     Accepts both relative paths (``src/main.py``) and absolute paths that lie
-    inside the root (``/home/user/proj/src/main.py``).
+    inside the root (``/home/user/proj/src/main.py``). Absolute paths under the
+    user-level ``~/.coder`` config dir are also allowed when ``allow_coder`` is
+    set — that is where skills, plans and MCP config live, and reading them
+    must never require a permission prompt (writing still goes through the
+    strict path).
     """
     root_real = os.path.realpath(os.path.abspath(root))
     if not os.path.isdir(root_real):
         raise PathEscapeError(f"root does not exist: {root}")
 
     raw = rel_path.strip()
+    if raw.startswith("~"):
+        raw = os.path.expanduser(raw)
     if os.path.isabs(raw):
         target = os.path.realpath(raw)
     else:
@@ -196,6 +203,10 @@ def resolve_safe(root: str, rel_path: str) -> str:
         target = os.path.realpath(os.path.join(root_real, rel))
 
     if target != root_real and not target.startswith(root_real + os.sep):
+        if allow_coder:
+            coder = os.path.realpath(user_coder_dir())
+            if target == coder or target.startswith(coder + os.sep):
+                return target
         raise PathEscapeError(f"path escapes project root: {rel_path}")
 
     return target
@@ -235,9 +246,23 @@ def _walk_files(root: str) -> Sequence[str]:
     return found
 
 
+def _display_path(root: str, file: str) -> str:
+    """Return a path string the agent can feed straight back into the tools.
+
+    Files under the workspace root show as their tree-relative path (``src/a``);
+    files under ``~/.coder`` (user skills/plans/MCP config) show as
+    ``~/.coder/skills/...`` so the agent can read them without permission.
+    """
+    root_real = os.path.realpath(os.path.abspath(root))
+    coder = os.path.realpath(user_coder_dir())
+    if file == coder or file.startswith(coder + os.sep):
+        return "~/.coder/" + os.path.relpath(file, coder).replace(os.sep, "/")
+    return os.path.relpath(file, root_real).replace(os.sep, "/")
+
+
 def list_files(root: str, path: str = "") -> dict:
     """List the directory contents of ``path`` (relative to root)."""
-    target = resolve_safe(root, path)
+    target = resolve_safe(root, path, allow_coder=True)
     if not os.path.isdir(target):
         return {"path": path, "error": "not a directory"}
 
@@ -266,8 +291,12 @@ def list_files(root: str, path: str = "") -> dict:
 
 
 def read_file(root: str, path: str) -> dict:
-    """Read the text content of ``path`` (relative to root)."""
-    target = resolve_safe(root, path)
+    """Read the text content of ``path`` (relative to root).
+
+    ``~/.coder`` paths (user skills/plans/MCP config) are always readable
+    without permission.
+    """
+    target = resolve_safe(root, path, allow_coder=True)
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
     if os.path.isdir(target):
@@ -558,7 +587,7 @@ def upsert_mcp_server(root: str, name: str, cfg: dict) -> dict:
             json.dump(data, fh, ensure_ascii=False, indent=2)
     except OSError as exc:
         return {"path": "~/.coder/mcp.json", "error": str(exc)}
-    return {"path": f"~/.coder/mcp.json", "name": name, "ok": True}
+    return {"path": "~/.coder/mcp.json", "name": name, "ok": True}
 
 
 def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
@@ -732,7 +761,7 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
     case-insensitive regex, ``ctx`` lines of surrounding context. Slower and
     does not honour ``.gitignore``, but returns the same result shape.
     """
-    target = resolve_safe(root, path)
+    target = resolve_safe(root, path, allow_coder=True)
     if not os.path.isdir(target) and not os.path.isfile(target):
         return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
 
@@ -748,7 +777,7 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
     for file in files:
         if not _is_text_path(file):
             continue
-        rel = os.path.relpath(file, resolve_safe(root, "")).replace(os.sep, "/")
+        rel = _display_path(root, file)
         try:
             with open(file, "r", encoding="utf-8", errors="ignore") as fh:
                 lines = [ln.rstrip("\n") for ln in fh]
@@ -780,11 +809,10 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     rg = shutil.which("rg")
     if not rg:
         return None
-    try:
-        target = resolve_safe(root, path)
-    except PathEscapeError:
-        raise
+    target = resolve_safe(root, path, allow_coder=True)
     root_real = os.path.realpath(os.path.abspath(root))
+    coder = os.path.realpath(user_coder_dir())
+    in_coder = target == coder or target.startswith(coder + os.sep)
     # IMPORTANT: when `path` names a single FILE, search that file only. This
     # used to silently widen to the file's parent directory whenever the path
     # wasn't itself a directory, so "search X inside path/to/File.tsx" quietly
@@ -796,7 +824,8 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     if not os.path.isdir(target) and not os.path.isfile(target):
         return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
 
-    search_arg = os.path.relpath(target, root_real).replace(os.sep, "/")
+    cwd = coder if in_coder else root_real
+    search_arg = os.path.relpath(target, cwd).replace(os.sep, "/")
     if search_arg in (".", ""):
         search_arg = "."
 
@@ -810,10 +839,11 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     try:
         proc = subprocess.run(
             cmd,
-            cwd=root_real,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=SEARCH_TIMEOUT,
+            check=False,  # rg's non-zero exit (1 = no matches) is handled below
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -832,6 +862,8 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
         if obj.get("type") == "match":
             path_text = (data.get("path") or {}).get("text") or ""
             file = path_text.removeprefix("./")
+            if in_coder:
+                file = "~/.coder/" + file
             entry = {
                 "file": file,
                 "line": data.get("line_number"),
@@ -904,7 +936,7 @@ def fuzzy_find_files(root: str, query: str, path: str = "") -> dict:
     Results are ranked by match score, then by path depth. Useful when the user
     only remembers part of a filename (litmus -> ``Liteform.tsx``).
     """
-    target = resolve_safe(root, path)
+    target = resolve_safe(root, path, allow_coder=True)
     if not os.path.isdir(target):
         return {"query": query, "matches": [], "error": "not a directory"}
 
@@ -918,7 +950,7 @@ def fuzzy_find_files(root: str, query: str, path: str = "") -> dict:
         score = _fuzzy_score(query, base)
         if score <= 0:
             continue
-        rel = os.path.relpath(file, resolve_safe(root, ""))
+        rel = _display_path(root, file)
         depth = rel.count(os.sep)
         # Order by score desc, then depth asc. Encode as sortable tuple.
         scored.append((-score, depth, rel))
@@ -1051,8 +1083,6 @@ def _html_to_text(html: str) -> tuple[str, str]:
     title = ""
     title_done = False
     out: list[str] = []
-    skip = 0  # depth of <script>/<style> blocks to drop
-    chrome = 0  # depth of nav/aside/footer/header regions to drop
 
     class _P(HTMLParser):
         nonlocal_skip = 0
@@ -1207,6 +1237,7 @@ def make_tool_callbacks(
     context_window: int = 0,
     summarizer_model: Any = None,
     permission_gates: dict | None = None,
+    ask_gates: dict | None = None,
     permit: dict | None = None,
 ) -> dict[str, Callable]:
     """Build the agent tools bound to ``root`` with an emit callback.
@@ -1280,18 +1311,20 @@ def make_tool_callbacks(
         return f"Successfully wrote {len(content)} characters to {path}."
 
     async def save_plan_tool(title: str, content: str) -> str:
-        """PLAN MODE ONLY. Save the implementation plan you just wrote to a markdown file at `~/.coder/plans/<workspace>/<date>-<slug>.md` (user-level, outside the project), so the user (or Coder mode, in a later turn) can open it again without you having to retype it. This is the ONE exception to plan mode being read-only — it never writes into the workspace, only into `~/.coder/plans/`. Call it ONCE, after your plan text is finalized in your reply, with `title` (a short name, becomes the filename slug) and `content` (the full plan in markdown — normally the same '## Plan' text you just wrote in your reply). Do not call this for anything other than the final plan for the current task."""
+        """PLAN MODE ONLY. Save the implementation plan you just wrote to `~/.coder/plans/<workspace>/plan.md` (user-level, outside the project), so the user (or Coder mode, in a later turn) can open it again without you having to retype it. Each call OVERWRITES the previous plan for this workspace — there is only ever one `plan.md` per workspace, always the latest task's plan. This is the ONE exception to plan mode being read-only — it never writes into the workspace, only into `~/.coder/plans/`. Call it ONCE, after your plan text is finalized in your reply, with `title` (short description) and `content` (the full plan in markdown — normally the same '## Plan' text you just wrote in your reply). Do not call this for anything other than the final plan for the current task."""
         emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
-        date_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        slug = slugify(title)
         workspace_slug = slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
         plans_dir = os.path.join(user_coder_dir(), "plans", workspace_slug)
-        rel_path = f"{date_prefix}-{slug}.md"
+        rel_path = "plan.md"
         abs_path = os.path.join(plans_dir, rel_path)
         try:
-            os.makedirs(plans_dir, exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as fh:
-                fh.write(content)
+            await asyncio.to_thread(os.makedirs, plans_dir, exist_ok=True)
+
+            def _write_plan() -> None:
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+
+            await asyncio.to_thread(_write_plan)
         except OSError as exc:
             msg = f"could not write plan: {exc}"
             emit({"kind": "tool_result", "tool": "save_plan", "summary": msg})
@@ -1358,7 +1391,7 @@ def make_tool_callbacks(
         return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
 
     async def update_plan(items: list[dict]) -> str:
-        """Set or update your step-by-step plan for the CURRENT task, shown to the user as a live checklist. Call this FIRST, before touching any files, for any task with 3 or more distinct steps — pass the full list with status='pending' for every item. As you work, call it again with the SAME full list (not just the changed item), updating the step you just finished to 'completed' and the step you're starting to 'in_progress'. Each item needs 'content' (a short imperative phrase, e.g. "Add the edit_file tool") and 'status' (one of 'pending', 'in_progress', 'completed'). Skip this entirely for simple one- or two-step requests — it's for genuinely multi-step work only, and calling it on trivial tasks is noise."""
+        """Set or update your step-by-step plan for the CURRENT task, shown to the user as a live checklist. ALWAYS call this FIRST, before touching any files — pass the full list with status='pending' for every item, even for requests that look small. As you work, call it again with the SAME full list (not just the changed item), updating the step you just finished to 'completed' and the step you're starting to 'in_progress'. Each item needs 'content' (a short imperative phrase, e.g. "Add the edit_file tool") and 'status' (one of 'pending', 'in_progress', 'completed'). Never skip this — a live checklist should be visible on every task."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
@@ -1718,11 +1751,12 @@ def make_tool_callbacks(
             return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
 
         try:
-            from pydantic_ai import Agent as _Agent, Tool as _Tool
+            from httpx import Timeout as _Timeout
+            from pydantic_ai import Agent as _Agent
+            from pydantic_ai import Tool as _Tool
+            from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
             from pydantic_ai.settings import ModelSettings as _ModelSettings
             from pydantic_ai.usage import UsageLimits as _UsageLimits
-            from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
-            from httpx import Timeout as _Timeout
 
             sub_agent = _Agent(
                 summarizer_model,
@@ -1810,9 +1844,9 @@ def make_tool_callbacks(
         answer = ""
         if summarizer_model is not None:
             try:
+                from httpx import Timeout
                 from pydantic_ai import Agent
                 from pydantic_ai.settings import ModelSettings
-                from httpx import Timeout
 
                 summarizer = Agent(
                     summarizer_model,
@@ -1846,9 +1880,23 @@ def make_tool_callbacks(
         return head + body
 
     async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:
-        """Request the user's permission to read, search or act OUTSIDE the current workspace root. BEFORE touching anything outside the project folder (e.g. ~/.config, /Users/..., $HOME files, system paths), call this and WAIT for the result. If it returns PERMISSION GRANTED you may proceed with that outside action; if PERMISSION DENIED you MUST NOT access it — instead explain to the user what you needed and why, and continue with what is possible inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
+        """Request the user's permission to read, search or act OUTSIDE the current workspace root. BEFORE touching anything outside the project folder (e.g. ~/.config, /Users/..., $HOME files, system paths), call this and WAIT for the result. (Reading the user-level `~/.coder` config dir — skills, plans, MCP config — is ALWAYS allowed and needs NO permission; do not call this for that.) If it returns PERMISSION GRANTED you may proceed with that outside action; if PERMISSION DENIED you MUST NOT access it — instead explain to the user what you needed and why, and continue with what is possible inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
+        # Paths under the always-readable ~/.coder config dir never need a
+        # permission prompt — grant silently with no UI card at all.
+        if path:
+            try:
+                target = resolve_safe(root, path, allow_coder=True)
+                coder = os.path.realpath(user_coder_dir())
+                if target == coder or target.startswith(coder + os.sep):
+                    return (
+                        f"PERMISSION GRANTED for {path!r}. This is inside the always-readable "
+                        f"~/.coder config dir — no permission is needed, you may proceed."
+                    )
+            except PathEscapeError:
+                pass
         emit({"kind": "tool", "tool": "request_permission", "args": {"action": action, "path": path}})
         if permission_gates is None:
+            emit({"kind": "tool_result", "tool": "request_permission", "summary": "permission system unavailable"})
             return "ERROR: permission system is not available."
         pid = f"p{uuid.uuid4().hex[:8]}"
         loop = asyncio.get_running_loop()
@@ -1864,18 +1912,71 @@ def make_tool_callbacks(
         if granted:
             if permit is not None:
                 permit["outside"] = True
+            emit({"kind": "tool_result", "tool": "request_permission", "summary": "granted"})
             return (
                 f"PERMISSION GRANTED for {path or action!r}. The user approved it — you may now "
                 f"complete this outside-workspace action (other outside actions still need a fresh "
                 f"permission)."
             )
+        emit({"kind": "tool_result", "tool": "request_permission", "summary": "denied"})
         return (
             f"PERMISSION DENIED for {path or action!r}. Do NOT access anything outside the workspace. "
             f"Tell the user what you needed and why, then continue with what you can do inside."
         )
 
+    async def confirm_action_tool(action: str, reason: str = "") -> str:
+        """Ask the user to confirm before an IMPORTANT or hard-to-reverse action, and WAIT for the result. Use this before things like: deleting or overwriting a file that has real content, force-pushing or rewriting git history (git push --force, git reset --hard, git rebase on shared history), dropping/truncating a database or table, running a destructive shell command (rm -rf, DROP TABLE, a migration that loses data), or any step you cannot cleanly undo. Also use it when you're about to commit to one of two genuinely different approaches and the choice meaningfully affects the outcome — in that case prefer ask_user instead if there's more than one reasonable option to present. `action` is a short, specific description of exactly what you're about to do (e.g. 'delete src/legacy/old-router.ts (312 lines, no longer imported)'); `reason` is a one-line why. If CONFIRMED, proceed. If DENIED, STOP that action, tell the user you stopped, and ask what they'd like instead — do not silently skip it and continue as if nothing happened. Do not call this for routine, easily-reversible edits (normal edit_file/write_file calls) — only for the genuinely risky or one-way ones."""
+        emit({"kind": "tool", "tool": "confirm_action", "args": {"action": action}})
+        if permission_gates is None:
+            emit({"kind": "tool_result", "tool": "confirm_action", "summary": "confirmation system unavailable"})
+            return "ERROR: confirmation system is not available. Do NOT proceed with the action; ask the user directly in your reply instead."
+        pid = f"c{uuid.uuid4().hex[:8]}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        permission_gates[pid] = fut
+        emit({"kind": "permission", "id": pid, "action": action, "reason": reason, "scope": "confirm"})
+        try:
+            granted = await asyncio.wait_for(fut, timeout=300)
+        except asyncio.TimeoutError:
+            granted = False
+        finally:
+            permission_gates.pop(pid, None)
+        if granted:
+            emit({"kind": "tool_result", "tool": "confirm_action", "summary": "confirmed"})
+            return f"CONFIRMED by the user: {action!r}. Proceed with it now."
+        emit({"kind": "tool_result", "tool": "confirm_action", "summary": "denied"})
+        return (
+            f"DENIED by the user: {action!r}. Do NOT do this — stop, tell the user you stopped, and ask "
+            f"what they'd like instead."
+        )
+
+    async def ask_user_tool(question: str, options: list[str] | None = None) -> str:
+        """Ask the user a question mid-task and WAIT for their answer, instead of guessing or picking silently on their behalf. Use this when you hit a genuine fork with no clearly-correct default — e.g. two reasonable but different implementation approaches, which of several matching files they meant, whether to keep or remove something ambiguous, a missing detail you can't infer from the project. Pass 2-5 short, mutually-exclusive `options` (a few words each) when the question is naturally multiple-choice — the user picks one with a tap. Omit `options` (or pass an empty list) for an open-ended question that needs a free-text answer. Keep `question` to one clear sentence. Do NOT use this for things you can just go find out yourself with a tool, and do not ask more than one question per call — if you have several, ask the most important one first. The returned string is the user's exact answer (the option they picked, or their typed text)."""
+        emit({"kind": "tool", "tool": "ask_user", "args": {"question": question, "options": options or []}})
+        if ask_gates is None:
+            emit({"kind": "tool_result", "tool": "ask_user", "summary": "ask system unavailable"})
+            return "ERROR: the ask-the-user system is not available. Ask the question directly in your reply instead and wait for the user's next message."
+        aid = f"a{uuid.uuid4().hex[:8]}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        ask_gates[aid] = fut
+        emit({"kind": "ask", "id": aid, "question": question, "options": options or []})
+        try:
+            answer = await asyncio.wait_for(fut, timeout=600)
+        except asyncio.TimeoutError:
+            answer = ""
+        finally:
+            ask_gates.pop(aid, None)
+        if not answer:
+            emit({"kind": "tool_result", "tool": "ask_user", "summary": "no answer (timed out)"})
+            return "The user did not answer in time. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
+        emit({"kind": "tool_result", "tool": "ask_user", "summary": f"answered: {answer[:80]}"})
+        return f"USER ANSWERED: {answer}"
+
     return {
         "request_permission": request_permission_tool,
+        "confirm_action": confirm_action_tool,
+        "ask_user": ask_user_tool,
         "write_file": write_file_tool,
         "edit_file": edit_file_tool,
         "memory": memory_tool,

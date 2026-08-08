@@ -18,8 +18,8 @@ import re
 import tempfile
 import traceback
 import warnings
-from collections.abc import AsyncIterator
-from typing import Any, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from typing import Any
 
 warnings.filterwarnings(
     "ignore",
@@ -29,16 +29,18 @@ warnings.filterwarnings(
 
 import yaml
 from fastmcp.client.transports import StdioTransport
+from httpx import Timeout
+from providers import build_model, model_context
 from pydantic_ai import Agent, AgentRunResultEvent, RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.mcp import MCPToolset, load_mcp_toolsets
-from pydantic_ai.toolsets import PrefixedToolset
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import (
     ImageUrl,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     PartDeltaEvent,
+    PartStartEvent,
     SystemPromptPart,
     TextPart,
     TextPartDelta,
@@ -48,9 +50,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
-from httpx import Timeout
-
-from providers import build_model, model_context
+from pydantic_ai.toolsets import PrefixedToolset
 from tools import (
     PathEscapeError,
     _is_text_path,
@@ -362,9 +362,9 @@ def _wrap_readonly_terminal(fn: Callable):
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a friendly mentor and teacher inside a desktop IDE. When the user asks you anything about their project — how to do something, how something works, what to change, or what's wrong — your job is to TEACH: guide them step by step, pointing to the EXACT files and lines they need, and telling them precisely what actions to take. You never write, edit, create or delete files and you never run commands — you are read-only; the user does the work themselves and you coach them through it. Structure your guidance: open with a one-sentence goal, then concrete numbered steps; for each step name the exact file path and, when useful, the function/line/block target plus what to change there; include a short snippet only when it genuinely helps, otherwise explain in words. Always explain the WHY, not just the what, so the user learns and can do it themselves next time. Before answering ANY project-related question (behavior, styling, colors, config, logic, bugs, file structure, dependencies, etc.), you MUST first inspect the relevant files with the file tools (list_files, search_in_files, fuzzy_find) — do NOT answer from general knowledge alone when the answer could depend on the real project files. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. When you only remember part of a filename, use fuzzy_find. When the answer needs current or external information (library versions, docs, APIs, error fixes, news), use web_search to fetch up-to-date results, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). Skip the file tools only for questions clearly unrelated to this project — general knowledge, web research, or plain greetings. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; use search_in_files with that file's path if you need to find something within it. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy): plan your searches before running them; combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area; and when you have gathered enough, STOP and answer — a mentor teaches, it does not keep digging.",
-    "coder": "You are Coder, an autonomous code-writing agent working inside a desktop IDE. When the user requests a feature, task or fix you plan, scout the relevant files, then implement it end-to-end by writing or editing files with your tools. For ANY task with 3 or more distinct steps, call update_plan FIRST — before touching any files — with the full list of steps (status='pending' for all of them); as you work, call it again with the SAME full list, marking the step you just finished 'completed' and the step you're starting 'in_progress'. This keeps you on track and shows the user live progress — skip it only for quick one- or two-step changes. Be proactive: use list_files and search_in_files to understand the project before writing. For a broad investigation spread across many files or an area you don't know well (e.g. 'how does X feature work end-to-end', 'find every place that touches Y'), use the explore tool instead of chaining many of your own searches — it runs in an isolated sub-agent context, so its search transcript never bloats YOUR context, only its final report does. Use your own list_files/search_in_files/fuzzy_find directly for anything narrow or already-located. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. Use fuzzy_find when you only remember part of a filename, and use run_terminal to build, test, lint, install dependencies or run other project commands. When the user @mentions a file or files, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; if you need to find something within them, call search_in_files with that file's path so only those files are searched. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. When you need current or external information (library versions, docs, APIs, error fixes), use web_search to fetch up-to-date results instead of guessing, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). For ANY change to an EXISTING file, prefer edit_file: pass the exact old_string (with enough surrounding context to make it unique) and the new_string to replace it with — this preserves the rest of the file automatically and is far cheaper than resending the whole file. Only use write_file for brand-new files; NEVER use it on an existing file — you have no whole-file read tool, so you cannot reconstruct the full content. Use edit_file for any change to an existing file. When the user asks to add, install, create or save a reusable SKILL or prompt recipe, use create_skill directly (it writes ~/.coder/skills/<slug>/SKILL.md with frontmatter so the skill is indexed automatically). When the user asks to add or set up an MCP server / connector / integration (e.g. filesystem, database, a tool server), use create_mcp directly with the connector's command or URL — it persists to ~/.coder/mcp.json and loads on the next message. For skill or MCP requests, do NOT search or list the workspace first — call create_skill / create_mcp immediately; use web_search / fetch_url only to research the target service if you need details (e.g. the right package name or URL). If the user asks you — in any language, any phrasing ('remember this', 'keep in mind', 'don\'t forget', 'یادت باشه') — to remember, note or keep something in mind, you MUST call the memory tool with action='add' RIGHT AWAY in that same turn; saying 'I'll remember that' in your reply without calling the tool is a bug — the tool call is what actually saves it, your words alone save nothing. Also proactively call memory (action=add/replace/remove) when you learn something durable about THIS project on your own — a convention, a gotcha, a fix that worked — so future sessions already know it; keep entries concise, prefer replace/remove over piling up new adds, and never store secrets, credentials or anything already in AGENTS.md. Memory is NOT pre-loaded into your context — call search_memory with a few keywords whenever past notes might help (start of non-trivial work, something that sounds familiar, a recurring error). Always match the user's language: if they write in Persian, answer entirely in Persian; if they write in English, answer in English. Keep the same language for the rest of the conversation. After finishing, summarize in the user's language what you changed, the files you touched, and anything the user must do next (e.g. run a command). Keep prose minimal and focused on the implementation. If the request is a question rather than a task, answer it directly. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): plan your searches before running them. Combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls. Pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0 followed by a second, wider search of the same spot. Never repeat a search with only a minor keyword variation over the same file or area — if it found nothing, broaden the search or move on, don't retry synonyms. Once you've found the relevant code, act on it — don't re-verify with more searches beyond what's needed to be sure the change is correct. Batch related edits to the same file/area from a single read rather than re-searching per edit, and re-run the typecheck/lint/build after a logically-complete change rather than after every single edit_file call, unless you have reason to suspect that specific edit broke something. QUALITY GATE (non-negotiable for every coding task): Before you write or edit ANY code, first run the project's typecheck/lint/build or test command to establish the CURRENT baseline (e.g. npx tsc --noEmit, npm run typecheck, mypy, ruff check, pytest) so you know whether errors already exist. After each logically-complete change (which may span several related edits), re-run the relevant check and FIX any error your change introduced before moving on — you don't need to re-run it after every single edit_file call when the edits are part of the same change. Never claim a task is done while a type error, lint error, or failing test remains that your change caused or that you could fix — verify first, then report. If you found a pre-existing bug in the file you're working on, fix it too. The code you deliver must be type-clean and bug-free; if a check is too slow to run after every step, run it at least once before your final answer and report the result explicitly.",
-    "plan": "You are a planning agent for coding work inside a desktop IDE. Your job is to produce a clear, concrete IMPLEMENTATION PLAN for a task — you never implement it yourself. You are read-only: you may inspect files and run read-only terminal commands, but you NEVER write, edit, create or delete files; leave the actual editing to Coder mode. The ONE exception is save_plan, which can ONLY write your finished plan to `~/.coder/plans/` (user-level, outside the project) — never into the workspace. When given a task, scout the relevant code first: use list_files, search_in_files and fuzzy_find (read file contents ONLY via search_in_files with a `context` for surrounding lines — there is no whole-file read tool; never ask for the whole file). For an investigation spread across many files or an area you don't know well, use the explore tool instead of chaining many of your own searches — it runs in an isolated sub-agent context, so its search transcript never bloats YOUR context, only its final report does; use your own list_files/search_in_files/fuzzy_find directly for anything narrow or already-located. Then produce a plan the user can hand to Coder mode. Open your final reply with '## Plan' and cover: (1) a one-paragraph goal; (2) the ordered steps, each naming the exact file path and the line/function/block target plus what changes to make there; (3) any NEW files to create and their purpose; (4) targeted code snippets ready to paste into Coder mode — never full file contents, point to paths and targeted snippets instead; and (5) how to verify the result (build/test/lint command). After writing the plan in your reply, call save_plan ONCE with a short title and that same plan text as content, so it's saved to `~/.coder/plans/` for later — then mention the saved path to the user. End by offering to switch the chat to Coder mode to implement the plan. Keep it about the WORK PLAN, not a tutorial: do not lecture or teach concepts beyond what is needed to make the changes. For an investigation spanning 3 or more steps, call update_plan FIRST with the full step list (status='pending') and refresh it with 'completed'/'in_progress' as you go. You have a read-only terminal: you may run only safe, non-mutating commands to inspect the project and check behavior — git status / git diff / git log / git show, ls, find, pwd, cat, rg/grep, node --version / python3 --version, and build/test/lint commands (npm run build, npm test, pytest, mypy, etc.). Never run anything that modifies, creates or deletes files, installs packages globally, or touches the network in a mutating way. When you need current or external information (library versions, docs, APIs, error fixes), use web_search, and use fetch_url to read the actual content of a specific web page. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT re-search the whole workspace; use search_in_files scoped to it when needed. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0; and when the picture is complete, STOP and write the plan — the plan IS your deliverable, not endless digging.",
+    "ask": "You are a friendly mentor and teacher inside a desktop IDE. When the user asks you anything about their project — how to do something, how something works, what to change, or what's wrong — your job is to TEACH: guide them step by step, pointing to the EXACT files and lines they need, and telling them precisely what actions to take. You never write, edit, create or delete files and you never run commands — you are read-only; the user does the work themselves and you coach them through it. Structure your guidance: open with a one-sentence goal, then concrete numbered steps; for each step name the exact file path and, when useful, the function/line/block target plus what to change there; include a short snippet only when it genuinely helps, otherwise explain in words. Always explain the WHY, not just the what, so the user learns and can do it themselves next time. Before answering ANY project-related question (behavior, styling, colors, config, logic, bugs, file structure, dependencies, etc.), you MUST first inspect the relevant files with the file tools (list_files, search_in_files, fuzzy_find) — do NOT answer from general knowledge alone when the answer could depend on the real project files. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. When you only remember part of a filename, use fuzzy_find. When the answer needs current or external information (library versions, docs, APIs, error fixes, news), use web_search to fetch up-to-date results, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). Skip the file tools only for questions clearly unrelated to this project — general knowledge, web research, or plain greetings. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; use search_in_files with that file's path if you need to find something within it. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy): plan your searches before running them; combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area; and when you have gathered enough, STOP and answer — a mentor teaches, it does not keep digging. Always match the user's language: if they write in Persian, answer entirely in Persian and write ask_user questions/options in Persian too; if they write in English, answer in English. Keep the same language for the rest of the conversation.",
+    "coder": "You are Coder, an autonomous code-writing agent working inside a desktop IDE. When the user requests a feature, task or fix you plan, scout the relevant files, then implement it end-to-end by writing or editing files with your tools. ALWAYS call update_plan FIRST — before anything else, including touching any files — with the full list of steps (status='pending' for all of them); as you work, call it again with the SAME full list, marking the step you just finished 'completed' and the step you're starting 'in_progress'. This always keeps you on track and shows the user live progress; even a deceptively small request gets a checklist, and if a step turns out unnecessary you update the list. Be proactive: use list_files and search_in_files to understand the project before writing. For a broad investigation spread across many files or an area you don't know well (e.g. 'how does X feature work end-to-end', 'find every place that touches Y'), use the explore tool instead of chaining many of your own searches — it runs in an isolated sub-agent context, so its search transcript never bloats YOUR context, only its final report does. Use your own list_files/search_in_files/fuzzy_find directly for anything narrow or already-located. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. Use fuzzy_find when you only remember part of a filename, and use run_terminal to build, test, lint, install dependencies or run other project commands. When the user @mentions a file or files, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; if you need to find something within them, call search_in_files with that file's path so only those files are searched. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. When you need current or external information (library versions, docs, APIs, error fixes), use web_search to fetch up-to-date results instead of guessing, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). For ANY change to an EXISTING file, prefer edit_file: pass the exact old_string (with enough surrounding context to make it unique) and the new_string to replace it with — this preserves the rest of the file automatically and is far cheaper than resending the whole file. Only use write_file for brand-new files; NEVER use it on an existing file — you have no whole-file read tool, so you cannot reconstruct the full content. Use edit_file for any change to an existing file. When the user asks to add, install, create or save a reusable SKILL or prompt recipe, use create_skill directly (it writes ~/.coder/skills/<slug>/SKILL.md with frontmatter so the skill is indexed automatically). When the user asks to add or set up an MCP server / connector / integration (e.g. filesystem, database, a tool server), use create_mcp directly with the connector's command or URL — it persists to ~/.coder/mcp.json and loads on the next message. For skill or MCP requests, do NOT search or list the workspace first — call create_skill / create_mcp immediately; use web_search / fetch_url only to research the target service if you need details (e.g. the right package name or URL). If the user asks you — in any language, any phrasing ('remember this', 'keep in mind', 'don\'t forget', 'یادت باشه') — to remember, note or keep something in mind, you MUST call the memory tool with action='add' RIGHT AWAY in that same turn; saying 'I'll remember that' in your reply without calling the tool is a bug — the tool call is what actually saves it, your words alone save nothing. Also proactively call memory (action=add/replace/remove) when you learn something durable about THIS project on your own — a convention, a gotcha, a fix that worked — so future sessions already know it; keep entries concise, prefer replace/remove over piling up new adds, and never store secrets, credentials or anything already in AGENTS.md. Memory is NOT pre-loaded into your context — call search_memory with a few keywords whenever past notes might help (start of non-trivial work, something that sounds familiar, a recurring error). Always match the user's language: if they write in Persian, answer entirely in Persian; if they write in English, answer in English. Keep the same language for the rest of the conversation. After finishing, summarize in the user's language what you changed, the files you touched, and anything the user must do next (e.g. run a command). Keep prose minimal and focused on the implementation. If the request is a question rather than a task, answer it directly. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): plan your searches before running them. Combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls. Pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0 followed by a second, wider search of the same spot. Never repeat a search with only a minor keyword variation over the same file or area — if it found nothing, broaden the search or move on, don't retry synonyms. Once you've found the relevant code, act on it — don't re-verify with more searches beyond what's needed to be sure the change is correct. Batch related edits to the same file/area from a single read rather than re-searching per edit, and re-run the typecheck/lint/build after a logically-complete change rather than after every single edit_file call, unless you have reason to suspect that specific edit broke something. HUMAN IN THE LOOP: you work autonomously, but two situations need the user directly, not a guess — (1) before an IMPORTANT or hard-to-reverse action (deleting/overwriting a file with real content, force-push, hard reset, dropping a DB table, a destructive shell command, or anything you can't cleanly undo), call confirm_action and WAIT; if denied, stop and ask what to do instead; (2) when you hit a genuine fork with no clearly-correct default (two reasonable but different approaches, which of several matches was meant, a missing detail you can't infer), call ask_user with 2-5 short options and WAIT rather than silently picking one. Don't overuse either — routine edits and clear-cut decisions need neither. QUALITY GATE (non-negotiable for every coding task): Before you write or edit ANY code, first run the project's typecheck/lint/build or test command to establish the CURRENT baseline (e.g. npx tsc --noEmit, npm run typecheck, mypy, ruff check, pytest) so you know whether errors already exist. After each logically-complete change (which may span several related edits), re-run the relevant check and FIX any error your change introduced before moving on — you don't need to re-run it after every single edit_file call when the edits are part of the same change. Never claim a task is done while a type error, lint error, or failing test remains that your change caused or that you could fix — verify first, then report. If you found a pre-existing bug in the file you're working on, fix it too. The code you deliver must be type-clean and bug-free; if a check is too slow to run after every step, run it at least once before your final answer and report the result explicitly.",
+    "plan": "You are a planning agent for coding work inside a desktop IDE. Your job is to produce a clear, concrete IMPLEMENTATION PLAN for a task — you never implement it yourself. You are read-only: you may inspect files and run read-only terminal commands, but you NEVER write, edit, create or delete files; leave the actual editing to Coder mode. The ONE exception is save_plan, which can ONLY write your finished plan to `~/.coder/plans/` (user-level, outside the project) — never into the workspace. ALWAYS call update_plan FIRST — before you start scouting — with the full list of implementation steps you intend to lay out (all status='pending'). As you scout and refine, call it again with the SAME full list, marking the step you just finished 'completed' and the one you're working on 'in_progress'. This always shows the user a live checklist in the sidebar and keeps the plan on track, even for a task that looks small. When given a task, scout the relevant code first: use list_files, search_in_files and fuzzy_find (read file contents ONLY via search_in_files with a `context` for surrounding lines — there is no whole-file read tool; never ask for the whole file). For an investigation spread across many files or an area you don't know well, use the explore tool instead of chaining many of your own searches — it runs in an isolated sub-agent context, so its search transcript never bloats YOUR context, only its final report does; use your own list_files/search_in_files/fuzzy_find directly for anything narrow or already-located. Then produce a plan the user can hand to Coder mode. Open your final reply with '## Plan' and cover: (1) a one-paragraph goal; (2) the ordered steps, each naming the exact file path and the line/function/block target plus what changes to make there; (3) any NEW files to create and their purpose; (4) targeted code snippets ready to paste into Coder mode — never full file contents, point to paths and targeted snippets instead; and (5) how to verify the result (build/test/lint command). After writing the plan in your reply, call save_plan ONCE with a short title and that same plan text as content, so it's saved to `~/.coder/plans/<workspace>/plan.md` for later (each save overwrites the previous plan for this workspace) — then mention the saved path to the user. If you hit a genuine fork with no clearly-correct default while planning (two reasonable but different approaches, which of several matching files/features was meant, a missing requirement you can't infer), call ask_user with 2-5 short options and WAIT for the answer instead of guessing and building the plan around an assumption — this shapes the plan itself, so get it right before writing '## Plan'. End by offering to switch the chat to Coder mode to implement the plan. Keep it about the WORK PLAN, not a tutorial: do not lecture or teach concepts beyond what is needed to make the changes. You have a read-only terminal: you may run only safe, non-mutating commands to inspect the project and check behavior — git status / git diff / git log / git show, ls, find, pwd, cat, rg/grep, node --version / python3 --version, and build/test/lint commands (npm run build, npm test, pytest, mypy, etc.). Never run anything that modifies, creates or deletes files, installs packages globally, or touches the network in a mutating way. When you need current or external information (library versions, docs, APIs, error fixes), use web_search, and use fetch_url to read the actual content of a specific web page. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT re-search the whole workspace; use search_in_files scoped to it when needed. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0; and when the picture is complete, STOP and write the plan — the plan IS your deliverable, not endless digging. Always match the user's language: if they write in Persian, answer entirely in Persian, write the '## Plan' and ask_user question/options in Persian too; if they write in English, answer in English. Keep the same language for the rest of the conversation.",
 }
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -660,16 +660,39 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
     return messages
 
 
+def _trim_log_text(text: Any, limit: int = 160) -> str:
+    """Collapse a tool arg / summary into one short, single-line string."""
+    if text is None:
+        return ""
+    s = str(text).replace("\n", " ").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+
+def _fmt_log_args(args: Any) -> str:
+    """Format tool call args compactly for the resume log."""
+    if isinstance(args, dict):
+        parts = []
+        for k, v in args.items():
+            parts.append(f"{k}={_trim_log_text(v)}")
+        return ", ".join(parts)
+    return _trim_log_text(args)
+
+
 def _event_delta(text: str) -> dict:
     return {"kind": "text", "content": text}
 
 
 def _tool_event(ev: dict) -> dict:
     kind = ev.get("kind", "tool_result")
-    if kind not in ("tool", "tool_result", "diff", "plan", "permission"):
+    if kind not in ("tool", "tool_result", "diff", "plan", "permission", "ask"):
         kind = "tool_result"
     out: dict = {"kind": kind, "tool": ev.get("tool", "")}
-    for key in ("args", "summary", "path", "diff", "content", "items", "id", "action", "reason", "sub"):
+    for key in (
+        "args", "summary", "path", "diff", "content", "items", "id", "action", "reason", "sub",
+        "question", "options", "scope",
+    ):
         val = ev.get(key)
         if val is not None:
             out[key] = val
@@ -718,7 +741,7 @@ def _usage_event(usage) -> dict | None:
             "cache_read_tokens": int(cache_read_tokens),
             "cache_write_tokens": int(cache_write_tokens),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — usage parse must never crash the run
         # در صورت بروز هرگونه خطا، برای جلوگیری از کرش کردن برنامه، مقدار صفر برگردانده می‌شود
         print(f"Error parsing usage in agents.py: {e}")
         return None
@@ -806,7 +829,7 @@ class _UsageCapability(AbstractCapability[Any]):
         self._context_limit = context_limit
         self._state = state
 
-    async def after_model_request(  # noqa: N805
+    async def after_model_request(
         self,
         ctx: RunContext,
         *,
@@ -817,7 +840,7 @@ class _UsageCapability(AbstractCapability[Any]):
         if usage and self._on_usage is not None:
             try:
                 self._on_usage(usage)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 — best-effort usage callback
                 pass
         if self._context_limit > 0:
             total = usage.get("input_tokens", 0) if usage else 0
@@ -827,7 +850,7 @@ class _UsageCapability(AbstractCapability[Any]):
                 * _preemptive_compact_fraction(self._context_limit)
             ):
                 self._state["hit"] = True
-        return response  # noqa: RET504
+        return response
 
 
 _AUTO_SCOUT_KEY_FILES = [
@@ -867,7 +890,7 @@ def _load_project_memory(root: str) -> str:
     for rel in _PROJECT_MEMORY_FILES:
         try:
             result = read_file(root, rel)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112 — missing/unreadable memory file is fine
             continue
         if not result or "content" not in result:
             continue
@@ -977,7 +1000,7 @@ def _needs_workspace(prompt: str) -> bool:
             return False
         if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$", low):
             return False
-        if low.startswith("/") or low.startswith("./") or low.startswith("../"):
+        if low.startswith(("/", "./", "../")):
             continue  # file path
         m = re.match(r"^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.([a-z]{2,6})$", low)
         if m and m.group(2) not in code_exts:
@@ -1024,7 +1047,7 @@ def _scout_workspace(root: str, max_total: int = _AUTO_SCOUT_MAX_TOTAL) -> str:
     for key in _AUTO_SCOUT_KEY_FILES:
         try:
             result = read_file(root, key)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112 — a missing key file just isn't scouted
             continue
         if not result or "content" not in result:
             continue
@@ -1266,9 +1289,9 @@ async def _maybe_auto_memory(
         return False
 
     try:
+        from httpx import Timeout
         from pydantic_ai import Agent
         from pydantic_ai.settings import ModelSettings
-        from httpx import Timeout
 
         summarizer = Agent(
             model,
@@ -1308,7 +1331,7 @@ async def _maybe_auto_memory(
             try:
                 remember(root, note_text)
                 saved += 1
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112 — one bad note shouldn't kill the batch
                 continue
         return saved > 0
     except Exception:  # noqa: BLE001
@@ -1391,9 +1414,11 @@ def _skills_section(skills: list[dict]) -> str:
         return ""
     lines = [
         "\n\n=== AVAILABLE SKILLS ===",
-        "These skills are available. If the user's request matches one, follow its "
-        "instructions exactly. Content is given inline when the skill cannot be "
-        "read from the workspace; otherwise read the SKILL.md file at the path shown.",
+        (
+            "These skills are available. If the user's request matches one, follow its "
+            "instructions exactly. Content is given inline when the skill cannot be "
+            "read from the workspace; otherwise read the SKILL.md file at the path shown."
+        ),
     ]
     for s in skills:
         name = s["name"]
@@ -1641,6 +1666,7 @@ async def run_agent(
     allow_create: bool = False,
     cap: dict | None = None,
     permission_gates: dict | None = None,
+    ask_gates: dict | None = None,
     allow_outside: bool = False,
     nvim_file: str = "",
     nvim_diagnostics: list | None = None,
@@ -1724,6 +1750,7 @@ async def run_agent(
         context_window=ctx,
         summarizer_model=model,
         permission_gates=permission_gates,
+        ask_gates=ask_gates,
         permit={"outside": allow_outside},
     )
     # Tool access is data-driven by per-mode capabilities (cap), so custom modes
@@ -1736,7 +1763,7 @@ async def run_agent(
     )
     if has_cap:
         _READ = {"list_files", "search_in_files", "fuzzy_find", "explore"}
-        _WRITE = {"write_file", "edit_file"}
+        _WRITE = {"write_file", "edit_file", "confirm_action"}
         _TERM = {"run_terminal"}
         _WEB = {"web_search", "fetch_url"}
         denied: set[str] = set()
@@ -1758,7 +1785,7 @@ async def run_agent(
             tools = {
                 name: fn
                 for name, fn in tools.items()
-                if name not in ("write_file", "edit_file", "run_terminal")
+                if name not in ("write_file", "edit_file", "run_terminal", "confirm_action")
             }
     # `save_plan` is the ONE write capability plan mode gets despite otherwise
     # being fully read-only (writeFiles=False / mode != "coder") — it writes to
@@ -1829,7 +1856,10 @@ async def run_agent(
         "\nUse paths RELATIVE to this folder (e.g. 'src/main.py'), never absolute paths. "
         "When the user says 'list files', 'show the project', or just 'ls', call list_files with no path to list the workspace root rather than asking for a path. The file tools are sandboxed to this root; any path outside it will be rejected."
         "\nYou operate ONLY inside this workspace. NEVER read, search or act on anything outside it "
-        "(e.g. ~/.config, ~/.cursor, /Users/... or any absolute path not under this root). If a task "
+        "(e.g. ~/.config, ~/.cursor, /Users/... or any absolute path not under this root). The ONLY "
+        "exception is reading the user-level `~/.coder` config dir (skills, plans, MCP config) — those "
+        "reads are always allowed without permission; identify them with paths like `~/.coder/skills/...`. "
+        "If a task "
         "genuinely needs access outside the workspace, call request_permission FIRST and wait for the "
         "result; only proceed with that outside action if it returns PERMISSION GRANTED — otherwise do "
         "not touch it and tell the user what you needed and why."
@@ -2001,6 +2031,13 @@ async def run_agent(
     # instead of looping — and re-sending the whole growing transcript —
     # indefinitely.
     high_watermark_retries = 0
+    # Compact record of the tool work performed across ALL attempts of this
+    # turn. When the deterministic step budget fires the widen-and-retry branch,
+    # this log is fed back into the retried run (as a system note) so the model
+    # continues where it left off instead of re-exploring the whole workspace
+    # from scratch. Reset per turn — a fresh prompt must not inherit stale
+    # tool results from a previous turn.
+    turn_tool_log: list[str] = []
     while True:
         attempt += 1
         # Reset the pre-emptive compact watermark per attempt: it is set by the
@@ -2043,22 +2080,35 @@ async def run_agent(
                 async def producer() -> None:
                     try:
                         async for event in events:
+                            # The FIRST chunk of a part arrives as a
+                            # `PartStartEvent` carrying the initial content, not
+                            # as a delta. Ignoring it silently dropped the
+                            # opening word of every response (and of every
+                            # retry/compact re-stream), gluing the tail of the
+                            # previous chunk to the next one.
+                            if isinstance(event, PartStartEvent):
+                                if isinstance(event.part, TextPart) and event.part.content:
+                                    await queue.put(_event_delta(event.part.content))  # noqa: B023 — see producer note
+                                elif isinstance(event.part, ThinkingPart) and event.part.content:
+                                    await queue.put(  # noqa: B023 — see producer note
+                                        {"kind": "thinking", "content": event.part.content}
+                                    )
                             if isinstance(event, PartDeltaEvent):
                                 delta = event.delta
                                 if isinstance(delta, TextPartDelta):
                                     chunk = delta.content_delta
                                     if chunk:
-                                        await queue.put(_event_delta(chunk))
+                                        await queue.put(_event_delta(chunk))  # noqa: B023 — `queue` intentionally late-bound per attempt
                                 elif isinstance(delta, ThinkingPartDelta):
                                     chunk = delta.content_delta
                                     if chunk:
-                                        await queue.put(
+                                        await queue.put(  # noqa: B023 — see producer note
                                             {"kind": "thinking", "content": chunk}
                                         )
                             elif isinstance(event, AgentRunResultEvent):
                                 usage = _usage_event(event.result.usage)
                                 if usage:
-                                    await queue.put(usage)
+                                    await queue.put(usage)  # noqa: B023 — see producer note
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
@@ -2070,9 +2120,9 @@ async def run_agent(
                         # retry recovers). Logging on every intermediate hop
                         # (producer -> consumer -> fatal) tripled the traceback
                         # spam in the sidecar log for a single failure.
-                        await queue.put({"kind": "_raise", "error": exc})
+                        await queue.put({"kind": "_raise", "error": exc})  # noqa: B023 — see producer note
                     finally:
-                        await queue.put(None)
+                        await queue.put(None)  # noqa: B023 — see producer note
 
                 producer_task = asyncio.create_task(producer())
 
@@ -2100,9 +2150,7 @@ async def run_agent(
                         if item.get("kind") == "tool" and item.get("tool") in (
                             "write_file",
                             "edit_file",
-                        ):
-                            mutating_ran = True
-                        elif (
+                        ) or (
                             item.get("kind") == "tool"
                             and item.get("tool") == "run_terminal"
                             and not _readonly_allowed(
@@ -2121,6 +2169,22 @@ async def run_agent(
                             # risk `tool_steps_cap` exists to guard against.
                             if not item.get("sub"):
                                 tool_steps_turn += 1
+                            # Record the tool call so the step-budget retry can
+                            # resume with memory instead of re-exploring (see the
+                            # `_HighWatermark` widen branch). Keep it trimmed.
+                            turn_tool_log.append(
+                                f"- {item['tool']}("
+                                f"{_trim_log_text(_fmt_log_args(item.get('args')))}"
+                                f")"
+                            )
+                        elif (
+                            item.get("kind") == "tool_result"
+                            and item.get("tool")
+                        ):
+                            turn_tool_log.append(
+                                f"- {item.get('tool')} result: "
+                                f"{_trim_log_text(item.get('summary'))}"
+                            )
                         if item.get("kind") == "text" and item.get("content"):
                             reply_chunks.append(str(item["content"]))
                         activity_happened = True
@@ -2165,7 +2229,7 @@ async def run_agent(
                     producer_task.cancel()
                     try:
                         await producer_task
-                    except (asyncio.CancelledError, Exception):
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
                         pass
 
                 if error is not None:
@@ -2179,10 +2243,10 @@ async def run_agent(
                         await _maybe_auto_memory(
                             model, root, prompt, _reply, tools_used
                         )
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001, S110 — best-effort, never raises
                         pass
             break  # success, exit the retry loop
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Auto-compact: the request itself overflowed the model's context
             # window (not a transient blip). Shrink the body of the turn (history
             # first, then the auto-scout) and retry so the task can actually
@@ -2249,21 +2313,50 @@ async def run_agent(
             # moment it hit the step cap — exactly the case where widening the cap
             # and continuing is the right move, since there's no history bloat to
             # blame in the first place.
+            #
+            # CRITICAL: each retry restarts `run_stream_events` from the CURRENT
+            # `history_messages` — which do NOT include the tool calls just made
+            # (they only live in `turn_tool_log`, capped separately). A blind retry
+            # would re-explore the whole workspace from scratch and re-blow the
+            # budget, doubling waste until the cap is exhausted. To fix that, feed
+            # the work done so far back in as a system note so the model continues
+            # where it left off. Retries are also bounded tighter (3 instead of 6)
+            # and the cap amplifier is smaller (300 instead of 500) so even a task
+            # that never converges fails loudly after a bounded amount of work.
             if (
                 isinstance(exc, _HighWatermark)
                 and exc.note is not None
                 and not mutating_ran
                 and (auto_compacted or len(history) == 0)
-                and high_watermark_retries < 6
+                and high_watermark_retries < 3
             ):
                 high_watermark_retries += 1
-                tool_steps_cap = min(int(tool_steps_cap * 2), 500)
+                tool_steps_cap = min(int(tool_steps_cap * 2), 300)
+                if turn_tool_log:
+                    # Only the tail matters and must stay small so the resume note
+                    # itself can't overflow the window. Cap the note words.
+                    tail = turn_tool_log[-40:]
+                    omitted = len(turn_tool_log) - len(tail)
+                    resume_lines = "\n".join(tail)
+                    if omitted > 0:
+                        resume_lines += f"\n({omitted} earlier steps omitted)"
+                    resume_note = (
+                        "Tool work already done so far in THIS turn — do NOT repeat "
+                        "or re-do any of it; continue from where you stopped:\n"
+                        f"{resume_lines}"
+                    )
+                    history_messages = history_messages + [
+                        ModelRequest(parts=[SystemPromptPart(content=resume_note)])
+                    ]
                 yield {
                     "kind": "retry",
                     "attempt": attempt,
                     "max_attempts": _RETRIES,
                     "delay": 0,
-                    "reason": f"tool-loop step budget raised to {tool_steps_cap}",
+                    "reason": (
+                        f"tool-loop step budget raised to {tool_steps_cap}"
+                        + (", resuming from previous tool results" if turn_tool_log else "")
+                    ),
                 }
                 continue
             empty_reply = _is_empty_output_error(exc)

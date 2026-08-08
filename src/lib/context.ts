@@ -16,9 +16,12 @@ export function estimateContextChars(
   let chars = 0
   chars += systemPrompt.length
   chars += 2200 // builtin system prompt + auto-scout/workspace note
-  const talk = msgs.filter((m) => m.role === 'user' || m.role === 'assistant')
+  const active = msgs.filter((m) => !m.compacted)
+  const talk = active.filter(
+    (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
+  )
   for (const m of talk.slice(-maxHistory)) chars += m.content.length
-  for (const m of msgs.slice(-maxHistory)) {
+  for (const m of active.slice(-maxHistory)) {
     for (const act of m.toolActivity ?? []) {
       chars += act.tool.length
       if (act.args) chars += JSON.stringify(act.args).length

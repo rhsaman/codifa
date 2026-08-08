@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEST = os.path.join(PARENT, "backend", "whisper")
@@ -32,7 +31,7 @@ def main() -> int:
 
     try:
         from huggingface_hub import snapshot_download
-    except ImportError as exc:  # pragma: no cover
+    except ImportError:  # pragma: no cover
         print("huggingface_hub is not installed. Run `npm run setup` first.")
         return 1
 

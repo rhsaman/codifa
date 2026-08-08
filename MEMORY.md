@@ -59,3 +59,8 @@
 - [2026-08-08] The assistant operates in Ask mode (guidance only, no code execution), so error details must be provided by the user before fixes can be suggested.
 - [2026-08-08] Known unresolved issue: auto-compact problem in `backend/agents.py` around line ~463; may resurface as context/compact-related errors.
 - [2026-08-08] Project uses `backend/agents.py` as a key file; when debugging, check terminal logs and IDE Problems panel for full error text.
+- [2026-08-08] Pending task: create AGENTS.md at repo root documenting project structure (bilingual EN/FA, mirror README style, ~2.5 KB draft already prepared). Backend auto-loads it — backend/agents.py _PROJECT_MEMORY_FILES=["AGENTS.md"], _load_project_memory(), 12 KB cap — no code changes needed. Verify with wc -c < 12000. Plan file: ~/.coder/plans/coder/2026-08-08-create-agents-md-project-structure.md. Implementation requires switching chat to Coder mode.
+- [2026-08-08] Project `coder` (CODEFA) has no `build/` folder and no icon assets (no png/icns/ico); electron-builder currently uses Electron's default icon.
+- [2026-08-08] To set a custom icon: create `build/icon.png` (512×512 or 1024×1024, transparent) and add `"icon": "build/icon.png"
+- [2026-08-08] macOS icon config lives in `electron/main.ts` (~line 187: `icon: path.join(import.meta.dirname, '../build/icon.png')`) and in `package.json` under `build.icon` + `files` including `build/icon.png`; source file is `build/icon.png` (~703×703).
+- [2026-08-08] Icon/taskbar changes only appear after repackaging: run `npm run dist:mac` (typecheck + Vite build + DMG/ZIP) to regenerate everything under `release/`; existing files there are never updated in place.

@@ -1,7 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
-import { streamChat, fetchModels, transcribeAudio, respondPermission } from "../lib/api";
+import { streamChat, fetchModels, transcribeAudio, respondPermission, respondAsk } from "../lib/api";
 import { api, workspaceSkills, type WorkspaceSkill } from "../lib/fs";
 import {
   contextPercent,
@@ -10,9 +10,11 @@ import {
 } from "../lib/context";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
+import { fixMixedText } from "../lib/bidi";
 import type { AgentMode, ChatMessage, NvimDiagnostic, SidecarEvent, ToolActivity } from "../types";
-import { ChatMessageView } from "./ChatMessage";
+import { ChatMessageView, ThinkingBlock } from "./ChatMessage";
 import { ModeSelect } from "./ModeSelect";
+import { ToolCallView } from "./ToolCallView";
 
 const PROVIDER_LABELS: Record<string, string> = {
   opencode: "opencode",
@@ -73,7 +75,9 @@ function sliceToBudget(
   const kept: typeof history = [];
   let acc = 0;
   for (const m of [...recent].reverse()) {
-    if (kept.length > 0 && acc + m.content.length > capped) break;
+    // System-role messages (a compact summary) are small but crucial: always
+    // keep them even if the char budget would otherwise trim the oldest turn.
+    if (m.role !== "system" && kept.length > 0 && acc + m.content.length > capped) break;
     kept.push(m);
     acc += m.content.length;
   }
@@ -93,6 +97,8 @@ export function ChatPanel() {
   const dir = useStore((s) => s.dir);
   const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
+  const storeStreaming = useStore((s) => s.isStreaming);
+  const isThinking = useStore((s) => s.isThinking);
   const modes = useStore((s) => allModes(s.settings));
   const maxHistory = provider.maxHistory ?? DEFAULT_MAX_HISTORY;
   const nvimFile = useStore((s) => s.nvimFile);
@@ -122,7 +128,11 @@ export function ChatPanel() {
   );
 
   const [input, setInput] = useState(chat?.draft?.input ?? "");
-  const [busy, setBusy] = useState(false);
+  const [busyLocal, setBusy] = useState(false);
+  const busy = busyLocal || storeStreaming;
+  const liveThinking = isThinking
+    ? chat?.messages.find((m) => m.streaming)?.thinking ?? ""
+    : "";
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   const [attachments, setAttachments] = useState<string[]>(
     chat?.draft?.attachments ?? [],
@@ -137,6 +147,8 @@ export function ChatPanel() {
   const [dragOver, setDragOver] = useState(false);
   const [stalled, setStalled] = useState(false);
   const [skillOpen, setSkillOpen] = useState(false);
+  const [skillQuery, setSkillQuery] = useState("");
+  const [skillIdx, setSkillIdx] = useState(0);
   const [liveUsage, setLiveUsage] = useState<number | null>(null);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
@@ -157,8 +169,29 @@ export function ChatPanel() {
     action: string;
     path?: string;
     reason?: string;
+    scope?: string;
   } | null>(null);
+  const [askReq, setAskReq] = useState<{
+    id: string;
+    question: string;
+    options: string[];
+  } | null>(null);
+  const [askFreeText, setAskFreeText] = useState("");
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
+  const skillQ = skillQuery.trim().toLowerCase();
+  const filteredSkills = wsSkills.filter(
+    (s) =>
+      !skillQ ||
+      s.name.toLowerCase().includes(skillQ) ||
+      (s.description ?? "").toLowerCase().includes(skillQ),
+  );
+  const filteredMcp = Object.keys(mcpConnectors).filter(
+    (name) => !skillQ || name.toLowerCase().includes(skillQ),
+  );
+  const skillOptions: Array<{ kind: "skill" | "mcp"; name: string; path?: string }> = [
+    ...filteredSkills.map((s) => ({ kind: "skill" as const, name: s.name, path: s.path })),
+    ...filteredMcp.map((name) => ({ kind: "mcp" as const, name })),
+  ];
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
@@ -170,6 +203,8 @@ export function ChatPanel() {
   const [nvimMentioned, setNvimMentioned] = useState(false);
   /** Transient confirmation shown when the user switches the chat's mode. */
   const [modeNotice, setModeNotice] = useState<string | null>(null);
+  /** Transient confirmation shown after a manual /compact. */
+  const [compactNotice, setCompactNotice] = useState<string | null>(null);
 
   // Switch the CURRENT chat's mode and confirm it visibly (so it's obvious the
   // change applies to this chat's next message, not a new chat).
@@ -185,6 +220,12 @@ export function ChatPanel() {
     const t = setTimeout(() => setModeNotice(null), 3500);
     return () => clearTimeout(t);
   }, [modeNotice]);
+
+  useEffect(() => {
+    if (!compactNotice) return;
+    const t = setTimeout(() => setCompactNotice(null), 4000);
+    return () => clearTimeout(t);
+  }, [compactNotice]);
 
   useEffect(() => {
     window.coder
@@ -402,6 +443,27 @@ const contextUsed = useMemo(() => {
             "\n",
           )}`
         : text;
+
+    // If a previous run was interrupted mid-task (its checklist isn't fully
+    // completed), remind the model of the current plan state so it continues
+    // ticking the same steps instead of re-planning from scratch. The note is
+    // only sent to the model — the stored user message keeps just `text`.
+    let promptWithResume = finalPrompt;
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      const plan = chat.messages[i].plan;
+      if (plan && plan.length > 0) {
+        if (!plan.every((t) => t.status === "completed")) {
+          const lines = plan
+            .map(
+              (t) =>
+                `- [${t.status === "completed" ? "✓" : t.status === "in_progress" ? "●" : " "}] ${t.content}`,
+            )
+            .join("\n");
+          promptWithResume += `\n\n[SYSTEM: a task was interrupted mid-way in this chat. Its checklist currently is:\n${lines}\nIf this message continues that task, PRESERVE this exact checklist and mark progress via update_plan (same items, update statuses) — do not create a new one. If this message is a new, unrelated task, ignore this note.]`;
+        }
+        break;
+      }
+    }
     setSkillOpen(false);
 
     const userMsg = s.addMessage({
@@ -422,13 +484,18 @@ const contextUsed = useMemo(() => {
       .filter(
         (m) =>
           m.id !== userMsg.id &&
+          !m.compacted &&
           (m.role === "user" || m.role === "assistant" || m.role === "system"),
       )
+      // The summary is stored last (so it renders below the conversation), but
+      // the model must receive it FIRST — it stands in for the older turns.
+      .sort((a, b) => (a.role === "system" ? -1 : 0) - (b.role === "system" ? -1 : 0))
       .map((m) => ({ role: m.role, content: m.content }));
     const history = sliceToBudget(allHistory, maxHistory, ctxWindow ?? undefined, chat.mode);
 
     const abort = new AbortController();
     abortRef.current = abort;
+    useStore.getState().setActiveAbort(abort);
     setBusy(true);
     setStalled(false);
     setLiveUsage(null);
@@ -515,7 +582,12 @@ const contextUsed = useMemo(() => {
             ?.messages.find((m) => m.id === assistantMsg.id)?.content ?? "";
         store.updateMessage(assistantMsg.id, {
           content: base ? `${base}\n> *${event.content ?? ""}*` : `> *${event.content ?? ""}*\n`,
+          // The backend just folded earlier turns away; the last message's usage
+          // is stale (it reflects the pre-compact context). Drop it so the top
+          // context meter falls back to the honest compacted estimate.
+          usage: undefined,
         });
+        setLiveUsage(null);
       } else if (event.kind === "plan") {
         store.updateMessage(assistantMsg.id, {
           plan: event.items ?? [],
@@ -527,6 +599,14 @@ const contextUsed = useMemo(() => {
           action: event.action ?? "",
           path: event.path,
           reason: event.reason,
+          scope: event.scope,
+        });
+      } else if (event.kind === "ask") {
+        setAskFreeText("");
+        setAskReq({
+          id: event.id ?? "",
+          question: event.question ?? "",
+          options: Array.isArray(event.options) ? event.options : [],
         });
       } else if (event.kind === "error") {
         store.updateMessage(assistantMsg.id, {
@@ -559,7 +639,7 @@ const contextUsed = useMemo(() => {
           provider: activeProvider,
           root: rootDir,
           mode: chat.mode,
-          prompt: finalPrompt,
+          prompt: promptWithResume,
           history,
           maxHistory,
           attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
@@ -594,6 +674,7 @@ const contextUsed = useMemo(() => {
       setStalled(false);
       setBusy(false);
       abortRef.current = null;
+      useStore.getState().setActiveAbort(null);
       useStore.getState().setStreaming(false, false);
       useStore.getState().updateMessage(assistantMsg.id, { streaming: false });
     }
@@ -604,7 +685,7 @@ const contextUsed = useMemo(() => {
     const ch = s.chats.find((c) => c.id === s.activeChatId);
     if (!ch) return;
     const msgs = ch.messages.filter(
-      (m) => m.role === "user" || m.role === "assistant",
+      (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
     );
     if (msgs.length === 0) return;
     const transcript = msgs
@@ -661,6 +742,17 @@ const contextUsed = useMemo(() => {
       `[Compacted conversation]\n${summary.trim() || "(empty summary)"}`,
       maxHistory,
     );
+    setCompactNotice(
+      summary.trim()
+        ? "Context compacted — older messages are collapsed above the summary."
+        : "Compact finished (empty summary) — older messages are collapsed.",
+    );
+    stickToBottom.current = true;
+    setShowJump(false);
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    });
   };
 
   const handleCommand = async (v: string) => {
@@ -860,7 +952,10 @@ const contextUsed = useMemo(() => {
             : MediaRecorder.isTypeSupported("audio/wav")
               ? "audio/wav"
               : "";
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const rec = new MediaRecorder(stream, {
+        ...(mime ? { mimeType: mime } : {}),
+        audioBitsPerSecond: 48_000,
+      });
       mediaChunksRef.current = [];
       rec.ondataavailable = (e) => {
         if (e.data.size > 0) mediaChunksRef.current.push(e.data);
@@ -873,7 +968,7 @@ const contextUsed = useMemo(() => {
         if (blob.size === 0) return;
         setTranscribing(true);
         try {
-          const text = await transcribeAudio(blob, setTranscribing);
+          const text = await transcribeAudio(blob, setTranscribing, dir === "rtl" ? "fa" : undefined);
           if (text) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
             textareaRef.current?.focus();
@@ -948,7 +1043,11 @@ const contextUsed = useMemo(() => {
   };
 
   const openSkillPicker = async () => {
-    setSkillOpen((o) => !o);
+    setSkillOpen((o) => {
+      if (!o) setSkillQuery("");
+      return !o;
+    });
+    setSkillIdx(0);
     if (wroot) {
       const sk = await workspaceSkills(wroot).catch(() => []);
       setWsSkills(sk);
@@ -1036,7 +1135,10 @@ const contextUsed = useMemo(() => {
     }
   };
 
-  const stop = () => abortRef.current?.abort();
+  const stop = () => {
+    abortRef.current?.abort();
+    useStore.getState().activeAbort?.abort();
+  };
 
   if (!chat) {
     return (
@@ -1098,6 +1200,11 @@ const contextUsed = useMemo(() => {
         )}
 
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
+        {liveThinking && (
+          <div className="thinking-pin">
+            <ThinkingBlock text={liveThinking} />
+          </div>
+        )}
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
@@ -1106,7 +1213,22 @@ const contextUsed = useMemo(() => {
             </div>
           )}
           {chat.messages.map((m: ChatMessage) => (
-            <ChatMessageView key={m.id} message={m} onRetry={retryMessage} />
+            <Fragment key={m.id}>
+              {m.toolActivity && m.toolActivity.length > 0 && (
+                <div className="tool-timeline">
+                  {m.toolActivity.map((act, i) => (
+                    <ToolCallView
+                      key={i}
+                      activity={act}
+                      onReverted={() =>
+                        useStore.getState().markToolReverted(m.id, i)
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+              <ChatMessageView message={m} onRetry={retryMessage} />
+            </Fragment>
           ))}
         </div>
         {showJump && (
@@ -1132,12 +1254,173 @@ const contextUsed = useMemo(() => {
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
+        {askReq && (
+          (() => {
+            const fa = /[\u0600-\u06FF]/.test(askReq.question);
+            return (
+              <div className="ask-card" dir={fa ? "rtl" : "ltr"}>
+                <div className="ask-card-head">
+                  <span className="ask-card-icon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01" />
+                    </svg>
+                  </span>
+                  <span className="ask-card-title">
+                    {fa ? "عامل سوالی از شما دارد" : "The agent has a question"}
+                  </span>
+                </div>
+                <div className="ask-card-question">{fa ? fixMixedText(askReq.question) : askReq.question}</div>
+                {askReq.options.length > 0 && (
+                  <div className="ask-options">
+                    {askReq.options.map((opt, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        className="ask-option"
+                        onClick={() => {
+                          void respondAsk(askReq.id, opt);
+                          setAskReq(null);
+                        }}
+                      >
+                        <span className="ask-option-mark">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M9 18l6-6-6-6" />
+                          </svg>
+                        </span>
+                        <span className="ask-option-text">{fa ? fixMixedText(opt) : opt}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className="ask-freetext">
+                  <textarea
+                    className="ask-input"
+                    rows={2}
+                    autoFocus
+                    dir={fa ? "rtl" : "ltr"}
+                    value={askFreeText}
+                    placeholder={fa ? "پاسخ خود را بنویسید…" : "Type your answer…"}
+                    onChange={(e) => setAskFreeText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && askFreeText.trim()) {
+                        e.preventDefault();
+                        void respondAsk(askReq.id, askFreeText.trim());
+                        setAskReq(null);
+                      }
+                    }}
+                  />
+                  <div className="ask-footer">
+                    <button
+                      type="button"
+                      className="btn ask-send"
+                      disabled={!askFreeText.trim()}
+                      onClick={() => {
+                        void respondAsk(askReq.id, askFreeText.trim());
+                        setAskReq(null);
+                      }}
+                    >
+                      {fa ? "ارسال" : "Send"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        )}
+        {permissionReq && (
+          (() => {
+            const fa = /[\u0600-\u06FF]/.test(permissionReq.action);
+            const isConfirm = permissionReq.scope === "confirm";
+            const title = isConfirm
+              ? fa ? "تأیید عملیات" : "Confirm action"
+              : fa ? "دسترسی بیرون از ورکاسپیس" : "Outside workspace access";
+            const note = isConfirm
+              ? fa
+                ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
+                : "The agent flagged this as important or hard to undo, and is waiting for you."
+              : fa
+                ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
+                : "This lets the agent work outside your current workspace.";
+            const denyLabel = fa ? "رد کردن" : "Deny";
+            return (
+              <div className="perm-card" dir={fa ? "rtl" : "ltr"}>
+                <div className="ask-card-head">
+                  <span className="ask-card-icon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                  </span>
+                  <span className="ask-card-title">{title}</span>
+                </div>
+                <div className="ask-card-question">{fa ? fixMixedText(permissionReq.action) : permissionReq.action}</div>
+                {permissionReq.path ? (
+                  <code className="perm-path" dir="ltr">{permissionReq.path}</code>
+                ) : null}
+                {permissionReq.reason ? (
+                  <div className="perm-reason">{fa ? fixMixedText(permissionReq.reason) : permissionReq.reason}</div>
+                ) : null}
+                <div className="perm-note">{note}</div>
+                <div className="perm-buttons">
+                  <button
+                    type="button"
+                    className="btn perm-deny"
+                    onClick={() => {
+                      void respondPermission(permissionReq.id, false);
+                      setPermissionReq(null);
+                    }}
+                  >
+                    {denyLabel}
+                  </button>
+                  {isConfirm ? (
+                    <button
+                      type="button"
+                      className="btn perm-allow"
+                      onClick={() => {
+                        void respondPermission(permissionReq.id, true);
+                        setPermissionReq(null);
+                      }}
+                    >
+                      {fa ? "تأیید" : "Confirm"}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="btn perm-allow"
+                        onClick={() => {
+                          void respondPermission(permissionReq.id, true);
+                          setPermissionReq(null);
+                        }}
+                      >
+                        {fa ? "اجازه موقت" : "Allow once"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn perm-allow-always"
+                        onClick={() => {
+                          void respondPermission(permissionReq.id, true);
+                          useStore.getState().setOutsideAllowed(true);
+                          setPermissionReq(null);
+                        }}
+                      >
+                        {fa ? "همیشه اجازه بده" : "Always allow"}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })()
+        )}
         <div className="composer-inner">
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}
           {modeNotice && (
             <div className="mode-notice" dir="ltr">{modeNotice}</div>
+          )}
+          {compactNotice && (
+            <div className="mode-notice compact-notice" dir="ltr">{compactNotice}</div>
           )}
           <div className="composer-input-wrap">
             {cmdOpen && (
@@ -1155,7 +1438,7 @@ const contextUsed = useMemo(() => {
                       acceptCmd(c.name);
                     }}
                   >
-                    <span className="mention-icon">/</span>
+                    <span className="mention-icon-badge cmd">/</span>
                     <span className="mention-rel">/{c.name}</span>
                     <span className="mention-hint">{c.hint}</span>
                   </div>
@@ -1164,20 +1447,73 @@ const contextUsed = useMemo(() => {
             )}
             {skillOpen && (
               <div className="mention-popup" dir="ltr">
+                <input
+                  className="mention-search"
+                  type="text"
+                  placeholder="Search skills and MCP tools…"
+                  value={skillQuery}
+                  onChange={(e) => {
+                    setSkillQuery(e.target.value);
+                    setSkillIdx(0);
+                  }}
+                  onKeyDown={(e) => {
+                    const move = (d: number) => {
+                      if (skillOptions.length === 0) return;
+                      setSkillIdx((i) => (i + d + skillOptions.length) % skillOptions.length);
+                    };
+                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      move(1);
+                      return;
+                    }
+                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      move(-1);
+                      return;
+                    }
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      move(1);
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      move(-1);
+                      return;
+                    }
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      const opt = skillOptions[skillIdx];
+                      if (opt) toggleSkillChip(opt);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      setSkillOpen(false);
+                      return;
+                    }
+                  }}
+                  autoFocus
+                />
                 <div className="mention-group">Skills</div>
-                {wsSkills.length === 0 && (
+                {filteredSkills.length === 0 && (
                   <div className="mention-empty">
-                    No skills in this workspace — add them in Settings → Skills
+                    {wsSkills.length === 0
+                      ? "No skills in this workspace — add them in Settings → Skills"
+                      : "No matching skills"}
                   </div>
                 )}
-                {wsSkills.map((s) => {
+                {filteredSkills.map((s, i) => {
                   const active = skillChips.some(
                     (c) => c.kind === "skill" && c.name === s.name,
                   );
                   return (
                     <div
                       key={s.path}
-                      className={`mention-item ${active ? "active" : ""}`}
+                      className={`mention-item ${active ? "active" : ""} ${i === skillIdx ? "kbd" : ""}`}
+                      onMouseEnter={() => setSkillIdx(i)}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         toggleSkillChip({
@@ -1187,7 +1523,7 @@ const contextUsed = useMemo(() => {
                         });
                       }}
                     >
-                      <span className="mention-icon">✦</span>
+                      <span className="mention-icon-badge skill">✦</span>
                       <span className="mention-rel">{s.name}</span>
                       <span className="mention-hint">
                         {s.description || s.path}
@@ -1196,25 +1532,28 @@ const contextUsed = useMemo(() => {
                   );
                 })}
                 <div className="mention-group">MCP tools</div>
-                {Object.keys(mcpConnectors).length === 0 && (
+                {filteredMcp.length === 0 && (
                   <div className="mention-empty">
-                    No MCP connectors — add them in Settings → MCP
+                    {Object.keys(mcpConnectors).length === 0
+                      ? "No MCP connectors — add them in Settings → MCP"
+                      : "No matching MCP tools"}
                   </div>
                 )}
-                {Object.entries(mcpConnectors).map(([name]) => {
+                {filteredMcp.map((name, i) => {
                   const active = skillChips.some(
                     (c) => c.kind === "mcp" && c.name === name,
                   );
                   return (
                     <div
                       key={name}
-                      className={`mention-item ${active ? "active" : ""}`}
+                      className={`mention-item ${active ? "active" : ""} ${filteredSkills.length + i === skillIdx ? "kbd" : ""}`}
+                      onMouseEnter={() => setSkillIdx(filteredSkills.length + i)}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         toggleSkillChip({ kind: "mcp", name });
                       }}
                     >
-                      <span className="mention-icon">🔌</span>
+                      <span className="mention-icon-badge mcp">🔌</span>
                       <span className="mention-rel">{name}</span>
                       <span className="mention-hint">MCP server</span>
                     </div>
@@ -1280,10 +1619,11 @@ const contextUsed = useMemo(() => {
             <div className="attachment-chips" dir="ltr">
               {skillChips.map((c) => (
                 <span
-                  className="attachment-chip skill-chip"
+                  className={`attachment-chip skill-chip${c.kind === "mcp" ? " mcp-chip" : ""}`}
                   key={`${c.kind}-${c.name}`}
                 >
-                  {c.kind === "skill" ? "✦" : "🔌"} {c.name}
+                  <span className="chip-icon-badge">{c.kind === "skill" ? "✦" : "🔌"}</span>
+                  {c.name}
                   <button
                     className="chip-x"
                     onClick={() => toggleSkillChip(c)}
@@ -1476,58 +1816,6 @@ const contextUsed = useMemo(() => {
           </div>
         </div>
       </div>
-      {permissionReq && (
-        <div className="perm-overlay">
-          <div className="perm-dialog">
-            <div className="perm-dialog-title">Outside workspace access</div>
-            <div className="perm-dialog-action">
-              {permissionReq.action}
-              {permissionReq.path ? (
-                <code className="perm-dialog-path">{permissionReq.path}</code>
-              ) : null}
-            </div>
-            {permissionReq.reason ? (
-              <div className="perm-dialog-reason">{permissionReq.reason}</div>
-            ) : null}
-            <div className="perm-dialog-note">
-              This lets the agent work outside your current workspace.
-            </div>
-            <div className="perm-dialog-buttons">
-              <button
-                type="button"
-                className="btn perm-deny"
-                onClick={() => {
-                  void respondPermission(permissionReq.id, false);
-                  setPermissionReq(null);
-                }}
-              >
-                Deny
-              </button>
-              <button
-                type="button"
-                className="btn perm-allow"
-                onClick={() => {
-                  void respondPermission(permissionReq.id, true);
-                  setPermissionReq(null);
-                }}
-              >
-                Allow once
-              </button>
-              <button
-                type="button"
-                className="btn perm-allow-always"
-                onClick={() => {
-                  void respondPermission(permissionReq.id, true);
-                  useStore.getState().setOutsideAllowed(true);
-                  setPermissionReq(null);
-                }}
-              >
-                Always allow
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

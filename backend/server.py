@@ -8,26 +8,30 @@ provided in each request.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ast
+import asyncio
 import json
 import os
 import re
 import traceback
+from typing import Annotated
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 # Pending permission requests: id -> asyncio.Future. Resolved by the
-# /permission/respond endpoint and awaited by the agent's request_permission tool.
+# /permission/respond endpoint and awaited by the agent's request_permission /
+# confirm_action tools.
 PERMISSION_GATES: dict[str, asyncio.Future] = {}
+# Pending multiple-choice / open questions the agent asked the user mid-task.
+# Resolved by /ask/respond and awaited by the agent's ask_user tool.
+ASK_GATES: dict[str, asyncio.Future] = {}
 
+import providers
+from agents import run_agent
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
-import providers
-from agents import run_agent
 
 app = FastAPI(title="CODEFA agent sidecar")
 
@@ -88,13 +92,28 @@ class PermissionResponse(BaseModel):
     allowed: bool
 
 
+class AskResponse(BaseModel):
+    id: str
+    answer: str
+
+
 @app.post("/permission/respond")
 async def permission_respond(req: PermissionResponse) -> dict:
-    """Resolve a pending outside-workspace permission request from the agent."""
+    """Resolve a pending outside-workspace permission / confirm_action request from the agent."""
     fut = PERMISSION_GATES.pop(req.id, None)
     if fut is None or fut.done():
         return {"status": "missing"}
     fut.set_result(req.allowed)
+    return {"status": "ok"}
+
+
+@app.post("/ask/respond")
+async def ask_respond(req: AskResponse) -> dict:
+    """Resolve a pending ask_user question (multiple-choice or free-text) from the agent."""
+    fut = ASK_GATES.pop(req.id, None)
+    if fut is None or fut.done():
+        return {"status": "missing"}
+    fut.set_result(req.answer)
     return {"status": "ok"}
 
 
@@ -106,7 +125,7 @@ async def health() -> dict:
 
 
 @app.get("/models")
-async def models(req: ModelsRequest = Query()) -> dict:
+async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
         ids = await providers.list_models(
             req.provider, req.base_url, req.api_key, req.env_var
@@ -148,6 +167,11 @@ async def _get_whisper_model():
 async def transcribe(request: Request) -> dict:
     """Transcribe a recorded audio clip (multipart 'file') using the local Whisper
     model. Returns {"text": "..."} or an HTTP error. Fully local and offline.
+
+    Tuned for clean, hallucination-free dictation on short clips:
+    * Silero VAD trims silence and skips pure-silence clips (no ghost text).
+    * An explicit `lang` hint (fa/en) beats auto-detection on short clips.
+    * Temperature fallback + conservative thresholds fix repeated-text stutters.
     """
     import io
 
@@ -160,21 +184,37 @@ async def transcribe(request: Request) -> dict:
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty audio")
+    lang = (form.get("lang") or "").strip().lower() or None
 
     try:
         model = await _get_whisper_model()
         # faster-whisper's decode_audio uses `av` to decode webm/ogg/opus/wav/mp3
-        # to a float32 PCM array, so any container the browser MediaRecorder emits
-        # is handled without extra conversion code here.
+        # to a float32 16 kHz PCM array, so any container the browser MediaRecorder
+        # emits is handled without extra conversion code here.
         pcm = decode_audio(io.BytesIO(data))
+        vad_parameters = {
+            "min_silence_duration_ms": 250,
+            "speech_pad_ms": 200,
+        }
         segments, _info = model.transcribe(
-            pcm, beam_size=5, language=None, vad_filter=False
+            pcm,
+            beam_size=5,
+            language=lang,
+            vad_filter=True,
+            vad_parameters=vad_parameters,
+            initial_prompt="## Persian dictation, no punctuation and no filler words" if lang == "fa" else None,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            without_timestamps=True,
         )
         text = " ".join(seg.text for seg in segments).strip()
         return {"text": text}
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from exc
 
 
@@ -317,6 +357,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 allow_create=req.allow_create,
                 cap=req.cap,
                 permission_gates=PERMISSION_GATES,
+                ask_gates=ASK_GATES,
                 allow_outside=req.allow_outside,
                 nvim_file=req.nvim_file,
                 nvim_diagnostics=req.nvim_diagnostics,
@@ -344,7 +385,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     usage_data = _usage_event(last_usage)
                     if usage_data:
                         yield _sse(usage_data)
-                except Exception:
+                except Exception:  # noqa: BLE001 — fallback if the helper is unavailable
                     # اگر تابع در agents.py نبود، به صورت دستی ارسال کن
                     yield _sse({"kind": "usage", "content": str(last_usage)})
 
@@ -353,7 +394,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # and its background producer task are unwound inside run_agent's
             # finally block, so just stop iterating cleanly.
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — must always surface an SSE error
             # Full traceback to the sidecar stderr so an opaque upstream message
             # ("Exceeded maximum output retries (1)", ...) never hides the real
             # trigger; the user still sees a readable error over SSE.
@@ -382,7 +423,7 @@ def main() -> None:
         from tools import validate_mcp_servers
 
         validate_mcp_servers()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 — broken connectors are handled lazily
         pass
 
     import uvicorn

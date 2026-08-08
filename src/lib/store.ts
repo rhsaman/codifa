@@ -9,6 +9,7 @@ import type {
   ProviderConfig,
   ProviderKind,
   Settings,
+  TokenUsage,
   Workspace,
 } from '../types'
 import { api, workspaceMcp } from './fs'
@@ -199,6 +200,9 @@ interface State {
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
   setOutsideAllowed: (allowed: boolean) => void
+  /** Live AbortController for the in-flight chat request (survives chat switches). */
+  activeAbort: AbortController | null
+  setActiveAbort: (abort: AbortController | null) => void
   /** File open in Neovim (absolute path), fed by the main-process watcher. */
   nvimFile: string | null
   setNvimFile: (abs: string | null) => void
@@ -256,6 +260,7 @@ export const useStore = create<State>((set, get) => ({
   isStreaming: false,
   isThinking: false,
   outsideAllowed: false,
+  activeAbort: null,
   /** Absolute path of the file currently open in Neovim (null if none / unknown). */
   nvimFile: null,
   /** LSP diagnostics reported for the Neovim file (empty when none / unknown). */
@@ -749,31 +754,39 @@ export const useStore = create<State>((set, get) => ({
 
   updateMessage: (id, patch) => {
     set((s) => ({
-      chats: s.chats.map((c) => ({
-        ...c,
-        messages: c.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
-        updatedAt: Date.now(),
-      })),
+      chats: s.chats.map((c) => {
+        const has = c.messages.some((m) => m.id === id)
+        if (!has) return c
+        return {
+          ...c,
+          messages: c.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
+          updatedAt: Date.now(),
+        }
+      }),
     }))
     persistSoon()
   },
 
   markToolReverted: (messageId, index) => {
     set((s) => ({
-      chats: s.chats.map((c) => ({
-        ...c,
-        messages: c.messages.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                toolActivity: (m.toolActivity ?? []).map((act, i) =>
-                  i === index ? { ...act, reverted: true } : act,
-                ),
-              }
-            : m,
-        ),
-        updatedAt: Date.now(),
-      })),
+      chats: s.chats.map((c) => {
+        const has = c.messages.some((m) => m.id === messageId)
+        if (!has) return c
+        return {
+          ...c,
+          messages: c.messages.map((m) =>
+            m.id === messageId
+              ? {
+                  ...m,
+                  toolActivity: (m.toolActivity ?? []).map((act, i) =>
+                    i === index ? { ...act, reverted: true } : act,
+                  ),
+                }
+              : m,
+          ),
+          updatedAt: Date.now(),
+        }
+      }),
     }))
     persistSoon()
   },
@@ -806,15 +819,35 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== id) return c
-        const recent =
-          keep > 0
-            ? c.messages.filter((m) => m.role !== 'system').slice(-keep)
-            : []
+        const nonSys = c.messages.filter((m) => m.role !== 'system')
+        // Keep the last `keep` messages verbatim; fold everything older into the
+        // summary. We keep one fewer than `keep` (see sliceToBudget: the next
+        // turn sends the last `maxHistory` entries, and the appended summary
+        // must survive that slice — so recent (keep-1) + summary = keep total).
+        const recentCount = keep > 0 ? Math.max(keep - 1, 0) : 0
+        const recentStart = Math.max(nonSys.length - recentCount, 0)
+        const compactedIds = new Set(
+          nonSys.slice(0, recentStart).map((m) => m.id),
+        )
+        // On a repeated /compact, also fold any PREVIOUS system summary so only
+        // the newest summary renders as the prominent block (the old ones stay
+        // greyed/collapsible like any other folded message).
+        for (const m of c.messages) {
+          if (m.role === 'system') compactedIds.add(m.id)
+        }
+        const messages = c.messages.map((m) =>
+          compactedIds.has(m.id)
+            ? { ...m, compacted: true, usage: undefined as TokenUsage | undefined }
+            : { ...m, usage: undefined as TokenUsage | undefined },
+        )
         return {
           ...c,
           messages: [
+            ...messages,
+            // Appended at the END so the summary block renders below the
+            // conversation (older folded messages above it), matching how
+            // compactions read in the scrollback.
             { id: uid(), role: 'system', content: summary, createdAt: Date.now() },
-            ...recent,
           ],
           updatedAt: Date.now(),
         }
@@ -874,6 +907,8 @@ export const useStore = create<State>((set, get) => ({
     }),
 
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
+
+  setActiveAbort: (activeAbort) => set({ activeAbort }),
 
   setNvimFile: (abs) => set({ nvimFile: abs }),
   setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),

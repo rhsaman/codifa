@@ -23,11 +23,13 @@ export interface ModelsResult {
 export async function transcribeAudio(
   blob: Blob,
   onModelLoading?: (loading: boolean) => void,
+  lang?: string,
 ): Promise<string> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const form = new FormData()
   form.append('audio', blob, 'clip.wav')
+  if (lang) form.append('lang', lang)
   if (onModelLoading) onModelLoading(true)
   try {
     const res = await fetch(`${url}/transcribe`, {
@@ -174,7 +176,7 @@ export async function streamChat(
   }
 }
 
-/** Answer a pending outside-workspace permission request from the agent. */
+/** Answer a pending outside-workspace permission / confirm_action request from the agent. */
 export async function respondPermission(
   id: string,
   allowed: boolean,
@@ -186,6 +188,21 @@ export async function respondPermission(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, allowed }),
+    })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Answer a pending ask_user question (multiple-choice or free-text) from the agent. */
+export async function respondAsk(id: string, answer: string): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/ask/respond`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, answer }),
     })
   } catch {
     /* best effort */

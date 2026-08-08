@@ -97,14 +97,21 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
       onClose()
       return
     }
-    if (e.key === 'ArrowDown') {
+    const move = (d: number) => {
+      const max = Math.max(results.length - 1, 0)
+      if (d > 0) setIdx((i) => (max === 0 ? 0 : (i + 1) % (max + 1)))
+      else setIdx((i) => (max === 0 ? 0 : (i - 1 + max + 1) % (max + 1)))
+    }
+    if (e.key === 'ArrowDown' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n')) {
       e.preventDefault()
-      setIdx((i) => Math.min(i + 1, Math.max(results.length - 1, 0)))
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') e.stopPropagation()
+      move(1)
       return
     }
-    if (e.key === 'ArrowUp') {
+    if (e.key === 'ArrowUp' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p')) {
       e.preventDefault()
-      setIdx((i) => Math.max(i - 1, 0))
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') e.stopPropagation()
+      move(-1)
       return
     }
     if (e.key === 'Enter') {

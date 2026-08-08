@@ -266,15 +266,13 @@ async def list_models(
                         m["context"] = OPENCODE_CONTEXT.get(m["id"])
                         if not m["context"] and m["id"].endswith("-free"):
                             m["context"] = 200_000
-                elif provider == "custom":
-                    if any(not m["context"] for m in models):
-                        default_ctx = await _llamacpp_default_ctx(base_url)
-                        if default_ctx:
-                            for m in models:
-                                if not m["context"]:
-                                    m["context"] = default_ctx
+                elif provider == "custom" and any(not m["context"] for m in models):
+                    default_ctx = await _llamacpp_default_ctx(base_url)
+                    for m in models:
+                        if default_ctx and not m["context"]:
+                            m["context"] = default_ctx
                 models.sort(key=lambda m: m["id"])
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ProviderError(f"failed to fetch models from {url}: {exc}") from exc
 
     _model_cache[cache_key] = (time.monotonic(), models)
@@ -301,7 +299,7 @@ async def model_context(
         for entry in enlisted:
             if entry.get("id") == model and entry.get("context"):
                 return int(entry["context"])
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 — fall back to the curated map below
         pass
     # opencode exposes known-capacity models even when list_models fails
     # (offline / transient). Consult the curated map for exact known models.

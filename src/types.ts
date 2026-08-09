@@ -129,12 +129,21 @@ export interface NvimDiagnostic {
   message: string
 }
 
+/** Chronological unit of an assistant message. Text is split into slices around
+ *  each tool call so the UI can interleave tool cards with the reply (Claude
+ *  style) instead of stacking all tools at the top/bottom. `tool` segments
+ *  reference `ChatMessage.toolActivity[index]`. */
+export type MessageSegment = { kind: 'text'; text: string } | { kind: 'tool'; index: number }
+
 export interface ChatMessage {
   id: string
   role: Role
   content: string
   mode?: AgentMode
   toolActivity?: ToolActivity[]
+  /** Interleaved render order (text slices + tool call positions). Absent on
+   *  messages persisted before this feature; they fall back to legacy layout. */
+  segments?: MessageSegment[]
   plan?: Array<{ content: string; status: string }>
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */

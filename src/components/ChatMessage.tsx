@@ -6,6 +6,7 @@ import type { ChatMessage } from '../types'
 import { fixMixedText, prepareContent } from '../lib/bidi'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
+import { ToolCallView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
 
 function textFromChildren(node: ReactNode): string {
@@ -318,7 +319,7 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
         </div>
       )}
 
-      {message.content && (
+      {(message.content || (message.segments && message.segments.length > 0)) && (
         isSummary ? (
           <div className="summary-block">
             <div className="summary-head">
@@ -340,6 +341,35 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
                 {prepareContent(message.content, dir)}
               </ReactMarkdown>
             </div>
+          </div>
+        ) : message.segments && message.segments.length > 0 ? (
+          /* Claude-style interleaved rendering: text slices and tool cards follow
+             each other in the exact order the agent produced them. */
+          <div className="msg-bubble segmented">
+            {message.segments.map((seg, i) =>
+              seg.kind === 'text' ? (
+                <div key={i} className="chat-message markdown-body">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeHighlight]}
+                    components={{
+                      a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
+                      pre: (props) => <CodeBlock {...props} />,
+                    }}
+                  >
+                    {prepareContent(seg.text, dir)}
+                  </ReactMarkdown>
+                </div>
+              ) : message.toolActivity?.[seg.index] ? (
+                <ToolCallView
+                  key={i}
+                  activity={message.toolActivity[seg.index]}
+                  onReverted={() =>
+                    useStore.getState().markToolReverted(message.id, seg.index)
+                  }
+                />
+              ) : null,
+            )}
           </div>
         ) : (
         <div className="msg-bubble">

@@ -11,7 +11,7 @@ import {
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
 import { fixMixedText } from "../lib/bidi";
-import type { AgentMode, ChatMessage, NvimDiagnostic, SidecarEvent, ToolActivity } from "../types";
+import type { AgentMode, ChatMessage, MessageSegment, NvimDiagnostic, SidecarEvent, ToolActivity } from "../types";
 import { ChatMessageView, ThinkingBlock } from "./ChatMessage";
 import { ModeSelect } from "./ModeSelect";
 import { ToolCallView } from "./ToolCallView";
@@ -130,9 +130,11 @@ export function ChatPanel() {
   const [input, setInput] = useState(chat?.draft?.input ?? "");
   const [busyLocal, setBusy] = useState(false);
   const busy = busyLocal || storeStreaming;
-  const liveThinking = isThinking
-    ? chat?.messages.find((m) => m.streaming)?.thinking ?? ""
-    : "";
+  // Live thinking pinned to the top while the streaming message carries any
+  // thinking text. Deliberately independent of `isThinking`: text chunks toggle
+  // that flag on/off mid-turn, which used to flicker the pin on and off as the
+  // model alternated between emitting text and reasoning.
+  const liveThinking = chat?.messages.find((m) => m.streaming)?.thinking ?? "";
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   const [attachments, setAttachments] = useState<string[]>(
     chat?.draft?.attachments ?? [],
@@ -477,6 +479,7 @@ const contextUsed = useMemo(() => {
       content: "",
       mode: chat.mode,
       toolActivity: [],
+      segments: [],
       streaming: true,
     });
 
@@ -502,6 +505,23 @@ const contextUsed = useMemo(() => {
     lastEventAt.current = Date.now();
     useStore.getState().setStreaming(true, false);
 
+    // Append a text slice to the message's segment list, merging into the
+    // trailing text segment when there is one so tool boundaries stay clean.
+    const appendTextSegment = (
+      segs: MessageSegment[] | undefined,
+      chunk: string,
+    ): MessageSegment[] => {
+      const cur = segs && segs.length ? [...segs] : [];
+      if (!chunk) return cur;
+      const last = cur[cur.length - 1];
+      if (last && last.kind === "text") {
+        cur[cur.length - 1] = { kind: "text", text: last.text + chunk };
+      } else {
+        cur.push({ kind: "text", text: chunk });
+      }
+      return cur;
+    };
+
     // Watchdog: if the provider stalls (no SSE event at all), surface a hint so
     // the run doesn't silently hang at a "retrying" banner.
     const stallTimer = setInterval(() => {
@@ -521,6 +541,10 @@ const contextUsed = useMemo(() => {
         store.updateMessage(assistantMsg.id, {
           content:
             (findMsg()?.content ?? "") + (event.content ?? ""),
+          segments: appendTextSegment(
+            findMsg()?.segments,
+            event.content ?? "",
+          ),
           retry: null,
         });
       } else if (event.kind === "thinking") {
@@ -540,6 +564,10 @@ const contextUsed = useMemo(() => {
         const current = findMsg()?.toolActivity ?? [];
         store.updateMessage(assistantMsg.id, {
           toolActivity: [...current, act],
+          segments: [
+            ...(findMsg()?.segments ?? []),
+            { kind: "tool", index: current.length } as MessageSegment,
+          ],
           retry: null,
         });
       } else if (event.kind === "retry") {
@@ -586,6 +614,10 @@ const contextUsed = useMemo(() => {
           // is stale (it reflects the pre-compact context). Drop it so the top
           // context meter falls back to the honest compacted estimate.
           usage: undefined,
+          segments: appendTextSegment(
+            findMsg()?.segments,
+            event.content ? `\n> *${event.content}*` : "",
+          ),
         });
         setLiveUsage(null);
       } else if (event.kind === "plan") {
@@ -1214,7 +1246,11 @@ const contextUsed = useMemo(() => {
           )}
           {chat.messages.map((m: ChatMessage) => (
             <Fragment key={m.id}>
-              {m.toolActivity && m.toolActivity.length > 0 && (
+              <ChatMessageView message={m} onRetry={retryMessage} />
+              {/* Newer messages render tool cards inline via `segments`; only
+                  older persisted messages without segments keep the stacked
+                  timeline below the bubble. */}
+              {!m.segments && m.toolActivity && m.toolActivity.length > 0 && (
                 <div className="tool-timeline">
                   {m.toolActivity.map((act, i) => (
                     <ToolCallView
@@ -1227,7 +1263,6 @@ const contextUsed = useMemo(() => {
                   ))}
                 </div>
               )}
-              <ChatMessageView message={m} onRetry={retryMessage} />
             </Fragment>
           ))}
         </div>

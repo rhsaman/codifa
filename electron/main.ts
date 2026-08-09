@@ -23,6 +23,17 @@ import {
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
 
+// The packaged app launched from Finder gets a minimal PATH
+// (`/usr/bin:/bin:/usr/sbin:/sbin`) that has no Homebrew dirs, so bare
+// `lsof`/`nvim` lookups fail with ENOENT and the Neovim label never appears.
+// Prepend the common install locations so child tools always resolve.
+const TOOL_PATH = [
+  '/opt/homebrew/bin',
+  '/usr/local/bin',
+  '/opt/local/bin',
+  process.env.PATH,
+].filter(Boolean).join(':')
+
 // --- Neovim "open file" tracking -------------------------------------------
 // The user runs nvim with `--listen <socket>` (or a wrapper). We discover the
 // running nvim instances, query the focused buffer directly over the RPC socket
@@ -41,7 +52,7 @@ function findNvimSockets(): Promise<string[]> {
     execFile(
       'lsof',
       ['-nP', '-c', 'nvim', '-U', '-F0n'],
-      { timeout: 5000 },
+      { timeout: 5000, env: { ...process.env, PATH: TOOL_PATH } },
       (err, stdout) => {
         if (err || !stdout) return resolve([])
         // `lsof -c nvim` matches ANY process named nvim — including this app's
@@ -77,7 +88,7 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
     execFile(
       'nvim',
       ['--server', socket, '--remote-expr', 'expand("%:p")'],
-      { timeout: 1500 },
+      { timeout: 1500, env: { ...process.env, PATH: TOOL_PATH } },
       (err, stdout) => {
         if (err) return resolve(null)
         const v = String(stdout ?? '').trim()
@@ -113,7 +124,7 @@ function queryNvimDiagnostics(socket: string): Promise<unknown[]> {
     execFile(
       'nvim',
       ['--server', socket, '--remote-expr', `luaeval('(${body})()')`],
-      { timeout: 1500 },
+      { timeout: 1500, env: { ...process.env, PATH: TOOL_PATH } },
       (err, stdout) => {
         if (err) return resolve([])
         const raw = String(stdout ?? '').trim()

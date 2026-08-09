@@ -143,6 +143,20 @@ npm run dist:linux  # only Linux
 
 Output lands in `release/`.
 
+**macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
+notarized), so the first launch from Finder may show
+*“CODEFA has been blocked because it may reduce your privacy and lower the
+security of your Mac.”* This is expected for locally-built apps without a
+Developer ID. Fix: right-click the app → **Open** → **Open** once. If you
+copied it from a download, also clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /path/to/CODEFA.app
+```
+
+(Removing the warning for every user requires a paid Apple Developer account
+and notarization.)
+
 ### Usage
 
 1. Click **Open Folder** (or `Cmd/Ctrl+O`) and select your project root.

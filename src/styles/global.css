@@ -1091,6 +1091,24 @@ textarea {
   border: none;
 }
 
+/* Claude-style interleaved assistant messages: text slices flow continuously
+   with inline tool cards inserted at the point each call happened. */
+.msg-bubble.segmented {
+  padding: 10px 0 0;
+}
+
+.msg-bubble.segmented > .chat-message.markdown-body {
+  padding: 0 12px;
+}
+
+.msg-bubble.segmented > .tool-card {
+  margin: 4px 12px;
+}
+
+.msg-bubble.segmented > .chat-message + .chat-message {
+  margin-top: 2px;
+}
+
 .msg.user .msg-bubble {
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -2854,7 +2872,7 @@ textarea {
   line-height: 1.6;
   color: var(--text-dim);
   white-space: pre-wrap;
-  max-height: 300px;
+  max-height: 150px;
   overflow-y: auto;
   border-top: 1px dashed var(--border);
 }

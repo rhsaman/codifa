@@ -235,7 +235,7 @@ export function ToolCallView({
 
   const hasExpand =
     activity.args || activity.summary || activity.diff
-  const isWrite = activity.tool === 'write_file'
+  const isWrite = activity.tool === 'write_file' || activity.tool === 'edit_file'
 
   const revert = async () => {
     if (!activity.diff || !root) return

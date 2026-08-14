@@ -1198,6 +1198,8 @@ export function ChatPanel() {
       toolRunningRef.current = false;
       setStalled(false);
       setBusy(false);
+      setAskReq(null);
+      setPermissionReq(null);
       abortRef.current = null;
       useStore.getState().setActiveAbort(null);
       useStore.getState().setStreaming(false, false);
@@ -1749,6 +1751,8 @@ export function ChatPanel() {
   };
 
   const stop = () => {
+    setAskReq(null);
+    setPermissionReq(null);
     abortRef.current?.abort();
     useStore.getState().activeAbort?.abort();
   };

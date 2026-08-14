@@ -1750,6 +1750,37 @@ def _needs_workspace(prompt: str) -> bool:
         if m and m.group(2) not in code_exts:
             return False
 
+    # A self-contained EXTERNAL error/log dump with a question — but NO hook
+    # into the project (no file path, no code-symbol token) — is a knowledge
+    # question, not a project task: e.g. a pasted macOS console line
+    # ``[1234:0814/..:ERROR:system_services.cc(34)] ... Error Domain=...``
+    # with a Persian "این مشکل چیه؟". Scouting the workspace for it only burns
+    # tokens and nudges the model into irrelevant exploration of a repo the
+    # error has nothing to do with. Shape-only test using the distinctive
+    # externals: a process-prefixed log line, a Cocoa ``Error Domain=...``
+    # pair, a Python traceback, or a Rust panic — plus a question intent.
+    if re.search(
+        r"(\[\d{1,6}:[\d./]+:[A-Z]+:[^\]]*\])"
+        r"|(Error Domain=[A-Za-z_.]+ Code=-?\d+)"
+        r"|(Traceback \(most recent call last\))"
+        r"|\bpanic\b",
+        text,
+        re.I,
+    ) and re.search(
+        r"what is|what does|what's|why|how do|چیه|چیست|چرا|مشکل|خطا|اشکال|علت|چه",
+        text,
+        re.I,
+    ):
+        # Project hook? A path or a dotted code-extension token means the user
+        # IS pointing at project files — keep scouting for those.
+        for tok in re.split(r"\s+", text):
+            low = tok.lower().strip("[]():,;\"'`*_")
+            if low.startswith(("/", "./", "../")):
+                return True
+            if low.endswith(tuple("." + ext for ext in code_exts)):
+                return True
+        return False
+
     return True
 
 

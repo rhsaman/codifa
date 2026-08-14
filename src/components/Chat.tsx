@@ -879,6 +879,53 @@ export function ChatPanel() {
       }
     }, 10_000);
 
+    // Preserve tool-call context on a FAILED turn so the next one doesn't redo
+    // it. `toolActivity` is a frontend-only render field and never part of the
+    // `history` sent to the backend (only role/content travel), so without
+    // folding the completed tool calls into `content`, the next turn would not
+    // know what this turn already did and would redo it from scratch. Fire it
+    // on EVERY failure path: the streamChat catch below AND inline SSE "error"
+    // events (a backend fatal arrives as a normal event, not a throw).
+    // A turn's stream can end without a tool_result for every started card
+    // (backend crash, stop, error, lost SSE). Force any still-"running" card to
+    // "done" so the spinner/tick never hangs forever.
+    const resolveStuckCards = () => {
+      const msg = useStore
+        .getState()
+        .chats.find((c) => c.id === chat.id)
+        ?.messages.find((m) => m.id === assistantMsg.id);
+      if (!msg || !msg.toolActivity?.some((a) => a.status === "running")) return;
+      const now = Date.now();
+      useStore.getState().updateMessage(assistantMsg.id, {
+        toolActivity: msg.toolActivity.map((a) =>
+          a.status === "running"
+            ? { ...a, status: "done", elapsedMs: now - (a.startedAt ?? now) }
+            : a,
+        ),
+      });
+    };
+
+    const preserveToolActivity = () => {
+      const doneActs = (
+        useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id)
+          ?.messages.find((m) => m.id === assistantMsg.id)?.toolActivity ?? []
+      ).filter((a) => a.status !== "running");
+      if (doneActs.length === 0) return;
+      const lines = doneActs
+        .slice(0, 20)
+        .map((a) => `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`);
+      const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${lines.join("\n")}]`;
+      const current = useStore
+        .getState()
+        .chats.find((c) => c.id === chat.id)
+        ?.messages.find((m) => m.id === assistantMsg.id);
+      useStore.getState().updateMessage(assistantMsg.id, {
+        content: (current?.content ?? "") + note,
+      });
+    };
+
     const handleEvent = (event: SidecarEvent) => {
       lastEventAt.current = Date.now();
       setStalled(false);
@@ -922,6 +969,7 @@ export function ChatPanel() {
           args: event.args,
           status: "running",
           startedAt: Date.now(),
+          callId: typeof event.call_id === "number" ? event.call_id : undefined,
         };
         const current = findMsg()?.toolActivity ?? [];
         store.updateMessage(assistantMsg.id, {
@@ -959,11 +1007,19 @@ export function ChatPanel() {
         toolRunningRef.current = false;
         const current = findMsg()?.toolActivity ?? [];
         const now = Date.now();
+        const gotId = typeof event.call_id === "number";
         const next: ToolActivity[] = current.map((a): ToolActivity => {
-          if (a.tool === event.tool && a.status === "running") {
+          // Match by per-call correlation id first (precise — the same tool
+          // can run many times, and explore sub-agent events share tool names);
+          // fall back to tool-name+status matching when the result has no id.
+          const target =
+            gotId && a.status === "running" && a.callId === event.call_id;
+          const fallback =
+            !gotId && a.tool === event.tool && a.status === "running";
+          if (target || fallback) {
             return {
               ...a,
-              status: event.status === "error" ? "error" : "done",
+              status: event.status === "error" ? "error" : event.status === "denied" ? "denied" : "done",
               summary: event.summary,
               engine: event.engine,
               items: event.results,
@@ -1055,6 +1111,9 @@ export function ChatPanel() {
           // persist it: the meter must fall back to the last completed turn.
           usage: undefined,
         });
+        // Fold the completed tool calls into content too — the backend fatal
+        // arrives as an inline event, not a throw, so the catch path won't run.
+        preserveToolActivity();
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -1092,6 +1151,7 @@ export function ChatPanel() {
         // queued stall-timer callback can't re-set it after the stream closes.
         setStalled(false);
         lastEventAt.current = Date.now();
+        resolveStuckCards();
       }
     };
 
@@ -1143,31 +1203,9 @@ export function ChatPanel() {
       );
     } catch (err) {
       // Preserve tool-call context on ANY abort — the user pressing Stop, the
-      // stall watchdog, or a backend/stream error. `toolActivity` is a
-      // frontend-only render field and never part of the `history` sent to the
-      // backend (only role/content travel), so without folding the completed
-      // tool calls into `content` here, the next turn would not know what this
-      // turn already did and would redo it from scratch. Apply it on every path.
-      const preserveToolActivity = () => {
-        const doneActs = (
-          useStore
-            .getState()
-            .chats.find((c) => c.id === chat.id)
-            ?.messages.find((m) => m.id === assistantMsg.id)?.toolActivity ?? []
-        ).filter((a) => a.status !== "running");
-        if (doneActs.length === 0) return;
-        const lines = doneActs
-          .slice(0, 20)
-          .map((a) => `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`);
-        const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${lines.join("\n")}]`;
-        const current = useStore
-          .getState()
-          .chats.find((c) => c.id === chat.id)
-          ?.messages.find((m) => m.id === assistantMsg.id);
-        useStore.getState().updateMessage(assistantMsg.id, {
-          content: (current?.content ?? "") + note,
-        });
-      };
+      // stall watchdog, or a backend/stream error that THROWS. `preserveToolActivity`
+      // is defined above and folded tool calls into `content`, so a manual retry
+      // knows what this turn already did instead of redoing it from scratch.
       if (watchdogAbortedRef.current) {
         // Forced by the stall watchdog, not the user clicking Stop — the
         // connection was silent for minutes straight, so surface a real,
@@ -1200,6 +1238,7 @@ export function ChatPanel() {
       setBusy(false);
       setAskReq(null);
       setPermissionReq(null);
+      resolveStuckCards();
       abortRef.current = null;
       useStore.getState().setActiveAbort(null);
       useStore.getState().setStreaming(false, false);

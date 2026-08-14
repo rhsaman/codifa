@@ -24,6 +24,7 @@ function fmtTime(ms?: number): string {
 function StatusIcon({ status }: { status: ToolActivity['status'] }) {
   if (status === 'running') return <span className="spinner" />
   if (status === 'error') return <span className="status-err">✗</span>
+  if (status === 'denied') return <span className="status-denied">⏹</span>
   return <span className="status-ok">✓</span>
 }
 
@@ -226,6 +227,7 @@ export const ToolGroupView = memo(function ToolGroupView({
   const [open, setOpen] = useState(false)
   const running = activities.some((a) => a.activity.status === 'running')
   const errored = activities.some((a) => a.activity.status === 'error')
+  const denied = activities.some((a) => a.activity.status === 'denied')
   const totalMs = activities.reduce((sum, a) => sum + (a.activity.elapsedMs || 0), 0)
 
   const counts: Record<string, number> = {}
@@ -237,12 +239,14 @@ export const ToolGroupView = memo(function ToolGroupView({
     .join(', ')
 
   return (
-    <div className={`tool-group ${errored ? 'error' : running ? 'running' : 'done'}`}>
+    <div className={`tool-group ${errored ? 'error' : running ? 'running' : denied ? 'denied' : 'done'}`}>
       <button className={`tool-group-head ${open ? 'open' : ''}`} onClick={() => setOpen((o) => !o)}>
         {running ? (
           <span className="spinner" />
         ) : errored ? (
           <span className="status-err">✗</span>
+        ) : denied ? (
+          <span className="status-denied">⏹</span>
         ) : (
           <span className="status-ok">✓</span>
         )}

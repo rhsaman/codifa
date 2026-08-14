@@ -4573,6 +4573,11 @@ textarea {
   font-weight: 700;
 }
 
+.status-denied {
+  color: var(--warning, #d7a03c);
+  font-weight: 700;
+}
+
 .tool-card-body {
   padding: 8px 10px;
   border-top: 1px dashed var(--border);
@@ -4594,6 +4599,10 @@ textarea {
 
 .tool-group.running {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.tool-group.denied {
+  border-color: color-mix(in srgb, var(--warning, #d7a03c) 45%, var(--border));
 }
 
 .tool-group-head {

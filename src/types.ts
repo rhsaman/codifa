@@ -198,11 +198,14 @@ export interface ToolActivity {
   tool: string
   args?: Record<string, unknown>
   summary?: string
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'done' | 'error' | 'denied'
   diff?: string
   elapsedMs?: number
   startedAt?: number
   reverted?: boolean
+  /** Per-call correlation id (backend-assigned) so a tool_result resolves the
+   *  exact card it belongs to even when the same tool runs many times. */
+  callId?: number
   /** Structured result rows (e.g. web_search hits) shown in the tool card. */
   items?: SearchResultItem[]
   /** Which web-search provider produced these results (e.g. 'tavily'). */
@@ -305,8 +308,10 @@ export interface SidecarEvent {
   tool?: string
   args?: Record<string, unknown>
   summary?: string
-  /** Tool-result status: 'error' marks a failed tool call (renders red ✗). */
-  status?: 'error' | 'done'
+  /** Tool-result status: 'error' marks a failed tool call (renders red ✗); 'denied' marks a cap-blocked call (renders ⏹). */
+  status?: 'error' | 'done' | 'denied'
+  /** Per-call correlation id pairing a 'tool' event with its 'tool_result'. */
+  call_id?: number
   diff?: string
   path?: string
   /** Auto-selected skill names (the 'skill' event kind). */

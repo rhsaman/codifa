@@ -57,6 +57,28 @@ _SUBAGENT_RETRY_SECONDS = 30
 _SUBAGENT_MAX_ATTEMPTS = 10
 
 
+def _is_content_gathering(text: str) -> bool:
+    """Heuristic for whether a task needs substantial verbatim content from
+    several files (styling / refactor / rewrite) rather than a narrow lookup.
+
+    Drives two behaviors: (1) ``explore_tool`` gives content-heavy tasks a bigger
+    report budget and allows verbatim code blocks; (2) the plan/coder agent's
+    own-search quota is bumped so it can gather content from known files itself
+    instead of looping explore. Keyword-based on purpose — cheap and stable —
+    not a full classifier. ``path_hint``/``hints`` presence alone does NOT count:
+    a scoped question can still be a short fact-lookup.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(k in low for k in ("restyle", "redesign", "restructure", "rewrite",
+                               "styling", "styles", "css", "jsx", "tsx", "scss",
+                               "border", "borders", "read the full", "full content",
+                               "verbatim", "entire component", "entire file",
+                               "get the css", "get the jsx", "get the code",
+                               "refactor", "migrate", "extract", "inline", "reflow"))
+
+
 async def _run_subagent_call(
     factory: Callable[[], Any],
     label: str,
@@ -1988,6 +2010,41 @@ def make_tool_callbacks(
     shared emit callback aligned with the streaming loop.
     """
 
+    # Correlate every tool call with its result via a per-turn monotonic
+    # `call_id`. The UI previously matched tool_results to running cards by
+    # (tool name + status) alone, which breaks when the SAME tool runs multiple
+    # times in a turn (e.g. 8× fuzzy_find) or when explore's sub-agent emits
+    # identically-named tool events into the same stream — results could resolve
+    # the wrong card, leaving a genuinely-started card stuck on "running"
+    # forever. Wrapping emit here gives each tool→result pair a stable id that
+    # the frontend can match on; sub-agent events (already tagged `sub=True`)
+    # flow through the same wrapper and get their own ids.
+    _call_seq = 0
+    _pending_calls: dict[str, list[int]] = {}
+    _pending_sub_calls: dict[str, list[int]] = {}
+
+    def _emit(event: dict) -> None:
+        nonlocal _call_seq
+        ev = dict(event)
+        kind = ev.get("kind")
+        tool = ev.get("tool") or ""
+        is_sub = bool(ev.get("sub"))
+        if kind == "tool":
+            _call_seq += 1
+            ev["call_id"] = _call_seq
+            if is_sub:
+                _pending_sub_calls.setdefault(tool, []).append(_call_seq)
+            else:
+                _pending_calls.setdefault(tool, []).append(_call_seq)
+        elif kind == "tool_result":
+            queue = _pending_sub_calls if is_sub else _pending_calls
+            if queue.get(tool):
+                ev["call_id"] = queue[tool].pop(0)
+        orig_emit(ev)
+
+    orig_emit = emit
+    emit = _emit
+
     # Reserve headroom so tool outputs + accumulated turn history + reply still fit.
     # Budgets scale with the context window so small models (e.g. 8k) get tight caps
     # that prevent overflow / mid-task truncation.
@@ -2007,6 +2064,13 @@ def make_tool_callbacks(
     # Shared state for the update_plan nudge backstop (see _format_plan_nudge_suffix
     # above) — lives for this run only, reset each time make_tool_callbacks is called.
     _plan_nudge_state = {"since_update": 0, "has_in_progress": False}
+    # Cross-call explore memory: dict cache_key -> body of every tool result the
+    # explore sub-agent(s) produced SO FAR this turn. Each new explore call seeds
+    # its own _sub_result_cache from this and prepends an "already explored"
+    # digest to its task_text, so repeated explore calls in one turn build on
+    # earlier findings instead of each starting from zero (the observed 10-15
+    # round re-discovery loop for broad styling tasks).
+    _explore_turn_digest: dict[str, str] = {}
     # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
     # update_plan (the common case for small tasks) never hit the threshold, so
     # the model could write its final reply with a step still stuck 'in_progress'
@@ -2084,7 +2148,7 @@ def make_tool_callbacks(
         )
 
     async def save_plan_tool(title: str, content: str) -> str:
-        """PLAN MODE ONLY. Save the implementation plan you just wrote as markdown in the user data folder (per-chat: `<data>/plan/<workspace>/<chat-id>/plan.md` — never inside the workspace), so the user or Coder mode can pick it up without retyping. Each call OVERWRITES this chat's plan. This is the ONE exception to plan mode being read-only — never writes into the workspace or project files. Call ONCE after your plan text is finalized, with `title` (short) and `content` (full plan markdown — normally your '## Plan' text)."""
+        """PLAN MODE ONLY. Save the implementation plan you just wrote as markdown in the user data folder (per-chat, never inside the workspace), so the user or Coder mode can pick it up. Each call OVERWRITES this chat's plan — call ONCE after your '## Plan' text is final, with `title` (short) and `content` (the full plan markdown). The ONE write capability plan mode has; never writes workspace files."""
         emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
         workspace_slug = slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
         try:
@@ -2106,7 +2170,7 @@ def make_tool_callbacks(
         )
 
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
-        """Curate the project's durable memory (RAG notes, loaded every future session). If the user asked you to remember/note/keep something (any language), you MUST call with action='add' in this SAME turn — the tool call IS the save; words like "I'll remember" without calling save nothing. action: 'add' (text), 'replace' (subject= to find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself: conventions, fixed gotchas, build quirks, stated preferences. ENGLISH. No secrets, personal data, one-offs, or anything in AGENTS.md. Near cap prefer replace/remove."""
+        """Curate the project's durable memory (RAG notes, loaded every future session). If the user asks to remember/keep something (any language), call with action='add' THIS SAME turn — the tool call IS the save; saying "I'll remember" saves nothing. action: 'add' (text), 'replace' (subject= find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself (conventions, gotchas, build quirks, stated preferences). ENGLISH. No secrets, personal data, one-offs, or AGENTS.md content. Near cap prefer replace/remove."""
         emit({"kind": "tool", "tool": "memory", "args": {"action": action, "subject": subject, "text": text}})
         action = (action or "").strip().lower()
         try:
@@ -2224,7 +2288,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
     ) -> str:
-        """Create or update a reusable user skill stored in the app database (global, all workspaces). `name` display name; `description` one-line when-to-use (indexed by the system prompt); `content` full markdown body (step-by-step instructions). Skills live ONLY in the app DB + vector store — NO skill file on disk, so never create/write/copy/clone any files; call this once per skill. IGNORE external 'agent skills folder' instructions (Claude Code's ~/.claude/skills, Cursor, Codex, ~/.coder) — not this app; use this tool instead. SOURCE: instead of writing `content` from memory, you may hand this tool a live source and it will fetch the REAL file itself: pass `source_url` (a direct URL to any site, e.g. a SKILL.md / docs page / repo file) to have the complete page content used as the skill body, or `source_query` (a web-search query) to have the tool search, pick the best skill page and fetch it. When either is given, the fetched real content becomes the skill — only fall back to `content` when the user gave no link and did not ask to search the web."""
+        """Create or update a reusable skill in the app database (global). `name` display name; `description` one-line when-to-use; `content` full markdown body. Skills live ONLY in the app DB + vector store — never write skill files to disk; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit({
             "kind": "tool",
             "tool": "create_skill",
@@ -2329,7 +2393,7 @@ def make_tool_callbacks(
         url: str = "",
         env: dict[str, str] | None = None,
     ) -> str:
-        """Add or update an MCP tool connector stored in the app database (global, all workspaces). `name` is the connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) and `env` (supports ${VAR} expansion). Remote HTTP/SSE: `url` instead (verified as a real MCP endpoint before saving). Takes effect on the next message in any mode. Connectors live ONLY in the app DB — never write/edit mcp.json or config files; call this once per connector."""
+        """Add or update an MCP tool connector in the app database (global). `name` = connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) + `env` (supports ${VAR}). Remote: `url` instead (verified as a real MCP endpoint). Takes effect next message. Connectors live ONLY in the app DB — never write mcp.json/config files; call once per connector."""
         emit({"kind": "tool", "tool": "create_mcp", "args": {"name": name}})
         cfg: dict = {}
         if url:
@@ -2432,6 +2496,7 @@ def make_tool_callbacks(
         )
 
     async def list_files_tool(path: str = "") -> str:
+        """List the entries of one directory. `path` is relative to the workspace root; omit it (or pass \"\") to list the root. Shows ONE level only — not recursive. Directories are marked with a trailing `/`; hidden files are skipped (except .gitignore/.env). Long listings are truncated with an `…(N more)` note."""
         emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
         try:
             result = list_files(root, path)
@@ -2453,6 +2518,7 @@ def make_tool_callbacks(
         return f"DIRECTORY {path or '/'}\n{body}"
 
     async def search_tool(query: str, path: str = "", context: int = 0) -> str:
+        """Search file CONTENTS under the workspace. `query` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar`. `path` is an optional subdirectory to restrict the search to (omit = whole workspace). `context` = number of surrounding lines to return before/after each match (use 5-10 to see code around a hit). Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
         emit({
             "kind": "tool",
             "tool": "search_in_files",
@@ -2589,6 +2655,7 @@ def make_tool_callbacks(
         return f"$ {command}\n{output}" + nudge
 
     async def fuzzy_find_tool(query: str, path: str = "") -> str:
+        """Find FILES/DIRS by partial name. `query` is a plain substring-like match on the file's basename (characters must appear in order, NOT regex) — use when you remember only part of a filename, e.g. `litmus` → `Liteform.tsx`. `path` optionally narrows the subtree (omit = whole workspace). Returns ranked relative paths, truncated at 50."""
         emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
         try:
             result = fuzzy_find_files(root, query, path)
@@ -2608,6 +2675,40 @@ def make_tool_callbacks(
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
         emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
         return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines) + note
+
+    async def read_files_tool(paths: list[str], per_file_chars: int = 6000) -> str:
+        """Read the content of already-identified files for verbatim code you need (JSX/CSS/functions). `paths` = list of workspace-relative file paths (max 5). `per_file_chars` caps each file's returned content (default 6000) so a read can't flood context. Use AFTER you know the exact paths (from fuzzy_find/search_in_files/explore) — not for discovery. One call can pull several known files; skip what you don't need."""
+        emit({"kind": "tool", "tool": "read_files", "args": {"paths": paths}})
+        if not paths:
+            emit(_error_result("read_files", "no paths given"))
+            return "ERROR: pass at least one file path."
+        cap = max(200, min(int(per_file_chars or 6000), 40_000))
+        blocks: list[str] = []
+        shown = 0
+        for p in paths[:5]:
+            shown += 1
+            try:
+                result = read_file(root, p)
+            except PathEscapeError as exc:
+                msg = f"invalid path: {exc}"
+                emit(_error_result("read_files", msg))
+                blocks.append(f"{p}: ERROR {msg}")
+                continue
+            if result.get("error"):
+                blocks.append(f"{p}: ERROR {result['error']}")
+                continue
+            content = result.get("content", "")
+            truncated = result.get("truncated", False)
+            if len(content) > cap:
+                content = content[:cap] + "\n…(truncated to fit context)"
+            blocks.append(f"===== {p} =====\n{content}")
+            emit({
+                "kind": "tool_result",
+                "tool": "read_files",
+                "summary": f"{p} · {len(content)} chars" + (" (truncated)" if truncated or len(result.get('content', '')) > cap else ""),
+            })
+        emit({"kind": "tool_result", "tool": "read_files", "summary": f"{shown} file(s) read"})
+        return "\n\n".join(blocks)
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
         """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own list_files/search_in_files/fuzzy_find when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
@@ -2650,7 +2751,7 @@ def make_tool_callbacks(
         # instead of a dead-end "use the result you already have" it never got.
         _sub_seen_searches: set[tuple[str, str]] = set()
         _sub_seen_listings: set[tuple[str, str]] = set()
-        _sub_result_cache: dict[str, str] = {}
+        _sub_result_cache: dict[str, str] = dict(_explore_turn_digest)
 
         def _sub_search_key(query: str, path: str) -> tuple[str, str]:
             q = re.sub(r"[^a-z0-9_.@]+", "", (query or "").lower())
@@ -2662,6 +2763,13 @@ def make_tool_callbacks(
 
         def _sub_cached(tool: str, key: tuple[str, str]) -> str | None:
             return _sub_result_cache.get(_sub_cache_key(tool, key))
+
+        def _sub_cache_put(tool: str, key: tuple[str, str], body: str) -> None:
+            """Store a tool result in BOTH the per-call cache and the turn-level
+            digest, so a later explore call in the same turn can reuse it."""
+            ckey = _sub_cache_key(tool, key)
+            _sub_result_cache[ckey] = body
+            _explore_turn_digest[ckey] = body
 
         def _sub_resume_note() -> str:
             """Distilled summary of the sub-agent's completed tool work, fed back
@@ -2800,7 +2908,7 @@ def make_tool_callbacks(
                 lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
             body = "\n".join(lines) if lines else "(empty directory)"
             out = f"DIRECTORY {path or '/'}\n{body}"
-            _sub_result_cache[_sub_cache_key("list_files", lkey)] = out
+            _sub_cache_put("list_files", lkey, out)
             _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": f"{len(result['entries'])} entries"})
             return out
 
@@ -2826,7 +2934,7 @@ def make_tool_callbacks(
             if not matches:
                 out = f"No matches for {query!r} under {path or '/'}."
                 if key[0]:
-                    _sub_result_cache[_sub_cache_key("search_in_files", key)] = out
+                    _sub_cache_put("search_in_files", key, out)
                 _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
                 return out
             lines: list[str] = []
@@ -2851,7 +2959,7 @@ def make_tool_callbacks(
             note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
             out = f"MATCHES for {query!r}\n" + "\n".join(lines) + note
             if key[0]:
-                _sub_result_cache[_sub_cache_key("search_in_files", key)] = out
+                _sub_cache_put("search_in_files", key, out)
             _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": f"{len(matches)} matches"})
             return out
 
@@ -2873,13 +2981,13 @@ def make_tool_callbacks(
             if not matches:
                 out = f"No files match {query!r} under {path or '/'}."
                 if key[0]:
-                    _sub_result_cache[_sub_cache_key("fuzzy_find", key)] = out
+                    _sub_cache_put("fuzzy_find", key, out)
                 _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": "no matches"})
                 return out
             lines = [m["path"] for m in matches[:50]]
             out = f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
             if key[0]:
-                _sub_result_cache[_sub_cache_key("fuzzy_find", key)] = out
+                _sub_cache_put("fuzzy_find", key, out)
             _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
             return out
 
@@ -2900,6 +3008,53 @@ def make_tool_callbacks(
                 task_text = f"Search ONLY within {path_hint}. {task}"
             if hints:
                 task_text = f"Known hints: {hints}. {task_text}"
+            # Cross-call memory: if earlier explore calls this turn already
+            # discovered files/areas, feed them to this fresh sub-agent so it
+            # builds on that work instead of re-listing/re-searching from zero.
+            if _explore_turn_digest:
+                items = list(_explore_turn_digest.items())[-20:]
+                omitted = len(_explore_turn_digest) - len(items)
+                digest_lines = []
+                for ckey, body in items:
+                    parts = ckey.split("|", 2)
+                    tool = parts[0]
+                    label = parts[1] if len(parts) > 1 and parts[1] else (parts[2] if len(parts) > 2 else "/")
+                    snippet = body[:200].replace("\n", " ")
+                    if len(body) > 200:
+                        snippet += "…"
+                    digest_lines.append(f"- {tool}({label}): {snippet}")
+                digest_note = "\n".join(digest_lines)
+                if omitted:
+                    digest_note += f"\n({omitted} earlier results omitted)"
+                task_text = (
+                    "Another explore call this turn already searched these — read "
+                    "them BEFORE re-searching, and only dig deeper where needed:\n"
+                    f"{digest_note}\n\nNOW answer this:\n{task_text}"
+                )
+
+            # Content-heavy tasks (restyle/refactor/rewrite, style-relevant
+            # keywords) genuinely need verbatim JSX/CSS/function bodies from
+            # several files, which a compressed ≤3-line-excerpt report can't
+            # carry. For those, relax the report to allow verbatim blocks and
+            # raise the sub-agent's max output so the parent gets the actual
+            # code in ONE call instead of looping explore for more detail.
+            # Narrow fact-lookups keep the cheap concise-report style/1200 cap.
+            if _is_content_gathering(task_text):
+                _sub_report_style = (
+                    " in a report that INCLUDES the verbatim code blocks the "
+                    "task needs (full JSX/CSS/function bodies relevant to the "
+                    "question, each prefixed by its exact file:line). Keep "
+                    "intervening prose under ~150 words — the code blocks are "
+                    "the deliverable, not padding."
+                )
+                _sub_max_tokens = 3000
+            else:
+                _sub_report_style = (
+                    " in a CONCISE report (under ~300 words): exact file paths "
+                    "and line numbers, code excerpts ≤ 3 lines unless the "
+                    "multi-line structure is the answer. Do not pad."
+                )
+                _sub_max_tokens = 1200
 
             sub_agent = _Agent(
                 summarizer_model,
@@ -2914,10 +3069,9 @@ def make_tool_callbacks(
                     "content search of a file. Never repeat a search with only a minor keyword "
                     "variation. Do NOT search for overly generic terms like 'class', 'function', "
                     "'def', 'import' or punctuation — use specific, project-relevant keywords. "
-                    "Stop as soon as you have enough to answer. When done, reply with a CONCISE report "
-                    "(under ~300 words): exact file paths and line numbers, code excerpts ≤ 3 lines "
-                    "unless the multi-line structure is the answer. Do not pad. "
-                    "ACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
+                    "Stop as soon as you have enough to answer. When done, report your findings "
+                    + _sub_report_style
+                    + "ACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
                     "invent, guess or abbreviate a path. If a search returns no matches, say so "
                     "explicitly instead of assuming it exists. If you are unsure a file exists, "
                     "confirm it with fuzzy_find before citing it. Only cite facts that appear in "
@@ -2935,7 +3089,7 @@ def make_tool_callbacks(
                     _Tool(_sub_search, name="search_in_files"),
                     _Tool(_sub_fuzzy_find, name="fuzzy_find"),
                 ],
-                model_settings=_ModelSettings(temperature=0.2, max_tokens=1200),
+                model_settings=_ModelSettings(temperature=0.2, max_tokens=_sub_max_tokens),
             )
 
             # Widen-and-resume retry loop (mirrors the PARENT agent's handling in
@@ -2947,8 +3101,8 @@ def make_tool_callbacks(
             # Each retry keeps the result cache (built above), so the fresh model
             # gets its earlier findings back via the dedup instead of re-exploring.
             _sub_model_name = str(getattr(summarizer_model, "model_name", "") or "")
-            _sub_request_limit = 20
-            _sub_tool_calls_limit = 40
+            _sub_request_limit = 10
+            _sub_tool_calls_limit = 24
             _sub_widen_retries = 0
             _sub_overflow_retries = 0
             _sub_run_prompt = task_text
@@ -2993,8 +3147,8 @@ def make_tool_callbacks(
                     if _sub_widen_retries >= 2:
                         raise
                     _sub_widen_retries += 1
-                    _sub_request_limit = min(_sub_request_limit * 2, 80)
-                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 120)
+                    _sub_request_limit = min(_sub_request_limit * 2, 40)
+                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 72)
                     resume_note = _sub_resume_note()
                     if resume_note:
                         _sub_run_prompt = f"{task_text}\n\n{resume_note}"
@@ -3221,7 +3375,7 @@ def make_tool_callbacks(
         return raw_results
 
     async def fetch_url_tool(url: str, question: str = "", full: bool = False) -> str:
-        """Fetch a web page / raw file and return its extracted text. Default (full=False) returns a bounded excerpt OR a sub-agent summary when `question` is set. For copying source files like SKILL.md / docs you need to read completely (e.g. installing a skill from a GitHub repo), the backend DETECTS these automatically (a ``.md``/``.txt``/source-code URL or a raw.githubusercontent.com / jsdelivr / gist URL always returns the full text up to 24k chars), so a single call per file is enough — you do not need to pass `full=True`. Do NOT re-fetch the same file through raw.githubusercontent / jsdelivr / GitHub API / portal mirrors — pick ONE raw URL and call it ONCE; if it still truncates, note that and move on rather than retrying the same content via other hosts. Every fetch_url re-sends the whole conversation, so each extra call costs real tokens."""
+        """Fetch a web page / raw file and return its extracted text. Default returns a bounded excerpt (or a sub-agent summary when `question` is set). For copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs) the backend auto-returns full text (up to 24k chars) — one call per file is enough; don't pass `full=True` and don't re-fetch the same file via other hosts. Every call re-sends the whole conversation, so it costs real tokens."""
         effective_full = bool(full)
         emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url, "full": effective_full}})
         # full=True bypasses the default excerpt cap: return the whole page so
@@ -3389,7 +3543,7 @@ def make_tool_callbacks(
         return head + body
 
     async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:
-        """Request the user's permission to read, search or act OUTSIDE the current workspace root (e.g. ~/.config, /Users/..., $HOME files, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills, plans and MCP connectors live in the app DB and are given inline — never read them from disk, never call this for them.) PERMISSION GRANTED → proceed; PERMISSION DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
+        """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors live in the app DB and come inline — never read them from disk, never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
         # Paths under the always-readable user data folder never need a
         # permission prompt — grant silently with no UI card at all.
         if path:
@@ -3434,7 +3588,7 @@ def make_tool_callbacks(
         )
 
     async def confirm_action_tool(action: str, reason: str = "") -> str:
-        """Ask the user to confirm an IMPORTANT or hard-to-reverse action and WAIT for the result: deleting/overwriting a file with real content, force-push/reset/rebase, dropping/truncating a DB, destructive shell (rm -rf, DROP TABLE, data-losing migration), or anything you can't cleanly undo. `action` = exactly what you'll do, specific (e.g. 'delete src/legacy/old-router.ts (312 lines, no longer imported)'); `reason` = one-line why. CONFIRMED → proceed. DENIED → stop, say you stopped, ask what they'd like instead — never silently skip. Not for routine reversible edits."""
+        """Ask the user to confirm an IMPORTANT or hard-to-reverse action and WAIT: deleting/overwriting a real file, force-push/reset/rebase, dropping/truncating a DB, destructive shell (rm -rf, DROP TABLE, data-losing migration), anything not cleanly undoable. `action` = exactly what you'll do, specific (e.g. 'delete src/legacy/old-router.ts'); `reason` = one-line why. CONFIRMED → proceed. DENIED → stop, say so, ask what they'd prefer — never silently skip. Not for routine reversible edits."""
         emit({"kind": "tool", "tool": "confirm_action", "args": {"action": action}})
         if permission_gates is None:
             emit(_error_result("confirm_action", "confirmation system unavailable"))
@@ -3460,7 +3614,7 @@ def make_tool_callbacks(
         )
 
     async def ask_user_tool(question: str, options: list[str] | None = None) -> str:
-        """Ask the user a question mid-task and WAIT for the answer instead of guessing. Use when the request is ambiguous, has conflicting instructions, or misses a detail you can't infer — and it's your FIRST action when intent is genuinely unclear. Pass 2-5 short, mutually-exclusive `options` (few words) for multiple-choice; omit/empty for free text. One clear `question`. Not for things you can find out yourself; one question per call. Returns the user's exact answer."""
+        """Ask the user a question mid-task and WAIT for the answer instead of guessing. Use when the request is ambiguous, has conflicting instructions, or misses a detail you can't infer — and it's your FIRST action when intent is genuinely unclear. Pass 2-5 short, mutually-exclusive `options` (few words) for multiple-choice; omit/empty for free text. Order the options by YOUR OWN preference: put the option you recommend and think is best FIRST (it becomes option #1 the user sees), then the rest in decreasing preference. One clear `question`. Not for things you can find out yourself; one question per call. Returns the user's exact answer."""
         emit({"kind": "tool", "tool": "ask_user", "args": {"question": question, "options": options or []}})
         if ask_gates is None:
             emit(_error_result("ask_user", "ask system unavailable"))
@@ -3791,6 +3945,7 @@ def make_tool_callbacks(
         "list_files": list_files_tool,
         "search_in_files": search_tool,
         "fuzzy_find": fuzzy_find_tool,
+        "read_files": read_files_tool,
         "explore": explore_tool,
         "save_plan": save_plan_tool,
         "web_search": web_search_tool,

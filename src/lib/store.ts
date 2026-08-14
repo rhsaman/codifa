@@ -124,7 +124,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole } = s
+  const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const memory = { taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, maxNotes: memoryMaxNotes, slidingTtl: memorySlidingTtl }
   const writes: Promise<unknown>[] = [
@@ -138,7 +138,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -263,6 +263,8 @@ interface State {
   sidebarOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
+  /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
+  pinnedChats: string[]
   workspaces: Workspace[]
   chats: Chat[]
   /** Chat ids deleted in the UI but not yet removed from the sidecar DB. */
@@ -357,6 +359,7 @@ interface State {
   deleteWorkspace: (key: string) => void
   setWorkspaceColor: (key: string, color: string) => void
   togglePinWorkspace: (key: string) => void
+  togglePinChat: (id: string) => void
   setActiveChat: (id: string) => void
   setChatMode: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
@@ -456,6 +459,7 @@ export const useStore = create<State>((set, get) => ({
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
+  pinnedChats: [],
   workspaces: [],
   chats: [],
   deletedChatIds: [],
@@ -657,6 +661,7 @@ export const useStore = create<State>((set, get) => ({
       sidebarOpen: raw.sidebarOpen !== false,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
+      pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
       workspaces,
       chats: loadedChats,
       activeChatId: activeId,
@@ -1061,7 +1066,7 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
-      return { chats, activeChatId, deletedChatIds: [...s.deletedChatIds, id] }
+      return { chats, activeChatId, deletedChatIds: [...s.deletedChatIds, id], pinnedChats: s.pinnedChats.filter((k) => k !== id) }
     })
     get().persist()
   },
@@ -1070,7 +1075,13 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const chats = s.chats.filter((c) => workspaceKey(c.root ?? '') !== key)
       const workspaces = s.workspaces.filter((w) => w.key !== key)
+      const doomedIds = new Set(
+        s.chats
+          .filter((c) => workspaceKey(c.root ?? '') === key)
+          .map((c) => c.id),
+      )
       const pinnedWorkspaces = s.pinnedWorkspaces.filter((k) => k !== key)
+      const pinnedChats = s.pinnedChats.filter((k) => !doomedIds.has(k))
       const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
         ? s.activeChatId
         : chats[chats.length - 1]?.id ?? ''
@@ -1078,6 +1089,7 @@ export const useStore = create<State>((set, get) => ({
         chats,
         workspaces,
         pinnedWorkspaces,
+        pinnedChats,
         activeChatId,
         deletedChatIds: [
           ...s.deletedChatIds,
@@ -1109,6 +1121,17 @@ export const useStore = create<State>((set, get) => ({
         ? s.pinnedWorkspaces.filter((k) => k !== key)
         : [key, ...s.pinnedWorkspaces]
       return { pinnedWorkspaces }
+    })
+    get().persist()
+  },
+
+  togglePinChat: (id) => {
+    set((s) => {
+      const wasPinned = s.pinnedChats.includes(id)
+      const pinnedChats = wasPinned
+        ? s.pinnedChats.filter((k) => k !== id)
+        : [id, ...s.pinnedChats]
+      return { pinnedChats }
     })
     get().persist()
   },

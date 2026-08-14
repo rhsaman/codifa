@@ -147,6 +147,8 @@ export interface Settings {
   workspaceColors?: Record<string, string>
   /** Workspace keys pinned to the top of the sidebar, most-recently-pinned first. */
   pinnedWorkspaces?: string[]
+  /** Chat ids pinned to the top of their workspace group, most-recently-pinned first. */
+  pinnedChats?: string[]
   /** Persisted workspace list — workspaces outlive their chats (deleting all a
    *  workspace's chats does NOT remove the workspace itself). Empty workspaces
    *  still render. Order is user-controlled (drag-and-drop in the sidebar). */

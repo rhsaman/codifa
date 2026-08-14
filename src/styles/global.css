@@ -3,6 +3,7 @@
   --bg-alt: #171717;
   --bg-panel: #212121;
   --bg-input: #2f2f2f;
+  --bg-hover: #2f2f2f;
   --border: #424242;
   --text: #d0d0d0;
   --text-dim: #a3a3a3;
@@ -108,6 +109,7 @@
   --bg-alt: #ececef;
   --bg-panel: #ffffff;
   --bg-input: #f1f1f3;
+  --bg-hover: #e1e1e5;
   --border: #e2e2e5;
   --text: #1a1a1a;
   --text-dim: #76767c;
@@ -306,22 +308,21 @@ textarea {
 .chat-item {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 9px 7px 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 5px 8px 6px 11px;
   border-radius: 11px;
   cursor: pointer;
   color: var(--text-dim);
   transition:
     background 0.14s ease,
-    color 0.14s ease,
-    transform 0.14s ease;
+    color 0.14s ease;
 }
 
 .chat-item:hover {
-  background: var(--bg-input);
+  background: var(--bg-hover);
   color: var(--text);
-  transform: translateX(1px);
 }
 
 .chat-item.active {
@@ -330,12 +331,19 @@ textarea {
   font-weight: 500;
 }
 
+/* In light mode --accent-dim (#eaeaea) is nearly identical to the sidebar's
+   --bg-alt (#ececef), so the active chat is invisible — use a clearly darker
+   gray instead. */
+[data-theme="light"] .chat-item.active {
+  background: #e0e0e4;
+}
+
 .chat-item.active::before {
   content: "";
   position: absolute;
   left: 2px;
-  top: 22%;
-  bottom: 22%;
+  top: 10%;
+  bottom: 10%;
   width: 3px;
   border-radius: 3px;
   background: var(--ws, var(--accent));
@@ -356,50 +364,71 @@ textarea {
   font-weight: 500;
 }
 
+/* Action icons (pin / rename / delete) sit ABOVE the chat title. Always laid
+   out (never display:none) so the row heights stay constant and the list never
+   "jumps"; only the opacity toggles. */
+.chat-item-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  min-height: 22px;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.12s ease,
+    transform 0.12s ease;
+}
+
+.chat-item:hover .chat-item-actions,
+.chat-item.active .chat-item-actions,
+.chat-item.pinned .chat-item-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .chat-item-edit,
-.chat-item-remove {
+.chat-item-remove,
+.chat-item-pin {
   flex: 0 0 auto;
   width: 22px;
   height: 22px;
   border-radius: 7px;
-  /* Always laid out (never display:none) so the row's height and the title's
-     available width stay constant whether or not the buttons are visible.
-     Toggling `display` here used to make hovered rows taller than idle ones
-     (button height 22px > text line height), which shoved every row below
-     it down/up as the cursor moved down the list — the sidebar "jump". */
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 16px;
   line-height: 1;
   color: var(--text-dim);
-  opacity: 0;
-  transform: scale(0.82);
-  pointer-events: none;
+  opacity: 1;
+  pointer-events: auto;
   transition:
     background 0.12s,
-    color 0.12s,
-    opacity 0.12s ease,
-    transform 0.12s ease;
+    color 0.12s;
 }
 
-.chat-item-edit svg {
+.chat-item-edit svg,
+.chat-item-pin svg {
   width: 14px;
   height: 14px;
 }
 
-.chat-item:hover .chat-item-edit,
-.chat-item:hover .chat-item-remove,
-.chat-item.active .chat-item-edit,
-.chat-item.active .chat-item-remove {
-  opacity: 1;
-  transform: scale(1);
-  pointer-events: auto;
+.chat-item-edit:hover {
+  background: var(--bg-hover);
+  color: var(--text);
 }
 
-.chat-item-edit:hover {
-  background: var(--bg-input);
-  color: var(--text);
+.chat-item-pin:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+.chat-item-pin.active {
+  color: var(--accent);
+}
+
+.chat-item.pinned .chat-item-title {
+  color: var(--accent);
 }
 
 .chat-item-remove:hover {

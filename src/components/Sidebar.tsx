@@ -46,6 +46,7 @@ function buildGroups(
   chats: Chat[],
   workspaces: Workspace[],
   pinnedWorkspaces: string[],
+  pinnedChats: string[],
 ): Group[] {
   const chatsByRoot = new Map<string, Chat[]>()
   for (const c of chats) {
@@ -54,10 +55,25 @@ function buildGroups(
     chatsByRoot.get(key)!.push(c)
   }
 
+  // Pinned chats float to the top of their group (most-recently-pinned first),
+  // then the rest sort by recency.
+  const pinRankChat = (id: string) => {
+    const i = pinnedChats.indexOf(id)
+    return i === -1 ? Infinity : i
+  }
+  const sortChats = (list: Chat[]) => {
+    list.sort((a, b) => {
+      const ar = pinRankChat(a.id)
+      const br = pinRankChat(b.id)
+      if (ar !== br) return ar - br
+      return b.updatedAt - a.updatedAt || b.createdAt - a.createdAt
+    })
+  }
+
   const groups: Group[] = []
   for (const ws of workspaces) {
     const list = chatsByRoot.get(ws.key) ?? []
-    list.sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt)
+    sortChats(list)
     // Don't show a "No project" bucket when it has nothing in it — the
     // sidebar stays empty instead of rendering a point-less heading.
     if (!ws.root && list.length === 0) {
@@ -81,7 +97,7 @@ function buildGroups(
     return i === -1 ? Infinity : i
   }
   const leftovers = [...chatsByRoot.entries()].map(([key, list]) => {
-    list.sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt)
+    sortChats(list)
     const root = list.find((c) => c.root)?.root ?? ''
     return {
       key,
@@ -117,6 +133,7 @@ export function Sidebar() {
   const theme = useStore((s) => s.theme)
   const workspaceColors = useStore((s) => s.workspaceColors)
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces)
+  const pinnedChats = useStore((s) => s.pinnedChats)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [colorOpen, setColorOpen] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -173,7 +190,7 @@ export function Sidebar() {
   const allProviders = useStore((s) => s.settings.providers)
   const recentModels = useStore((s) => s.recentModels)
 
-  const groups = buildGroups(chats, workspaces, pinnedWorkspaces)
+  const groups = buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats)
 
   // Live plan checklist of the ACTIVE chat surfaced in the sidebar footer. Uses
   // the latest message that carries a non-empty plan; hidden only when no plan
@@ -482,13 +499,51 @@ export function Sidebar() {
               </div>
               {!isCollapsed && (
                 <div className="sidebar-group-chats" style={color ? { '--ws': color } as React.CSSProperties : undefined}>
-                  {g.chats.map((c) => (
-                    <div
-                      key={c.id}
-                      className={`chat-item ${c.id === activeChatId ? 'active' : ''}`}
-                      onClick={() => useStore.getState().setActiveChat(c.id)}
-                      title={prepareContent(titleOf(c), dir)}
-                    >
+                  {g.chats.map((c) => {
+                    const isPinnedChat = pinnedChats.includes(c.id)
+                    return (
+                      <div
+                        key={c.id}
+                        className={`chat-item ${c.id === activeChatId ? 'active' : ''}${isPinnedChat ? ' pinned' : ''}`}
+                        onClick={() => useStore.getState().setActiveChat(c.id)}
+                        title={prepareContent(titleOf(c), dir)}
+                      >
+                      <div className="chat-item-actions">
+                        <button
+                          className={`chat-item-pin${isPinnedChat ? ' active' : ''}`}
+                          title={isPinnedChat ? 'Unpin conversation' : 'Pin to top'}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            useStore.getState().togglePinChat(c.id)
+                          }}
+                        >
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill={isPinnedChat ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+                          </svg>
+                        </button>
+                        <button
+                          className="chat-item-edit"
+                          title="Rename conversation"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            startRename(c)
+                          }}
+                        >
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+                          </svg>
+                        </button>
+                        <button
+                          className="chat-item-remove"
+                          title="Delete conversation"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (window.confirm('Delete this conversation?')) useStore.getState().deleteChat(c.id)
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
                       {renamingId === c.id ? (
                         <input
                           className="chat-rename-input"
@@ -515,30 +570,9 @@ export function Sidebar() {
                           {prepareContent(titleOf(c), dir)}
                         </span>
                       )}
-                      <button
-                        className="chat-item-edit"
-                        title="Rename conversation"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          startRename(c)
-                        }}
-                      >
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                        </svg>
-                      </button>
-                      <button
-                        className="chat-item-remove"
-                        title="Delete conversation"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          if (window.confirm('Delete this conversation?')) useStore.getState().deleteChat(c.id)
-                        }}
-                      >
-                        ×
-                      </button>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

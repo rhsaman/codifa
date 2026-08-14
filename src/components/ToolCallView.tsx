@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { ToolActivity } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
@@ -10,6 +10,10 @@ const TOOL_LABEL: Record<string, string> = {
   fuzzy_find: 'fuzzy_find',
   web_search: 'web_search',
   run_terminal: 'run_terminal',
+  search_memory: 'search_memory',
+  memory: 'memory',
+  ask_user: 'ask_user',
+  fetch_url: 'fetch_url',
 }
 
 function fmtTime(ms?: number): string {
@@ -208,16 +212,73 @@ function applyReverseDiff(diff: string, current: string): string {
   return content
 }
 
-export function ToolCallView({
+/** Compact "N read-only calls" summary for a run of consecutive non-write tool
+ *  activities, so a search-heavy turn doesn't stack a full row per call. Kept
+ *  collapsed by default; expanding reveals the normal ToolCallView for each
+ *  one (so args/summary/diff drill-down still works exactly as before). */
+export const ToolGroupView = memo(function ToolGroupView({
+  activities,
+  onReverted,
+}: {
+  activities: { activity: ToolActivity; index: number }[]
+  onReverted: (index: number) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const running = activities.some((a) => a.activity.status === 'running')
+  const errored = activities.some((a) => a.activity.status === 'error')
+  const totalMs = activities.reduce((sum, a) => sum + (a.activity.elapsedMs || 0), 0)
+
+  const counts: Record<string, number> = {}
+  for (const { activity } of activities) {
+    counts[activity.tool] = (counts[activity.tool] || 0) + 1
+  }
+  const detail = Object.entries(counts)
+    .map(([tool, n]) => `${n} ${TOOL_LABEL[tool] ?? tool}`)
+    .join(', ')
+
+  return (
+    <div className={`tool-group ${errored ? 'error' : running ? 'running' : 'done'}`}>
+      <button className={`tool-group-head ${open ? 'open' : ''}`} onClick={() => setOpen((o) => !o)}>
+        {running ? (
+          <span className="spinner" />
+        ) : errored ? (
+          <span className="status-err">✗</span>
+        ) : (
+          <span className="status-ok">✓</span>
+        )}
+        <span className="tool-group-label">{activities.length} tool calls</span>
+        <span className="tool-group-detail">{detail}</span>
+        <span className="tool-ms">{fmtTime(totalMs)}</span>
+        <span className={`chev ${open ? 'open' : ''}`}>▾</span>
+      </button>
+      {open && (
+        <div className="tool-group-body">
+          {activities.map(({ activity, index }) => (
+            <ToolCallView
+              key={index}
+              activity={activity}
+              onReverted={() => onReverted(index)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+})
+
+// Tools whose card should start expanded (the action itself IS the useful
+// content — a diff, a saved note, a new skill/connector — so a collapsed
+// default would hide the very thing the user needs to see happened).
+const OPEN_BY_DEFAULT = new Set(['write_file', 'edit_file', 'memory', 'create_skill', 'create_mcp', 'web_search'])
+
+export const ToolCallView = memo(function ToolCallView({
   activity,
   onReverted,
 }: {
   activity: ToolActivity
   onReverted?: () => void
 }) {
-  const [open, setOpen] = useState(
-    () => activity.tool === 'write_file' || activity.tool === 'edit_file'
-  )
+  const [open, setOpen] = useState(() => OPEN_BY_DEFAULT.has(activity.tool))
   const [reverting, setReverting] = useState(false)
   const root = useStore((s) => s.root)
 
@@ -260,6 +321,9 @@ export function ToolCallView({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+        {activity.tool === 'web_search' && activity.engine && (
+          <span className="tool-badge">{activity.engine}</span>
+        )}
         {activity.args && activity.args.command !== undefined && (
           <span className="tool-cmd">{String(activity.args.command)}</span>
         )}
@@ -277,6 +341,11 @@ export function ToolCallView({
         {activity.args && activity.args.query !== undefined && (
           <span className="tool-cmd">{String(activity.args.query)}</span>
         )}
+        {activity.tool === 'memory' && activity.args && (
+          <span className="tool-cmd">
+            {String(activity.args.text || activity.args.subject || '')}
+          </span>
+        )}
         <span className="tool-ms">{fmtTime(ms)}</span>
         {hasExpand && (
           <span className={`chev ${open ? 'open' : ''}`}>▾</span>
@@ -291,6 +360,17 @@ export function ToolCallView({
             </pre>
           )}
           {activity.summary && <div className="tool-summary">{activity.summary}</div>}
+          {activity.tool === 'web_search' && activity.items && activity.items.length > 0 && (
+            <ul className="web-results">
+              {activity.items.map((it, i) => (
+                <li key={i} className="web-result">
+                  <a className="web-result-link" href={it.url} target="_blank" rel="noreferrer">
+                    {it.title || it.url}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
           {activity.diff && <DiffView diff={activity.diff} />}
           {isWrite && activity.diff && !activity.reverted && (
             <button
@@ -308,4 +388,4 @@ export function ToolCallView({
       )}
     </div>
   )
-}
+})

@@ -3,6 +3,9 @@ import { app } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as net from 'net'
+import * as os from 'os'
+import { getDataRoot } from './store-db'
+import { getSecretsKey } from './secrets'
 
 export interface SidecarHandle {
   url: string
@@ -51,11 +54,20 @@ function getPythonRunner(backendDir: string): { cmd: string; args: string[] } | 
  * discrepancy only shows up in the packaged .app. The MCP server is spawned by
  * the Python sidecar, which inherits this process's env, so fixing PATH here
  * repairs the whole subtree.
+ *
+ * Platform notes: this only matters on macOS (Dock launches drop the login PATH).
+ * Linux launch contexts already carry the full PATH; Windows has no POSIX login
+ * shell to probe AND already passes the full system %PATH% to GUI apps, so for
+ * win32 we only normalize the separator (';' not ':').
  */
 function shellPath(): string {
-  const current = process.env.PATH || ''
+  const isWin = process.platform === 'win32'
+  const sep = isWin ? ';' : ':'
   const parts = new Set<string>()
-  for (const p of current.split(':')) if (p) parts.add(p)
+  for (const p of (process.env.PATH || '').split(sep)) if (p) parts.add(p)
+  if (isWin) {
+    return Array.from(parts).join(sep)
+  }
   // Common, predictable CLI locations regardless of the launch context.
   for (const dir of [
     '/opt/homebrew/bin',
@@ -74,17 +86,19 @@ function shellPath(): string {
   // user installed via brew/nvm etc. Silence errors — a slower/no shell just
   // falls back to the defaults above.
   try {
-    const shell = process.env.SHELL || '/bin/zsh'
+    const shell =
+      process.env.SHELL ||
+      (process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh')
     const probe =
       process.platform === 'darwin'
         ? `${shell} -l -c 'echo -n "$PATH"'`
         : `${shell} -c 'echo -n "$PATH"'`
     const out = execSync(probe, { timeout: 3000, encoding: 'utf8' })
-    for (const p of out.split(':')) if (p) parts.add(p)
+    for (const p of out.split(sep)) if (p) parts.add(p)
   } catch {
     /* ignore — defaults above are enough */
   }
-  return Array.from(parts).join(':')
+  return Array.from(parts).join(sep)
 }
 
 function findFreePort(): Promise<number> {
@@ -106,6 +120,9 @@ function findFreePort(): Promise<number> {
 
 let handle: SidecarHandle | null = null
 let starting: Promise<SidecarHandle> | null = null
+// Set right before an intentional stop so the exit handler can log a calm
+// "stopped" message instead of a scary "exited with code null".
+let stopping = false
 
 export function startSidecar(): Promise<SidecarHandle> {
   if (handle) return Promise.resolve(handle)
@@ -127,7 +144,18 @@ async function doStart(): Promise<SidecarHandle> {
   const runner = getPythonRunner(backendDir)
 
   let child: ChildProcess
-  const childEnv = { ...process.env, PATH: shellPath(), PYTHONIOENCODING: 'utf-8' }
+  const childEnv = {
+    ...process.env,
+    PATH: shellPath(),
+    PYTHONIOENCODING: 'utf-8',
+    // User-level data root (configurable from Settings → Data path). The
+    // sidecar owns the SQLite state DB and the skills/plans/mcp files there,
+    // so it must agree with Electron about where that root is.
+    CODER_DATA_DIR: getDataRoot(),
+    // AES key used to decrypt secrets (API keys / OAuth creds) that the
+    // renderer stores encrypted in settings.json. In-memory only, never on disk.
+    CODER_SECRET_KEY: getSecretsKey(),
+  }
   if (runner) {
     child = spawn(runner.cmd, [...runner.args, path.join(backendDir, 'server.py'), '--port', String(port)], {
       cwd: backendDir,
@@ -151,8 +179,15 @@ async function doStart(): Promise<SidecarHandle> {
     const text = d.toString().trim()
     if (text) console.error('[sidecar]', text)
   })
-  child.on('exit', (code) => {
-    console.error(`[sidecar] exited with code ${code}`)
+  child.on('exit', (code, signal) => {
+    if (stopping) {
+      console.log(`[sidecar] stopped (${signal || 'exit'})`)
+      stopping = false
+    } else if (code === null) {
+      console.error(`[sidecar] exited unexpectedly (signal ${signal})`)
+    } else {
+      console.error(`[sidecar] exited with code ${code}`)
+    }
     handle = null
   })
   child.on('error', (err) => {
@@ -191,9 +226,33 @@ export async function getSidecarUrl(): Promise<string | null> {
   }
 }
 
-export function stopSidecar(): void {
-  if (handle) {
-    handle.process.kill()
-    handle = null
+/** Return the running sidecar's URL WITHOUT starting/restarting it.
+ *  Used by the quit flush so saving settings/chats never blocks a shutdown on a
+ *  30s sidecar boot (a dead sidecar can't accept writes anyway). */
+export function peekSidecarUrl(): string | null {
+  return handle ? handle.url : null
+}
+
+export async function stopSidecar(timeoutMs = 5000): Promise<void> {
+  const current = handle
+  if (!current) return
+  handle = null
+  stopping = true
+  const proc = current.process
+  // Already gone — nothing to wait for.
+  if (proc.exitCode !== null) {
+    stopping = false
+    return
   }
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      console.error('[sidecar] stop timed out; killing')
+      proc.kill('SIGKILL')
+    }, timeoutMs)
+    proc.once('exit', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+    proc.kill('SIGTERM')
+  })
 }

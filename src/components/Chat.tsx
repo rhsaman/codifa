@@ -1,27 +1,59 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
-import { streamChat, fetchModels, transcribeAudio, respondPermission, respondAsk } from "../lib/api";
-import { api, workspaceSkills, type WorkspaceSkill } from "../lib/fs";
+import { api } from "../lib/fs";
+import { PROVIDER_META } from "../lib/provider-meta";
 import {
   contextPercent,
   estimateContextTokens,
+  formatCost,
   formatTokens,
+  formatTokensK,
 } from "../lib/context";
+import {
+  addMemoryNote,
+  streamChat,
+  fetchModels,
+  fetchCredits,
+  transcribeAudio,
+  respondPermission,
+  respondAsk,
+} from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
-import { fixMixedText } from "../lib/bidi";
-import type { AgentMode, ChatMessage, MessageSegment, NvimDiagnostic, SidecarEvent, ToolActivity } from "../types";
-import { ChatMessageView, ThinkingBlock } from "./ChatMessage";
+import { prepareContent } from "../lib/bidi";
+import {
+  GLOBAL_SHORTCUTS,
+  PREFIX_LABEL,
+  PREFIX_SHORTCUTS,
+  formatGlobalShortcut,
+  formatShortcut,
+} from "../lib/shortcuts";
+import type {
+  AgentMode,
+  ChatMessage,
+  MessageSegment,
+  NvimDiagnostic,
+  SidecarEvent,
+  ToolActivity,
+} from "../types";
+import { ChatMessageView, RetryBanner, ThinkingBlock } from "./ChatMessage";
+import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
+import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
 
-const PROVIDER_LABELS: Record<string, string> = {
-  opencode: "opencode",
-  openrouter: "OpenRouter",
-  custom: "Custom",
-  ollama: "Ollama",
-};
+const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
+  Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
+);
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "help", hint: "List all commands" },
@@ -30,9 +62,28 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "new", hint: "Start a new chat" },
   { name: "undo", hint: "Undo the last user/assistant exchange" },
   { name: "redo", hint: "Redo the last undone exchange" },
-  { name: "skill", hint: "Create a skill (describe what you want after the command)" },
-  { name: "mcp", hint: "Create an MCP connector (describe what you want after the command)" },
+  {
+    name: "skill",
+    hint: "Create a skill (describe what you want after the command)",
+  },
+  {
+    name: "mcp",
+    hint: "Create an MCP connector (describe what you want after the command)",
+  },
 ];
+
+/** True when a message asks to create/install/import skills or MCP connectors,
+ *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
+ *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه →
+ *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too. */
+function wantsSkillOrMcp(text: string): boolean {
+  const low = text.toLowerCase();
+  const action = /(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b/.test(
+    low,
+  );
+  const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)/.test(low);
+  return action && target;
+}
 
 const IMAGE_EXTS = new Set([
   "png",
@@ -58,26 +109,62 @@ function relFromRoot(root: string, p: string): string | null {
 const CHARS_PER_TOKEN = 4;
 
 function sliceToBudget(
-  history: Array<{ role: string; content: string }>,
+  history: Array<{
+    role: string;
+    content: string;
+    thinking?: string;
+    plan?: Array<{ content: string; status: string }>;
+    mode?: string;
+    toolActivity?: Array<{
+      tool: string;
+      args?: Record<string, unknown>;
+      summary?: string;
+      status: string;
+    }>;
+  }>,
   maxHistory: number,
   contextWindow?: number,
   mode?: AgentMode,
-): Array<{ role: string; content: string }> {
+): Array<{
+  role: string;
+  content: string;
+  thinking?: string;
+  plan?: Array<{ content: string; status: string }>;
+  mode?: string;
+  toolActivity?: Array<{
+    tool: string;
+    args?: Record<string, unknown>;
+    summary?: string;
+    status: string;
+  }>;
+}> {
   // Model-scale the history char budget so small-context models (8k) get a tiny
   // slice, mirroring the backend's own trimmer.
   const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000;
   const budget = Math.floor(ctx * 1.5); // chars (~37% of window at 4 chars/token); mirrors the backend's conservative history share
-  // Ask (mentor) replies are guidance, not a scrollback the model must re-read
-  // verbatim, so trim its historical tail harder (~60k chars ≈ 15k tokens),
-  // matching the backend's own Ask cap. Keeps the recent turns fully intact.
-  const capped = mode === "ask" ? Math.min(budget, 60000) : budget;
+  // Absolute per-mode ceilings: ask replies are guidance (not a scrollback to
+  // re-read verbatim), and coder/plan turn history is mostly tool-call records
+  // that stay relevant longer, but on very large windows the raw ctx*1.5 share
+  // would balloon past what the context window can really hold — so cap each
+  // mode. Mirrors the backend's per-mode caps.
+  const MODE_HISTORY_CAPS: Record<string, number> = {
+    ask: 60000,
+    plan: 120000,
+    coder: 140000,
+  };
+  const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? "ask"] ?? budget);
   const recent = history.slice(-maxHistory);
   const kept: typeof history = [];
   let acc = 0;
   for (const m of [...recent].reverse()) {
     // System-role messages (a compact summary) are small but crucial: always
     // keep them even if the char budget would otherwise trim the oldest turn.
-    if (m.role !== "system" && kept.length > 0 && acc + m.content.length > capped) break;
+    if (
+      m.role !== "system" &&
+      kept.length > 0 &&
+      acc + m.content.length > capped
+    )
+      break;
     kept.push(m);
     acc += m.content.length;
   }
@@ -93,10 +180,83 @@ export function ChatPanel() {
       s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
       s.settings.providers[0],
   );
+  const allProviders = useStore((s) => s.settings.providers);
+
+  // Live provider balance (OpenRouter), polled every 60s. Queried for every
+  // configured provider so the header always surfaces a real remaining balance
+  // (OpenRouter) even when the active provider has no balance endpoint.
+  // `balanceTick` is bumped right after each completed turn, so the chip also
+  // refreshes immediately whenever usage actually changes — without hammering
+  // the provider while idle.
+  const [creditMap, setCreditMap] = useState<
+    Record<
+      string,
+      Partial<{ balance: number; total_credits: number; total_usage: number }>
+    >
+  >({});
+  const [balanceTick, setBalanceTick] = useState(0);
+  useEffect(() => {
+    if (!allProviders || allProviders.length === 0) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      const settled = await Promise.allSettled(
+        allProviders.map((p) => fetchCredits(p)),
+      );
+      if (cancelled) return;
+      const map: Record<
+        string,
+        Partial<{ balance: number; total_credits: number; total_usage: number }>
+      > = {};
+      allProviders.forEach((p, i) => {
+        const r = settled[i];
+        if (r.status === "fulfilled") map[p.id] = r.value;
+      });
+      setCreditMap(map);
+      timer = setTimeout(poll, 60_000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    // Rerun only when the provider shape (id/kind/key base) changes.
+    allProviders
+      .map(
+        (p) =>
+          `${p.id}|${p.kind}|${p.apiKey ?? ""}|${p.envVar ?? ""}|${p.baseUrl ?? ""}|${p.authType ?? ""}|${p.oauthRefreshToken ?? ""}`,
+      )
+      .join(";"),
+    balanceTick,
+  ]);
+
+  // Which provider's balance the header chip displays: the active provider if it
+  // returns a number, otherwise the first configured provider with a balance
+  // (OpenRouter) so the chip always shows a real remaining amount.
+  let shownBal: {
+    provider: (typeof allProviders)[number];
+    amount: number;
+  } | null = null;
+  const activeBal = provider ? creditMap[provider.id] : undefined;
+  if (activeBal && activeBal.balance !== undefined) {
+    shownBal = { provider, amount: activeBal.balance };
+  } else {
+    for (const p of allProviders) {
+      const b = creditMap[p.id];
+      if (b && b.balance !== undefined) {
+        shownBal = { provider: p, amount: b.balance };
+        break;
+      }
+    }
+  }
   const root = useStore((s) => s.root);
   const dir = useStore((s) => s.dir);
+  const workspaces = useStore((s) => s.workspaces);
   const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
+  const autoSkills = useStore((s) => s.settings.autoSkills === true);
+  const setAutoSkills = useStore((s) => s.setAutoSkills);
   const storeStreaming = useStore((s) => s.isStreaming);
   const isThinking = useStore((s) => s.isThinking);
   const modes = useStore((s) => allModes(s.settings));
@@ -108,8 +268,10 @@ export function ChatPanel() {
     for (const d of nvimDiags) {
       const sev = d.severity;
       if (sev === 1 || sev === "Error" || sev === "error") counts.error++;
-      else if (sev === 2 || sev === "Warning" || sev === "warning") counts.warning++;
-      else if (sev === 3 || sev === "Information" || sev === "information") counts.info++;
+      else if (sev === 2 || sev === "Warning" || sev === "warning")
+        counts.warning++;
+      else if (sev === 3 || sev === "Information" || sev === "information")
+        counts.info++;
       else counts.hint++;
     }
     return counts;
@@ -122,7 +284,15 @@ export function ChatPanel() {
   }, [nvimFile, wroot]);
   // The label always shows when a Neovim file is detected; outside the workspace
   // we display the absolute path (it just can't be mentioned to the agent).
-  const nvimLabel = nvimFile ? (nvimRel || nvimFile) : null;
+  const nvimLabel = nvimFile ? nvimRel || nvimFile : null;
+  // Badge shows only the file name (last path segment); the full path stays in
+  // the tooltip. Trailing slashes are stripped so fugitive://.../.git// → .git.
+  const nvimBadge = nvimLabel
+    ? nvimLabel
+      .replace(/[\\/]+$/, "")
+      .split(/[\\/]/)
+      .pop() || nvimLabel
+    : null;
   const systemPrompt = useStore((s) =>
     chat ? (s.settings.systemPrompts?.[chat.mode] ?? "") : "",
   );
@@ -135,6 +305,11 @@ export function ChatPanel() {
   // that flag on/off mid-turn, which used to flicker the pin on and off as the
   // model alternated between emitting text and reasoning.
   const liveThinking = chat?.messages.find((m) => m.streaming)?.thinking ?? "";
+  /** The assistant message currently being rate-limited/retried by the provider,
+   *  if any. Its RetryBanner is rendered once, at the END of the message list
+   *  (not inline inside the message) so it never sits "above the agent's reply"
+   *  between the user's message and the incoming content. */
+  const retryingMsg = chat?.messages.find((m) => m.retry) ?? null;
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   const [attachments, setAttachments] = useState<string[]>(
     chat?.draft?.attachments ?? [],
@@ -148,10 +323,10 @@ export function ChatPanel() {
   const [cmdIndex, setCmdIndex] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   const [stalled, setStalled] = useState(false);
+  const [noRootHint, setNoRootHint] = useState("");
   const [skillOpen, setSkillOpen] = useState(false);
   const [skillQuery, setSkillQuery] = useState("");
   const [skillIdx, setSkillIdx] = useState(0);
-  const [liveUsage, setLiveUsage] = useState<number | null>(null);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
@@ -165,7 +340,6 @@ export function ChatPanel() {
   const [skillChips, setSkillChips] = useState<
     Array<{ kind: "skill" | "mcp"; name: string; path?: string }>
   >(chat?.draft?.skillChips ?? []);
-  const [wsSkills, setWsSkills] = useState<WorkspaceSkill[]>([]);
   const [permissionReq, setPermissionReq] = useState<{
     id: string;
     action: string;
@@ -180,33 +354,46 @@ export function ChatPanel() {
   } | null>(null);
   const [askFreeText, setAskFreeText] = useState("");
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
+  const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
+  const setMcpEnabled = useStore((s) => s.setMcpEnabled);
   const skillQ = skillQuery.trim().toLowerCase();
-  const filteredSkills = wsSkills.filter(
-    (s) =>
-      !skillQ ||
-      s.name.toLowerCase().includes(skillQ) ||
-      (s.description ?? "").toLowerCase().includes(skillQ),
-  );
   const filteredMcp = Object.keys(mcpConnectors).filter(
     (name) => !skillQ || name.toLowerCase().includes(skillQ),
   );
-  const skillOptions: Array<{ kind: "skill" | "mcp"; name: string; path?: string }> = [
-    ...filteredSkills.map((s) => ({ kind: "skill" as const, name: s.name, path: s.path })),
-    ...filteredMcp.map((name) => ({ kind: "mcp" as const, name })),
-  ];
+  const skillOptions: Array<{
+    kind: "skill" | "mcp";
+    name: string;
+    path?: string;
+  }> = [...filteredMcp.map((name) => ({ kind: "mcp" as const, name }))];
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const skillPopupRef = useRef<HTMLDivElement>(null);
   const lastEventAt = useRef(0);
-  const toggleRecordingRef = useRef<() => void>(() => {});
+  const toolRunningRef = useRef(false);
+  /** When the stall hint first turned on (see the watchdog in `send`); null
+   *  while not stalled. Used to escalate a passive hint into a forced abort
+   *  after a further grace period. */
+  const stalledSinceRef = useRef<number | null>(null);
+  /** True when the CURRENT request was aborted by the stall watchdog itself
+   *  (not by the user clicking Stop) — so the catch block can show a real
+   *  error instead of silently treating it like a user-initiated cancel. */
+  const watchdogAbortedRef = useRef(false);
+  const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
   /** Transient confirmation shown when the user switches the chat's mode. */
   const [modeNotice, setModeNotice] = useState<string | null>(null);
   /** Transient confirmation shown after a manual /compact. */
   const [compactNotice, setCompactNotice] = useState<string | null>(null);
+  /** Set when a compact attempt fails, so the composer can show a retry banner
+   *  instead of silently collapsing messages behind a broken summary. Cleared
+   *  on the next compact attempt (success or failure). */
+  const [compactError, setCompactError] = useState<string | null>(null);
+  /** Shown while the tmux-style Ctrl+A prefix is armed (waiting for the next key). */
+  const [prefixNotice, setPrefixNotice] = useState<string | null>(null);
 
   // Switch the CURRENT chat's mode and confirm it visibly (so it's obvious the
   // change applies to this chat's next message, not a new chat).
@@ -214,7 +401,18 @@ export function ChatPanel() {
     if (!chat) return;
     useStore.getState().setChatMode(chat.id, mode);
     const def = getMode(settings, mode);
-    setModeNotice(`Mode changed to ${def.label} — your next message runs in this mode.`);
+    setModeNotice(
+      `Mode changed to ${def.label} — your next message runs in this mode.`,
+    );
+  };
+
+  // Cycle to the next/previous mode in the current chat (Tab / ⌘M).
+  const cycleMode = (dir: 1 | -1) => {
+    if (!chat) return;
+    const ids = allModes(useStore.getState().settings).map((m) => m.id);
+    const idx = ids.indexOf(chat.mode);
+    const next = ids[(idx + dir + ids.length) % ids.length] ?? "ask";
+    changeMode(next);
   };
 
   useEffect(() => {
@@ -228,6 +426,47 @@ export function ChatPanel() {
     const t = setTimeout(() => setCompactNotice(null), 4000);
     return () => clearTimeout(t);
   }, [compactNotice]);
+
+  // Stable ref so the global coder:cmd listener below always invokes the latest
+  // handleCommand (fresh closures over chat/compact/busy state).
+  const handleCommandRef = useRef<(v: string) => Promise<void>>(() =>
+    Promise.resolve(),
+  );
+
+  useEffect(() => {
+    const onCmd = (e: Event) => {
+      const cmd = (e as CustomEvent<string>).detail;
+      if (typeof cmd === "string") void handleCommandRef.current(cmd);
+    };
+    const onPrefix = (e: Event) => {
+      const active = (e as CustomEvent<boolean>).detail === true;
+      setPrefixNotice(
+        active
+          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(PREFIX_SHORTCUTS).join(" / ")}`
+          : null,
+      );
+    };
+    window.addEventListener("coder:cmd", onCmd);
+    window.addEventListener("coder:prefix", onPrefix);
+    return () => {
+      window.removeEventListener("coder:cmd", onCmd);
+      window.removeEventListener("coder:prefix", onPrefix);
+    };
+  }, []);
+
+  // Close the skills/MCP popup when clicking outside of it.
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (
+        skillPopupRef.current &&
+        !skillPopupRef.current.contains(e.target as Node)
+      ) {
+        setSkillOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
 
   useEffect(() => {
     window.coder
@@ -246,13 +485,17 @@ export function ChatPanel() {
       .then((f) => {
         if (cancelled) return;
         useStore.getState().setNvimFile(f.abs);
-        useStore.getState().setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
+        useStore
+          .getState()
+          .setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
       })
       .catch(() => undefined);
     const unsub = window.coder.onNvimFile((f) => {
       if (cancelled) return;
       useStore.getState().setNvimFile(f.abs);
-      useStore.getState().setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
+      useStore
+        .getState()
+        .setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
     });
     return () => {
       cancelled = true;
@@ -273,22 +516,31 @@ export function ChatPanel() {
     });
   }, [chat?.id, input, attachments, images, skillChips]);
 
-  // Keep the model context window fresh from the provider's live /models list,
-  // so the context meter reflects the model's real capacity (not a hardcoded
-  // default). Refetch only when the provider's identity changes.
+  // Keep the model context window (and pricing, when the provider advertises
+  // it) fresh from the provider's live /models list, so the context meter
+  // reflects the model's real capacity and cost (not a hardcoded default).
+  // Refetch only when the provider's identity changes.
   useEffect(() => {
     let cancelled = false;
     if (!provider.kind) return;
     void fetchModels(provider)
       .then((res) => {
-        if (!cancelled) useStore.getState().setProviderContextMap(provider.id, res.context);
+        if (cancelled) return;
+        useStore.getState().setProviderContextMap(provider.id, res.context);
+        useStore.getState().setProviderPricingMap(provider.id, res.pricing);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider.id, provider.kind, provider.baseUrl, provider.apiKey, provider.envVar]);
+  }, [
+    provider.id,
+    provider.kind,
+    provider.baseUrl,
+    provider.apiKey,
+    provider.envVar,
+  ]);
 
   useEffect(() => {
     if (!wroot || attachments.length === 0) {
@@ -329,12 +581,7 @@ export function ChatPanel() {
 
   useEffect(() => {
     const onToggleMode = () => {
-      if (chat) {
-        const ids = allModes(useStore.getState().settings).map((m) => m.id);
-        const idx = ids.indexOf(chat.mode);
-        const next = ids[(idx + 1) % ids.length] ?? "ask";
-        changeMode(next);
-      }
+      cycleMode(1);
     };
     const onAttachFile = (e: Event) => {
       const rel = (e as CustomEvent<{ rel: string }>).detail?.rel;
@@ -351,7 +598,10 @@ export function ChatPanel() {
     return () => {
       window.removeEventListener("coder:toggle-mode", onToggleMode);
       window.removeEventListener("coder:toggle-voice", onToggleVoice);
-      window.removeEventListener("coder:attach-file", onAttachFile as EventListener);
+      window.removeEventListener(
+        "coder:attach-file",
+        onAttachFile as EventListener,
+      );
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id, chat?.mode, wroot]);
@@ -364,36 +614,6 @@ export function ChatPanel() {
     ).slice(0, 10);
   }, [cmdOpen, cmdQuery]);
 
-const contextUsed = useMemo(() => {
-  // Source of truth: the provider's OWN reported token usage from the last
-  // completed assistant turn (the total the model's context limit check uses).
-  // Matches opencode: tokenTotal = input + output + reasoning + cache. Falls
-  // back to a char-based estimate only before the first reply lands (or when
-  // the provider reports no usage).
-  const msgs = chat?.messages ?? [];
-
-  // During an in-flight turn the provider reports per-request usage via the
-  // `usage` SSE event (forwarded from each tool-loop model request). That is the
-  // REAL running token count — no estimation — so prefer it while streaming.
-  // Once streaming ends the final message's persisted usage is the truth.
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === "assistant") {
-    if (last.streaming && liveUsage !== null && liveUsage > 0) return liveUsage;
-    if (!last.streaming && last.usage && last.usage.totalTokens > 0) {
-      return last.usage.totalTokens;
-    }
-  }
-
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i];
-    if (m.role !== "assistant" || !m.usage) continue;
-    const total =
-      m.usage.totalTokens > 0 ? m.usage.totalTokens : m.usage.inputTokens;
-    if (total > 0) return total;
-  }
-  return estimateContextTokens(chat, systemPrompt, maxHistory);
-}, [chat, systemPrompt, maxHistory, liveUsage]);
-
   const ctxWindow =
     (provider.contextMap?.[provider.model] &&
       provider.contextMap[provider.model] > 0 &&
@@ -401,7 +621,72 @@ const contextUsed = useMemo(() => {
     (provider.contextWindow && provider.contextWindow > 0
       ? provider.contextWindow
       : null);
+
+  const contextUsed = useMemo(() => {
+    // Source of truth: the REAL input+output tokens the provider reported for
+    // the last completed exchange (message.usage), which already reflects
+    // whatever the backend actually sent — base system prompt, auto-scout
+    // dossier, RAG block and injected memory notes included. None of that is
+    // knowable from the frontend, so a blind character estimate of `history`
+    // alone was structurally unable to match it (it could only ever see the
+    // conversation text, not the backend-only additions). Because compacted
+    // messages are excluded and their `usage` is cleared, this naturally
+    // resets to a small number right after a compact, then reflects real
+    // usage again once the first post-compact reply completes. Falls back to
+    // the character-based estimate only when no real usage exists yet (a
+    // brand new chat, or the brief window between a compact and the next
+    // completed reply).
+    const msgs = chat?.messages ?? [];
+    const active = msgs.filter((m) => !m.compacted);
+    for (let i = active.length - 1; i >= 0; i--) {
+      const u = active[i].usage;
+      if (u) return u.totalTokens;
+    }
+    return estimateContextTokens(
+      chat,
+      systemPrompt,
+      maxHistory,
+      ctxWindow ?? undefined,
+      chat?.mode,
+    );
+  }, [chat, systemPrompt, maxHistory, ctxWindow]);
+
   const ctxPct = contextPercent(contextUsed, ctxWindow);
+
+  const pricing = provider.pricingMap?.[provider.model] ?? null;
+
+  // This chat's CUMULATIVE token usage & cost per model (main + explore /
+  // compact / vision sub-agents). Tracked in the chat record itself so it
+  // survives compacts and chat switches — session totals only ever grow. Each
+  // model is priced with its own advertised rate when the provider publishes
+  // one, falling back to the parent model's rate.
+  const sessionUsage = useMemo(() => {
+    const usage = chat?.usage ?? {};
+    const out: Array<{
+      model: string;
+      input: number;
+      output: number;
+      cacheRead: number;
+      cost: number | null;
+    }> = [];
+    for (const [model, u] of Object.entries(usage)) {
+      if (u.input + u.output <= 0) continue;
+      const price = provider.pricingMap?.[model] ?? pricing;
+      const cost = price
+        ? (u.input / 1_000_000) * price.input +
+        (u.output / 1_000_000) * price.output
+        : null;
+      out.push({
+        model,
+        input: u.input,
+        output: u.output,
+        cacheRead: u.cacheRead ?? 0,
+        cost,
+      });
+    }
+    out.sort((a, b) => b.input + b.output - (a.input + a.output));
+    return out;
+  }, [chat?.usage, provider.pricingMap, pricing]);
 
   const send = async (
     text: string,
@@ -412,38 +697,56 @@ const contextUsed = useMemo(() => {
     const s = useStore.getState();
     const chat = s.chats.find((c) => c.id === s.activeChatId);
     if (!chat) return;
-    const rootDir = chat.root || s.root;
-    if (!rootDir) {
-      const dir = await window.coder.selectFolder();
-      if (!dir) return;
-      s.setChatRoot(chat.id, dir);
+    // Messages that ask to create/install skills or MCP connectors also grant
+    // the create_skill/create_mcp tools — in EVERY mode (ask, plan, coder).
+    // The grant is sticky across the conversation: check the current message AND
+    // the last several chat messages, so a follow-up like "ادامه بده" keeps the
+    // tools it was originally granted (the user's install request is still in
+    // history and matches the intent).
+    if (!allowCreate) {
+      if (wantsSkillOrMcp(text)) {
+        allowCreate = true;
+      } else {
+        const recent = chat.messages.slice(-6);
+        for (const m of recent) {
+          if (m.role === "user" && m.content && wantsSkillOrMcp(m.content)) {
+            allowCreate = true;
+            break;
+          }
+        }
+      }
     }
+    const rootDir = chat.root || s.root;
+    if (!rootDir) return;
     const activeProvider = getActiveProvider();
     if (!activeProvider.model) {
       s.setSettingsOpen(true);
       return;
     }
-    s.addRecentModel(activeProvider.model);
+    s.addRecentModel(activeProvider.model, activeProvider.id);
 
-    // Selected skills / MCP connectors become an explicit instruction on this
-    // turn (visible as chips in the composer, mirrored here for the model).
+    // Selected skills (chips) and enabled MCP connectors (persistent switches)
+    // become an explicit instruction on this turn.
     const skillNotes: string[] = [];
     for (const chip of skillChips) {
       if (chip.kind === "skill") {
         skillNotes.push(
           `Read ${chip.path} and follow its instructions exactly.`,
         );
-      } else {
+      }
+    }
+    for (const name of s.settings.mcpEnabled ?? []) {
+      if (s.settings.mcpServers?.[name]) {
         skillNotes.push(
-          `Use the MCP tools from server "${chip.name}" where relevant.`,
+          `Use the MCP tools from server "${name}" where relevant.`,
         );
       }
     }
     const finalPrompt =
       skillNotes.length > 0
         ? `${text}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
-            "\n",
-          )}`
+          "\n",
+        )}`
         : text;
 
     // If a previous run was interrupted mid-task (its checklist isn't fully
@@ -453,7 +756,11 @@ const contextUsed = useMemo(() => {
     let promptWithResume = finalPrompt;
     for (let i = chat.messages.length - 1; i >= 0; i--) {
       const plan = chat.messages[i].plan;
-      if (plan && plan.length > 0) {
+      if (
+        plan &&
+        plan.length > 0 &&
+        (!chat.messages[i].mode || chat.messages[i].mode === chat.mode)
+      ) {
         if (!plan.every((t) => t.status === "completed")) {
           const lines = plan
             .map(
@@ -483,6 +790,11 @@ const contextUsed = useMemo(() => {
       streaming: true,
     });
 
+    // Clear any lingering retry banner from a previous message before sending.
+    for (const m of chat.messages) {
+      if (m.retry) s.updateMessage(m.id, { retry: null });
+    }
+
     const allHistory = chat.messages
       .filter(
         (m) =>
@@ -492,17 +804,33 @@ const contextUsed = useMemo(() => {
       )
       // The summary is stored last (so it renders below the conversation), but
       // the model must receive it FIRST — it stands in for the older turns.
-      .sort((a, b) => (a.role === "system" ? -1 : 0) - (b.role === "system" ? -1 : 0))
-      .map((m) => ({ role: m.role, content: m.content }));
-    const history = sliceToBudget(allHistory, maxHistory, ctxWindow ?? undefined, chat.mode);
+      .sort(
+        (a, b) =>
+          (a.role === "system" ? -1 : 0) - (b.role === "system" ? -1 : 0),
+      )
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        thinking: m.thinking,
+        plan: m.plan,
+        mode: m.mode,
+        toolActivity: (m.toolActivity ?? []).filter((a) => a.status !== "running"),
+      }));
+    const history = sliceToBudget(
+      allHistory,
+      maxHistory,
+      ctxWindow ?? undefined,
+      chat.mode,
+    );
 
     const abort = new AbortController();
     abortRef.current = abort;
     useStore.getState().setActiveAbort(abort);
     setBusy(true);
     setStalled(false);
-    setLiveUsage(null);
     lastEventAt.current = Date.now();
+    stalledSinceRef.current = null;
+    watchdogAbortedRef.current = false;
     useStore.getState().setStreaming(true, false);
 
     // Append a text slice to the message's segment list, merging into the
@@ -523,9 +851,30 @@ const contextUsed = useMemo(() => {
     };
 
     // Watchdog: if the provider stalls (no SSE event at all), surface a hint so
-    // the run doesn't silently hang at a "retrying" banner.
+    // the run doesn't silently hang at a "retrying" banner. 180s because the
+    // backend read timeout is 300s and slow free-tier thinking models can pause
+    // well past 60s between streamed chunks — a 60s threshold false-alarmed
+    // during legitimate long thinking.
+    // If the silence continues for a further HARD_STALL_GRACE_MS past that
+    // hint, force-abort: a truly dead connection (backend process crashed, a
+    // socket that never signals close, ...) produces NO event ever, so
+    // handleEvent's own "error" path can never fire on its own — without this,
+    // `busy` stays true and the composer's Send button stays stuck on the stop
+    // icon forever, with no visible error at all.
+    const HARD_STALL_GRACE_MS = 120_000;
     const stallTimer = setInterval(() => {
-      if (Date.now() - lastEventAt.current > 60_000) setStalled(true);
+      const limit = toolRunningRef.current ? 900_000 : 180_000;
+      const elapsed = Date.now() - lastEventAt.current;
+      if (elapsed <= limit) {
+        stalledSinceRef.current = null;
+        return;
+      }
+      setStalled(true);
+      if (stalledSinceRef.current == null) stalledSinceRef.current = Date.now();
+      if (Date.now() - stalledSinceRef.current > HARD_STALL_GRACE_MS) {
+        watchdogAbortedRef.current = true;
+        abort.abort();
+      }
     }, 10_000);
 
     const handleEvent = (event: SidecarEvent) => {
@@ -539,22 +888,33 @@ const contextUsed = useMemo(() => {
       if (event.kind === "text") {
         useStore.getState().setStreaming(true, false);
         store.updateMessage(assistantMsg.id, {
-          content:
-            (findMsg()?.content ?? "") + (event.content ?? ""),
-          segments: appendTextSegment(
-            findMsg()?.segments,
-            event.content ?? "",
-          ),
+          content: (findMsg()?.content ?? "") + (event.content ?? ""),
+          segments: appendTextSegment(findMsg()?.segments, event.content ?? ""),
           retry: null,
         });
       } else if (event.kind === "thinking") {
         useStore.getState().setStreaming(true, true);
         store.updateMessage(assistantMsg.id, {
-          thinking:
-            (findMsg()?.thinking ?? "") + (event.content ?? ""),
+          thinking: (findMsg()?.thinking ?? "") + (event.content ?? ""),
           retry: null,
         });
+      } else if (event.kind === "skill") {
+        const names = Array.isArray(event.skills) ? event.skills : [];
+        if (names.length > 0) {
+          const note = `> ✦ **Auto-selected skills:** ${names.join(", ")}\n\n`;
+          store.updateMessage(assistantMsg.id, {
+            content: note + (findMsg()?.content ?? ""),
+          });
+        } else if (event.note) {
+          store.updateMessage(assistantMsg.id, {
+            content: `> ${event.note}\n\n` + (findMsg()?.content ?? ""),
+          });
+        }
+      } else if (event.kind === "subagent_models") {
+        // Debug-only routing info. Deliberately NOT rendered into the chat —
+        // the user asked for subagent model lists to stay out of the message.
       } else if (event.kind === "tool") {
+        toolRunningRef.current = true;
         const act: ToolActivity = {
           tool: event.tool ?? "tool",
           args: event.args,
@@ -577,17 +937,34 @@ const contextUsed = useMemo(() => {
             maxAttempts: event.max_attempts ?? 3,
             delay: event.delay ?? 0,
             reason: event.reason ?? "",
+            model: event.model ?? "",
+            agent: event.agent ?? "",
+          },
+        });
+      } else if (event.kind === "retry_giveup") {
+        store.updateMessage(assistantMsg.id, {
+          retry: {
+            attempt: event.attempt ?? 1,
+            maxAttempts: event.max_attempts ?? 3,
+            delay: 0,
+            reason: event.reason ?? "",
+            gaveUp: true,
+            model: event.model ?? "",
+            agent: event.agent ?? "",
           },
         });
       } else if (event.kind === "tool_result") {
+        toolRunningRef.current = false;
         const current = findMsg()?.toolActivity ?? [];
         const now = Date.now();
-        const next = current.map((a) => {
+        const next: ToolActivity[] = current.map((a): ToolActivity => {
           if (a.tool === event.tool && a.status === "running") {
             return {
               ...a,
-              status: "done" as const,
+              status: event.status === "error" ? "error" : "done",
               summary: event.summary,
+              engine: event.engine,
+              items: event.results,
               elapsedMs: now - (a.startedAt ?? now),
             };
           }
@@ -604,25 +981,48 @@ const contextUsed = useMemo(() => {
         });
         store.updateMessage(assistantMsg.id, { toolActivity: next });
       } else if (event.kind === "compact") {
-        const base =
-          store.chats
-            .find((c) => c.id === store.activeChatId)
-            ?.messages.find((m) => m.id === assistantMsg.id)?.content ?? "";
-        store.updateMessage(assistantMsg.id, {
-          content: base ? `${base}\n> *${event.content ?? ""}*` : `> *${event.content ?? ""}*\n`,
-          // The backend just folded earlier turns away; the last message's usage
-          // is stale (it reflects the pre-compact context). Drop it so the top
-          // context meter falls back to the honest compacted estimate.
-          usage: undefined,
-          segments: appendTextSegment(
-            findMsg()?.segments,
-            event.content ? `\n> *${event.content}*` : "",
-          ),
-        });
-        setLiveUsage(null);
+        // Auto-compact: fold the older messages into the summary. The summary
+        // is persisted as a system message so the next request still sends it
+        // to the backend — the agent doesn't forget the compacted context.
+        // Deliberately does NOT touch scroll position: this can fire on almost
+        // every turn once the window is near full, and yanking the view up to
+        // the summary mid-stream (previously via scrollIntoView) is exactly
+        // what caused the chat to suddenly jump away from the live reply. The
+        // summary is still fully visible by scrolling up whenever the user wants.
+        const chatId = store.activeChatId;
+        if (chatId) {
+          store.compactChat(chatId, event.content ?? "", maxHistory);
+        }
+      } else if (event.kind === "compact_failed") {
+        // Auto-compact failed — the backend did NOT drop any messages. Surface
+        // the retry banner so the user can compact manually (the manual path
+        // runs the summarizer as a read-only ask request with the parent model,
+        // which succeeds even when the compact subagent model is invalid).
+        setCompactError(
+          event.reason || "Automatic compaction failed — nothing was deleted.",
+        );
       } else if (event.kind === "plan") {
+        const incoming = event.items ?? [];
+        // Get current plan from store (not stale assistantMsg.plan)
+        const currentMsg = findMsg();
+        const existing = currentMsg?.plan ?? [];
+        const hasOverlap = incoming.some(
+          (n) => n.id && existing.some((e) => e.id === n.id),
+        );
+        const merged = hasOverlap
+          ? existing
+            .map((e) => {
+              const upd = incoming.find((n) => n.id && n.id === e.id);
+              return upd ? { ...e, ...upd } : e;
+            })
+            .concat(
+              incoming.filter(
+                (n) => !n.id || !existing.some((e) => e.id === n.id),
+              ),
+            )
+          : incoming;
         store.updateMessage(assistantMsg.id, {
-          plan: event.items ?? [],
+          plan: merged,
           retry: null,
         });
       } else if (event.kind === "permission") {
@@ -648,20 +1048,48 @@ const contextUsed = useMemo(() => {
               ?.messages.find((m) => m.id === assistantMsg.id)?.content ?? "") +
             `\n\n> **Error:** ${event.content}`,
           error: true,
+          // A failed turn's usage is the last request before the drop — often
+          // inflated to ~100% (the reason the provider cut the stream). Don't
+          // persist it: the meter must fall back to the last completed turn.
+          usage: undefined,
         });
       } else if (event.kind === "usage") {
+        // `unbilled` events report a REJECTED (window-overflow) request — the
+        // provider never charged those tokens, so they must not count toward
+        // the message badge or the chat's billed totals.
+        if (event.unbilled) return;
         const inputTokens = event.input_tokens ?? 0;
         const outputTokens = event.output_tokens ?? 0;
-        setLiveUsage(event.total_tokens ?? inputTokens + outputTokens);
+        const total = event.total_tokens ?? inputTokens + outputTokens;
+        const model = (event.model || "").trim() || provider.model || "main";
+        // Accrue into the chat-wide cumulative usage (survives compacts and
+        // chat switches) so the titlebar can show main + sub-agent session
+        // totals and cost separately from the shrinkable current context.
+        store.accrueChatUsage(store.activeChatId, model, {
+          input: inputTokens,
+          output: outputTokens,
+          cacheRead: event.cache_read_tokens ?? 0,
+          cacheWrite: event.cache_write_tokens ?? 0,
+        });
+        // The message badge mirrors the LAST request of this turn (each new
+        // request REPLACES the previous while streaming) — it is NOT the
+        // accumulated whole-turn total, which would re-count the growing
+        // prompt on every tool-loop resend.
         store.updateMessage(assistantMsg.id, {
           usage: {
             inputTokens,
             outputTokens,
-            totalTokens: event.total_tokens ?? inputTokens + outputTokens,
-            cacheReadTokens: event.cache_read_tokens,
-            cacheWriteTokens: event.cache_write_tokens,
+            totalTokens: total,
+            cacheReadTokens: event.cache_read_tokens ?? 0,
+            cacheWriteTokens: event.cache_write_tokens ?? 0,
           },
         });
+      } else if (event.kind === "done") {
+        // The backend signals the end of the stream with a "done" event.
+        // Clear the stall hint immediately and refresh the watchdog clock so a
+        // queued stall-timer callback can't re-set it after the stream closes.
+        setStalled(false);
+        lastEventAt.current = Date.now();
       }
     };
 
@@ -671,44 +1099,111 @@ const contextUsed = useMemo(() => {
           provider: activeProvider,
           root: rootDir,
           mode: chat.mode,
+          chatId: chat.id,
           prompt: promptWithResume,
           history,
           maxHistory,
           attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
           images: imgs.map((i) => i.path),
           systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
-          thinkingLevel: supportsReasoning(activeProvider.model, activeProvider.kind)
-            ? activeProvider.thinkingLevel ?? ""
+          thinkingLevel: supportsReasoning(
+            activeProvider.model,
+            activeProvider.kind,
+          )
+            ? (activeProvider.thinkingLevel ?? "")
             : "",
           mcpServers: (() => {
             const all = s.settings.mcpServers ?? {};
-            const picked = skillChips.filter((c) => c.kind === "mcp").map((c) => c.name);
-            const sel: Record<string, typeof all[string]> = {};
-            for (const n of picked) if (all[n]) sel[n] = all[n];
+            const sel: Record<string, (typeof all)[string]> = {};
+            for (const n of s.settings.mcpEnabled ?? [])
+              if (all[n]) sel[n] = all[n];
             return sel;
           })(),
-          skills: skillChips.filter((c) => c.kind === "skill").map((c) => c.name),
+          skills: skillChips
+            .filter((c) => c.kind === "skill")
+            .map((c) => c.name),
+          autoSkills: s.settings.autoSkills === true,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
           nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
           nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
+          vectorDbPath: s.vectorDbPath,
+          vectorConfig: {
+            ttl_days: s.memoryTtlDays,
+            max_docs: s.memoryMaxDocs,
+            max_chunks: s.memoryMaxChunks,
+          },
+          subagentModels: s.subagentModels,
           signal: abort.signal,
         },
         handleEvent,
       );
     } catch (err) {
-      if ((err as Error).name !== "AbortError") {
+      // Preserve tool-call context on ANY abort — the user pressing Stop, the
+      // stall watchdog, or a backend/stream error. `toolActivity` is a
+      // frontend-only render field and never part of the `history` sent to the
+      // backend (only role/content travel), so without folding the completed
+      // tool calls into `content` here, the next turn would not know what this
+      // turn already did and would redo it from scratch. Apply it on every path.
+      const preserveToolActivity = () => {
+        const doneActs = (
+          useStore
+            .getState()
+            .chats.find((c) => c.id === chat.id)
+            ?.messages.find((m) => m.id === assistantMsg.id)?.toolActivity ?? []
+        ).filter((a) => a.status !== "running");
+        if (doneActs.length === 0) return;
+        const lines = doneActs
+          .slice(0, 20)
+          .map((a) => `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`);
+        const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${lines.join("\n")}]`;
+        const current = useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id)
+          ?.messages.find((m) => m.id === assistantMsg.id);
+        useStore.getState().updateMessage(assistantMsg.id, {
+          content: (current?.content ?? "") + note,
+        });
+      };
+      if (watchdogAbortedRef.current) {
+        // Forced by the stall watchdog, not the user clicking Stop — the
+        // connection was silent for minutes straight, so surface a real,
+        // visible error instead of the normal silent AbortError handling below.
+        handleEvent({
+          kind: "error",
+          content:
+            "The connection went silent for too long and was closed automatically — the backend may have crashed or lost connectivity. Please try again.",
+        });
+        preserveToolActivity();
+      } else if ((err as Error).name !== "AbortError") {
         handleEvent({ kind: "error", content: (err as Error).message });
+        preserveToolActivity();
+      } else {
+        // User-initiated Stop: the request was simply cancelled (no
+        // retry/resume loop). Folding the completed tool calls into content is
+        // handled by preserveToolActivity() above so the next turn knows what
+        // was already done.
+        preserveToolActivity();
       }
     } finally {
       clearInterval(stallTimer);
+      // Neutralize any stall-timer callback already queued: with a fresh clock
+      // its 180s check can't fire and re-show "Still waiting" after the stream
+      // has actually ended.
+      lastEventAt.current = Date.now();
+      stalledSinceRef.current = null;
+      toolRunningRef.current = false;
       setStalled(false);
       setBusy(false);
       abortRef.current = null;
       useStore.getState().setActiveAbort(null);
       useStore.getState().setStreaming(false, false);
-      useStore.getState().updateMessage(assistantMsg.id, { streaming: false });
+      useStore
+        .getState()
+        .updateMessage(assistantMsg.id, { streaming: false, retry: null });
+      // A turn just completed → usage changed. Refresh the balance chip now.
+      setBalanceTick((t) => t + 1);
     }
   };
 
@@ -726,12 +1221,15 @@ const contextUsed = useMemo(() => {
       .slice(-120000);
     const rootDir = ch.root || s.root;
     setBusy(true);
+    setCompactError(null);
     const prompt =
       "Summarize the following conversation into concise notes for continued work. " +
-      "Keep key decisions, files touched, and open questions. Answer in the language of the conversation, " +
-      "under 150 words, no preamble.\n\n" +
+      "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
+      "conversation is in another language (e.g. Persian/Farsi), under 150 words, no preamble.\n\n" +
       transcript;
     let summary = "";
+    let failed = false;
+    let failReason = "";
     // Run the summarizer as a minimal READ-ONLY request: no tools (every cap
     // false), no MCP servers, no skills, and the "ask" base prompt. This stops
     // the summarizer from being hijacked into tool loops or plan output, which
@@ -748,43 +1246,59 @@ const contextUsed = useMemo(() => {
           history: [],
           maxHistory: 0,
           systemPrompt: "",
-          cap: { readFiles: false, writeFiles: false, runTerminal: false, web: false },
+          cap: {
+            readFiles: false,
+            writeFiles: false,
+            runTerminal: false,
+            web: false,
+          },
           mcpServers: {},
           skills: [],
+          autoSkills: false,
           signal: ctr.signal,
         },
         (ev) => {
           if (ev.kind === "text") summary += ev.content ?? "";
-          else if (ev.kind === "error")
-            summary = summary || `(compact failed: ${ev.content})`;
+          else if (ev.kind === "error") {
+            failed = true;
+            failReason = ev.content ?? "unknown error";
+          }
         },
       );
     } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        summary = "(compact failed: timed out after 60s)";
-      } else {
-        summary = `(compact failed: ${(err as Error).message})`;
-      }
+      failed = true;
+      failReason =
+        (err as Error).name === "AbortError"
+          ? "timed out after 60s"
+          : (err as Error).message;
     } finally {
       clearTimeout(timeout);
       setBusy(false);
     }
+    // A summarizer that errored or returned nothing at all is a failed compact
+    // — do NOT collapse the real messages behind a fake "(compact failed)"
+    // summary. Leave the chat untouched and let the user retry manually.
+    if (failed || !summary.trim()) {
+      setCompactError(failReason || "empty summary");
+      return;
+    }
     s.compactChat(
       ch.id,
-      `[Compacted conversation]\n${summary.trim() || "(empty summary)"}`,
+      `[Compacted conversation]\n${summary.trim()}`,
       maxHistory,
     );
-    setCompactNotice(
-      summary.trim()
-        ? "Context compacted — older messages are collapsed above the summary."
-        : "Compact finished (empty summary) — older messages are collapsed.",
+    // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
+    // history stays recallable via memory later. Never blocks or throws.
+    addMemoryNote(rootDir, `[Compacted conversation]\n${summary.trim()}`).catch(
+      () => { },
     );
-    stickToBottom.current = true;
-    setShowJump(false);
-    requestAnimationFrame(() => {
-      const el = scrollRef.current;
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    });
+    setCompactNotice(
+      "Context compacted — older messages are collapsed above the summary.",
+    );
+    // Stay where the user is (normally the bottom, where the live conversation
+    // continues). The messages-change effect below keeps the view pinned to
+    // the bottom; do NOT yank the view up to the summary — that reads as the
+    // chat "suddenly scrolling to top" after every compact.
   };
 
   const handleCommand = async (v: string) => {
@@ -819,8 +1333,20 @@ const contextUsed = useMemo(() => {
         s.addMessage({
           role: "assistant",
           content:
-            "**Commands**\n\n" +
-            COMMANDS.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n"),
+            "**Modes**\n\n" +
+            allModes(settings)
+              .map((m) => `- **${m.label}** — ${m.description}`)
+              .join("\n") +
+            "\n\n**Commands**\n\n" +
+            COMMANDS.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n") +
+            "\n\n**Keyboard shortcuts**\n\n" +
+            GLOBAL_SHORTCUTS.map((s) => `- ${formatGlobalShortcut(s)}`).join(
+              "\n",
+            ) +
+            "\n\n**Prefix shortcuts** — press `Ctrl+A`, then a key:\n\n" +
+            Object.entries(PREFIX_SHORTCUTS)
+              .map(([key, sc]) => `- ${formatShortcut(key, sc)}`)
+              .join("\n"),
         });
         break;
       case "/skill":
@@ -859,17 +1385,43 @@ const contextUsed = useMemo(() => {
     }
   };
 
-  const retryMessage = (id: string) => {
-    if (busy) return;
-    const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === s.activeChatId);
-    if (!ch) return;
-    const msg = ch.messages.find((m) => m.id === id);
-    if (!msg || msg.role !== "user" || !msg.content.trim()) return;
-    if (!s.truncateTo(id)) return;
-    const text = msg.content;
-    void send(text, msg.attachments ?? [], msg.images ?? []);
-  };
+  // Route global coder:cmd dispatches (Ctrl+A prefix shortcuts) through the
+  // same handler as typing the equivalent slash command.
+  handleCommandRef.current = handleCommand;
+
+  const retryMessage = useCallback(
+    (id: string) => {
+      // If a previous turn is still mid-stream (auto-retry waiting on a provider
+      // throttle, streaming reply, etc.), pressing Retry must cancel that run
+      // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
+      // guard below and nothing happens, even after the user changed the model.
+      const active = useStore.getState().activeAbort;
+      if (active && !active.signal.aborted) {
+        active.abort();
+      }
+      const s = useStore.getState();
+      const ch = s.chats.find((c) => c.id === s.activeChatId);
+      if (!ch) return;
+      const msg = ch.messages.find((m) => m.id === id);
+      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
+      if (!s.truncateTo(id)) return;
+      const text = msg.content;
+      // Give the abort's finally block a tick to reset busy/streaming state
+      // before re-sending (send() re-sets busy=true itself, but the abort's
+      // finally would otherwise clear it mid-run).
+      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
+    },
+    [busy, send, maxHistory],
+  );
+
+  // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
+  // recreated `onRetry` per render would defeat it. Route through a ref instead.
+  const retryMessageRef = useRef(retryMessage);
+  retryMessageRef.current = retryMessage;
+  const onRetry = useMemo(
+    () => (id: string) => retryMessageRef.current(id),
+    [],
+  );
 
   const submit = () => {
     if (busy) return;
@@ -881,6 +1433,16 @@ const contextUsed = useMemo(() => {
       void handleCommand(v);
       return;
     }
+    const ss = useStore.getState();
+    const chatObj = ss.chats.find((c) => c.id === ss.activeChatId);
+    if (!chatObj) return;
+    const rootDir = chatObj.root || ss.root;
+    if (!rootDir) {
+      setNoRootHint("Open a project folder first — press ⌘O to pick one.");
+      setTimeout(() => setNoRootHint(""), 3000);
+      return;
+    }
+    setNoRootHint("");
     setInput("");
     setCmdOpen(null);
     const atts = attachments;
@@ -976,14 +1538,13 @@ const contextUsed = useMemo(() => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // Prefer a format the sidecar's `av` can decode; fall back to whatever the
       // browser supports (Whisper handles webm/ogg/opus/wav via decode_audio).
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-            ? "audio/webm"
-            : MediaRecorder.isTypeSupported("audio/wav")
-              ? "audio/wav"
-              : "";
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : MediaRecorder.isTypeSupported("audio/wav")
+            ? "audio/wav"
+            : "";
       const rec = new MediaRecorder(stream, {
         ...(mime ? { mimeType: mime } : {}),
         audioBitsPerSecond: 48_000,
@@ -1000,15 +1561,18 @@ const contextUsed = useMemo(() => {
         if (blob.size === 0) return;
         setTranscribing(true);
         try {
-          const text = await transcribeAudio(blob, setTranscribing, dir === "rtl" ? "fa" : undefined);
+          const text = await transcribeAudio(
+            blob,
+            setTranscribing,
+            dir === "rtl" ? "fa" : undefined,
+          );
           if (text) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
             textareaRef.current?.focus();
           }
         } catch (err) {
           window.alert(
-            `Voice transcription failed: ${
-              err instanceof Error ? err.message : String(err)
+            `Voice transcription failed: ${err instanceof Error ? err.message : String(err)
             }`,
           );
         } finally {
@@ -1074,21 +1638,23 @@ const contextUsed = useMemo(() => {
     setAttachments((a) => a.filter((x) => x !== rel));
   };
 
-  const openSkillPicker = async () => {
+  const openSkillPicker = () => {
     setSkillOpen((o) => {
       if (!o) setSkillQuery("");
       return !o;
     });
     setSkillIdx(0);
-    if (wroot) {
-      const sk = await workspaceSkills(wroot).catch(() => []);
-      setWsSkills(sk);
-    }
   };
 
-  const toggleSkillChip = (item: { kind: "skill" | "mcp"; name: string; path?: string }) => {
+  const toggleSkillChip = (item: {
+    kind: "skill" | "mcp";
+    name: string;
+    path?: string;
+  }) => {
     setSkillChips((chips) => {
-      const exists = chips.some((c) => c.kind === item.kind && c.name === item.name);
+      const exists = chips.some(
+        (c) => c.kind === item.kind && c.name === item.name,
+      );
       return exists
         ? chips.filter((c) => !(c.kind === item.kind && c.name === item.name))
         : [...chips, item];
@@ -1157,6 +1723,12 @@ const contextUsed = useMemo(() => {
       return;
     }
 
+    if (!cmdOpen && e.key === "Tab") {
+      e.preventDefault();
+      cycleMode(e.shiftKey ? -1 : 1);
+      return;
+    }
+
     if (e.key === "/" && !cmdOpen && !(e.metaKey || e.ctrlKey)) {
       startCmd();
       return;
@@ -1173,6 +1745,11 @@ const contextUsed = useMemo(() => {
   };
 
   if (!chat) {
+    const noWorkspace = workspaces.length === 0;
+    const pickWorkspace = async () => {
+      const dirSel = await api.selectFolder();
+      if (dirSel) useStore.getState().createWorkspace(dirSel);
+    };
     return (
       <div className="chat-panel">
         <div
@@ -1180,12 +1757,18 @@ const contextUsed = useMemo(() => {
           style={{ display: "flex", height: "100%", alignItems: "center" }}
         >
           <div>
-            <h2>No chat selected</h2>
+            <h2>
+              {noWorkspace ? "No workspace selected" : "No chat selected"}
+            </h2>
             <button
               className="btn"
-              onClick={() => useStore.getState().newChat()}
+              onClick={
+                noWorkspace
+                  ? pickWorkspace
+                  : () => useStore.getState().newChat()
+              }
             >
-              New chat
+              {noWorkspace ? "Select workspace" : "New chat"}
             </button>
           </div>
         </div>
@@ -1197,38 +1780,58 @@ const contextUsed = useMemo(() => {
     <div className="chat-panel">
       {titlebarEl &&
         createPortal(
-        <div className="chat-toolbar titlebar-toolbar">
-        <button
-          className="dir-toggle"
-          onClick={toggleDir}
-          title={
-            dir === "rtl"
-              ? "Right-to-left (فارسی) — click for LTR"
-              : "Left-to-right — click for RTL"
-          }
-        >
-          {dir === "rtl" ? "RTL" : "LTR"}
-        </button>
-        <span className="badge" title="Active model">
-          <span className="badge-provider">
-            {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
-          </span>
-          {provider.model || "no model"}
-        </span>
-        <span
-          className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
-          title={
-            ctxWindow != null
-              ? `Context used: provider-reported input tokens from the last turn (of the model's ${formatTokens(ctxWindow)} window)`
-              : "Context used: provider-reported input tokens from the last turn"
-          }
-          dir="ltr"
-        >
-          {formatTokens(contextUsed)}
-          {ctxPct !== null ? ` (${ctxPct}%)` : ""}
-        </span>
-        </div>,
-        titlebarEl,
+          <div className="chat-toolbar titlebar-toolbar">
+            <button
+              className="dir-toggle"
+              onClick={toggleDir}
+              title={
+                dir === "rtl"
+                  ? "Right-to-left (فارسی) — click for LTR"
+                  : "Left-to-right — click for RTL"
+              }
+            >
+              {dir === "rtl" ? "RTL" : "LTR"}
+            </button>
+            <span className="badge" title="Active model">
+              <span className="badge-provider">
+                {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
+              </span>
+              {provider.model || "no model"}
+            </span>
+            <span
+              className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
+              title={
+                ctxWindow != null
+                  ? `Context used: estimate of the current window (of the model's ${formatTokens(ctxWindow)} window) — resets on compact.`
+                  : "Context used: estimate of the current window — resets on compact."
+              }
+              dir="ltr"
+            >
+              {ctxPct !== null && (
+                <span className="context-meter-track">
+                  <span
+                    className="context-meter-fill"
+                    style={{ width: `${ctxPct}%` }}
+                  />
+                </span>
+              )}
+              <span className="context-meter-text">
+                {formatTokens(contextUsed)}
+                {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
+                {ctxPct !== null ? ` (${ctxPct}%)` : ""}
+              </span>
+            </span>
+            {shownBal && (
+              <span
+                className="badge titlebar-balance"
+                title={`${shownBal.provider.name} balance`}
+                dir="ltr"
+              >
+                💳 ${shownBal.amount.toFixed(2)}
+              </span>
+            )}
+          </div>,
+          titlebarEl,
         )}
 
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
@@ -1240,13 +1843,32 @@ const contextUsed = useMemo(() => {
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
-              <h2>{getMode(settings, chat.mode).label} mode</h2>
-              <p>{getMode(settings, chat.mode).description}</p>
+              <div className="empty-modes">
+                {allModes(settings).map((m) => (
+                  <div
+                    key={m.id}
+                    className={`empty-mode${m.id === chat.mode ? " active" : ""}`}
+                  >
+                    <span className="mode-select-icon">
+                      <ModeIcon icon={m.icon} />
+                    </span>
+                    <span className="empty-mode-body">
+                      <span className="empty-mode-label">{m.label}</span>
+                      <span className="empty-mode-desc">{m.description}</span>
+                    </span>
+                  </div>
+                ))}
+                <p className="empty-hint">
+                  Switch modes with <code>Tab</code>, <code>Cmd/Ctrl+M</code>,
+                  or the selector above — type <code>/help</code> for all
+                  commands and shortcuts.
+                </p>
+              </div>
             </div>
           )}
           {chat.messages.map((m: ChatMessage) => (
             <Fragment key={m.id}>
-              <ChatMessageView message={m} onRetry={retryMessage} />
+              <ChatMessageView message={m} onRetry={onRetry} />
               {/* Newer messages render tool cards inline via `segments`; only
                   older persisted messages without segments keep the stacked
                   timeline below the bubble. */}
@@ -1265,6 +1887,26 @@ const contextUsed = useMemo(() => {
               )}
             </Fragment>
           ))}
+          {retryingMsg?.retry && (
+            <RetryBanner
+              attempt={retryingMsg.retry.attempt}
+              maxAttempts={retryingMsg.retry.maxAttempts}
+              delay={retryingMsg.retry.delay}
+              reason={retryingMsg.retry.reason}
+              gaveUp={retryingMsg.retry.gaveUp}
+              model={retryingMsg.retry.model}
+              agent={retryingMsg.retry.agent}
+              onRetry={() => {
+                const msgs = chat?.messages ?? [];
+                const idx = msgs.findIndex((m) => m.id === retryingMsg.id);
+                const userMsg = [...msgs.slice(0, idx)]
+                  .reverse()
+                  .find((m) => m.role === "user");
+                if (userMsg) retryMessageRef.current(userMsg.id);
+              }}
+              onCancel={stop}
+            />
+          )}
         </div>
         {showJump && (
           <button
@@ -1273,10 +1915,20 @@ const contextUsed = useMemo(() => {
             onClick={() => {
               stickToBottom.current = true;
               setShowJump(false);
-              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+              scrollRef.current?.scrollTo({
+                top: scrollRef.current.scrollHeight,
+                behavior: "smooth",
+              });
             }}
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <path d="M12 5v14M5 12l7 7 7-7" />
             </svg>
           </button>
@@ -1289,14 +1941,23 @@ const contextUsed = useMemo(() => {
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        {askReq && (
+        {askReq &&
           (() => {
             const fa = /[\u0600-\u06FF]/.test(askReq.question);
             return (
               <div className="ask-card" dir={fa ? "rtl" : "ltr"}>
                 <div className="ask-card-head">
                   <span className="ask-card-icon">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
                       <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01" />
                     </svg>
                   </span>
@@ -1304,7 +1965,9 @@ const contextUsed = useMemo(() => {
                     {fa ? "عامل سوالی از شما دارد" : "The agent has a question"}
                   </span>
                 </div>
-                <div className="ask-card-question">{fa ? fixMixedText(askReq.question) : askReq.question}</div>
+                <div className="ask-card-question">
+                  {prepareContent(askReq.question, fa ? "rtl" : "ltr")}
+                </div>
                 {askReq.options.length > 0 && (
                   <div className="ask-options">
                     {askReq.options.map((opt, i) => (
@@ -1318,11 +1981,22 @@ const contextUsed = useMemo(() => {
                         }}
                       >
                         <span className="ask-option-mark">
-                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                          <svg
+                            width="11"
+                            height="11"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2.4"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
                             <path d="M9 18l6-6-6-6" />
                           </svg>
                         </span>
-                        <span className="ask-option-text">{fa ? fixMixedText(opt) : opt}</span>
+                        <span className="ask-option-text">
+                          {prepareContent(opt, fa ? "rtl" : "ltr")}
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -1334,10 +2008,16 @@ const contextUsed = useMemo(() => {
                     autoFocus
                     dir={fa ? "rtl" : "ltr"}
                     value={askFreeText}
-                    placeholder={fa ? "پاسخ خود را بنویسید…" : "Type your answer…"}
+                    placeholder={
+                      fa ? "پاسخ خود را بنویسید…" : "Type your answer…"
+                    }
                     onChange={(e) => setAskFreeText(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey && askFreeText.trim()) {
+                      if (
+                        e.key === "Enter" &&
+                        !e.shiftKey &&
+                        askFreeText.trim()
+                      ) {
                         e.preventDefault();
                         void respondAsk(askReq.id, askFreeText.trim());
                         setAskReq(null);
@@ -1360,15 +2040,18 @@ const contextUsed = useMemo(() => {
                 </div>
               </div>
             );
-          })()
-        )}
-        {permissionReq && (
+          })()}
+        {permissionReq &&
           (() => {
             const fa = /[\u0600-\u06FF]/.test(permissionReq.action);
             const isConfirm = permissionReq.scope === "confirm";
             const title = isConfirm
-              ? fa ? "تأیید عملیات" : "Confirm action"
-              : fa ? "دسترسی بیرون از ورکاسپیس" : "Outside workspace access";
+              ? fa
+                ? "تأیید عملیات"
+                : "Confirm action"
+              : fa
+                ? "دسترسی بیرون از ورکاسپیس"
+                : "Outside workspace access";
             const note = isConfirm
               ? fa
                 ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
@@ -1381,18 +2064,33 @@ const contextUsed = useMemo(() => {
               <div className="perm-card" dir={fa ? "rtl" : "ltr"}>
                 <div className="ask-card-head">
                   <span className="ask-card-icon">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
                       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                     </svg>
                   </span>
                   <span className="ask-card-title">{title}</span>
                 </div>
-                <div className="ask-card-question">{fa ? fixMixedText(permissionReq.action) : permissionReq.action}</div>
+                <div className="ask-card-question">
+                  {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
+                </div>
                 {permissionReq.path ? (
-                  <code className="perm-path" dir="ltr">{permissionReq.path}</code>
+                  <code className="perm-path" dir="ltr">
+                    {permissionReq.path}
+                  </code>
                 ) : null}
                 {permissionReq.reason ? (
-                  <div className="perm-reason">{fa ? fixMixedText(permissionReq.reason) : permissionReq.reason}</div>
+                  <div className="perm-reason">
+                    {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
+                  </div>
                 ) : null}
                 <div className="perm-note">{note}</div>
                 <div className="perm-buttons">
@@ -1445,17 +2143,46 @@ const contextUsed = useMemo(() => {
                 </div>
               </div>
             );
-          })()
-        )}
+          })()}
         <div className="composer-inner">
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}
           {modeNotice && (
-            <div className="mode-notice" dir="ltr">{modeNotice}</div>
+            <div className="mode-notice" dir="ltr">
+              {modeNotice}
+            </div>
+          )}
+          {prefixNotice && (
+            <div className="mode-notice prefix-notice" dir="ltr">
+              {prefixNotice}
+            </div>
           )}
           {compactNotice && (
-            <div className="mode-notice compact-notice" dir="ltr">{compactNotice}</div>
+            <div className="mode-notice compact-notice" dir="ltr">
+              {compactNotice}
+            </div>
+          )}
+          {compactError && (
+            <div className="mode-notice compact-notice compact-error" dir="ltr">
+              <span>Compact failed — {compactError}</span>
+              <button
+                type="button"
+                className="compact-retry-btn"
+                disabled={busy}
+                onClick={() => void compactContext()}
+              >
+                Retry
+              </button>
+              <button
+                type="button"
+                className="compact-dismiss-btn"
+                onClick={() => setCompactError(null)}
+                title="Dismiss"
+              >
+                ×
+              </button>
+            </div>
           )}
           <div className="composer-input-wrap">
             {cmdOpen && (
@@ -1481,11 +2208,11 @@ const contextUsed = useMemo(() => {
               </div>
             )}
             {skillOpen && (
-              <div className="mention-popup" dir="ltr">
+              <div className="mention-popup" ref={skillPopupRef} dir="ltr">
                 <input
                   className="mention-search"
                   type="text"
-                  placeholder="Search skills and MCP tools…"
+                  placeholder="Search connectors…"
                   value={skillQuery}
                   onChange={(e) => {
                     setSkillQuery(e.target.value);
@@ -1494,15 +2221,24 @@ const contextUsed = useMemo(() => {
                   onKeyDown={(e) => {
                     const move = (d: number) => {
                       if (skillOptions.length === 0) return;
-                      setSkillIdx((i) => (i + d + skillOptions.length) % skillOptions.length);
+                      setSkillIdx(
+                        (i) =>
+                          (i + d + skillOptions.length) % skillOptions.length,
+                      );
                     };
-                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") {
+                    if (
+                      (e.ctrlKey || e.metaKey) &&
+                      e.key.toLowerCase() === "n"
+                    ) {
                       e.preventDefault();
                       e.stopPropagation();
                       move(1);
                       return;
                     }
-                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+                    if (
+                      (e.ctrlKey || e.metaKey) &&
+                      e.key.toLowerCase() === "p"
+                    ) {
                       e.preventDefault();
                       e.stopPropagation();
                       move(-1);
@@ -1521,7 +2257,8 @@ const contextUsed = useMemo(() => {
                     if (e.key === "Enter") {
                       e.preventDefault();
                       const opt = skillOptions[skillIdx];
-                      if (opt) toggleSkillChip(opt);
+                      if (opt)
+                        setMcpEnabled(opt.name, !mcpEnabled.includes(opt.name));
                       return;
                     }
                     if (e.key === "Escape") {
@@ -1532,65 +2269,29 @@ const contextUsed = useMemo(() => {
                   }}
                   autoFocus
                 />
-                <div className="mention-group">Skills</div>
-                {filteredSkills.length === 0 && (
+                {Object.keys(mcpConnectors).length === 0 && (
                   <div className="mention-empty">
-                    {wsSkills.length === 0
-                      ? "No skills in this workspace — add them in Settings → Skills"
-                      : "No matching skills"}
-                  </div>
-                )}
-                {filteredSkills.map((s, i) => {
-                  const active = skillChips.some(
-                    (c) => c.kind === "skill" && c.name === s.name,
-                  );
-                  return (
-                    <div
-                      key={s.path}
-                      className={`mention-item ${active ? "active" : ""} ${i === skillIdx ? "kbd" : ""}`}
-                      onMouseEnter={() => setSkillIdx(i)}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        toggleSkillChip({
-                          kind: "skill",
-                          name: s.name,
-                          path: s.path,
-                        });
-                      }}
-                    >
-                      <span className="mention-icon-badge skill">✦</span>
-                      <span className="mention-rel">{s.name}</span>
-                      <span className="mention-hint">
-                        {s.description || s.path}
-                      </span>
-                    </div>
-                  );
-                })}
-                <div className="mention-group">MCP tools</div>
-                {filteredMcp.length === 0 && (
-                  <div className="mention-empty">
-                    {Object.keys(mcpConnectors).length === 0
-                      ? "No MCP connectors — add them in Settings → MCP"
-                      : "No matching MCP tools"}
+                    No MCP connectors — add them in Settings → MCP
                   </div>
                 )}
                 {filteredMcp.map((name, i) => {
-                  const active = skillChips.some(
-                    (c) => c.kind === "mcp" && c.name === name,
-                  );
+                  const on = mcpEnabled.includes(name);
                   return (
                     <div
                       key={name}
-                      className={`mention-item ${active ? "active" : ""} ${filteredSkills.length + i === skillIdx ? "kbd" : ""}`}
-                      onMouseEnter={() => setSkillIdx(filteredSkills.length + i)}
+                      className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
+                      onMouseEnter={() => setSkillIdx(i)}
                       onMouseDown={(e) => {
                         e.preventDefault();
-                        toggleSkillChip({ kind: "mcp", name });
+                        setMcpEnabled(name, !on);
                       }}
                     >
-                      <span className="mention-icon-badge mcp">🔌</span>
                       <span className="mention-rel">{name}</span>
-                      <span className="mention-hint">MCP server</span>
+                      <span className="mcp-switch">
+                        <span className="mcp-switch-track">
+                          <span className="mcp-switch-knob" />
+                        </span>
+                      </span>
                     </div>
                   );
                 })}
@@ -1600,8 +2301,17 @@ const contextUsed = useMemo(() => {
               ref={textareaRef}
               className="composer-input"
               rows={1}
-              dir="ltr"
-              style={{ direction: "ltr", textAlign: "left" }}
+              // Follows the app-wide dir toggle (same as message bubbles) instead of
+              // auto-detecting per keystroke: switching direction mid-sentence as
+              // soon as a Persian/Latin char appears was the actual "جابه‌جایی"
+              // problem — cursor and text order would jump while typing. A fixed
+              // dir means the textarea's own bidi handling of mixed FA/EN input
+              // stays stable and consistent with the rest of the UI.
+              dir={dir}
+              style={{
+                direction: dir,
+                textAlign: dir === "rtl" ? "right" : "left",
+              }}
               placeholder={
                 wroot
                   ? "Ask the agent…  (⌘P file · ⚡ skill · / command)"
@@ -1626,76 +2336,87 @@ const contextUsed = useMemo(() => {
               onClick={() => setNvimMentioned((m) => !m)}
             >
               <span className="nvim-glyph">nvim</span>
-              <span className="nvim-file">{nvimLabel}</span>
-              {nvimDiagCounts.error + nvimDiagCounts.warning + nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
-                <span className="nvim-lsp" dir="ltr">
-                  {nvimDiagCounts.error > 0 && (
-                    <span className="lsp-count lsp-error" title="LSP errors">
-                      {nvimDiagCounts.error}✕
-                    </span>
-                  )}
-                  {nvimDiagCounts.warning > 0 && (
-                    <span className="lsp-count lsp-warning" title="LSP warnings">
-                      {nvimDiagCounts.warning}!
-                    </span>
-                  )}
-                  {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
-                    <span className="lsp-count lsp-info" title="LSP info/hints">
-                      {nvimDiagCounts.info + nvimDiagCounts.hint}·
-                    </span>
-                  )}
-                </span>
-              )}
+              <span className="nvim-file">{nvimBadge}</span>
+              {nvimDiagCounts.error +
+                nvimDiagCounts.warning +
+                nvimDiagCounts.info +
+                nvimDiagCounts.hint >
+                0 && (
+                  <span className="nvim-lsp" dir="ltr">
+                    {nvimDiagCounts.error > 0 && (
+                      <span className="lsp-count lsp-error" title="LSP errors">
+                        {nvimDiagCounts.error}✕
+                      </span>
+                    )}
+                    {nvimDiagCounts.warning > 0 && (
+                      <span
+                        className="lsp-count lsp-warning"
+                        title="LSP warnings"
+                      >
+                        {nvimDiagCounts.warning}!
+                      </span>
+                    )}
+                    {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
+                      <span className="lsp-count lsp-info" title="LSP info/hints">
+                        {nvimDiagCounts.info + nvimDiagCounts.hint}·
+                      </span>
+                    )}
+                  </span>
+                )}
               <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
             </button>
           )}
 
-          {(attachments.length > 0 || images.length > 0 || skillChips.length > 0) && (
-            <div className="attachment-chips" dir="ltr">
-              {skillChips.map((c) => (
-                <span
-                  className={`attachment-chip skill-chip${c.kind === "mcp" ? " mcp-chip" : ""}`}
-                  key={`${c.kind}-${c.name}`}
-                >
-                  <span className="chip-icon-badge">{c.kind === "skill" ? "✦" : "🔌"}</span>
-                  {c.name}
-                  <button
-                    className="chip-x"
-                    onClick={() => toggleSkillChip(c)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-              {attachments.map((a) => (
-                <span className="attachment-chip" key={a}>
-                  {a}
-                  <button
-                    className="chip-x"
-                    onClick={() => removeAttachment(a)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-              {images.map((img) => (
-                <span className="attachment-chip image-chip" key={img.path}>
-                  {img.dataUrl ? (
-                    <img className="chip-thumb" src={img.dataUrl} alt="" />
-                  ) : (
-                    <span className="chip-thumb placeholder" />
-                  )}
-                  <span className="chip-name">{img.name}</span>
-                  <button
-                    className="chip-x"
-                    onClick={() => removeImage(img.path)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
+          {(attachments.length > 0 ||
+            images.length > 0 ||
+            skillChips.some((c) => c.kind === "skill")) && (
+              <div className="attachment-chips" dir="ltr">
+                {skillChips
+                  .filter((c) => c.kind === "skill")
+                  .map((c) => (
+                    <span
+                      className="attachment-chip skill-chip"
+                      key={`${c.kind}-${c.name}`}
+                    >
+                      <span className="chip-icon-badge">✦</span>
+                      {c.name}
+                      <button
+                        className="chip-x"
+                        onClick={() => toggleSkillChip(c)}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                {attachments.map((a) => (
+                  <span className="attachment-chip" key={a}>
+                    {a}
+                    <button
+                      className="chip-x"
+                      onClick={() => removeAttachment(a)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                {images.map((img) => (
+                  <span className="attachment-chip image-chip" key={img.path}>
+                    {img.dataUrl ? (
+                      <img className="chip-thumb" src={img.dataUrl} alt="" />
+                    ) : (
+                      <span className="chip-thumb placeholder" />
+                    )}
+                    <span className="chip-name">{img.name}</span>
+                    <button
+                      className="chip-x"
+                      onClick={() => removeImage(img.path)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
 
           <div className="composer-row">
             <span className="composer-left">
@@ -1705,12 +2426,27 @@ const contextUsed = useMemo(() => {
                 iconOnly
                 onChange={changeMode}
               />
+              <ProviderModelSelect />
+              <button
+                type="button"
+                className={`skills-toggle${autoSkills ? " on" : ""}`}
+                onClick={() => setAutoSkills(!autoSkills)}
+                title="Auto-use skills — pick the most relevant skills for each message (Coder mode)"
+                aria-pressed={autoSkills}
+              >
+                <span className="skills-toggle-track">
+                  <span className="skills-toggle-knob" />
+                </span>
+                <span className="skills-toggle-label">Skills</span>
+              </button>
             </span>
             <span className="composer-hint">
               {busy && (
                 <span className={`composer-working${stalled ? " warn" : ""}`}>
                   {stalled
-                    ? "Still waiting for the provider… (Stop to cancel)"
+                    ? toolRunningRef.current
+                      ? "Tool is still running… (Stop to cancel)"
+                      : "Still waiting for the provider… (Stop to cancel)"
                     : "Agent is working…"}
                 </span>
               )}
@@ -1802,10 +2538,10 @@ const contextUsed = useMemo(() => {
                 </svg>
               </button>
               <button
-                className={`icon-btn attach-btn${skillChips.length > 0 ? " has-chips" : ""}`}
+                className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
                 onClick={() => void openSkillPicker()}
                 disabled={busy}
-                title="Add skills / MCP tools to this message"
+                title="Add MCP tools to this message"
               >
                 <svg
                   viewBox="0 0 24 24"
@@ -1817,6 +2553,9 @@ const contextUsed = useMemo(() => {
                 >
                   <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
                 </svg>
+                {mcpEnabled.length > 0 && (
+                  <span className="attach-count">{mcpEnabled.length}</span>
+                )}
               </button>
               {busy ? (
                 <button

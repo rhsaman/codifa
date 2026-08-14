@@ -1,123 +1,814 @@
-import { useCallback, useEffect, useState } from 'react'
-import type { AgentModeDef, McpServerConfig, McpTransport, ModeCapabilities, ProviderConfig, ProviderKind } from '../types'
-import { useStore, DEFAULT_MAX_HISTORY } from '../lib/store'
-import { fetchModels } from '../lib/api'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
+import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
+import { useStore, DEFAULT_MAX_HISTORY, flushStateNow } from '../lib/store'
+import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
 import { api } from '../lib/fs'
 import { supportsReasoning } from '../lib/thinking'
-import { allModes, BUILTIN_IDS } from '../lib/modes'
-import { ModelPicker } from './ModelPicker'
+import { allModes } from '../lib/modes'
+import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 
-const KIND_LABELS: Record<ProviderKind, string> = {
-  opencode: 'opencode gateway',
-  openrouter: 'OpenRouter',
-  custom: 'Custom API',
-  ollama: 'Local',
+const KIND_LABELS: Record<ProviderKind, string> = Object.fromEntries(
+  Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
+) as Record<ProviderKind, string>
+
+const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
+  .filter((m) => m.builtin)
+  .map((m) => m.kind)
+const NEW_SKILL_KEY = '__new_skill__'
+
+function modelLabelForOpts(kind: ProviderKind, providerId: string, m: string): string {
+  return PROVIDER_META[kind]?.unprefixedModelId ? m : `${providerId}/${m}`
 }
 
-const BUILTIN_KINDS: ProviderKind[] = ['opencode', 'openrouter', 'ollama']
-const OPENCODE_DEFAULT_BASE = 'https://opencode.ai/zen/v1'
+/** Strip a redundant "providerId/" prefix from a model id (a model can get
+ *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
+ *  doubled as "openrouter/openrouter/free". */
+function bareModelFor(p: ProviderConfig, m: string): string {
+  return m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
+}
+
+// Live model lists fetched from each provider's /models endpoint, cached for
+// the session so reopening the picker doesn't refetch unchanged providers.
+const SUBAGENT_LIVE_CACHE = new Map<string, string[]>()
+
+function providerSig(p: ProviderConfig): string {
+  return [
+    p.id, p.kind, p.baseUrl, p.apiKey, p.envVar,
+    p.authType, p.oauthClientId, p.oauthClientSecret, p.oauthRefreshToken,
+  ].join('|')
+}
+
+function SubagentModelSelect({
+  agent, label, desc, current, onSelect,
+}: {
+  agent: string
+  label: string
+  desc: string
+  current: string
+  onSelect: (agent: string, model: string) => void
+}) {
+  const providers = useStore((s) => s.settings.providers)
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
+  const [live, setLive] = useState<Record<string, string[]>>({})
+  const [fetching, setFetching] = useState<Record<string, boolean>>({})
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const q = search.trim().toLowerCase()
+
+  // Union of the provider's live /models results and its saved list, so the
+  // subagent picker can search & pick any model the provider actually offers
+  // (matching the main composer picker) — not just the ones already saved.
+  const modelsFor = (p: ProviderConfig): string[] => {
+    const removed = new Set(p.removedModels ?? [])
+    const out = new Set<string>()
+    for (const m of live[p.id] ?? []) {
+      const b = bareModelFor(p, m)
+      if (!removed.has(b)) out.add(b)
+    }
+    for (const m of p.models ?? []) out.add(bareModelFor(p, m))
+    if (p.model) {
+      const b = bareModelFor(p, p.model)
+      if (!removed.has(b)) out.add(b)
+    }
+    return Array.from(out)
+  }
+
+  const ensureFetched = (p: ProviderConfig) => {
+    const sig = providerSig(p)
+    if (SUBAGENT_LIVE_CACHE.has(sig)) {
+      const cached = SUBAGENT_LIVE_CACHE.get(sig)!
+      setLive((l) => (l[p.id] === cached ? l : { ...l, [p.id]: cached }))
+      return
+    }
+    if (fetching[p.id]) return
+    setFetching((f) => ({ ...f, [p.id]: true }))
+    fetchModels(p)
+      .then((res) => {
+        SUBAGENT_LIVE_CACHE.set(sig, res.models)
+        setLive((l) => ({ ...l, [p.id]: res.models }))
+      })
+      .catch(() => {
+        /* keep the provider's saved list when /models is unavailable */
+      })
+      .finally(() => {
+        setFetching((f) => ({ ...f, [p.id]: false }))
+      })
+  }
+
+  // Kick off a live /models fetch for every provider when the menu opens.
+  useEffect(() => {
+    if (!open) return
+    for (const p of providers) ensureFetched(p)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  // `current` is stored as "providerId/model" (route through that provider).
+  // Legacy values may still be a bare model id or carry an old prefix — resolve
+  // a readable label in every case.
+  const currentLabel = (() => {
+    if (!current) return 'Use parent model'
+    const slash = current.indexOf('/')
+    if (slash > 0) {
+      const pid = current.slice(0, slash)
+      const p = providers.find((x) => x.id === pid)
+      // "providerId/model": show it only when the provider is NOT the active
+      // one (the subagent runs on a different provider), else show the bare
+      // model id. Legacy bare ids are shown as-is. A doubled prefix from a
+      // previously saved value ("providerId/providerId/model") is collapsed.
+      if (p && p.id !== 'opencode') return current.startsWith(`${p.id}/${p.id}/`) ? current.slice(p.id.length + 1) : current
+      if (p) return current.slice(slash + 1)
+    }
+    return current
+  })()
+
+  // Opening the combo box always starts from a clean search box — past
+  // selection stays visible via the "active" checkmark in the list below,
+  // not by pre-filling the input (which would just filter results down to
+  // the current pick instead of showing everything to browse/search).
+  const openMenu = () => {
+    if (open) return
+    setOpen(true)
+    setSearch('')
+  }
+
+  const closeMenu = () => {
+    setOpen(false)
+    setSearch('')
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        closeMenu()
+      }
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  const toggle = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const pick = (p: ProviderConfig, m: string) => {
+    // Store "providerId/model" so the subagent can route through a DIFFERENT
+    // provider than the active one (e.g. a local llama.cpp instance while the
+    // main model is a cloud gateway). The backend resolves the prefix from the
+    // saved provider config; a bare id (no prefix) still means "use the active
+    // provider". This also preserves which provider a model came from in the
+    // picker UI.
+    onSelect(agent, `${p.id}/${bareModelFor(p, m)}`)
+    closeMenu()
+    inputRef.current?.blur()
+  }
+
+  // Filter providers by name AND narrow the models shown to those matching the
+  // query (exactly like the composer picker), auto-expanding matches while
+  // searching so the result is visible immediately.
+  const visibleProviders = providers.map((p) => {
+    const all = modelsFor(p)
+    // Fuzzy (term-AND) search identical to the main composer picker: split the
+    // query into space-separated terms and require EVERY term to appear in the
+    // provider name OR model label — so any word of a model id (e.g. "deep"
+    // "v4" "flash") finds it, not just the full exact string.
+    const terms = q.split(/\s+/).filter(Boolean)
+    const models = terms.length
+      ? all.filter((m) => {
+          const hay = `${p.name} ${modelLabelForOpts(p.kind, p.id, m)}`.toLowerCase()
+          return terms.every((t) => hay.includes(t))
+        })
+      : all
+    const nameMatch = terms.length > 0 && p.name.toLowerCase().includes(q)
+    const visible = !terms.length || models.length > 0 || nameMatch
+    return { p, models, visible }
+  }).filter((x) => x.visible)
+
+  return (
+    <div className="field">
+      <div className="field-head">
+        <label>{label}</label>
+      </div>
+      <div className="hint">{desc}</div>
+      {/* Combo box: the trigger IS the search input — no separate search field
+          appears only after opening. Closed, it shows the current pick as a
+          placeholder (button-like); focusing/clicking it opens the dropdown
+          and immediately accepts typing to filter. */}
+      <div className={`model-select combo${open ? ' open' : ''}`} ref={wrapRef}>
+        <div className="model-select-combo-box">
+          <svg className="model-select-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.2-3.2" />
+          </svg>
+          <input
+            ref={inputRef}
+            className="model-select-combo-input"
+            value={search}
+            placeholder={open ? 'Search models…' : currentLabel}
+            dir="ltr"
+            onFocus={openMenu}
+            onClick={openMenu}
+            onChange={(e) => {
+              if (!open) setOpen(true)
+              setSearch(e.target.value)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') { closeMenu(); inputRef.current?.blur() }
+            }}
+          />
+          <span className="model-select-combo-chevron">{open ? '▴' : '▾'}</span>
+        </div>
+        {open && (
+          <div className="model-select-dropdown combo">
+            <div className="model-select-list">
+              <button
+                className={`model-select-item ${!current ? 'current' : ''}`}
+                onMouseDown={(e) => { e.preventDefault(); onSelect(agent, ''); closeMenu(); inputRef.current?.blur() }}
+                type="button"
+              >
+                Use parent model
+              </button>
+              {visibleProviders.map(({ p, models }) => {
+                const isOpen = q ? true : expanded.has(p.id)
+                return (
+                  <div key={p.id} className={`pm-provider${isOpen ? ' open' : ''}`}>
+                    <button
+                      type="button"
+                      className="pm-provider-name"
+                      onClick={() => toggle(p.id)}
+                    >
+                      <span className="pm-provider-caret">{isOpen ? '▾' : '▸'}</span>
+                      <span className="pm-provider-dot" aria-hidden />
+                      <span className="pm-provider-label">{p.name}</span>
+                      <span className="pm-provider-count">{modelsFor(p).length}</span>
+                    </button>
+                    {isOpen && (
+                      <div className="pm-models">
+                        {models.map((m) => {
+                          // Highlight the active subagent model: current is
+                          // stored as "providerId/model" now (bare model ids
+                          // from legacy configs still match via the stripped
+                          // comparison).
+                          const isActive =
+                            current === `${p.id}/${m}` ||
+                            current === m ||
+                            current.slice(current.indexOf('/') + 1) === m ||
+                            current.slice(current.indexOf('/') + 1) === `${p.id}/${m}`
+                          return (
+                            <button
+                              key={m}
+                              type="button"
+                              className={`mode-menu-item pm-model ${isActive ? 'active' : ''}`}
+                              onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
+                            >
+                              {!PROVIDER_META[p.kind]?.unprefixedModelId && (
+                                <span className="pm-model-provider">{p.id}/</span>
+                              )}
+                              <span className="pm-model-name">{m}</span>
+                            </button>
+                          )
+                        })}
+                        {models.length === 0 && (
+                          <div className="pm-hint">No models match “{search.trim()}”.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+              {visibleProviders.length === 0 && (
+                <div className="pm-empty">
+                  <span>No models match “{search.trim()}”.</span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const SEARCH_ENGINE_KINDS: Array<{ kind: SearchPluginKind; label: string; needsKey: boolean }> = [
+  { kind: 'duckduckgo', label: 'DuckDuckGo', needsKey: false },
+  { kind: 'tavily', label: 'Tavily', needsKey: true },
+]
+
+/** Settings → Plugins: web-search engine priority. */
+function PluginEditor() {
+  const searchPlugins = useStore((s) => s.searchPlugins)
+  const setSearchPlugins = useStore((s) => s.setSearchPlugins)
+
+  const plugins: SearchPluginConfig[] = searchPlugins.length > 0
+    ? searchPlugins
+    : [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }]
+
+  const move = (index: number, dir: -1 | 1) => {
+    const next = [...plugins]
+    const target = index + dir
+    if (target < 0 || target >= next.length) return
+    const [a, b] = [next[index], next[target]]
+    next[index] = { ...b, order: index }
+    next[target] = { ...a, order: target }
+    setSearchPlugins(next)
+  }
+
+  const toggle = (index: number, enabled: boolean) => {
+    setSearchPlugins(plugins.map((p, i) => (i === index ? { ...p, enabled } : p)))
+  }
+
+  const patch = (index: number, partial: Partial<SearchPluginConfig>) => {
+    setSearchPlugins(plugins.map((p, i) => (i === index ? { ...p, ...partial } : p)))
+  }
+
+  const addEngine = (kind: SearchPluginKind) => {
+    if (plugins.some((p) => p.kind === kind)) return
+    const meta = SEARCH_ENGINE_KINDS.find((k) => k.kind === kind)
+    setSearchPlugins([
+      ...plugins.map((p) => ({ ...p })),
+      { kind, label: meta?.label ?? kind, enabled: true, order: plugins.length } as SearchPluginConfig,
+    ])
+  }
+
+  const removeEngine = (index: number) => {
+    setSearchPlugins(plugins.filter((_, i) => i !== index).map((p, i) => ({ ...p, order: i })))
+  }
+
+  return (
+    <>
+      <div className="field">
+        <div className="field-head">
+          <label>Web Search engines</label>
+        </div>
+        <div className="hint">
+          The top engine is the <strong>primary</strong>; the ones below are tried in order as
+          fallbacks until one returns results. DuckDuckGo needs no API key; a disabled engine is
+          never used.
+        </div>
+        <div className="plugin-list">
+          {plugins.map((p, i) => {
+            const meta = SEARCH_ENGINE_KINDS.find((k) => k.kind === p.kind)
+            return (
+              <div className={`plugin-row${p.enabled ? '' : ' off'}`} key={p.kind}>
+                <div className="plugin-row-head">
+                  <span className="plugin-kind">{p.label}</span>
+                  {i === 0 ? (
+                    <span className="plugin-badge primary">Primary</span>
+                  ) : (
+                    <span className="plugin-badge">Fallback #{i}</span>
+                  )}
+                  <span className="plugin-role-hint">
+                    {p.enabled ? (i === 0 ? 'used first' : 'tried next') : 'disabled'}
+                  </span>
+                  <span className="plugin-spacer" />
+                  <span className="plugin-arrows">
+                    <button
+                      className="btn tiny icon"
+                      title="Move up"
+                      disabled={i === 0}
+                      onClick={() => move(i, -1)}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      className="btn tiny icon"
+                      title="Move down"
+                      disabled={i === plugins.length - 1}
+                      onClick={() => move(i, 1)}
+                    >
+                      ↓
+                    </button>
+                    <button
+                      className="btn tiny icon danger"
+                      title="Remove"
+                      onClick={() => removeEngine(i)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                  <label className="plugin-switch" title={p.enabled ? 'Disable' : 'Enable'}>
+                    <input
+                      type="checkbox"
+                      checked={p.enabled}
+                      onChange={(e) => toggle(i, e.target.checked)}
+                    />
+                    <span className="plugin-switch-track" />
+                  </label>
+                </div>
+                {meta?.needsKey && p.enabled && (
+                  <div className="plugin-fields">
+                    <label className="field-label">API key</label>
+                    <input
+                      value={p.apiKey ?? ''}
+                      onChange={(e) => patch(i, { apiKey: e.target.value })}
+                      placeholder={`${p.label} API key`}
+                      dir="ltr"
+                      type="password"
+                    />
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        <div className="skill-actions">
+          {SEARCH_ENGINE_KINDS.filter((k) => k.kind !== 'duckduckgo' && !plugins.some((p) => p.kind === k.kind)).map((k) => (
+            <button key={k.kind} className="btn tiny" onClick={() => addEngine(k.kind)}>
+              + Add {k.label}
+            </button>
+          ))}
+        </div>
+        <div className="hint" style={{ marginTop: 12 }}>
+          Tavily uses a plain API key. Search Console (site analytics) uses the Google account signed in
+          under Settings → Auth automatically, and DuckDuckGo needs no key.
+        </div>
+      </div>
+    </>
+  )
+}
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
   const addProvider = useStore((s) => s.addProvider)
   const removeProvider = useStore((s) => s.removeProvider)
-  const setActiveProvider = useStore((s) => s.setActiveProvider)
   const setProviderModels = useStore((s) => s.setProviderModels)
   const removeProviderModel = useStore((s) => s.removeProviderModel)
-  const recentModels = useStore((s) => s.recentModels)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
-  const upsertMode = useStore((s) => s.upsertMode)
   const removeMode = useStore((s) => s.removeMode)
   const fontSize = useStore((s) => s.fontSize)
   const setFontSize = useStore((s) => s.setFontSize)
+  const dataPath = useStore((s) => s.dataPath)
+  const setDataPath = useStore((s) => s.setDataPath)
+  const memoryTtlDays = useStore((s) => s.memoryTtlDays)
+  const memoryMaxDocs = useStore((s) => s.memoryMaxDocs)
+  const memoryMaxChunks = useStore((s) => s.memoryMaxChunks)
+  const setMemoryConfig = useStore((s) => s.setMemoryConfig)
+  const whisperModel = useStore((s) => s.whisperModel)
+  const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
+  const embeddingModel = useStore((s) => s.embeddingModel)
+  const embeddingBaseUrl = useStore((s) => s.embeddingBaseUrl)
+  const setWhisperModel = useStore((s) => s.setWhisperModel)
+  const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
+  const setEmbeddingModel = useStore((s) => s.setEmbeddingModel)
+  const setEmbeddingBaseUrl = useStore((s) => s.setEmbeddingBaseUrl)
+  const subagentModels = useStore((s) => s.subagentModels)
+  const setSubagentModel = useStore((s) => s.setSubagentModel)
+  const taskTtlHours = useStore((s) => s.taskTtlHours)
+  const shortTermTtlHours = useStore((s) => s.shortTermTtlHours)
+  const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
+  const memorySlidingTtl = useStore((s) => s.memorySlidingTtl)
+  const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
+  const root = useStore((s) => s.root)
 
   const providers = settings.providers
-  const active = providers.find((p) => p.id === settings.activeProviderId) ?? providers[0]
+  // Which provider's config is being EDITED in this dialog. Deliberately NOT
+  // derived from settings.activeProviderId — visiting Settings must never
+  // switch the app's active provider / main model.
+  const [editId, setEditId] = useState(settings.activeProviderId)
+  const active = providers.find((p) => p.id === editId) ?? providers[0]
 
   const [cfg, setCfg] = useState<ProviderConfig>({ ...active })
-  const [ctxMap, setCtxMap] = useState<Record<string, number>>({})
-  const [loadingModels, setLoadingModels] = useState(false)
-  const [modelError, setModelError] = useState('')
+  const [customModel, setCustomModel] = useState('')
   const [saved, setSaved] = useState(false)
+  // Google OAuth sign-in progress: "" idle, "busy" while the consent window is
+  // open, "ok"/"error" + message when the flow settles.
+  const [oauthState, setOauthState] = useState<{ status: string; msg: string }>({ status: '', msg: '' })
   const [maxHistoryInput, setMaxHistoryInput] = useState(String(active.maxHistory ?? DEFAULT_MAX_HISTORY))
   const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
+  // Which credential source the provider being edited will use: 'env' (an
+  // environment variable that must already exist) or 'key' (an API key stored
+  // encrypted at rest). Exactly ONE is active — the user picks, never both.
+  const [credMode, setCredMode] = useState<'env' | 'key'>(() => ((cfg.apiKey ?? '').trim() ? 'key' : 'env'))
+  // True once Save was blocked for a provider that has no usable credential.
+  const [credWarn, setCredWarn] = useState(false)
+  // Readiness checks for the provider being edited (drives the banner at the
+  // top of the form so the problem is visible BEFORE a message is sent).
+  const hasSavedKey = !!(cfg.apiKey ?? '').trim()
+  const credentialReady = envVarValue === true || hasSavedKey
+  const oauthReady = providerMeta(cfg.kind).oauth && cfg.authType === 'oauth' && !!(cfg.oauthRefreshToken ?? '')
+  const requiresKey = providerMeta(cfg.kind).requiresKey
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>(() => {
     const d: Record<string, string> = {}
     for (const m of allModes(settings)) d[m.id] = settings.systemPrompts?.[m.id] ?? ''
     return d
   })
-  const [modeDrafts, setModeDrafts] = useState<Record<string, AgentModeDef>>(() =>
-    Object.fromEntries((settings.modes ?? []).map((m) => [m.id, { ...m }])),
-  )
 
-  const [tab, setTab] = useState<'providers' | 'modes' | 'fonts' | 'skills' | 'mcp'>('providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'fonts' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models'>('providers')
+  const googleProvider = providers.find((p) => p.kind === 'google')
+  const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
+    clientId: googleProvider?.oauthClientId ?? '',
+    clientSecret: googleProvider?.oauthClientSecret ?? '',
+  })
+  useEffect(() => {
+    setGoogleAuthDraft({
+      clientId: googleProvider?.oauthClientId ?? '',
+      clientSecret: googleProvider?.oauthClientSecret ?? '',
+    })
+  }, [googleProvider?.oauthClientId, googleProvider?.oauthClientSecret])
+
+  // Close the whole settings window with Escape (unless focus is in a text
+  // field, where Escape is used by the inner dropdowns/search boxes).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      if (
+        e.key === 'Escape' &&
+        t &&
+        t.tagName !== 'INPUT' &&
+        t.tagName !== 'TEXTAREA' &&
+        t.tagName !== 'SELECT'
+      ) {
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // ---- Managed on-device models (Settings → Models) ----
+  const [mStatus, setMStatus] = useState<ModelsStatus | null>(null)
+  const [modelsMsg, setModelsMsg] = useState('')
+  // ---- Data path (Settings → Memory) ----
+  const [dataMsg, setDataMsg] = useState('')
+  const [migrating, setMigrating] = useState(false)
+  const [migrateLabel, setMigrateLabel] = useState('')
+  const [migratePct, setMigratePct] = useState(0)
+
+  const applyDataPath = async () => {
+    setDataMsg('')
+    const target = (dataPath ?? '').trim()
+    if (!target) return
+    setMigrating(true)
+    setMigrateLabel('Preparing…')
+    setMigratePct(0)
+    const unsub = api.onMigrateProgress((evt) => {
+      setMigrateLabel(evt.label)
+      setMigratePct(evt.pct)
+    })
+    try {
+      const resolved = await api.moveDataPath(target)
+      setDataPath(resolved)
+      setDataMsg(`All data moved to ${resolved}. The old location is now empty.`)
+    } catch (err) {
+      setDataMsg(`Could not move data: ${(err as Error).message}`)
+    } finally {
+      unsub()
+      setMigrating(false)
+      setMigrateLabel('')
+      setMigratePct(0)
+    }
+  }
+
+  // ---- Memory TTL / caps + clear (Settings → Memory) ----
+  const [ttlInput, setTtlInput] = useState(String(memoryTtlDays))
+  const [maxDocsInput, setMaxDocsInput] = useState(String(memoryMaxDocs))
+  const [maxChunksInput, setMaxChunksInput] = useState(String(memoryMaxChunks))
+  const [taskTtlInput, setTaskTtlInput] = useState(String(taskTtlHours))
+  const [shortTermTtlInput, setShortTermTtlInput] = useState(String(shortTermTtlHours))
+  const [cacheTtlInput, setCacheTtlInput] = useState(String(cacheTtlMinutes))
+  const [slidingInput, setSlidingInput] = useState(memorySlidingTtl)
+  const [memMsg, setMemMsg] = useState('')
+  const [memStats, setMemStats] = useState<MemoryStats | null>(null)
+  const [clearing, setClearing] = useState(false)
+
+  useEffect(() => {
+    setTtlInput(String(memoryTtlDays))
+    setMaxDocsInput(String(memoryMaxDocs))
+    setMaxChunksInput(String(memoryMaxChunks))
+  }, [memoryTtlDays, memoryMaxDocs, memoryMaxChunks])
+
+  const refreshMemStats = useCallback(async () => {
+    if (!root) {
+      setMemStats(null)
+      return
+    }
+    setMemStats(await getMemoryStats(root))
+  }, [root])
+
+  useEffect(() => {
+    if (tab !== 'memory') return
+    void refreshMemStats()
+  }, [tab, refreshMemStats])
+
+  const applyMemoryConfig = () => {
+    setMemMsg('')
+    const ttl = parseInt(ttlInput, 10)
+    const maxDocs = parseInt(maxDocsInput, 10)
+    const maxChunks = parseInt(maxChunksInput, 10)
+    if (!Number.isFinite(ttl) || ttl < 1) {
+      setMemMsg('TTL must be at least 1 day.')
+      return
+    }
+    if (!Number.isFinite(maxDocs) || maxDocs < 10) {
+      setMemMsg('Max documents must be at least 10.')
+      return
+    }
+    if (!Number.isFinite(maxChunks) || maxChunks < 50) {
+      setMemMsg('Max chunks must be at least 50.')
+      return
+    }
+    setMemoryConfig({ ttlDays: ttl, maxDocs, maxChunks })
+    setMemMsg(`Saved: TTL ${ttl} days, max ${maxDocs} docs, max ${maxChunks} chunks. Applied on the next run.`)
+    void refreshMemStats()
+  }
+
+  const doClearMemory = async () => {
+    if (!root) {
+      setMemMsg('No active workspace to clear.')
+      return
+    }
+    if (!window.confirm('Clear all RAG memory for this workspace? Memory notes and saved web pages will be permanently deleted.')) return
+    setClearing(true)
+    setMemMsg('')
+    try {
+      const res = await clearMemory(root)
+      setMemMsg(res.ok ? 'RAG memory cleared.' : `Could not clear: ${res.error ?? 'unknown error'}`)
+    } catch (err) {
+      setMemMsg(`Could not clear: ${(err as Error).message}`)
+    } finally {
+      setClearing(false)
+      void refreshMemStats()
+    }
+  }
+
+  const refreshModels = useCallback(async () => {
+    setMStatus(await getModelsStatus())
+  }, [])
+
+  // Poll while the modal is open so download progress / completion shows live.
+  useEffect(() => {
+    void refreshModels()
+    const id = setInterval(() => void refreshModels(), 2500)
+    return () => clearInterval(id)
+  }, [refreshModels])
+
+  const isRunning = (kind: 'whisper' | 'embedding') =>
+    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
+    'downloading'
+
+  const actDownload = async (kind: 'whisper' | 'embedding') => {
+    const repo = kind === 'whisper' ? whisperModel : embeddingModel
+    const base = kind === 'whisper' ? whisperBaseUrl : embeddingBaseUrl
+    setModelsMsg('')
+    try {
+      await downloadModel(kind, repo, base)
+      setModelsMsg(`Downloading ${repo}… (status below updates automatically)`)
+      void refreshModels()
+    } catch (err) {
+      setModelsMsg(`Download failed: ${(err as Error).message}`)
+    }
+  }
+
+  const actRemove = async (kind: 'whisper' | 'embedding', repo: string) => {
+    setModelsMsg('')
+    try {
+      await removeModel(kind, repo)
+      void refreshModels()
+    } catch (err) {
+      setModelsMsg(`Remove failed: ${(err as Error).message}`)
+    }
+  }
 
   const modes = allModes(settings)
 
   // ---- Skills & MCP tab state ----
-  const root = useStore((s) => s.root)
-
   const mcpServers = settings.mcpServers ?? {}
+  const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
   const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string }>>([])
-  const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
-  const [skillRaw, setSkillRaw] = useState('')
+  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
   const [skillsMsg, setSkillsMsg] = useState('')
+  const [skillFilter, setSkillFilter] = useState('')
+  const [mcpFilter, setMcpFilter] = useState('')
+  const [addingMcp, setAddingMcp] = useState(false)
 
-  const reloadSkills = useCallback(async (preferPath?: string) => {
-    const found: Array<{ name: string; path: string; raw: string }> = []
-    const entries = await api.coderList('skills').catch(() => [])
-    for (const e of entries) {
-      if (e.kind !== 'dir') continue
-      const rel = `skills/${e.name}/SKILL.md`
-      const r = await api.coderRead(rel).catch(() => null)
-      if (r) found.push({ name: e.name, path: rel, raw: r.content })
-    }
+  const reloadSkills = useCallback(async (preferName?: string) => {
+    const rows = await listSkills()
+    const found = rows.map((r) => ({ name: r.name, path: r.path, raw: r.content }))
     setSkills(found)
-    const target =
-      (preferPath && found.some((f) => f.path === preferPath) && preferPath) ||
-      (selectedSkill && found.some((f) => f.path === selectedSkill) ? selectedSkill : null)
-    setSelectedSkill(target)
-    setSkillRaw(target ? found.find((f) => f.path === target)?.raw ?? '' : '')
-  }, [selectedSkill])
+    setSkillDrafts((prev) => {
+      const names = new Set(found.map((f) => f.name))
+      const next: Record<string, string> = {}
+      for (const [k, v] of Object.entries(prev)) if (names.has(k)) next[k] = v
+      return next
+    })
+    if (preferName) {
+      setExpandedSkills((prev) => new Set(prev).add(preferName))
+      setSkillDrafts((prev) =>
+        prev[preferName] !== undefined
+          ? prev
+          : { ...prev, [preferName]: found.find((f) => f.name === preferName)?.raw ?? '' },
+      )
+    }
+  }, [])
 
   useEffect(() => {
     void reloadSkills()
   }, [reloadSkills])
 
-  const selectSkill = (path: string) => {
-    setSelectedSkill(path)
-    const s = skills.find((x) => x.path === path)
-    setSkillRaw(s?.raw ?? '')
+  const toggleSkill = (name: string) => {
+    setExpandedSkills((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+    setSkillDrafts((prev) => {
+      if (prev[name] !== undefined) return prev
+      return { ...prev, [name]: skills.find((x) => x.name === name)?.raw ?? '' }
+    })
+    setSkillsMsg('')
   }
 
-  const saveSkill = async () => {
-    if (!selectedSkill) return
-    const ok = await api.coderWrite(selectedSkill, skillRaw)
-    setSkillsMsg(ok ? 'Saved ✓' : 'Save failed.')
-    if (ok) void reloadSkills(selectedSkill)
+  const saveSkill = async (name: string) => {
+    const content = skillDrafts[name] ?? ''
+    const meta = skillMeta(content)
+    const newName = (meta.name || (name !== NEW_SKILL_KEY ? name : '') || 'new-skill').trim()
+    if (!content.trim()) {
+      setSkillsMsg('Nothing to save.')
+      return
+    }
+    const res = await syncSkill({
+      name: newName,
+      previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
+      content,
+    })
+    setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
+    if (res.ok) {
+      const savedName = res.name || newName
+      setSkillDrafts((prev) => {
+        const next = { ...prev }
+        if (name !== NEW_SKILL_KEY && name !== savedName) delete next[name]
+        next[savedName] = content
+        return next
+      })
+      setExpandedSkills((prev) => {
+        const next = new Set(prev)
+        if (name === NEW_SKILL_KEY || name !== savedName) next.delete(name)
+        next.add(savedName)
+        return next
+      })
+      void reloadSkills(savedName)
+    }
   }
 
-  const deleteSkill = async () => {
-    if (!selectedSkill) return
-    const folder = selectedSkill.slice(0, -'/SKILL.md'.length)
-    if (!window.confirm(`Delete skill "${folder}"?`)) return
-    const ok = await api.coderDelete(folder)
-    setSkillsMsg(ok ? 'Deleted.' : 'Delete failed.')
-    if (ok) void reloadSkills()
+  const deleteSkill = async (name: string) => {
+    if (!window.confirm(`Delete skill "${name}"?`)) return
+    const res = await syncSkill({ name, delete: true })
+    setSkillsMsg(res.ok ? 'Deleted.' : `Delete failed: ${res.note ?? 'unknown error'}`)
+    if (res.ok) {
+      setExpandedSkills((prev) => {
+        const next = new Set(prev)
+        next.delete(name)
+        return next
+      })
+      setSkillDrafts((prev) => {
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
+      void reloadSkills()
+    }
   }
 
-  // Keep the local editor in sync when the active provider changes.
+  const newSkill = () => {
+    setExpandedSkills((prev) => new Set(prev).add(NEW_SKILL_KEY))
+    setSkillDrafts((prev) => ({
+      ...prev,
+      [NEW_SKILL_KEY]:
+        '---\nname: new-skill\n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
+    }))
+    setSkillsMsg('Editing a new skill — fill in the details, then press Save skill.')
+  }
+
+  // Keep the local editor in sync when the edited provider changes.
   useEffect(() => {
     setCfg({ ...active })
-    setCtxMap({})
-    setModelError('')
+    setCustomModel('')
     setMaxHistoryInput(String(active.maxHistory ?? DEFAULT_MAX_HISTORY))
-  }, [settings.activeProviderId, active.id])
+  }, [editId, active.id])
+
+  // Derive the credential method when switching providers: a saved API key wins,
+  // otherwise show the env-var option (so the default env var names never look
+  // like configured keys).
+  useEffect(() => {
+    setCredMode((cfg.apiKey ?? '').trim() ? 'key' : 'env')
+    setCredWarn(false)
+  }, [editId, active.id])
 
   // Check whether the provider's env var currently has a value in the environment.
   useEffect(() => {
@@ -136,18 +827,25 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     }
   }, [cfg.envVar, active.id])
 
-  // Fetch & persist the model list for the active provider.
+  // Fetch & persist the model list for the active provider (merged with any
+  // manually added models so they are never overwritten). Models the user
+  // explicitly removed stay removed — they are excluded from the merge.
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      setModelError('')
-      setLoadingModels(true)
       try {
         const res = await fetchModels(cfg)
         if (cancelled) return
-        setCtxMap(res.context)
         useStore.getState().setProviderContextMap(active.id, res.context)
-        if (res.models.length > 0) setProviderModels(active.id, res.models)
+        if (res.models.length > 0) {
+          const current = useStore.getState().settings.providers.find((p) => p.id === active.id)
+          const existing = current?.models ?? []
+          const removed = new Set(current?.removedModels ?? [])
+          setProviderModels(
+            active.id,
+            Array.from(new Set([...res.models.filter((m) => !removed.has(m)), ...existing])),
+          )
+        }
         setCfg((c) => {
           if (c.model) return c
           const first = res.models[0]
@@ -155,10 +853,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             ? { ...c, model: first, contextWindow: res.context[first] || c.contextWindow }
             : c
         })
-      } catch (err) {
-        if (!cancelled) setModelError((err as Error).message)
-      } finally {
-        if (!cancelled) setLoadingModels(false)
+      } catch {
+        /* /models may be unreachable; keep the saved list */
       }
     })()
     return () => {
@@ -167,70 +863,99 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active.id, cfg.baseUrl, cfg.apiKey, cfg.kind])
 
-  const setModel = (model: string) => {
-    const ctx = ctxMap[model] ?? 0
-    setCfg((c) => ({ ...c, model, contextWindow: ctx || c.contextWindow }))
-    if (model && !(active.models ?? []).includes(model)) {
-      setProviderModels(active.id, [...(active.models ?? []), model])
-    }
+  const addCustomModel = () => {
+    const m = customModel.trim()
+    if (!m) return
+    setProviderModels(active.id, [...(active.models ?? []), m])
+    setCustomModel('')
   }
-
-  const selectedCtx = cfg.contextWindow && cfg.contextWindow > 0 ? cfg.contextWindow : undefined
 
   const setPrompt = (mode: string, value: string) =>
     setPromptDrafts((d) => ({ ...d, [mode]: value }))
+
+  const persistGoogleAuth = (patch: Partial<ProviderConfig>) => {
+    if (googleProvider) updateProvider(googleProvider.id, patch)
+  }
+
+  const signInGoogle = async () => {
+    const cid = googleAuthDraft.clientId.trim()
+    if (!cid) {
+      setOauthState({ status: 'error', msg: 'Paste your Google OAuth client id first.' })
+      return
+    }
+    setOauthState({ status: 'busy', msg: 'Opening Google sign-in…' })
+    try {
+      const res = await api.googleSignIn(cid, googleAuthDraft.clientSecret)
+      persistGoogleAuth({
+        authType: 'oauth',
+        oauthClientId: cid,
+        oauthClientSecret: googleAuthDraft.clientSecret,
+        oauthRefreshToken: res.refreshToken,
+      })
+      setOauthState({ status: 'ok', msg: 'Signed in — Google account connected.' })
+    } catch (err) {
+      setOauthState({
+        status: 'error',
+        msg: err instanceof Error ? err.message : 'Google sign-in failed.',
+      })
+    }
+  }
+
+  const disconnectGoogle = () => {
+    persistGoogleAuth({ authType: '', oauthRefreshToken: '' })
+    setOauthState({ status: 'ok', msg: 'Google account disconnected.' })
+  }
+
+  // Switching to the env-var method drops any stored API key so only ONE
+  // credential ever applies (the backend prefers a stored key over an env var).
+  const switchCredMode = (m: 'env' | 'key') => {
+    setCredWarn(false)
+    if (m === 'env') setCfg({ ...cfg, apiKey: '' })
+    setCredMode(m)
+  }
 
   const save = async () => {
     const historyN = parseInt(maxHistoryInput, 10)
     const cfgWithHistory =
       !Number.isNaN(historyN) && historyN > 0 ? { ...cfg, maxHistory: historyN } : { ...cfg, maxHistory: undefined }
-    const allIds = [...new Set([...allModes(settings).map((m) => m.id), ...Object.keys(modeDrafts)])]
-    for (const id of allIds) {
+    // Providers that REQUIRE a credential must not be saved in a broken state
+    // (empty env var + no saved key + no OAuth) — that is exactly how a user
+    // ends up with the "Set the GOOGLE_API_KEY environment variable" error.
+    if (
+      requiresKey &&
+      !oauthReady &&
+      !credentialReady
+    ) {
+      setCredWarn(true)
+      return
+    }
+    for (const id of allModes(settings).map((m) => m.id)) {
       setSystemPrompt(id, (promptDrafts[id] ?? '').trim())
     }
-    for (const def of Object.values(modeDrafts)) upsertMode(def)
-    for (const orig of settings.modes ?? []) {
-      if (!modeDrafts[orig.id]) removeMode(orig.id)
+    // Custom modes were removed — purge any legacy saved modes on next save.
+    if (settings.modes && settings.modes.length > 0) {
+      for (const orig of settings.modes) removeMode(orig.id)
     }
-    if (cfgWithHistory.model) addRecentModel(cfgWithHistory.model)
-    if (cfgWithHistory.model && !(active.models ?? []).includes(cfgWithHistory.model)) {
-      setProviderModels(active.id, [...(active.models ?? []), cfgWithHistory.model])
-    }
-    updateProvider(active.id, cfgWithHistory)
+    // The active model is chosen ONLY from the composer model picker — changing
+    // the "Active model" dropdown here must NOT switch the chat's model. Strip
+    // `model` so this provider save keeps the currently-selected model intact.
+    const { model: _model, ...cfgPersistFull } = cfgWithHistory
+    // Get live models/removedModels from store to avoid normalizing them to empty arrays
+    const liveProvider = useStore.getState().settings.providers.find((p) => p.id === active.id)
+    const { models: _models, removedModels: _removed, ...cfgPersist } = cfgPersistFull
+    updateProvider(active.id, {
+      ...cfgPersist,
+      model: liveProvider?.model ?? active.model,
+      models: liveProvider?.models ?? [],
+      removedModels: liveProvider?.removedModels ?? [],
+    })
     setSaved(true)
     setTimeout(onClose, 300)
   }
 
-  const addMode = () => {
-    const id = `m${Date.now().toString(36)}`
-    const def: AgentModeDef = {
-      id,
-      label: 'New mode',
-      icon: '⚙️',
-      description: 'A custom agent mode. Configure what it can do below.',
-      capabilities: { readFiles: true, writeFiles: false, runTerminal: false, web: true },
-    }
-    setModeDrafts((d) => ({ ...d, [id]: def }))
-  }
-
-  const patchMode = (id: string, patch: Partial<AgentModeDef>) =>
-    setModeDrafts((d) => {
-      const cur = d[id]
-      if (!cur) return d
-      return { ...d, [id]: { ...cur, ...patch } }
-    })
-
-  const patchCaps = (id: string, caps: Partial<ModeCapabilities>) =>
-    patchMode(id, { capabilities: { ...modeDrafts[id].capabilities, ...caps } })
-
-  const removeCustom = (id: string) =>
-    setModeDrafts((d) => {
-      const { [id]: _removed, ...rest } = d
-      return rest
-    })
-
   const handleAdd = () => {
-    addProvider()
+    const id = addProvider()
+    setEditId(id)
   }
 
   const handleRemove = (id: string) => {
@@ -239,46 +964,191 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     if (providers.length <= 1) return
     if (window.confirm(`Remove provider “${p.name}”? Its models will be deleted too.`)) {
       removeProvider(id)
+      if (editId === id) {
+        const rest = providers.filter((x) => x.id !== id)
+        setEditId(rest[0]?.id ?? '')
+      }
     }
   }
 
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
-        <h2>Settings</h2>
+  const TABS: { id: typeof tab; label: string; group: string; icon: ReactNode }[] = [
+    {
+      id: 'providers',
+      label: 'Providers',
+      group: 'Connection',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="2" y="4" width="20" height="7" rx="2" /><rect x="2" y="14" width="20" height="7" rx="2" />
+          <path d="M6 7.5h.01M6 17.5h.01" />
+        </svg>
+      ),
+    },
+    {
+      id: 'auth',
+      label: 'Auth',
+      group: 'Connection',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="4" y="10" width="16" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /><circle cx="12" cy="15" r="1.2" />
+        </svg>
+      ),
+    },
+    {
+      id: 'plugins',
+      label: 'Plugins',
+      group: 'Agent',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2v6h6M9 7a2 2 0 0 1 2-2h3l5 5v3a2 2 0 0 1-2 2h-1v9l-2 1V15h-3a2 2 0 0 1-2-2v-1H9a2 2 0 0 1-2-2v-1H7a2 2 0 0 1-2-2V7h4z" />
+        </svg>
+      ),
+    },
+    {
+      id: 'modes',
+      label: 'Modes',
+      group: 'Agent',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <line x1="4" y1="6" x2="20" y2="6" /><circle cx="9" cy="6" r="2.4" fill="currentColor" stroke="none" />
+          <line x1="4" y1="12" x2="20" y2="12" /><circle cx="15" cy="12" r="2.4" fill="currentColor" stroke="none" />
+          <line x1="4" y1="18" x2="20" y2="18" /><circle cx="11" cy="18" r="2.4" fill="currentColor" stroke="none" />
+        </svg>
+      ),
+    },
+    {
+      id: 'subagents',
+      label: 'Subagents',
+      group: 'Agent',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="9" cy="8" r="3" /><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6" />
+          <circle cx="18" cy="7" r="2.2" /><path d="M15.2 13a5 5 0 0 1 5.8 4.9" />
+        </svg>
+      ),
+    },
+    {
+      id: 'skills',
+      label: 'Skills',
+      group: 'Knowledge',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
+        </svg>
+      ),
+    },
+    {
+      id: 'mcp',
+      label: 'MCP',
+      group: 'Knowledge',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
+          <rect x="6" y="6" width="12" height="12" rx="2.5" />
+        </svg>
+      ),
+    },
+    {
+      id: 'memory',
+      label: 'Memory',
+      group: 'Knowledge',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 4a3 3 0 0 0-3 3v.2A3 3 0 0 0 4 10v1a3 3 0 0 0 1 2.24V15a3 3 0 0 0 3 3h1M15 4a3 3 0 0 1 3 3v.2a3 3 0 0 1 2 2.8v1a3 3 0 0 1-1 2.24V15a3 3 0 0 1-3 3h-1M9 4v16M15 4v16" />
+        </svg>
+      ),
+    },
+    {
+      id: 'fonts',
+      label: 'Fonts',
+      group: 'App',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M6 19 10.5 5h1L16 19M7.5 14.5h7" />
+        </svg>
+      ),
+    },
+    {
+      id: 'models',
+      label: 'Models',
+      group: 'App',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="7" y="7" width="10" height="10" rx="1.5" />
+          <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5 6.5 6.5M17.5 17.5l2 2M4.5 19.5l2-2M17.5 6.5l2-2" />
+        </svg>
+      ),
+    },
+  ]
 
-        <div className="settings-tabs">
-          <button
-            className={`settings-tab ${tab === 'providers' ? 'active' : ''}`}
-            onClick={() => setTab('providers')}
-          >
-            Providers
-          </button>
-          <button
-            className={`settings-tab ${tab === 'modes' ? 'active' : ''}`}
-            onClick={() => setTab('modes')}
-          >
-            Modes
-          </button>
-          <button
-            className={`settings-tab ${tab === 'fonts' ? 'active' : ''}`}
-            onClick={() => setTab('fonts')}
-          >
-            Fonts
-          </button>
-          <button
-            className={`settings-tab ${tab === 'skills' ? 'active' : ''}`}
-            onClick={() => setTab('skills')}
-          >
-            Skills
-          </button>
-          <button
-            className={`settings-tab ${tab === 'mcp' ? 'active' : ''}`}
-            onClick={() => setTab('mcp')}
-          >
-            MCP
+  // Tabs 'providers' / 'modes' / 'fonts' / 'auth' edit LOCAL buffered state
+  // (`cfg`, `promptDrafts`, `googleAuthDraft`) that is only committed to the
+  // store when Save is pressed — every other tab (plugins, mcp, skills,
+  // memory, subagents, models) writes straight to the store as the user
+  // types, so there is nothing to "save" or "cancel" there. The footer used
+  // to render three different button combinations across tabs (Cancel+Save /
+  // Save+Close / Close-only) with no visual explanation for the difference,
+  // which is exactly what made it unclear which button to press when
+  // switching tabs. Collapsing it to this one boolean keeps the rule simple
+  // and visible: buffered tabs always show Cancel+Save, every other tab
+  // always shows a single Done button.
+  const hasBufferedEdits = tab === 'providers' || tab === 'modes' || tab === 'fonts' || tab === 'auth'
+  // Auto-save tabs: Done force-flushes any pending state to disk before
+  // closing (a change made while a reply is streaming could otherwise be
+  // lost) — previously this required an extra, easy-to-miss "Save" click on
+  // just the subagents/memory/auth tabs; now it always happens automatically.
+  const handleDone = () => {
+    flushStateNow()
+    onClose()
+  }
+  // Buffered tabs route through the tab-appropriate persist function, then
+  // flush + show the same "Saved ✓" feedback either way.
+  const handleSave = () => {
+    if (tab === 'auth') {
+      const cid = googleAuthDraft.clientId.trim()
+      const csec = googleAuthDraft.clientSecret.trim()
+      if (cid || csec) persistGoogleAuth({ oauthClientId: cid, oauthClientSecret: csec })
+      flushStateNow()
+      setSaved(true)
+      setTimeout(onClose, 300)
+      return
+    }
+    save()
+  }
+
+  return (
+    <div className="modal-overlay" onMouseDown={onClose}>
+      <div className="modal modal-wide settings-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="settings-header">
+          <div className="settings-header-title">
+            <h2>Settings</h2>
+            <span className="settings-header-tab">{TABS.find((t) => t.id === tab)?.label}</span>
+          </div>
+          <button className="modal-close" onClick={onClose} title="Close (Esc)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
           </button>
         </div>
+
+        <div className="settings-body">
+          <div className="settings-tabs">
+            {TABS.map((t, i) => (
+              <Fragment key={t.id}>
+                {(i === 0 || t.group !== TABS[i - 1].group) && (
+                  <div className="settings-tab-group">{t.group}</div>
+                )}
+                <button
+                  className={`settings-tab ${tab === t.id ? 'active' : ''}`}
+                  onClick={() => setTab(t.id)}
+                >
+                  <span className="settings-tab-icon">{t.icon}</span>
+                  {t.label}
+                </button>
+              </Fragment>
+            ))}
+          </div>
+
+          <div className="settings-content">
 
         {tab === 'providers' && (
         <>
@@ -289,7 +1159,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <div
                 key={p.id}
                 className={`provider-tab ${p.id === active.id ? 'active' : ''}`}
-                onClick={() => setActiveProvider(p.id)}
+                onClick={() => setEditId(p.id)}
               >
                 <span className="provider-tab-name">{p.name}</span>
                 <span className="provider-tab-kind">{KIND_LABELS[p.kind]}</span>
@@ -312,13 +1182,44 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             </button>
           </div>
           <div className="hint">
-            Switching providers keeps each one’s name, base URL and model list. You can remove any added
-            provider (and any model) here.
+            Switching providers keeps each one’s name, base URL and saved models. The active model is
+            chosen in the composer; each provider shows its own models.
           </div>
         </div>
 
         {active && (
           <>
+            {providerMeta(cfg.kind).local ? (
+              <div className="env-key-hint">
+                <span className="status-dot ok" />
+                Local provider — no API key needed.
+              </div>
+            ) : oauthReady ? (
+              <div className="env-key-hint">
+                <span className="status-dot ok" />
+                Ready — connected via your Google account (Settings → Auth).
+              </div>
+            ) : credentialReady ? (
+              <div className="env-key-hint">
+                <span className="status-dot ok" />
+                Ready — authenticated via{' '}
+                {hasSavedKey ? 'saved API key' : cfg.envVar ? `env var ${cfg.envVar}` : 'the default env var'}
+                .
+              </div>
+            ) : requiresKey ? (
+              <div className="env-key-hint fail">
+                <span className="status-dot fail" />
+                No credential configured. Choose either an environment variable or a saved API key below —
+                otherwise this provider can't connect.
+                {credWarn && ' Save was blocked until you configure one.'}
+              </div>
+            ) : (
+              <div className="env-key-hint">
+                <span className="status-dot fail" />
+                No API key set — the provider will use an environment variable if one is available, or may
+                work without a key.
+              </div>
+            )}
             {!BUILTIN_KINDS.includes(cfg.kind) && (
               <div className="field">
                 <label>Name</label>
@@ -330,99 +1231,134 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
             )}
 
-            {(cfg.kind === 'custom' || cfg.kind === 'ollama') && (
+            {providerMeta(cfg.kind).editableBaseUrl && (
               <div className="field">
                 <label>Base URL</label>
                 <input
                   value={cfg.baseUrl}
                   onChange={(e) => setCfg({ ...cfg, baseUrl: e.target.value })}
-                  placeholder={cfg.kind === 'ollama' ? 'http://localhost:11434' : 'http://localhost:8080/v1'}
+                  placeholder={providerMeta(cfg.kind).local ? 'http://localhost:11434' : 'http://localhost:8080/v1'}
                   dir="ltr"
                 />
                 <div className="hint">
-                  {cfg.kind === 'ollama'
-                    ? 'Local endpoint. Works with Ollama, llama.cpp and vLLM.'
+                  {providerMeta(cfg.kind).local
+                    ? 'Local endpoint (llama.cpp-compatible). Also works with Ollama and vLLM.'
                     : 'Any OpenAI-compatible API (llama.cpp, vLLM, LocalAI, LM Studio, …).'}
                 </div>
               </div>
             )}
 
-            {cfg.kind === 'opencode' && (
+            {providerMeta(cfg.kind).baseUrlHint && !providerMeta(cfg.kind).editableBaseUrl && (
               <div className="field">
                 <label>Base URL</label>
                 <div className="env-key-hint">
                   <span className="status-dot ok" />
-                  {OPENCODE_DEFAULT_BASE} — routed via the opencode gateway (never OpenRouter).
+                  {providerMeta(cfg.kind).baseUrlHint}
                 </div>
-              </div>
-            )}
-
-            {cfg.kind === 'openrouter' && (
-              <div className="field">
-                <label>Base URL</label>
-                <div className="env-key-hint">
-                  <span className="status-dot ok" />
-                  https://openrouter.ai/api/v1
-                </div>
-              </div>
-            )}
-
-            {(cfg.kind === 'opencode' || cfg.kind === 'openrouter') && envVarValue === false && (
-              <div className="field">
-                <label>API Key</label>
-                <div className="env-key-hint">
-                  <span className="status-dot fail" />
-                  No key found. Set {cfg.envVar} in your environment, or leave it blank to fall back to the
-                  default for {KIND_LABELS[cfg.kind]}.
-                </div>
-              </div>
-            )}
-
-            <div className="field">
-              <label>Env var name</label>
-              <input
-                value={cfg.envVar ?? ''}
-                onChange={(e) => setCfg({ ...cfg, envVar: e.target.value })}
-                placeholder="e.g. OPENROUTER_API_KEY"
-                dir="ltr"
-              />
-              <div className="env-key-hint">
-                {envVarValue === null ? (
-                  <span className="hint">
-                    Leave empty to fall back to the built-in default (e.g.{' '}
-                    {cfg.kind === 'openrouter' ? 'OPENROUTER_API_KEY' : cfg.kind === 'opencode' ? 'OPENCODE_API_KEY' : 'none for local'}).
-                  </span>
-                ) : (
-                  <>
-                    <span className={`status-dot ${envVarValue ? 'ok' : ''}`} />
-                    {envVarValue
-                      ? `Using ${cfg.envVar} from your environment.`
-                      : `Env var ${cfg.envVar} not found.`}
-                  </>
+                {providerMeta(cfg.kind).extraHint && (
+                  <div className="env-key-hint">
+                    <span className="status-dot ok" />
+                    {providerMeta(cfg.kind).extraHint}
+                  </div>
                 )}
               </div>
-            </div>
+            )}
 
-            <div className="field">
-              <label>Model</label>
-              <ModelPicker
-                models={active.models ?? []}
-                recent={recentModels}
-                value={cfg.model}
-                onChange={setModel}
-                loading={loadingModels}
-                error={modelError}
-                disabled={loadingModels}
-              />
-              <div className="hint">
-                {cfg.kind === 'opencode'
-                  ? 'Fetched live from the opencode gateway (IDs have no opencode/ prefix).'
-                  : 'Recently used models appear on top — keep typing to search. Picked models are saved for this provider.'}
+            {!providerMeta(cfg.kind).local && (
+              <div className="field">
+                <label>Credential — pick one method</label>
+                <div className="cred-mode-toggle">
+                  <button
+                    type="button"
+                    className={credMode === 'env' ? 'active' : ''}
+                    onClick={() => switchCredMode('env')}
+                  >
+                    Environment variable
+                  </button>
+                  <button
+                    type="button"
+                    className={credMode === 'key' ? 'active' : ''}
+                    onClick={() => switchCredMode('key')}
+                  >
+                    Saved API key (encrypted)
+                  </button>
+                </div>
+                <div className="hint">
+                  CodeFa uses the method you choose — never both. Picking a name in "Env var name" alone is
+                  not a key: the variable must actually exist in your environment.
+                </div>
+
+                {credMode === 'env' ? (
+                  <div className="cred-block">
+                    <label className="field-label">Env var name</label>
+                    <input
+                      value={cfg.envVar ?? ''}
+                      onChange={(e) => setCfg({ ...cfg, envVar: e.target.value.trim(), apiKey: '' })}
+                      placeholder="e.g. OPENROUTER_API_KEY — must be set in your environment"
+                      dir="ltr"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    {envVarValue === true ? (
+                      <div className="env-key-hint">
+                        <span className="status-dot ok" />
+                        {cfg.envVar} is set in your environment — CodeFa will use it.
+                      </div>
+                    ) : envVarValue === false ? (
+                      <>
+                        <div className="env-key-hint fail">
+                          <span className="status-dot fail" />
+                          <strong>{cfg.envVar}</strong> is not set in your environment. CodeFa only sees
+                          variables that exist in your OS before it starts (launches from Finder/Dock
+                          ignore your shell profile). Either export it and restart CodeFa, or paste the
+                          key value below — it will be saved encrypted instead.
+                        </div>
+                        <div className="cred-inline-fallback">
+                          <label className="field-label">…or paste the key value (stored encrypted)</label>
+                          <input
+                            type="password"
+                            value={cfg.apiKey ?? ''}
+                            onChange={(e) => {
+                              setCfg({ ...cfg, apiKey: e.target.value })
+                              if (e.target.value.trim()) setCredMode('key')
+                            }}
+                            placeholder="e.g. AIza…"
+                            dir="ltr"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </div>
+                      </>
+                    ) : cfg.envVar ? (
+                      <div className="env-key-hint">Checking {cfg.envVar}…</div>
+                    ) : (
+                      <div className="env-key-hint">
+                        Empty uses the built-in default (
+                        {providerMeta(cfg.kind).envVars.join(' / ') || 'none'}).
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="cred-block">
+                    <label className="field-label">API key — skip environment variables entirely</label>
+                    <input
+                      type="password"
+                      value={cfg.apiKey ?? ''}
+                      onChange={(e) => setCfg({ ...cfg, apiKey: e.target.value })}
+                      placeholder="Paste your real Gemini key here"
+                      dir="ltr"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <div className="env-key-hint">
+                      Nothing is stored yet — paste the actual key value here and it will be encrypted
+                      (AES-256-GCM) when you press Save. This is an alternative to the environment
+                      variable method, not the place to type a variable name.
+                    </div>
+                  </div>
+                )}
               </div>
-              <div className="hint">
-                Context window: {selectedCtx ? `${fmtTokens(selectedCtx)} tokens` : 'unknown (not advertised)'}
-              </div>
-            </div>
+            )}
 
             <div className="field">
               <label>Thinking level</label>
@@ -455,9 +1391,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               )}
             </div>
 
-            {(active.models ?? []).length > 0 && (
-              <div className="field">
-                <label>Saved models for this provider</label>
+            <div className="field">
+              <label>Models for this provider</label>
+              <div className="hint">
+                Models are fetched live from this provider’s <code>/models</code> endpoint. Models you
+                pick in the composer and custom ones added below are saved to the database for this
+                provider.
+              </div>
+              {(active.models ?? []).length === 0 ? (
+                <div className="hint">No models saved yet — they appear here after fetching or adding one.</div>
+              ) : (
                 <div className="model-tags">
                   {(active.models ?? []).map((m) => (
                     <span key={m} className={`model-tag ${m === cfg.model ? 'current' : ''}`}>
@@ -472,8 +1415,23 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     </span>
                   ))}
                 </div>
+              )}
+              <div className="model-add-row">
+                <input
+                  className="model-add-input"
+                  value={customModel}
+                  onChange={(e) => setCustomModel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') addCustomModel()
+                  }}
+                  placeholder="Add a custom model id"
+                  dir="ltr"
+                />
+                <button className="btn tiny" onClick={addCustomModel} disabled={!customModel.trim()}>
+                  Add
+                </button>
               </div>
-            )}
+            </div>
 
             <div className="field">
               <label>Context &amp; History</label>
@@ -496,50 +1454,128 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </>
         )}
 
+        {tab === 'auth' && (
+        <>
+          <div className="field">
+            <div className="field-head">
+              <label>Google account</label>
+            </div>
+            <div className="hint">
+              One sign-in connects Gemini models (Settings → Providers) and the Search
+              Console tool (Settings → Plugins). Create an OAuth 2.0 Desktop client in the
+              Google Cloud Console (APIs &amp; Services → Credentials), paste its id and
+              secret below, then sign in.
+            </div>
+            <details className="guided-steps">
+              <summary>How to create your Google OAuth client id &amp; secret</summary>
+              <ol>
+                <li>
+                  Go to{' '}
+                  <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">
+                    console.cloud.google.com/apis/credentials
+                  </a>{' '}
+                  (signed in to the same Google account you want to use).
+                </li>
+                <li>If you don't have a project yet, click <strong>Select a project → New Project</strong> and create one.</li>
+                <li>If prompted, enable the APIs: <strong>Generative Language API</strong> and <strong>Google Search Console API</strong> (APIs &amp; Services → Library → search each → Enable).</li>
+                <li>
+                  Click <strong>Create Credentials → OAuth client ID</strong>.
+                </li>
+                <li>
+                  If asked to configure the consent screen first, click <strong>Configure consent screen</strong>,
+                  choose <strong>External</strong> (or Internal if it's your own Google Workspace), fill in the app
+                  name, add yourself under <strong>Test users</strong>, and save.
+                </li>
+                <li>Set <strong>Application type: Desktop app</strong>, give it any name, and click <strong>Create</strong>.</li>
+                <li>
+                  Copy the <strong>Client ID</strong> and <strong>Client secret</strong> Google shows, and paste
+                  them into the two fields above.
+                </li>
+              </ol>
+              <p className="hint">
+                One client is enough for both Gemini and Search Console — the sign-in below asks
+                for all the needed permissions in a single Google consent.
+              </p>
+            </details>
+            <label className="field-label">Google OAuth client id</label>
+            <input
+              value={googleAuthDraft.clientId}
+              onChange={(e) => setGoogleAuthDraft((d) => ({ ...d, clientId: e.target.value }))}
+              placeholder="Google OAuth client id"
+              dir="ltr"
+            />
+            <label className="field-label">Google OAuth client secret</label>
+            <input
+              value={googleAuthDraft.clientSecret}
+              onChange={(e) => setGoogleAuthDraft((d) => ({ ...d, clientSecret: e.target.value }))}
+              placeholder="Google OAuth client secret"
+              dir="ltr"
+              type="password"
+            />
+            <div className="oauth-actions">
+              {googleProvider?.authType === 'oauth' && googleProvider?.oauthRefreshToken ? (
+                <button className="btn tiny danger" onClick={disconnectGoogle}>
+                  Disconnect
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="oauth-signin-btn"
+                  disabled={oauthState.status === 'busy'}
+                  onClick={() => void signInGoogle()}
+                >
+                  {oauthState.status === 'busy' ? (
+                    <>
+                      <span className="oauth-btn-spinner" aria-hidden />
+                      Waiting for Google…
+                    </>
+                  ) : (
+                    <>
+                      <svg className="oauth-glogo" width="18" height="18" viewBox="0 0 18 18" aria-hidden>
+                        <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.12-.19-1.64H9v3.1h4.88c-.1.63-.38 1.58-.9 2.12l-.01.08 1.31 1.01.09.01c1.43-1.32 2.27-3.26 2.27-5.68z" />
+                        <path fill="#34A853" d="M9 18c1.62 0 2.98-.53 3.97-1.45l-1.4-1.08c-.38.26-.9.6-1.57.6-1.44 0-2.66-.96-3.09-2.3l-.06.01-1.33 1.03-.05.06C4.96 16.04 6.84 18 9 18z" />
+                        <path fill="#FBBC05" d="M5.91 11.87c-.2-.55-.32-1.15-.32-1.87s.12-1.32.32-1.87v-.08l-1.32-1.03-.06.05a6.68 6.68 0 0 0 0 5.7l1.32-1.03z" />
+                        <path fill="#EA4335" d="M9 3.78c.92 0 1.58.28 2.07.83l1.55-1.5C11.98 1.95 10.62 1.2 9 1.2 6.84 1.2 4.96 3.16 4.1 5.16l1.32 1.03C6.34 4.74 7.56 3.78 9 3.78z" />
+                      </svg>
+                      Sign in with Google
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+            {oauthState.msg && (
+              <div className={`env-key-hint ${oauthState.status === 'ok' ? 'ok' : ''}`}>
+                <span className={`status-dot ${oauthState.status === 'ok' ? 'ok' : oauthState.status === 'error' ? 'fail' : ''}`} />
+                {oauthState.msg}
+              </div>
+            )}
+            <div className="hint">
+              Connected: {googleProvider?.authType === 'oauth' && googleProvider?.oauthRefreshToken ? 'yes' : 'no'}. The
+              same sign-in also powers the Search Console tool automatically — you don't need a
+              separate connection.
+            </div>
+          </div>
+        </>
+        )}
+
+        {tab === 'plugins' && (
+        <>
+          <PluginEditor />
+        </>
+        )}
+
         {tab === 'modes' && (
         <>
             <div className="field">
               <label>Modes</label>
-              {modes.map((m) => {
-                const isBuiltin = BUILTIN_IDS.has(m.id)
-                const draft = modeDrafts[m.id]
-                const caps = isBuiltin ? m.capabilities : draft?.capabilities ?? m.capabilities
-                const label = isBuiltin ? m.label : draft?.label ?? m.label
-                const desc = isBuiltin ? m.description : draft?.description ?? m.description
-                return (
+              {modes.map((m) => (
                   <div className="mode-card" key={m.id}>
                     <div className="mode-card-head">
                       <span className="mode-card-icon"><ModeIcon icon={m.icon} /></span>
-                      <span className="mode-card-title">{label}</span>
-                      {isBuiltin ? (
-                        <span className="badge">built-in</span>
-                      ) : (
-                        <button className="btn tiny danger" onClick={() => removeCustom(m.id)}>
-                          Delete
-                        </button>
-                      )}
+                      <span className="mode-card-title">{m.label}</span>
+                      <span className="badge">built-in</span>
                     </div>
-                    {isBuiltin ? (
-                      <p className="hint">{desc}</p>
-                    ) : (
-                      <>
-                        <label className="field-label">Name</label>
-                        <input
-                          className="text-input"
-                          value={label}
-                          onChange={(e) => patchMode(m.id, { label: e.target.value })}
-                          dir="auto"
-                        />
-                        <label className="field-label">Description</label>
-                        <textarea
-                          className="system-prompt"
-                          rows={2}
-                          value={desc}
-                          onChange={(e) => patchMode(m.id, { description: e.target.value })}
-                          dir="auto"
-                        />
-                      </>
-                    )}
+                    <p className="hint">{m.description}</p>
                     <label className="field-label">Custom prompt <span className="hint">(appended to the built-in prompt)</span></label>
                     <textarea
                       className="system-prompt"
@@ -555,50 +1591,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         Clear
                       </button>
                     </div>
-                    {!isBuiltin && (
-                      <div className="cap-toggles">
-                        <label className="cap-toggle">
-                          <input
-                            type="checkbox"
-                            checked={caps.readFiles}
-                            onChange={(e) => patchCaps(m.id, { readFiles: e.target.checked })}
-                          />
-                          Read files
-                        </label>
-                        <label className="cap-toggle">
-                          <input
-                            type="checkbox"
-                            checked={caps.writeFiles}
-                            onChange={(e) => patchCaps(m.id, { writeFiles: e.target.checked })}
-                          />
-                          Write / edit files
-                        </label>
-                        <label className="cap-toggle">
-                          <input
-                            type="checkbox"
-                            checked={caps.runTerminal}
-                            onChange={(e) => patchCaps(m.id, { runTerminal: e.target.checked })}
-                          />
-                          Run terminal
-                        </label>
-                        <label className="cap-toggle">
-                          <input
-                            type="checkbox"
-                            checked={caps.web}
-                            onChange={(e) => patchCaps(m.id, { web: e.target.checked })}
-                          />
-                          Web access
-                        </label>
-                      </div>
-                    )}
                   </div>
-                )
-              })}
-              <div className="skill-actions">
-                <button className="btn tiny" onClick={addMode}>
-                  + New mode
-                </button>
-              </div>
+                ))}
             </div>
         </>
         )}
@@ -633,23 +1627,63 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <div className="field">
               <div className="field-head">
                 <label>MCP Tool Connectors</label>
+                <button
+                  className="btn tiny"
+                  onClick={() => {
+                    setAddingMcp((v) => !v)
+                    setMcpFilter('')
+                  }}
+                >
+                  {addingMcp ? 'Cancel' : '+ Add MCP'}
+                </button>
               </div>
               <div className="hint">
-                MCP servers expose extra tools to the agent (filesystem, databases, APIs…). Changes
-                apply on the next message in any mode. Env/header values support{' '}
+                MCP servers expose extra tools to the agent (filesystem, databases, APIs…). Connectors
+                are stored in the app database and changes apply on the next message in any mode.
+                Env/header values support{' '}
                 <code>{'${VAR}'}</code> and <code>{'${VAR:-default}'}</code> expansion from your shell
                 environment. Add a new connector by typing <code>/mcp &lt;description&gt;</code> in the chat,
-                then configure it here.
+                or press <b>+ Add MCP</b> above.
+              </div>
+              <div className="settings-search">
+                <input
+                  type="search"
+                  value={mcpFilter}
+                  onChange={(e) => setMcpFilter(e.target.value)}
+                  placeholder="Search connectors…"
+                  dir="ltr"
+                />
               </div>
               <div className="mcp-list">
-                {Object.entries(mcpServers).length === 0 && (
+                {addingMcp && (
+                  <McpEditor
+                    key="__new__"
+                    initialName=""
+                    initialCfg={{}}
+                    defaultOpen
+                    onSave={(_oldName, newName, next) => {
+                      addMcpServer(newName, next)
+                      setAddingMcp(false)
+                    }}
+                    onDelete={() => setAddingMcp(false)}
+                  />
+                )}
+                {Object.entries(mcpServers).length === 0 && !addingMcp && (
                   <div className="hint">No MCP connectors yet. Add one with <code>/mcp &lt;description&gt;</code> in the chat.</div>
                 )}
-                {Object.entries(mcpServers).map(([name, cfg]) => (
+                {Object.entries(mcpServers)
+                  .filter(([name, cfg]) => {
+                    const q = mcpFilter.trim().toLowerCase()
+                    if (!q) return true
+                    const summary = `${name} ${cfg.command ?? ''} ${(cfg.args ?? []).join(' ')} ${cfg.url ?? ''}`
+                    return summary.toLowerCase().includes(q)
+                  })
+                  .map(([name, cfg]) => (
                   <McpEditor
                     key={name}
                     initialName={name}
                     initialCfg={cfg}
+                    builtin={builtinMcp.includes(name)}
                     onSave={(oldName, newName, next) => {
                       if (oldName && oldName !== newName) removeMcpServer(oldName)
                       addMcpServer(newName, next)
@@ -668,71 +1702,382 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <>
             <div className="field">
               <div className="field-head">
-                <label>Skills {root ? '— in the current workspace' : '(open a project folder first)'}</label>
+                <label>Skills</label>
+                <button className="btn tiny" onClick={newSkill}>+ New skill</button>
               </div>
               <div className="hint">
-                Skills are <code>SKILL.md</code> files the agent reads when your request matches them.
-                They live in <code>.coder/skills/&lt;name&gt;/SKILL.md</code> (or{' '}
-                <code>.claude/skills</code> for Claude Code compatibility). Create new skills by typing{' '}
-                <code>/skill &lt;description&gt;</code> in the chat.
+                Skills are stored in the app database and matched to your messages semantically:
+                when a request matches a skill, the agent follows its instructions. Create new skills
+                by typing <code>/skill &lt;description&gt;</code> in the chat, or add them here.
+              </div>
+              <div className="settings-search">
+                <input
+                  type="search"
+                  value={skillFilter}
+                  onChange={(e) => setSkillFilter(e.target.value)}
+                  placeholder="Search skills…"
+                  dir="ltr"
+                />
               </div>
               <div className="skill-list">
                 {skills.length === 0 && (
                   <div className="hint">No skills yet. Create one with <code>/skill &lt;description&gt;</code> in the chat.</div>
                 )}
-                {skills.map((s) => {
-                  const metaName = skillMeta(s.raw).name || s.name
-                  const desc = skillMeta(s.raw).description
-                  return (
-                    <div
-                      key={s.path}
-                      className={`skill-item ${selectedSkill === s.path ? 'active' : ''}`}
-                      onClick={() => selectSkill(s.path)}
-                    >
-                      <span className="skill-item-name">{metaName}</span>
-                      <span className="skill-item-path">{s.path}</span>
-                      {desc && <span className="skill-item-desc">{desc}</span>}
+                {skills
+                  .filter((s) => {
+                    const q = skillFilter.trim().toLowerCase()
+                    if (!q) return true
+                    const meta = skillMeta(s.raw)
+                    return `${s.name} ${meta.name} ${meta.description}`.toLowerCase().includes(q)
+                  })
+                  .map((s) => {
+                    const meta = skillMeta(s.raw)
+                    const desc = meta.description
+                    const isOpen = expandedSkills.has(s.name)
+                    return (
+                      <div
+                        key={s.name}
+                        className={`skill-card ${isOpen ? 'open' : ''}`}
+                      >
+                        <div className="skill-card-head" onClick={() => toggleSkill(s.name)}>
+                          <span className={`skill-chevron ${isOpen ? 'open' : ''}`}>▶</span>
+                          <span className="skill-card-name">{meta.name || s.name}</span>
+                          {desc && <span className="skill-card-desc">{desc}</span>}
+                        </div>
+                        {isOpen && (
+                          <div className="skill-card-body">
+                            <textarea
+                              className="system-prompt skill-raw"
+                              value={skillDrafts[s.name] ?? s.raw}
+                              onChange={(e) =>
+                                setSkillDrafts((prev) => ({ ...prev, [s.name]: e.target.value }))
+                              }
+                              rows={12}
+                              dir="ltr"
+                              spellCheck={false}
+                            />
+                            <div className="prompt-actions">
+                              <span className="hint">{skillsMsg}</span>
+                              <div className="skill-actions">
+                                <button className="btn tiny danger" onClick={() => deleteSkill(s.name)}>
+                                  Delete
+                                </button>
+                                <button className="btn tiny" onClick={() => saveSkill(s.name)}>
+                                  Save skill
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                {expandedSkills.has(NEW_SKILL_KEY) && (
+                  <div className="skill-card open">
+                    <div className="skill-card-head">
+                      <span className="skill-chevron open">▶</span>
+                      <span className="skill-card-name">New skill</span>
                     </div>
-                  )
-                })}
-              </div>
-              {selectedSkill && (
-                <div className="skill-editor">
-                  <textarea
-                    className="system-prompt skill-raw"
-                    value={skillRaw}
-                    onChange={(e) => setSkillRaw(e.target.value)}
-                    rows={12}
-                    dir="ltr"
-                    spellCheck={false}
-                  />
-                  <div className="prompt-actions">
-                    <span className="hint">{skillsMsg}</span>
-                    <div className="skill-actions">
-                      <button className="btn tiny danger" onClick={deleteSkill}>
-                        Delete
-                      </button>
-                      <button className="btn tiny" onClick={saveSkill}>
-                        Save skill
-                      </button>
+                    <div className="skill-card-body">
+                      <textarea
+                        className="system-prompt skill-raw"
+                        value={skillDrafts[NEW_SKILL_KEY] ?? ''}
+                        onChange={(e) =>
+                          setSkillDrafts((prev) => ({ ...prev, [NEW_SKILL_KEY]: e.target.value }))
+                        }
+                        rows={12}
+                        dir="ltr"
+                        spellCheck={false}
+                      />
+                      <div className="prompt-actions">
+                        <span className="hint">{skillsMsg}</span>
+                        <div className="skill-actions">
+                          <button className="btn tiny" onClick={() => saveSkill(NEW_SKILL_KEY)}>
+                            Save skill
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
         </>
         )}
 
+        {tab === 'memory' && (
+        <>
+            <div className="field">
+              <div className="field-head">
+                <label>Data path</label>
+              </div>
+              <div className="data-path-row">
+                <input
+                  value={dataPath}
+                  onChange={(e) => setDataPath(e.target.value)}
+                  placeholder="~/.codefa"
+                  dir="ltr"
+                  disabled={migrating}
+                />
+                <button className="btn tiny" onClick={applyDataPath} disabled={!dataPath.trim() || migrating}>
+                  {migrating ? 'Moving…' : 'Apply & move data'}
+                </button>
+              </div>
+              {migrating && (
+                <div className="migrate-progress">
+                  <div className="migrate-bar-track">
+                    <div className="migrate-bar-fill" style={{ width: `${migratePct}%` }} />
+                  </div>
+                  <div className="hint">{migrateLabel} — {migratePct}%</div>
+                </div>
+              )}
+              <div className="hint">
+                All app data lives under this path — settings (<code>settings.json</code>), chats,
+                vector stores, models, memory, skills, MCP connectors and plans. Moving the path
+                copies every file to the new location and empties the old one. The default
+                <code>~/.codefa</code> resolves the same on macOS, Linux and Windows
+                (<code>~/</code> = the home directory).
+              </div>
+              {dataMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{dataMsg}</div>}
+            </div>
+            <div className="field">
+              <label>Memory TTL (days)</label>
+              <input
+                type="number"
+                min={1}
+                value={ttlInput}
+                onChange={(e) => setTtlInput(e.target.value)}
+                dir="ltr"
+              />
+              <div className="hint">
+                Notes and saved web pages expire <code>ttl_days</code> after their last update. Set a
+                high value (e.g. <code>3650</code>) to keep everything.
+              </div>
+            </div>
+            <div className="field">
+              <div className="field-head">
+                <label>Max documents / Max chunks</label>
+              </div>
+              <div className="data-path-row">
+                <input
+                  type="number"
+                  min={10}
+                  value={maxDocsInput}
+                  onChange={(e) => setMaxDocsInput(e.target.value)}
+                  placeholder="500"
+                  dir="ltr"
+                />
+                <input
+                  type="number"
+                  min={50}
+                  value={maxChunksInput}
+                  onChange={(e) => setMaxChunksInput(e.target.value)}
+                  placeholder="4000"
+                  dir="ltr"
+                />
+                <button className="btn tiny" onClick={applyMemoryConfig}>Save</button>
+              </div>
+              <div className="hint">
+Caps on total stored documents and chunks per workspace; the oldest are evicted first.
+                </div>
+                {memMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{memMsg}</div>}
+            </div>
+            <div className="field">
+              <label>Cache TTL (minutes)</label>
+              <input
+                type="number"
+                min={1}
+                value={cacheTtlInput}
+                onChange={(e) => setCacheTtlInput(e.target.value)}
+                dir="ltr"
+              />
+              <div className="hint">Search results, web pages and tool results expire after this many minutes.</div>
+            </div>
+            <div className="field">
+              <label>Task memory TTL (hours)</label>
+              <input
+                type="number"
+                min={1}
+                value={taskTtlInput}
+                onChange={(e) => setTaskTtlInput(e.target.value)}
+                dir="ltr"
+              />
+              <div className="hint">In-flight work notes expire after this many hours since last access.</div>
+            </div>
+            <div className="field">
+              <label>Short-term memory TTL (hours)</label>
+              <input
+                type="number"
+                min={1}
+                value={shortTermTtlInput}
+                onChange={(e) => setShortTermTtlInput(e.target.value)}
+                dir="ltr"
+              />
+              <div className="hint">Transient observations and session context expire after this many hours.</div>
+            </div>
+            <div className="field">
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="checkbox" checked={slidingInput} onChange={(e) => setSlidingInput(e.target.checked)} />
+                Sliding TTL (extend expiry when memory is used)
+              </label>
+            </div>
+            <div className="field">
+              <button className="btn tiny" onClick={() => {
+                const t = parseInt(taskTtlInput, 10)
+                const s = parseInt(shortTermTtlInput, 10)
+                const c = parseInt(cacheTtlInput, 10)
+                setMemoryTtlConfig({
+                  task: Number.isFinite(t) ? t : 6,
+                  shortTerm: Number.isFinite(s) ? s : 24,
+                  cache: Number.isFinite(c) ? c : 60,
+                  sliding: slidingInput,
+                })
+                setMemMsg('Memory TTL config saved.')
+              }}>Save TTL config</button>
+            </div>
+              {memStats && memStats.available && (
+                <div className="hint">
+                  Current usage: {memStats.docs} docs / {memStats.chunks} chunks in {memStats.db || 'workspace store'}.
+                  Active TTL {memStats.ttl_days}d, max {memStats.max_docs} docs / {memStats.max_chunks} chunks.
+                </div>
+              )}
+            <div className="field">
+              <button className="btn tiny danger" onClick={doClearMemory} disabled={clearing}>
+                {clearing ? 'Clearing…' : 'Clear RAG memory'}
+              </button>
+              <div className="hint">
+                Permanently deletes all memory notes and saved web pages for this workspace.
+              </div>
+            </div>
+        </>
+        )}
+
+        {tab === 'subagents' && (
+        <>
+          <div className="field">
+            <div className="field-head">
+              <label>Subagent Models</label>
+            </div>
+            <div className="hint">
+              Pick separate models for the built-in subagents. Leave a field empty to
+              use the parent model (the one chosen in the composer). The explore subagent
+              runs read-only searches; using a small/fast model here saves time and tokens.
+            </div>
+
+            <SubagentModelSelect
+              agent="explore"
+              label="Explore subagent"
+              desc="Read-only file search and code investigation (explore tool)."
+              current={subagentModels.explore || ''}
+              onSelect={setSubagentModel}
+            />
+            <SubagentModelSelect
+              agent="search"
+              label="Search subagent"
+              desc="Model that runs the explore sub-agent's search tools (search_in_files / fuzzy_find / list_files). Falls back to the explore model."
+              current={subagentModels.search || ''}
+              onSelect={setSubagentModel}
+            />
+            <SubagentModelSelect
+              agent="web"
+              label="Web subagent"
+              desc="Model that distills web_search results and summarizes fetched pages. Falls back to the explore model."
+              current={subagentModels.web || ''}
+              onSelect={setSubagentModel}
+            />
+            <SubagentModelSelect
+              agent="vision"
+              label="Vision model"
+              desc="Image analysis model (handles screenshots, diagrams and photos)."
+              current={subagentModels.vision || ''}
+              onSelect={setSubagentModel}
+            />
+            <SubagentModelSelect
+              agent="compact"
+              label="Compact model"
+              desc="Conversation summariser — compacts chat history to stay under the context window."
+              current={subagentModels.compact || ''}
+              onSelect={setSubagentModel}
+            />
+          </div>
+        </>
+        )}
+
+        {tab === 'models' && (
+        <>
+            <div className="field">
+              <div className="field-head">
+                <label>On-device Models</label>
+              </div>
+              <div className="hint">
+                These run fully offline on your machine. Downloads use an optional
+                HuggingFace mirror (leave empty for <code>huggingface.co</code>). Status
+                refreshes automatically while a download runs.
+              </div>
+              {modelsMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{modelsMsg}</div>}
+
+              <div className="mcp-card open">
+                <div className="mcp-card-head">
+                  <span className="mcp-chevron open">▶</span>
+                  <span className="mcp-card-title">Whisper — Voice input</span>
+                  <span className={`status-dot ${(mStatus?.whisper?.dirs ?? []).length > 0 ? 'ok' : ''}`} />
+                </div>
+                <div className="mcp-fields">
+                  <label className="field-label">Model (HF repo id)</label>
+                  <input value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} dir="ltr" placeholder="Systran/faster-whisper-medium" />
+                  <label className="field-label">Mirror base URL (optional)</label>
+                  <input value={whisperBaseUrl} onChange={(e) => setWhisperBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
+                  <ModelStatusLine status={mStatus?.whisper} running={isRunning('whisper')} onRemove={() => actRemove('whisper', whisperModel)} />
+                  <div className="skill-actions">
+                    {(mStatus?.whisper?.dirs ?? []).length === 0 && (
+                      <button className="btn tiny" disabled={isRunning('whisper')} onClick={() => actDownload('whisper')}>
+                        {isRunning('whisper') ? 'Downloading…' : 'Download'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mcp-card open">
+                <div className="mcp-card-head">
+                  <span className="mcp-chevron open">▶</span>
+                  <span className="mcp-card-title">Embedding — RAG memory</span>
+                  <span className={`status-dot ${(mStatus?.embedding?.dirs ?? []).some((d) => d.ready) ? 'ok' : ''}`} />
+                </div>
+                <div className="mcp-fields">
+                  <label className="field-label">Model (repo id)</label>
+                  <input value={embeddingModel} onChange={(e) => setEmbeddingModel(e.target.value)} dir="ltr" placeholder="intfloat/multilingual-e5-base" />
+                  <label className="field-label">Mirror base URL (optional)</label>
+                  <input value={embeddingBaseUrl} onChange={(e) => setEmbeddingBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
+                  <div className="hint">
+                    A custom model may have a different vector width — existing memory notes might not
+                    match; after switching, consider removing the old build.
+                  </div>
+                  <ModelStatusCard status={mStatus?.embedding} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
+                  <div className="skill-actions">
+                    {(!(mStatus?.embedding?.dirs ?? []).some((d) => d.ready) || isRunning('embedding')) && (
+                      <button className="btn tiny" disabled={isRunning('embedding')} onClick={() => actDownload('embedding')}>
+                        {isRunning('embedding') ? 'Downloading…' : 'Download'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+        </>
+        )}
+
+          </div>
+        </div>
+
         <div className="modal-actions">
-          {tab === 'mcp' || tab === 'skills' ? (
-            <button className="btn" onClick={onClose}>
-              Close
-            </button>
-          ) : (
+          {hasBufferedEdits ? (
             <>
               <button className="btn secondary" onClick={onClose}>Cancel</button>
-              <button className="btn" onClick={save} disabled={!cfg.model}>{saved ? 'Saved ✓' : 'Save'}</button>
+              <button className="btn" onClick={handleSave}>{saved ? 'Saved ✓' : 'Save'}</button>
             </>
+          ) : (
+            <button className="btn" onClick={handleDone}>Done</button>
           )}
         </div>
       </div>
@@ -740,9 +2085,80 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   )
 }
 
-function fmtTokens(n: number | undefined): string {
-  if (!n || n <= 0) return '—'
-  return `${Math.round(n / 1000)}K`
+function fmtBytes(n: number): string {
+  if (!n || n <= 0) return '0 MB'
+  const mb = n / (1024 * 1024)
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`
+}
+
+/** Whisper card status line: running → error → downloaded (single dir) → empty. */
+function ModelStatusLine({
+  status,
+  running,
+  onRemove,
+}: {
+  status?: import('../lib/api').ModelKindStatus
+  running: boolean
+  onRemove: () => void
+}) {
+  if (running) return <div className="hint">Downloading…</div>
+  if (status?.running?.state === 'error')
+    return (
+      <div className="hint" style={{ color: 'var(--danger)' }}>
+        Download failed: {status.running.error}
+      </div>
+    )
+  const dirs = status?.dirs ?? []
+  if (dirs.length === 0) return <div className="hint">Not downloaded.</div>
+  return (
+    <div className="skill-actions">
+      <span className="hint">Downloaded · {fmtBytes(dirs[0].size)}</span>
+      <button className="btn tiny danger" onClick={onRemove}>
+        Remove
+      </button>
+    </div>
+  )
+}
+
+/** Embedding card: lists every downloaded repo build with its own Remove. */
+function ModelStatusCard({
+  status,
+  running,
+  onRemove,
+}: {
+  status?: import('../lib/api').ModelKindStatus
+  running: boolean
+  onRemove: (repo: string) => void
+}) {
+  if (running) return <div className="hint">Downloading…</div>
+  if (status?.running?.state === 'error')
+    return (
+      <div className="hint" style={{ color: 'var(--danger)' }}>
+        Download failed: {status.running.error}
+      </div>
+    )
+  const dirs = status?.dirs ?? []
+  if (dirs.length === 0)
+    return (
+      <div className="hint">
+        Not downloaded — RAG memory &amp; web recall stay off until you download one.
+      </div>
+    )
+  return (
+    <div className="mcp-list">
+      {dirs.map((d) => (
+        <div key={d.dir} className="skill-actions">
+          <span className="hint">
+            <code>{d.repo}</code> · {fmtBytes(d.size)}
+            {d.ready ? ' · ready' : ' · incomplete'}
+          </span>
+          <button className="btn tiny danger" onClick={() => onRemove(d.repo)}>
+            Remove
+          </button>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 // ---- Skills & MCP helpers ------------------------------------------------ //
@@ -784,11 +2200,15 @@ function splitArgs(text: string): string[] {
 function McpEditor({
   initialName,
   initialCfg,
+  builtin = false,
+  defaultOpen = false,
   onSave,
   onDelete,
 }: {
   initialName: string
   initialCfg: McpServerConfig
+  builtin?: boolean
+  defaultOpen?: boolean
   onSave: (oldName: string, newName: string, cfg: McpServerConfig) => void
   onDelete: (name: string) => void
 }) {
@@ -808,7 +2228,7 @@ function McpEditor({
   const [env, setEnv] = useState(kvToText(initialCfg.env ?? {}))
   const [headers, setHeaders] = useState(kvToText(initialCfg.headers ?? {}))
   const [error, setError] = useState('')
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(defaultOpen)
 
   const transportLabel: Record<McpTransport, string> = {
     stdio: 'stdio',
@@ -844,7 +2264,7 @@ function McpEditor({
     const cfg = build()
     if (!cfg) return
     setError('')
-    onSave(initialName, name.trim(), cfg)
+    onSave(initialName, builtin ? initialName : name.trim(), cfg)
   }
 
   return (
@@ -852,6 +2272,7 @@ function McpEditor({
       <div className="mcp-card-head" onClick={() => setOpen((o) => !o)}>
         <span className={`mcp-chevron ${open ? 'open' : ''}`}>▶</span>
         <span className="mcp-card-title">{name || initialName || 'new connector'}</span>
+        {builtin && <span className="badge mcp-builtin">built-in</span>}
         <span className="mcp-type">{transportLabel[type]}</span>
         <span className="mcp-summary">{summary()}</span>
         <span className={`status-dot ${type === 'stdio' ? 'ok' : ''}`} />
@@ -859,7 +2280,7 @@ function McpEditor({
           <button className="btn tiny" onClick={save}>
             Save
           </button>
-          {initialName && (
+          {initialName && !builtin && (
             <button className="btn tiny danger" onClick={() => onDelete(initialName)}>
               Delete
             </button>
@@ -869,7 +2290,14 @@ function McpEditor({
       {open && (
       <div className="mcp-fields">
         <label className="field-label">Name</label>
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. filesystem" dir="ltr" />
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. filesystem"
+          dir="ltr"
+          readOnly={builtin}
+          title={builtin ? 'Built-in connectors keep their name' : undefined}
+        />
         <label className="field-label">Transport</label>
         <select value={type} onChange={(e) => setType(e.target.value as McpTransport)}>
           <option value="stdio">stdio (local command)</option>

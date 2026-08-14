@@ -1,16 +1,87 @@
 import type { Chat } from '../types'
+import { PERSIAN_RANGE } from './bidi'
 
 export const CHARS_PER_TOKEN = 4
 
+// Tokenizers consume far more tokens per character for certain scripts:
+// - Latin/digits/whitespace:            ~4 chars per token  -> weight 1
+// - Persian/Arabic (incl. ZWNJ/ZWJ):    ~2 chars per token  -> weight 2
+// - CJK / full-width ideographs:        ~1 char per token   -> weight 4
+const PERSIAN_CHAR = new RegExp(`[${PERSIAN_RANGE}\\u200C\\u200D]`)
+const CJK_CHAR =
+  /[\u2E80-\u2EFF\u3000-\u30FF\u31C0-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF\uFF01-\uFF60]/
+
+/** Count characters weighted by script, so Persian/CJK text is not
+ *  under-estimated by the flat "4 chars per token" rule. */
+function weightedCharCount(text: string): number {
+  let w = 0
+  for (const ch of text) {
+    if (PERSIAN_CHAR.test(ch)) w += 2
+    else if (CJK_CHAR.test(ch)) w += 4
+    else w += 1
+  }
+  return w
+}
+
+/**
+ * Split the talk-only (user/assistant/system) messages into the settled tail
+ * that would become `history` on the NEXT turn, and the currently-streaming
+ * message (if any) which is the turn still in flight.
+ *
+ * This mirrors `sliceToBudget` in Chat.tsx exactly: slice to the last
+ * `maxHistory` settled messages, then trim further to the same char budget
+ * (contextWindow * 1.5, capped at 60k for ask mode) the frontend actually
+ * sends. Without this second trim the estimate silently overshoots whatever
+ * the backend will really receive.
+ */
+function budgetedSettledHistory(
+  talk: Chat['messages'],
+  maxHistory: number,
+  contextWindow?: number,
+  mode?: string,
+): { settled: Chat['messages']; live: Chat['messages'][number] | null } {
+  const live =
+    talk.length > 0 && talk[talk.length - 1].streaming ? talk[talk.length - 1] : null
+  const rest = live ? talk.slice(0, -1) : talk
+
+  const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000
+  const budget = Math.floor(ctx * 1.5)
+  // Absolute per-mode ceilings — mirrors sliceToBudget in Chat.tsx exactly.
+  // ask: mentor guidance needs little scrollback; coder/plan turns carry more
+  // tool-call history that stays relevant, so they get higher (but still
+  // bounded) caps. Keeps runaway history from blowing past the window on very
+  // large-context models before the 80% auto-compact threshold kicks in.
+  const MODE_HISTORY_CAPS: Record<string, number> = {
+    ask: 60000,
+    plan: 120000,
+    coder: 140000,
+  }
+  const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? 'ask'] ?? budget)
+  const recent = rest.slice(-maxHistory)
+  const kept: Chat['messages'] = []
+  let acc = 0
+  for (const m of [...recent].reverse()) {
+    if (m.role !== 'system' && kept.length > 0 && acc + m.content.length > capped) break
+    kept.push(m)
+    acc += m.content.length
+  }
+  return { settled: kept.reverse(), live }
+}
+
 /**
  * Estimate the characters that would be sent to the model this turn:
- * system prompt + builtin/workspace note + last maxHistory message text +
- * the actual tool payload (name, args, result summary, diff).
+ * system prompt + builtin/workspace note + the budget-trimmed settled
+ * history (mirrors what `sliceToBudget` actually sends as `history`) + the
+ * in-flight turn's own content and tool payload (name, args, result
+ * summary, diff) — only the LIVE turn's tool activity counts, since past
+ * turns' tool calls are never resent once a turn has finished.
  */
 export function estimateContextChars(
   chat: Chat | null,
   systemPrompt: string,
   maxHistory: number,
+  contextWindow?: number,
+  mode?: string,
 ): number {
   const msgs = chat?.messages ?? []
   let chars = 0
@@ -20,9 +91,11 @@ export function estimateContextChars(
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
-  for (const m of talk.slice(-maxHistory)) chars += m.content.length
-  for (const m of active.slice(-maxHistory)) {
-    for (const act of m.toolActivity ?? []) {
+  const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
+  for (const m of settled) chars += m.content.length
+  if (live) {
+    chars += live.content.length
+    for (const act of live.toolActivity ?? []) {
       chars += act.tool.length
       if (act.args) chars += JSON.stringify(act.args).length
       if (act.summary) chars += act.summary.length
@@ -36,17 +109,53 @@ export function estimateContextTokens(
   chat: Chat | null,
   systemPrompt: string,
   maxHistory: number,
+  contextWindow?: number,
+  mode?: string,
 ): number {
-  return Math.floor(
-    estimateContextChars(chat, systemPrompt, maxHistory) / CHARS_PER_TOKEN,
+  const msgs = chat?.messages ?? []
+  let weight = 0
+  weight += weightedCharCount(systemPrompt)
+  weight += 2200 // builtin system prompt + auto-scout/workspace note
+  const active = msgs.filter((m) => !m.compacted)
+  const talk = active.filter(
+    (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
+  const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
+  for (const m of settled) weight += weightedCharCount(m.content)
+  if (live) {
+    weight += weightedCharCount(live.content)
+    for (const act of live.toolActivity ?? []) {
+      weight += weightedCharCount(act.tool)
+      if (act.args) weight += weightedCharCount(JSON.stringify(act.args))
+      if (act.summary) weight += weightedCharCount(act.summary)
+      if (act.diff) weight += weightedCharCount(act.diff)
+    }
+  }
+  return Math.floor(weight / CHARS_PER_TOKEN)
 }
 
 export function formatTokens(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+/** Compact thousands-separated form for big cumulative chips: 2365.1 -> "2,365K". */
+export function formatTokensK(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${Math.round(n / 1_000).toLocaleString("en-US")}K`
+  return Math.round(n).toLocaleString("en-US")
 }
 
 export function contextPercent(used: number, windowSize: number | null): number | null {
   if (!windowSize || windowSize <= 0) return null
   return Math.min(100, Math.round((used / windowSize) * 100))
+}
+
+/** Format a USD amount for the context-meter cost chip. Tiny amounts (most
+ *  single turns) show 4 decimals so they don't all collapse to "$0.00". */
+export function formatCost(usd: number): string {
+  if (usd <= 0) return '$0'
+  if (usd < 0.01) return `$${usd.toFixed(4)}`
+  return `$${usd.toFixed(2)}`
 }

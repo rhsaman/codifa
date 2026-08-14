@@ -1,5 +1,5 @@
 [project]
-name = "coder-backend"
+name = "CodeFa"
 version = "0.1.0"
 description = "Pydantic AI agent sidecar for the CODEFA Electron app"
 requires-python = ">=3.10"
@@ -9,5 +9,22 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "ddgs>=9.14.4",
+    "cryptography>=42.0.0",
     "faster-whisper>=1.2.1",
+    "numpy>=1.26",
+    "onnxruntime>=1.18",
+    "tokenizers>=0.19",
+    "sqlite-vec>=0.1.9",
+]
+
+[tool.ruff]
+# Treat the backend package itself as first-party so local modules
+# (agents, providers, tools, state_db, vector_store, embeddings, ...)
+# are sorted into their own import section instead of being mixed with
+# third-party packages. Paths are relative to this file's directory.
+src = ["."]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
 ]

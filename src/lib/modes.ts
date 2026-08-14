@@ -29,10 +29,9 @@ export const BUILTIN_MODES: AgentModeDef[] = [
 
 export const BUILTIN_IDS = new Set(BUILTIN_MODES.map((m) => m.id))
 
-/** All modes: built-ins first, then user-created (in settings). */
-export function allModes(settings: Settings): AgentModeDef[] {
-  const custom = Array.isArray(settings?.modes) ? settings.modes : []
-  return [...BUILTIN_MODES, ...custom]
+/** Only the three built-in modes exist — user-created custom modes were removed. */
+export function allModes(_settings: Settings): AgentModeDef[] {
+  return [...BUILTIN_MODES]
 }
 
 export function getMode(settings: Settings, id: AgentMode): AgentModeDef {

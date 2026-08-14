@@ -13,8 +13,11 @@ import asyncio
 import json
 import os
 import re
+import secrets
+import time
 import traceback
 from typing import Annotated
+from urllib.parse import quote
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
@@ -25,13 +28,67 @@ PERMISSION_GATES: dict[str, asyncio.Future] = {}
 # Pending multiple-choice / open questions the agent asked the user mid-task.
 # Resolved by /ask/respond and awaited by the agent's ask_user tool.
 ASK_GATES: dict[str, asyncio.Future] = {}
+# Google OAuth sign-in state: generated `state` token -> dict(client_id,
+# client_secret, redirect_uri, expiry). Populated by /oauth/google/start (when
+# the Electron main opens the consent window) and consumed by the callback that
+# exchanges the resulting authorization code for tokens.
+OAUTH_STATES: dict[str, dict] = {}
+# Authorization codes received via the callback, keyed by `state` so the
+# renderer can pick them up once the exchange lands.
+OAUTH_CODES: dict[str, str] = {}
+# Completed OAuth exchanges, keyed by `state`: {refresh_token, access_token,
+# expires_in, error}. Written by /oauth/google/callback (called by the OS
+# browser), polled by /oauth/google/result (called by the Electron main).
+OAUTH_RESULTS: dict[str, dict] = {}
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from pydantic import BaseModel
 
 import providers
 from agents import run_agent
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+
+
+def wants_skill_or_mcp(text: str) -> bool:
+    """True when a prompt asks to create/install/import skills or MCP connectors,
+    so the agent gets the `create_skill` / `create_mcp` tools for the turn.
+    Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه →
+    action; اسکیل/مهارت → skill target)."""
+    low = text.lower()
+    action = re.search(
+        r"\b(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b",
+        low,
+    )
+    target = re.search(r"\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)", low)
+    return bool(action and target)
+
+
+async def _oauth_access_token(req: ModelsRequest | ChatRequest) -> str:
+    """Resolve a live OAuth access token when the request uses OAuth (Google).
+
+    Returns "" for the plain API-key path so key-based flows are untouched.
+    """
+    if (req.auth_type or "").strip() != "oauth":
+        return ""
+    client_id = (req.oauth_client_id or "").strip()
+    client_secret = (req.oauth_client_secret or "").strip()
+    refresh = (req.oauth_refresh_token or "").strip()
+    if not client_id or not refresh:
+        return ""
+    return await providers.google_access_token(client_id, client_secret, refresh)
+
+
+# Sidecar's own listening port, set in main(). Used to build the loopback
+# redirect_uri for Google OAuth (the consent page lands back on this process).
+_SIDECAR_PORT = 0
+
+
+def _oauth_redirect_uri() -> str:
+    """Loopback URI Google redirects to after consent. The Electron main catches
+    this navigation in-process, so the path only needs to be unique per sidecar."""
+    return f"http://127.0.0.1:{_SIDECAR_PORT}/oauth/google/callback"
+
 
 app = FastAPI(title="CODEFA agent sidecar")
 
@@ -48,6 +105,13 @@ class ChatRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
+    # Google OAuth login (provider kind "google"): resolve a live access token
+    # from a stored refresh token instead of using an API key. Empty strings =
+    # key-based path unchanged.
+    auth_type: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_refresh_token: str = ""
     model: str = ""
     root: str = ""
     mode: str = "chat"
@@ -60,6 +124,7 @@ class ChatRequest(BaseModel):
     mcp_servers: dict = {}
     context_window: int = 0
     skills: list[str] = []
+    auto_skills: bool = False
     allow_create: bool = False
     # Mode capabilities: tool access per mode, so the backend can gate tools
     # data-driven instead of hardcoding mode names. Optional for backward compat.
@@ -78,6 +143,21 @@ class ChatRequest(BaseModel):
     # backend uses it to decide how many recent turns to keep verbatim when it
     # auto-compacts an overflowing context, so recent work is never lost.
     max_history: int = 10
+    # Chat id (renderer-side) so plans can be stored per chat
+    # (<data>/plan/<workspace>/<chat-id>/plan.md) instead of per workspace.
+    chat_id: str = ""
+    # Directory for the per-workspace RAG vector store (memory + web chunks).
+    # Empty string = default (~/.codefa/vector-db).
+    vector_db_path: str = ""
+    # Size / TTL bounds for the RAG store (max_docs, max_chunks, ttl_days).
+    # None = backend defaults.
+    vector_config: dict | None = None
+    # Retrieval knobs (auto_index, auto_recall, top_k, include_* toggles).
+    # None = backend defaults.
+    retrieval_config: dict | None = None
+    # Per-subagent model overrides: {"explore": "model-id", "vision": "...", "compact": "..."}.
+    # Missing / empty dict = use the parent model for every subagent.
+    subagent_models: dict = {}
 
 
 class ModelsRequest(BaseModel):
@@ -85,6 +165,25 @@ class ModelsRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
+    auth_type: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_refresh_token: str = ""
+
+
+class ModelDownloadRequest(BaseModel):
+    """Download a managed on-device model (whisper / embedding)."""
+
+    kind: str = ""
+    model: str = ""
+    base_url: str = ""
+
+
+class ModelRemoveRequest(BaseModel):
+    """Delete a downloaded model. ``model`` = repo id (embeddings) or "". """
+
+    kind: str = ""
+    model: str = ""
 
 
 class PermissionResponse(BaseModel):
@@ -95,6 +194,15 @@ class PermissionResponse(BaseModel):
 class AskResponse(BaseModel):
     id: str
     answer: str
+
+
+class StateRequest(BaseModel):
+    """Whole-state write from Electron main: settings and/or chat snapshot."""
+
+    settings: dict | None = None
+    chats: list | None = None
+    deleted_chats: list | None = None
+    deleted_workspaces: list | None = None
 
 
 @app.post("/permission/respond")
@@ -117,6 +225,33 @@ async def ask_respond(req: AskResponse) -> dict:
     return {"status": "ok"}
 
 
+# --- app state (settings + chats/messages) ------------------------------ #
+# Persisted as plain files in the user data root (backend/state_db.py): a
+# settings.json plus per-chat JSON files under chats/<workspace>/. Electron's
+# main process reads/writes state through these endpoints; the data root
+# defaults to ~/.codefa (configurable via CODER_DATA_DIR).
+
+
+@app.get("/app/state")
+async def app_state() -> dict:
+    import state_db
+
+    return state_db.get_state()
+
+
+@app.post("/app/state")
+async def app_save(req: StateRequest) -> dict:
+    import state_db
+
+    if req.settings is not None:
+        state_db.save_settings(req.settings)
+    if req.chats is not None or req.deleted_chats is not None:
+        state_db.save_chats(req.chats or [], deleted_ids=req.deleted_chats)
+    if req.deleted_workspaces:
+        state_db.remove_workspace_vectors(req.deleted_workspaces)
+    return {"ok": True}
+
+
 @app.get("/health")
 async def health() -> dict:
     import pydantic_ai
@@ -124,15 +259,174 @@ async def health() -> dict:
     return {"status": "ok", "version": pydantic_ai.__version__}
 
 
+class OAuthStartRequest(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    # Optional override of the requested OAuth scopes. Empty = the default
+    # Gemini scopes (GOOGLE_OAUTH_SCOPES). Non-empty = e.g. the Search Console
+    # scope (GOOGLE_SEARCH_CONSOLE_SCOPES) for the search_console tool, so the
+    # same OAuth flow signs in to different Google APIs with the open
+    # consent that its own scope set.
+    scope: str = ""
+
+
+@app.post("/oauth/google/start")
+async def oauth_google_start(req: OAuthStartRequest) -> dict:
+    """Begin a Google OAuth sign-in: build the consent URL for the client, keyed
+    by a random `state`. The redirect_uri points back at THIS sidecar's loopback
+    URL so the Electron main can catch the authorization code locally."""
+    client_id = (req.client_id or "").strip()
+    if not client_id:
+        raise HTTPException(status_code=400, detail="missing Google OAuth client id")
+    state = secrets.token_urlsafe(24)
+    redirect_uri = _oauth_redirect_uri()
+    scope = (req.scope or "").strip() or providers.GOOGLE_OAUTH_SCOPES
+    url = (
+        f"{providers.GOOGLE_OAUTH_AUTH_URL}"
+        f"?client_id={quote(client_id, safe='')}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
+        f"&response_type=code"
+        f"&scope={quote(scope, safe='')}"
+        f"&access_type=offline"
+        f"&prompt=consent"
+        f"&state={state}"
+    )
+    OAUTH_STATES[state] = {
+        "client_id": client_id,
+        "client_secret": (req.client_secret or "").strip(),
+        "expires": time.monotonic() + 15 * 60,
+    }
+    return {"url": url, "state": state}
+
+
+@app.get("/oauth/google/callback")
+async def oauth_google_callback(
+    code: str = "", state: str = "", error: str = ""
+) -> PlainTextResponse:
+    """The OS browser lands here after Google consent (via the loopback
+    redirect_uri). Exchange the code for refresh/access tokens, cache the result
+    by ``state`` for /oauth/google/result to pick up, and tell the user to close
+    the tab."""
+    entry = OAUTH_STATES.pop(state or "", None)
+    if error:
+        OAUTH_RESULTS[state or ""] = {"error": f"Google sign-in cancelled ({error})"}
+        return PlainTextResponse(
+            "Sign-in cancelled. You can close this tab.", status_code=200
+        )
+    if not entry or entry.get("expires", 0) < time.monotonic():
+        OAUTH_RESULTS[state or ""] = {"error": "oauth state expired; try signing in again"}
+        return PlainTextResponse("Sign-in expired. You can close this tab.", status_code=200)
+    if not code:
+        OAUTH_RESULTS[state or ""] = {"error": "Google returned no authorization code"}
+        return PlainTextResponse("No authorization code. You can close this tab.", status_code=200)
+    try:
+        data = await providers.google_exchange_code(
+            entry["client_id"],
+            entry["client_secret"],
+            code,
+            _oauth_redirect_uri(),
+        )
+    except providers.ProviderError as exc:
+        OAUTH_RESULTS[state or ""] = {"error": str(exc)}
+        return PlainTextResponse(
+            f"Sign-in failed: {exc} You can close this tab.", status_code=200
+        )
+    refresh = data.get("refresh_token") or ""
+    if not refresh:
+        OAUTH_RESULTS[state or ""] = {
+            "error": "Google returned no refresh token (was `access_type=offline` honored?)"
+        }
+        return PlainTextResponse("Sign-in failed. You can close this tab.", status_code=200)
+    OAUTH_RESULTS[state or ""] = {
+        "refresh_token": refresh,
+        "access_token": data.get("access_token") or "",
+        "expires_in": int(data.get("expires_in") or 3600),
+    }
+    return PlainTextResponse("Signed in! You can close this tab.", status_code=200)
+
+
+@app.get("/oauth/google/result")
+async def oauth_google_result(state: str = "") -> dict:
+    """Polled by the Electron main: returns the completed OAuth exchange for
+    ``state`` (or a pending marker) and clears it once consumed."""
+    result = OAUTH_RESULTS.pop(state or "", None)
+    if result is None:
+        return {"status": "pending"}
+    if "error" in result:
+        return {"status": "error", "message": result["error"]}
+    return {"status": "ok", **result}
+
+
 @app.get("/models")
 async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
+        oauth = await _oauth_access_token(req)
         ids = await providers.list_models(
-            req.provider, req.base_url, req.api_key, req.env_var
+            req.provider, req.base_url, req.api_key, req.env_var, oauth_token=oauth
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"models": ids}
+
+
+@app.get("/credits")
+async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
+    try:
+        oauth = await _oauth_access_token(req)
+        return await providers.fetch_credits(
+            req.provider, req.base_url, req.api_key, req.env_var, oauth_token=oauth
+        )
+    except providers.ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- managed on-device models (whisper / embedding) --------------------- #
+# Download & removal are user-initiated from Settings → Models (never
+# automatic). Downloads run on a background thread; /models/status is polled
+# while one is in flight.
+
+
+@app.post("/models/download")
+async def models_download(req: ModelDownloadRequest) -> dict:
+    import model_download
+
+    kind = (req.kind or "").strip() or model_download.KIND_EMBEDDING
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+        raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
+    model = (req.model or "").strip() or (
+        model_download.WHISPER_DEFAULT_REPO
+        if kind == model_download.KIND_WHISPER
+        else model_download.EMBEDDING_DEFAULT_REPO
+    )
+    if not model_download.start_download(kind, model, req.base_url):
+        raise HTTPException(status_code=400, detail="empty model repo id")
+    return {"ok": True, "kind": kind, "model": model}
+
+
+@app.get("/models/status")
+async def models_status() -> dict:
+    import model_download
+
+    return model_download.status()
+
+
+@app.get("/models/embedding-status")
+async def models_embedding_status() -> dict:
+    """RAG embedder diagnostics: model loaded? what dimension? why not?."""
+    from embeddings import status as embed_status
+
+    return embed_status()
+
+
+@app.post("/models/remove")
+async def models_remove(req: ModelRemoveRequest) -> dict:
+    import model_download
+
+    kind = (req.kind or "").strip().lower()
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+        raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
+    removed = model_download.remove(kind, req.model)
+    return {"ok": True, "kind": kind, "removed": removed}
 
 
 @app.get("/system-prompts")
@@ -142,9 +436,107 @@ async def system_prompts() -> dict:
     return {"chat": SYSTEM_PROMPTS["chat"], "codewriter": SYSTEM_PROMPTS["codewriter"]}
 
 
-# Lazy-loaded faster-whisper model (the CTranslate2 "small" model shipped under
-# backend/whisper/). Loaded once on first transcription and cached, so the first
-# request pays the load cost but every later one is fast and fully local+offline.
+# --- skills (stored in the app database, embedded in the skill vector store) - #
+
+
+class SkillSyncRequest(BaseModel):
+    name: str = ""
+    previous_name: str = ""
+    content: str = ""
+    description: str = ""
+    delete: bool = False
+
+
+@app.get("/skills")
+async def skills_list() -> dict:
+    import state_db
+
+    try:
+        skills = state_db.list_skills()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"could not read skills: {exc}") from exc
+    return {"skills": skills}
+
+
+@app.post("/skills/sync")
+async def skills_sync(req: SkillSyncRequest) -> dict:
+    from tools import persist_skill, remove_skill
+
+    name = (req.name or "").strip()
+    if req.delete:
+        if not name:
+            raise HTTPException(status_code=400, detail="missing skill name")
+        return remove_skill(name)
+    content = (req.content or "").strip()
+    if not content:
+        # Rebuild a full skill from structured fields when no raw markdown came.
+        name = name or (req.description or "").strip()[:60] or "skill"
+        content = (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {(req.description or '').strip()}\n"
+            "---\n\n"
+            f"# {name}\n"
+        )
+    result = persist_skill(content, fallback_name=name, previous_name=req.previous_name)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("note", "save failed"))
+    return result
+
+
+# --- MCP connectors (stored in the app database) --------------------------- #
+
+
+class McpSaveRequest(BaseModel):
+    name: str = ""
+    cfg: dict = {}
+
+
+class McpDeleteRequest(BaseModel):
+    name: str = ""
+
+
+@app.get("/mcp")
+async def mcp_list() -> dict:
+    import state_db
+    from tools import _BUILTIN_MCP_SERVERS
+
+    try:
+        return {
+            "mcpServers": state_db.list_mcp(),
+            "builtins": sorted(_BUILTIN_MCP_SERVERS),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"could not read MCP config: {exc}") from exc
+
+
+@app.post("/mcp")
+async def mcp_save(req: McpSaveRequest) -> dict:
+    from tools import upsert_mcp_server
+
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="missing connector name")
+    if not isinstance(req.cfg, dict):
+        raise HTTPException(status_code=400, detail="invalid connector config")
+    return upsert_mcp_server("", name, req.cfg)
+
+
+@app.post("/mcp/delete")
+async def mcp_delete(req: McpDeleteRequest) -> dict:
+    import state_db
+
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="missing connector name")
+    removed = state_db.delete_mcp(name)
+    return {"ok": True, "removed": removed}
+
+
+# Lazy-loaded faster-whisper model (the CTranslate2 model downloaded into
+# backend/whisper/, see Settings → Models). Loaded once on first transcription
+# and cached, so the first request pays the load cost but every later one is
+# fast and fully local+offline.
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
 
@@ -154,11 +546,21 @@ async def _get_whisper_model():
     if _whisper_model is None:
         async with _whisper_model_lock:
             if _whisper_model is None:
+                import model_download
+
+                if not model_download.whisper_ready():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Whisper model is not downloaded. Open Settings → Models and "
+                            f"download it ({model_download.WHISPER_DEFAULT_REPO})."
+                        ),
+                    )
                 from faster_whisper import WhisperModel
 
-                model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper")
+                model_dir = model_download.whisper_dir()
                 _whisper_model = WhisperModel(
-                    model_dir, device="cpu", compute_type="int8"
+                    model_dir, device="auto", compute_type="auto"
                 )
     return _whisper_model
 
@@ -222,10 +624,16 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def _friendly_error(exc: Exception, model: str) -> str:
+def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     text = str(exc)
+    # A bare `asyncio.TimeoutError` (and similar) has an EMPTY str() — the type
+    # name is the only clue. Turn it into a readable timeout message so the user
+    # isn't left with the generic fallback at the bottom.
+    if not text.strip():
+        text = "The model request timed out (no data arrived from the provider for an extended period)."
     # pydantic-ai HTTP errors render as: status_code: 400, model_name: ...,
-    # body: {'message': '...'}. Pull out the server's own message when present.
+    # body: {'message': '...'} (or body: [{'error': {'message': '...'}}] from
+    # Gemini's OpenAI-compat endpoint). Pull out the server's own message.
     detail = ""
     m = re.search(r"body:\s*(\{.*\})", text, re.DOTALL)
     if m:
@@ -236,10 +644,59 @@ def _friendly_error(exc: Exception, model: str) -> str:
                 detail = str(detail)
         except (ValueError, SyntaxError, TypeError):
             detail = ""
+    if not detail:
+        # Array form: body: [{'error': {'code': ..., 'message': ..., 'status': ...}}]
+        m = re.search(r"body:\s*(\[.*\])", text, re.DOTALL)
+        if m:
+            try:
+                arr = ast.literal_eval(m.group(1))
+                if isinstance(arr, list) and arr:
+                    err = arr[0].get("error") or {} if isinstance(arr[0], dict) else {}
+                    if isinstance(err, dict):
+                        detail = err.get("message") or str(err)
+                    else:
+                        detail = str(err)
+            except (ValueError, SyntaxError, TypeError):
+                detail = ""
     if detail:
         text = detail
     low = text.lower()
+    # Credential errors raised by providers.build_model are already actionable
+    # (they tell the user exactly what to fix in Settings) — never wrap them in
+    # a generic hint on top.
+    if "settings → providers" in low:
+        return text
     if (
+        "all connection attempts failed" in low
+        or "connection refused" in low
+        or "connecterror" in low
+        or "getaddrinfo" in low
+        or "no connection could be made" in low
+        or "name or service not known" in low
+        or "unable to connect" in low
+        or "connect call failed" in low
+    ):
+        endpoint = (base_url or "").strip()
+        hint = f" at {endpoint}" if endpoint else ""
+        text += (
+            f"\n\nCouldn't connect to the provider endpoint{hint}. For a local server "
+            "(llama.cpp/Ollama) make sure it's actually running and the base URL/port in "
+            "Settings are correct. For a cloud provider, check the base URL and your "
+            "internet connection."
+        )
+    elif (
+        "401" in low
+        or "invalid api key" in low
+        or "unauthorized" in low
+        or "auth error" in low
+        or "authentication" in low
+    ):
+        text += (
+            "\n\nThe API key for this provider is invalid, expired, or missing. Open "
+            "Settings → Providers and check the API key field (or the env var it "
+            "references)."
+        )
+    elif (
         "incomplete chunked read" in low
         or "peer closed connection" in low
         or "connection was closed" in low
@@ -250,6 +707,13 @@ def _friendly_error(exc: Exception, model: str) -> str:
             "\n\nThe connection to the model was dropped mid-stream (the upstream closed the "
             "request while streaming a reply). This is usually transient — retry the same "
             "message, or switch to another model in Settings if it keeps happening."
+        )
+    elif "timed out" in low or "timeout" in low:
+        text += (
+            "\n\nThe connection stalled mid-stream (the provider was slow to send the "
+            "next chunk). The run auto-resumes from the tool work already done, so "
+            "just wait; if it keeps happening, switch to a faster model in Settings "
+            "or compact the conversation."
         )
     elif "output retries" in low or "return text or call a tool" in low or "unexpectedmodelbehavior" in low:
         text += (
@@ -306,6 +770,25 @@ def _friendly_error(exc: Exception, model: str) -> str:
             "\n\nThis looks like an OpenRouter gateway block (some regions/keys can't reach it). "
             "Try the 'opencode' provider instead — it uses its own gateway (opencode.ai/zen)."
         )
+    elif "thought_signature" in low:
+        text = (
+            "Gemini 3.x models require a thought signature to be echoed back on every "
+            "tool call. The app's native Google connector handles this automatically — "
+            "restart the app and retry the same message. If it still fails, switch to a "
+            "Gemini 2.x model or another provider."
+        )
+    elif (
+        "no google credential configured" in low
+        or "set the google_api_key" in low
+        or "pass it via googleprovider" in low
+        or "googleprovider(api_key" in low
+    ):
+        text += (
+            "\n\nThe Google provider has no usable credential. Open Settings → Providers → "
+            "Google and EITHER set a real environment variable (GOOGLE_API_KEY or "
+            "GOOGLE_GENERATIVE_AI_API_KEY) that exists in your environment, OR paste your "
+            "Gemini API key in 'Saved API key'. A variable name alone is not a key."
+        )
     elif any(
         word in low
         for word in (
@@ -333,10 +816,24 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     if not req.root or not os.path.isdir(req.root):
         raise HTTPException(status_code=400, detail="invalid project root")
 
+    # Safety net: messages that ask to create/install skills or MCP connectors
+    # grant the create_skill/create_mcp tools even if the frontend didn't flag
+    # them. Available in EVERY mode (ask, plan, coder) — as long as the current
+    # prompt (or the recent history, so a "continue" follow-up keeps the grant)
+    # expresses the intent.
+    if not req.allow_create:
+        if wants_skill_or_mcp(req.prompt):
+            req.allow_create = True
+        else:
+            for turn in (req.history or [])[-6:]:
+                if turn.get("role") == "user" and wants_skill_or_mcp(
+                    str(turn.get("content", ""))
+                ):
+                    req.allow_create = True
+                    break
+
     async def event_gen():
         try:
-            last_usage = None
-
             async for event in run_agent(
                 provider=req.provider,
                 model_name=req.model,
@@ -354,6 +851,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 mcp_servers=req.mcp_servers,
                 context_window=req.context_window,
                 skills_selected=req.skills,
+                auto_skills=req.auto_skills,
                 allow_create=req.allow_create,
                 cap=req.cap,
                 permission_gates=PERMISSION_GATES,
@@ -362,32 +860,13 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 nvim_file=req.nvim_file,
                 nvim_diagnostics=req.nvim_diagnostics,
                 max_history=req.max_history,
+                vector_db_path=req.vector_db_path,
+                vector_config=req.vector_config,
+                retrieval_config=req.retrieval_config,
+                subagent_models=req.subagent_models,
+                chat_id=req.chat_id,
             ):
-                # --- بخش اصلاح شده برای جلوگیری از خطای AttributeError ---
-                # ابتدا چک می‌کنیم آیا event یک دیکشنری است یا یک شیء
-                if isinstance(event, dict):
-                    if "usage" in event:
-                        last_usage = event["usage"]
-                else:
-                    # اگر شیء است، با استفاده از getattr بدون خطا مقدار را می‌گیریم
-                    usage_val = getattr(event, "usage", None)
-                    if usage_val:
-                        last_usage = usage_val
-                # -------------------------------------------------------
-
                 yield _sse(event)
-
-            # ارسال usage در انتهای استریم
-            if last_usage:
-                try:
-                    from agents import _usage_event
-
-                    usage_data = _usage_event(last_usage)
-                    if usage_data:
-                        yield _sse(usage_data)
-                except Exception:  # noqa: BLE001 — fallback if the helper is unavailable
-                    # اگر تابع در agents.py نبود، به صورت دستی ارسال کن
-                    yield _sse({"kind": "usage", "content": str(last_usage)})
 
         except asyncio.CancelledError:
             # Client disconnected (aborted the stream): the run_agent generator
@@ -399,7 +878,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # ("Exceeded maximum output retries (1)", ...) never hides the real
             # trigger; the user still sees a readable error over SSE.
             traceback.print_exc()
-            yield _sse({"kind": "error", "content": _friendly_error(exc, req.model)})
+            yield _sse({"kind": "error", "content": _friendly_error(exc, req.model, req.base_url)})
         finally:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
             yield _sse({"kind": "done"})
@@ -411,11 +890,254 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     )
 
 
+class MemoryRequest(BaseModel):
+    """Root + optional vector-store folder for memory stats / clear."""
+
+    root: str = ""
+    vector_db_path: str = ""
+
+
+class MemoryAddRequest(MemoryRequest):
+    """Write a memory note to the workspace RAG store (Best-effort). `memory_type`
+    gives the retention class: "short_term" (~24h) or "long_term" (default)."""
+
+    text: str = ""
+    memory_type: str = "short_term"
+
+
+class MemoryAddResponse(BaseModel):
+    ok: bool = False
+    error: str = ""
+    skipped: str = ""
+
+
+class MemoryStatsResponse(BaseModel):
+    available: bool = False
+    db: str = ""
+    docs: int = 0
+    chunks: int = 0
+    kinds: dict[str, int] = {}
+    max_docs: int = 0
+    max_chunks: int = 0
+    ttl_days: int = 0
+
+
+class MemoryClearResponse(BaseModel):
+    ok: bool = False
+    error: str = ""
+
+
+@app.get("/memory/stats")
+async def memory_stats(
+    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
+    vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
+) -> MemoryStatsResponse:
+    from tools import open_vector_store
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    store = open_vector_store(root, vector_db_path)
+    if store is None:
+        return MemoryStatsResponse()
+    try:
+        return MemoryStatsResponse(available=True, **store.stats())
+    except Exception as exc:  # noqa: BLE001
+        return MemoryStatsResponse(available=False, db="", error=str(exc))
+
+
+@app.post("/memory/clear")
+async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
+    from tools import open_vector_store
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    store = open_vector_store(req.root, req.vector_db_path)
+    if store is None:
+        return MemoryClearResponse(ok=False, error="could not open vector store")
+    try:
+        store.clear()
+        return MemoryClearResponse(ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return MemoryClearResponse(ok=False, error=str(exc))
+
+
+@app.post("/memory/add")
+async def memory_add(req: MemoryAddRequest) -> MemoryAddResponse:
+    from tools import open_vector_store, remember
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    if not req.text or not req.text.strip():
+        return MemoryAddResponse(ok=False, error="empty text")
+    store = open_vector_store(req.root, req.vector_db_path)
+    if store is None:
+        return MemoryAddResponse(ok=False, error="could not open vector store")
+    try:
+        res = remember(
+            req.root,
+            req.text.strip(),
+            store,
+            memory_type=req.memory_type if req.memory_type in ("short_term", "long_term") else "short_term",
+        )
+        if res.get("error"):
+            return MemoryAddResponse(ok=False, error=str(res["error"]))
+        return MemoryAddResponse(
+            ok=True,
+            skipped=res.get("skipped", ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return MemoryAddResponse(ok=False, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Index / retrieval / cleanup endpoints
+# ---------------------------------------------------------------------------
+
+
+class IndexStatusResponse(BaseModel):
+    available: bool = False
+    db: str = ""
+    docs: int = 0
+    chunks: int = 0
+    kinds: dict[str, int] = {}
+    embedder: bool = False
+    needs_index: bool = False
+
+
+class IndexRunRequest(BaseModel):
+    root: str = ""
+    vector_db_path: str = ""
+    vector_config: dict | None = None
+    budget: int = 0  # 0 = unlimited (index everything this run)
+
+
+class IndexRunResponse(BaseModel):
+    ok: bool = False
+    total: int = 0
+    indexed: int = 0
+    pruned: int = 0
+    skipped: int = 0
+    unchanged: int = 0
+    error: str = ""
+
+
+class CleanupRunRequest(BaseModel):
+    root: str = ""
+    vector_db_path: str = ""
+
+
+class CleanupRunResponse(BaseModel):
+    ok: bool = False
+    evicted: int = 0
+    pruned_files: int = 0
+    expired_notes: int = 0
+    vacuumed: bool = False
+    error: str = ""
+
+
+def _open_store(root: str, vector_db_path: str):
+    """Open the workspace store or raise 400 with a clear message."""
+    from tools import open_vector_store
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    store = open_vector_store(root, vector_db_path)
+    if store is None:
+        raise HTTPException(status_code=503, detail="vector store unavailable")
+    return store
+
+
+@app.get("/index/status")
+async def index_status(
+    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
+    vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
+) -> IndexStatusResponse:
+    from embeddings import embedder_available
+    from indexer import needs_index
+
+    try:
+        store = _open_store(root, vector_db_path)
+    except HTTPException:
+        return IndexStatusResponse()
+    try:
+        stats = store.stats()
+        return IndexStatusResponse(
+            available=True,
+            db=str(getattr(store, "_db_path", "")),
+            docs=int(stats.get("docs", 0)),
+            chunks=int(stats.get("chunks", 0)),
+            kinds=dict(stats.get("by_kind", {})),
+            embedder=embedder_available(),
+            needs_index=bool(needs_index(store, root)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return IndexStatusResponse(available=False, error=str(exc))
+
+
+@app.post("/index/run")
+async def index_run(req: IndexRunRequest) -> IndexRunResponse:
+    from indexer import index_workspace
+
+    try:
+        store = _open_store(req.root, req.vector_db_path)
+    except HTTPException as exc:
+        return IndexRunResponse(error=str(exc.detail))
+    try:
+        result = index_workspace(
+            store,
+            req.root,
+            budget=req.budget or 0,
+        )
+        return IndexRunResponse(ok=True, **result)
+    except Exception as exc:  # noqa: BLE001
+        return IndexRunResponse(error=str(exc))
+
+
+@app.post("/cleanup/run")
+async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
+    from cleanup import run_cleanup
+    from tools import _memory_manager
+
+    try:
+        store = _open_store(req.root, req.vector_db_path)
+    except HTTPException as exc:
+        return CleanupRunResponse(error=str(exc.detail))
+    try:
+        report = run_cleanup(store, req.root, memory_manager=_memory_manager(req.root, store))
+        return CleanupRunResponse(ok=True, **report)
+    except Exception as exc:  # noqa: BLE001
+        return CleanupRunResponse(error=str(exc))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CODEFA agent sidecar")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+
+    # Central file logging: every Python logger (retrieval, vector_store, and any
+    # future module) appends WARNING+ to <data root>/codefa.log so a packaged app
+    # whose stderr is not captured still leaves a persistent error trail behind.
+    try:
+        import logging
+
+        from tools import user_coder_dir
+
+        _log_dir = user_coder_dir()
+        os.makedirs(_log_dir, exist_ok=True)
+        _handler = logging.FileHandler(
+            os.path.join(_log_dir, "codefa.log"), encoding="utf-8"
+        )
+        _handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"
+            )
+        )
+        _root = logging.getLogger()
+        _root.setLevel(logging.WARNING)
+        _root.addHandler(_handler)
+    except Exception:  # noqa: BLE001, S110 — logging must never kill the sidecar
+        pass
 
     # Disable broken stdio MCP connectors (e.g. a docker MCP with invalid flags)
     # as soon as the sidecar starts, so they never spam errors during use.
@@ -426,8 +1148,34 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110 — broken connectors are handled lazily
         pass
 
+    # Install the built-in starter skills on the very first run (no-op later).
+    try:
+        from tools import seed_starter_skills
+
+        seed_starter_skills()
+    except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
+        pass
+
+    # Install the built-in MCP connectors (e.g. the Docker MCP) on first run.
+    try:
+        from tools import seed_builtin_mcp
+
+        seed_builtin_mcp()
+    except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
+        pass
+
     import uvicorn
 
+    # Ensure essential data-root dirs exist (settings.json, skills/, mcp/, plan/).
+    try:
+        import state_db
+
+        state_db.bootstrap()
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    global _SIDECAR_PORT
+    _SIDECAR_PORT = args.port
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

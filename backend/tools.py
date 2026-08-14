@@ -7,6 +7,7 @@ files outside the selected project folder.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import difflib
 import json
@@ -15,11 +16,26 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 import unicodedata
 import uuid
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
 from typing import Any
+
+import providers as _providers
+import state_db as _state_db
+from cache import Cache, cache_path_for
+from embeddings import EmbedderUnavailableError
+from memory_manager import MEM_SHORT_TERM, MemoryConfig, MemoryManager
+from secret_utils import decrypt_secret
+from vector_store import (
+    KIND_MEMORY,
+    KIND_SKILL,
+    KIND_WEB,
+    StoreConfig,
+    VectorStore,
+    db_path_for,
+)
 
 MAX_READ_BYTES = 2_000_000  # 2 MB
 MAX_SEARCH_RESULTS = 200
@@ -27,15 +43,163 @@ MAX_FILES = 10_000
 MAX_TERMINAL_OUTPUT = 30_000
 TERMINAL_TIMEOUT = 120
 TERMINAL_TIMEOUT_MAX = 300
-MAX_WEB_SEARCH_RESULTS = 5
+MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
 WEB_SEARCH_TIMEOUT = 15
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 
-# DuckDuckGo HTML search backend (no API key required). Imported lazily inside
-# the function so a missing/old package degrades to a friendly message instead
-# of failing at import time.
-_BACKEND = "duckduckgo"
+# Sub-agent model calls (explore / terminal-search reader / web distiller)
+# share the parent turn's retry policy so a free-tier rate limit or connection
+# blip on the gateway retries the sub-agent instead of failing the whole turn
+# and re-burning parent tokens. Flat 30s cadence, up to 10 attempts, then the
+# caller's existing fallback path runs (raw output / error message).
+_SUBAGENT_RETRY_SECONDS = 30
+_SUBAGENT_MAX_ATTEMPTS = 10
+
+
+async def _run_subagent_call(
+    factory: Callable[[], Any],
+    label: str,
+    *,
+    emit: Callable[[dict], None] | None = None,
+    model_name: str = "",
+) -> Any:
+    """Run a sub-agent model call (``factory`` → coroutine) with the shared
+    retry policy: on a transient throttle / retryable error / empty-output
+    error, retry every 30s up to 10 attempts. A hard quota exhaustion or any
+    non-retryable failure (bad key, invalid model) is re-raised immediately so
+    the caller's existing fallback handles it.
+
+    When ``emit`` is provided, each retry is surfaced as a ``retry`` event so
+    the UI shows the sub-agent is retrying (instead of a frozen tool card for
+    up to 5 minutes of silent backoff). Returns the coroutine's result.
+    """
+    from agents import (
+        _is_empty_output_error,
+        _is_quota_exhausted,
+        _is_retryable,
+        _is_transient_throttle,
+    )
+
+    attempt = 0
+    while True:
+        try:
+            return await factory()
+        except Exception as exc:
+            retryable = (
+                _is_transient_throttle(exc)
+                or _is_retryable(exc)
+                or _is_empty_output_error(exc)
+            )
+            if (
+                _is_quota_exhausted(exc)
+                or not retryable
+                or attempt >= _SUBAGENT_MAX_ATTEMPTS
+            ):
+                raise
+            attempt += 1
+            if emit is not None:
+                try:
+                    emit(
+                        {
+                            "kind": "retry",
+                            "attempt": attempt,
+                            "max_attempts": _SUBAGENT_MAX_ATTEMPTS + 1,
+                            "delay": _SUBAGENT_RETRY_SECONDS,
+                            "reason": f"{label} hit a transient error — retrying",
+                            "model": model_name,
+                            "agent": label,
+                        }
+                    )
+                except Exception:  # noqa: BLE001, S110 — cosmetic only
+                    pass
+            await asyncio.sleep(_SUBAGENT_RETRY_SECONDS)
+
+
+def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
+    """A short, actionable note for when a subagent fails — names BOTH the
+    subagent and the model it ran on so the user can change the right one in
+    Settings → Subagents. Returns '' when there's nothing useful to say."""
+    text = str(exc).strip()
+    if model:
+        return (
+            f"Note: the {agent} sub-agent model ({model}) failed — change it in "
+            f"Settings → Subagents. ({text})"
+        )
+    if text:
+        return f"Note: the {agent} sub-agent failed. ({text})"
+    return ""
+
+
+# Web-search backends are pluggable via Settings → Plugins. Each engine is a
+# function ``(query, max_results, cfg) -> list[dict]`` where ``cfg`` is that
+# plugin's saved row; a new engine later = add its function here + one entry in
+# ``SEARCH_BACKENDS``, nothing else touches. ``duckduckgo`` needs no key and is
+# the built-in fallback. Private imports stay lazy so a missing/old package
+# degrades to a friendly message instead of failing at import time.
+def _active_search_engines() -> list[dict]:
+    try:
+        cfg = (_state_db.get_settings() or {}).get("searchPlugins") or []
+    except Exception:  # noqa: BLE001
+        return [{"kind": "duckduckgo"}]
+    enabled = [p for p in cfg if isinstance(p, dict) and p.get("enabled")]
+    if not enabled:
+        return [{"kind": "duckduckgo"}]
+    return sorted(enabled, key=lambda p: int(p.get("order", 99)))
+
+
+def _ddg_search(query: str, max_results: int, cfg: dict) -> list[dict]:
+    from ddgs import DDGS
+
+    with DDGS(timeout=WEB_SEARCH_TIMEOUT) as ddgs:
+        raw = ddgs.text(query, max_results=max_results)
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "title": str(item.get("title", "")).strip(),
+                "url": str(item.get("href", "") or item.get("url", "")).strip(),
+                "snippet": str(item.get("body", "") or item.get("snippet", "")).strip(),
+            }
+        )
+    return out
+
+
+
+
+
+def _tavily_search(query: str, max_results: int, cfg: dict) -> list[dict]:
+    """Tavily search API. Needs the plugin's ``apiKey`` set in Settings → Plugins."""
+    import httpx
+
+    key = decrypt_secret(cfg.get("apiKey") or "")
+    if not key:
+        raise RuntimeError("tavily search needs an API key")
+    with httpx.Client(timeout=WEB_SEARCH_TIMEOUT) as client:
+        resp = client.post(
+            "https://api.tavily.com/search",
+            json={"api_key": key, "query": query, "max_results": max_results},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"tavily {resp.status_code}: {resp.text[:200]}")
+        results = resp.json().get("results") or []
+    return [
+        {
+            "title": str(item.get("title", "")).strip(),
+            "url": str(item.get("url", "")).strip(),
+            "snippet": str(item.get("content", "") or item.get("snippet", "") or "").strip(),
+        }
+        for item in results
+        if isinstance(item, dict)
+    ]
+
+
+SEARCH_BACKENDS: dict[str, Callable[[str, int, dict], list[dict]]] = {
+    "duckduckgo": _ddg_search,
+    "tavily": _tavily_search,
+}
 
 _TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".jsonc", ".yaml", ".yml",
@@ -96,6 +260,7 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",  # tolerate non-UTF-8 bytes in terminal output
             start_new_session=True,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
@@ -184,10 +349,9 @@ def resolve_safe(root: str, rel_path: str, allow_coder: bool = False) -> str:
 
     Accepts both relative paths (``src/main.py``) and absolute paths that lie
     inside the root (``/home/user/proj/src/main.py``). Absolute paths under the
-    user-level ``~/.coder`` config dir are also allowed when ``allow_coder`` is
-    set — that is where skills, plans and MCP config live, and reading them
-    must never require a permission prompt (writing still goes through the
-    strict path).
+    user-level data folder (``user_coder_dir()`` — Data path in Settings) are
+    also allowed when ``allow_coder`` is set — reading them must never require
+    a permission prompt (writing still goes through the strict path).
     """
     root_real = os.path.realpath(os.path.abspath(root))
     if not os.path.isdir(root_real):
@@ -232,7 +396,19 @@ def _read_text(path: str) -> tuple[str, bool]:
         return data.decode("utf-8", errors="replace"), truncated
 
 
+# Cache of _walk_files listings per root, so consecutive fuzzy_find / list /
+# search calls inside one turn reuse the same file list instead of re-walking
+# the tree each time (a large repo walk can cost hundreds of ms and is pure
+# repeated work across sibling tool calls). Keyed on root, bounded TTL.
+_walk_cache: dict[str, tuple[float, Sequence[str]]] = {}
+_WALK_CACHE_TTL = 10.0  # seconds
+
+
 def _walk_files(root: str) -> Sequence[str]:
+    now = time.time()
+    cached = _walk_cache.get(root)
+    if cached is not None and now - cached[0] < _WALK_CACHE_TTL:
+        return cached[1]
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
@@ -242,7 +418,12 @@ def _walk_files(root: str) -> Sequence[str]:
         for name in filenames:
             found.append(os.path.join(dirpath, name))
             if len(found) >= MAX_FILES:
-                return found
+                break
+        if len(found) >= MAX_FILES:
+            break
+    if len(_walk_cache) > 8:
+        _walk_cache.clear()
+    _walk_cache[root] = (now, found)
     return found
 
 
@@ -250,13 +431,14 @@ def _display_path(root: str, file: str) -> str:
     """Return a path string the agent can feed straight back into the tools.
 
     Files under the workspace root show as their tree-relative path (``src/a``);
-    files under ``~/.coder`` (user skills/plans/MCP config) show as
-    ``~/.coder/skills/...`` so the agent can read them without permission.
+    files under the user data folder show their real absolute path. Skills,
+    plans and MCP connectors live in the app database and are given to the agent
+    inline instead.
     """
     root_real = os.path.realpath(os.path.abspath(root))
     coder = os.path.realpath(user_coder_dir())
     if file == coder or file.startswith(coder + os.sep):
-        return "~/.coder/" + os.path.relpath(file, coder).replace(os.sep, "/")
+        return file
     return os.path.relpath(file, root_real).replace(os.sep, "/")
 
 
@@ -293,8 +475,7 @@ def list_files(root: str, path: str = "") -> dict:
 def read_file(root: str, path: str) -> dict:
     """Read the text content of ``path`` (relative to root).
 
-    ``~/.coder`` paths (user skills/plans/MCP config) are always readable
-    without permission.
+    Paths under the user data folder are readable without permission.
     """
     target = resolve_safe(root, path, allow_coder=True)
     if not os.path.exists(target):
@@ -316,7 +497,7 @@ def write_file(root: str, path: str, content: str) -> dict:
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
-            "error": "the workspace .coder/ folder is reserved for the agent's own config (MCP servers, skills, plans) and lives in ~/.coder/ instead — do not write here",
+            "error": "the workspace .coder/ folder is reserved for the agent's own config (plans) and is stored in the app database instead — do not write here",
         }
     if os.path.isdir(target):
         return {"path": path, "error": "path is a directory"}
@@ -330,21 +511,41 @@ def write_file(root: str, path: str, content: str) -> dict:
 
 
 def user_coder_dir() -> str:
-    """Return the user-level ``~/.coder`` config directory, creating it if needed.
+    """Return the user-level data root (default ``~/.codefa``), creating it.
 
-    Skills and MCP connectors live here (global, shared across all workspaces),
-    not inside each project's ``.coder/`` folder.
+    The state DB (settings, chats, skills, MCP connectors) and the vector
+    stores live here (global, shared across all workspaces), not inside each
+    project's ``.coder/`` folder. The root is configurable from
+    Settings → Data path: Electron sets ``CODER_DATA_DIR`` on the sidecar env,
+    which the desktop app reads to locate the same folder the state DB lives in.
     """
-    base = os.path.join(os.path.expanduser("~"), ".coder")
-    os.makedirs(base, exist_ok=True)
-    return base
+    # Single source of truth for the data root: state_db.data_root() reads the
+    # same CODER_DATA_DIR (set by Electron) and owns the whole file layout.
+    return _state_db.data_root()
+
+
+# Name of the app-level log file written into the user data dir (see
+# user_coder_dir). All best-effort error/diagnostic logging lands here.
+LOG_FILENAME = "codefa.log"
+
+_cache: Cache | None = None
+
+
+def _get_result_cache() -> Cache:
+    """Lazy-once result cache (search / web lookups with TTL)."""
+    global _cache
+    if _cache is not None:
+        return _cache
+    _cache = Cache(cache_path_for(_state_db.data_root()))
+    return _cache
 
 
 def _is_workspace_coder_dir(root: str, target: str) -> bool:
     """True if ``target`` resolves inside ``<root>/.coder``.
 
-    The workspace ``.coder/`` folder is reserved/forbidden: all agent config
-    (MCP servers, skills, plans) belongs in ``~/.coder``, never in the project.
+    The workspace ``.coder/`` folder is reserved/forbidden: the agent's user-level
+    config lives in the user data folder, and skills/plans/MCP connectors live in
+    the app database — never in the project.
     """
     root_real = os.path.realpath(os.path.abspath(root))
     coder_dir = os.path.join(root_real, ".coder")
@@ -357,98 +558,395 @@ def slugify(name: str) -> str:
     return slug or "skill"
 
 
-LEARNED_MEMORY_FILE = "MEMORY.md"
-LEARNED_MEMORY_MAX_BYTES = 50_000
 MEMORY_SEARCH_MAX_RESULTS = 15
-_MEMORY_HEADER = "# Agent Memory\n\n## Important Notes\n"
-
-
-def _memory_bullets(target: str) -> list[str]:
-    """Read the memory file and return its ``## Important Notes`` bullets.
-
-    Data lines are top-level markdown list items (``- ``-prefixed); everything
-    else is structural and discarded so the file keeps the canonical format.
-    """
-    if not os.path.isfile(target):
-        return []
-    try:
-        existing, _truncated = _read_text(target)
-    except OSError:
-        return []
-    return [line for line in existing.splitlines() if line.strip().startswith("- ")]
-
-
-def _memory_render(bullets: list[str]) -> str:
-    if not bullets:
-        return _MEMORY_HEADER
-    return _MEMORY_HEADER + "\n".join(bullets) + "\n"
-
-
-def _memory_write(target: str, bullets: list[str]) -> None:
-    """Write bullets under the canonical header. If the result exceeds the byte
-    cap, drop the OLDEST bullets (from the top) until it fits — recent learnings
-    are more likely still relevant.
-    """
-    # Trimming must be length-aware; reduce candidates until under the cap.
-    while bullets and len(_memory_render(bullets)) > LEARNED_MEMORY_MAX_BYTES:
-        bullets.pop(0)
-    with open(target, "w", encoding="utf-8") as fh:
-        fh.write(_memory_render(bullets))
-
-
-def _write_memory(target: str, bullets: list[str]) -> dict:
-    try:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        _memory_write(target, bullets)
-    except OSError as exc:
-        return {"path": LEARNED_MEMORY_FILE, "error": str(exc)}
-    return {"path": LEARNED_MEMORY_FILE, "ok": True}
+DEFAULT_VECTOR_DB_DIR = "vector-db"
 
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def _bullet_date(line: str) -> str:
-    m = re.match(r"-\s*\[(\d{4}-\d{2}-\d{2})\]", line.strip())
-    return m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _memory_key(note: str) -> str:
+    """Stable vector-store key for a memory note (from its normalized text)."""
+    slug = slugify(note[:60]) or "note"
+    return f"memory:{slug}"
 
 
-def _remember_fill(target: str, note: str, stamp: str) -> dict:
-    """Dedupe-and-append a note. Shared by ``remember`` and ``replace_memory``."""
-    bullets = _memory_bullets(target)
-    norm = _normalize(note)
-    for line in bullets:
-        if norm in _normalize(line):
-            return {"path": LEARNED_MEMORY_FILE, "ok": True, "skipped": "duplicate"}
-    bullets.append(f"- [{stamp}] {note}")
-    return _write_memory(target, bullets)
+def open_vector_store(
+    root: str, base_dir: str = "", config: dict | None = None
+) -> VectorStore | None:
+    """Open (or create) the workspace's RAG vector store for durable memory.
+
+    One sqlite file per workspace under ``base_dir`` (default
+    ``~/.codefa/vector-db``). Returns ``None`` when it can't be opened so
+    callers degrade gracefully — never raises.
+    """
+    base_dir = base_dir or _state_db.vector_db_dir()
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        slug = (
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+        )
+        db_path = db_path_for(base_dir, slug)
+        return VectorStore(db_path, StoreConfig.from_dict(config))
+    except Exception as exc:  # noqa: BLE001
+        # Surface the failure instead of returning None silently, so a broken
+        # vector store / missing embedding model is visible in the sidecar log.
+        try:
+            with open(
+                os.path.join(user_coder_dir(), LOG_FILENAME),
+                "a",
+                encoding="utf-8",
+            ) as fh:
+                fh.write(f"[vector-store] open failed for {root!r}: {exc!r}\n")
+        except OSError:
+            pass
+        print(f"[vector-store] open failed for {root!r}: {exc!r}", flush=True)
+        return None
 
 
-def remember(root: str, note: str) -> dict:
-    """Append a short, durable note to the project's self-written memory file
-    (``<root>/MEMORY.md``), so future sessions in this project start
-    with what the agent already learned.
+def open_skill_store(base_dir: str = "") -> VectorStore | None:
+    """Open (or create) the global skill vector store (``skills.vectors.sqlite``).
 
-    This file is written by the agent itself across sessions — conventions it
-    discovered, gotchas, fixes that worked, preferences the user stated in
-    passing. Notes live under a single ``## Important Notes`` section. A
-    near-duplicate note is skipped. The file is capped at
-    ``LEARNED_MEMORY_MAX_BYTES``: oldest entries are dropped first so it never
-    grows unbounded.
+    Skills are indexed globally (not per workspace), so they live in one
+    sqlite file under ``base_dir`` (default ``~/.codefa/vector-db``). Returns
+    ``None`` when it can't be opened so callers degrade gracefully.
+    """
+    base_dir = base_dir or _state_db.vector_db_dir()
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        return VectorStore(os.path.join(base_dir, "skills.vectors.sqlite"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
+    """Pull ``name`` and ``description`` from a skill's markdown frontmatter.
+
+    Returns ``(name, description, body)``. The name falls back to the slug
+    when the frontmatter omits it.
+    """
+    raw = (raw or "").strip()
+    fm = ""
+    body = raw
+    m = re.match(r"^---\n([\s\S]*?)\n---\n?", raw)
+    if m:
+        fm = m.group(1)
+        body = raw[m.end():]
+    name = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
+    description = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
+    return (
+        (name.group(1).strip() if name else "") or "",
+        (description.group(1).strip() if description else "") or "",
+        body.strip(),
+    )
+
+
+def persist_skill(
+    raw: str,
+    fallback_name: str = "",
+    previous_name: str = "",
+    store: VectorStore | None = None,
+) -> dict:
+    """Persist a skill to the app database and re-embed it in the vector store.
+
+    ``raw`` is the full skill markdown (frontmatter + body). The name and
+    description are parsed from the frontmatter; the whole skill is embedded
+    (name/description + body) under the synthetic id ``db://skills/<slug>`` so
+    auto-selection keeps working. The id is a virtual key — skills live in the
+    app database and the vector store, never as files on disk.
+    """
+    name, description, body = _parse_skill_markdown(raw)
+    if not name:
+        name = fallback_name.strip()
+    if not name:
+        return {"ok": False, "note": "skill needs a name"}
+    slug = slugify(name)
+    path = f"db://skills/{slug}"
+    if not body:
+        body = f"Write step-by-step instructions for {name}."
+    try:
+        _state_db.save_skill(name, slug, description, path, raw or body)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "note": f"could not save skill: {exc}"}
+    if previous_name and previous_name != name:
+        _state_db.delete_skill(previous_name)
+
+    indexed = False
+    note = f"skill '{name}' saved to the app database"
+    if store is None:
+        store = open_skill_store()
+    if store is not None:
+        try:
+            store.upsert_doc(
+                path, KIND_SKILL, name,
+                [f"{name}. {description}", body[:2000]],
+            )
+            if previous_name and previous_name != name:
+                prev_slug = slugify(previous_name)
+                # Drop any legacy ~/.coder/... vector ids for the old name.
+                store.remove(f"~/.coder/skills/{prev_slug}/SKILL.md")
+                store.remove(f"db://skills/{prev_slug}")
+            indexed = True
+        except EmbedderUnavailableError as exc:
+            note = f"{note} (not indexed yet: {exc})"
+        except Exception as exc:  # noqa: BLE001
+            note = f"{note} (vector update failed: {exc})"
+    return {"ok": True, "name": name, "slug": slug, "indexed": indexed, "note": note}
+
+
+def remove_skill(name: str, store: VectorStore | None = None) -> dict:
+    """Delete a skill from the app database and its vectors."""
+    try:
+        removed = _state_db.delete_skill(name)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "note": f"could not remove skill: {exc}"}
+    if store is None:
+        store = open_skill_store()
+    if store is not None:
+        try:
+            store.remove(f"db://skills/{slugify(name)}")
+            store.remove(f"~/.coder/skills/{slugify(name)}/SKILL.md")
+        except Exception:  # noqa: BLE001, S110 — vector removal is best-effort
+            pass
+    return {"ok": True, "removed": removed, "note": f"skill '{name}' removed"}
+
+
+def skill_store_status() -> tuple[VectorStore | None, str]:
+    """Open the global skill store, returning it plus a status note."""
+    store = open_skill_store()
+    if store is None:
+        return None, "skill index unavailable"
+    return store, ""
+
+
+_STARTER_SKILLS: list[tuple[str, str, str]] = [
+    (
+        "landing-page-design",
+        "Design high-converting landing pages (structure, copy hierarchy, CTA placement).",
+        (
+            "When asked to design or build a landing page, follow this workflow:\n"
+            "1. Define the single conversion goal and the target visitor.\n"
+            "2. Structure: hero → social proof → features/benefits → how it works → pricing → FAQ → final CTA.\n"
+            "3. Copy hierarchy: one clear headline (H1), one supporting subheadline, scannable benefit bullets.\n"
+            "4. Place exactly one primary CTA above the fold and repeat it after the last section.\n"
+            "5. Keep visual hierarchy: one accent color for CTAs, generous whitespace, consistent spacing scale.\n"
+            "6. Add trust signals near the first CTA (testimonials, logos, ratings)."
+        ),
+    ),
+    (
+        "pricing-page",
+        "Build persuasive pricing pages with clear plans, comparison and FAQ.",
+        (
+            "When asked to build a pricing page:\n"
+            "1. Show 3 plans by default (Starter / Pro / Enterprise), highlighting the middle one as 'Most popular'.\n"
+            "2. Lead with the price anchor (monthly, and annual-with-discount toggle if relevant).\n"
+            "3. List 4-6 concrete features per plan, checked icons; never vague marketing words.\n"
+            "4. Add a comparison table for the key differentiating features.\n"
+            "5. Close with a money-back guarantee + a short FAQ addressing objections."
+        ),
+    ),
+    (
+        "threejs-scroll-storytelling",
+        "Build scroll-driven 3D storytelling pages with Three.js (React Three Fiber).",
+        (
+            "When asked to build a scroll-driven 3D scene with Three.js:\n"
+            "1. Use React Three Fiber (Canvas) with drei helpers; avoid raw WebGL boilerplate.\n"
+            "2. Map page scroll to the scene via useScroll (drei): camera moves or object rotation/position per scroll progress.\n"
+            "3. Keep performance: enable antialias, cap pixelRatio at 2, reuse materials and geometries.\n"
+            "4. Add scroll sections with the canvas fixed behind; each section triggers a scene state change.\n"
+            "5. Fall back gracefully on low-end devices (reduce motion, lower DPR)."
+        ),
+    ),
+    (
+        "git-workflow",
+        "Follow a clean, safe git workflow: status, branch, staged commits, push.",
+        (
+            "When doing git work:\n"
+            "1. Always run `git status` first; review the diff before staging.\n"
+            "2. Work on a descriptive feature branch (git checkout -b <feature>).\n"
+            "3. Stage only intended files (git add <paths>), never secrets or build artifacts.\n"
+            "4. Commit with a concise message in the repo's style; keep changes focused.\n"
+            "5. Pull/merge recent main before pushing to avoid conflicts; push and open a PR when asked."
+        ),
+    ),
+]
+
+
+def seed_starter_skills() -> list[str]:
+    """Install the built-in starter skills on first run (no-op afterwards).
+
+    Seeds only when the skill table is empty, so user edits/deletions are never
+    overwritten. Returns the names that were seeded.
+    """
+    try:
+        existing = _state_db.list_skills()
+    except Exception:  # noqa: BLE001
+        return []
+    if existing:
+        return []
+    seeded: list[str] = []
+    for name, description, body in _STARTER_SKILLS:
+        markdown = (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            "---\n\n"
+            f"# {name}\n\n{body}\n"
+        )
+        result = persist_skill(markdown, fallback_name=name)
+        if result.get("ok"):
+            seeded.append(name)
+    return seeded
+
+
+# Built-in MCP connectors shipped with the app. They are seeded on first run
+# and exempt from startup validation (which would otherwise delete them on
+# machines where the underlying tool isn't installed) — a broken builtin only
+# surfaces if the model actually calls one of its tools.
+_BUILTIN_MCP_SERVERS: dict[str, dict] = {
+    "docker": {
+        "command": "docker",
+        "args": ["mcp", "gateway", "run"],
+    },
+}
+
+
+def seed_builtin_mcp() -> list[str]:
+    """Install the built-in MCP connectors on first run (no-op afterwards).
+
+    Seeds only when the ``mcp`` table is empty, so user edits/deletions are
+    never overwritten. Returns the names that were seeded.
+    """
+    try:
+        existing = _state_db.list_mcp()
+    except Exception:  # noqa: BLE001
+        return []
+    if existing:
+        return []
+    seeded: list[str] = []
+    for name, cfg in _BUILTIN_MCP_SERVERS.items():
+        try:
+            _state_db.save_mcp(name, json.dumps(cfg, ensure_ascii=False))
+            seeded.append(name)
+        except Exception:  # noqa: BLE001, S112
+            continue
+    return seeded
+
+
+# e5 cosine similarity sits in a compressed band overall — even unrelated
+# short sentences (esp. Persian) score ~0.88-0.89, so a cosine-alone cutoff
+# cannot tell duplicates apart from merely-different notes. A genuine
+# duplicate is a near word-for-word restatement: it clears a much higher bar
+# (~0.97+) AND usually shares a substring. We require EITHER cosine >= 0.985
+# OR a long shared substring, so new-but-different facts are never swallowed.
+_MEMORY_DEDUP_THRESHOLD = 0.90
+_MEMORY_DEDUP_SUBSTR_MIN = 24  # chars — a shared run this long = same restatement
+
+
+def _project_slug(root: str) -> str:
+    """Workspace slug used to scope memory notes (same as the vector store)."""
+    try:
+        return slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+    except Exception:  # noqa: BLE001
+        return "workspace"
+
+
+def _memory_manager(root: str, store: VectorStore | None = None) -> MemoryManager:
+    """Shared memory manager bound to the workspace vector store (if any)."""
+    try:
+        mm = MemoryManager(data_root=user_coder_dir(), config=MemoryConfig.from_settings(None))
+        if store is not None:
+            mm.bind_store(store)
+        return mm
+    except Exception:  # noqa: BLE001 — never let memory setup break the tool
+        return MemoryManager(data_root=user_coder_dir())
+
+
+def remember(
+    root: str,
+    note: str,
+    store: VectorStore | None = None,
+    memory_type: str = "long_term",
+) -> dict:
+    """Save a short, durable note to the project's RAG memory.
+
+    Notes are stored in ``<data>/memory/memories.jsonl`` (source of truth),
+    indexed in FTS5, and written through to the workspace vector store
+    (``memory`` kind) for semantic recall. Deduped two ways: an exact
+    substring match (cheap, catches identical restatements) and — when the
+    embedder is available — a semantic near-duplicate check via cosine
+    similarity (catches the SAME fact reworded in different words, which the
+    substring check misses).
+
+    ``memory_type`` selects the retention class; pass ``"short_term"`` for
+    ~24h ephemeral notes (e.g. compact summaries) so they don't pollute the
+    durable long-term memory.
     """
     note = (note or "").strip()
     if not note:
         return {"error": "empty note"}
-    if len(note) > 500:
-        note = note[:500] + "…"
+    if len(note) > 4000:
+        note = note[:4000] + "…"
+    if store is None:
+        return {"error": "memory store not available"}
+    project = _project_slug(root)
+    near = []
+    try:
+        # Always reach the nearest existing note (low bar) so we can judge it.
+        near = store.search(note, KIND_MEMORY, top_k=1, min_score=0.5)
+    except EmbedderUnavailableError:
+        near = []  # no semantic dedup possible — save anyway
+    except Exception:  # noqa: BLE001
+        near = []
+    dup = None
+    if near:
+        cand = near[0]
+        score = float(cand.get("score") or 0)
+        title = str(cand.get("title") or "")
+        shared = _longest_shared_substring(note.lower(), title.lower())
+        if score >= _MEMORY_DEDUP_THRESHOLD or shared >= _MEMORY_DEDUP_SUBSTR_MIN:
+            dup = cand
+    if dup is not None:
+        return {
+            "path": KIND_MEMORY,
+            "ok": True,
+            "skipped": "duplicate",
+            "matched": dup["key"],
+        }
+    mm = _memory_manager(root, store)
+    if memory_type == "short_term":
+        memory_type = MEM_SHORT_TERM
+    res = mm.add(note, memory_type=memory_type, project_id=project)
+    if "error" in res:
+        return {"path": KIND_MEMORY, "error": res["error"]}
+    return {"path": KIND_MEMORY, "ok": True}
 
-    target = resolve_safe(root, LEARNED_MEMORY_FILE)
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return _remember_fill(target, note, stamp)
+
+def _longest_shared_substring(a: str, b: str) -> int:
+    """Length of the longest common substring (space-insensitive)."""
+    a = " ".join(a.split())
+    b = " ".join(b.split())
+    if not a or not b:
+        return 0
+    n, m = len(a), len(b)
+    best = 0
+    prev = [0] * (m + 1)
+    cur = [0] * (m + 1)
+    for i in range(1, n + 1):
+        prev, cur = cur, [0] * (m + 1)
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+            else:
+                cur[j] = 0
+    return best
 
 
-def replace_memory(root: str, subject: str, new_text: str) -> dict:
+def replace_memory(
+    root: str, subject: str, new_text: str, store: VectorStore | None = None
+) -> dict:
     """Hermes-style ``replace``: update the stored note that contains ``subject``
     so it now reads ``new_text``. If nothing matches, it appends ``new_text`` as
     an add instead, so ``replace`` is always safe to call.
@@ -461,87 +959,84 @@ def replace_memory(root: str, subject: str, new_text: str) -> dict:
         return {"error": "empty replacement text"}
     if len(new_text) > 500:
         new_text = new_text[:500] + "…"
+    if store is None:
+        return {"error": "memory store not available"}
 
-    target = resolve_safe(root, LEARNED_MEMORY_FILE)
-    bullets = _memory_bullets(target)
-    subject_norm = _normalize(subject)
-    for i, line in enumerate(bullets):
-        if subject_norm in _normalize(line):
-            bullets[i] = f"- [{_bullet_date(line)}] {new_text}"
-            return _write_memory(target, bullets)
-    return _remember_fill(
-        target, new_text, datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    )
+    mm = _memory_manager(root, store)
+    res = mm.replace(subject, new_text, project_id=_project_slug(root))
+    if "error" in res:
+        return {"path": KIND_MEMORY, "error": res["error"]}
+    return {"path": KIND_MEMORY, "ok": True}
 
 
-def remove_memory(root: str, subject: str) -> dict:
+def remove_memory(root: str, subject: str, store: VectorStore | None = None) -> dict:
     """Hermes-style ``remove``: delete the stored note that contains ``subject``.
     Returns ok (as a no-op) if nothing matches.
     """
     subject = (subject or "").strip()
     if not subject:
         return {"error": "empty subject"}
+    if store is None:
+        return {"error": "memory store not available"}
 
-    target = resolve_safe(root, LEARNED_MEMORY_FILE)
-    bullets = _memory_bullets(target)
-    subject_norm = _normalize(subject)
-    kept = [b for b in bullets if subject_norm not in _normalize(b)]
-    if len(kept) == len(bullets):
-        return {"path": LEARNED_MEMORY_FILE, "ok": True, "skip": "not found"}
-    return _write_memory(target, kept)
+    mm = _memory_manager(root, store)
+    res = mm.remove(subject, project_id=_project_slug(root))
+    if "error" in res:
+        return {"path": KIND_MEMORY, "error": res["error"]}
+    return {"path": KIND_MEMORY, "ok": True, "skip": "not found" if not res.get("removed") else False}
 
 
-def search_memory(root: str, query: str, max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> dict:
-    """Search the project's memory bullets for ones relevant to ``query``.
+def search_memory(
+    root: str,
+    query: str,
+    max_results: int = MEMORY_SEARCH_MAX_RESULTS,
+    store: VectorStore | None = None,
+) -> dict:
+    """Search the project's RAG memory for notes relevant to ``query``.
 
-    Now that the memory file can hold many notes (up to
-    ``LEARNED_MEMORY_MAX_BYTES``, no longer small enough to always inline into
-    the system prompt), this lets the agent pull in only what's relevant
-    instead of the whole file. Ranks bullets by keyword overlap — a whole-word
-    match scores higher than a bare substring hit — across every word in
-    ``query``. An empty query returns the most recently added notes instead
-    (the file is append-only, so recency == tail order).
+    Notes are retrieved via a cascade (FTS5 lexical + vector semantic, with
+    sliding TTL on matched notes). An empty query returns the most recently
+    added notes instead.
     """
     query = (query or "").strip()
-    try:
-        target = resolve_safe(root, LEARNED_MEMORY_FILE)
-    except PathEscapeError as exc:
-        return {"query": query, "error": str(exc)}
-    bullets = _memory_bullets(target)
-    total = len(bullets)
-    if total == 0:
-        return {"query": query, "notes": [], "total": 0}
+    if store is None:
+        return {"query": query, "notes": [], "total": 0, "error": "memory store not available"}
+    mm = _memory_manager(root, store)
+    project = _project_slug(root)
+    total = len(mm.list(project_id=project))
     if not query:
-        top = bullets[-max_results:]
-        return {"query": query, "notes": list(reversed(top)), "total": total}
+        notes = [m["content"] for m in mm.list(project_id=project)[:max_results]]
+        return {"query": query, "notes": notes, "total": total}
+    try:
+        results = mm.search(query, project_id=project, top_k=max_results, min_score=0.2)
+    except EmbedderUnavailableError as exc:
+        return {"query": query, "notes": [], "total": total, "error": str(exc)}
+    return {
+        "query": query,
+        "notes": [m["content"] for m in results],
+        "total": total,
+        "matched": len(results),
+    }
 
-    words = [w for w in re.split(r"\W+", query.lower()) if w]
-    scored: list[tuple[int, int, str]] = []
-    for i, bullet in enumerate(bullets):
-        low = bullet.lower()
-        score = 0
-        for w in words:
-            if re.search(rf"\b{re.escape(w)}\b", low):
-                score += 3
-            elif w in low:
-                score += 1
-        if score > 0:
-            scored.append((-score, -i, bullet))
-    scored.sort()
-    top = [b for _, _, b in scored[:max_results]]
-    return {"query": query, "notes": top, "total": total, "matched": len(scored)}
+
+def search_web_docs(
+    query: str, store: VectorStore | None, max_results: int = 8, min_score: float = 0.2
+) -> list[dict]:
+    """Semantic search over saved web documents. Returns top chunks with sources."""
+    if store is None or not query:
+        return []
+    return store.search(query, KIND_WEB, top_k=max_results, min_score=min_score)
 
 
 def create_skill(root: str, name: str, description: str, content: str) -> dict:
-    """Create or overwrite a user skill at ``~/.coder/skills/<slug>/SKILL.md``.
+    """Create or overwrite a user skill in the app database (global, shared).
 
     ``name`` is the display name, ``description`` is indexed for the system
     prompt, and ``content`` is the full markdown body (step-by-step
-    instructions). Existing skill of the same name is replaced. The ``root``
-    argument is kept for API compatibility and is not used.
+    instructions). The skill is stored in the state DB and embedded into the
+    global skill vector store; an existing skill of the same name is replaced.
+    The ``root`` argument is kept for API compatibility and is not used.
     """
-    slug = slugify(name)
-    rel = f"skills/{slug}/SKILL.md"
     body = content.strip()
     if not body:
         body = f"Write step-by-step instructions for {name}."
@@ -552,42 +1047,29 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
         "---\n\n"
         f"# {name}\n\n{body}\n"
     )
-    path = os.path.join(user_coder_dir(), rel)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(markdown)
-    except OSError as exc:
-        return {"path": f"~/.coder/{rel}", "error": str(exc)}
-    return {"path": f"~/.coder/{rel}", "ok": True}
+    result = persist_skill(markdown, fallback_name=name)
+    if not result.get("ok"):
+        return {"path": f"db://skills/{slugify(name)}", "error": result.get("note", "save failed")}
+    return {
+        "path": f"db://skills/{slugify(name)}",
+        "name": result["name"],
+        "ok": True,
+        "indexed": result["indexed"],
+        "note": result["note"],
+    }
 
 
 def upsert_mcp_server(root: str, name: str, cfg: dict) -> dict:
-    """Add or replace one MCP server entry in ``~/.coder/mcp.json`` (the Claude
-    Code ``mcpServers`` JSON shape), which is shared globally across workspaces.
+    """Add or replace one MCP server entry in the app database (shared globally).
 
-    Reads the existing config (if any), merges ``cfg`` under ``mcpServers[name]``
-    and writes it back, preserving the other connectors. ``root`` is kept for API
-    compatibility and is not used.
+    Stores ``cfg`` under ``name`` in the ``mcp`` table. ``root`` is kept for
+    API compatibility and is not used.
     """
-    base = user_coder_dir()
-    path = os.path.join(base, "mcp.json")
-    data: dict = {"mcpServers": {}}
     try:
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                parsed = json.load(fh)
-            if isinstance(parsed, dict) and isinstance(parsed.get("mcpServers"), dict):
-                data = parsed
-    except (OSError, ValueError):
-        data = {"mcpServers": {}}
-    data["mcpServers"][name] = cfg
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-    except OSError as exc:
-        return {"path": "~/.coder/mcp.json", "error": str(exc)}
-    return {"path": "~/.coder/mcp.json", "name": name, "ok": True}
+        _state_db.save_mcp(name, json.dumps(cfg or {}, ensure_ascii=False))
+    except Exception as exc:  # noqa: BLE001
+        return {"name": name, "error": str(exc)}
+    return {"name": name, "ok": True}
 
 
 def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
@@ -625,29 +1107,24 @@ def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
 
 
 def validate_mcp_servers() -> list[str]:
-    """Check every stdio connector in ``~/.coder/mcp.json`` and remove the ones
+    """Check every stdio connector in the app database and remove the ones
     that fail to start (bad command, wrong flags, immediate crash).
 
     Returns the names of the servers that were removed so the app can warn the
     user. HTTP/SSE (url) connectors are not probed at startup.
     """
-    base = user_coder_dir()
-    path = os.path.join(base, "mcp.json")
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            parsed = json.load(fh)
-    except (OSError, ValueError):
-        return []
-    servers = parsed.get("mcpServers") if isinstance(parsed, dict) else None
-    if not isinstance(servers, dict) or not servers:
+    servers = _state_db.list_mcp()
+    if not servers:
         return []
 
     removed: list[str] = []
-    changed = False
     for name, cfg in list(servers.items()):
         if not isinstance(cfg, dict):
+            continue
+        if name in _BUILTIN_MCP_SERVERS:
+            # Builtin connectors (e.g. the Docker MCP) survive startup
+            # validation even when the tool isn't installed — the failure only
+            # surfaces if the model calls one of its tools.
             continue
         if cfg.get("url"):
             continue  # remote — validated lazily on use
@@ -660,15 +1137,8 @@ def validate_mcp_servers() -> list[str]:
         err = _probe_stdio_server(cmd)
         if err:
             removed.append(name)
-            del servers[name]
-            changed = True
+            _state_db.delete_mcp(name)
             print(f"[coder] MCP server {name!r} disabled at startup: {err}", flush=True)
-    if changed:
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump({"mcpServers": servers}, fh, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
     return removed
 
 
@@ -699,7 +1169,7 @@ def edit_file(
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
-            "error": "the workspace .coder/ folder is reserved for the agent's own config (MCP servers, skills, plans) and lives in ~/.coder/ instead — do not write here",
+            "error": "the workspace .coder/ folder is reserved for the agent's own config (plans) and is stored in the app database instead — do not write here",
         }
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
@@ -752,6 +1222,206 @@ def edit_file(
         "new_content": new_content,
         "occurrences": count,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Automatic post-edit verification (Coder mode)
+# --------------------------------------------------------------------------- #
+# Cheap, best-effort syntax/type checks run right after write_file/edit_file
+# succeeds, with the result appended INLINE to that same tool's return string.
+# This is deliberately narrow in scope (not a full lint/test run — the system
+# prompt's QUALITY GATE already asks the model to run those explicitly after a
+# logically-complete change): the goal here is to catch a broken edit the
+# INSTANT it happens, for free, without costing the model a separate
+# run_terminal tool call (and the full-turn resend that call would trigger).
+
+_TS_VERIFY_DEBOUNCE_SECONDS = 15
+# Keyed by realpath(root) so concurrent sessions on different workspaces never
+# share a debounce window, but rapid edits within ONE workspace only pay for
+# one project-wide tsc pass per window instead of one per edit_file call.
+_last_ts_verify: dict[str, float] = {}
+
+
+def _verify_python_syntax(target: str) -> str | None:
+    """Instant, subprocess-free syntax check for a .py file via ast.parse.
+
+    Returns "OK", a short ``SyntaxError: ...`` message, or ``None`` if the file
+    can't be read (never raises).
+    """
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    try:
+        ast.parse(src, filename=target)
+    except SyntaxError as exc:
+        return f"SyntaxError: {exc.msg} (line {exc.lineno}, col {exc.offset})"
+    except (ValueError, TypeError) as exc:
+        return f"could not parse: {exc}"
+    return "OK"
+
+
+def _find_tsc(root: str) -> str | None:
+    """Prefer the project's own local tsc (its exact configured version) over
+    any globally-installed one; return None if neither exists."""
+    local = os.path.join(root, "node_modules", ".bin", "tsc")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return shutil.which("tsc")
+
+
+def _verify_typescript(root: str) -> str | None:
+    """Project-wide ``tsc --noEmit``, debounced per workspace.
+
+    Only runs when the project has a ``tsconfig.json`` (otherwise a bare tsc
+    invocation reports meaningless global-scope errors) and a resolvable tsc
+    binary. Debounced to ``_TS_VERIFY_DEBOUNCE_SECONDS`` so a burst of several
+    edit_file calls in the same turn triggers at most one full typecheck
+    instead of one per call — later edits in the same burst silently skip
+    (return ``None``) rather than re-paying the whole-project cost.
+    Returns "OK", a compact error summary, or ``None`` when skipped/unavailable
+    (never raises).
+    """
+    if not os.path.isfile(os.path.join(root, "tsconfig.json")):
+        return None
+    root_real = os.path.realpath(root)
+    now = time.monotonic()
+    last = _last_ts_verify.get(root_real, 0.0)
+    if now - last < _TS_VERIFY_DEBOUNCE_SECONDS:
+        return None
+    tsc = _find_tsc(root)
+    if not tsc:
+        return None
+    _last_ts_verify[root_real] = now
+    try:
+        proc = subprocess.run(  # noqa: PLW1510 — returncode checked below
+            [tsc, "--noEmit", "--pretty", "false"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode == 0:
+        return "OK"
+    out = (proc.stdout or proc.stderr or "").strip()
+    error_lines = [ln for ln in out.splitlines() if ": error TS" in ln]
+    if not error_lines:
+        return None  # tsc failed for some other reason (config issue etc.) — stay silent
+    count = len(error_lines)
+    preview = "\n".join(error_lines[:8])
+    more = f"\n…({count - 8} more)" if count > 8 else ""
+    return f"{count} TypeScript error(s):\n{preview}{more}"
+
+
+def verify_edit(root: str, path: str) -> str | None:
+    """Best-effort post-write verification for Coder mode's write_file/edit_file.
+
+    Dispatches by extension: .py gets an instant AST syntax check; .ts/.tsx get
+    a debounced project-wide typecheck. Every other extension (and any error
+    resolving the path) returns ``None`` so the caller adds nothing to the tool
+    result — this must never turn a successful write into a reported failure.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        target = resolve_safe(root, path)
+    except PathEscapeError:
+        return None
+    if ext == ".py":
+        return _verify_python_syntax(target)
+    if ext in (".ts", ".tsx"):
+        return _verify_typescript(root)
+    return None
+
+
+def _format_verify_suffix(note: str | None) -> str:
+    """Turn a ``verify_edit`` result into the suffix appended to a tool reply."""
+    if not note:
+        return ""
+    if note == "OK":
+        return "\n\n✓ auto-verify: no syntax/type errors."
+    return f"\n\n⚠️ AUTO-VERIFY FAILED:\n{note}\nFix this before moving on to the next step."
+
+
+# Backstop for the 'forgets to check off a finished checklist step' failure mode.
+# Prompt instructions alone ('call update_plan again marking it completed') are
+# not reliably followed, so make_tool_callbacks tracks how many mutating tool
+# calls have happened since the plan was last updated while a step is still
+# 'in_progress', and a due nudge is piggybacked onto that tool's OWN reply
+# (same trick as AUTO-VERIFY) so no extra message-injection machinery is needed.
+def _format_plan_nudge_suffix(due: bool) -> str:
+    if not due:
+        return ""
+    return (
+        "\n\n💡 Reminder: your checklist still has a step marked 'in_progress' after "
+        "several tool calls — call update_plan now with the SAME full list, marking "
+        "any step you've actually finished 'completed' (and the next one 'in_progress')."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Plan self-check (Plan mode's save_plan)
+# --------------------------------------------------------------------------- #
+# A common plan-mode failure: the plan references a file path that doesn't
+# actually exist (hallucinated, misremembered, or a stale name from an older
+# search) but isn't flagged as a NEW file to create. Coder mode then either
+# fails to find it or silently creates a stray duplicate. This is a pure
+# filesystem check (no extra LLM call) run right before the plan is saved, so
+# it costs nothing in tokens while catching a real class of plan errors.
+
+_PLAN_PATH_RE = re.compile(r"`([\w./-]+\.[A-Za-z0-9]{1,8})`")
+_PLAN_NEW_FILE_MARKERS = ("new file", "create", "new:", "add a new", "to be created")
+
+# `path:line` citations in a sub-agent explore report. Deliberately narrow
+# (a dot-extension path followed by a colon + digits) so prose like "it was
+# fixed in v1.2: done" and `scheme://` URLs aren't caught.
+_CITATION_RE = re.compile(
+    r"(?<![\w/.])([\w][\w./\-]+\.[A-Za-z0-9]{1,8}):(\d+)"
+)
+
+
+def _self_check_plan_paths(root: str, content: str) -> str:
+    """Flag backtick-quoted file paths in a plan that don't exist on disk and
+    aren't described nearby as a new file.
+
+    Deliberately conservative (only backtick-quoted, extension-bearing paths;
+    skips anything near a "new file"-style marker) so it flags likely mistakes
+    without nagging on every intentionally-new file. Returns a short warning
+    suffix, or ``""`` when nothing looks wrong (never raises).
+    """
+    try:
+        candidates = {m.group(1) for m in _PLAN_PATH_RE.finditer(content or "")}
+    except Exception:  # noqa: BLE001
+        return ""
+    if not candidates:
+        return ""
+    missing: list[str] = []
+    for rel in sorted(candidates):
+        if rel.startswith(("http:", "https:")):
+            continue
+        try:
+            target = resolve_safe(root, rel)
+        except PathEscapeError:
+            continue
+        if os.path.exists(target):
+            continue
+        idx = content.find(f"`{rel}`")
+        window = content[max(0, idx - 60) : idx].lower() if idx >= 0 else ""
+        if any(marker in window for marker in _PLAN_NEW_FILE_MARKERS):
+            continue
+        missing.append(rel)
+    if not missing:
+        return ""
+    preview = ", ".join(missing[:6])
+    more = f" (+{len(missing) - 6} more)" if len(missing) > 6 else ""
+    return (
+        f"\n\n⚠️ SELF-CHECK: {len(missing)} path(s) in the plan don't exist in the workspace and "
+        f"weren't marked as new: {preview}{more}. Before finishing, confirm these are correct — either "
+        "they're typos/wrong paths (fix them) or genuinely new files (say so explicitly in the plan)."
+    )
 
 
 def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
@@ -842,6 +1512,7 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
             cwd=cwd,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=SEARCH_TIMEOUT,
             check=False,  # rg's non-zero exit (1 = no matches) is handled below
         )
@@ -863,7 +1534,7 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
             path_text = (data.get("path") or {}).get("text") or ""
             file = path_text.removeprefix("./")
             if in_coder:
-                file = "~/.coder/" + file
+                file = os.path.join(coder, file)
             entry = {
                 "file": file,
                 "line": data.get("line_number"),
@@ -974,46 +1645,55 @@ def summarize_value(value: str) -> str:
 
 
 def web_search(query: str, max_results: int = 5) -> dict:
-    """Search the web (DuckDuckGo HTML, no API key required).
+    """Search the web using the enabled engines from Settings → Plugins, in
+    ``order`` (order 0 = primary, higher = fallback). DuckDuckGo needs no API
+    key; Tavily uses the plugin's stored key. Only the engines the user
+    explicitly enabled are tried, in order, until one returns results — a
+    disabled engine (DuckDuckGo included) is never used, and a mis-configured
+    key surfaces as an error instead of being silently masked.
 
-    Returns a list of ``{"title", "url", "snippet"}`` results. Never raises —
-    network errors and missing backends degrade to a friendly error message.
+    Returns a list of ``{"title", "url", "snippet"}`` results. Never raises.
     """
     query = query.strip()
     if not query:
         return {"query": query, "results": []}
     max_results = max(1, min(int(max_results or 5), MAX_WEB_SEARCH_RESULTS))
-    try:
-        if _BACKEND == "duckduckgo":
-            from ddgs import DDGS
-
-            with DDGS(timeout=WEB_SEARCH_TIMEOUT) as ddgs:
-                raw = ddgs.text(query, max_results=max_results)
-        else:
-            return {"query": query, "error": f"unknown web search backend: {_BACKEND}"}
-    except ImportError:
-        return {
-            "query": query,
-            "error": "web search backend not installed; run `uv sync --project backend` to install ddgs",
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {"query": query, "error": f"web search failed: {exc}"}
-
-    results = []
-    for item in raw or []:
-        if not isinstance(item, dict):
+    engines = _active_search_engines()
+    tried: list[str] = []
+    fallbacks: list[str] = []
+    for eng in engines:
+        kind = (eng.get("kind") or "").strip()
+        fn = SEARCH_BACKENDS.get(kind)
+        if not fn:
             continue
-        results.append(
-            {
-                "title": str(item.get("title", "")).strip(),
-                "url": str(item.get("href", "") or item.get("url", "")).strip(),
-                "snippet": str(item.get("body", "") or item.get("snippet", "")).strip(),
+        try:
+            results = fn(query, max_results, eng)
+        except ImportError:
+            return {
+                "query": query,
+                "error": (
+                    f"{kind} backend not installed; run `uv sync --project backend` "
+                    f"to install the required package"
+                ),
             }
-        )
-    return {"query": query, "results": results}
+        except Exception as exc:  # noqa: BLE001 — degrade per-engine
+            tried.append(f"{kind}: {exc}")
+            fallbacks.append(kind)
+            continue
+        if results:
+            return {
+                "query": query,
+                "results": results,
+                "engine": kind,
+                "fallbacks": fallbacks,
+            }
+        tried.append(f"{kind}: no results")
+        fallbacks.append(kind)
+    reason = "; ".join(tried) if tried else "no search engines enabled"
+    return {"query": query, "error": f"web search failed: {reason}"}
 
 
-MAX_FETCH_BYTES = 250_000
+MAX_FETCH_BYTES = 1_000_000
 FETCH_TIMEOUT = 15
 # Intermediate cap applied to a fetched page BEFORE it is handed to the
 # summarizer model. It is not the context budget (that comes from the model's
@@ -1027,7 +1707,9 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
     Returns ``{"url", "title", "content"}`` on success or ``{"url", "error"}``
     with a friendly reason otherwise. HTML is stripped to plain text; binary /
     non-text responses are rejected; content is capped at ``max_chars`` so a
-    single page can never flood the context window. Never raises.
+    single page can never flood the context window. The response is streamed
+    and reads at most ``MAX_FETCH_BYTES``, so oversized pages are truncated
+    rather than rejected wholesale. Never raises.
     """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
@@ -1037,7 +1719,8 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
         import httpx
 
         with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=True) as client:
-            resp = client.get(
+            with client.stream(
+                "GET",
                 url,
                 headers={
                     "User-Agent": (
@@ -1045,24 +1728,29 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
                     )
                 },
-            )
-            if resp.status_code >= 400:
-                return {
-                    "url": url,
-                    "error": f"server returned HTTP {resp.status_code}",
-                }
-            if len(resp.content) > MAX_FETCH_BYTES:
-                return {"url": url, "error": "page too large to fetch"}
-            ct = resp.headers.get("content-type", "")
-            if not (
-                "text/" in ct
-                or "application/json" in ct
-                or "application/xml" in ct
-                or ct.startswith("text/html")
-                or ct == ""
-            ):
-                return {"url": url, "error": f"unsupported content-type {ct!r}"}
-            body = resp.content.decode("utf-8", errors="replace")
+            ) as resp:
+                if resp.status_code >= 400:
+                    return {
+                        "url": url,
+                        "error": f"server returned HTTP {resp.status_code}",
+                    }
+                ct = resp.headers.get("content-type", "")
+                if not (
+                    "text/" in ct
+                    or "application/json" in ct
+                    or "application/xml" in ct
+                    or ct.startswith("text/html")
+                    or ct == ""
+                ):
+                    return {"url": url, "error": f"unsupported content-type {ct!r}"}
+                chunks: list[bytes] = []
+                size = 0
+                for chunk in resp.iter_bytes(65_536):
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= MAX_FETCH_BYTES:
+                        break
+            body = b"".join(chunks).decode("utf-8", errors="replace")
             title = ""
             text = body
             if "text/html" in ct or ct == "":
@@ -1231,14 +1919,61 @@ def _validate_mcp_url(url: str, timeout: int = 15) -> dict:
         return {"ok": False, "error": f"could not reach the endpoint: {exc}"}
 
 
+def _is_terminal_search(command: str) -> bool:
+    """Heuristic: is this run_terminal call a read-only search/inspection of
+    the codebase (so it should be handled by the dedicated "search" subagent
+    model when one is configured) rather than build/run/git/package work?
+
+    The agent usually prefixes commands with ``cd <root> && …`` and often
+    labels sections with ``echo "=== … ==="``, so we scan every
+    ``&&``/``;``/``|``/newline segment, skip those label/prefix segments, and
+    classify as search when the first *meaningful* command is a read-only
+    search/inspection command. Stopping at the first meaningful command also
+    keeps build pipelines (``npm run build && cat dist/…``) from being
+    misclassified as search.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    # Commands that only set up the environment or print labels — never the
+    # actual operation, so they don't decide the classification.
+    _SKIP = {"cd", "echo", "pwd", "export", "env", "set", "source", "clear", "time"}
+    _SEARCH = {
+        "grep", "egrep", "fgrep", "rg", "ripgrep", "find", "sed", "awk",
+        "cat", "ls", "head", "tail", "wc", "sort", "uniq", "type", "which",
+        "nl", "tree", "file", "stat", "cut", "tr", "diff", "strings",
+        "xxd", "od", "less", "more", "fold", "fmt", "paste", "join",
+        "tac", "rev", "shuf", "seq", "xargs", "jq", "sqlite3",
+    }
+    _GIT_PREFIXES = ("git grep", "git log", "git diff", "git show", "git blame")
+    for seg in re.split(r"&&|;|\||\n", cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        first = seg.split()[0].lower() if seg.split() else ""
+        if first in _SKIP:
+            continue
+        if first in _SEARCH:
+            return True
+        if seg.startswith(_GIT_PREFIXES):
+            return True
+        # First meaningful command is not a search — stop here.
+        return False
+    return False
+
+
 def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
     context_window: int = 0,
     summarizer_model: Any = None,
+    web_model: Any = None,
+    search_model: Any = None,
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
     permit: dict | None = None,
+    store: VectorStore | None = None,
+    chat_id: str = "",
 ) -> dict[str, Callable]:
     """Build the agent tools bound to ``root`` with an emit callback.
 
@@ -1269,6 +2004,39 @@ def make_tool_callbacks(
         terminal_out_chars = MAX_TERMINAL_OUTPUT
     tool_out_chars = min(tool_out_chars, MAX_READ_BYTES)
 
+    # Shared state for the update_plan nudge backstop (see _format_plan_nudge_suffix
+    # above) — lives for this run only, reset each time make_tool_callbacks is called.
+    _plan_nudge_state = {"since_update": 0, "has_in_progress": False}
+    # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
+    # update_plan (the common case for small tasks) never hit the threshold, so
+    # the model could write its final reply with a step still stuck 'in_progress'
+    # and no nudge ever fired. 1 nudges after EVERY mutating call while stuck, so
+    # even a single-tool-call task gets reminded before the model's final reply.
+    _PLAN_NUDGE_EVERY = 1
+
+    def _plan_nudge_due() -> bool:
+        """Call once per mutating tool call. Returns True (and resets the counter)
+        once every `_PLAN_NUDGE_EVERY` calls made while the plan still has a step
+        stuck 'in_progress' — fires repeatedly, not just once, until the model
+        actually updates the plan."""
+        if not _plan_nudge_state["has_in_progress"]:
+            return False
+        _plan_nudge_state["since_update"] += 1
+        if _plan_nudge_state["since_update"] >= _PLAN_NUDGE_EVERY:
+            _plan_nudge_state["since_update"] = 0
+            return True
+        return False
+
+    def _error_result(tool: str, msg: str) -> dict:
+        """Build a tool_result event for a FAILED tool call.
+
+        ``status: "error"`` is what drives the UI's red ✗ badge (see
+        Chat.tsx's status mapping in ToolCallView: only 'error' renders the
+        cross, anything else renders ✓). Every failure path must go through
+        this so a failed fetch/search/write is never shown as a success tick.
+        """
+        return {"kind": "tool_result", "tool": tool, "summary": msg, "status": "error"}
+
     async def write_file_tool(path: str, content: str) -> str:
         """Replace the ENTIRE file at ``path`` with ``content`` (existing content is overwritten). Prefer edit_file to modify an existing file; only use this for brand-new files or an explicit full rewrite — you must supply the complete new content yourself since there is no whole-file read tool."""
         emit({"kind": "tool", "tool": "write_file", "args": {"path": path}})
@@ -1284,10 +2052,10 @@ def make_tool_callbacks(
             result = write_file(root, path, content)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "write_file", "summary": msg})
+            emit(_error_result("write_file", msg))
             return f"ERROR writing {path}: {msg}"
         if "error" in result:
-            emit({"kind": "tool_result", "tool": "write_file", "summary": result["error"]})
+            emit(_error_result("write_file", result["error"]))
             return f"ERROR writing {path}: {result['error']}"
         if old is not None and old != content:
             diff = "".join(
@@ -1308,52 +2076,57 @@ def make_tool_callbacks(
                 "summary": f"{len(content)} chars · +{adds}/-{dels}",
             })
         emit({"kind": "tool_result", "tool": "write_file", "summary": f"{len(content)} chars"})
-        return f"Successfully wrote {len(content)} characters to {path}."
+        verify_note = await asyncio.to_thread(verify_edit, root, path)
+        return (
+            f"Successfully wrote {len(content)} characters to {path}."
+            + _format_verify_suffix(verify_note)
+            + _format_plan_nudge_suffix(_plan_nudge_due())
+        )
 
     async def save_plan_tool(title: str, content: str) -> str:
-        """PLAN MODE ONLY. Save the implementation plan you just wrote to `~/.coder/plans/<workspace>/plan.md` (user-level, outside the project), so the user (or Coder mode, in a later turn) can open it again without you having to retype it. Each call OVERWRITES the previous plan for this workspace — there is only ever one `plan.md` per workspace, always the latest task's plan. This is the ONE exception to plan mode being read-only — it never writes into the workspace, only into `~/.coder/plans/`. Call it ONCE, after your plan text is finalized in your reply, with `title` (short description) and `content` (the full plan in markdown — normally the same '## Plan' text you just wrote in your reply). Do not call this for anything other than the final plan for the current task."""
+        """PLAN MODE ONLY. Save the implementation plan you just wrote as markdown in the user data folder (per-chat: `<data>/plan/<workspace>/<chat-id>/plan.md` — never inside the workspace), so the user or Coder mode can pick it up without retyping. Each call OVERWRITES this chat's plan. This is the ONE exception to plan mode being read-only — never writes into the workspace or project files. Call ONCE after your plan text is finalized, with `title` (short) and `content` (full plan markdown — normally your '## Plan' text)."""
         emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
         workspace_slug = slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
-        plans_dir = os.path.join(user_coder_dir(), "plans", workspace_slug)
-        rel_path = "plan.md"
-        abs_path = os.path.join(plans_dir, rel_path)
         try:
-            await asyncio.to_thread(os.makedirs, plans_dir, exist_ok=True)
-
-            def _write_plan() -> None:
-                with open(abs_path, "w", encoding="utf-8") as fh:
-                    fh.write(content)
-
-            await asyncio.to_thread(_write_plan)
-        except OSError as exc:
-            msg = f"could not write plan: {exc}"
-            emit({"kind": "tool_result", "tool": "save_plan", "summary": msg})
-            return f"ERROR saving plan to {abs_path}: {msg}"
-        emit({"kind": "tool_result", "tool": "save_plan", "summary": abs_path})
-        return f"Saved the plan to {abs_path}."
+            _state_db.save_plan(workspace_slug, title, content, chat_id=chat_id)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"could not save plan: {exc}"
+            emit(_error_result("save_plan", msg))
+            return f"ERROR saving plan: {msg}"
+        check_note = _self_check_plan_paths(root, content)
+        emit({
+            "kind": "tool_result",
+            "tool": "save_plan",
+            "summary": "saved" + (" (self-check flagged paths)" if check_note else ""),
+        })
+        return (
+            "Saved the plan to the app database for this workspace. "
+            "It will be offered again automatically on the next run in this workspace."
+            + check_note
+        )
 
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
-        """Curate the project's durable memory (stored in MEMORY.md at the project root and loaded into every future session for this project). IMPORTANT: if the user explicitly asked you to remember/note/keep something in mind (any language, any phrasing), you MUST call this tool with action='add' in this same turn — replying with words like "I'll remember that" WITHOUT calling this tool saves nothing; the tool call itself is the save. action must be one of: 'add' (text= new note), 'replace' (subject= text to find, text= new wording for that bullet), 'remove' (subject= text contained in the bullet to delete). Beyond explicit requests, also remember durable, reusable facts you learn on your own: project conventions and how the project works, gotchas and bug fixes that worked, build/test quirks, and preferences the user stated. In ENGLISH. Do NOT store secrets, credentials, personal data, one-off details, or anything already in AGENTS.md. If memory is near its cap, prefer replace/remove over adding."""
+        """Curate the project's durable memory (RAG notes, loaded every future session). If the user asked you to remember/note/keep something (any language), you MUST call with action='add' in this SAME turn — the tool call IS the save; words like "I'll remember" without calling save nothing. action: 'add' (text), 'replace' (subject= to find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself: conventions, fixed gotchas, build quirks, stated preferences. ENGLISH. No secrets, personal data, one-offs, or anything in AGENTS.md. Near cap prefer replace/remove."""
         emit({"kind": "tool", "tool": "memory", "args": {"action": action, "subject": subject, "text": text}})
         action = (action or "").strip().lower()
         try:
             if action == "replace":
-                result = replace_memory(root, subject, text)
+                result = replace_memory(root, subject, text, store)
             elif action == "remove":
-                result = remove_memory(root, subject)
+                result = remove_memory(root, subject, store)
             elif action in ("add", "remember", ""):
-                result = remember(root, text or subject)
+                result = remember(root, text or subject, store)
             else:
                 msg = f"unknown action {action!r} (use add|replace|remove)"
-                emit({"kind": "tool_result", "tool": "memory", "summary": msg})
+                emit(_error_result("memory", msg))
                 return f"ERROR: {msg}"
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "memory", "summary": msg})
+            emit(_error_result("memory", msg))
             return f"ERROR updating memory: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "memory", "summary": msg})
+            emit(_error_result("memory", msg))
             return f"ERROR updating memory: {msg}"
         if result.get("skipped") == "duplicate":
             emit({"kind": "tool_result", "tool": "memory", "summary": "already known"})
@@ -1365,17 +2138,17 @@ def make_tool_callbacks(
         return f"Memory updated ({action}). It will be loaded automatically in future sessions for this project."
 
     async def search_memory_tool(query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> str:
-        """Search this project's durable memory (MEMORY.md at the project root) for notes relevant to `query`. Memory is NOT pre-loaded into your context anymore (it can hold many notes), so call this to pull in only what's relevant instead of guessing. Use it at the start of non-trivial work, when the request sounds like something covered before, or when stuck on a recurring error — pass a few keywords (e.g. "port config", "auth flow", "test failures"). Leave query empty to see the most recently added notes."""
+        """Search this project's durable memory (RAG notes) for notes relevant to `query`. The most relevant notes to the current message are auto-injected every run, so you usually don't need this. Call when you need MORE: a different angle, older notes, or a mid-task check (e.g. a recurring error). Pass a few keywords (e.g. "port config", "auth flow"); leave query empty for the most recently added notes."""
         emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
         try:
-            result = search_memory(root, query, max_results)
+            result = search_memory(root, query, max_results, store)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "search_memory", "summary": msg})
+            emit(_error_result("search_memory", msg))
             return f"ERROR searching memory: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "search_memory", "summary": msg})
+            emit(_error_result("search_memory", msg))
             return f"ERROR searching memory: {msg}"
         notes = result.get("notes", [])
         total = result.get("total", 0)
@@ -1391,7 +2164,7 @@ def make_tool_callbacks(
         return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
 
     async def update_plan(items: list[dict]) -> str:
-        """Set or update your step-by-step plan for the CURRENT task, shown to the user as a live checklist. ALWAYS call this FIRST, before touching any files — pass the full list with status='pending' for every item, even for requests that look small. As you work, call it again with the SAME full list (not just the changed item), updating the step you just finished to 'completed' and the step you're starting to 'in_progress'. Each item needs 'content' (a short imperative phrase, e.g. "Add the edit_file tool") and 'status' (one of 'pending', 'in_progress', 'completed'). Never skip this — a live checklist should be visible on every task."""
+        """Set/update your step-by-step live checklist for the CURRENT task. ALWAYS call FIRST, before touching files — full list with status='pending' for every item, even small requests. Re-call with the SAME full list, marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Never skip. Write items in the SAME language the user is writing in."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
@@ -1402,10 +2175,39 @@ def make_tool_callbacks(
             if status not in ("pending", "in_progress", "completed"):
                 status = "pending"
             if content:
-                normalized.append({"content": content[:200], "status": status})
+                normalized.append(
+                    {
+                        # Positional id (NOT a content hash): the tool's own contract
+                        # requires the model to resend the SAME full list on every
+                        # call, so the item at index i IS step i even if its wording
+                        # was reworded slightly between calls. A content-hash id
+                        # changes the moment the text drifts even one character,
+                        # which made the frontend's id-based merge treat the reworded
+                        # step as a brand-new item and append a duplicate alongside
+                        # the stale one — the 'multiple tasks flash together' bug.
+                        "id": f"step-{len(normalized)}",
+                        "content": content[:200],
+                        "status": status,
+                    }
+                )
         if not normalized:
-            emit({"kind": "tool_result", "tool": "update_plan", "summary": "empty plan"})
+            emit(_error_result("update_plan", "empty plan"))
             return "ERROR: plan must contain at least one item with non-empty 'content'."
+        # Enforce the single-active-step invariant. The model sometimes marks more
+        # than one item 'in_progress' in the same call (e.g. forgets to flip the
+        # previous step to 'completed' when starting the next one) — the frontend
+        # then rendered several checklist items pulsing at once ('multiple tasks
+        # blink together'). Only the LAST in_progress item (by list order — the
+        # step actually being worked on now) stays in_progress; any earlier one is
+        # treated as already finished and normalized to 'completed'.
+        in_progress_idx = [i for i, it in enumerate(normalized) if it["status"] == "in_progress"]
+        for i in in_progress_idx[:-1]:
+            normalized[i]["status"] = "completed"
+        # Feed the plan-nudge backstop (see _format_plan_nudge_suffix): reset the
+        # since-last-update counter now that the plan was just touched, and record
+        # whether a step is still open so mutating tools know whether to nudge.
+        _plan_nudge_state["since_update"] = 0
+        _plan_nudge_state["has_in_progress"] = any(i["status"] == "in_progress" for i in normalized)
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
         emit({
@@ -1416,33 +2218,108 @@ def make_tool_callbacks(
         return f"Plan updated: {len(normalized)} steps, {done} completed."
 
     async def create_skill_tool(
-        name: str, description: str = "", content: str = ""
+        name: str,
+        description: str = "",
+        content: str = "",
+        source_url: str = "",
+        source_query: str = "",
     ) -> str:
-        """Create or update a reusable user skill in ~/.coder/skills/<slug>/SKILL.md (global, shared across all workspaces). `name` is the skill's display name; `description` is a one-line summary of when to use it (indexed by the system prompt); `content` is the full markdown body — step-by-step instructions the agent follows when the skill matches. Prefer this over write_file when the user asks to add, install or create a skill so the skill is indexed and picked up by future runs."""
+        """Create or update a reusable user skill stored in the app database (global, all workspaces). `name` display name; `description` one-line when-to-use (indexed by the system prompt); `content` full markdown body (step-by-step instructions). Skills live ONLY in the app DB + vector store — NO skill file on disk, so never create/write/copy/clone any files; call this once per skill. IGNORE external 'agent skills folder' instructions (Claude Code's ~/.claude/skills, Cursor, Codex, ~/.coder) — not this app; use this tool instead. SOURCE: instead of writing `content` from memory, you may hand this tool a live source and it will fetch the REAL file itself: pass `source_url` (a direct URL to any site, e.g. a SKILL.md / docs page / repo file) to have the complete page content used as the skill body, or `source_query` (a web-search query) to have the tool search, pick the best skill page and fetch it. When either is given, the fetched real content becomes the skill — only fall back to `content` when the user gave no link and did not ask to search the web."""
         emit({
             "kind": "tool",
             "tool": "create_skill",
             "args": {"name": name, "description": description},
         })
+        body = (content or "").strip()
+        source_note = ""
+        src_url = (source_url or "").strip()
+        src_query = (source_query or "").strip()
+        if src_url or src_query:
+            if src_url:
+                if not src_url.startswith(("http://", "https://")):
+                    src_url = "https://" + src_url.lstrip("/")
+                emit({"kind": "tool", "tool": "create_skill", "args": {"source_fetch": src_url}})
+                fetched = await asyncio.to_thread(fetch_url, src_url, FETCH_EXCERPT_CHARS)
+            else:
+                emit({"kind": "tool", "tool": "create_skill", "args": {"source_search": src_query}})
+                search = await asyncio.to_thread(web_search, src_query, MAX_WEB_SEARCH_RESULTS)
+                if "error" in search:
+                    msg = f"web search failed: {search['error']}"
+                    emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                    return f"ERROR creating skill {name!r}: {msg}"
+                results = search.get("results", [])
+                if not results:
+                    msg = f"web search for {src_query!r} returned no results"
+                    emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                    return f"ERROR creating skill {name!r}: {msg}"
+                # Prefer a result that looks like an actual skill/markdown source
+                # (github / raw / SKILL.md / .md) over generic pages; otherwise
+                # fall back to the first result.
+                picked = results[0]
+                for r in results:
+                    u = (r.get("url") or "").lower()
+                    if (
+                        "github.com" in u
+                        or "raw.githubusercontent" in u
+                        or "skill" in u
+                        or u.rstrip("/").endswith(".md")
+                    ):
+                        picked = r
+                        break
+                src_url = picked.get("url", "")
+                emit({"kind": "tool", "tool": "create_skill", "args": {"source_fetch": src_url}})
+                fetched = await asyncio.to_thread(fetch_url, src_url, FETCH_EXCERPT_CHARS)
+            if "error" in fetched:
+                msg = f"could not fetch source {src_url!r}: {fetched['error']}"
+                emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                return f"ERROR creating skill {name!r}: {msg}"
+            real = (fetched.get("content") or "").strip()
+            if len(real) < 50:
+                msg = f"source {src_url!r} contained almost no readable text"
+                emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                return f"ERROR creating skill {name!r}: {msg}"
+            body = real
+            source_note = f"built from real content fetched from {src_url} ({len(body)} chars)"
+            if not (description or "").strip():
+                # Derive a one-line description from the fetched file so the
+                # skill stays searchable even when the model omits it.
+                _desc = ""
+                _fm = re.match(r"^---\n([\s\S]*?)\n---\n?", body)
+                if _fm:
+                    _d = re.search(r"^description:\s*(.+)$", _fm.group(1), re.MULTILINE)
+                    if _d:
+                        _desc = _d.group(1).strip()
+                if not _desc:
+                    _first_line = next((l.strip() for l in body.splitlines() if l.strip() and not l.lstrip().startswith("#")), "")
+                    _title = next((l.lstrip("#").strip() for l in body.splitlines() if l.lstrip().startswith("#")), "")
+                    _desc = _first_line or _title or f"Skill about {name}."
+                description = _desc[:300]
+        if not body:
+            body = f"Write step-by-step instructions for {name}."
         try:
-            result = create_skill(root, name, description, content)
+            result = create_skill(root, name, description, body)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "create_skill", "summary": msg})
+            emit(_error_result("create_skill", msg))
             return f"ERROR creating skill {name!r}: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "create_skill", "summary": msg})
+            emit(_error_result("create_skill", msg))
             return f"ERROR creating skill {name!r}: {msg}"
+        indexed = result.get("indexed")
+        summary = f"saved to the app database as skill {name!r}"
+        if indexed is False:
+            summary += " (not indexed — no embedding model available)"
         emit({
             "kind": "tool_result",
             "tool": "create_skill",
-            "summary": f"saved {result['path']}",
+            "summary": summary,
         })
+        note = result.get("note", "")
+        extra = f" {source_note}." if source_note else "."
         return (
-            f"Skill {name!r} saved to {result['path']}. It is indexed automatically "
-            "and will be offered on future runs. Tell the user the skill was created "
-            "and where it lives."
+            f"Skill {name!r} saved. {note}{extra} It will be offered on future runs. "
+            "Tell the user the skill was created."
         )
 
     async def create_mcp_tool(
@@ -1452,7 +2329,7 @@ def make_tool_callbacks(
         url: str = "",
         env: dict[str, str] | None = None,
     ) -> str:
-        """Add or update an MCP tool connector in the user-level ~/.coder/mcp.json (global, shared across all workspaces). `name` is the connector id shown in Settings → MCP. For a local server use `command` (e.g. "npx") plus optional `args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) and `env` (extra environment variables, supports ${VAR} expansion). For a remote HTTP/SSE server use `url` instead; the url is verified to be a real MCP endpoint before saving. The connector takes effect on the next message in any mode and its tools become available to the agent."""
+        """Add or update an MCP tool connector stored in the app database (global, all workspaces). `name` is the connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) and `env` (supports ${VAR} expansion). Remote HTTP/SSE: `url` instead (verified as a real MCP endpoint before saving). Takes effect on the next message in any mode. Connectors live ONLY in the app DB — never write/edit mcp.json or config files; call this once per connector."""
         emit({"kind": "tool", "tool": "create_mcp", "args": {"name": name}})
         cfg: dict = {}
         if url:
@@ -1490,19 +2367,19 @@ def make_tool_callbacks(
             result = upsert_mcp_server(root, name, cfg)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "create_mcp", "summary": msg})
+            emit(_error_result("create_mcp", msg))
             return f"ERROR creating MCP connector {name!r}: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "create_mcp", "summary": msg})
+            emit(_error_result("create_mcp", msg))
             return f"ERROR creating MCP connector {name!r}: {msg}"
         emit({
             "kind": "tool_result",
             "tool": "create_mcp",
-            "summary": f"updated {name} in ~/.coder/mcp.json",
+            "summary": f"updated {name} in the app database",
         })
         return (
-            f"MCP connector {name!r} saved to ~/.coder/mcp.json (user-level, "
+            f"MCP connector {name!r} saved to the app database (user-level, "
             "shared across all workspaces). It will be loaded on "
             "the next message. Tell the user it was added and what tools it exposes."
             f"{auth_note}"
@@ -1521,10 +2398,10 @@ def make_tool_callbacks(
             result = edit_file(root, path, old_string, new_string, replace_all)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "edit_file", "summary": msg})
+            emit(_error_result("edit_file", msg))
             return f"ERROR editing {path}: {msg}"
         if "error" in result:
-            emit({"kind": "tool_result", "tool": "edit_file", "summary": result["error"]})
+            emit(_error_result("edit_file", result["error"]))
             return f"ERROR editing {path}: {result['error']}"
         old = result["old_content"]
         content = result["new_content"]
@@ -1547,7 +2424,12 @@ def make_tool_callbacks(
         })
         occ = result.get("occurrences", 1)
         emit({"kind": "tool_result", "tool": "edit_file", "summary": f"+{adds}/-{dels}"})
-        return f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
+        verify_note = await asyncio.to_thread(verify_edit, root, path)
+        return (
+            f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
+            + _format_verify_suffix(verify_note)
+            + _format_plan_nudge_suffix(_plan_nudge_due())
+        )
 
     async def list_files_tool(path: str = "") -> str:
         emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
@@ -1555,10 +2437,10 @@ def make_tool_callbacks(
             result = list_files(root, path)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "list_files", "summary": msg})
+            emit(_error_result("list_files", msg))
             return f"ERROR listing {path}: {msg}"
         if "error" in result:
-            emit({"kind": "tool_result", "tool": "list_files", "summary": result["error"]})
+            emit(_error_result("list_files", result["error"]))
             return f"ERROR listing {path}: {result['error']}"
         lines = []
         for entry in result["entries"][:listing_count]:
@@ -1580,11 +2462,11 @@ def make_tool_callbacks(
             result = search_in_files(root, query, path, context)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+            emit(_error_result("search_in_files", msg))
             return f"ERROR searching {path}: {msg}"
         if result.get("error"):
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+            emit(_error_result("search_in_files", msg))
             return f"ERROR searching {path}: {msg}"
         matches = result.get("matches", [])
         if not matches:
@@ -1625,16 +2507,86 @@ def make_tool_callbacks(
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "run_terminal", "summary": msg})
+            emit(_error_result("run_terminal", msg))
             return f"ERROR running {command!r}: {msg}"
         output = result["output"].strip()
         if len(output) > terminal_out_chars:
             output = output[:terminal_out_chars] + "\n…(output truncated to fit context)"
         summary = f"exit {result['exit_code']} · {len(output)} chars"
         emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
+        nudge = _format_plan_nudge_suffix(_plan_nudge_due())
         if not output:
-            return f"$ {command}\n(no output, exit code {result['exit_code']})"
-        return f"$ {command}\n{output}"
+            return f"$ {command}\n(no output, exit code {result['exit_code']})" + nudge
+        # When a dedicated "search" subagent model is configured and this is a
+        # codebase search (grep/rg/find/sed...), pass the raw output through the
+        # search subagent so it does the interpretation work (and its tokens are
+        # accounted to the search model in MODEL USAGE), instead of the parent
+        # model reading the raw output directly.
+        if search_model is not None and _is_terminal_search(command):
+            try:
+                from pydantic_ai import Agent as _SA
+                from pydantic_ai.settings import ModelSettings as _SMS
+
+                reader = _SA(
+                    search_model,
+                    system_prompt=(
+                        "You are a code-search reader. A shell command searched the "
+                        "codebase and produced the raw output below. Distill it into a "
+                        "CONCISE answer (under ~150 words): what was found, exact file "
+                        "paths and line numbers, and a one-line note on the most "
+                        "relevant match. Do not restate the whole raw output."
+                    ),
+                    model_settings=_SMS(temperature=0.2, max_tokens=400),
+                )
+                res = await _run_subagent_call(
+                    lambda: reader.run(
+                        f"COMMAND: {command}\n\nOUTPUT:\n{output}",
+                        model_settings=_SMS(
+                            timeout=_providers.model_timeout(
+                                model=search_model, total=60, connect=15, read=60
+                            )
+                        ),
+                    ),
+                    "terminal-search reader",
+                    emit=emit,
+                    model_name=str(getattr(search_model, "model_name", "") or ""),
+                )
+                distilled = str(getattr(res, "output", "") or "").strip()
+                if distilled:
+                    from agents import _usage_event  # local import (circular-safe)
+
+                    _usage_ev = _usage_event(
+                        getattr(res, "usage", None),
+                        model=str(getattr(search_model, "model_name", "") or ""),
+                    )
+                    if _usage_ev:
+                        emit(_usage_ev)
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "run_terminal",
+                        "summary": f"search distilled · {len(distilled)} chars",
+                    })
+                    return (
+                        f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
+                    )
+            except Exception as exc:  # noqa: BLE001 — fall back to raw output
+                # The search subagent model failed (bad key / invalid model /
+                # quota). Say so with the model name so the user can fix it in
+                # Settings → Subagents, THEN provide the raw output as fallback.
+                _search_note = _subagent_fail_note(
+                    "search", str(getattr(search_model, "model_name", "") or ""), exc
+                )
+                if _search_note:
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "run_terminal",
+                            "summary": "search subagent failed — raw output below",
+                            "status": "error",
+                        }
+                    )
+                    return f"$ {command}\n{_search_note}\n{output}" + nudge
+        return f"$ {command}\n{output}" + nudge
 
     async def fuzzy_find_tool(query: str, path: str = "") -> str:
         emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
@@ -1642,11 +2594,11 @@ def make_tool_callbacks(
             result = fuzzy_find_files(root, query, path)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": msg})
+            emit(_error_result("fuzzy_find", msg))
             return f"ERROR finding {query!r} under {path or '/'}: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": msg})
+            emit(_error_result("fuzzy_find", msg))
             return f"ERROR finding {query!r} under {path or '/'}: {msg}"
         matches = result.get("matches", [])
         if not matches:
@@ -1657,12 +2609,18 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
         return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines) + note
 
-    async def explore_tool(task: str) -> str:
-        """Delegate a broad, read-only investigation to an ISOLATED sub-agent, Claude-Code/opencode style. Use this instead of a long chain of your own list_files/search_in_files/fuzzy_find calls when a question is spread across MANY files or an area you don't know well yet — e.g. 'find where the header layout is defined and how the model badge's state flows into it', or 'find every place that reads or writes chat.mode and how they relate'. The sub-agent runs its OWN search loop in its OWN isolated context: none of ITS intermediate list_files/search_in_files calls or their raw output land in YOUR context — only the short written report below does. This is what actually keeps context usage low on big investigations (a wasted or repeated search inside the sub-agent costs IT context, not you). Pass a clear, SPECIFIC `task` describing exactly what to find and why — the sub-agent has no memory of this conversation, so include any details it needs (e.g. relevant file names or symbols you already know). Do NOT use this for a single file or a location you already know — call search_in_files yourself, it's cheaper for a narrow lookup. The sub-agent has a bounded step budget and may report back partial results if the task was too broad — if that happens, split it into smaller `explore` calls."""
+    async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
+        """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own list_files/search_in_files/fuzzy_find when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
         emit({"kind": "tool", "tool": "explore", "args": {"task": task}})
         if summarizer_model is None:
-            emit({"kind": "tool_result", "tool": "explore", "summary": "unavailable"})
+            emit(_error_result("explore", "unavailable"))
             return "ERROR: explore is unavailable (no model configured for this session)."
+
+        # Sub-agent-specific tighter limits — keeps tool output compact
+        # so the sub-agent model sees only relevant data, never megabytes.
+        _sub_listing_count = min(listing_count, 30)
+        _sub_search_count = min(search_count, 30)
+        _sub_tool_out_chars = max(400, min(tool_out_chars, 7_000))
 
         def _sub_emit(event: dict) -> None:
             # Forward to the same UI stream (so the user sees live sub-agent
@@ -1674,48 +2632,208 @@ def make_tool_callbacks(
             event["sub"] = True
             emit(event)
 
+        # Code-enforced dedup for the sub-agent's search tools. The sub-agent
+        # model repeatedly re-searches the same area with only minor keyword
+        # variation ("FastAPI" then "FastAPI" again, "@app" then "@app." then
+        # "@app.get") — each is a fresh model request that re-resends its whole
+        # isolated transcript, the single biggest token burn in an explore run.
+        # A prompt instruction to "not repeat" is not enough; this makes an
+        # exact repeat return a short stop-signal instead of burning another
+        # round-trip, and near-duplicate prefixes are folded in too.
+        #
+        # Each tool's ACTUAL result is also cached (keyed the same way). That
+        # serves two purposes: (1) a dedup hit returns the real findings — with
+        # an "ALREADY" prefix — instead of a memory-based stop-signal, and (2)
+        # when the run is retried after a step-budget / context overflow (see
+        # the widen loop below), a FRESH sub-agent model has no memory of the
+        # prior attempt, so its re-issued queries get the cached results back
+        # instead of a dead-end "use the result you already have" it never got.
+        _sub_seen_searches: set[tuple[str, str]] = set()
+        _sub_seen_listings: set[tuple[str, str]] = set()
+        _sub_result_cache: dict[str, str] = {}
+
+        def _sub_search_key(query: str, path: str) -> tuple[str, str]:
+            q = re.sub(r"[^a-z0-9_.@]+", "", (query or "").lower())
+            p = re.sub(r"[^a-z0-9_.@/]+", "", (path or "").lower())
+            return (q, p)
+
+        def _sub_cache_key(tool: str, key: tuple[str, str]) -> str:
+            return f"{tool}|{key[0]}|{key[1]}"
+
+        def _sub_cached(tool: str, key: tuple[str, str]) -> str | None:
+            return _sub_result_cache.get(_sub_cache_key(tool, key))
+
+        def _sub_resume_note() -> str:
+            """Distilled summary of the sub-agent's completed tool work, fed back
+            on a widen/overflow retry so a fresh model continues from the cached
+            findings instead of re-exploring from zero. Stays small (tail only)."""
+            if not _sub_result_cache:
+                return ""
+            items = list(_sub_result_cache.items())[-30:]
+            omitted = len(_sub_result_cache) - len(items)
+            lines = []
+            for cache_key, body in items:
+                parts = cache_key.split("|", 2)
+                tool = parts[0]
+                label = parts[1] if len(parts) > 1 and parts[1] else (parts[2] if len(parts) > 2 else "/")
+                snippet = body[:300].replace("\n", " ")
+                if len(body) > 300:
+                    snippet += "…"
+                lines.append(f"- {tool}({label}): {snippet}")
+            note = "\n".join(lines)
+            if omitted:
+                note += f"\n({omitted} earlier results omitted)"
+            return (
+                "Exploration work already completed in earlier attempts — do NOT redo it. "
+                "Use these cached results and continue where the investigation stopped:\n"
+                f"{note}"
+            )
+
+        def _sub_verify_report_paths(report: str) -> list[str]:
+            """Find `path:line` references in a sub-agent report that point at
+            files that do not exist under `root`. Returns a short list of bad
+            refs (capped) or [] when everything cited exists. Purely disk-based —
+            no model calls, so accuracy is verified without burning tokens."""
+            if not report:
+                return []
+            root_real = os.path.realpath(os.path.abspath(root))
+            bad: list[str] = []
+            seen: set[tuple[str, str]] = set()
+            for m in _CITATION_RE.finditer(report):
+                rel = m.group(1)
+                line = m.group(2)
+                key = (rel, line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    cand = os.path.realpath(os.path.join(root, rel.lstrip("/")))
+                except Exception:  # noqa: BLE001
+                    continue
+                if cand == root_real or not cand.startswith(root_real + os.sep):
+                    continue
+                if not os.path.isfile(cand):
+                    bad.append(f"{rel}:{line}")
+                    if len(bad) >= 15:
+                        break
+            return bad
+
+        def _sub_check_seen(tool: str, key: tuple[str, str], query: str, path: str) -> str | None:
+            for seen_key in _sub_seen_searches:
+                # Exact repeat: return the cached result (real data, even for a
+                # fresh model on retry), not a dead-end "use your memory".
+                if key == seen_key:
+                    cached = _sub_cached(tool, key)
+                    body = (
+                        cached
+                        if cached
+                        else f"(no stored result for {query!r} under {path or '/'})"
+                    )
+                    _sub_emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "search_in_files",
+                            "summary": "already searched",
+                        }
+                    )
+                    return (
+                        f"ALREADY SEARCHED: you ran this exact search "
+                        f"({query!r} under {path or '/'}) earlier. Result from earlier:\n"
+                        f"{body}"
+                    )
+                # Broader re-search of a more-specific earlier one: the specific
+                # result already contains the useful signal — return it.
+                if path == seen_key[1] and key[0] and seen_key[0].startswith(key[0]):
+                    cached = _sub_cached(tool, seen_key)
+                    body = cached or "(no stored result)"
+                    _sub_emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "search_in_files",
+                            "summary": "already searched",
+                        }
+                    )
+                    return (
+                        f"ALREADY SEARCHED: you previously searched a more specific term "
+                        f"({seen_key[0]!r}) under {path or '/'}. Result from earlier:\n"
+                        f"{body}"
+                    )
+            return None
+
         async def _sub_list_files(path: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
+            lkey = _sub_search_key("", path) or (path, "")
+            # Listing a directory is idempotent: re-listing the SAME directory
+            # later in a run returns the same tree and only re-resends the whole
+            # sub-agent transcript for nothing. Fold repeats (the sub-agent
+            # re-listed backend/, the root and scripts/ three times during a
+            # retry).
+            if lkey in _sub_seen_listings:
+                cached = _sub_cached("list_files", lkey)
+                body = cached or f"(no stored result for {path or '/'})"
+                _sub_emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "list_files",
+                        "summary": "already listed",
+                    }
+                )
+                return (
+                    f"ALREADY LISTED: you listed {path or '/'} earlier. Listing from earlier:\n"
+                    f"{body}"
+                )
+            _sub_seen_listings.add(lkey)
             try:
                 result = list_files(root, path)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": msg})
+                _sub_emit(_error_result("list_files", msg))
                 return f"ERROR listing {path}: {msg}"
             if "error" in result:
-                _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": result["error"]})
+                _sub_emit(_error_result("list_files", result["error"]))
                 return f"ERROR listing {path}: {result['error']}"
             lines = []
-            for entry in result["entries"][:listing_count]:
+            for entry in result["entries"][:_sub_listing_count]:
                 marker = "/" if entry["kind"] == "dir" else "  "
                 lines.append(f"{marker}{entry['name']}")
-            if len(result["entries"]) > listing_count:
-                lines.append(f"…({len(result['entries']) - listing_count} more entries)")
+            if len(result["entries"]) > _sub_listing_count:
+                lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
             body = "\n".join(lines) if lines else "(empty directory)"
+            out = f"DIRECTORY {path or '/'}\n{body}"
+            _sub_result_cache[_sub_cache_key("list_files", lkey)] = out
             _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": f"{len(result['entries'])} entries"})
-            return f"DIRECTORY {path or '/'}\n{body}"
+            return out
 
         async def _sub_search(query: str, path: str = "", context: int = 0) -> str:
             _sub_emit({"kind": "tool", "tool": "search_in_files", "args": {"query": query, "path": path, "context": context}})
+            key = _sub_search_key(query, path)
+            if key[0]:
+                stop = _sub_check_seen("search_in_files", key, query, path)
+                if stop is not None:
+                    return stop
+                _sub_seen_searches.add(key)
             try:
                 result = search_in_files(root, query, path, context)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+                _sub_emit(_error_result("search_in_files", msg))
                 return f"ERROR searching {path}: {msg}"
             if result.get("error"):
                 msg = result["error"]
-                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+                _sub_emit(_error_result("search_in_files", msg))
                 return f"ERROR searching {path}: {msg}"
             matches = result.get("matches", [])
             if not matches:
+                out = f"No matches for {query!r} under {path or '/'}."
+                if key[0]:
+                    _sub_result_cache[_sub_cache_key("search_in_files", key)] = out
                 _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
-                return f"No matches for {query!r} under {path or '/'}."
+                return out
             lines: list[str] = []
             total = 0
             shown = 0
             for m in matches:
-                if shown >= search_count:
+                if shown >= _sub_search_count:
                     break
                 block = [f"{m['file']}:{m['line']}: {m['text']}"]
                 if m.get("context_lines"):
@@ -1723,55 +2841,94 @@ def make_tool_callbacks(
                         marker = ">" if cl["line"] == m["line"] else " "
                         block.append(f"{m['file']}:{cl['line']}: {marker} {cl['text']}")
                 block_size = sum(len(b) + 1 for b in block)
-                if lines and total + block_size > tool_out_chars:
+                if lines and total + block_size > _sub_tool_out_chars:
                     break
                 lines.extend(block)
                 shown += 1
                 total += block_size
-                if total >= tool_out_chars:
+                if total >= _sub_tool_out_chars:
                     break
             note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
+            out = f"MATCHES for {query!r}\n" + "\n".join(lines) + note
+            if key[0]:
+                _sub_result_cache[_sub_cache_key("search_in_files", key)] = out
             _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": f"{len(matches)} matches"})
-            return f"MATCHES for {query!r}\n" + "\n".join(lines) + note
+            return out
 
         async def _sub_fuzzy_find(query: str, path: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
+            key = _sub_search_key(query, path)
+            if key[0]:
+                stop = _sub_check_seen("fuzzy_find", key, query, path)
+                if stop is not None:
+                    return stop
+                _sub_seen_searches.add(key)
             try:
                 result = fuzzy_find_files(root, query, path)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": msg})
+                _sub_emit(_error_result("fuzzy_find", msg))
                 return f"ERROR finding {query!r} under {path or '/'}: {msg}"
             matches = result.get("matches", [])
             if not matches:
+                out = f"No files match {query!r} under {path or '/'}."
+                if key[0]:
+                    _sub_result_cache[_sub_cache_key("fuzzy_find", key)] = out
                 _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": "no matches"})
-                return f"No files match {query!r} under {path or '/'}."
+                return out
             lines = [m["path"] for m in matches[:50]]
+            out = f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
+            if key[0]:
+                _sub_result_cache[_sub_cache_key("fuzzy_find", key)] = out
             _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
-            return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
+            return out
 
         try:
-            from httpx import Timeout as _Timeout
             from pydantic_ai import Agent as _Agent
             from pydantic_ai import Tool as _Tool
             from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
+            from pydantic_ai.messages import (
+                ModelRequest as _ModelRequest,
+                SystemPromptPart as _SystemPromptPart,
+            )
             from pydantic_ai.settings import ModelSettings as _ModelSettings
             from pydantic_ai.usage import UsageLimits as _UsageLimits
+
+            # Prepend path hint and known hints to the task when given.
+            task_text = task
+            if path_hint:
+                task_text = f"Search ONLY within {path_hint}. {task}"
+            if hints:
+                task_text = f"Known hints: {hints}. {task_text}"
 
             sub_agent = _Agent(
                 summarizer_model,
                 system_prompt=(
-                    "You are a read-only exploration sub-agent working inside a desktop IDE's project "
-                    "workspace. You have NO memory of any other conversation — the TASK below is your "
-                    "entire context. Investigate it using list_files, search_in_files and fuzzy_find. Be "
-                    "efficient: combine related searches with regex alternation (foo|bar|baz) instead of "
-                    "separate calls, pass a generous `context` (5-10) on your first search of an area "
-                    "instead of a low-context search followed by a wider one on the same spot, and never "
-                    "repeat a search with only a minor keyword variation over the same area. Stop as soon "
-                    "as you have enough to answer. When done, reply with a CONCISE report (under ~300 "
-                    "words): the exact file paths and line numbers relevant to the task, short code "
-                    "excerpts only where they materially help, and a direct answer to what was asked. Do "
-                    "not pad with commentary or restate the task."
+                    "You are a read-only exploration sub-agent. "
+                    "TOOL CHOICE: use fuzzy_find to locate FILES by name (part of a filename, "
+                    "or an extension like 'py'), use list_files to see a directory's contents, "
+                    "and use search_in_files only to find CONTENT INSIDE already-identified files "
+                    "or to confirm a symbol/string exists. Do NOT search_in_files to discover which "
+                    "files exist — that returns hundreds of noisy matches. Combine multiple search "
+                    "terms with regex alternation (foo|bar|baz). Pass context=5-10 on your first "
+                    "content search of a file. Never repeat a search with only a minor keyword "
+                    "variation. Do NOT search for overly generic terms like 'class', 'function', "
+                    "'def', 'import' or punctuation — use specific, project-relevant keywords. "
+                    "Stop as soon as you have enough to answer. When done, reply with a CONCISE report "
+                    "(under ~300 words): exact file paths and line numbers, code excerpts ≤ 3 lines "
+                    "unless the multi-line structure is the answer. Do not pad. "
+                    "ACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
+                    "invent, guess or abbreviate a path. If a search returns no matches, say so "
+                    "explicitly instead of assuming it exists. If you are unsure a file exists, "
+                    "confirm it with fuzzy_find before citing it. Only cite facts that appear in "
+                    "your tool results; never rely on memory of files you did not actually see. "
+                    "PERSISTENCE: before concluding something 'does not exist' or 'is not handled "
+                    "anywhere', try MULTIPLE search phrasings and several likely locations — the "
+                    "exact literal string often differs from natural phrasing (try substrings, word "
+                    "fragments, adjacent terms), and a single search returning no matches is NOT "
+                    "proof of absence. When the task asks for exact file:line references and your "
+                    "first searches come up empty, keep investigating rather than reporting "
+                    "'not found' immediately."
                 ),
                 tools=[
                     _Tool(_sub_list_files, name="list_files"),
@@ -1780,24 +2937,187 @@ def make_tool_callbacks(
                 ],
                 model_settings=_ModelSettings(temperature=0.2, max_tokens=1200),
             )
-            res = await sub_agent.run(
-                task,
-                usage_limits=_UsageLimits(request_limit=16, tool_calls_limit=30),
-                model_settings=_ModelSettings(timeout=_Timeout(150, connect=15, read=150)),
-            )
+
+            # Widen-and-resume retry loop (mirrors the PARENT agent's handling in
+            # agents.py: a pydantic-ai UsageLimitExceeded or a provider context
+            # overflow is NOT a hard failure — raise the budget / resume from the
+            # cached tool results so a broad-but-legitimate investigation finishes
+            # in this isolated run instead of telling the PARENT to split the task
+            # (which then re-pays full discovery overhead in its OWN context).
+            # Each retry keeps the result cache (built above), so the fresh model
+            # gets its earlier findings back via the dedup instead of re-exploring.
+            _sub_model_name = str(getattr(summarizer_model, "model_name", "") or "")
+            _sub_request_limit = 20
+            _sub_tool_calls_limit = 40
+            _sub_widen_retries = 0
+            _sub_overflow_retries = 0
+            _sub_run_prompt = task_text
+            _sub_res = None
+            while True:
+                try:
+                    _sub_res = await _run_subagent_call(
+                        lambda: sub_agent.run(
+                            _sub_run_prompt,
+                            # Was request_limit=10/tool_calls_limit=20 — too tight for a
+                            # genuinely broad investigation in a large codebase, so it hit
+                            # UsageLimitExceeded routinely and told the PARENT to split the
+                            # task into more explore calls. Each new explore call spins up a
+                            # FRESH sub-agent with no memory of what the previous attempt
+                            # already found, so that "split it up and retry" pattern was
+                            # paying the full discovery overhead (re-listing/re-searching
+                            # the same areas) two or three times over for one investigation
+                            # — exactly the repeated-tool-call token burn being reported.
+                            # Doubling the budget lets most broad-but-reasonable tasks
+                            # finish in ONE isolated sub-agent run instead. Still bounded,
+                            # so a truly runaway task fails loudly rather than looping
+                            # forever — it just needs a materially bigger task to get there.
+                            usage_limits=_UsageLimits(
+                                request_limit=_sub_request_limit,
+                                tool_calls_limit=_sub_tool_calls_limit,
+                            ),
+                            model_settings=_ModelSettings(
+                                timeout=_providers.model_timeout(
+                                    model=summarizer_model, total=90, connect=10, read=90
+                                )
+                            ),
+                        ),
+                        "explore sub-agent",
+                        emit=emit,
+                        model_name=_sub_model_name,
+                    )
+                    break
+                except _UsageLimitExceeded:
+                    # Step/request budget hit, no mutating side effects possible
+                    # (read-only sub-agent). Widen the budget and resume with the
+                    # cached tool results, mirroring the parent's widen branch.
+                    if _sub_widen_retries >= 2:
+                        raise
+                    _sub_widen_retries += 1
+                    _sub_request_limit = min(_sub_request_limit * 2, 80)
+                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 120)
+                    resume_note = _sub_resume_note()
+                    if resume_note:
+                        _sub_run_prompt = f"{task_text}\n\n{resume_note}"
+                    emit(
+                        {
+                            "kind": "retry",
+                            "attempt": _sub_widen_retries,
+                            "max_attempts": 3,
+                            "delay": 0,
+                            "reason": (
+                                f"explore step budget raised to {_sub_request_limit} requests / "
+                                f"{_sub_tool_calls_limit} tool calls, resuming from previous tool results"
+                            ),
+                            "model": _sub_model_name,
+                            "agent": "explore sub-agent",
+                        }
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    # A provider context overflow inside the sub-agent's own
+                    # isolated window: its transcript got too big. Resume ONCE
+                    # from the cached findings (the prompt + cached results are
+                    # far smaller than the raw transcript, so it fits again).
+                    # UsageLimitExceeded is handled above; `_is_context_overflow`
+                    # matches only real overflow wording.
+                    from agents import _is_context_overflow
+
+                    if _is_context_overflow(exc) and _sub_overflow_retries < 1:
+                        _sub_overflow_retries += 1
+                        resume_note = _sub_resume_note()
+                        if resume_note:
+                            _sub_run_prompt = f"{task_text}\n\n{resume_note}"
+                        emit(
+                            {
+                                "kind": "retry",
+                                "attempt": 1,
+                                "max_attempts": 2,
+                                "delay": 0,
+                                "reason": "explore sub-agent context was full — resuming from previous tool results",
+                                "model": _sub_model_name,
+                                "agent": "explore sub-agent",
+                            }
+                        )
+                        continue
+                    raise
+            res = _sub_res
             report = str(getattr(res, "output", "") or "").strip()
+
+            # Citation verification: extract `path:line` references from the
+            # report and check each file exists on disk. Sub-agents occasionally
+            # fabricate paths/line numbers; if any are bogus, run ONE bounded
+            # correction round (sub-agent tokens only) pointing out the bad refs.
+            if report:
+                bad_refs = _sub_verify_report_paths(report)
+                if bad_refs:
+                    resume_history: list[_ModelRequest] = []
+                    _resume_note = _sub_resume_note()
+                    if _resume_note:
+                        resume_history = [
+                            _ModelRequest(parts=[_SystemPromptPart(content=_resume_note)])
+                        ]
+                    try:
+                        fix_result = await _run_subagent_call(
+                            lambda: sub_agent.run(
+                                (
+                                    "Your exploration report cites file paths that do not exist in "
+                                    "the workspace:\n"
+                                    + "\n".join(f"- {b}" for b in bad_refs[:15])
+                                    + "\n\nCorrect the report: for each, either fix the path to the "
+                                    "REAL file (confirm it with fuzzy_find/search_in_files first) or "
+                                    "remove the fabricated reference entirely. Keep the rest of the "
+                                    "report unchanged. Reply with ONLY the corrected report."
+                                ),
+                                message_history=resume_history,
+                                usage_limits=_UsageLimits(
+                                    request_limit=max(4, _sub_request_limit),
+                                    tool_calls_limit=max(8, _sub_tool_calls_limit),
+                                ),
+                                model_settings=_ModelSettings(
+                                    timeout=_providers.model_timeout(
+                                        model=summarizer_model, total=60, connect=10, read=60
+                                    )
+                                ),
+                            ),
+                            "explore sub-agent",
+                            emit=emit,
+                            model_name=_sub_model_name,
+                        )
+                        fixed = str(getattr(fix_result, "output", "") or "").strip()
+                        if fixed:
+                            report = fixed
+                    except Exception:  # noqa: BLE001, S110 — a failed fix is not fatal
+                        pass
         except _UsageLimitExceeded:
-            emit({"kind": "tool_result", "tool": "explore", "summary": "step budget exceeded"})
+            emit(_error_result("explore", "step budget exceeded"))
             return (
                 f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
                 "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
                 "part yourself with search_in_files."
             )
         except Exception as exc:  # noqa: BLE001
-            emit({"kind": "tool_result", "tool": "explore", "summary": f"failed: {exc}"})
-            return f"ERROR: explore sub-agent failed: {exc}"
+            _sub_model = str(getattr(summarizer_model, "model_name", "") or "")
+            emit(_error_result("explore", f"failed: {exc}"))
+            return (
+                f"ERROR: explore sub-agent failed"
+                f" ({_sub_model} model, change it in Settings → Subagents): {exc}"
+            )
+        # The sub-agent's model requests are billed real tokens, but they ran
+        # through a SEPARATE pydantic_ai Agent instance that never passed through
+        # _UsageCapability (that's only wired up for the PARENT agent's own model
+        # in agents.py) — so this usage was silently missing from both the live
+        # context meter and the cost total. Surface it the same way a normal
+        # tool-loop step does, via the same _usage_event normalizer.
+        from agents import (
+            _usage_event,  # local import: agents.py imports this module at load time
+        )
+
+        sub_model_name = str(getattr(summarizer_model, "model_name", "") or "")
+        usage_event = _usage_event(getattr(res, "usage", None), model=sub_model_name)
+        if usage_event:
+            emit(usage_event)
         if not report:
-            emit({"kind": "tool_result", "tool": "explore", "summary": "no report"})
+            emit(_error_result("explore", "no report"))
             return f"The exploration sub-agent found nothing usable for {task!r}."
         emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars"})
         return f"EXPLORE REPORT for {task!r}\n{report}"
@@ -1807,30 +3127,188 @@ def make_tool_callbacks(
         result = await asyncio.to_thread(web_search, query, max_results)
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "web_search", "summary": msg})
+            emit({"kind": "tool_result", "tool": "web_search", "summary": msg, "status": "error"})
             return f"WEB SEARCH ERROR for {query!r}: {msg}"
         results = result.get("results", [])
         if not results:
             emit({"kind": "tool_result", "tool": "web_search", "summary": "no results"})
             return f"No web results for {query!r}."
         lines = []
+        ui_items: list[dict] = []
         for r in results:
             snippet = r["snippet"]
             if len(snippet) > WEB_SEARCH_SNIPPET_MAX:
                 snippet = snippet[:WEB_SEARCH_SNIPPET_MAX] + " …"
             lines.append(f"- {r['title']}\n  {r['url']}\n  {snippet}")
-        emit({"kind": "tool_result", "tool": "web_search", "summary": f"{len(results)} results"})
-        return f"WEB RESULTS for {query!r}\n" + "\n".join(lines)
+            ui_items.append({"title": r["title"], "url": r["url"], "snippet": snippet})
+            # Persist each hit into the workspace vector store (KIND_WEB) so
+            # later retrieval can recall it without re-fetching the web.
+            if store is not None:
+                try:
+                    store.upsert_doc(
+                        f"web:{r['url']}",
+                        KIND_WEB,
+                        r.get("title", r["url"]),
+                        [snippet],
+                        {"source_url": r["url"], "source_type": "web"},
+                    )
+                except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
+                    pass
+        summary = f"{len(results)} results"
+        fallbacks = result.get("fallbacks") or []
+        engine = result.get("engine") or ""
+        if fallbacks:
+            summary += f" — fell back to {engine} after {', '.join(fallbacks)}"
+        emit({"kind": "tool_result", "tool": "web_search", "summary": summary, "engine": engine, "results": ui_items})
+        raw_results = f"WEB RESULTS for {query!r}\n" + "\n".join(lines)
+        # If a dedicated "web" subagent model is configured, distill the raw
+        # results into a concise answer so the main context stays lean
+        # (Claude-Code-style). Otherwise return the raw results as before.
+        if web_model is not None:
+            try:
+                from pydantic_ai import Agent
+                from pydantic_ai.settings import ModelSettings
 
-    async def fetch_url_tool(url: str, question: str = "") -> str:
-        emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url}})
+                distiller = Agent(
+                    web_model,
+                    system_prompt=(
+                        "You are a web-search reader. Read the quoted search results "
+                        "and answer the user's query with a CONCISE summary (under "
+                        "150 words) that cites the most relevant result URLs inline. "
+                        "If the results cannot answer the query, say so."
+                    ),
+                    model_settings=ModelSettings(temperature=0.2, max_tokens=400),
+                )
+                res = await _run_subagent_call(
+                    lambda: distiller.run(
+                        f"QUERY: {query}\n\nSEARCH RESULTS:\n" + "\n".join(lines),
+                        model_settings=ModelSettings(
+                            timeout=_providers.model_timeout(
+                                model=web_model, total=60, connect=15, read=60
+                            )
+                        ),
+                    ),
+                    "web-search distiller",
+                    emit=emit,
+                    model_name=str(getattr(web_model, "model_name", "") or ""),
+                )
+                distilled = str(getattr(res, "output", "") or "").strip()
+                if distilled:
+                    from agents import _usage_event  # local import (circular-safe)
+
+                    _usage_ev = _usage_event(
+                        getattr(res, "usage", None),
+                        model=str(getattr(web_model, "model_name", "") or ""),
+                    )
+                    if _usage_ev:
+                        emit(_usage_ev)
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "web_search",
+                        "summary": f"{len(results)} results (distilled)",
+                        "engine": engine,
+                        "results": ui_items,
+                    })
+                    return f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
+            except Exception as exc:  # noqa: BLE001 — fall back to raw results
+                # The web subagent model failed — tell the user which one to fix
+                # in Settings → Subagents, then return raw results as fallback.
+                _web_note = _subagent_fail_note(
+                    "web", str(getattr(web_model, "model_name", "") or ""), exc
+                )
+                if _web_note:
+                    return raw_results + "\n\n" + _web_note
+        return raw_results
+
+    async def fetch_url_tool(url: str, question: str = "", full: bool = False) -> str:
+        """Fetch a web page / raw file and return its extracted text. Default (full=False) returns a bounded excerpt OR a sub-agent summary when `question` is set. For copying source files like SKILL.md / docs you need to read completely (e.g. installing a skill from a GitHub repo), the backend DETECTS these automatically (a ``.md``/``.txt``/source-code URL or a raw.githubusercontent.com / jsdelivr / gist URL always returns the full text up to 24k chars), so a single call per file is enough — you do not need to pass `full=True`. Do NOT re-fetch the same file through raw.githubusercontent / jsdelivr / GitHub API / portal mirrors — pick ONE raw URL and call it ONCE; if it still truncates, note that and move on rather than retrying the same content via other hosts. Every fetch_url re-sends the whole conversation, so each extra call costs real tokens."""
+        effective_full = bool(full)
+        emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url, "full": effective_full}})
+        # full=True bypasses the default excerpt cap: return the whole page so
+        # one call is enough for copying source files (SKILL.md / docs). The
+        # extracted body is already bounded by fetch_url (FETCH_EXCERPT_CHARS).
+        #
+        # AUTO-DETECT source files regardless of the model's `full` flag: a URL
+        # that points at a raw file (markdown / text / source-code extension, or
+        # a raw.githubusercontent / jsdelivr / gist host) is ALWAYS returned in
+        # full. Relying on the model to remember full=True is fragile — without
+        # this, a skill-install fetch would silently come back as a tiny excerpt
+        # and the agent would re-fetch the same file (token blow-up, truncated
+        # skills), which is exactly the bug this fixes.
+        _cap = tool_out_chars
+        _probe = url.split("?", 1)[0].rstrip("/")
+        _ext = _probe.rsplit(".", 1)[-1].lower() if "." in _probe.rsplit("/", 1)[-1] else ""
+        _raw_hosts = ("raw.githubusercontent.com", "cdn.jsdelivr.net", "gist.github.com", "raw.fastgit.org")
+        _ext_full = {
+            "md", "markdown", "txt", "text", "json", "yaml", "yml", "toml",
+            "py", "ts", "tsx", "js", "jsx", "css", "html", "htm", "sh", "bash",
+            "pdf", "xml", "svg", "csv", "r", "sql", "env", "ini", "conf", "cfg",
+        }
+        if effective_full or _ext in _ext_full or _probe.startswith(_raw_hosts):
+            _cap = FETCH_EXCERPT_CHARS
+            effective_full = True
+        cache = _get_result_cache()
+        cache_key = f"fetch:{url}"
+        # Return cached page if fresh (TTL: 24h).
+        cached = cache.get(cache_key)
+        if cached:
+            body = ""
+            title = ""
+            try:
+                data = json.loads(cached)
+                body = data.get("content", "")
+                title = data.get("title", "")
+            except (ValueError, TypeError):
+                pass
+            if body:
+                if len(body) > _cap:
+                    body = body[: _cap] + "\n…(output truncated to fit context)"
+                emit({
+                    "kind": "tool_result",
+                    "tool": "fetch_url",
+                    "summary": f"{len(body)} chars (cached)",
+                })
+                return f"FETCHED {url} (cached)\nTitle: {title or 'unknown'}\n\n{body}"
         result = await asyncio.to_thread(fetch_url, url)
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "fetch_url", "summary": msg})
+            emit(_error_result("fetch_url", msg))
             return f"ERROR fetching {url}: {msg}"
         body = result.get("content", "")
         title = result.get("title", "")
+        # Cache the fetch result (24h TTL)
+        if body:
+            try:
+                cache.set(cache_key, json.dumps({"content": body, "title": title}, ensure_ascii=False), 86400)
+            except Exception:  # noqa: BLE001, S110
+                pass
+        # Persist the fetched page into the workspace vector store (KIND_WEB)
+        # so later retrieval can recall it without re-fetching the web.
+        if store is not None and body:
+            try:
+                store.upsert_doc(
+                    f"web:{url}",
+                    KIND_WEB,
+                    title or url,
+                    [body[:WEB_SEARCH_SNIPPET_MAX * 4]],
+                    {"source_url": url, "source_type": "web"},
+                )
+            except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
+                pass
+
+        # full=True (or auto-detected source file) returns the whole page
+        # verbatim — no summarizer, no excerpt. This is the skill-install path:
+        # the caller needs the complete source.
+        if effective_full:
+            if len(body) > _cap:
+                body = body[: _cap] + "\n…(output truncated to fit context)"
+            emit({
+                "kind": "tool_result",
+                "tool": "fetch_url",
+                "summary": f"{len(body)} chars",
+            })
+            return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
+
         emit({
             "kind": "tool_result",
             "tool": "fetch_url",
@@ -1842,14 +3320,13 @@ def make_tool_callbacks(
         # with a tiny token budget) answers the `question` from the extracted
         # text, keeping the main context lean.
         answer = ""
-        if summarizer_model is not None:
+        if web_model is not None or summarizer_model is not None:
             try:
-                from httpx import Timeout
                 from pydantic_ai import Agent
                 from pydantic_ai.settings import ModelSettings
 
                 summarizer = Agent(
-                    summarizer_model,
+                    web_model or summarizer_model,
                     system_prompt=(
                         "You are a web-page reader. Read the quoted page text and "
                         "answer the user's question with a CONCISE summary (under "
@@ -1860,28 +3337,60 @@ def make_tool_callbacks(
                     model_settings=ModelSettings(temperature=0.2, max_tokens=400),
                 )
                 _prompt = question.strip() or "Summarize the key content of this page."
-                res = await summarizer.run(
-                    f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
-                    model_settings=ModelSettings(
-                        timeout=Timeout(90, connect=15, read=90)
+                res = await _run_subagent_call(
+                    lambda: summarizer.run(
+                        f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
+                        model_settings=ModelSettings(
+                            timeout=_providers.model_timeout(
+                                model=web_model or summarizer_model, total=90, connect=15, read=90
+                            )
+                        ),
+                    ),
+                    "web-page summarizer",
+                    emit=emit,
+                    model_name=str(
+                        getattr(web_model or summarizer_model, "model_name", "") or ""
                     ),
                 )
                 answer = str(getattr(res, "output", "") or "").strip()
-            except Exception:  # noqa: BLE001
-                answer = ""  # summarizer failed; fall through to excerpt
+                # Surface the summarizer's token usage so it shows in MODEL USAGE
+                # (same normalizer the explore sub-agent uses).
+                from agents import _usage_event  # local import (circular-safe)
+
+                _usage_ev = _usage_event(
+                    getattr(res, "usage", None),
+                    model=str(
+                        getattr(web_model or summarizer_model, "model_name", "") or ""
+                    ),
+                )
+                if _usage_ev:
+                    emit(_usage_ev)
+            except Exception as exc:  # noqa: BLE001
+                # Web summarizer subagent failed — note it with the model name
+                # so the user can fix Settings → Subagents, then excerpt-fall.
+                answer = ""
+                _web_note = _subagent_fail_note(
+                    "web",
+                    str(getattr(web_model or summarizer_model, "model_name", "") or ""),
+                    exc,
+                )
+                if _web_note:
+                    answer = _web_note  # becomes the "summary" replaced below
 
         head = f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "")
         if answer:
+            if answer.startswith("Note: the"):
+                return head + answer
             return head + "SUMMARY:\n" + answer
         # Fallback: no summarizer (or it failed) — return a bounded excerpt that
         # respects the shared context budget so it can never overflow the window.
-        if len(body) > tool_out_chars:
-            body = body[:tool_out_chars] + "\n…(output truncated to fit context)"
+        if len(body) > _cap:
+            body = body[: _cap] + "\n…(output truncated to fit context)"
         return head + body
 
     async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:
-        """Request the user's permission to read, search or act OUTSIDE the current workspace root. BEFORE touching anything outside the project folder (e.g. ~/.config, /Users/..., $HOME files, system paths), call this and WAIT for the result. (Reading the user-level `~/.coder` config dir — skills, plans, MCP config — is ALWAYS allowed and needs NO permission; do not call this for that.) If it returns PERMISSION GRANTED you may proceed with that outside action; if PERMISSION DENIED you MUST NOT access it — instead explain to the user what you needed and why, and continue with what is possible inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
-        # Paths under the always-readable ~/.coder config dir never need a
+        """Request the user's permission to read, search or act OUTSIDE the current workspace root (e.g. ~/.config, /Users/..., $HOME files, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills, plans and MCP connectors live in the app DB and are given inline — never read them from disk, never call this for them.) PERMISSION GRANTED → proceed; PERMISSION DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
+        # Paths under the always-readable user data folder never need a
         # permission prompt — grant silently with no UI card at all.
         if path:
             try:
@@ -1890,13 +3399,13 @@ def make_tool_callbacks(
                 if target == coder or target.startswith(coder + os.sep):
                     return (
                         f"PERMISSION GRANTED for {path!r}. This is inside the always-readable "
-                        f"~/.coder config dir — no permission is needed, you may proceed."
+                        f"user data folder (Data path in Settings) — no permission is needed, you may proceed."
                     )
             except PathEscapeError:
                 pass
         emit({"kind": "tool", "tool": "request_permission", "args": {"action": action, "path": path}})
         if permission_gates is None:
-            emit({"kind": "tool_result", "tool": "request_permission", "summary": "permission system unavailable"})
+            emit(_error_result("request_permission", "permission system unavailable"))
             return "ERROR: permission system is not available."
         pid = f"p{uuid.uuid4().hex[:8]}"
         loop = asyncio.get_running_loop()
@@ -1925,10 +3434,10 @@ def make_tool_callbacks(
         )
 
     async def confirm_action_tool(action: str, reason: str = "") -> str:
-        """Ask the user to confirm before an IMPORTANT or hard-to-reverse action, and WAIT for the result. Use this before things like: deleting or overwriting a file that has real content, force-pushing or rewriting git history (git push --force, git reset --hard, git rebase on shared history), dropping/truncating a database or table, running a destructive shell command (rm -rf, DROP TABLE, a migration that loses data), or any step you cannot cleanly undo. Also use it when you're about to commit to one of two genuinely different approaches and the choice meaningfully affects the outcome — in that case prefer ask_user instead if there's more than one reasonable option to present. `action` is a short, specific description of exactly what you're about to do (e.g. 'delete src/legacy/old-router.ts (312 lines, no longer imported)'); `reason` is a one-line why. If CONFIRMED, proceed. If DENIED, STOP that action, tell the user you stopped, and ask what they'd like instead — do not silently skip it and continue as if nothing happened. Do not call this for routine, easily-reversible edits (normal edit_file/write_file calls) — only for the genuinely risky or one-way ones."""
+        """Ask the user to confirm an IMPORTANT or hard-to-reverse action and WAIT for the result: deleting/overwriting a file with real content, force-push/reset/rebase, dropping/truncating a DB, destructive shell (rm -rf, DROP TABLE, data-losing migration), or anything you can't cleanly undo. `action` = exactly what you'll do, specific (e.g. 'delete src/legacy/old-router.ts (312 lines, no longer imported)'); `reason` = one-line why. CONFIRMED → proceed. DENIED → stop, say you stopped, ask what they'd like instead — never silently skip. Not for routine reversible edits."""
         emit({"kind": "tool", "tool": "confirm_action", "args": {"action": action}})
         if permission_gates is None:
-            emit({"kind": "tool_result", "tool": "confirm_action", "summary": "confirmation system unavailable"})
+            emit(_error_result("confirm_action", "confirmation system unavailable"))
             return "ERROR: confirmation system is not available. Do NOT proceed with the action; ask the user directly in your reply instead."
         pid = f"c{uuid.uuid4().hex[:8]}"
         loop = asyncio.get_running_loop()
@@ -1951,10 +3460,10 @@ def make_tool_callbacks(
         )
 
     async def ask_user_tool(question: str, options: list[str] | None = None) -> str:
-        """Ask the user a question mid-task and WAIT for their answer, instead of guessing or picking silently on their behalf. Use this when you hit a genuine fork with no clearly-correct default — e.g. two reasonable but different implementation approaches, which of several matching files they meant, whether to keep or remove something ambiguous, a missing detail you can't infer from the project. Pass 2-5 short, mutually-exclusive `options` (a few words each) when the question is naturally multiple-choice — the user picks one with a tap. Omit `options` (or pass an empty list) for an open-ended question that needs a free-text answer. Keep `question` to one clear sentence. Do NOT use this for things you can just go find out yourself with a tool, and do not ask more than one question per call — if you have several, ask the most important one first. The returned string is the user's exact answer (the option they picked, or their typed text)."""
+        """Ask the user a question mid-task and WAIT for the answer instead of guessing. Use when the request is ambiguous, has conflicting instructions, or misses a detail you can't infer — and it's your FIRST action when intent is genuinely unclear. Pass 2-5 short, mutually-exclusive `options` (few words) for multiple-choice; omit/empty for free text. One clear `question`. Not for things you can find out yourself; one question per call. Returns the user's exact answer."""
         emit({"kind": "tool", "tool": "ask_user", "args": {"question": question, "options": options or []}})
         if ask_gates is None:
-            emit({"kind": "tool_result", "tool": "ask_user", "summary": "ask system unavailable"})
+            emit(_error_result("ask_user", "ask system unavailable"))
             return "ERROR: the ask-the-user system is not available. Ask the question directly in your reply instead and wait for the user's next message."
         aid = f"a{uuid.uuid4().hex[:8]}"
         loop = asyncio.get_running_loop()
@@ -1968,10 +3477,305 @@ def make_tool_callbacks(
         finally:
             ask_gates.pop(aid, None)
         if not answer:
-            emit({"kind": "tool_result", "tool": "ask_user", "summary": "no answer (timed out)"})
+            emit(_error_result("ask_user", "no answer (timed out)"))
             return "The user did not answer in time. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
         emit({"kind": "tool_result", "tool": "ask_user", "summary": f"answered: {answer[:80]}"})
         return f"USER ANSWERED: {answer}"
+
+    async def _search_console_impl(
+        action: str = "sites",
+        start_date: str = "",
+        end_date: str = "",
+        row_limit: int = 10,
+        url: str = "",
+    ) -> str:
+        """Query the user's Google Search Console data. ``action``:
+          - "sites": list the sites the connected Google account can access;
+          - "query": search analytics for ``site_url`` from ``start_date`` to
+            ``end_date`` (YYYY-MM-DD, default = last 28 days), top queries;
+          - "inspect": URL Inspection check for ``url`` — index status, coverage
+            state (why a page is/isn't indexed: noindex, robots.txt block, 404,
+            soft-404, duplicate canonical, crawl errors), last crawl time.
+        Uses the Google account signed in under Settings → Auth (the same OAuth
+        client as the Gemini model). No site URL is needed — when none is set,
+        the tool lists the account's sites and picks the first one automatically.
+        Without a signed-in account this returns a setup hint instead of failing."""
+        client_id = ""
+        client_secret = ""
+        refresh = ""
+        try:
+            settings = _state_db.get_settings() or {}
+        except Exception:  # noqa: BLE001
+            settings = {}
+        # Primary source: the legacy Search Console config. New installs leave it
+        # empty and fall back to the unified google provider OAuth creds.
+        sc_cfg = settings.get("searchConsole") or {}
+        client_id = decrypt_secret(sc_cfg.get("clientId") or "")
+        client_secret = decrypt_secret(sc_cfg.get("clientSecret") or "")
+        refresh = decrypt_secret(sc_cfg.get("refreshToken") or "")
+        if not (client_id and client_secret and refresh):
+            # Fall back to the google provider's OAuth trio WHOLESALE. A client
+            # id/secret and a refresh token must come from the SAME OAuth client —
+            # mixing the legacy Search Console client with the provider's refresh
+            # token yields Google's "OAuth client was not found" 401.
+            for p in settings.get("providers") or []:
+                if isinstance(p, dict) and p.get("kind") == "google":
+                    pc_id = decrypt_secret(p.get("oauthClientId") or "")
+                    pc_secret = decrypt_secret(p.get("oauthClientSecret") or "")
+                    pc_refresh = decrypt_secret(p.get("oauthRefreshToken") or "")
+                    if pc_id and pc_secret and pc_refresh:
+                        client_id, client_secret, refresh = pc_id, pc_secret, pc_refresh
+                        sc_cfg = {**sc_cfg, "clientId": client_id, "clientSecret": client_secret, "refreshToken": refresh}
+                    break
+        if not (client_id and client_secret and refresh):
+            return "Google Search Console is not signed in — connect your Google account in Settings → Auth."
+        try:
+            token = await _providers.google_access_token(client_id, client_secret, refresh)
+        except Exception as exc:  # noqa: BLE001
+            return f"Search Console auth failed: {exc} — reconnect the Google account in Settings → Auth."
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            if action == "sites":
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.get(
+                        "https://www.googleapis.com/webmasters/v3/sites",
+                        headers=headers,
+                    )
+                data = r.json()
+                if r.status_code >= 400:
+                    return f"Search Console sites error {r.status_code}: {data.get('error', {}).get('message', r.text[:200])}"
+                rows = data.get("siteEntry") or []
+                lines = [f"- {s.get('siteUrl', '')}" for s in rows]
+                return (f"Search Console sites ({len(lines)}):\n" + "\n".join(lines)) if lines else "No sites accessible with this account."
+            if action == "query":
+                import datetime
+                import urllib.parse
+
+                today = datetime.datetime.now(datetime.timezone.utc).date()
+                try:
+                    e = datetime.date.fromisoformat(end_date) if end_date else today
+                except ValueError:
+                    return "Invalid end_date — use YYYY-MM-DD."
+                try:
+                    s = datetime.date.fromisoformat(start_date) if start_date else e - datetime.timedelta(days=27)
+                except ValueError:
+                    return "Invalid start_date — use YYYY-MM-DD."
+                site_url = (sc_cfg.get("siteUrl") or "").strip()
+                candidates: list[str] = []
+                if not site_url:
+                    # Auto-discover: list the account's sites. GSC returns them in
+                    # a non-deterministic order, so sort URL-prefix properties
+                    # (https://…) before domain properties (sc-domain:…) and try
+                    # them in order — skipping any the account can't query.
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.get("https://www.googleapis.com/webmasters/v3/sites", headers=headers)
+                    if r.status_code >= 400:
+                        data = r.json()
+                        return (
+                            f"Search Console sites error {r.status_code}: "
+                            f"{data.get('error', {}).get('message', r.text[:200])}"
+                        )
+                    rows = (r.json().get("siteEntry") or [])
+                    if not rows:
+                        return "No sites accessible with this account — add a verified property in Google Search Console first."
+                    candidates = sorted(
+                        (str(s.get("siteUrl", "")).strip() for s in rows if s.get("siteUrl")),
+                        key=lambda u: (not u.startswith("https://"), u),
+                    )
+                    if not candidates:
+                        return "Could not determine a site URL from the connected account."
+                else:
+                    candidates = [site_url]
+                body = {
+                    "startDate": s.isoformat(),
+                    "endDate": e.isoformat(),
+                    "dimensions": ["query"],
+                    "rowLimit": max(1, min(int(row_limit or 10), 25)),
+                }
+                # The GSC API expects `sites/{siteUrl}` to be URL-encoded — the
+                # value is "https://example.com/" or "sc-domain:example.com",
+                # whose `:` and `/` must be percent-encoded in the path.
+                errors: list[str] = []
+                rows: list[dict] = []
+                for site in candidates:
+                    site_url_enc = urllib.parse.quote(site, safe="")
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.post(
+                            f"https://www.googleapis.com/webmasters/v3/sites/{site_url_enc}/searchAnalytics/query",
+                            headers=headers,
+                            json=body,
+                        )
+                    if r.status_code >= 400:
+                        try:
+                            data = r.json()
+                            msg = data.get("error", {}).get("message", r.text[:200])
+                        except Exception:  # noqa: BLE001
+                            msg = r.text[:200]
+                        errors.append(f"{site}: {msg}")
+                        continue
+                    rows = r.json().get("rows") or []
+                    if rows:
+                        site_url = site
+                        break
+                if not rows and len(errors) == len(candidates):
+                    return "Search Console query error:\n" + "\n".join(errors)
+                if not rows:
+                    return f"No search analytics for {site_url} between {s} and {e}."
+                lines = []
+                for row in rows:
+                    q = (row.get("keys") or [""])[0]
+                    lines.append(
+                        f"- {q}: {row.get('clicks', 0)} clicks, {row.get('impressions', 0)} impressions, "
+                        f"CTR {round((row.get('ctr', 0) or 0) * 100, 1)}%, pos {round(row.get('position', 0) or 0, 1)}"
+                    )
+                return f"Search Console ({site_url}, {s} → {e}):\n" + "\n".join(lines)
+            if action == "inspect":
+                import urllib.parse
+
+                target_url = (url or "").strip()
+                if not target_url:
+                    return "Invalid url — the 'inspect' action needs a full page URL (e.g. https://example.com/page)."
+                site_url = (sc_cfg.get("siteUrl") or "").strip()
+                candidates: list[str] = []
+                if not site_url:
+                    # Auto-discover like the query action: list the account's
+                    # sites, preferring URL-prefix properties, and try them in
+                    # order until one accepts the inspection.
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.get("https://www.googleapis.com/webmasters/v3/sites", headers=headers)
+                    if r.status_code >= 400:
+                        data = r.json()
+                        return (
+                            f"Search Console sites error {r.status_code}: "
+                            f"{data.get('error', {}).get('message', r.text[:200])}"
+                        )
+                    rows = (r.json().get("siteEntry") or [])
+                    if not rows:
+                        return "No sites accessible with this account — add a verified property in Google Search Console first."
+                    candidates = sorted(
+                        (str(s.get("siteUrl", "")).strip() for s in rows if s.get("siteUrl")),
+                        key=lambda u: (not u.startswith("https://"), u),
+                    )
+                    if not candidates:
+                        return "Could not determine a site URL from the connected account."
+                else:
+                    candidates = [site_url]
+                errors: list[str] = []
+                for site in candidates:
+                    site_url_enc = urllib.parse.quote(site, safe="")
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.post(
+                            "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect",
+                            headers=headers,
+                            json={"inspectionUrl": target_url, "siteUrl": site},
+                        )
+                    if r.status_code >= 400:
+                        try:
+                            data = r.json()
+                            msg = data.get("error", {}).get("message", r.text[:200])
+                        except Exception:  # noqa: BLE001
+                            msg = r.text[:200]
+                        errors.append(f"{site}: {msg}")
+                        continue
+                    data = r.json()
+                    insp = data.get("inspectionResult") or {}
+                    index = insp.get("indexStatusResult") or {}
+                    verdict = insp.get("verdict", "")
+                    cov_state = index.get("coverageState", "")
+                    robots = index.get("robotsTxtState", "")
+                    indexing_state = index.get("indexingState", "")
+                    page_fetch = index.get("pageFetchState", "")
+                    last_crawl = index.get("lastCrawlTime", "") or ""
+                    # Map the coverageState codes to user-readable verdicts
+                    # (Google's enum: notInIndex, webpageWithUserTraffic,
+                    # webpageWithGoogleTraffic, webpageWithHistory, webpageInIndex,
+                    # pageWithSoft404, pageWithDuplicateWithoutUserChosenCanonical,
+                    # discoveredNotCrawled, crawledCurrentlyNotIndexed).
+                    lines = [
+                        f"URL: {target_url}",
+                        f"(site: {site})",
+                        f"verdict: {verdict}",
+                        f"coverage: {cov_state}",
+                        f"indexing: {indexing_state}",
+                        f"page fetch: {page_fetch}",
+                        f"robots.txt: {robots}",
+                    ]
+                    if last_crawl:
+                        lines.append(f"last crawl: {last_crawl}")
+                    # If the page isn't indexed, surface WHY (noindex/robots/404/
+                    # soft-404/duplicate canonical) instead of a bare enum.
+                    low_cov = cov_state.lower()
+                    low_verdict = verdict.lower()
+                    reasons: list[str] = []
+                    if "noindex" in robots.lower():
+                        reasons.append("blocked by noindex")
+                    if robots.lower() == "bloqueado" or "not crawled" in page_fetch.lower():
+                        reasons.append("robots.txt block / not crawled")
+                    if "soft404" in low_cov or "soft 404" in low_verdict:
+                        reasons.append("soft-404")
+                    if "duplicate" in low_cov and "canonical" in low_cov:
+                        reasons.append("duplicate without user-chosen canonical")
+                    if "discovered" in low_cov and "crawl" in low_cov:
+                        reasons.append("discovered but not yet crawled")
+                    if "crawled" in low_cov and "not indexed" in low_cov:
+                        reasons.append("crawled but not yet indexed")
+                    if reasons:
+                        lines.append("not-indexed reasons: " + ", ".join(reasons))
+                    return "\n".join(lines)
+                return "Search Console inspect error:\n" + "\n".join(errors)
+            return f"Unknown search_console action {action!r} — use 'sites', 'query' or 'inspect'."
+        except Exception as exc:  # noqa: BLE001
+            return f"Search Console request failed: {exc}"
+
+    async def search_console_tool(
+        action: str = "sites",
+        start_date: str = "",
+        end_date: str = "",
+        row_limit: int = 10,
+        url: str = "",
+    ) -> str:
+        """Query the user's Google Search Console data (see ``_search_console_impl``)."""
+        emit(
+            {
+                "kind": "tool",
+                "tool": "search_console",
+                "args": {
+                    "action": action,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "url": url,
+                },
+            }
+        )
+        result = await _search_console_impl(
+            action=action,
+            start_date=start_date,
+            end_date=end_date,
+            row_limit=row_limit,
+            url=url,
+        )
+        is_err = result.startswith(
+            (
+                "Google Search Console is not signed in",
+                "Search Console auth failed",
+                "Search Console sites error",
+                "Search Console query error",
+                "Search Console request failed",
+                "Invalid ",
+                "Unknown search_console",
+            )
+        )
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "search_console",
+                "summary": (result[:400] + "…") if len(result) > 400 else result,
+                "status": "error" if is_err else "done",
+            }
+        )
+        return result
 
     return {
         "request_permission": request_permission_tool,
@@ -1990,6 +3794,7 @@ def make_tool_callbacks(
         "explore": explore_tool,
         "save_plan": save_plan_tool,
         "web_search": web_search_tool,
+        "search_console": search_console_tool,
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
     }

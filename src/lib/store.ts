@@ -8,14 +8,62 @@ import type {
   McpServerConfig,
   ProviderConfig,
   ProviderKind,
+  RecentModel,
+  SearchConsoleConfig,
+  SearchPluginConfig,
+  SearchPluginKind,
   Settings,
   TokenUsage,
   Workspace,
 } from '../types'
-import { api, workspaceMcp } from './fs'
+import { api } from './fs'
+import { deleteMcp, listMcp, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
+import { encryptSettings, decryptSettings } from './secrets'
+import { PROVIDER_META } from './provider-meta'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+// Strip transient, in-memory-only fields from messages before persisting so
+// they never reappear after a restart (e.g. the rate-limit retry banner).
+function sanitizeChats(chats: Chat[]): Chat[] {
+  return chats.map((c) => ({
+    ...c,
+    messages: c.messages.map((m) => {
+      const clean = { ...m } as Record<string, unknown>
+      delete clean.retry
+      delete clean.streaming
+      delete clean.thinking
+      delete clean.toolActivity
+      return clean as unknown as ChatMessage
+    }),
+  }))
+}
+
+/** Display labels for the built-in modes (used in the mode-switch history note). */
+const MODE_LABELS: Record<string, string> = { ask: 'Ask', plan: 'Plan', coder: 'Coder' }
+
+/** Canonical display label per web-search engine kind — the label saved in a
+ *  plugin row is derived metadata, never user-edited, so stale/legacy labels
+ *  are replaced on hydration. */
+const SEARCH_PLUGIN_LABELS: Record<SearchPluginKind, string> = {
+  duckduckgo: 'DuckDuckGo',
+  tavily: 'Tavily',
+}
+
+/** Reduce an ordered plugin list to the first occurrence of each kind, keeping
+ *  the original order, so a stray duplicate (left by a migration) can't show
+ *  twice in Settings → Plugins or be tried twice by the backend. */
+function dedupeByKind(rows: SearchPluginConfig[]): SearchPluginConfig[] {
+  const seen = new Set<SearchPluginKind>()
+  const out: SearchPluginConfig[] = []
+  for (const r of rows) {
+    if (seen.has(r.kind)) continue
+    seen.add(r.kind)
+    out.push(r)
+  }
+  return out
+}
 
 /** Map legacy prompt keys from before the modes registry onto current ids. */
 function migrateModePrompts(prompts: Record<string, string>): Record<string, string> {
@@ -37,6 +85,72 @@ function persistSoon(): void {
   persistTimer = setTimeout(() => useStore.getState().persist(), 500)
 }
 
+// Flush any deferred (mid-stream) persist immediately — used on app close so
+// user-initiated saves made while streaming are not lost. ALWAYS writes the
+// full current state (not just when a timer is pending): the main process only
+// flushes its own queue after it receives the ACK, so writing unconditionally
+// guarantees every in-memory change (added provider model, subagent model,
+// …) reaches the main process before quit.
+function flushPendingPersist(): Promise<unknown> {
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = undefined
+  }
+  return writeStateNow(useStore.getState())
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    void flushPendingPersist()
+  })
+  // The main process asks the renderer to flush right before quitting, then
+  // waits for this ACK before flushing its own queue — closing the race where
+  // a write (e.g. a subagent model picked while streaming) arrived after the
+  // main flush had already run and was silently dropped.
+  api.onFlushPersist(() => {
+    flushPendingPersist()
+      .catch(() => {})
+      .finally(() => {
+        api.flushPersistDone()
+      })
+  })
+}
+
+/** Serialize the current store state to the sidecar DB (settings + chats).
+ *  Shared by the debounced `persist` (skipped while a reply is streaming) and
+ *  the force flush used on app quit. */
+// Serialize settings persistence: each writeStateNow snapshots state
+// synchronously, but encryption is async — a newer persist can overtake an older
+// one, and letting the stale snapshot win would revert the user's latest change.
+// A monotonic counter drops any snapshot that a newer writeStateNow superseded.
+let persistSeq = 0
+function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
+  const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole } = s
+  const seq = ++persistSeq
+  const memory = { taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, maxNotes: memoryMaxNotes, slidingTtl: memorySlidingTtl }
+  const writes: Promise<unknown>[] = [
+    api.storeSet('chats', sanitizeChats(chats)),
+  ]
+  // Skip persisting settings while the store still holds cold-start defaults
+  // (sidecar returned null on load, e.g. an external data volume that mounted
+  // late). Writing defaults here is exactly what clobbered the real
+  // settings.json on restart. Chats are safe to write regardless.
+  if (s.settingsHydrated) {
+    // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
+    writes.unshift(
+      (async () => {
+        const payload = await encryptSettings({ ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole } as Settings)
+        if (seq !== persistSeq) return
+        await api.storeSet('settings', payload)
+      })(),
+    )
+  }
+  const del = s.deletedChatIds
+  if (del.length) writes.push(api.storeSet('deleted_chats', del))
+  const delW = s.deletedWorkspaceRoots
+  if (delW.length) writes.push(api.storeSet('deleted_workspaces', delW))
+  return Promise.all(writes)
+}
+
 // Per-chat in-memory undo/redo stacks (not persisted). An "exchange" is a user
 // message plus every message that follows it (usually one assistant reply).
 const historyStacks = new Map<string, { undo: ChatMessage[][]; redo: ChatMessage[][] }>()
@@ -49,93 +163,112 @@ function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][
   return st
 }
 
-export const DEFAULT_MAX_HISTORY = 10
+export const DEFAULT_MAX_HISTORY = 15
 
-export const PROVIDER_NAMES: Record<ProviderKind, string> = {
-  opencode: 'opencode',
-  openrouter: 'OpenRouter',
-  ollama: 'Ollama (local)',
-  custom: 'Custom API',
-}
+export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
+  Object.values(PROVIDER_META).map((m) => [m.kind, m.name]),
+) as Record<ProviderKind, string>
 
 function defaultProviders(): ProviderConfig[] {
+  const row = (id: ProviderKind, extra: Partial<ProviderConfig> = {}): ProviderConfig => ({
+    id: id === 'ollama' ? 'local' : id,
+    name: PROVIDER_META[id].name,
+    kind: id,
+    apiKey: '',
+    envVar: PROVIDER_META[id].defaultEnvVar,
+    baseUrl: '',
+    model: '',
+    ...extra,
+  })
   return [
-    {
-      id: 'opencode',
-      name: 'opencode',
-      kind: 'opencode',
-      apiKey: '',
-      envVar: 'OPENCODE_API_KEY',
-      baseUrl: '',
-      model: 'deepseek-v4-flash-free',
-    },
-    {
-      id: 'openrouter',
-      name: 'OpenRouter',
-      kind: 'openrouter',
-      apiKey: '',
-      envVar: 'OPENROUTER_API_KEY',
-      baseUrl: '',
-      model: '',
-    },
-    {
-      id: 'ollama',
-      name: 'Ollama (local)',
-      kind: 'ollama',
-      apiKey: '',
-      envVar: '',
-      baseUrl: 'http://localhost:11434',
-      model: '',
-    },
+    row('opencode', { model: 'deepseek-v4-flash-free' }),
+    row('openrouter'),
+    row('ollama', { baseUrl: 'http://localhost:11434' }),
+    row('google'),
+    row('nvidia'),
+    row('cloudflare'),
+    row('tokenrouter'),
   ]
 }
 
 function normalizeProvider(p: ProviderConfig): ProviderConfig {
   const kind = p.kind || 'custom'
-  // The opencode gateway uses unprefixed IDs (deepseek-v4-flash-free, not
-  // opencode/deepseek-v4-flash-free) — drop the stale prefix if present.
+  // Kinds that use unprefixed model ids (opencode) — drop any stale provider
+  // prefix if present.
+  const unprefixed = PROVIDER_META[kind]?.unprefixedModelId
   let model = p.model || ''
-  if (kind === 'opencode' && model.startsWith('opencode/')) model = model.slice('opencode/'.length)
+  if (unprefixed && model.startsWith('opencode/')) model = model.slice('opencode/'.length)
   return {
-    id: p.id || 'custom',
+    // The local llama.cpp provider's id was historically 'ollama'; keep it
+    // stable by migrating any legacy rows to the canonical 'local' id.
+    id: p.id === 'ollama' ? 'local' : p.id || 'custom',
     name: p.name || PROVIDER_NAMES[kind] || 'Custom API',
     kind,
     apiKey: p.apiKey || '',
     envVar: p.envVar ?? defaultEnvVar(kind),
     baseUrl: p.baseUrl || '',
     model,
+    authType: p.authType ?? '',
+    oauthClientId: p.oauthClientId || '',
+    oauthClientSecret: p.oauthClientSecret || '',
+    oauthRefreshToken: p.oauthRefreshToken || '',
     contextWindow: p.contextWindow,
     contextMap: p.contextMap,
+    pricingMap: p.pricingMap,
     maxHistory: p.maxHistory,
     thinkingLevel: p.thinkingLevel ?? '',
-    models: Array.isArray(p.models) ? p.models.map((m) => (kind === 'opencode' ? m.replace(/^opencode\//, '') : m)) : [],
+    models: Array.isArray(p.models)
+      ? p.models.map((m) => (unprefixed ? m.replace(/^opencode\//, '') : m))
+      : [],
+    removedModels: Array.isArray(p.removedModels) ? p.removedModels : [],
   }
 }
 
 function defaultEnvVar(kind: ProviderKind): string {
-  switch (kind) {
-    case 'opencode':
-      return 'OPENCODE_API_KEY'
-    case 'openrouter':
-      return 'OPENROUTER_API_KEY'
-    default:
-      return ''
+  return PROVIDER_META[kind]?.defaultEnvVar ?? ''
+}
+
+/** Accept both the current {providerId, model} shape and legacy bare strings. */
+function normalizeRecentModels(raw: unknown): RecentModel[] {
+  if (!Array.isArray(raw)) return []
+  const out: RecentModel[] = []
+  for (const entry of raw) {
+    if (typeof entry === 'string' && entry.trim()) {
+      out.push({ providerId: '', model: entry.trim() })
+    } else if (entry && typeof entry === 'object') {
+      const e = entry as { providerId?: unknown; model?: unknown }
+      const model = typeof e.model === 'string' ? e.model.trim() : ''
+      const pid = typeof e.providerId === 'string' ? e.providerId : ''
+      if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model })
+    }
   }
+  return out.slice(0, 20)
 }
 
 interface State {
   loaded: boolean
+  /** True once the sidecar returned a non-empty settings payload on load.
+   *  While false, the store holds DEFAULTS (cold-start fallback) and must NOT
+   *  persist them — writing defaults would clobber the real settings.json on a
+   *  slow volume. */
+  settingsHydrated: boolean
   settings: Settings
+  /** Names of built-in MCP connectors (e.g. "docker") that can't be removed. */
+  builtinMcp: string[]
   root: string
   theme: 'dark' | 'light'
   dir: 'rtl' | 'ltr'
   maxHistory: number
-  recentModels: string[]
+  recentModels: RecentModel[]
   sidebarOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
   workspaces: Workspace[]
   chats: Chat[]
+  /** Chat ids deleted in the UI but not yet removed from the sidecar DB. */
+  deletedChatIds: string[]
+  /** Project roots whose workspace was deleted — their vector store is removed. */
+  deletedWorkspaceRoots: string[]
   activeChatId: string
   settingsOpen: boolean
   isStreaming: boolean
@@ -153,17 +286,20 @@ interface State {
   setActiveProvider: (id: string) => void
   setProviderModels: (id: string, models: string[]) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
+  setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number }>) => void
   removeProviderModel: (id: string, model: string) => void
   setMcpServers: (mcpServers: Record<string, McpServerConfig>) => void
   addMcpServer: (name: string, cfg: McpServerConfig) => void
   updateMcpServer: (name: string, cfg: McpServerConfig) => void
   removeMcpServer: (name: string) => void
+  setMcpEnabled: (name: string, on: boolean) => void
   setSystemPrompt: (mode: AgentMode, text: string) => void
-  /** Upsert a user-created mode def; kept separate from built-ins. */
-  upsertMode: (def: AgentModeDef) => void
+  /** Toggle auto-skill selection (RAG) in Coder mode. */
+  setAutoSkills: (on: boolean) => void
+  /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
-  setRecentModels: (recentModels: string[]) => void
-  addRecentModel: (model: string) => void
+  setRecentModels: (recentModels: RecentModel[]) => void
+  addRecentModel: (model: string, providerId?: string) => void
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
   toggleSidebar: () => void
@@ -174,6 +310,44 @@ interface State {
   setMaxHistory: (n: number) => void
   fontSize: number
   setFontSize: (n: number) => void
+  /** Directory for the per-workspace RAG vector store; "" = default. */
+  vectorDbPath: string
+  setVectorDbPath: (p: string) => void
+  /** RAG store bounds: TTL (days), max docs, max chunks. */
+  memoryTtlDays: number
+  memoryMaxDocs: number
+  memoryMaxChunks: number
+  setMemoryConfig: (c: { ttlDays?: number; maxDocs?: number; maxChunks?: number }) => void
+  /** User-level data root (app DB + skills/plans/mcp + vector stores). */
+  dataPath: string
+  setDataPath: (p: string) => void
+  /** On-device model preferences (Settings → Models). */
+  whisperModel: string
+  whisperBaseUrl: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  setWhisperModel: (m: string) => void
+  setWhisperBaseUrl: (u: string) => void
+  setEmbeddingModel: (m: string) => void
+  setEmbeddingBaseUrl: (u: string) => void
+  /** Per-subagent model overrides: explore / vision / compact. */
+  subagentModels: Record<string, string>
+  setSubagentModel: (agent: string, model: string) => void
+  /** Memory-type TTLs (configurable from Settings → Memory). */
+  taskTtlHours: number
+  shortTermTtlHours: number
+  longTermTtlHours: number
+  cacheTtlMinutes: number
+  memoryMaxNotes: number
+  memorySlidingTtl: boolean
+  setMemoryTtlConfig: (c: { task?: number; shortTerm?: number; longTerm?: number; cache?: number; maxNotes?: number; sliding?: boolean }) => void
+
+  /** Web-search engines for web_search (Settings → Plugins). */
+  searchPlugins: SearchPluginConfig[]
+  setSearchPlugins: (plugins: SearchPluginConfig[]) => void
+  /** Google Search Console OAuth + site for the search_console tool. */
+  searchConsole: SearchConsoleConfig
+  setSearchConsole: (patch: Partial<SearchConsoleConfig>) => void
 
   newChat: (mode?: AgentMode) => string
   newChatInRoot: (root: string, mode?: AgentMode) => string
@@ -190,6 +364,15 @@ interface State {
   renameChat: (id: string, title: string) => void
   addMessage: (message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
+  /** Add a model's token deltas to the chat-wide cumulative usage (survives
+   *  compacts, unlike a single message's per-turn usage). */
+  accrueChatUsage: (
+    chatId: string,
+    modelId: string,
+    delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+  ) => void
+  /** Zero the cumulative per-model usage of a chat (sidebar "reset" button). */
+  resetChatUsage: (chatId: string) => void
   markToolReverted: (messageId: string, index: number) => void
   truncateTo: (messageId: string) => boolean
   clearChat: (id: string) => void
@@ -243,18 +426,40 @@ function makeWorkspace(root: string): Workspace {
 
 export const useStore = create<State>((set, get) => ({
   loaded: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, modes: [] },
+  settingsHydrated: false,
+  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], autoSkills: false },
+  builtinMcp: [],
   root: '',
   theme: 'dark',
   dir: 'rtl',
   maxHistory: DEFAULT_MAX_HISTORY,
   fontSize: 14,
+  vectorDbPath: '',
+  memoryTtlDays: 180,
+  memoryMaxDocs: 500,
+  memoryMaxChunks: 4000,
+  whisperModel: 'Systran/faster-whisper-medium',
+  whisperBaseUrl: '',
+  embeddingModel: 'intfloat/multilingual-e5-base',
+  embeddingBaseUrl: '',
   recentModels: [],
+  subagentModels: {},
+  taskTtlHours: 6,
+  shortTermTtlHours: 24,
+  longTermTtlHours: 8760,
+  cacheTtlMinutes: 60,
+  memoryMaxNotes: 500,
+  memorySlidingTtl: true,
+  searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
+  searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
+  dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
   workspaces: [],
-  chats: [makeChat()],
+  chats: [],
+  deletedChatIds: [],
+  deletedWorkspaceRoots: [],
   activeChatId: '',
   settingsOpen: false,
   isStreaming: false,
@@ -271,17 +476,46 @@ export const useStore = create<State>((set, get) => ({
       api.storeGet<Settings>('settings'),
       api.storeGet<Chat[]>('chats'),
     ])
-    const loadedChats0 = chats && chats.length > 0 ? chats : [makeChat()]
+    // True on a genuine first run (no settings file on disk yet) — in that case
+    // the store's defaults ARE the correct state and may be persisted. On a cold
+    // start where an existing settings file is briefly unreadable (slow external
+    // volume), this stays false and the store refuses to write defaults over the
+    // real file until a refresh returns the actual settings.
+    let hasSettingsFile = false
+    try {
+      hasSettingsFile = (await api.hasSettingsFile()) ?? false
+    } catch {
+      /* treat as present — safest for the wipe guard */
+    }
+    // The authoritative data root is the pointer file in Electron (data-root.json),
+    // not whatever stale value was last persisted into the settings DB. Sync it so
+    // Settings → Memory shows where data actually lives.
+    let realDataPath = ''
+    try {
+      realDataPath = (await api.getDataPath()) ?? ''
+    } catch {
+      /* keep the persisted value */
+    }
+    const loadedChats0 = chats && chats.length > 0 ? chats : []
     const loadedChats = loadedChats0.map((c) =>
       c.mode ? { ...c, mode: normalizeMode(c.mode) } : c,
     ) as Chat[]
     const activeId = loadedChats[loadedChats.length - 1]?.id ?? ''
-    const raw = (settings ?? {}) as Partial<Settings> & { provider?: ProviderConfig }
+    // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
+    // the in-memory store always works with plaintext.
+    const raw = await decryptSettings((settings ?? {}) as Partial<Settings> & { provider?: ProviderConfig })
 
     let providers: ProviderConfig[]
     let activeProviderId = ''
     if (Array.isArray(raw.providers) && raw.providers.length > 0) {
       providers = raw.providers.map(normalizeProvider)
+      // Backfill built-in provider rows that are missing from a settings file
+      // saved by an older build (e.g. a google provider added in a newer
+      // version), so it appears in Settings without the user re-adding it.
+      const present = new Set(providers.map((p) => p.id))
+      for (const def of defaultProviders()) {
+        if (!present.has(def.id)) providers.push(def)
+      }
       activeProviderId = providers.some((p) => p.id === raw.activeProviderId)
         ? raw.activeProviderId!
         : providers[0].id
@@ -318,6 +552,9 @@ export const useStore = create<State>((set, get) => ({
         ? raw.modes.filter((m: AgentModeDef) => m && !BUILTIN_IDS.has(m.id))
         : [],
       mcpServers: raw.mcpServers ?? {},
+      mcpEnabled: Array.isArray(raw.mcpEnabled)
+        ? raw.mcpEnabled.filter((n: string) => !!raw.mcpServers?.[n])
+        : [],
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
@@ -342,23 +579,81 @@ export const useStore = create<State>((set, get) => ({
       }
     }
 
-    // Merge MCP connectors that the agent wrote to .coder/mcp.json into the UI
-    // settings so they show up in Settings → MCP (file wins, since it may hold
+    // Merge MCP connectors from the sidecar's app database into the UI
+    // settings so they show up in Settings → MCP (DB wins, since it also holds
     // agent-created connectors not in the persisted settings).
     const root = typeof raw.root === 'string' ? raw.root : ''
-    if (root) {
-      const fileMcp = await workspaceMcp(root)
-      loadedSettings.mcpServers = { ...(loadedSettings.mcpServers ?? {}), ...fileMcp }
-    }
+    const dbMcp = await listMcp()
+    const mergedMcp = { ...(loadedSettings.mcpServers ?? {}), ...(dbMcp.mcpServers ?? {}) }
+    loadedSettings.mcpServers = mergedMcp
+    const builtins = (dbMcp.builtins ?? []).filter((n) => mergedMcp[n])
+
+    // Rows for removed engines (e.g. Google Custom Search, sunset by Google) are
+    // dropped here so they disappear from Settings → Plugins on reload. Labels
+    // are canonicalized per kind (a removed engine previously coerced to
+    // `duckduckgo` left a stale "Google (Custom Search)" label behind), and
+    // duplicate kinds (the same leftover) are reduced to the first occurrence.
+    const searchPlugins = Array.isArray(raw.searchPlugins)
+      ? dedupeByKind(
+          (raw.searchPlugins as Partial<SearchPluginConfig>[])
+            .filter((p) => (['duckduckgo', 'tavily'] as const).includes(p.kind as SearchPluginConfig['kind']))
+            .map((p) => {
+              const kind = p.kind as SearchPluginConfig['kind']
+              return {
+                kind,
+                label: SEARCH_PLUGIN_LABELS[kind] || p.label || '',
+                enabled: p.enabled !== false,
+                order: typeof p.order === 'number' ? p.order : 0,
+                apiKey: p.apiKey || '',
+              }
+            }),
+        )
+      : []
 
     set({
       loaded: true,
+      // Only treat persisted settings as authoritative once the sidecar
+      // actually returned them. A cold-start where the external volume isn't
+      // mounted yet returns null here — the store stays on defaults and refuses
+      // to persist them until a refresh returns the real file. A genuine first
+      // run (no settings file at all) is fine to persist, though.
+      settingsHydrated: settings !== null || !hasSettingsFile,
       settings: loadedSettings,
+      builtinMcp: builtins,
       root,
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       maxHistory: typeof raw.maxHistory === 'number' && raw.maxHistory > 0 ? raw.maxHistory : DEFAULT_MAX_HISTORY,
       fontSize,
-      recentModels: Array.isArray(raw.recentModels) ? raw.recentModels.slice(0, 20) : [],
+      vectorDbPath: typeof raw.vectorDbPath === 'string' ? raw.vectorDbPath : '',
+      memoryTtlDays: typeof raw.memoryTtlDays === 'number' && raw.memoryTtlDays > 0 ? raw.memoryTtlDays : 180,
+      memoryMaxDocs: typeof raw.memoryMaxDocs === 'number' && raw.memoryMaxDocs >= 10 ? raw.memoryMaxDocs : 500,
+      memoryMaxChunks: typeof raw.memoryMaxChunks === 'number' && raw.memoryMaxChunks >= 50 ? raw.memoryMaxChunks : 4000,
+      dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
+      whisperModel: typeof raw.whisperModel === 'string' && raw.whisperModel.trim() ? raw.whisperModel : 'Systran/faster-whisper-medium',
+      whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
+      embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
+      embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
+      subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
+        ? { ...(raw.subagentModels as Record<string, string>) }
+        : {},
+      taskTtlHours: typeof raw.memory?.taskTtlHours === 'number' && raw.memory.taskTtlHours > 0 ? raw.memory.taskTtlHours : 6,
+      shortTermTtlHours: typeof raw.memory?.shortTermTtlHours === 'number' && raw.memory.shortTermTtlHours > 0 ? raw.memory.shortTermTtlHours : 24,
+      longTermTtlHours: typeof raw.memory?.longTermTtlHours === 'number' && raw.memory.longTermTtlHours > 0 ? raw.memory.longTermTtlHours : 8760,
+      cacheTtlMinutes: typeof raw.memory?.cacheTtlMinutes === 'number' && raw.memory.cacheTtlMinutes > 0 ? raw.memory.cacheTtlMinutes : 60,
+      memoryMaxNotes: typeof raw.memory?.maxNotes === 'number' && raw.memory.maxNotes >= 20 ? raw.memory.maxNotes : 500,
+      memorySlidingTtl: typeof raw.memory?.slidingTtl === 'boolean' ? raw.memory.slidingTtl : true,
+      // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
+      // are dropped here so they disappear from Settings → Plugins on reload.
+      searchPlugins: searchPlugins.length > 0
+        ? searchPlugins
+        : [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
+      searchConsole: {
+        clientId: typeof raw.searchConsole?.clientId === 'string' ? raw.searchConsole.clientId : '',
+        clientSecret: typeof raw.searchConsole?.clientSecret === 'string' ? raw.searchConsole.clientSecret : '',
+        refreshToken: typeof raw.searchConsole?.refreshToken === 'string' ? raw.searchConsole.refreshToken : '',
+        siteUrl: typeof raw.searchConsole?.siteUrl === 'string' ? raw.searchConsole.siteUrl : '',
+      },
+      recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
@@ -369,9 +664,16 @@ export const useStore = create<State>((set, get) => ({
   },
 
   persist: () => {
-    const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces, workspaces } = get()
-    void api.storeSet('settings', { ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces, workspaces })
-    void api.storeSet('chats', chats)
+    // Never rewrite the whole DB while a reply is streaming: each SSE token
+    // fires store updates, and persisting every one hammers coder.db / the
+    // cache file. The final state is persisted once streaming ends.
+    // BUT never DROP user-initiated saves (mode prompts, subagent models,
+    // provider config) made mid-stream: defer until streaming ends instead.
+    if (get().isStreaming) {
+      persistSoon()
+      return
+    }
+    writeStateNow(get())
   },
 
   setProviderConfig: (patch) => {
@@ -412,7 +714,7 @@ export const useStore = create<State>((set, get) => ({
       models: [],
     }
     set((s) => ({
-      settings: { ...s.settings, providers: [...s.settings.providers, provider], activeProviderId: id },
+      settings: { ...s.settings, providers: [...s.settings.providers, provider] },
     }))
     get().persist()
     return id
@@ -444,7 +746,14 @@ export const useStore = create<State>((set, get) => ({
       settings: {
         ...s.settings,
         providers: s.settings.providers.map((p) =>
-          p.id === id ? { ...p, models: Array.from(new Set(models.filter(Boolean))) } : p,
+          p.id === id
+            ? {
+                ...p,
+                models: Array.from(new Set(models.filter(Boolean))),
+                // Explicitly re-added models are no longer hidden.
+                removedModels: (p.removedModels ?? []).filter((m) => !models.includes(m)),
+              }
+            : p,
         ),
       },
     }))
@@ -461,15 +770,38 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  removeProviderModel: (id, model) => {
+  setProviderPricingMap: (id, pricingMap) => {
     set((s) => ({
       settings: {
         ...s.settings,
-        providers: s.settings.providers.map((p) =>
-          p.id === id ? { ...p, models: (p.models ?? []).filter((m) => m !== model) } : p,
-        ),
+        providers: s.settings.providers.map((p) => (p.id === id ? { ...p, pricingMap } : p)),
       },
     }))
+    get().persist()
+  },
+
+  removeProviderModel: (id, model) => {
+    set((s) => {
+      const target = s.settings.providers.find((p) => p.id === id)
+      const remaining = (target?.models ?? []).filter((m) => m !== model)
+      return {
+        settings: {
+          ...s.settings,
+          providers: s.settings.providers.map((p) =>
+            p.id === id
+              ? {
+                  ...p,
+                  models: remaining,
+                  removedModels: Array.from(new Set([...(p.removedModels ?? []), model])),
+                  // The main model is chosen in the composer, NOT here — never
+                  // rewrite `model` when a provider model is removed.
+                }
+              : p,
+          ),
+        },
+        recentModels: s.recentModels.filter((r) => !(r.providerId === id && r.model === model)),
+      }
+    })
     get().persist()
   },
 
@@ -483,6 +815,7 @@ export const useStore = create<State>((set, get) => ({
       settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
     }))
     get().persist()
+    void saveMcp(name, cfg)
   },
 
   updateMcpServer: (name, cfg) => {
@@ -490,13 +823,27 @@ export const useStore = create<State>((set, get) => ({
       settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
     }))
     get().persist()
+    void saveMcp(name, cfg)
   },
 
   removeMcpServer: (name) => {
+    if (get().builtinMcp.includes(name)) return
     set((s) => {
       const mcpServers = { ...(s.settings.mcpServers ?? {}) }
       delete mcpServers[name]
-      return { settings: { ...s.settings, mcpServers } }
+      const mcpEnabled = (s.settings.mcpEnabled ?? []).filter((n) => n !== name)
+      return { settings: { ...s.settings, mcpServers, mcpEnabled } }
+    })
+    get().persist()
+    void deleteMcp(name)
+  },
+
+  setMcpEnabled: (name, on) => {
+    set((s) => {
+      const cur = new Set(s.settings.mcpEnabled ?? [])
+      if (on) cur.add(name)
+      else cur.delete(name)
+      return { settings: { ...s.settings, mcpEnabled: [...cur] } }
     })
     get().persist()
   },
@@ -508,17 +855,6 @@ export const useStore = create<State>((set, get) => ({
         systemPrompts: { ...(s.settings.systemPrompts ?? {}), [mode]: text },
       },
     }))
-    get().persist()
-  },
-
-  upsertMode: (def) => {
-    set((s) => {
-      const modes = [...(s.settings.modes ?? [])]
-      const i = modes.findIndex((m) => m.id === def.id)
-      if (i >= 0) modes[i] = def
-      else modes.push(def)
-      return { settings: { ...s.settings, modes } }
-    })
     get().persist()
   },
 
@@ -569,6 +905,74 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  setVectorDbPath: (vectorDbPath) => {
+    set({ vectorDbPath: (vectorDbPath ?? '').trim() })
+    get().persist()
+  },
+
+  setMemoryConfig: ({ ttlDays, maxDocs, maxChunks }) => {
+    set({
+      memoryTtlDays: typeof ttlDays === 'number' && ttlDays > 0 ? Math.round(ttlDays) : get().memoryTtlDays,
+      memoryMaxDocs: typeof maxDocs === 'number' && maxDocs >= 10 ? Math.round(maxDocs) : get().memoryMaxDocs,
+      memoryMaxChunks: typeof maxChunks === 'number' && maxChunks >= 50 ? Math.round(maxChunks) : get().memoryMaxChunks,
+    })
+    get().persist()
+  },
+
+  setDataPath: (dataPath) => {
+    set({ dataPath: (dataPath ?? '').trim() })
+    get().persist()
+  },
+
+  setWhisperModel: (m) => {
+    set({ whisperModel: (m ?? '').trim() || 'Systran/faster-whisper-medium' })
+    get().persist()
+  },
+  setWhisperBaseUrl: (u) => {
+    set({ whisperBaseUrl: (u ?? '').trim() })
+    get().persist()
+  },
+  setEmbeddingModel: (m) => {
+    set({ embeddingModel: (m ?? '').trim() || 'intfloat/multilingual-e5-base' })
+    get().persist()
+  },
+  setEmbeddingBaseUrl: (u) => {
+    set({ embeddingBaseUrl: (u ?? '').trim() })
+    get().persist()
+  },
+
+  setSubagentModel: (agent, model) => {
+    set((s) => {
+      const subagentModels = { ...s.subagentModels }
+      if (model) subagentModels[agent] = model
+      else delete subagentModels[agent]
+      return { subagentModels }
+    })
+    get().persist()
+  },
+
+  setMemoryTtlConfig: (c) => {
+    set({
+      taskTtlHours: typeof c.task === 'number' && c.task > 0 ? Math.round(c.task) : get().taskTtlHours,
+      shortTermTtlHours: typeof c.shortTerm === 'number' && c.shortTerm > 0 ? Math.round(c.shortTerm) : get().shortTermTtlHours,
+      longTermTtlHours: typeof c.longTerm === 'number' && c.longTerm > 0 ? Math.round(c.longTerm) : get().longTermTtlHours,
+      cacheTtlMinutes: typeof c.cache === 'number' && c.cache > 0 ? Math.round(c.cache) : get().cacheTtlMinutes,
+      memoryMaxNotes: typeof c.maxNotes === 'number' && c.maxNotes >= 20 ? Math.round(c.maxNotes) : get().memoryMaxNotes,
+      memorySlidingTtl: typeof c.sliding === 'boolean' ? c.sliding : get().memorySlidingTtl,
+    })
+    get().persist()
+  },
+
+  setSearchPlugins: (searchPlugins) => {
+    set({ searchPlugins })
+    get().persist()
+  },
+
+  setSearchConsole: (patch) => {
+    set((s) => ({ searchConsole: { ...s.searchConsole, ...patch } }))
+    get().persist()
+  },
+
   setSidebarOpen: (sidebarOpen) => {
     set({ sidebarOpen })
     get().persist()
@@ -584,11 +988,15 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  addRecentModel: (model) => {
+  addRecentModel: (model, providerId) => {
     const m = (model || '').trim()
     if (!m) return
+    const pid = providerId || ''
     set((s) => {
-      const recentModels = [m, ...s.recentModels.filter((x) => x !== m)].slice(0, 20)
+      const recentModels = [
+        { providerId: pid, model: m },
+        ...s.recentModels.filter((x) => x.model !== m || x.providerId !== pid),
+      ].slice(0, 20)
       return { recentModels }
     })
     get().persist()
@@ -653,7 +1061,7 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
-      return { chats, activeChatId }
+      return { chats, activeChatId, deletedChatIds: [...s.deletedChatIds, id] }
     })
     get().persist()
   },
@@ -666,7 +1074,20 @@ export const useStore = create<State>((set, get) => ({
       const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
         ? s.activeChatId
         : chats[chats.length - 1]?.id ?? ''
-      return { chats, workspaces, pinnedWorkspaces, activeChatId }
+      return {
+        chats,
+        workspaces,
+        pinnedWorkspaces,
+        activeChatId,
+        deletedChatIds: [
+          ...s.deletedChatIds,
+          ...s.chats.filter((c) => workspaceKey(c.root ?? '') === key).map((c) => c.id),
+        ],
+        deletedWorkspaceRoots: [
+          ...s.deletedWorkspaceRoots,
+          ...s.chats.filter((c) => workspaceKey(c.root ?? '') === key).map((c) => c.root ?? ''),
+        ],
+      }
     })
     get().persist()
   },
@@ -699,7 +1120,21 @@ export const useStore = create<State>((set, get) => ({
 
   setChatMode: (id, mode) => {
     set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, mode, updatedAt: Date.now() } : c)),
+      chats: s.chats.map((c) => {
+        if (c.id !== id) return c
+        // Record the switch in the history so the agent sees the mode change in
+        // the conversation (not just in the system prompt) and the compact
+        // summary preserves it. System messages are always kept by sliceToBudget.
+        const label = MODE_LABELS[mode] ?? mode
+        const modeMsg: ChatMessage = {
+          id: uid(),
+          role: 'system',
+          content: `[Mode switched to ${label} — the next user message runs in ${label} mode.]`,
+          modeSwitch: true,
+          createdAt: Date.now(),
+        }
+        return { ...c, mode, messages: [...c.messages, modeMsg], updatedAt: Date.now() }
+      }),
     }))
     get().persist()
   },
@@ -718,7 +1153,6 @@ export const useStore = create<State>((set, get) => ({
         c.id === id ? { ...c, draft: { ...c.draft, ...patch } } : c,
       ),
     }))
-    persistSoon()
   },
 
   renameChat: (id, title) => {
@@ -764,7 +1198,42 @@ export const useStore = create<State>((set, get) => ({
         }
       }),
     }))
+    // updateMessage fires on every SSE token while streaming — persisting the
+    // whole chats array each time is what hammers coder.db / app-state-cache.json.
+    // Skip it during streaming; the final state is persisted once the stream ends
+    // (setStreaming(false) → the trailing updateMessage({streaming:false})).
+    if (!get().isStreaming) persistSoon()
+  },
+
+  accrueChatUsage: (chatId, modelId, delta) => {
+    if ((delta.input || 0) <= 0 && (delta.output || 0) <= 0) return
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== chatId) return c
+        const usage = { ...(c.usage ?? {}) }
+        const prev = usage[modelId] ?? { input: 0, output: 0 }
+        usage[modelId] = {
+          input: prev.input + (delta.input || 0),
+          output: prev.output + (delta.output || 0),
+          cacheRead: (prev.cacheRead ?? 0) + (delta.cacheRead ?? 0),
+          cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
+          lastUsed: Date.now(),
+        }
+        return { ...c, usage, updatedAt: Date.now() }
+      }),
+    }))
+    // Usage events fire once per completed model call (not per token), and
+    // persistSoon is debounced, so persisting here is cheap and safe.
     persistSoon()
+  },
+
+  resetChatUsage: (chatId) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === chatId ? { ...c, usage: undefined, updatedAt: Date.now() } : c,
+      ),
+    }))
+    get().persist()
   },
 
   markToolReverted: (messageId, index) => {
@@ -793,7 +1262,9 @@ export const useStore = create<State>((set, get) => ({
 
   clearChat: (id) => {
     set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, messages: [], updatedAt: Date.now() } : c)),
+      chats: s.chats.map((c) =>
+        c.id === id ? { ...c, messages: [], usage: undefined, updatedAt: Date.now() } : c,
+      ),
     }))
     get().persist()
   },
@@ -840,15 +1311,19 @@ export const useStore = create<State>((set, get) => ({
             ? { ...m, compacted: true, usage: undefined as TokenUsage | undefined }
             : { ...m, usage: undefined as TokenUsage | undefined },
         )
+        const summaryMsg = {
+          id: uid(),
+          role: 'system' as const,
+          content: summary,
+          createdAt: Date.now(),
+        }
+        // The summary is appended at the END of the message list — a "context
+        // checkpoint" sitting at the bottom of the scrollback, directly above
+        // the next user turn, rather than wedged mid-list where it reads as a
+        // duplicate bubble. The most recent messages stay verbatim above it.
         return {
           ...c,
-          messages: [
-            ...messages,
-            // Appended at the END so the summary block renders below the
-            // conversation (older folded messages above it), matching how
-            // compactions read in the scrollback.
-            { id: uid(), role: 'system', content: summary, createdAt: Date.now() },
-          ],
+          messages: [...messages, summaryMsg],
           updatedAt: Date.now(),
         }
       }),
@@ -908,11 +1383,34 @@ export const useStore = create<State>((set, get) => ({
 
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
 
+  setAutoSkills: (on) => {
+    set((s) => ({ settings: { ...s.settings, autoSkills: on } }))
+    get().persist()
+  },
+
   setActiveAbort: (activeAbort) => set({ activeAbort }),
 
   setNvimFile: (abs) => set({ nvimFile: abs }),
   setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),
 }))
+
+/**
+ * Force-persist the store NOW, ignoring the streaming guard. Called on app
+ * quit (beforeunload) so a change made while a reply was streaming — e.g. a
+ * subagent model picked in Settings, which `persist()` had deferred via
+ * persistSoon() — is never lost to a timer that never fires before the window
+ * closes. The main process then flushes its own queue on will-quit.
+ */
+export function flushStateNow(): Promise<unknown> {
+  clearTimeout(persistTimer)
+  return writeStateNow(useStore.getState())
+}
+
+// Re-fetch state when the sidecar becomes reachable (cold-start refresh) or
+// after a data-root move, so the sidebar never stays empty/stale.
+api.onSidecarChanged(() => {
+  void useStore.getState().load()
+})
 
 export function getActiveChat(): Chat | null {
   const s = useStore.getState()

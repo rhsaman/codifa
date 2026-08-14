@@ -2,46 +2,56 @@
 backend/whisper/ so voice input works fully offline.
 
 Usage:
-    uv run --project backend python scripts/download-whisper.py
+    uv run --project backend python backend/download-whisper.py
+    uv run --project backend python backend/download-whisper.py \
+        --model Systran/faster-whisper-medium --endpoint https://hf-mirror.com
+
+The same download is available from the app via Settings → Models.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import sys
 
-PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEST = os.path.join(PARENT, "backend", "whisper")
-REPO = "Systran/faster-whisper-medium"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import model_download
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download the on-device Whisper model")
-    parser.add_argument("--repo", default=REPO, help="HuggingFace repo id")
-    parser.add_argument("--dest", default=DEST, help="Destination directory")
+    parser.add_argument(
+        "--model",
+        default=model_download.WHISPER_DEFAULT_REPO,
+        help="HuggingFace repo id (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default="",
+        help="HF mirror endpoint, e.g. https://hf-mirror.com",
+    )
     args = parser.parse_args()
 
-    if os.path.isdir(args.dest) and any(
-        os.path.getsize(os.path.join(args.dest, f)) > 0
-        for f in os.listdir(args.dest)
-        if os.path.isfile(os.path.join(args.dest, f))
-    ):
-        print(f"Model already present at {args.dest} — skipping download.")
+    if model_download.whisper_ready():
+        suffix = f" ({model_download.whisper_dir()})" if args.model == model_download.WHISPER_DEFAULT_REPO else ""
+        print(f"Whisper model already present at {model_download.whisper_dir()} — skipping download{suffix}.")
         return 0
 
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:  # pragma: no cover
-        print("huggingface_hub is not installed. Run `npm run setup` first.")
+    if not model_download.start_download(model_download.KIND_WHISPER, args.model, args.endpoint):
+        print("Could not start download (empty repo id).")
         return 1
 
-    os.makedirs(args.dest, exist_ok=True)
-    print(f"Downloading {args.repo} -> {args.dest} ...")
-    snapshot_download(
-        repo_id=args.repo,
-        local_dir=args.dest,
-        local_dir_use_symlinks=False,
-    )
+    import time
+
+    print(f"Downloading {args.model} -> {model_download.whisper_dir()} ...")
+    while model_download.download_state(model_download.KIND_WHISPER):
+        state = model_download.download_state(model_download.KIND_WHISPER) or {}
+        if state.get("state") == "error":
+            print(f"Download failed: {state.get('error')}")
+            return 1
+        time.sleep(1)
     print("Done.")
     return 0
 

@@ -3,6 +3,10 @@ import { api } from './fs'
 
 let sidecarUrl: string | null = null
 
+api.onSidecarChanged(() => {
+  sidecarUrl = null
+})
+
 export async function ensureSidecar(): Promise<string | null> {
   if (sidecarUrl) return sidecarUrl
   const url = await api.getSidecarUrl()
@@ -10,9 +14,27 @@ export async function ensureSidecar(): Promise<string | null> {
   return sidecarUrl
 }
 
+export interface ModelPricing {
+  input: number
+  output: number
+}
+
+/** Query params / body fields carrying a provider's OAuth credentials. Empty for
+ *  key-based providers so the request shape is unchanged. */
+function oauthParams(cfg: ProviderConfig): Array<[string, string]> {
+  if (cfg.authType !== 'oauth') return []
+  const out: Array<[string, string]> = [['auth_type', 'oauth']]
+  if (cfg.oauthClientId) out.push(['oauth_client_id', cfg.oauthClientId])
+  if (cfg.oauthClientSecret) out.push(['oauth_client_secret', cfg.oauthClientSecret])
+  if (cfg.oauthRefreshToken) out.push(['oauth_refresh_token', cfg.oauthRefreshToken])
+  return out
+}
+
 export interface ModelsResult {
   models: string[]
   context: Record<string, number>
+  /** USD per MILLION tokens, when the provider/models.dev advertises a price. */
+  pricing: Record<string, ModelPricing>
 }
 
 /**
@@ -50,6 +72,36 @@ export async function transcribeAudio(
   }
 }
 
+/**
+ * Best-effort write of a short-term (~24h) memory note into the workspace RAG
+ * store. Used after /compact so the summary stays recallable. Resolves without
+ * throwing when the store isn't available.
+ */
+export async function addMemoryNote(
+  root: string,
+  text: string,
+  vectorDbPath?: string,
+): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url || !root || !text) return
+  try {
+    const res = await fetch(`${url}/memory/add`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        root,
+        text,
+        vector_db_path: vectorDbPath ?? '',
+        memory_type: 'short_term',
+      }),
+      signal: AbortSignal.timeout(30_000),
+    })
+    await res.json().catch(() => ({}))
+  } catch {
+    // Silent: compaction must never fail because a note couldn't be saved.
+  }
+}
+
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {  const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const params = new URLSearchParams({
@@ -58,19 +110,52 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> { 
     api_key: cfg.apiKey,
   })
   if (cfg.envVar) params.set('env_var', cfg.envVar)
+  for (const [k, v] of oauthParams(cfg)) params.set(k, v)
   const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error((body as { detail?: string }).detail || `models request failed (${res.status})`)
   }
-  const data = (await res.json()) as { models: Array<{ id: string; context: number | null }> }
+  const data = (await res.json()) as {
+    models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null }>
+  }
   const models: string[] = []
   const context: Record<string, number> = {}
+  const pricing: Record<string, ModelPricing> = {}
   for (const m of data.models ?? []) {
     models.push(m.id)
     if (m.context) context[m.id] = m.context
+    if (m.pricing) pricing[m.id] = m.pricing
   }
-  return { models, context }
+  return { models, context, pricing }
+}
+
+export interface CreditsResult {
+  balance: number
+  total_credits: number
+  total_usage: number
+}
+
+/** Fetch the provider account's remaining credit balance (OpenRouter only;
+ *  other providers return an empty object → UI shows no balance line). */
+export async function fetchCredits(cfg: ProviderConfig): Promise<Partial<CreditsResult>> {
+  const url = await ensureSidecar()
+  if (!url) return {}
+  const params = new URLSearchParams({
+    provider: cfg.kind,
+    base_url: cfg.baseUrl,
+    api_key: cfg.apiKey,
+  })
+  if (cfg.envVar) params.set('env_var', cfg.envVar)
+  for (const [k, v] of oauthParams(cfg)) params.set(k, v)
+  try {
+    const res = await fetch(`${url}/credits?${params}`, { signal: AbortSignal.timeout(15_000) })
+    if (!res.ok) return {}
+    const data = (await res.json()) as Partial<CreditsResult>
+    return data
+  } catch {
+    return {}
+  }
 }
 
 export interface StreamParams {
@@ -78,7 +163,22 @@ export interface StreamParams {
   root: string
   mode: AgentMode
   prompt: string
-  history: Array<{ role: string; content: string }>
+  /** Renderer-side chat id — the backend stores plans per chat under
+   *  <data>/plan/<workspace>/<chat-id>/plan.md. */
+  chatId?: string
+  history: Array<{
+    role: string
+    content: string
+    thinking?: string
+    plan?: Array<{ content: string; status: string }>
+    mode?: string
+    toolActivity?: Array<{
+      tool: string
+      args?: Record<string, unknown>
+      summary?: string
+      status: string
+    }>
+  }>
   /** How many recent messages to send per turn / preserve verbatim on compact. */
   maxHistory?: number
   attachments?: string[]
@@ -88,6 +188,8 @@ export interface StreamParams {
   mcpServers?: Record<string, McpServerConfig>
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
+  /** Auto-pick the most relevant skills (Coder mode) via RAG. */
+  autoSkills?: boolean
   /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
   allowCreate?: boolean
   /** Per-mode tool capabilities sent to the backend for tool gating. */
@@ -98,6 +200,12 @@ export interface StreamParams {
   nvimFile?: string
   /** LSP diagnostics for the Neovim file, so the agent can see its issues. */
   nvimDiagnostics?: NvimDiagnostic[]
+  /** Directory for the per-workspace RAG vector store ("" = backend default). */
+  vectorDbPath?: string
+  /** Size / TTL bounds for the RAG store (max_docs, max_chunks, ttl_days). */
+  vectorConfig?: { ttl_days: number; max_docs: number; max_chunks: number }
+  /** Per-subagent model overrides (explore, vision, compact). */
+  subagentModels?: Record<string, string>
   signal?: AbortSignal
 }
 
@@ -117,10 +225,15 @@ export async function streamChat(
       api_key: params.provider.apiKey,
       env_var: params.provider.envVar ?? '',
       base_url: params.provider.baseUrl,
+      auth_type: params.provider.authType ?? '',
+      oauth_client_id: params.provider.oauthClientId ?? '',
+      oauth_client_secret: params.provider.oauthClientSecret ?? '',
+      oauth_refresh_token: params.provider.oauthRefreshToken ?? '',
       model: params.provider.model,
       root: params.root,
       mode: params.mode,
       prompt: params.prompt,
+      chat_id: params.chatId ?? '',
       history: params.history,
       max_history: params.maxHistory ?? params.provider.maxHistory ?? 10,
       attachments: params.attachments ?? [],
@@ -129,11 +242,15 @@ export async function streamChat(
       thinking_level: params.thinkingLevel ?? '',
       mcp_servers: params.mcpServers ?? {},
       skills: params.skills ?? [],
+      auto_skills: params.autoSkills ?? false,
       allow_create: params.allowCreate ?? false,
       cap: params.cap ?? {},
       allow_outside: params.allowOutside ?? false,
       nvim_file: params.nvimFile ?? "",
       nvim_diagnostics: params.nvimDiagnostics ?? [],
+      vector_db_path: params.vectorDbPath ?? "",
+      vector_config: params.vectorConfig ?? null,
+      subagent_models: params.subagentModels ?? {},
       context_window: params.provider.contextWindow ?? 0,
     }),
   })
@@ -206,5 +323,253 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
     })
   } catch {
     /* best effort */
+  }
+}
+
+// ---- Managed on-device models (whisper / embedding) ---------------------- //
+
+export type ManagedModelKind = "whisper" | "embedding"
+
+export interface ModelDirInfo {
+  repo: string
+  dir: string
+  size: number
+  ready: boolean
+}
+
+export interface ModelRunState {
+  state: "downloading" | "error"
+  repo: string
+  error?: string
+}
+
+export interface ModelKindStatus {
+  dirs: ModelDirInfo[]
+  running?: ModelRunState
+}
+
+export interface ModelsStatus {
+  whisper: ModelKindStatus
+  embedding: ModelKindStatus
+}
+
+/** Kick off a background model download (Settings → Models). */
+export async function downloadModel(
+  kind: ManagedModelKind,
+  model: string,
+  baseUrl = "",
+): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  await fetch(`${url}/models/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind, model, base_url: baseUrl }),
+  })
+}
+
+/** Poll the current download state + on-disk model dirs. */
+export async function getModelsStatus(): Promise<ModelsStatus> {
+  const url = await ensureSidecar()
+  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  const res = await fetch(`${url}/models/status`)
+  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  const data = (await res.json()) as ModelsStatus
+  return {
+    whisper: data.whisper ?? { dirs: [] },
+    embedding: data.embedding ?? { dirs: [] },
+  }
+}
+
+/** Delete a downloaded model folder. */
+export async function removeModel(
+  kind: ManagedModelKind,
+  model: string,
+): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  await fetch(`${url}/models/remove`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind, model }),
+  })
+}
+
+// ---- Skills & MCP connectors (stored in the sidecar's app database) ------- //
+
+export interface SkillRow {
+  name: string
+  slug: string
+  description: string
+  path: string
+  content: string
+}
+
+export interface SkillSyncResult {
+  ok: boolean
+  name?: string
+  indexed?: boolean
+  note?: string
+  removed?: boolean
+}
+
+/** List all skills from the app database. */
+export async function listSkills(): Promise<SkillRow[]> {
+  const url = await ensureSidecar()
+  if (!url) return []
+  try {
+    const res = await fetch(`${url}/skills`)
+    if (!res.ok) return []
+    const data = (await res.json()) as { skills?: SkillRow[] }
+    return data.skills ?? []
+  } catch {
+    return []
+  }
+}
+
+/** Create/update/delete a skill in the app database (+ vector store). */
+export async function syncSkill(params: {
+  name: string
+  previousName?: string
+  content?: string
+  description?: string
+  delete?: boolean
+}): Promise<SkillSyncResult> {
+  const url = await ensureSidecar()
+  if (!url) return { ok: false, note: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/skills/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: params.name,
+        previous_name: params.previousName ?? "",
+        content: params.content ?? "",
+        description: params.description ?? "",
+        delete: params.delete ?? false,
+      }),
+    })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { ok: false, note: body.detail || `save failed (${res.status})` }
+    }
+    return (await res.json()) as SkillSyncResult
+  } catch {
+    return { ok: false, note: "could not reach the agent" }
+  }
+}
+
+/** List MCP connectors (+ builtin names) from the app database. */
+export async function listMcp(): Promise<{
+  mcpServers: Record<string, McpServerConfig>
+  builtins: string[]
+}> {
+  const url = await ensureSidecar()
+  if (!url) return { mcpServers: {}, builtins: [] }
+  try {
+    const res = await fetch(`${url}/mcp`)
+    if (!res.ok) return { mcpServers: {}, builtins: [] }
+    const data = (await res.json()) as {
+      mcpServers?: Record<string, McpServerConfig>
+      builtins?: string[]
+    }
+    return {
+      mcpServers: data.mcpServers ?? {},
+      builtins: Array.isArray(data.builtins) ? data.builtins : [],
+    }
+  } catch {
+    return { mcpServers: {}, builtins: [] }
+  }
+}
+
+/** Save an MCP connector to the app database. */
+export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, cfg }),
+    })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Remove an MCP connector from the app database. */
+export async function deleteMcp(name: string): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/mcp/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    })
+  } catch {
+    /* best effort */
+  }
+}
+
+export interface MemoryStats {
+  available: boolean
+  db: string
+  docs: number
+  chunks: number
+  kinds: Record<string, number>
+  max_docs: number
+  max_chunks: number
+  ttl_days: number
+}
+
+/** RAG store usage for a workspace (docs/chunks + active TTL/caps). */
+export async function getMemoryStats(
+  root: string,
+  vectorDbPath?: string,
+): Promise<MemoryStats> {
+  const url = await ensureSidecar()
+  const empty: MemoryStats = {
+    available: false,
+    db: "",
+    docs: 0,
+    chunks: 0,
+    kinds: {},
+    max_docs: 0,
+    max_chunks: 0,
+    ttl_days: 0,
+  }
+  if (!url || !root) return empty
+  try {
+    const qs = new URLSearchParams({ root })
+    if (vectorDbPath) qs.set("vector_db_path", vectorDbPath)
+    const res = await fetch(`${url}/memory/stats?${qs.toString()}`)
+    if (!res.ok) return empty
+    return { ...empty, ...((await res.json()) as Partial<MemoryStats>) }
+  } catch {
+    return empty
+  }
+}
+
+/** Wipe the workspace's RAG store (memory notes + saved web chunks). */
+export async function clearMemory(
+  root: string,
+  vectorDbPath?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const url = await ensureSidecar()
+  if (!url || !root) return { ok: false, error: "no active workspace" }
+  try {
+    const res = await fetch(`${url}/memory/clear`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, vector_db_path: vectorDbPath ?? "" }),
+    })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { ok: false, error: body.detail || `clear failed (${res.status})` }
+    }
+    return (await res.json()) as { ok: boolean; error?: string }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }

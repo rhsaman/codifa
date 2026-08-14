@@ -1,6 +1,13 @@
-export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom'
+export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter'
 
 export type AgentMode = string
+
+/** A recently used model, tied to the provider it was used on so it can be
+ *  re-selected unambiguously (models are shown as provider/model). */
+export interface RecentModel {
+  providerId: string
+  model: string
+}
 
 /** Per-mode tool access. Sent to the backend so tool gating is data-driven
  *  instead of hardcoded to mode names — lets anyone add custom modes. */
@@ -32,7 +39,7 @@ export type ThinkingLevel =
 /** Transport type for an MCP tool connector. */
 export type McpTransport = 'stdio' | 'http' | 'sse'
 
-/** One MCP server connector (Claude Code `.mcp.json` shape). */
+/** One MCP server connector (stored in the app database). */
 export interface McpServerConfig {
   command?: string
   args?: string[]
@@ -43,6 +50,32 @@ export interface McpServerConfig {
   type?: string
 }
 
+/** A web-search engine backend selectable in Settings → Plugins. Order decides
+ *  the primary (order 0) and the fallbacks (higher order = tried later). Add a
+ *  new engine later by adding a `SearchPluginKind` + a row in the backend
+ *  registry `SEARCH_BACKENDS`; no other code changes. */
+export type SearchPluginKind = 'duckduckgo' | 'tavily'
+
+export interface SearchPluginConfig {
+  kind: SearchPluginKind
+  label: string
+  enabled: boolean
+  /** Lower = tried first. order 0 = primary, higher = fallback. */
+  order: number
+  /** Tavily API key (duckduckgo needs none). */
+  apiKey?: string
+}
+
+/** Google Search Console integration (Settings → Plugins): OAuth client from
+ *  the Google Cloud Console + the site whose search-analytics data the
+ *  `search_console` tool queries. */
+export interface SearchConsoleConfig {
+  clientId: string
+  clientSecret: string
+  refreshToken: string
+  siteUrl: string
+}
+
 export interface ProviderConfig {
   id: string
   name: string
@@ -51,13 +84,23 @@ export interface ProviderConfig {
   envVar?: string
   baseUrl: string
   model: string
+  /** OAuth login (Google "google" kind): auth_type = "oauth" turns the provider
+   *  into a token-based connection resolved from oauthRefreshToken. */
+  authType?: string
+  oauthClientId?: string
+  oauthClientSecret?: string
+  oauthRefreshToken?: string
   contextWindow?: number
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
+  /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
+  pricingMap?: Record<string, { input: number; output: number }>
   /** Per-provider "Messages to remember" — how many recent user/assistant messages are sent each turn. */
   maxHistory?: number
   thinkingLevel?: ThinkingLevel
   models?: string[]
+  /** Models the user explicitly removed; hidden from the live /models catalog. */
+  removedModels?: string[]
 }
 
 export interface Settings {
@@ -68,13 +111,38 @@ export interface Settings {
   modes?: AgentModeDef[]
   /** MCP tool connectors (key = connector name), sent to the agent each run. */
   mcpServers?: Record<string, McpServerConfig>
+  /** MCP connector names switched on via the composer popup. Applied to every
+   *  message; defaults to none. */
+  mcpEnabled?: string[]
   fontSize?: number
   root?: string
   dir?: 'rtl' | 'ltr'
   maxHistory?: number
   compact?: boolean
-  recentModels?: string[]
+  recentModels?: RecentModel[]
   sidebarOpen?: boolean
+  /** Directory for the per-workspace RAG vector store (memory + web chunks).
+   *  Empty string = default ({dataPath}/vector-db). */
+  vectorDbPath?: string
+  /** RAG store bounds: notes/pages expire after memoryTtlDays (from last
+   *  update), capped at memoryMaxDocs docs / memoryMaxChunks chunks. */
+  memoryTtlDays?: number
+  memoryMaxDocs?: number
+  memoryMaxChunks?: number
+  /** User-level data root: app DB (coder.db), skills/plans/mcp files and the
+   *  vector store all live under this folder. Default: ~/.codefa. */
+  dataPath?: string
+  /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */
+  whisperModel?: string
+  whisperBaseUrl?: string
+  /** On-device embedding (RAG memory) model: repo id + optional mirror. */
+  embeddingModel?: string
+  embeddingBaseUrl?: string
+  /** Web-search engines for the web_search tool (Settings → Plugins). Order
+   *  decides primary vs fallback. Empty = DuckDuckGo only (backward compat). */
+  searchPlugins?: SearchPluginConfig[]
+  /** Google Search Console OAuth + site for the search_console tool. */
+  searchConsole?: SearchConsoleConfig
   /** Per-workspace accent color, keyed by workspace key (root path, "" for no project). */
   workspaceColors?: Record<string, string>
   /** Workspace keys pinned to the top of the sidebar, most-recently-pinned first. */
@@ -83,6 +151,28 @@ export interface Settings {
    *  workspace's chats does NOT remove the workspace itself). Empty workspaces
    *  still render. Order is user-controlled (drag-and-drop in the sidebar). */
   workspaces?: Workspace[]
+  /** Auto-use skills in Coder mode: pick the most relevant skills for each
+   * message via RAG. Default off. */
+  autoSkills?: boolean
+  /** Per-subagent model overrides (namespace / explorer / vision / compact).
+   *  Each key maps to a model from the active provider, or empty = use the
+   *  parent model. */
+  subagentModels?: Record<string, string>
+  /** Memory TTL / cache config — configurable from Settings → Memory. */
+  memory?: {
+    /** TASK memory lifetime in hours (default 6). */
+    taskTtlHours?: number
+    /** SHORT_TERM memory lifetime in hours (default 24). */
+    shortTermTtlHours?: number
+    /** LONG_TERM memory lifetime in hours (default 8760 = 1 year). */
+    longTermTtlHours?: number
+    /** Cache TTL for search/web/tool results in minutes (default 60). */
+    cacheTtlMinutes?: number
+    /** Max memory notes (default 500). */
+    maxNotes?: number
+    /** Whether to extend TTL on access (sliding TTL, default true). */
+    slidingTtl?: boolean
+  }
 }
 
 /** A first-class workspace in the sidebar. ``root`` is the project folder; may
@@ -96,6 +186,12 @@ export interface Workspace {
 
 export type Role = 'user' | 'assistant' | 'system' | 'tool'
 
+export interface SearchResultItem {
+  title: string
+  url: string
+  snippet?: string
+}
+
 export interface ToolActivity {
   tool: string
   args?: Record<string, unknown>
@@ -105,6 +201,10 @@ export interface ToolActivity {
   elapsedMs?: number
   startedAt?: number
   reverted?: boolean
+  /** Structured result rows (e.g. web_search hits) shown in the tool card. */
+  items?: SearchResultItem[]
+  /** Which web-search provider produced these results (e.g. 'tavily'). */
+  engine?: string
 }
 
 export interface TokenUsage {
@@ -113,6 +213,21 @@ export interface TokenUsage {
   totalTokens: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
+}
+
+/** Per-chat cumulative token usage, keyed by model id ("" = main model). These
+ *  session totals survive compacts and reloads and only ever grow, unlike a
+ *  single message's `TokenUsage` which is per-turn and cleared on compact. */
+export interface ChatUsage {
+  [modelId: string]: {
+    input: number
+    output: number
+    cacheRead?: number
+    cacheWrite?: number
+    /** Epoch ms of the last token accrual for this model — used to sort "most
+     *  recently used" first in the sidebar usage panel. */
+    lastUsed?: number
+  }
 }
 
 /** One Language-Server diagnostic reported by Neovim for the active buffer.
@@ -144,7 +259,7 @@ export interface ChatMessage {
   /** Interleaved render order (text slices + tool call positions). Absent on
    *  messages persisted before this feature; they fall back to legacy layout. */
   segments?: MessageSegment[]
-  plan?: Array<{ content: string; status: string }>
+  plan?: Array<{ id?: string; content: string; status: string }>
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
@@ -152,10 +267,11 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; model?: string; agent?: string } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
+  modeSwitch?: boolean
   createdAt: number
 }
 
@@ -174,21 +290,35 @@ export interface Chat {
   mode: AgentMode
   root?: string
   messages: ChatMessage[]
+  /** Cumulative per-model token usage for this chat (session totals). */
+  usage?: ChatUsage
   draft?: ChatDraft
   createdAt: number
   updatedAt: number
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'compact' | 'plan' | 'permission' | 'ask'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'subagent_models'
   content?: string
   tool?: string
   args?: Record<string, unknown>
   summary?: string
+  /** Tool-result status: 'error' marks a failed tool call (renders red ✗). */
+  status?: 'error' | 'done'
   diff?: string
   path?: string
+  /** Auto-selected skill names (the 'skill' event kind). */
+  skills?: string[]
+  /** Informational note on a 'skill' event with an empty skills list (why no skill was auto-applied). */
+  note?: string
+  /** Per-subagent model routing (the 'subagent_models' event kind): which model actually ran for explore/search/web/compact/vision. */
+  models?: Record<string, string>
   /** update_plan items: [{ content, status }] */
-  items?: Array<{ content: string; status: string }>
+  items?: Array<{ id?: string; content: string; status: string }>
+  /** Structured tool results (web_search hits) shown in the tool card. */
+  results?: SearchResultItem[]
+  /** Which web-search provider produced the results (e.g. 'tavily'). */
+  engine?: string
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string
@@ -202,8 +332,14 @@ export interface SidecarEvent {
   total_tokens?: number
   cache_read_tokens?: number
   cache_write_tokens?: number
+  /** Model name for per-model usage breakdown (empty = parent). */
+  model?: string
+  /** Overflow events are REJECTED (unbilled) requests — never counted in billed totals. */
+  unbilled?: boolean
   attempt?: number
   max_attempts?: number
   delay?: number
   reason?: string
+  /** Agent label for retry events (e.g. "main agent", "explore subagent") — so the user knows WHICH model to change. */
+  agent?: string
 }

@@ -1,9 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
+import { DownloadModelGate } from './components/DownloadModelGate'
+import { getModelsStatus } from './lib/api'
+import { PREFIX_KEY, PREFIX_SHORTCUTS } from './lib/shortcuts'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -15,6 +18,12 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [embeddingGate, setEmbeddingGate] = useState<'unknown' | 'ready' | 'missing'>('unknown')
+
+  // tmux-style prefix sequence (Ctrl+A then u/r/c/x). The flag lives in a ref
+  // so the window listener reads the latest state without re-subscribing.
+  const prefixActiveRef = useRef(false)
+  const prefixTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     const openSearch = () => setSearchOpen(true)
@@ -33,8 +42,82 @@ export default function App() {
     void load()
   }, [load])
 
+  // First-run "download essential model" gate: RAG memory and skill
+  // auto-selection need the on-device embedding model. Until a ready
+  // embedding build exists, the app is fully blocked behind a download
+  // page. Re-checks every few seconds so it clears automatically the
+  // moment a download finishes (and never appears once one is installed).
+  // A transient fetch failure stays 'unknown' and retries; after a few
+  // failures it falls through to the app so a sidecar hiccup never traps
+  // the user (the gate reappears on the next launch).
   useEffect(() => {
+    if (!loaded || embeddingGate === 'ready') return
+    let cancelled = false
+    let failures = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const check = () => {
+      getModelsStatus()
+        .then((st) => {
+          if (cancelled) return
+          const ready = (st.embedding?.dirs ?? []).some((d) => d.ready)
+          setEmbeddingGate(ready ? 'ready' : 'missing')
+        })
+        .catch(() => {
+          failures++
+          if (failures > 3) {
+            setEmbeddingGate('ready')
+            return
+          }
+          timer = setTimeout(check, 2500)
+        })
+    }
+    check()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [loaded, embeddingGate])
+
+  const recheckEmbedding = () => setEmbeddingGate('unknown')
+
+  useEffect(() => {
+    const cancelPrefix = () => {
+      if (!prefixActiveRef.current) return
+      prefixActiveRef.current = false
+      if (prefixTimerRef.current !== null) {
+        window.clearTimeout(prefixTimerRef.current)
+        prefixTimerRef.current = null
+      }
+      window.dispatchEvent(new CustomEvent('coder:prefix', { detail: false }))
+    }
+
     function onKey(e: KeyboardEvent) {
+      // While the prefix is armed, the very next key runs (or cancels) it.
+      if (prefixActiveRef.current) {
+        cancelPrefix()
+        const k = e.key.toLowerCase()
+        const sc = PREFIX_SHORTCUTS[k]
+        if (sc) {
+          e.preventDefault()
+          window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
+        }
+        return
+      }
+      // Arm the prefix: Ctrl+A with no other modifiers. Cmd+A (macOS select-all)
+      // still works because it sets metaKey, which we exclude here.
+      if (
+        e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === PREFIX_KEY
+      ) {
+        e.preventDefault()
+        prefixActiveRef.current = true
+        window.dispatchEvent(new CustomEvent('coder:prefix', { detail: true }))
+        prefixTimerRef.current = window.setTimeout(cancelPrefix, 2000)
+        return
+      }
       if (!(e.metaKey || e.ctrlKey)) return
       const k = e.key.toLowerCase()
       switch (k) {
@@ -78,15 +161,23 @@ export default function App() {
       }
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('blur', cancelPrefix)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('blur', cancelPrefix)
+    }
   }, [])
 
-  if (!loaded) {
+  if (!loaded || embeddingGate === 'unknown') {
     return (
       <div className="empty-state" style={{ display: 'flex', height: '100vh', alignItems: 'center' }}>
         Loading…
       </div>
     )
+  }
+
+  if (embeddingGate === 'missing') {
+    return <DownloadModelGate onReady={recheckEmbedding} />
   }
 
   return (

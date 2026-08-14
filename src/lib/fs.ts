@@ -15,6 +15,12 @@ export interface SearchMatch {
 export const api = {
   getSidecarUrl: () => window.coder.getSidecarUrl(),
   getEnv: (key: string): Promise<string | null> => window.coder.getEnv(key),
+  googleSignIn: (
+    clientId: string,
+    clientSecret: string,
+    scope?: string,
+  ): Promise<{ refreshToken: string; accessToken: string; expiresIn: number }> =>
+    window.coder.googleSignIn(clientId, clientSecret, scope),
   selectFolder: () => window.coder.selectFolder(),
   selectFile: () => window.coder.selectFile(),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => window.coder.fsList(root, rel),
@@ -38,6 +44,14 @@ export const api = {
   getPathForFile: (file: File): string => window.coder.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => window.coder.storeGet<T>(key),
   storeSet: (key: string, value: unknown): Promise<boolean> => window.coder.storeSet(key, value),
+  getDataPath: (): Promise<string> => window.coder.getDataPath(),
+  hasSettingsFile: (): Promise<boolean> => window.coder.hasSettingsFile(),
+  moveDataPath: (p: string): Promise<string> => window.coder.moveDataPath(p),
+  onSidecarChanged: (cb: () => void): (() => void) => window.coder.onSidecarChanged(cb),
+  onFlushPersist: (cb: () => void): (() => void) => window.coder.onFlushPersist(cb),
+  flushPersistDone: (): void => window.coder.flushPersistDone(),
+  onMigrateProgress: (cb: (evt: { label: string; pct: number }) => void): (() => void) =>
+    window.coder.onMigrateProgress(cb),
   getNvimFile: (): Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }> =>
     window.coder.getNvimFile() as Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }>,
   onNvimFile: (
@@ -59,46 +73,6 @@ const MAX_INDEXED = 800
 export interface WorkspaceFile {
   rel: string
   name: string
-}
-
-/** Read the user-level MCP config (`~/.coder/mcp.json`, Claude Code shape). */
-export async function workspaceMcp(
-  root: string,
-): Promise<Record<string, import('../types').McpServerConfig>> {
-  const r = await api.coderRead('mcp.json').catch(() => null)
-  if (!r) return {}
-  try {
-    const parsed = JSON.parse(r.content)
-    return parsed && typeof parsed === 'object' && 'mcpServers' in parsed
-      ? (parsed.mcpServers as Record<string, import('../types').McpServerConfig>)
-      : {}
-  } catch {
-    return {}
-  }
-}
-
-export interface WorkspaceSkill {
-  name: string
-  path: string
-  description: string
-}
-
-/** List user skills (`~/.coder/skills`) with their frontmatter name/description. */
-export async function workspaceSkills(root: string): Promise<WorkspaceSkill[]> {
-  const out: WorkspaceSkill[] = []
-  const entries = await api.coderList('skills').catch(() => [])
-  for (const e of entries) {
-    if (e.kind !== 'dir') continue
-    const rel = `skills/${e.name}/SKILL.md`
-    const r = await api.coderRead(rel).catch(() => null)
-    if (!r) continue
-    const fmMatch = /^---\n([\s\S]*?)\n---/.exec(r.content)
-    const fm = fmMatch?.[1] ?? ''
-    const name = /^name:\s*(.+)$/m.exec(fm)?.[1]?.trim() || e.name
-    const description = /^description:\s*(.+)$/m.exec(fm)?.[1]?.trim() || ''
-    out.push({ name, path: rel, description })
-  }
-  return out
 }
 
 export async function workspaceFiles(root: string): Promise<WorkspaceFile[]> {

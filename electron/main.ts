@@ -1,9 +1,12 @@
-import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, shell } from 'electron'
 import { execFile } from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
 import * as fs from 'fs'
-import { getSidecarUrl, stopSidecar } from './sidecar'
+import { getSidecarUrl, peekSidecarUrl, startSidecar, stopSidecar } from './sidecar'
+import { loadShellEnv } from './shell-env'
+import { getDataRoot, moveDataRootAsync, setDataRoot } from './store-db'
+import { registerSecretsIpc } from './secrets'
 import { buildOverlayHtml } from './captureOverlay'
 import {
   listDir,
@@ -13,7 +16,6 @@ import {
   deleteSafe,
   searchContent,
   readJsonFile,
-  writeJsonFile,
   coderDirList,
   coderDirRead,
   coderDirWrite,
@@ -22,6 +24,12 @@ import {
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
+
+// A Finder/Dock launch has no shell, so env vars exported in ~/.zshrc etc. never
+// reach the app (or the sidecar it spawns). Pull the plain `export NAME=value`
+// lines in BEFORE anything reads process.env (settings env checks, sidecar
+// spawn), so key-based providers work the same as a terminal launch.
+loadShellEnv()
 
 // The packaged app launched from Finder gets a minimal PATH
 // (`/usr/bin:/bin:/usr/sbin:/sbin`) that has no Homebrew dirs, so bare
@@ -226,6 +234,9 @@ function createWindow(): void {
 }
 
 function registerIpc(): void {
+  // --- secrets (API keys / OAuth creds encrypted at rest) -------------------
+  registerSecretsIpc()
+
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
 
@@ -240,6 +251,63 @@ function registerIpc(): void {
   ipcMain.handle('env:get', (_e, key: string) => {
     if (typeof key !== 'string' || key.length === 0 || key.length > 128 || !ENV_VAR_PATTERN.test(key)) return null
     return process.env[key] ?? null
+  })
+
+  // --- Google OAuth sign-in -------------------------------------------------
+  // Opens Google's consent page in the OS's default browser (NOT an embedded
+  // window). Google redirects to the sidecar's loopback callback URL, which the
+  // sidecar itself handles (exchanging the code and caching the tokens); the
+  // main process polls the sidecar until that result lands. Resolves with
+  // {refreshToken, accessToken, expiresIn} or rejects with the failure reason.
+  ipcMain.handle('oauth:google', async (_e, clientId: unknown, clientSecret: unknown, scope?: unknown) => {
+    const cid = typeof clientId === 'string' ? clientId.trim() : ''
+    const csec = typeof clientSecret === 'string' ? clientSecret.trim() : ''
+    if (!cid) throw new Error('missing Google OAuth client id')
+    const sidecar = await getSidecarUrl()
+    if (!sidecar) throw new Error('Python agent not ready — run `npm run setup`')
+
+    const start = await fetch(`${sidecar}/oauth/google/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: cid,
+        client_secret: csec,
+        scope: typeof scope === 'string' && scope.trim() ? scope.trim() : '',
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!start.ok) {
+      const body = await start.json().catch(() => ({}))
+      throw new Error((body as { detail?: string }).detail || `oauth start failed (${start.status})`)
+    }
+    const { url: consentUrl, state } = (await start.json()) as { url: string; state: string }
+    if (!consentUrl || !state) throw new Error('oauth start returned no url')
+
+    await shell.openExternal(consentUrl)
+
+    // Poll the sidecar for the completed exchange (the OS browser redirected
+    // there after consent). Give the user 5 minutes to approve.
+    const deadline = Date.now() + 5 * 60_000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 750))
+      const res = await fetch(`${sidecar}/oauth/google/result?state=${encodeURIComponent(state)}`, {
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => null)
+      if (!res) continue
+      const data = (await res.json().catch(() => null)) as
+        | { status: string; message?: string; refresh_token?: string; access_token?: string; expires_in?: number }
+        | null
+      if (!data || data.status === 'pending') continue
+      if (data.status === 'error') {
+        throw new Error(data.message || 'Google sign-in failed')
+      }
+      return {
+        refreshToken: data.refresh_token ?? '',
+        accessToken: data.access_token ?? '',
+        expiresIn: data.expires_in ?? 3600,
+      }
+    }
+    throw new Error('Google sign-in timed out')
   })
 
   // --- folder selection -----------------------------------------------------
@@ -289,7 +357,7 @@ function registerIpc(): void {
     return readImageDataUrl(absPath)
   })
 
-  // --- global ~/.coder config dir (skills + MCP connectors) ----------------
+  // --- global user data folder (Data path in Settings) ----------------------
   ipcMain.handle('coder:list', (_e, rel: string) => {
     return coderDirList(rel)
   })
@@ -443,20 +511,409 @@ function registerIpc(): void {
   })
 
   // --- persistence ----------------------------------------------------------
-  ipcMain.handle('store:get', (_e, key: string) => {    if (key === 'settings') return readJsonFile('settings.json', {})
-    if (key === 'chats') return readJsonFile('chats.json', [])
+  // Settings + chats/messages live in one SQLite DB owned by the Python
+  // sidecar ({data root}/coder.db, see backend/state_db.py). The renderer
+  // keeps the same store:get/store:set contract; only the backing store
+  // changes. Legacy JSON files are imported on first run and then archived —
+  // the app no longer writes them.
+  ipcMain.handle('store:get', async (_e, key: string) => {
+    const state = await loadAppState()
+    if (key === 'settings') return state.settings
+    if (key === 'chats') return state.chats
     return null
   })
   ipcMain.handle('store:set', (_e, key: string, value: unknown) => {
-    writeJsonFile(`${key}.json`, value)
-    return true
+    if (key === 'settings') {
+      queueStateWrite({ settings: value })
+      return true
+    }
+    if (key === 'chats') {
+      queueStateWrite({ chats: Array.isArray(value) ? value : [] })
+      return true
+    }
+    if (key === 'deleted_chats') {
+      queueStateWrite({ deleted_chats: Array.isArray(value) ? (value as string[]) : [] })
+      return true
+    }
+    if (key === 'deleted_workspaces') {
+      queueStateWrite({ deleted_workspaces: Array.isArray(value) ? (value as string[]) : [] })
+      return true
+    }
+    return false
   })
+
+  // --- data root (Settings → Data path) ------------------------------------
+  ipcMain.handle('data:path', () => getDataRoot())
+  // Whether a settings file already exists in the data root. Used by the
+  // renderer's settings-wipe guard: on a genuine FIRST run there is no file, so
+  // writing defaults is fine; on a cold start where the sidecar briefly can't
+  // read an existing file (slow external volume), the renderer must NOT persist
+  // its defaults over the real settings. Checks the main-process side because
+  // it may succeed even while the sidecar/volume mount is still warming up.
+  ipcMain.handle('data:has-settings', () => {
+    try {
+      return fs.existsSync(path.join(getDataRoot(), 'settings.json'))
+    } catch {
+      return false
+    }
+  })
+  ipcMain.handle('data:move', async (_e, p: string) => {
+    // Flush anything still queued so no state is lost across the move.
+    await flushStateQueue()
+    // Stop the sidecar and WAIT for it to exit so the DB's WAL is
+    // checkpointed and the files are quiescent before we copy them.
+    await stopSidecar()
+    const win = BrowserWindow.getAllWindows()[0]
+    const moved = await moveDataRootAsync(p, (label, pct) => {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('migrate:progress', { label, pct })
+      }
+    })
+    // Everything lives under one root now: point it at the new location.
+    setDataRoot(moved)
+    try {
+      await startSidecar()
+    } catch (err) {
+      throw new Error(`sidecar restart after data move failed: ${(err as Error).message}`)
+    }
+    for (const w of BrowserWindow.getAllWindows()) {
+      w.webContents.send('sidecar:changed')
+    }
+    appState = null
+    return moved
+  })
+}
+
+// --- state store (sidecar DB with legacy-JSON fallback) -------------------- //
+
+interface AppState {
+  settings: unknown
+  chats: unknown[]
+}
+
+let appState: AppState | null = null
+let pendingWrites: { settings?: unknown; chats?: unknown[]; deleted_chats?: string[]; deleted_workspaces?: string[] } = {}
+let stateFlushTimer: ReturnType<typeof setTimeout> | null = null
+let stateFlushInFlight: Promise<void> | null = null
+
+/** Read the whole app state. Relies on the sidecar DB when reachable. */
+async function loadAppState(): Promise<AppState> {
+  if (appState) return appState
+  // Bounded wait: never block the renderer's first load on a slow sidecar.
+  const url = await Promise.race([
+    getSidecarUrl().catch(() => null),
+    new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+  ])
+  if (url) {
+    try {
+      const res = await fetch(`${url}/app/state`)
+      const data = (res.ok ? await res.json() : {}) as {
+        settings?: unknown
+        chats?: unknown[]
+      }
+      const cached = readStateCache()
+      // Guard: if the sidecar returns an EMPTY state (settings: null) but a
+      // cache from a previous run exists, prefer the cache — a cold start on a
+      // slow external volume can otherwise read "no settings" and let the
+      // renderer persist defaults over the real file. The cache is refreshed by
+      // refreshAppStateLater once the sidecar returns real data.
+      const settings = data.settings ?? cached?.settings ?? null
+      const chats = Array.isArray(data.chats) && data.chats.length > 0
+        ? data.chats
+        : (cached?.chats ?? [])
+      appState = { settings, chats }
+      writeStateCache(appState)
+      return appState
+    } catch {
+      /* sidecar drop — fall through to cache/legacy */
+    }
+  }
+  // Cold start: the sidecar may still be booting. Show the last cached state
+  // (from a previous run) instead of an empty sidebar, then refresh in the
+  // background once the sidecar is reachable.
+  appState = readStateCache() ?? {
+    settings: readJsonFile('settings.json', {}),
+    chats: readJsonFile('chats.json', []),
+  }
+  void refreshAppStateLater()
+  return appState
+}
+
+/** Cache the last known app state so a cold start can show it immediately.
+ *  Async fire-and-forget: a full-state write must never block the main process
+ *  (the old writeFileSync froze the window on every debounced flush). */
+function writeStateCache(state: AppState): void {
+  try {
+    const file = path.join(getDataRoot(), 'app-state-cache.json')
+    void fs.promises.writeFile(file, JSON.stringify(state), 'utf-8')
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function readStateCache(): AppState | null {
+  try {
+    const file = path.join(getDataRoot(), 'app-state-cache.json')
+    if (!fs.existsSync(file)) return null
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8')) as {
+      settings?: unknown
+      chats?: unknown[]
+    }
+    return {
+      settings: data.settings ?? null,
+      chats: Array.isArray(data.chats) ? data.chats : [],
+    }
+  } catch {
+    return null
+  }
+}
+
+/** After a cold-start fallback, fetch the real state once the sidecar is up. */
+async function refreshAppStateLater(): Promise<void> {
+  // getSidecarUrl() waits for the sidecar to become healthy (deduped), so a
+  // single call is enough — no polling loop needed.
+  const url = await getSidecarUrl().catch(() => null)
+  if (!url) return
+  try {
+    const res = await fetch(`${url}/app/state`)
+    const data = (res.ok ? await res.json() : {}) as {
+      settings?: unknown
+      chats?: unknown[]
+    }
+    const cached = readStateCache()
+    // Same guard as loadAppState: never downgrade to an empty state (volume
+    // still warming up) when a previous run's cache has real data.
+    appState = {
+      settings: data.settings ?? cached?.settings ?? null,
+      chats: Array.isArray(data.chats) && data.chats.length > 0
+        ? data.chats
+        : (cached?.chats ?? []),
+    }
+    writeStateCache(appState)
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('sidecar:changed')
+    }
+  } catch {
+    /* sidecar still down — leave the cached state */
+  }
+}
+
+/** Merge a partial write into the pending batch and schedule a debounced flush. */
+function queueStateWrite(partial: {
+  settings?: unknown
+  chats?: unknown[]
+  deleted_chats?: string[]
+  deleted_workspaces?: string[]
+}): void {
+  if (partial.settings !== undefined) pendingWrites.settings = partial.settings
+  if (partial.chats !== undefined) pendingWrites.chats = partial.chats
+  if (partial.deleted_chats !== undefined) {
+    pendingWrites.deleted_chats = [
+      ...(pendingWrites.deleted_chats ?? []),
+      ...partial.deleted_chats,
+    ]
+  }
+  if (partial.deleted_workspaces !== undefined) {
+    pendingWrites.deleted_workspaces = [
+      ...(pendingWrites.deleted_workspaces ?? []),
+      ...partial.deleted_workspaces,
+    ]
+  }
+  if (stateFlushTimer) clearTimeout(stateFlushTimer)
+  stateFlushTimer = setTimeout(() => void flushStateQueue(), 300)
+}
+
+/** Write pending state to the sidecar DB (single atomic-ish POST). */
+async function flushStateQueue(): Promise<void> {
+  // Serialize flushes: if one is already in flight, wait for it to finish
+  // before starting the next. The backend does a FULL settings overwrite, so
+  // an older snapshot finishing after a newer one would silently revert the
+  // user's latest change (e.g. add model + set subagent models then quit).
+  // This lock guarantees newest-wins ordering.
+  if (stateFlushInFlight) {
+    await stateFlushInFlight
+    if (!pendingWrites.settings && !Array.isArray(pendingWrites.chats) && !pendingWrites.deleted_chats?.length && !pendingWrites.deleted_workspaces?.length) return
+  }
+  if (stateFlushTimer) {
+    clearTimeout(stateFlushTimer)
+    stateFlushTimer = null
+  }
+  if (!pendingWrites.settings && !Array.isArray(pendingWrites.chats) && !pendingWrites.deleted_chats?.length && !pendingWrites.deleted_workspaces?.length) return
+  const batch = pendingWrites
+  pendingWrites = {}
+  const run = (async () => {
+    // Prefer the already-running sidecar (fast path, and crucial on quit: never
+    // block shutdown on a 30s sidecar boot). Only if there is none do we try to
+    // start one. Either way, a failure below RE-ENQUEUES the batch — a settings
+    // change must never be silently dropped because the sidecar was briefly down.
+    const url = peekSidecarUrl() ?? (await getSidecarUrl().catch(() => null))
+    if (!url) {
+      reenqueueBatch(batch)
+      return
+    }
+    try {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 1500)
+      try {
+        await fetch(`${url}/app/state`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(batch),
+          signal: ctrl.signal,
+        })
+      } finally {
+        clearTimeout(t)
+      }
+      // Keep the cold-start cache fresh with the latest writes.
+      if (appState) {
+        if (batch.settings !== undefined) appState.settings = batch.settings
+        if (Array.isArray(batch.chats)) appState.chats = batch.chats
+        if (batch.deleted_chats?.length) {
+          appState.chats = (appState.chats ?? []).filter((c: any) => !batch.deleted_chats!.includes(c.id))
+        }
+        writeStateCache(appState)
+      }
+    } catch {
+      // Sidecar briefly down / request failed: keep the batch and retry after
+      // the next write. Never drop it.
+      reenqueueBatch(batch)
+    }
+  })()
+  stateFlushInFlight = run
+  try {
+    await run
+  } finally {
+    stateFlushInFlight = null
+  }
+}
+
+/** Merge a failed write batch back into the pending queue so it is retried on
+ *  the next flush instead of being silently dropped (would lose settings). */
+function reenqueueBatch(batch: {
+  settings?: unknown
+  chats?: unknown[]
+  deleted_chats?: string[]
+  deleted_workspaces?: string[]
+}): void {
+  if (batch.settings !== undefined && pendingWrites.settings === undefined) pendingWrites.settings = batch.settings
+  if (Array.isArray(batch.chats) && !Array.isArray(pendingWrites.chats)) pendingWrites.chats = batch.chats
+  if (batch.deleted_chats?.length && !pendingWrites.deleted_chats?.length) {
+    pendingWrites.deleted_chats = [...(pendingWrites.deleted_chats ?? []), ...batch.deleted_chats]
+  }
+  if (batch.deleted_workspaces?.length && !pendingWrites.deleted_workspaces?.length) {
+    pendingWrites.deleted_workspaces = [...(pendingWrites.deleted_workspaces ?? []), ...batch.deleted_workspaces]
+  }
+}
+
+/**
+ * One-time migration from the legacy JSON files to the sidecar DB. Runs before
+ * the renderer mounts so the very first load already reads from SQLite. Old
+ * JSON files are renamed to *.bak afterwards; nothing is deleted.
+ *
+ * The legacy files lived at ~/.coder (the pre-1.2 default). IMPORTANT: we only
+ * scan that true legacy path — never the ACTIVE data root. In the file-backed
+ * store the active root's settings.json/chats.json are the LIVE state written
+ * by state_db, not legacy leftovers; running this over getDataRoot() used to
+ * rename the live settings.json to settings.json.bak on every launch, which
+ * wiped the user's settings on each restart.
+ */
+async function migrateLegacyState(): Promise<void> {
+  const roots = [path.join(os.homedir(), '.coder')]
+  for (const root of roots) {
+    await migrateLegacyStateFrom(root)
+  }
+}
+
+async function migrateLegacyStateFrom(root: string): Promise<void> {
+  const settingsFile = path.join(root, 'settings.json')
+  const chatsFile = path.join(root, 'chats.json')
+  const hasSettings = fs.existsSync(settingsFile)
+  const hasChats = fs.existsSync(chatsFile)
+  if (!hasSettings && !hasChats) return
+
+  const url = await getSidecarUrl().catch(() => null)
+  if (!url) return
+  // Only import when the DB is still empty — never clobber newer data with
+  // stale JSON (e.g. a failed rename leaves the JSON behind).
+  let existing: { settings?: unknown; chats?: unknown[] } = {}
+  try {
+    const st = await fetch(`${url}/app/state`)
+    existing = st.ok ? (await st.json()) : {}
+  } catch {
+    /* treat as empty */
+  }
+  if (existing.settings != null || (Array.isArray(existing.chats) && existing.chats.length > 0)) {
+    // DB already has state — still archive the legacy files so they stop
+    // shadowing the new storage, but do not import.
+    if (hasSettings) {
+      try { fs.renameSync(settingsFile, `${settingsFile}.bak`) } catch { /* ignore */ }
+    }
+    if (hasChats) {
+      try { fs.renameSync(chatsFile, `${chatsFile}.bak`) } catch { /* ignore */ }
+    }
+    return
+  }
+  const body: { settings?: unknown; chats?: unknown[] } = {}
+  if (hasSettings) {
+    try {
+      body.settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'))
+    } catch {
+      /* corrupt legacy file → ignore */
+    }
+  }
+  if (hasChats) {
+    try {
+      body.chats = JSON.parse(fs.readFileSync(chatsFile, 'utf-8'))
+    } catch {
+      /* corrupt legacy file → ignore */
+    }
+  }
+  if (!body.settings && !Array.isArray(body.chats)) return
+
+  try {
+    const res = await fetch(`${url}/app/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (res.ok) {
+      if (hasSettings) {
+        try {
+          fs.renameSync(settingsFile, `${settingsFile}.bak`)
+        } catch {
+          /* keep the file; it is no longer read */
+        }
+      }
+      if (hasChats) {
+        try {
+          fs.renameSync(chatsFile, `${chatsFile}.bak`)
+        } catch {
+          /* keep the file; it is no longer read */
+        }
+      }
+    }
+  } catch {
+    /* sidecar not ready — the JSON stays until the next launch */
+  }
 }
 
 app.whenReady().then(async () => {
   registerIpc()
+  // Import any legacy JSON state into the SQLite DB BEFORE the renderer
+  // mounts, so the very first store:get already reads from the DB (and the
+  // sidecar is up). Bounded to ~4s so a broken/missing backend can never stall
+  // window creation; failures are non-fatal and the renderer degrades.
+  try {
+    await Promise.race([
+      migrateLegacyState(),
+      new Promise((r) => setTimeout(r, 4000)),
+    ])
+  } catch (err) {
+    console.error('legacy migration failed:', err)
+  }
   createWindow()
-  // Start the sidecar lazily; failures are surfaced in the UI, not fatal.
+  // Start the sidecar lazily (a no-op if migrateLegacyState already did);
+  // failures are surfaced in the UI, not fatal.
   getSidecarUrl().catch((err) => console.error('sidecar startup failed:', err))
   // Track the file open in Neovim (live RPC socket poll; see watchNvimFile).
   watchNvimFile()
@@ -474,6 +931,54 @@ app.on('activate', () => {
   }
 })
 
-app.on('will-quit', () => {
-  stopSidecar()
+let quitting = false
+app.on('before-quit', (e) => {
+  // Block quit until pending state writes (settings/chats) are flushed to the
+  // sidecar, so user-initiated saves made right before quitting are not lost.
+  if (quitting) return
+  e.preventDefault()
+  quitting = true
+  // Ask the renderer to flush its in-memory state (deferred mid-stream writes)
+  // into the main process's pending batch before we flush that batch. The
+  // renderer ACKs with 'flush-persist-done' once its store:set IPC has been
+  // sent, so we never flush before its writes have landed in our queue.
+  const win = BrowserWindow.getAllWindows()[0]
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('flush-persist')
+  }
+  // Give the renderer a short grace to push its writes, then flush the main
+  // queue. A hard timeout guarantees the app ALWAYS closes even if the sidecar
+  // is unresponsive (a hung fetch must never block quit).
+  const finish = () => {
+    stopSidecar()
+    app.quit()
+  }
+  const hardTimer = setTimeout(finish, 8000)
+  let flushed = false
+  const doFlush = async () => {
+    if (flushed) return
+    flushed = true
+    // Retry a few times: flushStateQueue re-enqueues on failure, but on quit
+    // there is no later flush — so a briefly-slow sidecar must not silently
+    // drop the user's settings. Each attempt has its own 1.5s fetch timeout.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await flushStateQueue().catch(() => {})
+      const stillPending =
+        pendingWrites.settings !== undefined ||
+        Array.isArray(pendingWrites.chats) ||
+        (pendingWrites.deleted_chats?.length ?? 0) > 0 ||
+        (pendingWrites.deleted_workspaces?.length ?? 0) > 0
+      if (!stillPending) break
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    clearTimeout(hardTimer)
+    finish()
+  }
+  const ackTimer = setTimeout(doFlush, 1500)
+  ipcMain.once('flush-persist-done', () => {
+    clearTimeout(ackTimer)
+    // Tiny delay so the renderer's store:set IPC lands in the main queue
+    // before we flush it.
+    setTimeout(doFlush, 100)
+  })
 })

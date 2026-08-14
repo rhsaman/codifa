@@ -1,6 +1,6 @@
 {
-  "name": "coder-ai-assistant",
-  "version": "1.1.0",
+  "name": "CodeFa",
+  "version": "1.2.0",
   "description": "Multi-provider AI coding assistant with a Pydantic AI agent sidecar, Monaco editor and file explorer.",
   "author": {
     "name": "coder",
@@ -11,7 +11,6 @@
   "type": "module",
   "scripts": {
     "setup": "uv sync --project backend",
-    "setup:voice": "uv run --project backend python backend/download-whisper.py",
     "dev": "vite",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "npm run typecheck && vite build",
@@ -66,7 +65,9 @@
         "filter": [
           "**/*",
           "!**/__pycache__/**",
-          "!**/.venv/**"
+          "!**/.venv/**",
+          "!**/whisper/**",
+          "!**/models--*/**"
         ]
       }
     ],

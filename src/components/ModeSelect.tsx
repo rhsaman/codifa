@@ -22,7 +22,7 @@ export function ModeSelect({
         type="button"
         className={iconOnly ? "icon-btn mode-btn" : "mode-select-current"}
         onClick={() => setOpen((o) => !o)}
-        title={`${current.label} — applies to this chat only (⌘M cycles modes)`}
+        title={`${current.label} — applies to this chat only (Tab / ⌘M cycles modes)`}
       >
         {!iconOnly && (
           <span className="mode-select-icon"><ModeIcon icon={current.icon} /></span>

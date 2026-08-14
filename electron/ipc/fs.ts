@@ -1,6 +1,6 @@
 import * as fs from 'fs'
-import * as os from 'os'
 import * as path from 'path'
+import { getDataRoot } from '../store-db'
 
 /**
  * Resolve a renderer-supplied relative path against a project ROOT, rejecting
@@ -15,7 +15,7 @@ export function resolveSafe(root: string, relPath: string): string {
   if (!rel) return rootReal
   const candidate = path.join(rootReal, rel)
   // Walk up to the nearest EXISTING ancestor (the target itself may not exist
-  // yet) and resolve THAT, so a brand-new nested path (e.g. .coder/skills/x)
+  // yet) and resolve THAT, so a brand-new nested path (e.g. .codefa/skills/x)
   // can be created without the intermediate directories existing. If that
   // ancestor is a symlink, realpathSync resolves its target and the containment
   // check below still catches any escape out of the root.
@@ -201,25 +201,27 @@ export function baseName(relPath: string): string {
 }
 
 // --------------------------------------------------------------------------- //
-// Persistence: settings + chats stored in ~/.coder/
+// Persistence: settings + chats stored in the sidecar SQLite DB under the
+// configurable data root (default ~/.codefa). Skills/MCP files also resolve
+// against that same root.
 // --------------------------------------------------------------------------- //
 
 function dataDir(): string {
-  const dir = path.join(os.homedir(), '.coder')
+  const dir = getDataRoot()
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
   return dir
 }
 
-/** Resolve a renderer-supplied relative path against ~/.coder, rejecting any
- *  attempt to escape it. The target may not exist yet (new skills/mcp files). */
+/** Resolve a renderer-supplied relative path against the data root, rejecting
+ *  any attempt to escape it. The target may not exist yet (new skills/mcp files). */
 function resolveCoderSafe(relPath: string): string {
-  const base = path.join(os.homedir(), '.coder')
+  const base = getDataRoot()
   const rel = relPath.replace(/\\/g, '/').trim().replace(/^\/+/, '')
   if (!rel) return base
   const candidate = path.resolve(base, rel)
   const resolved = fs.existsSync(candidate) ? fs.realpathSync(candidate) : candidate
   if (resolved !== base && !resolved.startsWith(base + path.sep)) {
-    throw new Error('path escapes ~/.coder')
+    throw new Error('path escapes the data root')
   }
   return resolved
 }

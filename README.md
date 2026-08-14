@@ -1,126 +1,75 @@
-# Codefa
+<div align="center">
 
-> English description below — توضیحات فارسی در ادامه آمده است.
+# 💻 Codefa
 
----
+**The offline-first AI coding assistant for your own machine.**
 
-## What is Codefa? / کدفا چیست؟
+Codefa is a desktop IDE-style workspace — file explorer, Monaco editor and a
+streaming AI chat — powered by a real **agent** that reads, searches and edits
+your code *itself*, confined to the folder you choose. Bring your own model:
+OpenRouter, any OpenAI-compatible API, or a fully local endpoint. Type, or just
+talk (local Whisper). Nothing leaves your machine unless you want it to.
 
-**English —** Codefa is an **offline-first desktop coding assistant** built with
-Electron. It gives you a full IDE-style workspace — a file explorer, a Monaco
-editor and an AI chat panel — with an **AI agent (built on Pydantic AI) that
-actually works inside your project**: it can open files, read them, search across
-them and edit them *itself*, all confined to the folder you choose. You can talk
-to it by typing *or* by voice (local whisper), and it streams its reasoning and
-code changes in real time. It connects to your own models (OpenRouter, any
-OpenAI-compatible API, or a local Ollama / llama.cpp / vLLM endpoint), so nothing
-leaves your machine unless you want it to.
+کدفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری تمام‌عیار با کاوشگر فایل،
+ویرایشگر کد و چتِ هوش مصنوعیِ زنده. در قلب آن یک **عامل واقعی** نشسته که
+فایل‌های شما را خودش می‌خواند، جستجو و ویرایش می‌کند — و همه‌چیز فقط در همان
+پوشه‌ای که انتخاب کرده‌اید. مدل‌تان را خودتان بیاورید: OpenRouter، هر API سازگار
+با OpenAI یا یک مدل کاملاً محلی. تایپ کنید یا حرف بزنید (Whisper محلی). مگر
+اینکه خودتان بخواهید، هیچ‌چیز از دستگاه شما بیرون نمی‌رود.
 
-**فارسی —** کدفا یک دستیار کدنویسی دسکتاپی است که بر پایهٔ Electron و با نگاهی
-ویژه به آفلاین بودن ساخته شده است؛ یعنی هر کاری که انجام می‌دهد، روی خودِ دستگاه
-شما می‌ماند، مگر آنکه خودتان بخواهید چیزی به بیرون ارسال شود. چیزی که کدفا را از
-یک چت‌بات ساده جدا می‌کند، «عامل» باهوشی است که در دل آن نشسته و بر بستر
-Pydantic AI کار می‌کند. این عامل صرفاً به شما پاسخ نمی‌دهد؛ بلکه به‌راستی وارد
-پروژهٔ شما می‌شود و درست مانند یک همکار مهندس، فایل‌ها را باز می‌کند، مضمونشان را
-می‌خواند، در میانشان جستجو می‌کند و حتی خودش آن‌ها را ویرایش می‌کند — و تمام این
-دست‌وپا زدن‌ها هم محدود به همان پوشه‌ای است که شما برگزیده‌اید. کار با آن
-ساده است: یا متن بنویسید، یا به‌راستی با آن حرف بزنید و بگذارید صدایتان (با
-تبدیل گفتار به متنِ محلی) به پیام بدل شود، و جوابش را پاره‌گفتارپاره‌گفتار و
-زنده ببینید. چون هر فراهم‌کننده‌ای که دوست دارید به آن وصل می‌شود — از
-OpenRouter تا هر APIِ سازگار با OpenAI و حتی یک سرور محلی مانند Ollama یا
-llama.cpp — بیشترِ کارها بر بستر و داده‌های خودِ شما انجام می‌شود.
+[English](#english-english) · [فارسی](#persian-فارسی)
+
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Electron](https://img.shields.io/badge/Electron-31-47848F?logo=electron&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![Pydantic AI](https://img.shields.io/badge/Pydantic%20AI-v1-8A2BE2)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+
+</div>
 
 ---
 
-## Feature overview — نمای کلی ویژگی‌ها
+## English / English
 
-**English**
+<details open>
+<summary><b>📖 English — click for the full documentation</b></summary>
 
-- 🔌 **Bring your own model** — OpenRouter, any OpenAI-compatible API, or a fully
-  local endpoint; switch models from the UI.
-- 🤖 **Real agent, not glorified autocomplete** — reads, searches, writes and
-  edits your files inside a sandboxed project folder, including MCP connectors.
-- 🎤 **Voice input** — hold a button, speak in Persian/English, get text (local whisper).
-- 📊 **Live context meter** — see exactly how much of the model's context you've used.
-- 🛟 **Never-stuck agent** — gracefully auto-compacts history on small context windows.
-- 🖥️ **Full IDE UI** — file explorer, Monaco editor, markdown chat, dark/light theme.
-- 🔒 **Safe by design** — every read/write/search confined to your chosen folder.
-- 🔁 **Streaming + persistence** — token-by-token SSE, history kept in `~/.coder/`.
+### ✨ Features
 
-**فارسی**
+| | Feature | Description |
+|---|---|---|
+| 🔌 | **Bring your own model** | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI. |
+| 🤖 | **A real agent, not autocomplete** | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Cycle with `Cmd/Ctrl+M`. |
+| 🛠️ | **Tool-based agent** | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
+| 🎤 | **Voice input** | Hold the mic, speak in Persian or English, get text. Transcription runs on a fully local, offline Whisper model (installed from **Settings → Models**); a live "wave" equalizer animates while recording. |
+| 🧠 | **On-device models** | Manage downloadable models from the UI: Whisper for voice and an embedding model for RAG memory — fully offline. |
+| 📊 | **Live context meter** | The context-usage bar updates in real time using the provider's exact per-request token counts, not an estimate. |
+| 🛟 | **Graceful small-context handling** | Works smoothly even on small 8K local models — history is compacted automatically before context runs out, so the agent keeps going instead of crashing. |
+| 🖥️ | **Full IDE UI** | Resizable file explorer (left), Monaco editor (center), streaming markdown chat with syntax highlighting (right), dark/light theme. |
+| 🌐 | **RTL / LTR** | Persian and English mix correctly in chat — parentheses and arrows are never mirrored, and markdown (bold, headings, lists, tables) still renders properly in RTL. The whole UI and this README support both directions. |
+| 💾 | **Durable storage** | Settings, chat history, skills, connectors and plans are saved safely and never written inside your project. |
+| 🗂️ | **RAG memory** | Notes you ask the agent to remember and saved web pages are embedded and searchable per project — fully offline. |
+| 🔁 | **Streaming + persistence** | Token-by-token streaming replies; multiple parallel chats. |
+| ⌨️ | **Slash commands** | `/compact` (summarize into a running summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`. |
 
-- 🔌 **مدل‌تان را بیاورید** — به همین فراهم‌کننده‌ای که خودتان انتخاب می‌کنید وصل می‌شود: OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی؛ و تعویض مدل از خودِ رابط کاربری.
-- 🤖 **هدف حقیقی، نه تکمیل خودکار** — فایل‌هایتان را می‌خواند، جستجو و ویرایش می‌کند و به دل پروژهٔ ایزولهٔ شما می‌رود؛ و از اتصال‌های MCP هم پشتیبانی می‌کند.
-- 🎤 **ورودی صوتی** — دکمه را می‌فشارید، به فارسی یا انگلیسی حرف می‌زنید و متنش همان‌جا آماده می‌شود.
-- 📊 **نوار بافتِ زنده** — می‌بینید دقیقاً چه اندازه از پنجرهٔ بافتِ مدل را مصرف کرده‌اید.
-- 🛡️ **فشردن ناگهانی ندارد** — در پنجرهٔ بافتِ کوچک، تاریخچه به‌شکلی هوشمند و خودکار فشرده می‌شود تا کار نصفه رها نشود.
-- 🖥️ **رابطی به بلندِ یک IDE** — کاوشگر فایل، ویرایشگر و چت، همراه با تم تیره و روشن.
-- 🔒 **امنیت از پایه** — هر خواندن، نوشتن یا جستجو فقط در همان پوشهٔ انتخابی شما انجام می‌شود.
-- 🔁 **استریم و ماندگاری** — پاسخ‌ها قطعه‌به‌قطعه می‌رسند و بایگانی گفتگوها در `~/.coder/` نگه داشته می‌شود.
+### 📦 Requirements
 
----
-
-## English
-
-### Features
-
-- **Multi-provider LLM** — OpenRouter, any OpenAI-compatible API (llama.cpp / vLLM),
-  and local Ollama — all driven through Pydantic AI.
-- **Dynamic model switching** — models are fetched from the active provider and
-  selectable directly from the UI settings.
-- **Three agent modes** — `Ask` (read-only mentor that teaches you step by step),
-  `Plan` (read-only planner that scouts the code and writes an implementation
-  plan) and `Coder` (autonomous code-writing agent). Cycle through them at the
-  top of the chat panel or with `Cmd/Ctrl+M`.
-- **Tool-based agent** — `search_in_files`, `list_files`, `write_file`,
-  `edit_file`, plus MCP connectors, all executed by the Pydantic AI sidecar
-  and constrained to the project root.
-- **Safe file access** — pick a project folder; every read/write/search is
-  confined to it (path-traversal and symlink-escape guards in both Electron IPC
-  and Python).
-- **Voice input** — a push (mic) button records your voice and transcribes it with a
-  fully local, offline `faster-whisper` model once installed; the text is then
-  inserted into the composer. While recording, the mic icon animates into a
-  live "wave" equalizer (Claude Code style).
-- **Live context meter** — the context-usage bar updates in real time during
-  long tool loops, using the provider's exact per-request token counts instead
-  of an estimate.
-- **Graceful small-context handling** — when the model's context window is small
-  (e.g. an 8192-token local model) the agent pre-emptively compacts history at 80%
-  of the window and auto-compacts on overflow, so the agent keeps working instead
-  of crashing.
-- **UI** — resizable file explorer (left), Monaco editor (center), streaming AI
-  chat with markdown + syntax highlighting (right).
-- **RTL / LTR** — chat messages use `direction: auto; unicode-bidi: plaintext` so
-  Persian and English mix correctly; the whole README and UI support both.
-- **Streaming** — token-by-token SSE streaming from the sidecar, no terminal output.
-- **Persistence** — provider config, chat history, skills, MCP connectors and
-  saved plans all stored in `~/.coder/` — never inside your project.
-- **Slash commands** — `/compact` (summarizes the conversation into a running
-  summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`.
-- **Bonus** — model caching, multiple chats, dark/light theme, keyboard shortcuts.
-
-### Requirements
-
-- Node.js >= 20 and npm
+- Node.js ≥ 20 and npm
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
-- Python >= 3.10 (managed by uv)
+- Python ≥ 3.10 (managed by uv)
 
-### Setup
+### 🚀 Setup
 
 ```bash
-npm install       # JS dependencies
+npm install       # JavaScript dependencies
 npm run setup     # creates backend/.venv and installs pydantic-ai, fastapi, uvicorn
 ```
 
-Voice input uses a fully local `faster-whisper` model (see `backend/whisper/`).
-If it is missing, install it once with:
+Voice and RAG-memory models are optional. Install them from the app's
+**Settings → Models** tab (fully offline once downloaded).
 
-```bash
-npm run setup:voice     # downloads the CTranslate2 "small" model into backend/whisper/
-```
-
-### Development
+### 🧑‍💻 Development
 
 ```bash
 npm run dev
@@ -128,228 +77,235 @@ npm run dev
 
 Opens the Electron window with a hot-reloading renderer. The Python sidecar
 (FastAPI + Pydantic AI) is auto-spawned on an ephemeral localhost port. When
-launched from the packaged `.app`, Codefa also merges the GUI PATH with your login
-shell path so tools such as `docker` (used by MCP stdio connectors) are found.
+launched from the packaged `.app`, Codefa also merges the GUI PATH with your
+login-shell path so tools like `docker` (used by MCP stdio connectors) are found.
 
-### Building / packaging
+### 🏗️ Building / packaging
 
 ```bash
 npm run build       # typecheck + build renderer, main and preload
-npm run dist        # package for the current OS (dmg/zip on mac, NSIS exe on win, AppImage on linux)
-npm run dist:mac    # only macOS
-npm run dist:win    # only Windows
-npm run dist:linux  # only Linux
+npm run dist        # package for the current OS
+npm run dist:mac    # only macOS (dmg / zip)
+npm run dist:win    # only Windows (NSIS)
+npm run dist:linux  # only Linux (AppImage)
 ```
 
 Output lands in `release/`.
 
-**macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
-notarized), so the first launch from Finder may show
-*“CODEFA has been blocked because it may reduce your privacy and lower the
-security of your Mac.”* This is expected for locally-built apps without a
-Developer ID. Fix: right-click the app → **Open** → **Open** once. If you
-copied it from a download, also clear the quarantine flag:
+> **macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
+> notarized), so the first launch from Finder may show *"CODEFA has been blocked
+> because it may reduce your privacy…"*. This is expected for locally-built apps.
+> Fix: right-click the app → **Open** → **Open**. If copied from a download,
+> also clear the quarantine flag:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /path/to/CODEFA.app
+> ```
 
-```bash
-xattr -dr com.apple.quarantine /path/to/CODEFA.app
-```
-
-(Removing the warning for every user requires a paid Apple Developer account
-and notarization.)
-
-### Usage
+### 🖱️ Usage
 
 1. Click **Open Folder** (or `Cmd/Ctrl+O`) and select your project root.
-2. Open settings (`Cmd/Ctrl+,`). The default provider is **opencode**
-   (`opencode/deepseek-v4-flash-free` via OpenRouter). You can switch to
-   OpenRouter, a custom OpenAI-compatible API, or a local endpoint
-   (Ollama / llama.cpp / vLLM), enter your API key / base URL, and pick a model.
+2. Open settings (`Cmd/Ctrl+,`). Pick OpenRouter, a custom OpenAI-compatible
+   API, or a local endpoint (Ollama / llama.cpp / vLLM); enter your API key /
+   base URL and choose a model.
 3. Choose an agent mode: **Ask**, **Plan** or **Coder**.
-4. Type a message and press `Cmd/Ctrl+Enter`. The agent streams its reply and
-   uses sandboxed tools to inspect or modify files. Press the mic button to
-   dictate instead of typing. In Plan mode, `/compact` saves a running summary,
-   and the final plan is stored under `~/.coder/plans/<workspace>/`.
+4. Type a message and press `Cmd/Ctrl+Enter` (or use the mic button). The agent
+   streams its reply and uses its tools to inspect or modify files — always
+   confined to the folder you opened. In **Plan** mode the finished plan is saved
+   for that project and auto-loaded on your next Plan/Coder run. If you ask the
+   agent to install skills or MCP connectors (from a repo, a docs page, etc.),
+   it saves them into the app itself — it never writes files into other tools'
+   config folders, even if the source's instructions say so.
 
-### Keyboard shortcuts
+> 💡 The app **Data path** is configurable. Its default is `~/.codefa` on every
+> OS: `~/.codefa` (macOS), `/home/<user>/.codefa` (Linux) and
+> `C:\Users\<user>\.codefa` (Windows). Changing it moves your data to the new
+> folder, keeping a backup of the old one — all from **Settings → Memory**.
 
-| Shortcut         | Action                                             |
-| ---------------- | -------------------------------------------------- |
-| `Cmd/Ctrl+Enter` | Send chat message                                  |
-| `Cmd/Ctrl+M`     | Cycle agent mode (Ask / Plan / Coder)             |
-| `Cmd/Ctrl+P`     | Quick-open / search overlay (⌘⇧F for content grep) |
-| `Cmd/Ctrl+B`     | Toggle sidebar                                     |
-| `Cmd/Ctrl+,`     | Open settings                                      |
-| `Cmd/Ctrl+S`     | Save current file                                  |
-| `Cmd/Ctrl+T`     | New chat                                           |
+### ⌨️ Keyboard shortcuts
 
-### Architecture
+| Shortcut         | Action                                        |
+| ---------------- | --------------------------------------------- |
+| `Cmd/Ctrl+Enter` | Send chat message                             |
+| `Cmd/Ctrl+M`     | Cycle agent mode (Ask / Plan / Coder)         |
+| `Cmd/Ctrl+P`     | Quick-open / search overlay (`⌘⇧F` = content grep) |
+| `Cmd/Ctrl+B`     | Toggle sidebar                                |
+| `Cmd/Ctrl+,`     | Open settings                                 |
+| `Cmd/Ctrl+S`     | Save current file                             |
+| `Cmd/Ctrl+T`     | New chat                                      |
+| `Ctrl+A` then `u` | Undo last exchange (tmux-style prefix)       |
+| `Ctrl+A` then `r` | Redo last undone exchange (tmux-style prefix) |
+| `Ctrl+A` then `c` | Compact the chat context (tmux-style prefix)  |
+| `Ctrl+A` then `x` | Clear this chat's messages (tmux-style prefix) |
+
+### 🏛️ Architecture
 
 ```
-┌──────────────── Electron ────────────────┐
-│ main.ts   window, sidecar spawn, fs IPC, │
-│           config + chat persistence      │
-│ preload.ts contextBridge (whitelisted)   │
-│ renderer  React + Monaco + chat (SSE)    │
-└─────┬──────────────────▲─────────────────┘
-      │ spawn / stdio     │ HTTP + SSE (127.0.0.1)
-┌─────▼──────────────────┴─────────────────┐
-│ Python sidecar  (uv managed .venv)        │
-│ server.py     FastAPI /health /models    │
-│               /chat/stream (SSE) /fs     │
-│               /transcribe (Whisper)      │
-│ providers.py  → pydantic-ai OpenAIModel  │
-│ tools.py      sandboxed fs tools         │
-│ agents.py     Ask / Plan / Coder agents   │
-│               (live usage + compact)     │
-└───────────────────────────────────────────┘
+┌──────────────────────────── Electron ────────────────────────────┐
+│ main.ts      window, sidecar spawn, fs IPC,                       │
+│              config + chat persistence (SQLite)                   │
+│ preload.ts   contextBridge (whitelisted API)                      │
+│ renderer     React + Monaco + chat (SSE)                          │
+└──────────────┬─────────────────────────▲──────────────────────────┘
+               │ spawn / stdio           │ HTTP + SSE (127.0.0.1)
+┌──────────────▼─────────────────────────┴──────────────────────────┐
+│ Python sidecar  (uv-managed .venv)                                │
+│ server.py      FastAPI  /health  /models                          │
+│                /chat/stream (SSE)  /fs  /transcribe (Whisper)     │
+│                /app/state (SQLite settings + chats)               │
+│ providers.py   → pydantic-ai OpenAIModel                          │
+│ tools.py       sandboxed fs tools + memory + MCP                  │
+│ agents.py      Ask / Plan / Coder agents                          │
+│                (live usage + compact + RAG memory)                │
+└───────────────────────────────────────────────────────────────────┘
 ```
+
+</details>
+
+---
 
 ## Persian / فارسی
 
-### کدفا چیست؟
+<details>
+<summary><b>📖 فارسی — برای مشاهدهٔ مستندات کامل کلیک کنید</b></summary>
 
-کدفا یک دستیار کدنویسی دسکتاپی است که بر پایهٔ Electron ساخته شده و در نگاه
-اول، همان حسی را دارد که یک ویرایشگر کد مدرن می‌دهد: کاوشگری برای فایل‌ها،
-ویرایشگری توانمند و یک پنل گفتگو که در کنار شما کار می‌کند. اما تفاوت اصلی در
-همان «پنل گفتگو» است؛ پشت این گفتگو، یک عامل هوش مصنوعی واقعی نشسته که بر بستر
-Pydantic AI ساخته شده و می‌تواند مستقیماً با کد شما سر و کار داشته باشد. این
-عامل فقط حرف نمی‌زند؛ فایل‌های پروژهٔ شما را می‌خواند، در آن‌ها جستجو می‌کند و
-خودش آن‌ها را تغییر می‌دهد — آن هم تنها در چارچوب همان پوشه‌ای که برایش مشخص
-کرده‌اید. به همین دلیل هم کدفا به هر فراهم‌کننده‌ای وصل می‌شود که خودتان بخواهید،
-هم به سرویس‌های ابری مانند OpenRouter، هم به هر APIِ سازگار با OpenAI و هم به
-مدل‌های محلی مثل Ollama و llama.cpp؛ تا در هر حال، کار اصلی همواره روی خودِ
-دستگاه شما و در همان پروژهٔ خودتان انجام شود.
+<div dir="rtl">
 
-### امکانات
+### ✨ امکانات
 
-- **چند فراهم‌کنندهٔ هوش مصنوعی** — کدفا به OpenRouter، هر APIِ سازگار با
-  OpenAI (مانند llama.cpp یا vLLM) و نیز Ollama محلی وصل می‌شود؛ همگی از طریق
-  Pydantic AI.
-- **تعویض سادهٔ مدل** — فهرست مدل‌ها از فراهم‌کنندهٔ فعال دریافت می‌شود و
-  می‌توانید از همان صفحهٔ تنظیمات، مدل دلخواه را برگزینید.
-- **سه حالتِ عامل** — «پرسش» (دستیارِ فقط‌خواندنی که گام‌به‌گام به شما آموزش
-  می‌دهد)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و یک برنامهٔ پیاده‌سازی
-  می‌نویسد) و «نویسندهٔ کد» (عامل خودمختاری که مستقلاً کد می‌نویسد). با دکمهٔ بالای
-  پنل گفتگو یا کلید `Cmd/Ctrl+M` می‌توانید میانشان جابه‌جا شوید.
-- **عاملِ ابزارمحور** — عملیات‌هایی مانند `search_in_files`، `write_file`،
-  `list_files` و `edit_file` (و همچنین اتصال‌های MCP) همگی توسط
-  sidecar پایتونی اجرا و به ریشهٔ پروژه محدود می‌شوند.
-- **دسترسی امن به فایل‌ها** — شما پوشهٔ پروژه را مشخص می‌کنید و تمام خواندن‌ها،
-  نوشتن‌ها و جستجوها به همان پوشه محدود است؛ هم در سمت الکترون و هم در سمت
-  پایتون، در برابر مسیرهای گذر (path traversal) و فرار از symlink حفاظت شده‌اید.
-- **ورودی صوتی** — با فشردن دکمهٔ میکروفون، صدای خود را ضبط کنید؛ این صدا با
-  مدلِ کاملاً محلی و آفلاینِ `faster-whisper` به متن تبدیل و همان‌جا در کادر پیام
-  گذاشته می‌شود. هنگام ضبط هم آیکن میکروفون به صورت یک اکولایزر موجدارِ متحرک
-  (به سبک Claude Code) درمی‌آید.
-- **نوار استفادهٔ بافتِ زنده** — در طول حلقه‌های طولانیِ ابزار، میزان مصرف بافت
-  به‌طور مستقیم و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز
-  می‌شود، نه بر پایهٔ یک برآورد تقریبی.
-- **مدیریت هوشمند بافتِ کم** — اگر پنجرهٔ بافتِ مدل کوچک باشد (مثلاً مدلِ
-  ۸۱۹۲ توکنی در LM Studio)، عامل پیش از رسیدن به سقف، در ۸۰٪ ظرفیت تاریخچه را
-  فشرده می‌کند و در صورت سرریز هم به‌طور خودکار این کار را انجام می‌دهد تا به
-  جای توقف، کار همچنان پیش برود.
-- **رابط کاربری** — کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco
-  (وسط) و چتِ هوش مصنوعی با پشتیبانی از markdown و هایلایتِ سینتکس (راست).
-- **راست‌به‌چپ / چپ‌به‌راست** — پیام‌ها از `direction: auto; unicode-bidi:
-  plaintext` استفاده می‌کنند تا ترکیب فارسی و انگلیسی به‌درستی نمایش داده شود.
-- **استریم** — پاسخ‌ها به‌شکل قطعه‌به‌قطعه و از طریق SSE از sidecar می‌رسند؛
-  نیازی به نگه داشتن ترمینال نیست.
-- **ماندگاری** — پیکربندی فراهم‌کننده، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌های MCP و
-  برنامه‌های ذخیره‌شده همه در `~/.coder/` ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما.
-- **دستورهای اسلش** — `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`،
-  `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`.
-- **و چند چیز دیگر** — حافظهٔ پنهانِ مدل، چند گفتگوی موازی، تم تیره و روشن و
-  میان‌برهای صفحه‌کلید.
+|  | ویژگی | توضیح |
+|---|---|---|
+| 🔌 | **مدل‌تان را خودتان بیاورید** | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است. |
+| 🤖 | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Cmd/Ctrl+M` میان‌شان بچرخید. |
+| 🛠️ | **عاملِ ابزارمحور** | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
+| 🎤 | **ورودی صوتی** | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا با مدلِ کاملاً محلی و آفلاینِ Whisper به متن تبدیل می‌شود (از تب **تنظیمات ← مدل‌ها** نصب می‌شود). هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود. |
+| 🧠 | **مدل‌های روی دستگاه** | مدل‌های قابل دانلود از خودِ رابط کاربری مدیریت می‌شوند: Whisper برای صدا و یک مدل جاساز (embedding) برای حافظهٔ RAG — کاملاً آفلاین. |
+| 📊 | **نوار استفادهٔ بافتِ زنده** | نوار مصرف بافت در لحظه و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز می‌شود، نه برآورد. |
+| 🛟 | **مدیریت هوشمند بافتِ کم** | حتی با مدل‌های کوچک محلی (مثلاً ۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن بافت، تاریخچه به‌طور خودکار فشرده می‌شود تا به‌جای توقف، کار پیش برود. |
+| 🖥️ | **رابطی به بلندِ یک IDE** | کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco (وسط) و چتِ مارک‌داون با هایلایت سینتکس (راست)، به‌همراه تم تیره و روشن. |
+| 🌐 | **راست‌به‌چپ / چپ‌به‌راست** | ترکیب فارسی و انگلیسی در چت درست نمایش داده می‌شود — پرانتزها و فلش‌ها برعکس نمی‌شوند و مارک‌داون (بولد، تیتر، لیست، جدول) در متن راست‌به‌چپ هم درست رندر می‌شود. رابط کاربری و همین مستندات هر دو دوزبانه‌اند. |
+| 💾 | **ذخیره‌سازی ماندگار** | تنظیمات، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌ها و برنامه‌ها به‌شکل امن ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما نوشته نمی‌شوند. |
+| 🗂️ | **حافظهٔ RAG** | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد و صفحات وبِ ذخیره‌شده، برای هر پروژه جاساز و قابل جستجو می‌شوند — کاملاً آفلاین. |
+| 🔁 | **استریم و ماندگاری** | پاسخ‌ها قطعه‌به‌قطعه می‌رسند؛ چند گفتگوی موازی. |
+| ⌨️ | **دستورهای اسلش** | `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`، `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`. |
 
-### پیش‌نیازها
+### 📦 پیش‌نیازها
 
 - Node.js نسخهٔ ۲۰ به بالا و npm
 - [uv](https://docs.astral.sh/uv/) (مدیر بسته‌های پایتون)
 - پایتون نسخهٔ ۳.۱۰ به بالا (که خود uv آن را مدیریت می‌کند)
 
-### نصب
+### 🚀 نصب
 
 ```bash
 npm install       # نصب وابستگی‌های جاوااسکریپت
 npm run setup     # ساخت backend/.venv و نصب pydantic-ai، fastapi و uvicorn
 ```
 
-ورودی صوتی به مدلِ کاملاً محلیِ `faster-whisper` نیاز دارد (در پوشهٔ
-`backend/whisper/`). اگر مدل هنوز روی دستگاه نیست، یک بار نصبش کنید:
+مدل‌های صوتی و حافظهٔ RAG اختیاری‌اند و از تب **تنظیمات ← مدل‌ها** نصب
+می‌شوند (پس از دانلود، کاملاً آفلاین کار می‌کنند).
 
-```bash
-npm run setup:voice     # دانلود مدل CTranslate2 "small" در backend/whisper/
-```
-
-### توسعه
+### 🧑‍💻 توسعه
 
 ```bash
 npm run dev
 ```
 
-با این دستور، پنجرهٔ Electron با رابطِ گرم (hot-reload) باز می‌شود. sidecar
-پایتونی (FastAPI + Pydantic AI) به‌صورت خودکار روی یک پورت محلیِ موقت اجرا
-می‌شود. در نسخهٔ بسته‌بندی‌شده نیز PATHِ رابط گرافیکی با PATHِ شلِ ورود ترکیب
-می‌شود تا ابزارهایی مانند `docker` (که اتصال‌های MCP به آن نیاز دارند) پیدا شوند.
+پنجرهٔ Electron با رابطِ گرم (hot-reload) باز می‌شود. sidecar پایتونی
+(FastAPI + Pydantic AI) به‌صورت خودکار روی یک پورت محلیِ موقت اجرا می‌شود. در
+نسخهٔ بسته‌بندی‌شده نیز PATH رابط گرافیکی با PATH شلِ ورود ترکیب می‌شود تا
+ابزارهایی مانند `docker` (موردنیاز اتصال‌های MCP) پیدا شوند.
 
-### ساخت و بسته‌بندی
+### 🏗️ ساخت و بسته‌بندی
 
 ```bash
 npm run build       # typecheck + ساخت renderer، main و preload
-npm run dist        # بسته‌بندی برای سیستم‌عاملِ فعلی (dmg/zip در مک، NSIS در ویندوز، AppImage در لینوکس)
-npm run dist:mac    # فقط مک
-npm run dist:win    # فقط ویندوز
-npm run dist:linux  # فقط لینوکس
+npm run dist        # بسته‌بندی برای سیستم‌عاملِ فعلی
+npm run dist:mac    # فقط مک (dmg / zip)
+npm run dist:win    # فقط ویندوز (NSIS)
+npm run dist:linux  # فقط لینوکس (AppImage)
 ```
 
 خروجی در پوشهٔ `release/` قرار می‌گیرد.
 
-### کاربرد
+> **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
+> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار *«CODEFA به
+> خاطر کاهش حریم خصوصی مسدود شده است»* را نشان دهد. این برای برنامه‌های
+> ساخته‌شدهٔ محلی طبیعی است. راه‌حل: روی برنامه کلیک راست کنید ← **Open** ←
+> **Open**. اگر از اینترنت کپی شده است، فلگ قرنطینه را هم پاک کنید:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /path/to/CODEFA.app
+> ```
 
-۱. روی **باز کردن پوشه** کلیک کنید (یا کلید `Cmd/Ctrl+O`) و ریشهٔ پروژه را
-   انتخاب کنید.
-۲. تنظیمات را باز کنید (`Cmd/Ctrl+,`). فراهم‌کنندهٔ پیش‌فرض **opencode** است
-   (`opencode/deepseek-v4-flash-free` از طریق OpenRouter). می‌توانید به
-   OpenRouter، به یک APIِ سازگار با OpenAI یا به یک سرور محلی (Ollama /
-   llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه (base URL) را وارد کنید و
-   مدل را برگزینید.
+### 🖱️ کاربرد
+
+۱. روی **باز کردن پوشه** کلیک کنید (یا `Cmd/Ctrl+O`) و ریشهٔ پروژه را انتخاب کنید.
+
+۲. تنظیمات را باز کنید (`Cmd/Ctrl+,`). به OpenRouter، یک API سازگار با OpenAI
+   یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه
+   را وارد کنید و مدل را برگزینید.
+
 ۳. حالتِ عامل را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
-۴. پیام خود را بنویسید و `Cmd/Ctrl+Enter` را بزنید. عامل پاسخ را به‌صورت
-   زنده (استریم) نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از ابزارهای
-   sandbox شده بهره می‌گیرد. اگر دوست داشتید به جای تایپ، صحبت کنید، فقط
-   دکمهٔ میکروفون را فشار دهید. در حالتِ برنامه، برنامهٔ نهایی در
-   `~/.coder/plans/<workspace>/` ذخیره می‌شود.
 
-### میان‌برهای صفحه‌کلید
+۴. پیام خود را بنویسید و `Cmd/Ctrl+Enter` را بزنید (یا دکمهٔ میکروفون را
+   فشار دهید). عامل پاسخ را زنده نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از
+   ابزارهایش بهره می‌گیرد — همیشه فقط در همان پوشه‌ای که باز کرده‌اید. در حالتِ
+   برنامه، برنامهٔ نهایی برای همان پروژه ذخیره و در اجرای بعدیِ حالت
+   برنامه/نویسندهٔ کد خودکار بارگذاری می‌شود. اگر از عامل بخواهید مهارت‌ها یا
+   اتصال‌های MCP را نصب کند (از یک مخزن، صفحهٔ مستندات و …)، آن‌ها را داخل خودِ
+   برنامه ذخیره می‌کند — حتی اگر دستورالعملِ منبع چنین بگوید، در پوشه‌های
+   پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد.
+
+> 💡 «مسیر داده» برنامه قابل تنظیم است و پیش‌فرض آن در هر سیستم‌عاملی
+> `~/.codefa` است: `~/.codefa` (مک)، `/home/<user>/.codefa` (لینوکس) و
+> `C:\Users\<user>\.codefa` (ویندوز). تغییر آن، داده‌هایتان را به پوشهٔ جدید
+> منتقل و از پوشهٔ قبلی پشتیبان نگه می‌دارد — همه از **تنظیمات ← حافظه**.
+
+### ⌨️ میان‌برهای صفحه‌کلید
 
 | میان‌بر            | کارکرد                             |
 | ------------------ | ---------------------------------- |
-| `Cmd/Ctrl+Enter` | ارسال پیام گفتگو                   |
+| `Cmd/Ctrl+Enter` | ارسال پیام گفتگو                    |
 | `Cmd/Ctrl+M`     | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
-| `Cmd/Ctrl+P`     | جستجوی سریع و سریع‌باز کردن (⌘⇧F برای جستجوی محتوا) |
-| `Cmd/Ctrl+B`     | نمایش/پنهان‌کردن نوار کناری        |
-| `Cmd/Ctrl+,`     | باز کردن تنظیمات                   |
-| `Cmd/Ctrl+S`     | ذخیرهٔ فایل جاری                   |
-| `Cmd/Ctrl+T`     | گفتگوی تازه                        |
+| `Cmd/Ctrl+P`     | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا) |
+| `Cmd/Ctrl+B`     | نمایش/پنهان‌کردن نوار کناری         |
+| `Cmd/Ctrl+,`     | باز کردن تنظیمات                    |
+| `Cmd/Ctrl+S`     | ذخیرهٔ فایل جاری                    |
+| `Cmd/Ctrl+T`     | گفتگوی تازه                         |
+| `Ctrl+A` و سپس `u` | بازگردانی آخرین تبادل (پیشوندِ سبک tmux) |
+| `Ctrl+A` و سپس `r` | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
+| `Ctrl+A` و سپس `c` | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux) |
+| `Ctrl+A` و سپس `x` | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux) |
 
-### معماری
+### 🏛️ معماری
 
 ```
 ┌───────────────────────────── Electron ─────────────────────────────┐
 │ main.ts       پنجره، راه‌اندازی sidecar، IPC فایل،                    │
-│               ذخیره‌سازی پیکربندی و گفتگوها                            │
-│ preload.ts    contextBridge (دسترسی‌های کنترل‌شده)                     │
-│ renderer      React + Monaco + گفتگو (SSE)                           │
+│               پیکربندی و گفتگوها (SQLite)                            │
+│ preload.ts    contextBridge (دسترسی‌های کنترل‌شده)                    │
+│ renderer      React + Monaco + گفتگو (SSE)                          │
 └──────────────┬───────────────────────────▲──────────────────────────┘
-               │ spawn / stdio              │ HTTP + SSE (127.0.0.1)
+               │ spawn / stdio             │ HTTP + SSE (127.0.0.1)
 ┌──────────────▼───────────────────────────┴──────────────────────────┐
-│ ساید‌کار پایتون  (uv .venv)                                          │
+│ ساید‌کار پایتون  (uv .venv)                                         │
 │ server.py      FastAPI  /health  /models                            │
-│                /chat/stream (SSE)  /fs                              │
-│                /transcribe (Whisper)                                │
+│                /chat/stream (SSE)  /fs  /transcribe (Whisper)       │
+│                /app/state (SQLite تنظیمات و گفتگوها)                 │
 │ providers.py   → pydantic-ai OpenAIModel                            │
-│ tools.py       ابزارهای امنِ فایل (sandbox)                          │
-│ agents.py      عامل پرسش / برنامه / نویسندهٔ کد                        │
-│                (مصرف زندهٔ بافت + فشرده‌سازی)                         │
+│ tools.py       ابزارهای امنِ فایل + memory + MCP                    │
+│ agents.py      عامل پرسش / برنامه / نویسندهٔ کد                      │
+│                (مصرف زندهٔ بافت + فشرده‌سازی + حافظهٔ RAG)           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+</div>
+</details>
+
+---
+
+## 📄 License / مجوز
+
+MIT — do whatever you like, just keep the license. / هر طور که می‌خواهید
+استفاده کنید؛ فقط مجوز را نگه دارید.

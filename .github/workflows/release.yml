@@ -107,9 +107,6 @@ jobs:
       - name: Create backend virtualenv (uv sync)
         run: npm run setup
 
-      - name: Download faster-whisper model
-        run: npm run setup:voice
-
       - name: Build renderer + electron
         run: npm run build
 

@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import type { ChatMessage } from '../types'
-import { fixMixedText, prepareContent } from '../lib/bidi'
+import type { ChatMessage, ToolActivity } from '../types'
+import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
-import { ToolCallView } from './ToolCallView'
+import { ToolCallView, ToolGroupView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
 
 function textFromChildren(node: ReactNode): string {
@@ -57,6 +57,26 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   )
 }
 
+// Shared overrides for every markdown renderer in this component.
+// `table` is wrapped in a scroll container: `display: block` on the <table>
+// itself makes its anonymous inner table shrink-wrap to content width, so the
+// cells never stretch to the border. A bordered full-width wrapper fixes the
+// "table doesn't fill the width" gap and carries the horizontal scroll.
+const mdComponents = {
+  a: (props: React.HTMLAttributes<HTMLAnchorElement>) => (
+    <a {...props} target="_blank" rel="noreferrer" />
+  ),
+  pre: (props: React.HTMLAttributes<HTMLPreElement>) => <CodeBlock {...props} />,
+  table: ({
+    node: _node,
+    ...props
+  }: React.HTMLAttributes<HTMLTableElement> & { node?: unknown }) => (
+    <div className="markdown-table-scroll">
+      <table {...props} />
+    </div>
+  ),
+}
+
 const fmtTokens = (n?: number): string => {
   if (!n) return '0'
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
@@ -90,23 +110,33 @@ export function ThinkingBlock({ text }: { text: string }) {
             stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
           }}
         >
-          {text}
+          {stripBidiMarks(fixZwsp(text))}
         </div>
       )}
     </div>
   )
 }
 
-function RetryBanner({
+export function RetryBanner({
   attempt,
   maxAttempts,
   delay,
   reason,
+  gaveUp,
+  model,
+  agent,
+  onCancel,
+  onRetry,
 }: {
   attempt: number
   maxAttempts: number
   delay: number
   reason: string
+  gaveUp?: boolean
+  model?: string
+  agent?: string
+  onCancel?: () => void
+  onRetry?: () => void
 }) {
   const [left, setLeft] = useState(delay)
   useEffect(() => {
@@ -123,17 +153,44 @@ function RetryBanner({
     }, 1000)
     return () => clearInterval(t)
   }, [delay])
+  const unlimited = maxAttempts <= 0
+  const isRateLimit = unlimited && (reason?.toLowerCase().includes('rate limit') || reason?.toLowerCase().includes('quota'))
+  const countdown =
+    delay > 0
+      ? left > 0
+        ? ` — retry in ${left}s`
+        : ' — retrying…'
+      : ' — retrying…'
+  const label = gaveUp ? 'Retry limit reached' : isRateLimit ? 'Provider rate limit' : unlimited ? 'Provider rate limit' : 'Provider hiccup'
+  const suffix = gaveUp
+    ? ` (${attempt}/${maxAttempts})`
+    : unlimited
+      ? ` (attempt ${attempt})${countdown}`
+      : ` (${attempt}/${maxAttempts})${countdown}`
+  const who = model
+    ? ` — ${model}${agent ? ` (${agent})` : ''}`
+    : agent
+      ? ` — ${agent}`
+      : ''
   return (
     <div className="retry-banner" title={reason || undefined}>
       <span className="spinner" />
       <span>
-        Provider hiccup — retrying ({attempt}/{maxAttempts})
-        {delay > 0
-          ? left > 0
-            ? `, retry in ${left}s`
-            : ', retrying…'
-          : '…'}
+        {label}
+        {suffix}
+        {who ? <span className="retry-who">{who}</span> : null}
+        {reason ? <span className="retry-reason"> — {reason}</span> : null}
       </span>
+      {onRetry && (
+        <button className="retry-btn" onClick={onRetry} title="Retry — resumes where it stopped without redoing completed work">
+          Retry
+        </button>
+      )}
+      {onCancel && (
+        <button className="retry-cancel" onClick={onCancel} title="Cancel retry">
+          ✕
+        </button>
+      )}
     </div>
   )
 }
@@ -188,7 +245,95 @@ function UsageBadge({ input, output, total }: { input: number; output: number; t
   )
 }
 
-export function ChatMessageView({ message, onRetry }: { message: ChatMessage; onRetry?: (id: string) => void }) {
+// Any tool that MUTATES persistent state (workspace files, the memory vector
+// store, saved skills/MCP connectors) always renders as its own full, visible
+// card — never swept into the collapsed read-only group. Grouping a write
+// silently is worse than grouping a search: the user has no way to tell it
+// happened, which is exactly the "did this actually save?" confusion this set
+// exists to prevent.
+const ALWAYS_VISIBLE_TOOLS = new Set([
+  'write_file',
+  'edit_file',
+  'memory',
+  'create_skill',
+  'create_mcp',
+])
+
+/** Interleave text slices with tool cards (Claude-style), but collapse runs of
+ *  2+ consecutive read-only/non-mutating tool calls (search/list/fuzzy_find/
+ *  web_search/run_terminal/search_memory) into one ToolGroupView so a
+ *  search-heavy turn doesn't stack a full-height row per call. Anything in
+ *  ALWAYS_VISIBLE_TOOLS always breaks the run and renders as its own full card
+ *  (diff/confirmation visible), same as before. */
+function renderSegments(message: ChatMessage): ReactNode[] {
+  const nodes: ReactNode[] = []
+  let pending: { activity: ToolActivity; index: number }[] = []
+
+  const flush = (key: string) => {
+    if (pending.length === 0) return
+    if (pending.length === 1) {
+      const { activity, index } = pending[0]
+      nodes.push(
+        <ToolCallView
+          key={key}
+          activity={activity}
+          onReverted={() => useStore.getState().markToolReverted(message.id, index)}
+        />,
+      )
+    } else {
+      nodes.push(
+        <ToolGroupView
+          key={key}
+          activities={pending}
+          onReverted={(idx) => useStore.getState().markToolReverted(message.id, idx)}
+        />,
+      )
+    }
+    pending = []
+  }
+
+  message.segments?.forEach((seg, i) => {
+    if (seg.kind === 'text') {
+      flush(`grp-${i}`)
+      nodes.push(
+        <div key={i} className="chat-message markdown-body">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeHighlight]}
+            components={mdComponents}
+          >
+            {prepareContent(seg.text, useStore.getState().dir)}
+          </ReactMarkdown>
+        </div>,
+      )
+      return
+    }
+    const activity = message.toolActivity?.[seg.index]
+    if (!activity) return
+    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool)) {
+      flush(`grp-${i}`)
+      nodes.push(
+        <ToolCallView
+          key={i}
+          activity={activity}
+          onReverted={() => useStore.getState().markToolReverted(message.id, seg.index)}
+        />,
+      )
+    } else {
+      pending.push({ activity, index: seg.index })
+    }
+  })
+  flush('grp-end')
+  return nodes
+}
+
+export const ChatMessageView = memo(function ChatMessageView({
+  message,
+  onRetry,
+}: {
+  message: ChatMessage
+  onRetry?: (id: string) => void
+}) {
   const isUser = message.role === 'user'
   const dir = useStore((s) => s.dir)
   const settings = useStore((s) => s.settings)
@@ -199,7 +344,7 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
 
   const copyMessage = async () => {
     try {
-      await navigator.clipboard.writeText(message.content)
+      await navigator.clipboard.writeText(stripBidiMarks(fixZwsp(message.content)))
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {
@@ -207,7 +352,25 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
     }
   }
 
-  const isSummary = message.role === 'system'
+  const isSummary = message.role === 'system' && !message.modeSwitch
+  const isModeSwitch = message.modeSwitch === true
+
+  // Mode-switch notices exist so the model knows which mode the next message
+  // runs in — the user doesn't want them rendered in the chat. Keep the message
+  // in the data (the agent still receives it) but render nothing.
+  if (isModeSwitch) return null
+
+  // While the provider is retrying, the assistant message has no content yet —
+  // hide the empty placeholder so the retry banner (rendered once, at the END
+  // of the chat in Chat.tsx) is the only thing between the user's message and
+  // the incoming reply, instead of a dangling empty bubble.
+  if (
+    message.retry &&
+    !message.content &&
+    !(message.segments && message.segments.length > 0)
+  ) {
+    return null
+  }
   const roleLabel = isUser
     ? 'You'
     : message.role === 'tool'
@@ -223,7 +386,7 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
   // message is NOT re-sent (the summary replaces it).
   if (message.compacted) {
     return (
-      <div className="msg compacted">
+      <div className="msg compacted" data-msg-id={message.id}>
         <div className="msg-role">
           {roleLabel}
           {message.usage && (
@@ -242,8 +405,8 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
           <span className={`chev ${collapsed ? '' : 'open'}`}>▸</span>
           <span className="compacted-preview">
             {collapsed
-              ? `${message.content.length > 90 ? message.content.slice(0, 90) + '…' : message.content || '(no text)'}`
-              : message.content}
+              ? `${message.content.length > 90 ? stripBidiMarks(fixZwsp(message.content.slice(0, 90))) + '…' : stripBidiMarks(fixZwsp(message.content)) || '(no text)'}`
+              : stripBidiMarks(fixZwsp(message.content))}
           </span>
         </button>
       </div>
@@ -251,8 +414,12 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
   }
 
   return (
-    <div className={`msg ${isUser ? 'user' : ''} ${message.error ? 'error' : ''}`}>
-      {!isSummary && (
+    <div
+      className={`msg ${isUser ? 'user' : ''} ${message.error ? 'error' : ''}`}
+      data-msg-id={message.id}
+      data-is-summary={isSummary ? 'true' : undefined}
+    >
+      {!isSummary && !isModeSwitch && (
         <div className="msg-role">
           {roleLabel}
         </div>
@@ -280,21 +447,12 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
                   {item.status === 'completed' ? '✓' : item.status === 'in_progress' ? '●' : '○'}
                 </span>
                 <span className="plan-item-content">
-                  {dir === 'rtl' ? fixMixedText(item.content) : item.content}
+                  {prepareContent(item.content, dir)}
                 </span>
               </li>
             ))}
           </ul>
         </div>
-      )}
-
-      {!isUser && message.retry && (
-        <RetryBanner
-          attempt={message.retry.attempt}
-          maxAttempts={message.retry.maxAttempts}
-          delay={message.retry.delay}
-          reason={message.retry.reason}
-        />
       )}
 
       {message.attachments && message.attachments.length > 0 && (
@@ -319,8 +477,10 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
         </div>
       )}
 
-      {(message.content || (message.segments && message.segments.length > 0)) && (
-        isSummary ? (
+      {(isSummary || message.content || (message.segments && message.segments.length > 0)) && (
+        isModeSwitch ? (
+          <div className="mode-switch-note" dir="ltr">{stripBidiMarks(fixZwsp(message.content))}</div>
+        ) : isSummary ? (
           <div className="summary-block">
             <div className="summary-head">
               <span className="summary-icon">📎</span>
@@ -333,59 +493,31 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 rehypePlugins={[rehypeHighlight]}
-                components={{
-                  a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
-                  pre: (props) => <CodeBlock {...props} />,
-                }}
+                components={mdComponents}
               >
-                {prepareContent(message.content, dir)}
+                {prepareContent(message.content || "(empty summary)", dir)}
               </ReactMarkdown>
             </div>
           </div>
         ) : message.segments && message.segments.length > 0 ? (
           /* Claude-style interleaved rendering: text slices and tool cards follow
-             each other in the exact order the agent produced them. */
+             each other in the exact order the agent produced them, with runs of
+             2+ read-only tool calls collapsed into one summary (see renderSegments). */
           <div className="msg-bubble segmented">
-            {message.segments.map((seg, i) =>
-              seg.kind === 'text' ? (
-                <div key={i} className="chat-message markdown-body">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeHighlight]}
-                    components={{
-                      a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
-                      pre: (props) => <CodeBlock {...props} />,
-                    }}
-                  >
-                    {prepareContent(seg.text, dir)}
-                  </ReactMarkdown>
-                </div>
-              ) : message.toolActivity?.[seg.index] ? (
-                <ToolCallView
-                  key={i}
-                  activity={message.toolActivity[seg.index]}
-                  onReverted={() =>
-                    useStore.getState().markToolReverted(message.id, seg.index)
-                  }
-                />
-              ) : null,
-            )}
+            {renderSegments(message)}
           </div>
         ) : (
         <div className="msg-bubble">
           {isUser ? (
             <div className="chat-message user-text" dir={dir}>
-              {dir === 'rtl' ? fixMixedText(message.content) : message.content}
+              {prepareContent(message.content, dir)}
             </div>
           ) : (
             <div className="chat-message markdown-body">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 rehypePlugins={[rehypeHighlight]}
-                components={{
-                  a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
-                  pre: (props) => <CodeBlock {...props} />,
-                }}
+                components={mdComponents}
               >
                 {prepareContent(message.content, dir)}
               </ReactMarkdown>
@@ -437,4 +569,4 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
       )}
     </div>
   )
-}
+})

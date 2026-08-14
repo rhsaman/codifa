@@ -8,7 +8,10 @@ yarn-error.log*
 .pnpm-debug.log*
 *.tgz
 
-whisper
+# Downloaded on-device ML models (Settings → Models; fetched at runtime, not committed):
+backend/whisper/
+backend/models--*/
+models--*/
 MEMORY.md
 
 # ============================================================

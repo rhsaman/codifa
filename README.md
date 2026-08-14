@@ -133,10 +133,11 @@ Output lands in `release/`.
 | `Cmd/Ctrl+,`     | Open settings                                 |
 | `Cmd/Ctrl+S`     | Save current file                             |
 | `Cmd/Ctrl+T`     | New chat                                      |
-| `Ctrl+A` then `u` | Undo last exchange (tmux-style prefix)       |
-| `Ctrl+A` then `r` | Redo last undone exchange (tmux-style prefix) |
-| `Ctrl+A` then `c` | Compact the chat context (tmux-style prefix)  |
-| `Ctrl+A` then `x` | Clear this chat's messages (tmux-style prefix) |
+| `Ctrl+X` then `u` | Undo last exchange (tmux-style prefix)       |
+| `Ctrl+X` then `r` | Redo last undone exchange (tmux-style prefix) |
+| `Ctrl+X` then `c` | Compact the chat context (tmux-style prefix)  |
+| `Ctrl+X` then `x` | Clear this chat's messages (tmux-style prefix) |
+| `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)     |
 
 ### 🏛️ Architecture
 
@@ -273,10 +274,11 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 | `Cmd/Ctrl+,`     | باز کردن تنظیمات                    |
 | `Cmd/Ctrl+S`     | ذخیرهٔ فایل جاری                    |
 | `Cmd/Ctrl+T`     | گفتگوی تازه                         |
-| `Ctrl+A` و سپس `u` | بازگردانی آخرین تبادل (پیشوندِ سبک tmux) |
-| `Ctrl+A` و سپس `r` | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
-| `Ctrl+A` و سپس `c` | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux) |
-| `Ctrl+A` و سپس `x` | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `u` | بازگردانی آخرین تبادل (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `r` | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `c` | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `x` | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `Space` | نگه‌داشتن Space برای ضبط صدا (پیشوندِ سبک tmux) |
 
 ### 🏛️ معماری
 

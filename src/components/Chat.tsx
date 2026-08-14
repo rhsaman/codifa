@@ -392,7 +392,7 @@ export function ChatPanel() {
    *  instead of silently collapsing messages behind a broken summary. Cleared
    *  on the next compact attempt (success or failure). */
   const [compactError, setCompactError] = useState<string | null>(null);
-  /** Shown while the tmux-style Ctrl+A prefix is armed (waiting for the next key). */
+  /** Shown while the tmux-style Ctrl+X prefix is armed (waiting for the next key). */
   const [prefixNotice, setPrefixNotice] = useState<string | null>(null);
 
   // Switch the CURRENT chat's mode and confirm it visibly (so it's obvious the
@@ -442,7 +442,9 @@ export function ChatPanel() {
       const active = (e as CustomEvent<boolean>).detail === true;
       setPrefixNotice(
         active
-          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(PREFIX_SHORTCUTS).join(" / ")}`
+          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(PREFIX_SHORTCUTS)
+              .map((k) => (k === " " ? "Space" : k))
+              .join(" / ")}`
           : null,
       );
     };
@@ -1343,7 +1345,7 @@ export function ChatPanel() {
             GLOBAL_SHORTCUTS.map((s) => `- ${formatGlobalShortcut(s)}`).join(
               "\n",
             ) +
-            "\n\n**Prefix shortcuts** — press `Ctrl+A`, then a key:\n\n" +
+            "\n\n**Prefix shortcuts** — press `Ctrl+X`, then a key:\n\n" +
             Object.entries(PREFIX_SHORTCUTS)
               .map(([key, sc]) => `- ${formatShortcut(key, sc)}`)
               .join("\n"),
@@ -1385,7 +1387,7 @@ export function ChatPanel() {
     }
   };
 
-  // Route global coder:cmd dispatches (Ctrl+A prefix shortcuts) through the
+  // Route global coder:cmd dispatches (Ctrl+X prefix shortcuts) through the
   // same handler as typing the equivalent slash command.
   handleCommandRef.current = handleCommand;
 
@@ -1558,17 +1560,22 @@ export function ChatPanel() {
         setRecording(false);
         const type = mediaChunksRef.current[0]?.type ?? mime;
         const blob = new Blob(mediaChunksRef.current, { type });
-        if (blob.size === 0) return;
+        if (blob.size === 0) {
+          console.debug("[voice] empty recording (no audio captured)");
+          window.alert("No audio was captured — check your microphone.");
+          return;
+        }
         setTranscribing(true);
         try {
-          const text = await transcribeAudio(
-            blob,
-            setTranscribing,
-            dir === "rtl" ? "fa" : undefined,
-          );
+          const lang = dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
+          console.debug("[voice] transcribing", { mime: blob.type, bytes: blob.size, lang });
+          const text = await transcribeAudio(blob, setTranscribing, lang);
           if (text) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
             textareaRef.current?.focus();
+          } else {
+            console.debug("[voice] empty transcription (silence/unrecognized)");
+            window.alert("Nothing was recognized — please try again.");
           }
         } catch (err) {
           window.alert(
@@ -1582,7 +1589,9 @@ export function ChatPanel() {
       mediaRecorderRef.current = rec;
       rec.start();
       setRecording(true);
+      console.debug("[voice] recording started", { mime: rec.mimeType });
     } catch (err) {
+      console.debug("[voice] microphone unavailable:", err);
       window.alert(
         `Microphone unavailable: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -2460,8 +2469,8 @@ export function ChatPanel() {
                   transcribing
                     ? "Transcribing voice…"
                     : recording
-                      ? "Stop recording (⌘⇧M)"
-                      : "Record voice input (⌘⇧M)"
+                      ? "Stop recording (Ctrl+X Space)"
+                      : "Record voice input (Ctrl+X then Space)"
                 }
               >
                 {recording ? (

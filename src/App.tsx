@@ -6,7 +6,7 @@ import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { DownloadModelGate } from './components/DownloadModelGate'
 import { getModelsStatus } from './lib/api'
-import { PREFIX_KEY, PREFIX_SHORTCUTS } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -20,7 +20,7 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [embeddingGate, setEmbeddingGate] = useState<'unknown' | 'ready' | 'missing'>('unknown')
 
-  // tmux-style prefix sequence (Ctrl+A then u/r/c/x). The flag lives in a ref
+  // tmux-style prefix sequence (Ctrl+X then u/r/c/x). The flag lives in a ref
   // so the window listener reads the latest state without re-subscribing.
   const prefixActiveRef = useRef(false)
   const prefixTimerRef = useRef<number | null>(null)
@@ -95,22 +95,27 @@ export default function App() {
       // While the prefix is armed, the very next key runs (or cancels) it.
       if (prefixActiveRef.current) {
         cancelPrefix()
-        const k = e.key.toLowerCase()
+        const k = physicalKey(e)
         const sc = PREFIX_SHORTCUTS[k]
         if (sc) {
           e.preventDefault()
-          window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
+          if (sc.action === 'voice') {
+            // Ctrl+X then Space: toggle voice recording (the mic button).
+            window.dispatchEvent(new CustomEvent('coder:toggle-voice'))
+          } else {
+            window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
+          }
         }
         return
       }
-      // Arm the prefix: Ctrl+A with no other modifiers. Cmd+A (macOS select-all)
+      // Arm the prefix: Ctrl+X with no other modifiers. Cmd+X (macOS cut)
       // still works because it sets metaKey, which we exclude here.
       if (
         e.ctrlKey &&
         !e.metaKey &&
         !e.altKey &&
         !e.shiftKey &&
-        e.key.toLowerCase() === PREFIX_KEY
+        physicalKey(e) === PREFIX_KEY
       ) {
         e.preventDefault()
         prefixActiveRef.current = true
@@ -119,7 +124,7 @@ export default function App() {
         return
       }
       if (!(e.metaKey || e.ctrlKey)) return
-      const k = e.key.toLowerCase()
+      const k = physicalKey(e)
       switch (k) {
         case 'b': {
           e.preventDefault()
@@ -143,12 +148,7 @@ export default function App() {
         }
         case 'm': {
           e.preventDefault()
-          if (e.shiftKey) {
-            // ⌘⇧M: toggle voice recording (the mic button, see Chat.tsx).
-            window.dispatchEvent(new CustomEvent('coder:toggle-voice'))
-          } else {
-            window.dispatchEvent(new CustomEvent('coder:toggle-mode'))
-          }
+          window.dispatchEvent(new CustomEvent('coder:toggle-mode'))
           break
         }
         case 't': {

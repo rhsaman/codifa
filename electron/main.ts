@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, session, shell } from 'electron'
 import { execFile } from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
@@ -52,10 +52,89 @@ let lastNvimDiags: unknown[] = []
 let nvimPollTimer: ReturnType<typeof setInterval> | null = null
 let nvimIdleTicks = 0
 
-/** Unix sockets listening for nvim RPC, found via `lsof` (matches any process
- *  whose command name contains "nvim" — the `--listen` socket lives wherever
- *  the user put it, so we can't guess the path). */
-function findNvimSockets(): Promise<string[]> {
+/** Directories where nvim's server sockets live. nvim names its default socket
+ *  `nvim.<pid>.0` under `$TMPDIR/nvim.<uid>/<token>/` on macOS and uses a
+ *  `$XDG_RUNTIME_DIR/nvim/<pid>/0` layout on Linux. `lsof` alone is unreliable
+ *  on macOS (often returns empty for other processes' sockets), so we prefer to
+ *  glob these dirs directly and only probe sockets whose embedded pid is alive. */
+function nvimSocketRoots(): string[] {
+  const roots: string[] = []
+  const tmp = os.tmpdir()
+  if (tmp) {
+    try {
+      for (const name of fs.readdirSync(tmp)) {
+        if (name.startsWith('nvim')) roots.push(path.join(tmp, name))
+      }
+    } catch {
+      /* tmp not readable — fall through */
+    }
+  }
+  const xdg = process.env.XDG_RUNTIME_DIR
+  if (xdg) roots.push(path.join(xdg, 'nvim'))
+  roots.push(path.join(os.homedir(), 'Library', 'Caches', 'nvim'))
+  return roots
+}
+
+/** Parse the owning nvim pid from a socket path (`nvim.<pid>.0`, or the XDG
+ *  `.../nvim/<pid>/0` form). Returns null when it isn't a known nvim layout. */
+function nvimSocketPid(socket: string): number | null {
+  const leaf = path.basename(socket)
+  const m = leaf.match(/^nvim\.(\d+)\.0$/)
+  if (m) return Number(m[1])
+  const parent = path.basename(path.dirname(socket))
+  if (leaf === '0' && /^\d+$/.test(parent)) return Number(parent)
+  return null
+}
+
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+async function walkNvimSocketDir(dir: string, depth: number, acc: string[]): Promise<void> {
+  let entries
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name)
+    if (ent.isDirectory()) {
+      if (depth < 5) await walkNvimSocketDir(full, depth + 1, acc)
+      continue
+    }
+    const pid = nvimSocketPid(full)
+    if (pid === null) continue
+    let isSock = false
+    try {
+      isSock = fs.statSync(full).isSocket()
+    } catch {
+      continue
+    }
+    if (isSock && pidIsAlive(pid)) acc.push(full)
+  }
+}
+
+/** Unix sockets listening for nvim RPC. Discovered by globbing nvim's socket
+ *  dirs (pid-liveness filtered) so it works without Full Disk Access; falls
+ *  back to `lsof` for custom `--listen <socket>` paths the glob can't see. */
+async function findNvimSockets(): Promise<string[]> {
+  const found: string[] = []
+  for (const root of nvimSocketRoots()) {
+    if (!root) continue
+    await walkNvimSocketDir(root, 0, found)
+  }
+  const uniq = [...new Set(found)]
+  if (uniq.length > 0) return uniq
+  // Fallback for non-default socket names (user passed `--listen`): enumerate
+  // via lsof, keeping only genuine `nvim.<pid>.0` server sockets (this avoids
+  // this app's own `nvim --server --remote-expr` subprocesses and stale ones).
   return new Promise((resolve) => {
     execFile(
       'lsof',
@@ -63,13 +142,6 @@ function findNvimSockets(): Promise<string[]> {
       { timeout: 5000, env: { ...process.env, PATH: TOOL_PATH } },
       (err, stdout) => {
         if (err || !stdout) return resolve([])
-        // `lsof -c nvim` matches ANY process named nvim — including this app's
-        // own `nvim --server ... --remote-expr` polling subprocesses — so it
-        // also surfaces unrelated sockets (cmux, ssh-agent, launchd, Chrome,
-        // etc.). Polling those with `nvim --server` hangs for the full timeout
-        // each, which stacked up into 40+ stuck nvim subprocesses and starved
-        // the real server socket. Keep only genuine nvim server sockets, whose
-        // path follows nvim's `nvim.<pid>.0` convention.
         const out: string[] = []
         for (const rec of stdout.split('\0')) {
           if (!rec.startsWith('n')) continue
@@ -899,6 +971,15 @@ async function migrateLegacyStateFrom(root: string): Promise<void> {
 
 app.whenReady().then(async () => {
   registerIpc()
+  // Grant microphone access in-app so voice input works even on dev-server /
+  // unsigned builds, where Electron would otherwise auto-deny media requests
+  // and getUserMedia would fail silently or error out.
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    callback(permission === 'media')
+  })
+  session.defaultSession.setPermissionCheckHandler(
+    (_wc, permission) => permission === 'media',
+  )
   // Import any legacy JSON state into the SQLite DB BEFORE the renderer
   // mounts, so the very first store:get already reads from the DB (and the
   // sidecar is up). Bounded to ~4s so a broken/missing backend can never stall

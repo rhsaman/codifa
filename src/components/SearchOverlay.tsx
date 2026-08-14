@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { workspaceFiles, api, type WorkspaceFile, type SearchMatch } from '../lib/fs'
 import { useStore } from '../lib/store'
+import { physicalKey } from '../lib/shortcuts'
 
 function fuzzyScore(pattern: string, text: string): number {
   pattern = pattern.toLowerCase()
@@ -102,15 +103,15 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
       if (d > 0) setIdx((i) => (max === 0 ? 0 : (i + 1) % (max + 1)))
       else setIdx((i) => (max === 0 ? 0 : (i - 1 + max + 1) % (max + 1)))
     }
-    if (e.key === 'ArrowDown' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n')) {
+    if (e.key === 'ArrowDown' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'n')) {
       e.preventDefault()
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') e.stopPropagation()
+      if ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'n') e.stopPropagation()
       move(1)
       return
     }
-    if (e.key === 'ArrowUp' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p')) {
+    if (e.key === 'ArrowUp' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'p')) {
       e.preventDefault()
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') e.stopPropagation()
+      if ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'p') e.stopPropagation()
       move(-1)
       return
     }
@@ -120,7 +121,7 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
       if (r) select('rel' in r ? (r as WorkspaceFile).rel : (r as SearchMatch).file)
       return
     }
-    if (e.key === 'F' && e.shiftKey && (e.metaKey || e.ctrlKey)) {
+    if (physicalKey(e) === 'f' && e.shiftKey && (e.metaKey || e.ctrlKey)) {
       e.preventDefault()
       setMode((m) => (m === 'grep' ? 'file' : 'grep'))
       return

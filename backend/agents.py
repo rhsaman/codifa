@@ -2724,6 +2724,27 @@ _MODE_OUTPUT = {
 }
 
 
+_HAS_PERSIAN = re.compile(r"[\u0600-\u06FF]")
+
+
+def _language_directive(text: str) -> str:
+    """A short, prominent reply-language rule placed right after the mode
+    declaration so even weak models can't miss it. Detects Persian by script
+    and otherwise falls back to 'match the user's language'."""
+    if text and _HAS_PERSIAN.search(text):
+        return (
+            "\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply "
+            "ENTIRELY in Persian — every message, todo/checklist item, plan content, "
+            "summary, ask_user question and options, and any comment or text inside "
+            "generated code/files. Never reply in English when the user writes Persian."
+        )
+    return (
+        "\nLANGUAGE RULE (always follow): Reply entirely in the same language the user "
+        "writes in — Persian → Persian, English → English, etc. Never switch languages "
+        "for todo lists, plans or summaries."
+    )
+
+
 def _mode_declare(mode: str) -> str:
     label = _MODE_LABELS.get(mode, (mode or "Ask").capitalize())
     caps = _MODE_CAPS.get(
@@ -3354,7 +3375,7 @@ async def run_agent(
     # The mode declaration comes FIRST so a mid-chat mode switch (Coder ↔ Plan)
     # re-orients the agent immediately — buried at the end of a long prompt it
     # was easy to miss and the agent kept behaving as the previous mode.
-    system_final = _mode_declare(mode) + base_prompt + workspace_note
+    system_final = _mode_declare(mode) + _language_directive(prompt) + base_prompt + workspace_note
     # LANGUAGE RULE (always follow): match the user's language for the entire
     # conversation. If the user writes in Persian (فارسی), reply entirely in
     # Persian — including the update_plan checklist/todo items, the plan

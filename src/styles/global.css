@@ -349,7 +349,7 @@ textarea {
   flex-direction: column;
   align-items: stretch;
   gap: 2px;
-  padding: 5px 8px 6px 11px;
+  padding: 6px 8px 7px 13px;
   border-radius: 12px;
   cursor: pointer;
   color: var(--text-dim);
@@ -544,7 +544,7 @@ textarea {
 .sidebar-group {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 
 .sidebar-group.dragging {
@@ -766,9 +766,9 @@ textarea {
 .sidebar-group-chats {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding-left: 8px;
-  margin-left: 14px;
+  gap: 4px;
+  padding-left: 10px;
+  margin: 2px 0 2px 16px;
   border-left: 2px solid
     color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent);
 }
@@ -2898,12 +2898,13 @@ textarea {
 }
 
 .tool-card-head .tool-cmd.tool-task {
-  display: inline-block;
-  max-width: 38ch;
+  /* Truncate only when it actually overflows the card, never by a fixed
+     char count: short tasks show fully, long ones get a real ellipsis. */
+  flex: 1 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  vertical-align: bottom;
 }
 
 .tool-card-head .tool-badge.tool-sub-count {
@@ -2951,10 +2952,10 @@ textarea {
 
 .tool-sub-row .tool-sub-args {
   color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .tool-sub-row .tool-sub-summary {
@@ -2965,7 +2966,8 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   margin-left: auto;
-  max-width: 34ch;
+  flex: 0 1 auto;
+  max-width: 22ch;
 }
 
 .tool-sub-row .tool-ms {
@@ -5242,10 +5244,12 @@ textarea {
   font-size: 11px;
   color: var(--text-dim);
   opacity: 0.85;
+  /* Ellipsize only when the group head runs out of room. */
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 /* Chevron as a tiny circular chip, rotates when open. */

@@ -323,12 +323,22 @@ function subArgSummary(activity: ToolActivity): string {
   if (!args) return ''
   const path = String(args.filePath ?? args.path ?? '')
   const pattern = String(args.pattern ?? args.query ?? '')
-  const start = String(args.offset ?? args.start ?? '')
-  const limit = String(args.limit ?? '')
+  const startRaw = args.offset ?? args.start
+  const limitRaw = args.limit
   let s = path
-  if (start && String(Number(start)) === start && !limit) s += `:${start}`
+  const st = Number(startRaw)
+  const lm = Number(limitRaw)
+  if (startRaw !== undefined && startRaw !== '' && Number.isFinite(st) && st >= 0) {
+    // Show the real range (mirrors the main tool card) instead of a fake "…".
+    if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
+      s += `:${st}–${st + lm - 1}`
+    } else {
+      s += `:${st}`
+    }
+  } else if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
+    s += `:1–${lm}`
+  }
   if (pattern) s += s ? ' · ' + pattern : pattern
-  if (limit && s) s += '…'
   return s
 }
 

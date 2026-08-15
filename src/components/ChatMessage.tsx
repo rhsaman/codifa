@@ -95,17 +95,27 @@ const THINKING_MAX_H = 320
 const THINKING_DEFAULT_H = 84
 
 export function ThinkingBlock({ text }: { text: string }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
   const [height, setHeight] = useState(THINKING_DEFAULT_H)
   const textRef = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true)
   const drag = useRef<{ startY: number; startH: number } | null>(null)
   const empty = text.trim().length === 0
+  // While collapsed, show the latest streamed line (truncated to one line)
+  // instead of a word count, so the user sees live reasoning progress.
+  const lastLine =
+    text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() ?? ''
   const label = empty
     ? 'Thinking…'
     : open
       ? 'Hide thinking'
-      : `Thinking (${localWords(text).toLocaleString()} words)`
+      : lastLine
+        ? `Thinking — ${lastLine}`
+        : 'Thinking…'
   useEffect(() => {
     const el = textRef.current
     if (!el || !open || empty || !stickToBottom.current) return

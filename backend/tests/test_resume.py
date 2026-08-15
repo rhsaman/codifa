@@ -1,0 +1,213 @@
+"""Live test: interrupted-turn resume.
+
+Covers Stop/abort, a hard API error, an app-close (no marker folded into history),
+and a Plan→Coder style handoff with a checklist. Drives the real backend against
+the shared mock server. Run standalone (`python backend/tests/test_resume.py`) or via
+`python backend/tests/run_tests.py`.
+"""
+import asyncio
+import json
+import os
+import tempfile
+import time
+
+# Hermetic data root BEFORE importing anything that touches state_db.
+_TMP = tempfile.mkdtemp(prefix="coder-test-resume-data-")
+os.environ["CODER_DATA_DIR"] = _TMP
+
+# Import the harness FIRST — it puts the repo backend dir on sys.path so the
+# backend modules below resolve wherever the tests run from.
+from mock_openai import (
+    mock,
+    start_server,
+    stop_server,
+    text_reply,
+    tool_call,
+)
+
+import state_db
+from agents import run_agent
+
+
+async def run_turn(**kw):
+    events = []
+    async for ev in run_agent(**kw):
+        events.append(ev)
+    return events
+
+
+def find_in_request(captured, pred):
+    for body in captured:
+        for msg in body.get("messages", []):
+            if pred(msg):
+                return body, msg
+    return None, None
+
+
+def make_workspace():
+    ws = tempfile.mkdtemp(prefix="coder-test-resume-ws-")
+    with open(os.path.join(ws, "app.py"), "w") as fh:
+        fh.write("def foo():\n    return 42\n")
+    return ws
+
+
+async def main():
+    task, base = await start_server()
+    try:
+        ws = make_workspace()
+        chat_id = "chat-resume-1"
+        common = {
+            "provider": "custom", "model_name": "mock-model", "base_url": base, "api_key": "test",
+            "root": ws, "mode": "ask", "chat_id": chat_id,
+        }
+
+        # ==== Scenario 1: Stop / abort mid-stream after a completed tool ====
+        mock.script = [tool_call("grep", json.dumps({"pattern": "foo", "path": ""}))]
+        mock.captured = []
+        events = []
+        interrupted = False
+        async for ev in run_agent(prompt="find foo", history=[], **common):
+            events.append(ev)
+            if ev.get("kind") == "tool_result":
+                interrupted = True
+                break  # simulate client abort / Stop
+        assert interrupted, "run 1 never reached a tool_result"
+
+        resume = state_db.load_turn_resume(ws, chat_id)
+        assert resume and resume.get("tools"), "resume file missing after interruption"
+        tools = [t for t in resume["tools"] if isinstance(t, dict)]
+        assert tools and tools[0]["tool"] == "grep", "resume file lost the grep record"
+        full_result = tools[0]["result"]
+        assert "MATCHES" in full_result and "app.py" in full_result, \
+            f"resume result is not the FULL grep output: {full_result[:200]!r}"
+        print("  resume/1 OK: interrupted; file holds full grep result")
+
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        history = [
+            {"role": "user", "content": "find foo"},
+            {"role": "assistant",
+             "content": "[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
+        ]
+        await run_turn(prompt="continue", history=history, **common)
+        _, call_msg = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant" and any(
+                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
+            ),
+        )
+        assert call_msg, "continue request did not replay the resume tool call"
+        tool_calls = [tc for tc in call_msg["tool_calls"] if tc.get("id", "").startswith("resume-")]
+        assert tool_calls[0]["function"]["name"] == "grep", "resume tool call wrong name"
+        _, ret_msg = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "tool" and m.get("tool_call_id") == tool_calls[0]["id"],
+        )
+        assert ret_msg and full_result in ret_msg["content"], \
+            "resume tool return missing the FULL result"
+        assert state_db.load_turn_resume(ws, chat_id) is None, \
+            "resume file not cleared after a clean finish"
+        print("  resume/1 OK: continue replays full result; file cleared")
+
+        # ==== Scenario 2: run cut off by a hard 400 after tool work ====
+        chat2 = "chat-resume-2"
+        mock.script = [
+            tool_call("grep", json.dumps({"pattern": "def", "path": ""})),
+            None,  # next model request gets a hard 400
+        ]
+        mock.captured = []
+        raised = None
+        try:
+            async for _ev in run_agent(prompt="find def", history=[], **{**common, "chat_id": chat2}):
+                pass
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        assert raised is not None, "expected the hard error to propagate"
+        resume2 = state_db.load_turn_resume(ws, chat2)
+        assert resume2 and resume2.get("tools"), "resume file missing after an error"
+        assert resume2["tools"][0]["tool"] == "grep", "resume after error lost the record"
+
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        history2 = [
+            {"role": "user", "content": "find def"},
+            {"role": "assistant", "content": "[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
+        ]
+        await run_turn(prompt="continue", history=history2, **{**common, "chat_id": chat2})
+        _, call_msg = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant" and any(
+                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
+            ),
+        )
+        assert call_msg, "error-path continue did not replay the resume tool call"
+        print("  resume/2 OK: resume file survives a hard error and replays")
+
+        # ==== Scenario 3: hard app close — no marker, recency guard must fire ====
+        chat3 = "chat-resume-3"
+        state_db.save_turn_resume(ws, chat3, {"prompt": "find foo", "tools": [
+            {"tool": "grep", "args": {"pattern": "foo", "path": ""},
+             "result": "MATCHES for 'foo'\napp.py:1: def foo():", "ts": time.time()},
+        ]})
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        history3 = [
+            {"role": "user", "content": "find foo"},
+            {"role": "assistant", "content": "Let me search for that.\nRunning grep..."},
+        ]
+        await run_turn(prompt="continue", history=history3, **{**common, "chat_id": chat3})
+        _, call_msg3 = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant" and any(
+                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
+            ),
+        )
+        assert call_msg3, "hard-close continuation did not inject resume via recency guard"
+        assert state_db.load_turn_resume(ws, chat3) is None, "hard-close continue left the file behind"
+        print("  resume/3 OK: fresh resume file injected without a marker")
+
+        # ==== Scenario 4: interrupted run had a checklist; continue preserves it ====
+        chat4 = "chat-resume-4"
+        state_db.save_turn_resume(ws, chat4, {"prompt": "implement X", "tools": [
+            {"tool": "grep", "args": {"pattern": "foo", "path": ""},
+             "result": "MATCHES for 'foo'\napp.py:1: def foo():", "ts": time.time()},
+        ]})
+        mock.script = [text_reply("Continuing.")]
+        mock.captured = []
+        history4 = [
+            {"role": "user", "content": "implement feature X"},
+            {"role": "assistant", "mode": "coder",
+             "content": "I'll break this into steps.",
+             "plan": [
+                 {"content": "Find where foo is defined", "status": "completed"},
+                 {"content": "Read the implementation", "status": "in_progress"},
+                 {"content": "Write the change", "status": "pending"},
+             ]},
+            {"role": "assistant",
+             "content": "grep ran...[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
+        ]
+        await run_turn(prompt="ادامه بده", history=history4, mode="coder",
+                       **{**{k: v for k, v in common.items() if k != "mode"}, "chat_id": chat4})
+        _, call_msg4 = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant" and any(
+                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
+            ),
+        )
+        assert call_msg4, "plan scenario continue did not replay completed tool work"
+        _, plan_note = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "system" and "Continue this checklist" in (m.get("content") or ""),
+        )
+        assert plan_note and "Read the implementation" in plan_note.get("content", ""), \
+            "checklist not preserved via _plan_reuse_note"
+        assert state_db.load_turn_resume(ws, chat4) is None, "plan scenario left the resume file behind"
+        print("  resume/4 OK: checklist preserved on continue")
+
+        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist)")
+    finally:
+        await stop_server(task)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

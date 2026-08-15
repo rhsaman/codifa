@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
-import { useStore, DEFAULT_MAX_HISTORY, flushStateNow } from '../lib/store'
+import { useStore, defaultMaxHistoryFor, flushStateNow } from '../lib/store'
 import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
 import { api } from '../lib/fs'
 import { supportsReasoning } from '../lib/thinking'
@@ -485,7 +485,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Google OAuth sign-in progress: "" idle, "busy" while the consent window is
   // open, "ok"/"error" + message when the flow settles.
   const [oauthState, setOauthState] = useState<{ status: string; msg: string }>({ status: '', msg: '' })
-  const [maxHistoryInput, setMaxHistoryInput] = useState(String(active.maxHistory ?? DEFAULT_MAX_HISTORY))
+  const [maxHistoryInput, setMaxHistoryInput] = useState(String(active.maxHistory ?? defaultMaxHistoryFor(active.kind)))
   const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
   // Which credential source the provider being edited will use: 'env' (an
   // environment variable that must already exist) or 'key' (an API key stored
@@ -799,7 +799,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     setCfg({ ...active })
     setCustomModel('')
-    setMaxHistoryInput(String(active.maxHistory ?? DEFAULT_MAX_HISTORY))
+    setMaxHistoryInput(String(active.maxHistory ?? defaultMaxHistoryFor(active.kind)))
   }, [editId, active.id])
 
   // Derive the credential method when switching providers: a saved API key wins,
@@ -1974,7 +1974,7 @@ Caps on total stored documents and chunks per workspace; the oldest are evicted 
             <SubagentModelSelect
               agent="search"
               label="Search subagent"
-              desc="Model that runs the explore sub-agent's search tools (search_in_files / fuzzy_find / list_files). Falls back to the explore model."
+              desc="Model that runs the explore sub-agent's search tools (grep / glob / list_files). Falls back to the explore model."
               current={subagentModels.search || ''}
               onSelect={setSubagentModel}
             />

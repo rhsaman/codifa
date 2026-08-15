@@ -1726,7 +1726,7 @@ def _rg_glob(root: str, pattern: str, target: str, path: str) -> dict | None:
     files: list[str] = []
     for raw in proc.stdout.splitlines():
         rel = raw.removeprefix("./")
-        if in_coder := (target.startswith(coder + os.sep)):
+        if target.startswith(coder + os.sep):
             rel = os.path.join(coder, rel)
             files.append(_display_path(root, rel))
         else:
@@ -2077,10 +2077,8 @@ def _is_terminal_search(command: str) -> bool:
             continue
         if first in _SEARCH:
             return True
-        if seg.startswith(_GIT_PREFIXES):
-            return True
         # First meaningful command is not a search — stop here.
-        return False
+        return seg.startswith(_GIT_PREFIXES)
     return False
 
 
@@ -2925,7 +2923,7 @@ def make_tool_callbacks(
                 seen.add(key)
                 try:
                     cand = os.path.realpath(os.path.join(root, rel.lstrip("/")))
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001, S112 — unreadable entry just isn't flagged
                     continue
                 if cand == root_real or not cand.startswith(root_real + os.sep):
                     continue
@@ -3129,6 +3127,8 @@ def make_tool_callbacks(
             from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
             from pydantic_ai.messages import (
                 ModelRequest as _ModelRequest,
+            )
+            from pydantic_ai.messages import (
                 SystemPromptPart as _SystemPromptPart,
             )
             from pydantic_ai.settings import ModelSettings as _ModelSettings
@@ -3257,7 +3257,11 @@ def make_tool_callbacks(
                     _Tool(_sub_grep, name="grep"),
                     _Tool(_sub_glob, name="glob"),
                 ],
-                model_settings=_ModelSettings(temperature=0.2, max_tokens=_sub_max_tokens),
+                model_settings=_ModelSettings(
+                    temperature=0.2,
+                    max_tokens=_sub_max_tokens,
+                    parallel_tool_calls=True,
+                ),
             )
 
             # Widen-and-resume retry loop (mirrors the PARENT agent's handling in
@@ -3278,8 +3282,12 @@ def make_tool_callbacks(
             while True:
                 try:
                     _sub_res = await _run_subagent_call(
-                        lambda: sub_agent.run(
-                            _sub_run_prompt,
+                        # Bind the loop variables as defaults so each iteration's
+                        # lambda captures ITS OWN values (B023) — the widen-retry
+                        # below reassigns them, and the lambda must not see the
+                        # post-loop values.
+                        lambda _p=_sub_run_prompt, _r=_sub_request_limit, _t=_sub_tool_calls_limit: sub_agent.run(
+                            _p,
                             # Was request_limit=10/tool_calls_limit=20 — too tight for a
                             # genuinely broad investigation in a large codebase, so it hit
                             # UsageLimitExceeded routinely and told the PARENT to split the
@@ -3294,13 +3302,14 @@ def make_tool_callbacks(
                             # so a truly runaway task fails loudly rather than looping
                             # forever — it just needs a materially bigger task to get there.
                             usage_limits=_UsageLimits(
-                                request_limit=_sub_request_limit,
-                                tool_calls_limit=_sub_tool_calls_limit,
+                                request_limit=_r,
+                                tool_calls_limit=_t,
                             ),
                             model_settings=_ModelSettings(
                                 timeout=_providers.model_timeout(
                                     model=summarizer_model, total=90, connect=10, read=90
-                                )
+                                ),
+                                parallel_tool_calls=True,
                             ),
                         ),
                         "explore sub-agent",
@@ -3335,7 +3344,7 @@ def make_tool_callbacks(
                         }
                     )
                     continue
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     # A provider context overflow inside the sub-agent's own
                     # isolated window: its transcript got too big. Resume ONCE
                     # from the cached findings (the prompt + cached results are
@@ -3398,7 +3407,8 @@ def make_tool_callbacks(
                                 model_settings=_ModelSettings(
                                     timeout=_providers.model_timeout(
                                         model=summarizer_model, total=60, connect=10, read=60
-                                    )
+                                    ),
+                                    parallel_tool_calls=True,
                                 ),
                             ),
                             "explore sub-agent",

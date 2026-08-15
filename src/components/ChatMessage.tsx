@@ -262,7 +262,7 @@ const ALWAYS_VISIBLE_TOOLS = new Set([
 ])
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
- *  2+ consecutive read-only/non-mutating tool calls (search/list/fuzzy_find/
+ *  2+ consecutive read-only/non-mutating tool calls (grep/glob/read/
  *  web_search/run_terminal/search_memory) into one ToolGroupView so a
  *  search-heavy turn doesn't stack a full-height row per call. Anything in
  *  ALWAYS_VISIBLE_TOOLS always breaks the run and renders as its own full card

@@ -1,9 +1,11 @@
 import asyncio
-import os, sys
+import os
+import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-import providers
 from pydantic_ai import Agent
+
+import providers
 
 CANDIDATES = {
     "nvidia": ["nvidia/nemotron-mini-4b-instruct", "nvidia/nvidia-nemotron-nano-9b-v2"],
@@ -26,10 +28,10 @@ async def m(kind: str) -> bool:
                 r = await asyncio.wait_for(agent.run("Say OK"), timeout=40)
                 print(f"  completion OK [{model}] -> {r.output!r}")
                 return True
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
                 print(f"  model {model} failed: {type(e).__name__}: {str(e)[:100]}")
         return False
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
         print(f"  !! {type(e).__name__}: {e}")
         return False
 

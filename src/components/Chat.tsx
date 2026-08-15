@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
+import { getActiveProvider, useStore, defaultMaxHistoryFor } from "../lib/store";
 import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
 import {
@@ -260,7 +260,7 @@ export function ChatPanel() {
   const autoSkills = useStore((s) => s.settings.autoSkills === true);
   const setAutoSkills = useStore((s) => s.setAutoSkills);
   const modes = useStore((s) => allModes(s.settings));
-  const maxHistory = provider.maxHistory ?? DEFAULT_MAX_HISTORY;
+  const maxHistory = provider.maxHistory ?? defaultMaxHistoryFor(provider.kind);
   const nvimFile = useStore((s) => s.nvimFile);
   const nvimDiags = useStore((s) => s.nvimDiagnostics);
   const nvimDiagCounts = useMemo(() => {
@@ -2662,15 +2662,11 @@ export function ChatPanel() {
               </button>
             </span>
             <span className="composer-hint">
-              {busy && (
-                <span className={`composer-working${stalled ? " warn" : ""}`}>
-                  {stalled
-                    ? toolRunningRef.current
-                      ? "Tool is still running… (Stop to cancel)"
-                      : "Still waiting for the provider… (Stop to cancel)"
-                    : queuedMsgs.length > 0
-                      ? `Agent is working… ${queuedMsgs.length} queued · Enter steers, no interruption`
-                      : "Agent is working… Enter steers, no interruption"}
+              {busy && stalled && (
+                <span className="composer-working warn">
+                  {toolRunningRef.current
+                    ? "Tool is still running… (Stop to cancel)"
+                    : "Still waiting for the provider… (Stop to cancel)"}
                 </span>
               )}
             </span>

@@ -6,7 +6,7 @@
 
 Codefa is a desktop IDE-style workspace — file explorer, Monaco editor and a
 streaming AI chat — powered by a real **agent** that reads, searches and edits
-your code *itself*, confined to the folder you choose. Bring your own model:
+your code _itself_, confined to the folder you choose. Bring your own model:
 OpenRouter, any OpenAI-compatible API, or a fully local endpoint. Type, or just
 talk (local Whisper). Nothing leaves your machine unless you want it to.
 
@@ -23,7 +23,7 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 ![Electron](https://img.shields.io/badge/Electron-31-47848F?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![Pydantic AI](https://img.shields.io/badge/Pydantic%20AI-v1-8A2BE2)
+![Pydantic AI](https://img.shields.io/badge/Pydantic%20AI-v2-8A2BE2)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 
 </div>
@@ -37,21 +37,21 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 
 ### ✨ Features
 
-| | Feature | Description |
-|---|---|---|
-| 🔌 | **Bring your own model** | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI. |
-| 🤖 | **A real agent, not autocomplete** | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Cycle with `Cmd/Ctrl+M`. |
-| 🛠️ | **Tool-based agent** | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
-| 🎤 | **Voice input** | Hold the mic, speak in Persian or English, get text. Transcription runs on a fully local, offline Whisper model (installed from **Settings → Models**); a live "wave" equalizer animates while recording. |
-| 🧠 | **On-device models** | Manage downloadable models from the UI: Whisper for voice and an embedding model for RAG memory — fully offline. |
-| 📊 | **Live context meter** | The context-usage bar updates in real time using the provider's exact per-request token counts, not an estimate. |
-| 🛟 | **Graceful small-context handling** | Works smoothly even on small 8K local models — history is compacted automatically before context runs out, so the agent keeps going instead of crashing. |
-| 🖥️ | **Full IDE UI** | Resizable file explorer (left), Monaco editor (center), streaming markdown chat with syntax highlighting (right), dark/light theme. |
-| 🌐 | **RTL / LTR** | Persian and English mix correctly in chat — parentheses and arrows are never mirrored, and markdown (bold, headings, lists, tables) still renders properly in RTL. The whole UI and this README support both directions. |
-| 💾 | **Durable storage** | Settings, chat history, skills, connectors and plans are saved safely and never written inside your project. |
-| 🗂️ | **RAG memory** | Notes you ask the agent to remember and saved web pages are embedded and searchable per project — fully offline. |
-| 🔁 | **Streaming + persistence** | Token-by-token streaming replies; multiple parallel chats. |
-| ⌨️ | **Slash commands** | `/compact` (summarize into a running summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`. |
+|     | Feature                             | Description                                                                                                                                                                                                                                                                                     |
+| --- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔌  | **Bring your own model**            | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI.                                                                                                                                            |
+| 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Cycle with `Cmd/Ctrl+M`.                                                                                           |
+| 🛠️  | **Tool-based agent**                | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
+| 🎤  | **Voice input**                     | Hold the mic, speak in Persian or English, get text. Transcription runs on a fully local, offline Whisper model (installed from **Settings → Models**); a live "wave" equalizer animates while recording.                                                                                       |
+| 🧠  | **On-device models**                | Manage downloadable models from the UI: Whisper for voice and an embedding model for RAG memory — fully offline.                                                                                                                                                                                |
+| 📊  | **Live context meter**              | The context-usage bar updates in real time using the provider's exact per-request token counts, not an estimate.                                                                                                                                                                                |
+| 🛟  | **Graceful small-context handling** | Works smoothly even on small 8K local models — history is compacted automatically before context runs out, so the agent keeps going instead of crashing.                                                                                                                                        |
+| 🖥️  | **Full IDE UI**                     | Resizable file explorer (left), Monaco editor (center), streaming markdown chat with syntax highlighting (right), dark/light theme.                                                                                                                                                             |
+| 🌐  | **RTL / LTR**                       | Persian and English mix correctly in chat — parentheses and arrows are never mirrored, and markdown (bold, headings, lists, tables) still renders properly in RTL. The whole UI and this README support both directions.                                                                        |
+| 💾  | **Durable storage**                 | Settings, chat history, skills, connectors and plans are saved safely and never written inside your project.                                                                                                                                                                                    |
+| 🗂️  | **RAG memory**                      | Notes you ask the agent to remember and saved web pages are embedded and searchable per project — fully offline.                                                                                                                                                                                |
+| 🔁  | **Streaming + persistence**         | Token-by-token streaming replies; multiple parallel chats.                                                                                                                                                                                                                                      |
+| ⌨️  | **Slash commands**                  | `/compact` (summarize into a running summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`.                                                                                                                                                                                |
 
 ### 📦 Requirements
 
@@ -93,8 +93,8 @@ npm run dist:linux  # only Linux (AppImage)
 Output lands in `release/`.
 
 > **macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
-> notarized), so the first launch from Finder may show *"CODEFA has been blocked
-> because it may reduce your privacy…"*. This is expected for locally-built apps.
+> notarized), so the first launch from Finder may show _"CODEFA has been blocked
+> because it may reduce your privacy…"_. This is expected for locally-built apps.
 > Fix: right-click the app → **Open** → **Open**. If copied from a download,
 > also clear the quarantine flag:
 >
@@ -124,19 +124,19 @@ Output lands in `release/`.
 
 ### ⌨️ Keyboard shortcuts
 
-| Shortcut         | Action                                        |
-| ---------------- | --------------------------------------------- |
-| `Cmd/Ctrl+Enter` | Send chat message                             |
-| `Cmd/Ctrl+M`     | Cycle agent mode (Ask / Plan / Coder)         |
-| `Cmd/Ctrl+P`     | Quick-open / search overlay (`⌘⇧F` = content grep) |
-| `Cmd/Ctrl+B`     | Toggle sidebar                                |
-| `Cmd/Ctrl+,`     | Open settings                                 |
-| `Cmd/Ctrl+S`     | Save current file                             |
-| `Cmd/Ctrl+T`     | New chat                                      |
-| `Ctrl+X` then `u` | Undo last exchange (tmux-style prefix)       |
-| `Ctrl+X` then `r` | Redo last undone exchange (tmux-style prefix) |
-| `Ctrl+X` then `c` | Compact the chat context (tmux-style prefix)  |
-| `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)     |
+| Shortcut              | Action                                             |
+| --------------------- | -------------------------------------------------- |
+| `Cmd/Ctrl+Enter`      | Send chat message                                  |
+| `Cmd/Ctrl+M`          | Cycle agent mode (Ask / Plan / Coder)              |
+| `Cmd/Ctrl+P`          | Quick-open / search overlay (`⌘⇧F` = content grep) |
+| `Cmd/Ctrl+B`          | Toggle sidebar                                     |
+| `Cmd/Ctrl+,`          | Open settings                                      |
+| `Cmd/Ctrl+S`          | Save current file                                  |
+| `Cmd/Ctrl+T`          | New chat                                           |
+| `Ctrl+X` then `u`     | Undo last exchange (tmux-style prefix)             |
+| `Ctrl+X` then `r`     | Redo last undone exchange (tmux-style prefix)      |
+| `Ctrl+X` then `c`     | Compact the chat context (tmux-style prefix)       |
+| `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)           |
 
 ### 🏛️ Architecture
 
@@ -173,21 +173,21 @@ Output lands in `release/`.
 
 ### ✨ امکانات
 
-|  | ویژگی | توضیح |
-|---|---|---|
-| 🔌 | **مدل‌تان را خودتان بیاورید** | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است. |
-| 🤖 | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Cmd/Ctrl+M` میان‌شان بچرخید. |
-| 🛠️ | **عاملِ ابزارمحور** | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
-| 🎤 | **ورودی صوتی** | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا با مدلِ کاملاً محلی و آفلاینِ Whisper به متن تبدیل می‌شود (از تب **تنظیمات ← مدل‌ها** نصب می‌شود). هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود. |
-| 🧠 | **مدل‌های روی دستگاه** | مدل‌های قابل دانلود از خودِ رابط کاربری مدیریت می‌شوند: Whisper برای صدا و یک مدل جاساز (embedding) برای حافظهٔ RAG — کاملاً آفلاین. |
-| 📊 | **نوار استفادهٔ بافتِ زنده** | نوار مصرف بافت در لحظه و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز می‌شود، نه برآورد. |
-| 🛟 | **مدیریت هوشمند بافتِ کم** | حتی با مدل‌های کوچک محلی (مثلاً ۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن بافت، تاریخچه به‌طور خودکار فشرده می‌شود تا به‌جای توقف، کار پیش برود. |
-| 🖥️ | **رابطی به بلندِ یک IDE** | کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco (وسط) و چتِ مارک‌داون با هایلایت سینتکس (راست)، به‌همراه تم تیره و روشن. |
-| 🌐 | **راست‌به‌چپ / چپ‌به‌راست** | ترکیب فارسی و انگلیسی در چت درست نمایش داده می‌شود — پرانتزها و فلش‌ها برعکس نمی‌شوند و مارک‌داون (بولد، تیتر، لیست، جدول) در متن راست‌به‌چپ هم درست رندر می‌شود. رابط کاربری و همین مستندات هر دو دوزبانه‌اند. |
-| 💾 | **ذخیره‌سازی ماندگار** | تنظیمات، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌ها و برنامه‌ها به‌شکل امن ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما نوشته نمی‌شوند. |
-| 🗂️ | **حافظهٔ RAG** | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد و صفحات وبِ ذخیره‌شده، برای هر پروژه جاساز و قابل جستجو می‌شوند — کاملاً آفلاین. |
-| 🔁 | **استریم و ماندگاری** | پاسخ‌ها قطعه‌به‌قطعه می‌رسند؛ چند گفتگوی موازی. |
-| ⌨️ | **دستورهای اسلش** | `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`، `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`. |
+|     | ویژگی                          | توضیح                                                                                                                                                                                                                                                                                        |
+| --- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔌  | **مدل‌تان را خودتان بیاورید**  | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است.                                                                                                                        |
+| 🤖  | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Cmd/Ctrl+M` میان‌شان بچرخید.                                                                      |
+| 🛠️  | **عاملِ ابزارمحور**            | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
+| 🎤  | **ورودی صوتی**                 | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا با مدلِ کاملاً محلی و آفلاینِ Whisper به متن تبدیل می‌شود (از تب **تنظیمات ← مدل‌ها** نصب می‌شود). هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود.                                                                 |
+| 🧠  | **مدل‌های روی دستگاه**         | مدل‌های قابل دانلود از خودِ رابط کاربری مدیریت می‌شوند: Whisper برای صدا و یک مدل جاساز (embedding) برای حافظهٔ RAG — کاملاً آفلاین.                                                                                                                                                         |
+| 📊  | **نوار استفادهٔ بافتِ زنده**   | نوار مصرف بافت در لحظه و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز می‌شود، نه برآورد.                                                                                                                                                                                     |
+| 🛟  | **مدیریت هوشمند بافتِ کم**     | حتی با مدل‌های کوچک محلی (مثلاً ۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن بافت، تاریخچه به‌طور خودکار فشرده می‌شود تا به‌جای توقف، کار پیش برود.                                                                                                                                     |
+| 🖥️  | **رابطی به بلندِ یک IDE**      | کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco (وسط) و چتِ مارک‌داون با هایلایت سینتکس (راست)، به‌همراه تم تیره و روشن.                                                                                                                                                             |
+| 🌐  | **راست‌به‌چپ / چپ‌به‌راست**    | ترکیب فارسی و انگلیسی در چت درست نمایش داده می‌شود — پرانتزها و فلش‌ها برعکس نمی‌شوند و مارک‌داون (بولد، تیتر، لیست، جدول) در متن راست‌به‌چپ هم درست رندر می‌شود. رابط کاربری و همین مستندات هر دو دوزبانه‌اند.                                                                              |
+| 💾  | **ذخیره‌سازی ماندگار**         | تنظیمات، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌ها و برنامه‌ها به‌شکل امن ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما نوشته نمی‌شوند.                                                                                                                                                              |
+| 🗂️  | **حافظهٔ RAG**                 | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد و صفحات وبِ ذخیره‌شده، برای هر پروژه جاساز و قابل جستجو می‌شوند — کاملاً آفلاین.                                                                                                                                                            |
+| 🔁  | **استریم و ماندگاری**          | پاسخ‌ها قطعه‌به‌قطعه می‌رسند؛ چند گفتگوی موازی.                                                                                                                                                                                                                                              |
+| ⌨️  | **دستورهای اسلش**              | `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`، `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`.                                                                                                                                                                             |
 
 ### 📦 پیش‌نیازها
 
@@ -229,8 +229,8 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 خروجی در پوشهٔ `release/` قرار می‌گیرد.
 
 > **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
-> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار *«CODEFA به
-> خاطر کاهش حریم خصوصی مسدود شده است»* را نشان دهد. این برای برنامه‌های
+> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«CODEFA به
+> خاطر کاهش حریم خصوصی مسدود شده است»_ را نشان دهد. این برای برنامه‌های
 > ساخته‌شدهٔ محلی طبیعی است. راه‌حل: روی برنامه کلیک راست کنید ← **Open** ←
 > **Open**. اگر از اینترنت کپی شده است، فلگ قرنطینه را هم پاک کنید:
 >
@@ -243,19 +243,19 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 ۱. روی **باز کردن پوشه** کلیک کنید (یا `Cmd/Ctrl+O`) و ریشهٔ پروژه را انتخاب کنید.
 
 ۲. تنظیمات را باز کنید (`Cmd/Ctrl+,`). به OpenRouter، یک API سازگار با OpenAI
-   یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه
-   را وارد کنید و مدل را برگزینید.
+یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه
+را وارد کنید و مدل را برگزینید.
 
 ۳. حالتِ عامل را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
 
 ۴. پیام خود را بنویسید و `Cmd/Ctrl+Enter` را بزنید (یا دکمهٔ میکروفون را
-   فشار دهید). عامل پاسخ را زنده نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از
-   ابزارهایش بهره می‌گیرد — همیشه فقط در همان پوشه‌ای که باز کرده‌اید. در حالتِ
-   برنامه، برنامهٔ نهایی برای همان پروژه ذخیره و در اجرای بعدیِ حالت
-   برنامه/نویسندهٔ کد خودکار بارگذاری می‌شود. اگر از عامل بخواهید مهارت‌ها یا
-   اتصال‌های MCP را نصب کند (از یک مخزن، صفحهٔ مستندات و …)، آن‌ها را داخل خودِ
-   برنامه ذخیره می‌کند — حتی اگر دستورالعملِ منبع چنین بگوید، در پوشه‌های
-   پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد.
+فشار دهید). عامل پاسخ را زنده نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از
+ابزارهایش بهره می‌گیرد — همیشه فقط در همان پوشه‌ای که باز کرده‌اید. در حالتِ
+برنامه، برنامهٔ نهایی برای همان پروژه ذخیره و در اجرای بعدیِ حالت
+برنامه/نویسندهٔ کد خودکار بارگذاری می‌شود. اگر از عامل بخواهید مهارت‌ها یا
+اتصال‌های MCP را نصب کند (از یک مخزن، صفحهٔ مستندات و …)، آن‌ها را داخل خودِ
+برنامه ذخیره می‌کند — حتی اگر دستورالعملِ منبع چنین بگوید، در پوشه‌های
+پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد.
 
 > 💡 «مسیر داده» برنامه قابل تنظیم است و پیش‌فرض آن در هر سیستم‌عاملی
 > `~/.codefa` است: `~/.codefa` (مک)، `/home/<user>/.codefa` (لینوکس) و
@@ -264,20 +264,20 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 
 ### ⌨️ میان‌برهای صفحه‌کلید
 
-| میان‌بر            | کارکرد                             |
-| ------------------ | ---------------------------------- |
-| `Cmd/Ctrl+Enter` | ارسال پیام گفتگو                    |
-| `Cmd/Ctrl+M`     | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
-| `Cmd/Ctrl+P`     | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا) |
-| `Cmd/Ctrl+B`     | نمایش/پنهان‌کردن نوار کناری         |
-| `Cmd/Ctrl+,`     | باز کردن تنظیمات                    |
-| `Cmd/Ctrl+S`     | ذخیرهٔ فایل جاری                    |
-| `Cmd/Ctrl+T`     | گفتگوی تازه                         |
-| `Ctrl+X` و سپس `u` | بازگردانی آخرین تبادل (پیشوندِ سبک tmux) |
-| `Ctrl+X` و سپس `r` | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
-| `Ctrl+X` و سپس `c` | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux) |
-| `Ctrl+X` و سپس `x` | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux) |
-| `Ctrl+X` و سپس `Space` | نگه‌داشتن Space برای ضبط صدا (پیشوندِ سبک tmux) |
+| میان‌بر                | کارکرد                                                |
+| ---------------------- | ----------------------------------------------------- |
+| `Cmd/Ctrl+Enter`       | ارسال پیام گفتگو                                      |
+| `Cmd/Ctrl+M`           | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
+| `Cmd/Ctrl+P`           | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا)    |
+| `Cmd/Ctrl+B`           | نمایش/پنهان‌کردن نوار کناری                           |
+| `Cmd/Ctrl+,`           | باز کردن تنظیمات                                      |
+| `Cmd/Ctrl+S`           | ذخیرهٔ فایل جاری                                      |
+| `Cmd/Ctrl+T`           | گفتگوی تازه                                           |
+| `Ctrl+X` و سپس `u`     | بازگردانی آخرین تبادل (پیشوندِ سبک tmux)              |
+| `Ctrl+X` و سپس `r`     | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `c`     | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux)            |
+| `Ctrl+X` و سپس `x`     | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux)        |
+| `Ctrl+X` و سپس `Space` | نگه‌داشتن Space برای ضبط صدا (پیشوندِ سبک tmux)       |
 
 ### 🏛️ معماری
 

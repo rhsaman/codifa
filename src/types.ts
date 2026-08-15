@@ -12,7 +12,7 @@ export interface RecentModel {
 /** Per-mode tool access. Sent to the backend so tool gating is data-driven
  *  instead of hardcoded to mode names — lets anyone add custom modes. */
 export interface ModeCapabilities {
-  readFiles: boolean // list / search / fuzzy_find
+  readFiles: boolean // list / search (grep/glob)
   writeFiles: boolean // write_file / edit_file
   runTerminal: boolean // run_terminal
   web: boolean // web_search / fetch_url

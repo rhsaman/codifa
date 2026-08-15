@@ -164,7 +164,21 @@ function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][
   return st
 }
 
-export const DEFAULT_MAX_HISTORY = 15
+/** Default "Messages to remember" (cloud/global). Local providers (ollama) use
+ *  a smaller default (see `defaultMaxHistoryFor`), since their models usually
+ *  have small context windows. */
+export const DEFAULT_MAX_HISTORY = 10
+
+/** Local providers keep far fewer past messages by default — a small local
+ *  model's context window is quickly flooded by several verbose tool-loop turns. */
+export const LOCAL_MAX_HISTORY = 3
+
+/** Resolve the default "Messages to remember" for a provider kind: local
+ *  providers get `LOCAL_MAX_HISTORY`, everything else `DEFAULT_MAX_HISTORY`.
+ *  An explicit per-provider `maxHistory` always overrides this at call sites. */
+export function defaultMaxHistoryFor(kind: ProviderKind | undefined | null): number {
+  return PROVIDER_META[kind ?? 'custom']?.local ? LOCAL_MAX_HISTORY : DEFAULT_MAX_HISTORY
+}
 
 export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.name]),

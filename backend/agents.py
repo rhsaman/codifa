@@ -17,6 +17,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import traceback
 import warnings
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -46,7 +47,9 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ThinkingPart,
     ThinkingPartDelta,
+    ToolCallPart,
     ToolReturn,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.settings import ModelSettings
@@ -58,6 +61,7 @@ import state_db
 from context_builder import build_context
 from providers import (
     OPENCODE_UA,
+    _expand_base,
     _provider_meta,
     build_model,
     is_opencode,
@@ -79,7 +83,8 @@ from tools import (
     make_tool_callbacks,
     open_skill_store,
     open_vector_store,
-    read_file,    remember,
+    read_file,
+    remember,
     resolve_safe,
     slugify,
     user_coder_dir,
@@ -211,26 +216,11 @@ def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
 # Plan mode's OWN grep/glob calls are capped in CODE, not just prompt wording —
 # "TOOL-CALL DISCIPLINE" language alone is not reliably followed by weaker
 # models (prompt enforcement != model compliance). After the limit, further
-# calls are refused with an error that points at `explore` (whose search steps
-# run in an isolated sub-agent and never bloat the parent's resent transcript),
-# so an investigation-heavy plan turn can't quietly burn tokens on many shallow
+# calls are auto-delegated to `explore` (whose search steps run in an isolated
+# sub-agent and never bloat the parent's resent transcript), so an
+# investigation-heavy plan turn can't quietly burn tokens on many shallow
 # searches of its own.
 _PLAN_OWN_SEARCH_LIMIT = 15
-# Content-gathering tasks (restyle/refactor/rewrite — see tools._is_content_gathering)
-# need the parent to pull verbatim code from SEVERAL already-known files. Pushing
-# those through explore forces report-compressed summaries into a loop (the observed
-# 10-15 round styling-task thrash). Give the parent enough own-search quota to
-# gather content itself; open-ended "find where X is" investigations stay delegated.
-_PLAN_CONTENT_OWN_SEARCH_LIMIT = 25
-
-
-def _search_limit_msg(limit: int) -> str:
-    return (
-        f"ERROR: you already used your {limit} own grep/glob "
-        "calls for this turn. Delegate any further investigation to the `explore` tool "
-        "— it runs in an isolated sub-agent, so its search steps cost IT context, not you. If you "
-        "already have enough to answer, stop scouting now and give your answer."
-    )
 
 
 def _wrap_limited_grep(
@@ -239,11 +229,38 @@ def _wrap_limited_grep(
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
     tool: str = "grep",
+    delegate: Callable | None = None,
 ):
     async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
-            msg = _search_limit_msg(limit)
+            # Prompt wording alone is not reliably followed by weaker models:
+            # an over-quota search that would otherwise be DENIED with a "use
+            # explore" note is instead AUTO-DELEGATED to the explore sub-agent
+            # exactly once (isolated context). This is what actually guarantees
+            # the sub-agent gets used when the parent over-searches itself.
+            if counter["n"] == limit + 1 and delegate is not None:
+                task = (
+                    f"Find every occurrence matching the pattern {pattern!r}"
+                    f"{f' restricted to {path!r}' if path else ' across the workspace'}"
+                    f"{f' with file-type filter {include!r}' if include else ''}"
+                    " and report the file:line locations with a short snippet for each, "
+                    "plus a one-paragraph summary of what you found and which files matter."
+                )
+                try:
+                    report = await delegate(task=task, path_hint=path, hints=include)
+                except Exception as exc:  # noqa: BLE001
+                    report = f"ERROR: delegated search failed: {exc}"
+                return (
+                    "[NOTE: your own grep/glob budget for this turn is used up — this "
+                    "search was delegated to the explore sub-agent (isolated context).]\n\n"
+                    + report
+                )
+            msg = (
+                "ERROR: your own grep/glob calls for this turn are used up and the broad "
+                "search was already delegated to the explore sub-agent — read its report "
+                "above and stop making more grep/glob calls."
+            )
             if emit is not None:
                 emit(
                     {
@@ -272,11 +289,32 @@ def _wrap_limited_glob(
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
     tool: str = "glob",
+    delegate: Callable | None = None,
 ):
     async def wrapped(pattern: str, path: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
-            msg = _search_limit_msg(limit)
+            if counter["n"] == limit + 1 and delegate is not None:
+                task = (
+                    f"Find all files matching the glob pattern {pattern!r}"
+                    f"{f' under {path!r}' if path else ' in the workspace'}"
+                    " and report the matching paths with a short description of each, "
+                    "plus a one-paragraph summary of what you found and which files matter."
+                )
+                try:
+                    report = await delegate(task=task, path_hint=path)
+                except Exception as exc:  # noqa: BLE001
+                    report = f"ERROR: delegated search failed: {exc}"
+                return (
+                    "[NOTE: your own grep/glob budget for this turn is used up — this "
+                    "search was delegated to the explore sub-agent (isolated context).]\n\n"
+                    + report
+                )
+            msg = (
+                "ERROR: your own grep/glob calls for this turn are used up and the broad "
+                "search was already delegated to the explore sub-agent — read its report "
+                "above and stop making more grep/glob calls."
+            )
             if emit is not None:
                 emit({"kind": "tool", "tool": tool, "args": {"pattern": pattern, "path": path}})
                 emit(
@@ -538,9 +576,12 @@ def _search_bypass_reject(command: str) -> str | None:
     prog = str(tokens[0]).split("/")[-1].split()[0]
     if prog in _SEARCH_BYPASS_PROGS:
         return _SEARCH_BYPASS_MSG.format(prog=prog)
-    if prog in ("python", "python3") and ("-c" in tokens or "-m" in tokens):
-        if _PY_WALK_RE.search(command):
-            return _SEARCH_BYPASS_MSG.format(prog="a python file-search one-liner")
+    if (
+        prog in ("python", "python3")
+        and ("-c" in tokens or "-m" in tokens)
+        and _PY_WALK_RE.search(command)
+    ):
+        return _SEARCH_BYPASS_MSG.format(prog="a python file-search one-liner")
     return None
 
 
@@ -567,10 +608,94 @@ def _wrap_no_search_bypass(fn: Callable):
 # usage reports the exact model.
 _OPENROUTER_FREE_FALLBACK = "openrouter/free"
 
+
+def _subagent_target(
+    entry: str,
+    parent_provider: str,
+    parent_base_url: str,
+    parent_api_key: str,
+    parent_env_var: str,
+    parent_oauth_token: str,
+    provider_lookup: Callable[[str], dict | None],
+) -> tuple[str, str, str, str, str, str] | None:
+    """Resolve a subagent model entry to (provider_kind, model, base_url,
+    api_key, env_var, oauth_token), or None to use the parent model.
+
+    ``entry`` may be a bare model id ("Qwen3.5-4B-Q4_K_S.gguf") resolved
+    against the parent provider, or a "providerId/model" pair routing the
+    subagent through that provider's own base URL / key. A legacy leading
+    "providerKind/" prefix (from the old UI picker labels) is dropped when
+    it matches the parent provider or a configured provider id.
+
+    ``provider_lookup(pid)`` returns the saved Settings → Providers row for an
+    id, or None. A prefixed entry whose head is NOT a saved row but IS a known
+    built-in gateway kind (e.g. "openrouter/free" while the parent is the
+    opencode gateway and OpenRouter auth is env-only) still routes through
+    that kind's own defaults — built-in base URL and the env credential chain
+    (build_model reads OPENROUTER_API_KEY etc.) — so a manually-entered model
+    is honored instead of being dumped onto the parent provider.
+    """
+    entry = (entry or "").strip()
+    if not entry:
+        return None
+    pid: str | None = None
+    model_part = entry
+    p: dict | None = None
+    if "/" in entry:
+        head, _, tail = entry.partition("/")
+        if head and tail:
+            row = provider_lookup(head)
+            if row is not None:
+                # Saved provider row wins (its stored key/base/oauth apply).
+                pid, model_part, p = head, tail, row
+            elif head == parent_provider:
+                # Parent-kind prefix: keep the PARENT's own base/key/oauth.
+                model_part = tail
+            elif _provider_meta(head).get("base_url"):
+                # Known built-in gateway kind with no saved row (env-var-only
+                # auth). Resolve through the kind's defaults; the credential
+                # comes from the env chain inside build_model.
+                meta = _provider_meta(head)
+                pid, model_part = head, tail
+                p = {
+                    "id": head,
+                    "kind": head,
+                    "baseUrl": _expand_base(meta.get("base_url") or "", head),
+                    "apiKey": "",
+                    "envVar": "",
+                    "oauthRefreshToken": "",
+                }
+        if p is None and pid:
+            p = provider_lookup(pid)
+    if p is not None:
+        kind = p.get("kind") or "custom"
+        # A legacy/typo'd entry may carry the provider prefix TWICE
+        # ("openrouter/openrouter/free") — collapse it to the bare model id
+        # before routing, so the "free" shortcut (and any real model) still
+        # resolves through its own provider.
+        own_prefix = f"{p.get('id') or pid}/"
+        while model_part.startswith(own_prefix):
+            model_part = model_part[len(own_prefix):]
+        # OpenRouter model ids must include the upstream vendor
+        # ("vendor/model"), so a bare "free" shortcut can't build. Resolve
+        # it to the exact id the user picked — `openrouter/free`, OpenRouter's
+        # Free Models Router — instead of silently falling back to the parent.
+        if kind == "openrouter" and "/" not in model_part:
+            model_part = _OPENROUTER_FREE_FALLBACK
+        return (
+            kind,
+            model_part,
+            p.get("baseUrl") or "",
+            p.get("apiKey") or "",
+            p.get("envVar") or "",
+            p.get("oauthRefreshToken") or "",
+        )
+    return (parent_provider, model_part, parent_base_url, parent_api_key, parent_env_var, parent_oauth_token)
+
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use glob for filenames (patterns like `**/*.ts` or `src/*.py`), grep for content (regex, optionally with include to filter extensions), and read to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. Use glob to find files by name pattern; run_terminal to build/test/lint. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. CODE QUALITY: respect the project's layering and conventions, DRY, no hardcoded values, clean linted code; fix any error you introduce and leave the codebase clean.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode.",
+    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use glob for filenames (patterns like `**/*.ts` or `src/*.py`), grep for content (regex, optionally with include to filter extensions), and read to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
+    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. Use glob to find files by name pattern; run_terminal to build/test/lint. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. CODE QUALITY: respect the project's layering and conventions, DRY, no hardcoded values, clean linted code; fix any error you introduce and leave the codebase clean. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
 }
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -611,6 +736,7 @@ async def _settings_for(
     api_key: str = "",
     env_var: str = "",
     oauth_token: str = "",
+    scope: str = "",
 ) -> ModelSettings:
     """Model settings tuned to the mode, provider and the model's context window.
 
@@ -620,7 +746,9 @@ async def _settings_for(
     explicit ``thinking`` (they usually can't honor it). An explicit user
     ``thinking_level`` overrides. Free-tier models never get ``thinking`` either
     way, since free routers commonly reject the parameter and return an empty
-    response.
+    response. ``scope`` (narrow/broad/content, see ``_task_scope``) tightens the
+    output budget for narrow/targeted tasks — the answer is short and the code
+    lands via tool results, so a large reply ceiling just invites verbose filler.
     """
     base = dict(MODEL_SETTINGS.get(mode, MODEL_SETTINGS["ask"]))
     if ctx > 0:
@@ -648,6 +776,12 @@ async def _settings_for(
             max_tokens = min(max(1_024, ctx // 4), _MAX_OUTPUT_TOKENS)
         if mode == "ask":
             max_tokens = min(max_tokens, 8_000)
+        # Narrow/targeted tasks produce a short, direct answer — code lands via
+        # tool results, not the reply — so a tighter output ceiling saves real
+        # output tokens without hurting quality. Broad/content tasks keep the
+        # full budget (their replies can legitimately be longer).
+        if scope == "narrow":
+            max_tokens = min(max_tokens, _NARROW_OUTPUT_CAP)
         base["max_tokens"] = max_tokens
     # opencode's zen gateway streams CUMULATIVE usage on every chunk (not just
     # the final one). pydantic-ai's default is to SUM per-chunk usage, which
@@ -669,6 +803,16 @@ async def _settings_for(
         base["openrouter_cache_instructions"] = True
         base["openrouter_cache_tool_definitions"] = True
         base["openrouter_cache_messages"] = True
+    # Explicitly encourage the model to batch multiple tool calls into one response
+    # (the searches/reads the turn already knows it needs) instead of firing them
+    # one at a time — each separate round-trip re-sends the whole accumulated
+    # transcript. pydantic-ai already executes tool calls concurrently once they're
+    # emitted; this gets the model to EMIT several in the first place. Gated by the
+    # provider allowlist: only OpenAI-compatible cloud gateways receive it, so local
+    # (ollama) and google never see a field their API could reject. The OpenAI
+    # adapter only forwards it when the request has tools at all.
+    if _provider_meta(provider).get("parallel_calls"):
+        base["parallel_tool_calls"] = True
     is_free = "free" in (model or "").lower()
     if ctx > 0 and _provider_meta(provider).get("auto_think") and not is_free:
         if ctx <= 16_000:
@@ -713,6 +857,13 @@ _RETRY_BASE_SECONDS = 30
 _THROTTLE_BASE_SECONDS = 30
 _THROTTLE_MAX_SECONDS = 30
 _THROTTLE_MAX_ATTEMPTS = 10
+# Durable interrupted-turn resume: how many completed tool records to keep per
+# chat, how much of each result to retain, and how long a saved resume file is
+# considered "recent" (so a stale file from a long-abandoned chat never gets
+# injected into an unrelated new question).
+_RESUME_MAX_TOOLS = 12
+_RESUME_RESULT_MAX = 6_000
+_RESUME_MAX_AGE_SECONDS = 24 * 60 * 60
 _RETRYABLE_PHRASES = (
     "rate limit",
     "ratelimit",
@@ -995,6 +1146,12 @@ DEFAULT_CONTEXT_WINDOW_FLOOR = 32_000
 # coding assistant; many providers reject larger values outright.
 _MAX_OUTPUT_TOKENS = 8_192
 
+# Output-token ceiling for NARROW/targeted turns (see _task_scope + _settings_for).
+# A targeted lookup/fix needs a short direct reply — the code itself is written
+# through write_file/edit_file tool results, not the model's text — so capping
+# its reply saves real (often expensive) output tokens while keeping full quality.
+_NARROW_OUTPUT_CAP = 2_048
+
 
 def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
     """Convert plain {role, content} turns to pydantic-ai messages."""
@@ -1024,6 +1181,38 @@ def _to_model_messages(history: list[dict]) -> list[ModelMessage]:
             messages.append(ModelResponse(parts=parts or [TextPart(content="")]))
         elif role == "user":
             messages.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+        elif role == "resume_tool":
+            # A completed tool call replayed from a previous INTERRUPTED turn of
+            # this chat (see the run_agent resume injection): emit it as a real
+            # tool-call ModelResponse + the matching tool-return ModelRequest so
+            # the model structurally sees the work already done with its actual
+            # result. The instruction note travels as a separate system turn.
+            tool = str(turn.get("tool", "")).strip()
+            if not tool:
+                continue
+            call_id = str(turn.get("call_id") or f"resume-{len(messages)}")
+            messages.append(
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=tool,
+                            args=_json_safe(turn.get("args")) or {},
+                            tool_call_id=call_id,
+                        )
+                    ]
+                )
+            )
+            messages.append(
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name=tool,
+                            content=str(turn.get("result") or ""),
+                            tool_call_id=call_id,
+                        )
+                    ]
+                )
+            )
     return messages
 
 
@@ -1072,6 +1261,68 @@ def _plan_reuse_note(history: list[dict]) -> str:
             f"{rule}\n"
             "If the checklist does not match the current task, replace it with a new one.\n"
             f"EXISTING CHECKLIST:\n{numbered}"
+        )
+    return ""
+
+
+# Path-like token scan for extracting file references from a Plan-mode message's
+# prose (mirrors `_task_has_explicit_file`'s pattern). The reliable source is the
+# plan's own trailing `Files:` line, but plans written before that contract don't
+# have one, so prose + checklist items are scanned as a fallback.
+_PLAN_PATH_RE = re.compile(
+    r"(?:[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh))"
+)
+
+
+def _plan_discovery_note(history: list[dict]) -> str:
+    """Build a no-rediscovery instruction for a Coder turn that follows a Plan.
+
+    Plan mode already answered WHICH files are relevant. Coder only needs to
+    verify their current content before editing — re-running glob/grep/explore to
+    rediscover them wastes tokens and repeats work. Walks ``history`` backward
+    for the latest Plan-mode assistant message, extracts the file paths it
+    identified (its trailing ``Files:`` line, else a regex scan of the plan prose
+    and checklist items), and returns a short instruction naming those paths.
+    Returns "" when no plan or no paths were found.
+    """
+    for turn in reversed(history):
+        if turn.get("role") != "assistant":
+            continue
+        content = str(turn.get("content", ""))
+        is_plan = turn.get("mode") == "plan" or content.lstrip().startswith("## Plan")
+        if not is_plan:
+            continue
+        paths: list[str] = []
+        files_line = re.search(
+            r"(?:^|\n)[ \t]*Files?[ \t]*:[ \t]*(.+?)[ \t]*\r?$",
+            content,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if files_line:
+            raw = files_line.group(1)
+            for part in re.split(r"[,\n]", raw):
+                p = part.strip().strip("`")
+                if p and len(p) < 160:
+                    paths.append(p)
+        if not paths:
+            candidates = list(_PLAN_PATH_RE.findall(content))
+            for it in (turn.get("plan") or []):
+                if isinstance(it, dict):
+                    candidates += _PLAN_PATH_RE.findall(str(it.get("content", "")))
+            paths = candidates
+        uniq: list[str] = []
+        for p in paths:
+            if p not in uniq:
+                uniq.append(p)
+        paths = uniq[:12]
+        if not paths:
+            continue
+        joined = ", ".join(f"`{p}`" for p in paths)
+        return (
+            "A Plan-mode message earlier in this conversation already identified these files as "
+            f"relevant: {joined}. Do NOT re-run glob/grep/explore to rediscover WHICH files matter — "
+            "go straight to read/grep on these exact paths to verify their current content before "
+            "editing. Only use glob/explore for files Plan did not name."
         )
     return ""
 
@@ -1146,6 +1397,25 @@ def _fmt_log_args(args: Any) -> str:
 
 def _event_delta(text: str) -> dict:
     return {"kind": "text", "content": text}
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce a tool-arg value into JSON-serializable form.
+
+    Tool args come from the model's JSON schema (already serializable), but a
+    tool wrapper may hand us richer objects (paths, datetime, enums), so coerce
+    anything unrecognized to its string form rather than failing the write.
+    """
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 # Compact log of tool work performed so far in the CURRENT turn. Fed back as a
@@ -1676,7 +1946,7 @@ def _load_learned_memory(store: VectorStore | None, query: str = "") -> str:
             for kw in _fts_keywords(query):
                 try:
                     hits = store.fts_search(kw, KIND_MEMORY, top_k=2)
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001, S112 — a failed term just contributes no hits
                     continue
                 if hits:
                     # Keep only the single best hit per keyword — the 2nd/3rd
@@ -1876,7 +2146,7 @@ def _needs_workspace(prompt: str) -> bool:
         r"(ReferenceError|TypeError|SyntaxError|RangeError|Uncaught (?:Error|Exception)|"
         r"Error Domain=|Traceback \(most recent call last\)|\bpanic:|\bERROR:)",
         text,
-        re.I,
+        re.IGNORECASE,
     ):
         # A named external source settles it — external, no scouting — UNLESS
         # the same message also ties the log to this project ("خطای لاگ از
@@ -1910,11 +2180,11 @@ def _needs_workspace(prompt: str) -> bool:
         r"|(Traceback \(most recent call last\))"
         r"|\bpanic\b",
         text,
-        re.I,
+        re.IGNORECASE,
     ) and re.search(
         r"what is|what does|what's|why|how do|چیه|چیست|چرا|مشکل|خطا|اشکال|علت|چه",
         text,
-        re.I,
+        re.IGNORECASE,
     ):
         # Project hook? A path or a dotted code-extension token means the user
         # IS pointing at project files — keep scouting for those.
@@ -2154,7 +2424,7 @@ def _scout_signature(root: str) -> str:
         try:
             full = resolve_safe(root, key)
             parts.append(f"{key}:{os.path.getmtime(full)}")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112 — unreadable key just isn't part of the fingerprint
             continue
     return "|".join(parts)
 
@@ -2578,7 +2848,6 @@ async def _maybe_auto_memory(
         return False
 
     try:
-        from httpx import Timeout
         from pydantic_ai import Agent
         from pydantic_ai.settings import ModelSettings
 
@@ -2796,19 +3065,23 @@ def _auto_select_skills(
     skills: list[dict],
     prompt: str,
     top_k: int = 3,
-    rel_gap: float = 0.03,
+    rel_gap: float = 0.015,
+    min_abs: float = 0.76,
 ) -> list[dict]:
     """Pick the most relevant skills for ``prompt`` via RAG similarity.
 
     Skill passages must already be indexed in the store (see
-    ``_sync_skills_to_store``). Mean-pooled e5 cosine sits in a compressed band
-    (everything scores ~0.8), so an absolute similarity floor can't separate a
-    real match from noise. Instead we use a scale-free *relative* gate: the top
-    score must beat the average score across ALL skills by ``rel_gap``
-    (confirmed against the real skill set: genuine matches clear ~0.03,
-    unrelated requests stay under it). Candidates are mapped back to the loaded
-    skill dicts by their ``path`` key. Falls back to ``[]`` (no skills) when the
-    store is unavailable or nothing clears the gate — never raises.
+    ``_sync_skills_to_store``). Mean-pooled e5 cosine sits in a compressed band:
+    genuine matches score ~0.79-0.83 while noise (greetings, small talk) lands
+    below ~0.75, so a *relative* gate alone is too fragile — the top candidate
+    must clear an absolute floor (``min_abs``) AND the best score should beat
+    the average by at least ``rel_gap`` (tail near-ties within the gap are kept
+    as candidates). Measured on the real skill set: a landing-page request tops
+    out at ~0.80 (previously missed at a 0.03 gap) while "سلام" stays at ~0.74
+    and is correctly dropped. A single installed skill still works (no minimum
+    candidate count). Candidates are mapped back to the loaded skill dicts by
+    their ``path`` key. Falls back to ``[]`` when the store is unavailable or
+    nothing clears the gate — never raises.
     """
     if not prompt or not skills or store is None:
         return []
@@ -2816,7 +3089,7 @@ def _auto_select_skills(
     try:
         # Ask for several chunks per skill: each skill is stored as multiple
         # passages, so a top_k equal to the skill count can collapse to a single
-        # skill after dedup and wrongly trip the len(scores) < 2 gate below.
+        # skill after dedup.
         hits = store.search(
             prompt, kind=KIND_SKILL, top_k=max(len(skills) * 4, 8), min_score=0.0
         )
@@ -2830,16 +3103,21 @@ def _auto_select_skills(
             continue
         seen.add(key)
         scores.append((float(hit.get("score", 0.0)), key))
-    if len(scores) < 2:
-        return []
     scores.sort(key=lambda x: x[0], reverse=True)
-    mean = sum(s for s, _ in scores) / len(scores)
+    if not scores:
+        return []
+    best_score = scores[0][0]
+    # Absolute gate: a compressed-band top score means the prompt didn't
+    # genuinely match anything (greetings, small talk) — do not attach a skill.
+    if best_score < min_abs:
+        return []
     # Relative gate: unusable unless the best skill clearly stands out.
-    if scores[0][0] - mean < rel_gap:
+    mean = sum(s for s, _ in scores) / len(scores)
+    if best_score - mean < rel_gap:
         return []
     picked: list[dict] = []
     for score, key in scores[:top_k]:
-        if score < scores[0][0] - rel_gap:  # drop the long tail of near-ties
+        if score < best_score - rel_gap:  # drop the long tail of near-ties
             break
         skill = by_path[key]
         if skill not in picked:
@@ -3028,7 +3306,8 @@ _MODE_OUTPUT = {
     "plan": (
         "Your reply MUST be an implementation plan: open with '## Plan', then ordered steps with exact file paths "
         "and line targets, targeted snippets for Coder mode, and how to verify — never do the work, and end by "
-        "offering to switch to Coder mode to implement it."
+        "offering to switch to Coder mode to implement it. End the plan with a 'Files: path1, path2, ...' line "
+        "listing every file the implementation will touch."
     ),
     "coder": "",
 }
@@ -3336,47 +3615,15 @@ async def run_agent(
         "providerKind/" prefix (from the old UI picker labels) is dropped when
         it matches the parent provider or a configured provider id.
         """
-        entry = (entry or "").strip()
-        if not entry:
-            return None
-        pid: str | None = None
-        model_part = entry
-        # Legacy/compat: a leading "providerId/" prefix that names a real
-        # provider routes the subagent through that provider. A single slash
-        # inside the model id (e.g. "deepseek/deepseek-chat") is a MODEL id,
-        # not a provider prefix — only split when the prefix is a known
-        # configured provider.
-        if "/" in entry:
-            head, _, tail = entry.partition("/")
-            if head and tail and _subagent_provider(head) is not None:
-                pid, model_part = head, tail
-            elif head == provider:
-                model_part = tail
-        p = _subagent_provider(pid) if pid else None
-        if p is not None:
-            kind = p.get("kind") or "custom"
-            # A legacy/typo'd entry may carry the provider prefix TWICE
-            # ("openrouter/openrouter/free") — collapse it to the bare model id
-            # before routing, so the "free" shortcut (and any real model) still
-            # resolves through its own provider.
-            own_prefix = f"{p.get('id') or pid}/"
-            while model_part.startswith(own_prefix):
-                model_part = model_part[len(own_prefix):]
-            # OpenRouter model ids must include the upstream vendor
-            # ("vendor/model"), so a bare "free" shortcut can't build. Resolve
-            # it to the exact id the user picked — `openrouter/free`, OpenRouter's
-            # Free Models Router — instead of silently falling back to the parent.
-            if kind == "openrouter" and "/" not in model_part:
-                model_part = _OPENROUTER_FREE_FALLBACK
-            return (
-                kind,
-                model_part,
-                p.get("baseUrl") or "",
-                p.get("apiKey") or "",
-                p.get("envVar") or "",
-                p.get("oauthRefreshToken") or "",
-            )
-        return (provider, model_part, base_url, api_key, env_var, oauth_token)
+        return _subagent_target(
+            entry,
+            provider,
+            base_url,
+            api_key,
+            env_var,
+            oauth_token,
+            _subagent_provider,
+        )
 
     def _build_subagent(entry: str) -> tuple[Any, str] | None:
         """Build the subagent model for an entry; returns (model, model_name)
@@ -3678,6 +3925,11 @@ async def run_agent(
             own_search_limit = _TASK_SCOPE_NARROW_LIMIT
         plan_search_counter: dict = {}
         _deny_emit = lambda ev: queue.put_nowait(_tool_event(ev))
+        # When a broad task exhausts its own-search quota, the FIRST over-quota
+        # grep/glob call is auto-delegated to the explore sub-agent (delegate)
+        # instead of merely being denied — weak models otherwise ignore the
+        # "use explore" note and keep looping shallow searches of their own.
+        _explore_delegate = tools.get("explore")
         if "grep" in tools:
             tools["grep"] = _wrap_limited_grep(
                 tools["grep"],
@@ -3685,6 +3937,7 @@ async def run_agent(
                 limit=own_search_limit,
                 emit=_deny_emit,
                 tool="grep",
+                delegate=_explore_delegate,
             )
         if "glob" in tools:
             tools["glob"] = _wrap_limited_glob(
@@ -3693,6 +3946,7 @@ async def run_agent(
                 limit=own_search_limit,
                 emit=_deny_emit,
                 tool="glob",
+                delegate=_explore_delegate,
             )
     # Steer injection: every tool's result is a delivery point for user
     # messages typed while this run is active. The wrapper drains the per-chat
@@ -3728,8 +3982,54 @@ async def run_agent(
 
         return wrapped
 
+    # Durable interrupted-turn resume: capture the FULL result of every tool
+    # call that completes this turn and persist it to disk (state_db) keyed by
+    # chat id. If the run is then cut off — user Stop, an error, or the app
+    # closing mid-stream — the next run for the same chat replays these calls
+    # as REAL tool messages (see the injection below) so the model continues
+    # from the completed work with the actual output instead of redoing it.
+    # Wraps AFTER `_steer_wrap` so the final returned content is captured
+    # (including any appended steer note). Best-effort: a write failure never
+    # affects the tool's own result. `functools.wraps` keeps the real
+    # signature/schema for pydantic-ai's introspection.
+    resume_buffer: list[dict] = []
+
+    def _resume_wrap(fn: Callable, tool_name: str):
+        import functools as _functools
+
+        @_functools.wraps(fn)
+        async def wrapped(*args, **kwargs):
+            result = await fn(*args, **kwargs)
+            content = result.return_value if isinstance(result, ToolReturn) else result
+            text = str(content or "") if content is not None else ""
+            if text.strip():
+                resume_buffer.append(
+                    {
+                        "tool": tool_name,
+                        "args": _json_safe(kwargs),
+                        "result": text[:_RESUME_RESULT_MAX],
+                        "ts": time.time(),
+                    }
+                )
+                if len(resume_buffer) > _RESUME_MAX_TOOLS:
+                    del resume_buffer[: len(resume_buffer) - _RESUME_MAX_TOOLS]
+                try:
+                    state_db.save_turn_resume(
+                        root,
+                        chat_id,
+                        {"prompt": prompt, "tools": list(resume_buffer)},
+                    )
+                except Exception:  # noqa: BLE001, S110 — best-effort, never fails the tool
+                    pass
+            return result
+
+        return wrapped
+
     if chat_id:
         tools = {name: _steer_wrap(fn, chat_id) for name, fn in tools.items()}
+        tools = {
+            name: _resume_wrap(fn, name) for name, fn in tools.items()
+        }
     registered = [Tool(fn, name=name) for name, fn in tools.items()]
 
     # MCP tool connectors: the UI's connector list is persisted to the app
@@ -4104,7 +4404,7 @@ async def run_agent(
 
     agent_settings = await _settings_for(
         mode, ctx, thinking_level, provider, model_name, base_url, api_key, env_var,
-        oauth_token=oauth_token,
+        oauth_token=oauth_token, scope=_turn_scope,
     )
     agent = Agent(
         model,
@@ -4157,6 +4457,78 @@ async def run_agent(
     if scouted:
         user_content.append(scouted)
 
+    # Durable interrupted-turn resume: if a PREVIOUS run of THIS chat was cut
+    # off — user Stop, an error, or the app closing mid-stream — the backend
+    # persisted the FULL results of every tool call it completed (see
+    # `_resume_wrap` above). Replay those as REAL tool-call / tool-return
+    # message pairs so the model sees the work as already done with the actual
+    # output and continues from where it stopped, instead of redoing the calls
+    # (the classic "ادامه بده re-explores the whole workspace" bug when the
+    # model only had a text recap). The records are appended to `history` (not
+    # just `history_messages`) so they survive every retry/auto-compact path
+    # that rebuilds messages from `history`. The state file lives on disk, so
+    # this works even when the app was force-closed and the frontend never got
+    # to fold its own marker into the message.
+    resume_tools: list[dict] = []
+    _resume_state: dict = {}
+    try:
+        _resume_state = state_db.load_turn_resume(root, chat_id) or {}
+        if isinstance(_resume_state.get("tools"), list):
+            resume_tools = [
+                t
+                for t in _resume_state["tools"]
+                if isinstance(t, dict) and str(t.get("tool", "")).strip()
+            ]
+    except Exception:  # noqa: BLE001 — best-effort, never fails the run
+        resume_tools = []
+    if resume_tools:
+        # Only inject when this run plausibly continues the interrupted turn:
+        # the same prompt re-sent, the interrupted assistant message still the
+        # last one in history (its folded marker), or the interruption was
+        # recent (covers a fresh "ادامه بده" after a hard app close where no
+        # marker was folded). A stale file from a long-abandoned chat must
+        # never leak into an unrelated new question.
+        _last = history[-1] if history else {}
+        _inject = False
+        try:
+            _ts = float(resume_tools[-1].get("ts", 0))
+        except (TypeError, ValueError):
+            _ts = 0
+        if (
+            str(_resume_state.get("prompt", "")) == prompt
+            or (
+                _last.get("role") == "assistant"
+                and "[Interrupted before finishing" in str(_last.get("content", ""))
+            )
+            or (_ts > 0 and time.time() - _ts <= _RESUME_MAX_AGE_SECONDS)
+        ):
+            _inject = True
+        if _inject:
+            # `_to_model_messages` translates each `resume_tool` record into a
+            # ToolCallPart `ModelResponse` followed by its ToolReturnPart
+            # `ModelRequest` (with the FULL result), and the trailing system
+            # record instructs the model to treat them as already done.
+            history = history + [
+                {
+                    "role": "resume_tool",
+                    "tool": str(_t["tool"]),
+                    "args": _json_safe(_t.get("args")) or {},
+                    "result": str(_t.get("result") or ""),
+                    "call_id": f"resume-{_i}",
+                }
+                for _i, _t in enumerate(resume_tools)
+            ] + [
+                {
+                    "role": "system",
+                    "content": (
+                        "The tool calls above were completed in the PREVIOUS (interrupted) "
+                        "run of this turn, with their actual results. Treat them as already "
+                        "done — do NOT re-run the same tools. Continue the task from where "
+                        "it was cut off."
+                    ),
+                }
+            ]
+
     # Keep the history small enough that the model's context window still has
     # room for the system prompt, scouting, tool-loop re-sends and the reply.
     # Without this, an 8k model overflows and gets truncated mid-task.
@@ -4171,6 +4543,13 @@ async def run_agent(
         if reuse_note:
             history_messages = [
                 ModelRequest(parts=[SystemPromptPart(content=reuse_note)])
+            ] + history_messages
+        # Plan→Coder handoff: Plan already identified the relevant files; tell
+        # Coder to verify them directly instead of re-running discovery tools.
+        discovery_note = _plan_discovery_note(history)
+        if discovery_note:
+            history_messages = [
+                ModelRequest(parts=[SystemPromptPart(content=discovery_note)])
             ] + history_messages
     # Tool-call memory: when earlier turns already ran tool calls (fetch_url,
     # web_search, file tools...), the model must NOT re-issue the identical calls
@@ -4512,6 +4891,18 @@ async def run_agent(
                         )
                     except Exception:  # noqa: BLE001, S110 — best-effort
                         pass
+            # The turn finished cleanly, so any interrupted-turn resume state
+            # for this chat is consumed — a future run must NOT replay these
+            # tool calls (they're complete, and this reply stands in for them).
+            # Deliberately cleared only HERE (a clean finish), NOT at injection
+            # time: if the continuation run is itself cut off before it makes
+            # any progress, the saved state must still be there for the next
+            # attempt. `_resume_wrap` overwrites the file as new tools run, so
+            # a re-interrupted continuation re-saves its own work.
+            try:
+                state_db.clear_turn_resume(root, chat_id)
+            except Exception:  # noqa: BLE001, S110 — best-effort
+                pass
             break  # success, exit the retry loop
         except Exception as exc:
             # A short-lived free-tier throttle (e.g. `429 FreeUsageLimitError:

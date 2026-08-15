@@ -141,6 +141,10 @@ class ProviderError(RuntimeError):
 #   free_ctx_fallback    Treat `-free` models as 200K context (opencode).
 #   editable_base_url    User can enter a custom base URL (custom/ollama).
 #   local                Runs locally, no network credential (ollama).
+#   parallel_calls       OpenAI-compatible gateway that honors `parallel_tool_calls`
+#                        in the request body. Only these kinds get the flag; local
+#                        (ollama) and non-OpenAI-compatible kinds (google) never
+#                        see it, so no request can fail on an unsupported field.
 _PROVIDERS: dict[str, dict] = {
     "google": {
         "name": "Google",
@@ -162,6 +166,7 @@ _PROVIDERS: dict[str, dict] = {
         "id_prefix": "openrouter",
         "cache_headers": True,
         "auto_think": True,
+        "parallel_calls": True,
     },
     "opencode": {
         "name": "opencode",
@@ -178,6 +183,7 @@ _PROVIDERS: dict[str, dict] = {
         "auto_think": True,
         "unprefixed_id": True,
         "free_ctx_fallback": True,
+        "parallel_calls": True,
     },
     "ollama": {
         "name": "local",
@@ -197,6 +203,7 @@ _PROVIDERS: dict[str, dict] = {
         "models": "openai",
         "base_url": "",
         "editable_base_url": True,
+        "parallel_calls": True,
     },
     "nvidia": {
         "name": "NVIDIA",
@@ -210,6 +217,7 @@ _PROVIDERS: dict[str, dict] = {
         # prefix here when the stored id is slash-less.
         "id_prefix": "nvidia",
         "auto_think": True,
+        "parallel_calls": True,
     },
     "cloudflare": {
         "name": "Cloudflare",
@@ -222,6 +230,7 @@ _PROVIDERS: dict[str, dict] = {
         "base_url": CLOUDFLARE_ACCOUNTS_BASE + "/{account}/ai/v1",
         "models_url": CLOUDFLARE_ACCOUNTS_BASE + "/{account}/ai/models/search",
         "auto_think": True,
+        "parallel_calls": True,
     },
     "tokenrouter": {
         "name": "TokenRouter",
@@ -232,6 +241,7 @@ _PROVIDERS: dict[str, dict] = {
         "base_url": TOKENROUTER_BASE,
         "models_query": "?limit=200",  # gateway 400s on /models without any arg
         "auto_think": True,
+        "parallel_calls": True,
     },
 }
 

@@ -6,8 +6,8 @@ import { api } from '../lib/fs'
 const TOOL_LABEL: Record<string, string> = {
   write_file: 'write_file',
   list_files: 'list_files',
-  search_in_files: 'search_in_files',
-  fuzzy_find: 'fuzzy_find',
+  grep: 'grep',
+  glob: 'glob',
   web_search: 'web_search',
   run_terminal: 'run_terminal',
   search_memory: 'search_memory',
@@ -270,11 +270,6 @@ export const ToolGroupView = memo(function ToolGroupView({
   )
 })
 
-// Tools whose card should start expanded (the action itself IS the useful
-// content — a diff, a saved note, a new skill/connector — so a collapsed
-// default would hide the very thing the user needs to see happened).
-const OPEN_BY_DEFAULT = new Set(['write_file', 'edit_file', 'memory', 'create_skill', 'create_mcp', 'web_search'])
-
 function subArgSummary(activity: ToolActivity): string {
   const args = activity.args
   if (!args) return ''
@@ -322,7 +317,6 @@ export const ToolCallView = memo(function ToolCallView({
   activity: ToolActivity
   onReverted?: () => void
 }) {
-  const [open, setOpen] = useState(() => OPEN_BY_DEFAULT.has(activity.tool))
   const [reverting, setReverting] = useState(false)
   const root = useStore((s) => s.root)
 
@@ -338,8 +332,6 @@ export const ToolCallView = memo(function ToolCallView({
       ? now - activity.startedAt
       : activity.elapsedMs
 
-  const hasExpand =
-    activity.args || activity.summary || activity.diff || (activity.children && activity.children.length > 0)
   const isWrite = activity.tool === 'write_file' || activity.tool === 'edit_file'
   const readPaths = Array.isArray(activity.args?.paths)
     ? (activity.args.paths as string[])
@@ -362,12 +354,8 @@ export const ToolCallView = memo(function ToolCallView({
   }
 
   return (
-    <div className={`tool-card ${activity.status}`}>
-      <button
-        className={`tool-card-head ${open ? 'open' : ''}`}
-        onClick={() => hasExpand && setOpen((o) => !o)}
-        disabled={!hasExpand}
-      >
+    <div className={`tool-card ${activity.status}${isWrite ? ' wide' : ''}`}>
+      <div className="tool-card-head">
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
         {activity.tool === 'web_search' && activity.engine && (
@@ -437,13 +425,9 @@ export const ToolCallView = memo(function ToolCallView({
         )}
         {fetchSummary && <span className="tool-cmd">{fetchSummary}</span>}
         <span className="tool-ms">{fmtTime(ms)}</span>
-        {hasExpand && (
-          <span className={`chev ${open ? 'open' : ''}`}>▾</span>
-        )}
-      </button>
+      </div>
 
-      {open && (
-        <div className="tool-card-body">
+      <div className="tool-card-body">
           {activity.args && Object.keys(activity.args).length > 0 && (
             <pre className="tool-args" dir="ltr">
               {JSON.stringify(activity.args, null, 2)}
@@ -484,8 +468,7 @@ export const ToolCallView = memo(function ToolCallView({
           {isWrite && activity.reverted && (
             <span className="reverted-tag">reverted</span>
           )}
-        </div>
-      )}
+      </div>
     </div>
   )
 })

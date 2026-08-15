@@ -395,7 +395,16 @@ export function Sidebar() {
   if (!open) return null
 
   return (
-    <aside className="sidebar" style={{ flexBasis: sidebarWidth, width: sidebarWidth }}>
+    <aside
+      className="sidebar"
+      style={
+        {
+          flexBasis: sidebarWidth,
+          width: sidebarWidth,
+          '--sidebar-w': `${sidebarWidth}px`,
+        } as React.CSSProperties
+      }
+    >
       <div
         className="sidebar-resize-handle"
         title="Drag to resize sidebar"

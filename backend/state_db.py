@@ -63,7 +63,7 @@ def bootstrap() -> None:
     missing a directory.
     """
     data_root()
-    for d in (skills_dir(), mcp_dir(), plans_dir(), memory_dir(), models_dir()):
+    for d in (skills_dir(), mcp_dir(), plans_dir(), memory_dir(), models_dir(), resume_dir()):
         os.makedirs(d, exist_ok=True)
     os.makedirs(vector_db_dir(), exist_ok=True)
     sp = settings_path()
@@ -108,6 +108,58 @@ def vector_db_dir() -> str:
 
 def plans_dir() -> str:
     return os.path.join(data_root(), "plan")
+
+
+def resume_dir() -> str:
+    """Directory for per-chat interrupted-turn resume state.
+
+    When a run is cut off (user Stop, an error, or the app closing mid-stream)
+    the backend persists the FULL results of every tool call it completed, so a
+    later run for the same chat can continue from where it stopped instead of
+    redoing the work. Files live on disk (not memory) so they survive a full
+    app restart. Keyed by workspace + chat id.
+    """
+    return os.path.join(data_root(), "resume")
+
+
+def _resume_file(root: str, chat_id: str) -> str:
+    ws = _slugify(
+        os.path.basename(os.path.realpath(root).rstrip(os.sep)) or "workspace"
+    )
+    cid = _safe_file(chat_id, fallback="chat")
+    return os.path.join(resume_dir(), ws, f"{cid}.json")
+
+
+def save_turn_resume(root: str, chat_id: str, payload: dict) -> None:
+    """Persist the completed-tool records of the current turn for ``chat_id``.
+
+    Overwrites the previous state so the file always holds the most recent
+    interrupted turn. Best-effort: never raises (I/O must not fail a run).
+    """
+    if not chat_id:
+        return
+    try:
+        _atomic_write_json(_resume_file(root, chat_id), payload)
+    except (OSError, TypeError, ValueError):  # best-effort
+        pass
+
+
+def load_turn_resume(root: str, chat_id: str) -> dict | None:
+    """Read the persisted resume state for ``chat_id``, or None."""
+    if not chat_id:
+        return None
+    data = _read_json(_resume_file(root, chat_id))
+    return data if isinstance(data, dict) else None
+
+
+def clear_turn_resume(root: str, chat_id: str) -> None:
+    """Remove the persisted resume state for ``chat_id`` (after a clean finish)."""
+    if not chat_id:
+        return
+    try:
+        os.remove(_resume_file(root, chat_id))
+    except OSError:
+        pass
 
 
 def skills_dir() -> str:

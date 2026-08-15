@@ -3806,6 +3806,7 @@ async def run_agent(
         explore_model=explore_model,
         web_model=web_model,
         search_model=search_model,
+        main_model=model,
         permission_gates=permission_gates,
         ask_gates=ask_gates,
         permit={"outside": allow_outside},

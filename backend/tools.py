@@ -2090,6 +2090,7 @@ def make_tool_callbacks(
     explore_model: Any = None,
     web_model: Any = None,
     search_model: Any = None,
+    main_model: Any = None,
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
     permit: dict | None = None,
@@ -2167,6 +2168,90 @@ def make_tool_callbacks(
 
     orig_emit = emit
     emit = _emit
+
+    # Sub-agent fallback state: when a sub-agent model (explore / web / search)
+    # hard-fails (bad key / invalid model / quota exhaustion), the tool re-runs
+    # the call on the MAIN model instead of degrading to a raw-output note.
+    # Sticky per slot per turn: once a slot falls back, the rest of the turn's
+    # calls for that slot go straight to the main model (no point re-hitting a
+    # broken model).
+    _fallback_state: dict[str, bool] = {}
+
+    def _emit_fallback(
+        slot: str,
+        agent_label: str,
+        failed_model: Any,
+        fallback_model: Any,
+        exc: Exception,
+    ) -> None:
+        """Mark a sub-agent slot as fallen back (sticky for the rest of the turn)
+        and surface a ``retry``-family event so the UI shows a distinct
+        'sub-agent failed — using main model' banner instead of a spinner."""
+        _fallback_state[slot] = True
+        failed_name = str(getattr(failed_model, "model_name", "") or "")
+        fallback_name = str(getattr(fallback_model, "model_name", "") or "")
+        text = str(exc).strip()
+        try:
+            emit(
+                {
+                    "kind": "retry",
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "delay": 0,
+                    "reason": f"{agent_label} model ({failed_name}) failed: {text}",
+                    "model": fallback_name,
+                    "agent": agent_label,
+                    "fallback": True,
+                }
+            )
+        except Exception:  # noqa: BLE001, S110 — cosmetic only
+            pass
+
+    async def _run_distill(
+        slot: str,
+        sub_model: Any,
+        label: str,
+        make_agent: Callable[[Any], Any],
+        make_prompt: Callable[[], str],
+        timeout_total: int = 60,
+    ) -> tuple[Any, Any]:
+        """Run a one-shot sub-agent distillation call (web distiller / page
+        summarizer / terminal-search reader) with the shared retry policy,
+        falling back to the MAIN model on a hard failure (bad key / invalid
+        model / quota exhaustion). Returns ``(result, model_that_ran)`` so the
+        caller can label usage + tool_result with the model that ACTUALLY ran.
+        Sticky per slot per turn: a slot that already fell back skips the
+        sub-agent model and goes straight to the main model."""
+        from pydantic_ai.settings import ModelSettings as _MS
+
+        model = main_model if _fallback_state.get(slot) else sub_model
+        while True:
+            try:
+                agent = make_agent(model)
+                res = await _run_subagent_call(
+                    lambda: agent.run(
+                        make_prompt(),
+                        model_settings=_MS(
+                            timeout=_providers.model_timeout(
+                                model=model,
+                                total=timeout_total,
+                                connect=15,
+                                read=timeout_total,
+                            )
+                        ),
+                    ),
+                    label,
+                    emit=emit,
+                    model_name=str(getattr(model, "model_name", "") or ""),
+                )
+                return res, model
+            except Exception as exc:  # noqa: BLE001 — fall back to main model
+                if model is main_model or main_model is None:
+                    raise
+                # Hard failure on the sub-agent model → re-run on the main model
+                # for the rest of this turn (sticky).
+                _emit_fallback(slot, label, model, main_model, exc)
+                model = main_model
 
     def _invoke(fn: Callable) -> Callable:
         import functools as _functools
@@ -2689,43 +2774,40 @@ def make_tool_callbacks(
         if len(output) > terminal_out_chars:
             output = output[:terminal_out_chars] + "\n…(output truncated to fit context)"
         summary = f"exit {result['exit_code']} · {len(output)} chars"
-        emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
         nudge = _format_plan_nudge_suffix(_plan_nudge_due())
         if not output:
+            emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
             return f"$ {command}\n(no output, exit code {result['exit_code']})" + nudge
         # When a dedicated "search" subagent model is configured and this is a
         # codebase search (grep/rg/find/sed...), pass the raw output through the
         # search subagent so it does the interpretation work (and its tokens are
         # accounted to the search model in MODEL USAGE), instead of the parent
-        # model reading the raw output directly.
-        if search_model is not None and _is_terminal_search(command) and len(output) >= 600:
+        # model reading the raw output directly. On a hard sub-agent failure the
+        # call falls back to the MAIN model (see _run_distill) — the raw output
+        # is only returned when BOTH models fail.
+        _reader_model = main_model if _fallback_state.get("search") else search_model
+        if _reader_model is not None and _is_terminal_search(command) and len(output) >= 600:
             try:
                 from pydantic_ai import Agent as _SA
                 from pydantic_ai.settings import ModelSettings as _SMS
 
-                reader = _SA(
-                    search_model,
-                    system_prompt=(
-                        "You are a code-search reader. A shell command searched the "
-                        "codebase and produced the raw output below. Distill it into a "
-                        "CONCISE answer (under ~150 words): what was found, exact file "
-                        "paths and line numbers, and a one-line note on the most "
-                        "relevant match. Do not restate the whole raw output."
-                    ),
-                    model_settings=_SMS(temperature=0.2, max_tokens=400),
-                )
-                res = await _run_subagent_call(
-                    lambda: reader.run(
-                        f"COMMAND: {command}\n\nOUTPUT:\n{output}",
-                        model_settings=_SMS(
-                            timeout=_providers.model_timeout(
-                                model=search_model, total=60, connect=15, read=60
-                            )
-                        ),
-                    ),
+                res, ran_model = await _run_distill(
+                    "search",
+                    _reader_model,
                     "terminal-search reader",
-                    emit=emit,
-                    model_name=str(getattr(search_model, "model_name", "") or ""),
+                    lambda m: _SA(
+                        m,
+                        system_prompt=(
+                            "You are a code-search reader. A shell command searched the "
+                            "codebase and produced the raw output below. Distill it into a "
+                            "CONCISE answer (under ~150 words): what was found, exact file "
+                            "paths and line numbers, and a one-line note on the most "
+                            "relevant match. Do not restate the whole raw output."
+                        ),
+                        model_settings=_SMS(temperature=0.2, max_tokens=400),
+                    ),
+                    lambda: f"COMMAND: {command}\n\nOUTPUT:\n{output}",
+                    timeout_total=60,
                 )
                 distilled = str(getattr(res, "output", "") or "").strip()
                 if distilled:
@@ -2733,7 +2815,7 @@ def make_tool_callbacks(
 
                     _usage_ev = _usage_event(
                         getattr(res, "usage", None),
-                        model=str(getattr(search_model, "model_name", "") or ""),
+                        model=str(getattr(ran_model, "model_name", "") or ""),
                     )
                     if _usage_ev:
                         emit(_usage_ev)
@@ -2741,17 +2823,24 @@ def make_tool_callbacks(
                         "kind": "tool_result",
                         "tool": "run_terminal",
                         "summary": f"search distilled · {len(distilled)} chars",
+                        "model": str(getattr(ran_model, "model_name", "") or ""),
                     })
                     return (
                         f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
                     )
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
-                # The search subagent model failed (bad key / invalid model /
-                # quota). Say so with the model name so the user can fix it in
-                # Settings → Subagents, THEN provide the raw output as fallback.
-                _search_note = _subagent_fail_note(
-                    "search", str(getattr(search_model, "model_name", "") or ""), exc
+                # Both the search subagent AND the main model failed. Say so with
+                # the model name so the user can fix it in Settings → Subagents,
+                # THEN provide the raw output as fallback.
+                _ran_name = str(
+                    getattr(
+                        main_model if _fallback_state.get("search") else search_model,
+                        "model_name",
+                        "",
+                    )
+                    or ""
                 )
+                _search_note = _subagent_fail_note("search", _ran_name, exc)
                 if _search_note:
                     emit(
                         {
@@ -2759,9 +2848,11 @@ def make_tool_callbacks(
                             "tool": "run_terminal",
                             "summary": "search subagent failed — raw output below",
                             "status": "error",
+                            "model": _ran_name,
                         }
                     )
                     return f"$ {command}\n{_search_note}\n{output}" + nudge
+        emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
         return f"$ {command}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "") -> str:
@@ -2856,8 +2947,11 @@ def make_tool_callbacks(
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
         """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
-        _explore_model_name = str(getattr(explore_model, "model_name", "") or "")
-        emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _explore_model_name})
+        # The model that will run this explore call: the explore sub-agent, or
+        # the MAIN model once this slot has fallen back earlier in the turn.
+        _run_model = main_model if _fallback_state.get("explore") else explore_model
+        _run_model_name = str(getattr(_run_model, "model_name", "") or "")
+        emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _run_model_name})
         if explore_model is None:
             emit(_error_result("explore", "unavailable"))
             return "ERROR: explore is unavailable (no model configured for this session)."
@@ -2868,6 +2962,11 @@ def make_tool_callbacks(
         _sub_search_count = min(search_count, 30)
         _sub_tool_out_chars = max(400, min(tool_out_chars, 5_000))
 
+        # The model name stamped on the sub-agent's internal tool events. Updated
+        # per _run_explore(model) so a fallback run on the main model labels its
+        # read/grep/glob events with the main model, not the failed sub-agent's.
+        _sub_emit_model_name = _run_model_name
+
         def _sub_emit(event: dict) -> None:
             # Forward to the same UI stream (so the user sees live sub-agent
             # activity) but tagged `sub=True` so the PARENT's deterministic
@@ -2876,7 +2975,7 @@ def make_tool_callbacks(
             # the sub-agent's, which is discarded once explore_tool returns.
             event = dict(event)
             event["sub"] = True
-            event.setdefault("model", _explore_model_name)
+            event.setdefault("model", _sub_emit_model_name)
             emit(event)
 
         # Code-enforced dedup for the sub-agent's search tools. The sub-agent
@@ -3160,10 +3259,19 @@ def make_tool_callbacks(
             _sub_emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
             return out
 
-        try:
+        from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
+
+        async def _run_explore(model: Any) -> str:
+            """Run the isolated exploration sub-agent on ``model`` and return its
+            report. Reuses the dedup caches so a fresh model (a fallback) continues
+            from the failed attempt's findings instead of re-exploring from zero.
+            Raises ``_UsageLimitExceeded`` (step budget — NOT a model failure, so
+            no fallback) or the underlying exception (hard failure) for the caller
+            to decide on falling back to the main model."""
+            nonlocal _sub_emit_model_name
+            _sub_emit_model_name = str(getattr(model, "model_name", "") or "")
             from pydantic_ai import Agent as _Agent
             from pydantic_ai import Tool as _Tool
-            from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
             from pydantic_ai.messages import (
                 ModelRequest as _ModelRequest,
             )
@@ -3249,7 +3357,7 @@ def make_tool_callbacks(
                 _sub_max_tokens = 1200
 
             sub_agent = _Agent(
-                explore_model,
+                model,
                 system_prompt=(
                     "You are a read-only exploration sub-agent. Your job is to find the "
                     "answer FAST and CHEAPLY and hand back a compact structured report. "
@@ -3311,7 +3419,7 @@ def make_tool_callbacks(
             # (which then re-pays full discovery overhead in its OWN context).
             # Each retry keeps the result cache (built above), so the fresh model
             # gets its earlier findings back via the dedup instead of re-exploring.
-            _sub_model_name = str(getattr(explore_model, "model_name", "") or "")
+            _sub_model_name = str(getattr(model, "model_name", "") or "")
             _sub_request_limit = 10
             _sub_tool_calls_limit = 24
             _sub_widen_retries = 0
@@ -3346,7 +3454,7 @@ def make_tool_callbacks(
                             ),
                             model_settings=_ModelSettings(
                                 timeout=_providers.model_timeout(
-                                    model=explore_model, total=90, connect=10, read=90
+                                    model=model, total=90, connect=10, read=90
                                 ),
                                 parallel_tool_calls=True,
                             ),
@@ -3445,7 +3553,7 @@ def make_tool_callbacks(
                                 ),
                                 model_settings=_ModelSettings(
                                     timeout=_providers.model_timeout(
-                                        model=explore_model, total=60, connect=10, read=60
+                                        model=model, total=60, connect=10, read=60
                                     ),
                                     parallel_tool_calls=True,
                                 ),
@@ -3459,6 +3567,28 @@ def make_tool_callbacks(
                             report = fixed
                     except Exception:  # noqa: BLE001, S110 — a failed fix is not fatal
                         pass
+            # The sub-agent's model requests are billed real tokens, but they ran
+            # through a SEPARATE pydantic_ai Agent instance that never passed
+            # through _UsageCapability (that's only wired up for the PARENT
+            # agent's own model in agents.py) — so this usage was silently
+            # missing from both the live context meter and the cost total.
+            # Surface it the same way a normal tool-loop step does, via the same
+            # _usage_event normalizer, labeled with the model that ACTUALLY ran.
+            from agents import _usage_event  # local import (circular-safe)
+
+            _usage_ev = _usage_event(
+                getattr(_sub_res, "usage", None), model=_sub_model_name
+            )
+            if _usage_ev:
+                emit(_usage_ev)
+            return report
+
+        # Run the explore sub-agent, falling back to the MAIN model on a hard
+        # failure (bad key / invalid model / quota exhaustion). Step-budget
+        # exhaustion (_UsageLimitExceeded) is deliberately NOT a fallback — it
+        # means the task is too broad, not that the model is broken.
+        try:
+            report = await _run_explore(_run_model)
         except _UsageLimitExceeded:
             emit(_error_result("explore", "step budget exceeded"))
             return (
@@ -3467,34 +3597,53 @@ def make_tool_callbacks(
                 "part yourself with grep/read."
             )
         except Exception as exc:  # noqa: BLE001
-            _sub_model = str(getattr(explore_model, "model_name", "") or "")
-            emit(_error_result("explore", f"failed: {exc}"))
-            return (
-                f"ERROR: explore sub-agent failed"
-                f" ({_sub_model} model, change it in Settings → Subagents): {exc}"
-            )
-        # The sub-agent's model requests are billed real tokens, but they ran
-        # through a SEPARATE pydantic_ai Agent instance that never passed through
-        # _UsageCapability (that's only wired up for the PARENT agent's own model
-        # in agents.py) — so this usage was silently missing from both the live
-        # context meter and the cost total. Surface it the same way a normal
-        # tool-loop step does, via the same _usage_event normalizer.
-        from agents import (
-            _usage_event,  # local import: agents.py imports this module at load time
-        )
-
-        sub_model_name = str(getattr(explore_model, "model_name", "") or "")
-        usage_event = _usage_event(getattr(res, "usage", None), model=sub_model_name)
-        if usage_event:
-            emit(usage_event)
+            if _run_model is main_model or main_model is None:
+                emit(_error_result("explore", f"failed: {exc}"))
+                return (
+                    f"ERROR: explore sub-agent failed"
+                    f" ({_run_model_name} model, change it in Settings → Subagents): {exc}"
+                )
+            # Hard failure on the explore sub-agent model → re-run on the main
+            # model for the rest of this turn (sticky), reusing the dedup caches
+            # so the fresh model continues from the failed attempt's findings.
+            _fallback_state["explore"] = True
+            _emit_fallback("explore", "explore sub-agent", _run_model, main_model, exc)
+            try:
+                report = await _run_explore(main_model)
+            except _UsageLimitExceeded:
+                emit(_error_result("explore", "step budget exceeded"))
+                return (
+                    f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
+                    "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
+                    "part yourself with grep/read."
+                )
+            except Exception as exc2:  # noqa: BLE001
+                _main_name = str(getattr(main_model, "model_name", "") or "")
+                emit(_error_result("explore", f"failed: {exc2}"))
+                return (
+                    f"ERROR: explore sub-agent failed"
+                    f" ({_main_name} model): {exc2}"
+                )
+            _ran_model = main_model
+        else:
+            _ran_model = _run_model
         if not report:
             emit(_error_result("explore", "no report"))
             return f"The exploration sub-agent found nothing usable for {task!r}."
-        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _explore_model_name})
+        _ran_model_name = str(getattr(_ran_model, "model_name", "") or "")
+        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _ran_model_name})
         return f"EXPLORE REPORT for {task!r}\n{report}"
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
-        emit({"kind": "tool", "tool": "web_search", "args": {"query": query}})
+        # The model that will distill the results: the web sub-agent, or the
+        # MAIN model once this slot has fallen back earlier in the turn.
+        _web_runner = main_model if _fallback_state.get("web") else web_model
+        _web_runner_name = (
+            str(getattr(_web_runner, "model_name", "") or "")
+            if _web_runner is not None
+            else ""
+        )
+        emit({"kind": "tool", "tool": "web_search", "args": {"query": query}, "model": _web_runner_name})
         result = await asyncio.to_thread(web_search, query, max_results)
         if "error" in result:
             msg = result["error"]
@@ -3530,38 +3679,33 @@ def make_tool_callbacks(
         engine = result.get("engine") or ""
         if fallbacks:
             summary += f" — fell back to {engine} after {', '.join(fallbacks)}"
-        emit({"kind": "tool_result", "tool": "web_search", "summary": summary, "engine": engine, "results": ui_items})
         raw_results = f"WEB RESULTS for {query!r}\n" + "\n".join(lines)
         # If a dedicated "web" subagent model is configured, distill the raw
         # results into a concise answer so the main context stays lean
-        # (Claude-Code-style). Otherwise return the raw results as before.
-        if web_model is not None:
+        # (Claude-Code-style). Otherwise return the raw results as before. On a
+        # hard sub-agent failure the call falls back to the MAIN model (see
+        # _run_distill) — raw results are only returned when BOTH models fail.
+        if _web_runner is not None:
             try:
                 from pydantic_ai import Agent
                 from pydantic_ai.settings import ModelSettings
 
-                distiller = Agent(
-                    web_model,
-                    system_prompt=(
-                        "You are a web-search reader. Read the quoted search results "
-                        "and answer the user's query with a CONCISE summary (under "
-                        "150 words) that cites the most relevant result URLs inline. "
-                        "If the results cannot answer the query, say so."
-                    ),
-                    model_settings=ModelSettings(temperature=0.2, max_tokens=400),
-                )
-                res = await _run_subagent_call(
-                    lambda: distiller.run(
-                        f"QUERY: {query}\n\nSEARCH RESULTS:\n" + "\n".join(lines),
-                        model_settings=ModelSettings(
-                            timeout=_providers.model_timeout(
-                                model=web_model, total=60, connect=15, read=60
-                            )
-                        ),
-                    ),
+                res, ran_model = await _run_distill(
+                    "web",
+                    _web_runner,
                     "web-search distiller",
-                    emit=emit,
-                    model_name=str(getattr(web_model, "model_name", "") or ""),
+                    lambda m: Agent(
+                        m,
+                        system_prompt=(
+                            "You are a web-search reader. Read the quoted search results "
+                            "and answer the user's query with a CONCISE summary (under "
+                            "150 words) that cites the most relevant result URLs inline. "
+                            "If the results cannot answer the query, say so."
+                        ),
+                        model_settings=ModelSettings(temperature=0.2, max_tokens=400),
+                    ),
+                    lambda: f"QUERY: {query}\n\nSEARCH RESULTS:\n" + "\n".join(lines),
+                    timeout_total=60,
                 )
                 distilled = str(getattr(res, "output", "") or "").strip()
                 if distilled:
@@ -3569,7 +3713,7 @@ def make_tool_callbacks(
 
                     _usage_ev = _usage_event(
                         getattr(res, "usage", None),
-                        model=str(getattr(web_model, "model_name", "") or ""),
+                        model=str(getattr(ran_model, "model_name", "") or ""),
                     )
                     if _usage_ev:
                         emit(_usage_ev)
@@ -3579,22 +3723,48 @@ def make_tool_callbacks(
                         "summary": f"{len(results)} results (distilled)",
                         "engine": engine,
                         "results": ui_items,
+                        "model": str(getattr(ran_model, "model_name", "") or ""),
                     })
                     return f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
             except Exception as exc:  # noqa: BLE001 — fall back to raw results
-                # The web subagent model failed — tell the user which one to fix
-                # in Settings → Subagents, then return raw results as fallback.
-                _web_note = _subagent_fail_note(
-                    "web", str(getattr(web_model, "model_name", "") or ""), exc
+                # Both the web subagent AND the main model failed — tell the user
+                # which one to fix in Settings → Subagents, then return raw
+                # results as fallback.
+                _ran_name = str(
+                    getattr(
+                        main_model if _fallback_state.get("web") else web_model,
+                        "model_name",
+                        "",
+                    )
+                    or ""
                 )
+                _web_note = _subagent_fail_note("web", _ran_name, exc)
                 if _web_note:
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "web_search",
+                        "summary": summary,
+                        "engine": engine,
+                        "results": ui_items,
+                        "model": _ran_name,
+                    })
                     return raw_results + "\n\n" + _web_note
+        emit({"kind": "tool_result", "tool": "web_search", "summary": summary, "engine": engine, "results": ui_items, "model": _web_runner_name})
         return raw_results
 
     async def fetch_url_tool(url: str, question: str = "", full: bool = False) -> str:
         """Fetch a web page / raw file and return its extracted text. Default returns a bounded excerpt (or a sub-agent summary when `question` is set). For copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs) the backend auto-returns full text (up to 24k chars) — one call per file is enough; don't pass `full=True` and don't re-fetch the same file via other hosts. Every call re-sends the whole conversation, so it costs real tokens."""
         effective_full = bool(full)
-        emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url, "full": effective_full}})
+        # The model that will summarize the page: the web/explore sub-agent, or
+        # the MAIN model once this slot has fallen back earlier in the turn.
+        _sum_model = web_model or explore_model
+        _sum_runner = main_model if _fallback_state.get("web") else _sum_model
+        _sum_runner_name = (
+            str(getattr(_sum_runner, "model_name", "") or "")
+            if _sum_runner is not None
+            else ""
+        )
+        emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url, "full": effective_full}, "model": _sum_runner_name})
         # full=True bypasses the default excerpt cap: return the whole page so
         # one call is enough for copying source files (SKILL.md / docs). The
         # extracted body is already bounded by fetch_url (FETCH_EXCERPT_CHARS).
@@ -3680,49 +3850,39 @@ def make_tool_callbacks(
             })
             return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
 
-        emit({
-            "kind": "tool_result",
-            "tool": "fetch_url",
-            "summary": f"{len(body)} chars",
-        })
-
         # Claude-Code-style: the main model receives only a distilled answer,
         # not the raw page. A summarizer model (the same configured model, run
         # with a tiny token budget) answers the `question` from the extracted
-        # text, keeping the main context lean.
+        # text, keeping the main context lean. On a hard sub-agent failure the
+        # call falls back to the MAIN model (see _run_distill) — the bounded
+        # excerpt is only returned when BOTH models fail.
         answer = ""
-        if web_model is not None or explore_model is not None:
+        _ran_sum_name = _sum_runner_name
+        if _sum_runner is not None:
             try:
                 from pydantic_ai import Agent
                 from pydantic_ai.settings import ModelSettings
 
-                summarizer = Agent(
-                    web_model or explore_model,
-                    system_prompt=(
-                        "You are a web-page reader. Read the quoted page text and "
-                        "answer the user's question with a CONCISE summary (under "
-                        "120 words). If the page cannot answer the question, say "
-                        "so. Ignore navigation menus, sidebars, footers and "
-                        "ads."
-                    ),
-                    model_settings=ModelSettings(temperature=0.2, max_tokens=400),
-                )
                 _prompt = question.strip() or "Summarize the key content of this page."
-                res = await _run_subagent_call(
-                    lambda: summarizer.run(
-                        f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
-                        model_settings=ModelSettings(
-                            timeout=_providers.model_timeout(
-                                model=web_model or explore_model, total=90, connect=15, read=90
-                            )
-                        ),
-                    ),
+                res, ran_model = await _run_distill(
+                    "web",
+                    _sum_runner,
                     "web-page summarizer",
-                    emit=emit,
-                    model_name=str(
-                        getattr(web_model or explore_model, "model_name", "") or ""
+                    lambda m: Agent(
+                        m,
+                        system_prompt=(
+                            "You are a web-page reader. Read the quoted page text and "
+                            "answer the user's question with a CONCISE summary (under "
+                            "120 words). If the page cannot answer the question, say "
+                            "so. Ignore navigation menus, sidebars, footers and "
+                            "ads."
+                        ),
+                        model_settings=ModelSettings(temperature=0.2, max_tokens=400),
                     ),
+                    lambda: f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
+                    timeout_total=90,
                 )
+                _ran_sum_name = str(getattr(ran_model, "model_name", "") or "")
                 answer = str(getattr(res, "output", "") or "").strip()
                 # Surface the summarizer's token usage so it shows in MODEL USAGE
                 # (same normalizer the explore sub-agent uses).
@@ -3730,33 +3890,54 @@ def make_tool_callbacks(
 
                 _usage_ev = _usage_event(
                     getattr(res, "usage", None),
-                    model=str(
-                        getattr(web_model or explore_model, "model_name", "") or ""
-                    ),
+                    model=_ran_sum_name,
                 )
                 if _usage_ev:
                     emit(_usage_ev)
             except Exception as exc:  # noqa: BLE001
-                # Web summarizer subagent failed — note it with the model name
-                # so the user can fix Settings → Subagents, then excerpt-fall.
+                # Both the web/explore subagent AND the main model failed — note
+                # it with the model name so the user can fix Settings →
+                # Subagents, then excerpt-fall.
                 answer = ""
-                _web_note = _subagent_fail_note(
-                    "web",
-                    str(getattr(web_model or explore_model, "model_name", "") or ""),
-                    exc,
+                _ran_name = str(
+                    getattr(
+                        main_model if _fallback_state.get("web") else _sum_model,
+                        "model_name",
+                        "",
+                    )
+                    or ""
                 )
+                _web_note = _subagent_fail_note("web", _ran_name, exc)
                 if _web_note:
                     answer = _web_note  # becomes the "summary" replaced below
 
         head = f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "")
         if answer:
             if answer.startswith("Note: the"):
+                emit({
+                    "kind": "tool_result",
+                    "tool": "fetch_url",
+                    "summary": f"{len(body)} chars",
+                    "model": _ran_sum_name,
+                })
                 return head + answer
+            emit({
+                "kind": "tool_result",
+                "tool": "fetch_url",
+                "summary": f"summarized · {len(answer)} chars",
+                "model": _ran_sum_name,
+            })
             return head + "SUMMARY:\n" + answer
         # Fallback: no summarizer (or it failed) — return a bounded excerpt that
         # respects the shared context budget so it can never overflow the window.
         if len(body) > _cap:
             body = body[: _cap] + "\n…(output truncated to fit context)"
+        emit({
+            "kind": "tool_result",
+            "tool": "fetch_url",
+            "summary": f"{len(body)} chars",
+            "model": _ran_sum_name,
+        })
         return head + body
 
     async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:

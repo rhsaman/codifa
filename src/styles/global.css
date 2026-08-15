@@ -4931,6 +4931,24 @@ textarea {
   color: #1f2937;
 }
 
+/* Sub-agent model hard-failed → tool fell back to the MAIN model. Distinct
+   look from the provider-retry banner: no spinner, no Retry button, and a
+   neutral (non-amber) accent so it reads as "handled" rather than "stuck". */
+.retry-banner.retry-banner-fallback {
+  border-left-color: var(--link);
+  background: color-mix(in srgb, var(--link) 8%, var(--bg));
+}
+
+.retry-banner-fallback .retry-fallback-icon {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--link);
+}
+
+.retry-banner-fallback .retry-who {
+  color: var(--text);
+}
+
 /* ---- live working status line (streaming assistant message) ---- */
 .msg-working {
   display: inline-flex;

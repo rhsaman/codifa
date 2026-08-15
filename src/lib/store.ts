@@ -217,9 +217,10 @@ function defaultProviders(): ProviderConfig[] {
 
 function normalizeProvider(p: ProviderConfig): ProviderConfig {
   const kind = p.kind || 'custom'
+  const meta = PROVIDER_META[kind]
   // Kinds that use unprefixed model ids (opencode) — drop any stale provider
   // prefix if present.
-  const unprefixed = PROVIDER_META[kind]?.unprefixedModelId
+  const unprefixed = meta?.unprefixedModelId
   let model = p.model || ''
   if (unprefixed && model.startsWith('opencode/')) model = model.slice('opencode/'.length)
   return {
@@ -230,7 +231,8 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     kind,
     apiKey: p.apiKey || '',
     envVar: p.envVar ?? defaultEnvVar(kind),
-    baseUrl: p.baseUrl || '',
+    // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
+    baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
     model,
     authType: p.authType ?? '',
     oauthClientId: p.oauthClientId || '',

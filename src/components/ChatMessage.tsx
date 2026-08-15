@@ -179,6 +179,7 @@ export function RetryBanner({
   gaveUp,
   model,
   agent,
+  fallback,
   onCancel,
   onRetry,
 }: {
@@ -189,6 +190,7 @@ export function RetryBanner({
   gaveUp?: boolean
   model?: string
   agent?: string
+  fallback?: boolean
   onCancel?: () => void
   onRetry?: () => void
 }) {
@@ -215,17 +217,38 @@ export function RetryBanner({
         ? ` — retry in ${left}s`
         : ' — retrying…'
       : ' — retrying…'
+  const who = model
+    ? ` — ${model}${agent ? ` (${agent})` : ''}`
+    : agent
+      ? ` — ${agent}`
+      : ''
+  // A sub-agent model hard-failed and the tool fell back to the MAIN model.
+  // Distinct banner: no spinner, no retry button — the fallback already ran.
+  if (fallback) {
+    return (
+      <div className="retry-banner retry-banner-fallback" title={reason || undefined}>
+        <span className="retry-fallback-icon" aria-hidden>
+          ⚠
+        </span>
+        <span>
+          Sub-agent failed — using main model
+          {who ? <span className="retry-who">{who}</span> : null}
+          {reason ? <span className="retry-reason"> — {reason}</span> : null}
+        </span>
+        {onCancel && (
+          <button className="retry-cancel" onClick={onCancel} title="Cancel retry">
+            ✕
+          </button>
+        )}
+      </div>
+    )
+  }
   const label = gaveUp ? 'Retry limit reached' : isRateLimit ? 'Provider rate limit' : unlimited ? 'Provider rate limit' : 'Provider hiccup'
   const suffix = gaveUp
     ? ` (${attempt}/${maxAttempts})`
     : unlimited
       ? ` (attempt ${attempt})${countdown}`
       : ` (${attempt}/${maxAttempts})${countdown}`
-  const who = model
-    ? ` — ${model}${agent ? ` (${agent})` : ''}`
-    : agent
-      ? ` — ${agent}`
-      : ''
   return (
     <div className="retry-banner" title={reason || undefined}>
       <span className="spinner" />

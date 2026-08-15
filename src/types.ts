@@ -295,7 +295,7 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; model?: string; agent?: string } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; model?: string; agent?: string; fallback?: boolean } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -414,4 +414,8 @@ export interface SidecarEvent {
   reason?: string
   /** Agent label for retry events (e.g. "main agent", "explore subagent") — so the user knows WHICH model to change. */
   agent?: string
+  /** True on a retry-family event when a sub-agent model hard-failed and the
+   *  tool fell back to the MAIN model — the UI renders a distinct
+   *  'sub-agent failed — using main model' banner instead of a spinner. */
+  fallback?: boolean
 }

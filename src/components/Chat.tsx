@@ -1033,6 +1033,7 @@ export function ChatPanel() {
             reason: event.reason ?? "",
             model: event.model ?? "",
             agent: event.agent ?? "",
+            fallback: event.fallback,
           },
         });
       } else if (event.kind === "retry_giveup") {
@@ -1045,6 +1046,7 @@ export function ChatPanel() {
             gaveUp: true,
             model: event.model ?? "",
             agent: event.agent ?? "",
+            fallback: event.fallback,
           },
         });
       } else if (event.kind === "tool_result") {
@@ -1067,6 +1069,7 @@ export function ChatPanel() {
               summary: event.summary,
               engine: event.engine,
               items: event.results,
+              model: event.model || act.model,
               elapsedMs: now - (act.startedAt ?? now),
             };
           }
@@ -2103,6 +2106,7 @@ export function ChatPanel() {
               gaveUp={retryingMsg.retry.gaveUp}
               model={retryingMsg.retry.model}
               agent={retryingMsg.retry.agent}
+              fallback={retryingMsg.retry.fallback}
               onRetry={() => {
                 const msgs = chat?.messages ?? [];
                 const idx = msgs.findIndex((m) => m.id === retryingMsg.id);

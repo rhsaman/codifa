@@ -389,8 +389,6 @@ export function ChatPanel() {
   const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
-  /** Transient confirmation shown when the user switches the chat's mode. */
-  const [modeNotice, setModeNotice] = useState<string | null>(null);
   /** Transient confirmation shown after a manual /compact. */
   const [compactNotice, setCompactNotice] = useState<string | null>(null);
   /** Set when a compact attempt fails, so the composer can show a retry banner
@@ -399,16 +397,15 @@ export function ChatPanel() {
   const [compactError, setCompactError] = useState<string | null>(null);
   /** Shown while the tmux-style Ctrl+X prefix is armed (waiting for the next key). */
   const [prefixNotice, setPrefixNotice] = useState<string | null>(null);
+  /** Dismissible error banner (e.g. an unknown slash command) shown at the
+   *  bottom of the message list, in the same spot as the retry banner. */
+  const [cmdError, setCmdError] = useState<string | null>(null);
 
-  // Switch the CURRENT chat's mode and confirm it visibly (so it's obvious the
-  // change applies to this chat's next message, not a new chat).
+  // Switch the CURRENT chat's mode. No UI toast — the agent knows which mode the
+  // next message runs in; the user doesn't need a visible confirmation.
   const changeMode = (mode: AgentMode) => {
     if (!chat) return;
     useStore.getState().setChatMode(chat.id, mode);
-    const def = getMode(settings, mode);
-    setModeNotice(
-      `Mode changed to ${def.label} — your next message runs in this mode.`,
-    );
   };
 
   // Cycle to the next/previous mode in the current chat (Tab / ⌘M).
@@ -419,12 +416,6 @@ export function ChatPanel() {
     const next = ids[(idx + dir + ids.length) % ids.length] ?? "ask";
     changeMode(next);
   };
-
-  useEffect(() => {
-    if (!modeNotice) return;
-    const t = setTimeout(() => setModeNotice(null), 3500);
-    return () => clearTimeout(t);
-  }, [modeNotice]);
 
   useEffect(() => {
     if (!compactNotice) return;
@@ -1301,12 +1292,19 @@ export function ChatPanel() {
       // knows what this turn already did instead of redoing it from scratch.
       if (watchdogAbortedRef.current) {
         // Forced by the stall watchdog, not the user clicking Stop — the
-        // connection was silent for minutes straight, so surface a real,
-        // visible error instead of the normal silent AbortError handling below.
-        handleEvent({
-          kind: "error",
-          content:
-            "The connection went silent for too long and was closed automatically — the backend may have crashed or lost connectivity. Please try again.",
+        // connection was silent for minutes straight. Surface a RETRY banner
+        // (with a Retry button that re-sends the same message) instead of a
+        // plain inline error, so the user has a one-click way to try again.
+        useStore.getState().updateMessage(assistantMsg.id, {
+          retry: {
+            attempt: 1,
+            maxAttempts: 1,
+            delay: 0,
+            reason:
+              "The connection went silent for too long and was closed automatically — the backend may have crashed or lost connectivity. Tap Retry to try again.",
+            gaveUp: true,
+            watchdog: true,
+          },
         });
         preserveToolActivity();
       } else if ((err as Error).name !== "AbortError") {
@@ -1542,10 +1540,9 @@ export function ChatPanel() {
         break;
       }
       default:
-        s.addMessage(ch?.id ?? "", {
-          role: "assistant",
-          content: `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
-        });
+        setCmdError(
+          `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
+        );
     }
   };
 
@@ -2104,6 +2101,7 @@ export function ChatPanel() {
               delay={retryingMsg.retry.delay}
               reason={retryingMsg.retry.reason}
               gaveUp={retryingMsg.retry.gaveUp}
+              watchdog={retryingMsg.retry.watchdog}
               model={retryingMsg.retry.model}
               agent={retryingMsg.retry.agent}
               fallback={retryingMsg.retry.fallback}
@@ -2117,6 +2115,60 @@ export function ChatPanel() {
               }}
               onCancel={stop}
             />
+          )}
+          {(cmdError || compactError || compactNotice || prefixNotice) && (
+            <div className="chat-notices">
+              {cmdError && (
+                <div className="notice-banner notice-error" dir="ltr">
+                  <span className="notice-icon">⚠</span>
+                  <span className="notice-text">{cmdError}</span>
+                  <button
+                    type="button"
+                    className="notice-dismiss"
+                    onClick={() => setCmdError(null)}
+                    title="Dismiss"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+              {compactError && (
+                <div className="notice-banner notice-error" dir="ltr">
+                  <span className="notice-icon">⚠</span>
+                  <span className="notice-text">
+                    Compact failed — {compactError}
+                  </span>
+                  <button
+                    type="button"
+                    className="notice-btn"
+                    disabled={busy}
+                    onClick={() => void compactContext()}
+                  >
+                    Retry
+                  </button>
+                  <button
+                    type="button"
+                    className="notice-dismiss"
+                    onClick={() => setCompactError(null)}
+                    title="Dismiss"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+              {compactNotice && (
+                <div className="notice-banner notice-info" dir="ltr">
+                  <span className="notice-icon">✓</span>
+                  <span className="notice-text">{compactNotice}</span>
+                </div>
+              )}
+              {prefixNotice && (
+                <div className="notice-banner notice-prefix" dir="ltr">
+                  <span className="notice-icon">⌨</span>
+                  <span className="notice-text">{prefixNotice}</span>
+                </div>
+              )}
+            </div>
           )}
         </div>
         {showJump && (
@@ -2358,42 +2410,6 @@ export function ChatPanel() {
         <div className="composer-inner">
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
-          )}
-          {modeNotice && (
-            <div className="mode-notice" dir="ltr">
-              {modeNotice}
-            </div>
-          )}
-          {prefixNotice && (
-            <div className="mode-notice prefix-notice" dir="ltr">
-              {prefixNotice}
-            </div>
-          )}
-          {compactNotice && (
-            <div className="mode-notice compact-notice" dir="ltr">
-              {compactNotice}
-            </div>
-          )}
-          {compactError && (
-            <div className="mode-notice compact-notice compact-error" dir="ltr">
-              <span>Compact failed — {compactError}</span>
-              <button
-                type="button"
-                className="compact-retry-btn"
-                disabled={busy}
-                onClick={() => void compactContext()}
-              >
-                Retry
-              </button>
-              <button
-                type="button"
-                className="compact-dismiss-btn"
-                onClick={() => setCompactError(null)}
-                title="Dismiss"
-              >
-                ×
-              </button>
-            </div>
           )}
           <div className="composer-input-wrap">
             {cmdOpen && (

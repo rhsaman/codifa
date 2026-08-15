@@ -69,6 +69,10 @@ _REL_SKIP_PATTERNS = [
     re.compile(r"(^|/)\.env\.local$"),
     re.compile(r"(^|/)\.env\.production$"),
     re.compile(r"(^|/)coverage\.xml$"),
+    # AGENTS.md is already injected IN FULL into every system prompt via
+    # _load_project_memory (agents.py) — indexing it would surface its chunks
+    # again through the RAG file block, duplicating the same content.
+    re.compile(r"(^|/)AGENTS\.md$"),
 ]
 
 

@@ -754,12 +754,16 @@ async def _settings_for(
     if ctx > 0:
         # max_tokens: prefer the model's REAL advertised output limit from the
         # provider (openrouter max_completion_tokens, models.dev limit.output,
-        # ollama max_tokens) — never a hard-coded guess. Only when the provider
-        # doesn't advertise an output limit do we fall back to a budget scaled
-        # from the resolved context window, capped at a safe universal bound
-        # (many providers reject max_tokens above their model's actual output
-        # limit, which surfaces as "Model token limit (...) exceeded" and kills
-        # the whole turn). Ask is a mentor/teacher: its replies are step-by-step
+        # ollama max_tokens) — never a hard-coded guess. But never trust the
+        # advertisement blindly: some providers (e.g. DeepSeek) advertise a
+        # large theoretical max (64k) that their serving endpoint rejects once
+        # input + max_tokens exceeds the real window ("Model token limit (...)
+        # exceeded before any response was generated"), so the advertised value
+        # is capped by the same universal bound as the fallback path. Only when
+        # the provider doesn't advertise an output limit do we fall back to a
+        # budget scaled from the resolved context window, capped at that same
+        # safe universal bound. Ask is a mentor/teacher: its replies are
+        # step-by-step
         # guidance that practically never needs a huge generation, so we cap its
         # output well below the scaled budget to avoid burning tokens on verbose
         # filler while keeping full quality.
@@ -771,7 +775,12 @@ async def _settings_for(
         except Exception:  # noqa: BLE001
             max_output = 0
         if max_output > 0:
-            max_tokens = max_output
+            # Trust the advertised limit, but never above the same universal
+            # bound as the fallback: some providers (e.g. DeepSeek) advertise a
+            # large theoretical max (64k) that their serving endpoint rejects
+            # once input + max_tokens exceeds the real window ("Model token
+            # limit (64000) exceeded before any response was generated").
+            max_tokens = min(max_output, max(1_024, ctx // 4), _MAX_OUTPUT_TOKENS)
         else:
             max_tokens = min(max(1_024, ctx // 4), _MAX_OUTPUT_TOKENS)
         if mode == "ask":
@@ -1010,6 +1019,34 @@ def _is_retryable(exc: BaseException) -> bool:
         return True
     low = text.lower()
     return any(phrase in low for phrase in _RETRYABLE_PHRASES)
+
+
+def _friendly_retry_reason(exc: BaseException) -> str:
+    """Human-friendly reason for the retry banner. Connection errors get an
+    actionable hint instead of the raw exception text (which is often cryptic,
+    e.g. ``ConnectError: All connection attempts failed``).
+    """
+    low = str(exc).lower()
+    if (
+        "all connection attempts failed" in low
+        or "connection refused" in low
+        or "connecterror" in low
+        or "getaddrinfo" in low
+        or "no connection could be made" in low
+        or "name or service not known" in low
+        or "unable to connect" in low
+        or "connect call failed" in low
+        or "connection reset" in low
+        or "connection aborted" in low
+        or "connection closed" in low
+        or "peer closed connection" in low
+        or "incomplete chunked read" in low
+    ):
+        return (
+            "Can't reach the provider — check your internet connection and that "
+            "the base URL/port in Settings are correct. Retrying…"
+        )
+    return str(exc)[:200]
 
 
 # Phrases that indicate a hard usage-QUOTA exhaustion (daily/monthly/free-tier
@@ -1689,21 +1726,13 @@ class _UsageCapability(AbstractCapability[Any]):
         return response
 
 
-_AUTO_SCOUT_KEY_FILES = [
-    "package.json",
-    "pyproject.toml",
-    "Cargo.toml",
-    "go.mod",
-    "requirements.txt",
-    "pom.xml",
-    "build.gradle",
-    "composer.json",
-    "Gemfile",
-    "README.md",
-    "readme.md",
-    "Pipfile",
-    "Makefile",
-]
+# Auto-scouted key files are intentionally disabled: dumping package.json /
+# README.md / readme.md (the same file as README.md on case-insensitive macOS,
+# so it was read twice) into every system prompt burned up to ~48k chars per
+# turn on large-context models. The agent has read/grep tools and can fetch any
+# of these itself when it actually needs them — the scout stays limited to the
+# tiny root listing built in _scout_workspace.
+_AUTO_SCOUT_KEY_FILES: list[str] = []
 
 # Persistent per-project instructions file, checked in this order at the
 # project root (mirrors the emerging AGENTS.md convention shared by several
@@ -2750,7 +2779,27 @@ async def _compact_history(
     if not older:
         return None
 
-    text = "\n\n".join(str(t.get("content", "")) for t in older)
+    # A previous compact already left a "[Compacted earlier context]" summary at
+    # the head of the history. Re-summarizing it on every compact would cascade:
+    # each pass re-compresses the old summary (250 words -> 250 words) and
+    # squeezes out older details. Keep it verbatim and only summarize the turns
+    # that came after it.
+    existing_summary = ""
+    older_turns: list[dict] = []
+    for t in older:
+        content = str(t.get("content", ""))
+        if t.get("role") == "system" and content.startswith(
+            "[Compacted earlier context]"
+        ):
+            existing_summary += content.removeprefix("[Compacted earlier context]\n")
+        else:
+            older_turns.append(t)
+    if not older_turns:
+        # The head is already a compact summary and there is nothing new to
+        # compress — don't re-compress the old summary, report nothing to do.
+        return None
+
+    text = "\n\n".join(str(t.get("content", "")) for t in older_turns)
     if len(text) > max_chars:
         text = text[-max_chars:] + "\n...(older part omitted)"
 
@@ -2798,6 +2847,9 @@ async def _compact_history(
 
     if not summary:
         return None  # empty summary — treat as failure, do NOT drop messages
+
+    if existing_summary:
+        summary = existing_summary.rstrip() + "\n\n" + summary
 
     return (
         [
@@ -3101,8 +3153,8 @@ def _auto_select_skills(
     skills: list[dict],
     prompt: str,
     top_k: int = 3,
-    rel_gap: float = 0.015,
-    min_abs: float = 0.76,
+    rel_gap: float = 0.02,
+    min_abs: float = 0.79,
 ) -> list[dict]:
     """Pick the most relevant skills for ``prompt`` via RAG similarity.
 
@@ -3112,9 +3164,13 @@ def _auto_select_skills(
     below ~0.75, so a *relative* gate alone is too fragile — the top candidate
     must clear an absolute floor (``min_abs``) AND the best score should beat
     the average by at least ``rel_gap`` (tail near-ties within the gap are kept
-    as candidates). Measured on the real skill set: a landing-page request tops
-    out at ~0.80 (previously missed at a 0.03 gap) while "سلام" stays at ~0.74
-    and is correctly dropped. A single installed skill still works (no minimum
+    as candidates). Both gates were tightened (0.76→0.79, 0.015→0.02) after a
+    skill set dominated by near-duplicate design skills (8 of 10) scored
+    0.76-0.82 on unrelated prompts ("رفع باگ", "یه کد پایتون بنویس", ...) and
+    got auto-attached on every turn; measured on that set, 0.79/0.02 rejects
+    greetings/small-talk and code prompts while a landing-page request (0.82,
+    gap 0.040), a git request (0.82, gap 0.043) and dashboard/color prompts
+    (0.80-0.82) still pass. A single installed skill still works (no minimum
     candidate count). Candidates are mapped back to the loaded skill dicts by
     their ``path`` key. Falls back to ``[]`` when the store is unavailable or
     nothing clears the gate — never raises.
@@ -4481,15 +4537,12 @@ async def run_agent(
     # it never calls the file tools. Skipped when the user already attached most
     # of the project's entries, or when the request is clearly not about the
     # project (a general/external question like "is X.com free?", greetings, or
-    # a web/MCP lookup) — no point scattering the listing into those turns. The
-    # budget scales with the model's context window so small models (e.g. 8k)
-    # get a tiny scouting budget that can't overflow the window. Ask (mentor)
-    # keeps the fixed small budget instead of the scaled one — its prompt tells
-    # it to inspect only the relevant files via grep/read directly, so a large
-    # auto-scouted dossier per question just burns tokens.
+    # a web/MCP lookup) — no point scattering the listing into those turns.
+    # Fixed budget for every mode. The old 6x scaling (ctx//4) could dump up to
+    # ~48k chars of auto-scouted files into the prompt on large-context models —
+    # pure token waste, since the agent can read any file itself via read/grep.
+    # With _AUTO_SCOUT_KEY_FILES empty, the scout is just the tiny root listing.
     scout_budget = _AUTO_SCOUT_MAX_TOTAL
-    if ctx > 0 and mode != "ask":
-        scout_budget = max(0, min((ctx // 4) - 600, _AUTO_SCOUT_MAX_TOTAL * 6))
     scouted = ""
     if not scoped:
         try:
@@ -5442,7 +5495,7 @@ async def run_agent(
                 attempt=attempt,
                 max_attempts=_RETRIES,
                 delay=delay,
-                reason=str(exc)[:200],
+                reason=_friendly_retry_reason(exc),
             )
             await asyncio.sleep(delay)
             continue

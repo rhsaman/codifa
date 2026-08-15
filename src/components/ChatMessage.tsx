@@ -187,6 +187,7 @@ export function RetryBanner({
   delay,
   reason,
   gaveUp,
+  watchdog,
   model,
   agent,
   fallback,
@@ -198,6 +199,7 @@ export function RetryBanner({
   delay: number
   reason: string
   gaveUp?: boolean
+  watchdog?: boolean
   model?: string
   agent?: string
   fallback?: boolean
@@ -253,15 +255,25 @@ export function RetryBanner({
       </div>
     )
   }
-  const label = gaveUp ? 'Retry limit reached' : isRateLimit ? 'Provider rate limit' : unlimited ? 'Provider rate limit' : 'Provider hiccup'
+  const label = gaveUp
+    ? watchdog
+      ? 'Connection lost'
+      : 'Retry limit reached'
+    : isRateLimit
+      ? 'Provider rate limit'
+      : unlimited
+        ? 'Provider rate limit'
+        : 'Provider hiccup'
   const suffix = gaveUp
-    ? ` (${attempt}/${maxAttempts})`
+    ? watchdog
+      ? ''
+      : ` (${attempt}/${maxAttempts})`
     : unlimited
       ? ` (attempt ${attempt})${countdown}`
       : ` (${attempt}/${maxAttempts})${countdown}`
   return (
     <div className="retry-banner" title={reason || undefined}>
-      <span className="spinner" />
+      {!gaveUp && <span className="spinner" />}
       <span>
         {label}
         {suffix}
@@ -669,6 +681,11 @@ export const ChatMessageView = memo(function ChatMessageView({
               <span className={`summary-chevron${summaryCollapsed ? '' : ' open'}`}>▶</span>
               <span className="summary-icon">📎</span>
               <span className="summary-label">Context summary</span>
+              {summaryCollapsed && message.content && (
+                <span className="summary-preview">
+                  {stripBidiMarks(fixZwsp(message.content))}
+                </span>
+              )}
               <span className="summary-hint">
                 earlier turns collapsed — not re-sent; a fresh reader continues from here
               </span>

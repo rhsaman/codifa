@@ -2229,7 +2229,9 @@ def make_tool_callbacks(
             try:
                 agent = make_agent(model)
                 res = await _run_subagent_call(
-                    lambda: agent.run(
+                    # Bind loop vars as defaults so the closure stays correct
+                    # even if the callable is invoked after the loop advances.
+                    lambda agent=agent, model=model: agent.run(
                         make_prompt(),
                         model_settings=_MS(
                             timeout=_providers.model_timeout(
@@ -2245,7 +2247,7 @@ def make_tool_callbacks(
                     model_name=str(getattr(model, "model_name", "") or ""),
                 )
                 return res, model
-            except Exception as exc:  # noqa: BLE001 — fall back to main model
+            except Exception as exc:  # fall back to main model
                 if model is main_model or main_model is None:
                     raise
                 # Hard failure on the sub-agent model → re-run on the main model

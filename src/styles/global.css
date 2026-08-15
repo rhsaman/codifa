@@ -1837,6 +1837,17 @@ textarea {
   max-width: 45%;
 }
 
+.summary-preview {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0.85;
+}
+
 .summary-head {
   cursor: pointer;
   user-select: none;
@@ -6703,61 +6714,111 @@ textarea {
   background: color-mix(in srgb, #74c0fc 16%, transparent);
 }
 
-/* ---- mode switch confirmation banner ---- */
-.mode-notice {
-  margin: 0 0 8px;
-  padding: 6px 12px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: 6px;
-  background: var(--bg-alt);
-  color: var(--text);
-  font-size: 12px;
+/* ---- unified chat notices (bottom of the message list) ---- */
+.chat-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 2px;
 }
 
-.prefix-notice {
-  border-left-color: #f08c00;
-  color: #f08c00;
-}
-
-.compact-error {
+.notice-banner {
   display: flex;
   align-items: center;
-  gap: 10px;
-  border-left-color: #e03131;
+  gap: 8px;
+  padding: 8px 12px;
+  border: none;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-alt) 80%, var(--bg));
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 16%, transparent);
 }
 
-.compact-error span {
-  flex: 1;
-}
-
-.compact-retry-btn {
-  border: 1px solid var(--border);
+.notice-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
   border-radius: 5px;
-  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.notice-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice-error {
+  border-left-color: #e03131;
+  background: color-mix(in srgb, #e03131 7%, var(--bg));
+}
+
+.notice-error .notice-icon {
+  color: #e03131;
+  background: color-mix(in srgb, #e03131 14%, transparent);
+}
+
+.notice-info {
+  border-left-color: var(--accent);
+}
+
+.notice-info .notice-icon {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.notice-prefix {
+  border-left-color: #f08c00;
+}
+
+.notice-prefix .notice-icon {
+  color: #f08c00;
+  background: color-mix(in srgb, #f08c00 14%, transparent);
+}
+
+.notice-btn {
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 5px;
+  background: var(--bg-input);
   color: var(--text);
   font-size: 12px;
   padding: 3px 10px;
   cursor: pointer;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
 }
 
-.compact-retry-btn:hover:not(:disabled) {
-  background: var(--bg-hover, var(--border));
+.notice-btn:hover:not(:disabled) {
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
-.compact-retry-btn:disabled {
+.notice-btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-.compact-dismiss-btn {
+.notice-dismiss {
+  flex: 0 0 auto;
   border: none;
   background: transparent;
   color: var(--text-dim, var(--text));
-  font-size: 15px;
+  font-size: 13px;
   line-height: 1;
   cursor: pointer;
-  padding: 0 2px;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.notice-dismiss:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
 }
 
 .mode-switch-note {
@@ -7085,7 +7146,6 @@ textarea {
 .msg.user .msg-bubble,
 .tool-card,
 .sidebar-usage-group.open,
-.compact-retry-btn,
 .retry-banner .retry-cancel,
 .plan-block,
 .nvim-label,
@@ -7233,20 +7293,6 @@ textarea {
   border-right: none;
 }
 
-.mode-notice {
-  border: none;
-  border-left: 3px solid var(--accent);
-  background: color-mix(in srgb, var(--bg-alt) 75%, var(--bg));
-}
-
-.prefix-notice {
-  border-left-color: #f08c00;
-}
-
-.compact-error {
-  border-left-color: #e03131;
-}
-
 .thinking-block {
   border: none;
   border-left: 3px solid var(--thinking);
@@ -7292,7 +7338,6 @@ textarea {
 
 .copy-btn,
 .btn.tiny,
-.compact-retry-btn,
 .retry-banner .retry-cancel {
   background: var(--bg-input);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);

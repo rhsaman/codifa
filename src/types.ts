@@ -295,7 +295,7 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; model?: string; agent?: string; fallback?: boolean } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean

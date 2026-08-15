@@ -1469,11 +1469,11 @@ export const useStore = create<State>((set, get) => ({
         // turns and any follow-up tool calls AFTER it, instead of a bubble glued
         // to the bottom of the scrollback. The model still receives it first on
         // the next request (sliceToBudget sorts system-first).
-        let boundary = 0
-        for (let i = 0; i < messages.length; i++) {
-          if (messages[i].compacted) boundary = i + 1
-        }
-        messages.splice(boundary, 0, summaryMsg)
+        // Insert the summary right before the first preserved (non-compacted)
+        // message so streamed replies + tool calls always render BELOW the
+        // checkpoint. Falls back to the end if everything was folded.
+        const boundary = messages.findIndex((m) => !m.compacted)
+        messages.splice(boundary === -1 ? messages.length : boundary, 0, summaryMsg)
         return {
           ...c,
           messages,

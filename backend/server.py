@@ -47,7 +47,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import providers
-from agents import run_agent
+from agents import _drain_steer, _enqueue_steer, run_agent
 
 
 def wants_skill_or_mcp(text: str) -> bool:
@@ -881,6 +881,10 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             yield _sse({"kind": "error", "content": _friendly_error(exc, req.model, req.base_url)})
         finally:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
+            # Clear any unconsumed steers for this chat so they don't leak into
+            # a future run of the same chat (the frontend re-sends them as the
+            # next turn via its own queue).
+            _drain_steer(req.chat_id)
             yield _sse({"kind": "done"})
 
     return StreamingResponse(
@@ -888,6 +892,28 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class SteerRequest(BaseModel):
+    chat_id: str = ""
+    id: str = ""
+    prompt: str = ""
+
+
+@app.post("/chat/steer")
+async def chat_steer(req: SteerRequest) -> dict:
+    """Queue a user message for injection into a RUNNING agent (no abort).
+
+    The message sits in the per-chat STEER_INBOX until the run's next tool
+    call, at which point the tool wrapper appends it to the tool result so the
+    model reads it immediately. If the run ends before any tool call (e.g. the
+    agent is already streaming its final answer), the message stays queued and
+    the frontend auto-sends it as the next turn.
+    """
+    if not req.chat_id or not req.prompt.strip():
+        return {"ok": False, "error": "chat_id and prompt are required"}
+    await _enqueue_steer(req.chat_id, {"id": req.id, "prompt": req.prompt.strip()})
+    return {"ok": True}
 
 
 class MemoryRequest(BaseModel):

@@ -136,7 +136,6 @@ Output lands in `release/`.
 | `Ctrl+X` then `u` | Undo last exchange (tmux-style prefix)       |
 | `Ctrl+X` then `r` | Redo last undone exchange (tmux-style prefix) |
 | `Ctrl+X` then `c` | Compact the chat context (tmux-style prefix)  |
-| `Ctrl+X` then `x` | Clear this chat's messages (tmux-style prefix) |
 | `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)     |
 
 ### 🏛️ Architecture

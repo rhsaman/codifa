@@ -42,6 +42,7 @@ const api = {
   coderWrite: (rel: string, content: string): Promise<boolean> =>
     ipcRenderer.invoke('coder:write', rel, content),
   coderDelete: (rel: string): Promise<boolean> => ipcRenderer.invoke('coder:delete', rel),
+  copyText: (text: string): Promise<boolean> => ipcRenderer.invoke('clipboard:write', text),
   searchContent: (root: string, query: string): Promise<SearchMatch[]> =>
     ipcRenderer.invoke('fs:search', root, query),
   readImage: (absPath: string): Promise<string | null> => ipcRenderer.invoke('fs:read-image', absPath),

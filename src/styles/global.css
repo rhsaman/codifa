@@ -364,6 +364,38 @@ textarea {
   font-weight: 500;
 }
 
+/* Row that keeps the streaming dot inline with the chat title instead of a
+   full-width flex child below it (.chat-item is a column layout). */
+.chat-item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Live streaming dot for chats whose agent is working in the background. */
+.chat-item-streaming {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent, #3b82f6);
+  flex: 0 0 auto;
+  animation: chat-streaming-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes chat-streaming-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
 /* Action icons (pin / rename / delete) sit ABOVE the chat title. Always laid
    out (never display:none) so the row heights stay constant and the list never
    "jumps"; only the opacity toggles. */
@@ -1484,6 +1516,31 @@ textarea {
   color: var(--text-dim);
 }
 
+.steer-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.steer-note .steer-dot {
+  font-size: 8px;
+  color: var(--link, #4f8cff);
+  animation: steer-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes steer-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .msg-bubble {
   padding: 10px 8px;
   border-radius: var(--radius);
@@ -1507,6 +1564,55 @@ textarea {
 
 .msg-bubble.segmented > .tool-group {
   margin: 4px 8px;
+}
+
+/* A steer message (typed mid-run) injected inline between tool calls: renders
+   right after the tool card that carried it, with the agent's later text and
+   tool cards stacking below. Full-width bubble, mirroring a normal user
+   message exactly (background + border + right-aligned text in RTL). */
+.msg-bubble.segmented > .seg-steer {
+  /* Clear gap both sides so the bubble reads as a separate user message, not a
+     tool card glued to its neighbors (the surrounding tool cards use 4px). */
+  margin: 16px 0;
+}
+
+.seg-steer {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.seg-steer-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+.seg-steer-text {
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.seg-steer-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+.seg-steer:hover .msg-copy,
+.seg-steer:hover .msg-retry {
+  opacity: 1;
+}
+
+.chat-messages[data-dir="rtl"] .seg-steer-text {
+  text-align: right;
 }
 
 .msg-bubble.segmented > .chat-message + .chat-message {
@@ -2120,6 +2226,21 @@ textarea {
   50% {
     box-shadow: 0 0 0 6px transparent;
   }
+}
+
+/* Queue button: shown next to Stop while a chat is working. Sends the typed
+   message after the current turn instead of steering into it. */
+.queue-btn {
+  width: 34px;
+  height: 34px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+
+.queue-btn:not(:disabled):hover {
+  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-input));
 }
 
 /* ---- image attachment chips ---- */
@@ -4279,6 +4400,23 @@ textarea {
   background: color-mix(in srgb, var(--link) 12%, var(--bg-panel));
 }
 
+/* Messages typed while the agent is working: steer chips (already delivered to
+   the running agent) and queue chips (auto-send after the current turn). */
+.attachment-chip.queued-chip {
+  border-color: color-mix(in srgb, #3b82f6 45%, var(--border));
+  background: color-mix(in srgb, #3b82f6 10%, var(--bg-panel));
+  max-width: 56ch;
+}
+
+.attachment-chip.queued-chip.steer-chip {
+  border-color: color-mix(in srgb, #10b981 45%, var(--border));
+  background: color-mix(in srgb, #10b981 10%, var(--bg-panel));
+}
+
+.queued-chips {
+  padding-bottom: 2px;
+}
+
 .chip-icon-badge {
   display: inline-flex;
   align-items: center;
@@ -4543,6 +4681,15 @@ textarea {
   color: var(--text-dim);
   overflow-wrap: anywhere;
   min-width: 0;
+}
+
+.tool-card-head .tool-path + .tool-path {
+  margin-left: 3px;
+}
+
+.tool-card-head .tool-path.tool-more {
+  font-style: italic;
+  opacity: 0.75;
 }
 
 .tool-ms {

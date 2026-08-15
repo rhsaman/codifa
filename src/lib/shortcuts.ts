@@ -36,7 +36,6 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   u: { cmd: "/undo", label: "Undo the last exchange" },
   r: { cmd: "/redo", label: "Redo the last undone exchange" },
   c: { cmd: "/compact", label: "Summarize & compact the chat context" },
-  x: { cmd: "/clear", label: "Clear all messages in this chat" },
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
 };
 

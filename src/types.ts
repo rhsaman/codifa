@@ -94,7 +94,7 @@ export interface ProviderConfig {
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
-  pricingMap?: Record<string, { input: number; output: number }>
+  pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   /** Per-provider "Messages to remember" — how many recent user/assistant messages are sent each turn. */
   maxHistory?: number
   thinkingLevel?: ThinkingLevel
@@ -253,7 +253,10 @@ export interface NvimDiagnostic {
  *  each tool call so the UI can interleave tool cards with the reply (Claude
  *  style) instead of stacking all tools at the top/bottom. `tool` segments
  *  reference `ChatMessage.toolActivity[index]`. */
-export type MessageSegment = { kind: 'text'; text: string } | { kind: 'tool'; index: number }
+export type MessageSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; index: number }
+  | { kind: 'user'; id: string }
 
 export interface ChatMessage {
   id: string
@@ -268,6 +271,16 @@ export interface ChatMessage {
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
+  /** True for a user message steered into a RUNNING agent (typed mid-run). It
+   *  is visible immediately; the backend confirms delivery with `steer_applied`
+   *  (flag cleared) or, if the turn ends without injecting it, it is re-sent as
+   *  the next turn reusing this same message. */
+  steerPending?: boolean
+  /** True for a user message steered into a RUNNING agent once the backend
+   *  confirmed delivery (`steer_applied`): the message's own bubble is hidden
+   *  and it is instead rendered inline, right after the tool call that carried
+   *  it, via a `{ kind: 'user' }` segment on the assistant message. */
+  steerInterleaved?: boolean
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
@@ -287,6 +300,24 @@ export interface ChatDraft {
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   skillChips?: Array<{ kind: 'skill' | 'mcp'; name: string; path?: string }>
+  /** True while the composer's mention of a Neovim file was active, so a queued
+   *  turn started from another chat can reproduce the mention. */
+  nvimMentioned?: string
+}
+
+/** A message typed while the chat's agent is already working. `kind: 'steer'`
+ *  is delivered to the RUNNING agent (via /chat/steer, injected at the next
+ *  tool call, no abort); `kind: 'queue'` waits and auto-sends one-by-one after
+ *  the current turn completes. `sent` is set once the message has been turned
+ *  into a real chat turn (either consumed mid-run or drained). */
+export interface QueuedMessage {
+  id: string
+  text: string
+  attachments?: string[]
+  images?: Array<{ path: string; name: string; dataUrl?: string }>
+  kind: 'steer' | 'queue'
+  createdAt: number
+  sent?: boolean
 }
 
 export interface Chat {
@@ -298,12 +329,14 @@ export interface Chat {
   /** Cumulative per-model token usage for this chat (session totals). */
   usage?: ChatUsage
   draft?: ChatDraft
+  /** Messages typed while this chat's agent was working, sent/steered later. */
+  queued?: QueuedMessage[]
   createdAt: number
   updatedAt: number
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'subagent_models'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'subagent_models' | 'steer_applied'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -322,6 +355,9 @@ export interface SidecarEvent {
   models?: Record<string, string>
   /** update_plan items: [{ content, status }] */
   items?: Array<{ id?: string; content: string; status: string }>
+  /** Steer messages the running agent consumed (injected into a tool result);
+   *  the frontend removes these ids from the chat's pending queue. */
+  ids?: string[]
   /** Structured tool results (web_search hits) shown in the tool card. */
   results?: SearchResultItem[]
   /** Which web-search provider produced the results (e.g. 'tavily'). */

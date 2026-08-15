@@ -8,6 +8,7 @@ import type {
   McpServerConfig,
   ProviderConfig,
   ProviderKind,
+  QueuedMessage,
   RecentModel,
   SearchConsoleConfig,
   SearchPluginConfig,
@@ -288,7 +289,7 @@ interface State {
   setActiveProvider: (id: string) => void
   setProviderModels: (id: string, models: string[]) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
-  setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number }>) => void
+  setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   removeProviderModel: (id: string, model: string) => void
   setMcpServers: (mcpServers: Record<string, McpServerConfig>) => void
   addMcpServer: (name: string, cfg: McpServerConfig) => void
@@ -365,8 +366,14 @@ interface State {
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
   renameChat: (id: string, title: string) => void
-  addMessage: (message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
+  addMessage: (chatId: string, message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
+  /** Record a message typed while the chat's agent is already working. */
+  queueMessage: (chatId: string, msg: Omit<QueuedMessage, 'createdAt'>) => void
+  removeQueuedMessage: (chatId: string, id: string) => void
+  clearQueue: (chatId: string) => void
+  /** Mark a queued message as consumed (steered into the running agent). */
+  markQueuedSent: (chatId: string, id: string) => void
   /** Add a model's token deltas to the chat-wide cumulative usage (survives
    *  compacts, unlike a single message's per-turn usage). */
   accrueChatUsage: (
@@ -386,9 +393,13 @@ interface State {
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
   setOutsideAllowed: (allowed: boolean) => void
-  /** Live AbortController for the in-flight chat request (survives chat switches). */
-  activeAbort: AbortController | null
-  setActiveAbort: (abort: AbortController | null) => void
+  /** Whether any chat currently has a streaming assistant message (persist gate
+   *  and multi-chat "busy" indication). */
+  anyStreaming: () => boolean
+  /** Live AbortControllers per chat id (survive chat switches, allow multiple
+   *  chats to run concurrently). */
+  chatAborts: Record<string, AbortController | null>
+  setChatAbort: (chatId: string, abort: AbortController | null) => void
   /** File open in Neovim (absolute path), fed by the main-process watcher. */
   nvimFile: string | null
   setNvimFile: (abs: string | null) => void
@@ -469,7 +480,9 @@ export const useStore = create<State>((set, get) => ({
   isStreaming: false,
   isThinking: false,
   outsideAllowed: false,
-  activeAbort: null,
+  chatAborts: {},
+  setChatAbort: (chatId, abort) =>
+    set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
   /** Absolute path of the file currently open in Neovim (null if none / unknown). */
   nvimFile: null,
   /** LSP diagnostics reported for the Neovim file (empty when none / unknown). */
@@ -674,7 +687,7 @@ export const useStore = create<State>((set, get) => ({
     // cache file. The final state is persisted once streaming ends.
     // BUT never DROP user-initiated saves (mode prompts, subagent models,
     // provider config) made mid-stream: defer until streaming ends instead.
-    if (get().isStreaming) {
+    if (get().anyStreaming()) {
       persistSoon()
       return
     }
@@ -1185,20 +1198,29 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  addMessage: (message) => {
+  addMessage: (chatId, message) => {
     const id = uid()
     const full: ChatMessage = { ...message, id, createdAt: Date.now() }
     set((s) => {
       if (message.role === 'user') {
-        const st = stackFor(s.activeChatId)
+        const st = stackFor(chatId)
         st.redo = []
       }
       const chats = s.chats.map((c) =>
-        c.id === s.activeChatId
+        c.id === chatId
           ? {
               ...c,
               messages: [...c.messages, full],
-              updatedAt: Date.now(),
+              // A chat's sidebar position only changes when its agent's turn
+              // COMPLETES (see updateMessage). Sending a user message or the
+              // streaming assistant message must NOT float the chat to the top
+              // mid-run, or two concurrent chats keep swapping places. Instant
+              // completed assistant replies (undo/redo/help/skill confirmations)
+              // still bump, since they're finished turns.
+              updatedAt:
+                !message.streaming && message.role === 'assistant'
+                  ? Date.now()
+                  : c.updatedAt,
               title: c.messages.length === 0 && message.role === 'user' ? message.content.slice(0, 48) : c.title,
             }
           : c,
@@ -1209,15 +1231,58 @@ export const useStore = create<State>((set, get) => ({
     return full
   },
 
+  queueMessage: (chatId, msg) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === chatId
+          ? { ...c, queued: [...(c.queued ?? []), { ...msg, createdAt: Date.now() }] }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  removeQueuedMessage: (chatId, id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === chatId ? { ...c, queued: (c.queued ?? []).filter((q) => q.id !== id) } : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  clearQueue: (chatId) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === chatId ? { ...c, queued: [] } : c)),
+    }))
+    get().persist()
+  },
+
+  markQueuedSent: (chatId, id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === chatId
+          ? { ...c, queued: (c.queued ?? []).map((q) => (q.id === id ? { ...q, sent: true } : q)) }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
   updateMessage: (id, patch) => {
     set((s) => ({
       chats: s.chats.map((c) => {
-        const has = c.messages.some((m) => m.id === id)
-        if (!has) return c
+        const msg = c.messages.find((m) => m.id === id)
+        if (!msg) return c
+        // Only the turn-completion transition (streaming true -> false) moves
+        // the chat in the sidebar; per-token content/thinking/tool deltas must
+        // not reorder it, or two concurrent chats trade places constantly.
+        const completes =
+          msg.streaming === true && patch.streaming === false
         return {
           ...c,
           messages: c.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
-          updatedAt: Date.now(),
+          updatedAt: completes ? Date.now() : c.updatedAt,
         }
       }),
     }))
@@ -1225,7 +1290,7 @@ export const useStore = create<State>((set, get) => ({
     // whole chats array each time is what hammers coder.db / app-state-cache.json.
     // Skip it during streaming; the final state is persisted once the stream ends
     // (setStreaming(false) → the trailing updateMessage({streaming:false})).
-    if (!get().isStreaming) persistSoon()
+    if (!get().anyStreaming()) persistSoon()
   },
 
   accrueChatUsage: (chatId, modelId, delta) => {
@@ -1242,7 +1307,11 @@ export const useStore = create<State>((set, get) => ({
           cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
           lastUsed: Date.now(),
         }
-        return { ...c, usage, updatedAt: Date.now() }
+        // Usage fires once per model call INSIDE a run — don't reorder the
+        // sidebar mid-turn. The turn-completion bump in updateMessage handles
+        // reordering when the agent finishes.
+        const working = c.messages.some((m) => m.streaming)
+        return { ...c, usage, updatedAt: working ? c.updatedAt : Date.now() }
       }),
     }))
     // Usage events fire once per completed model call (not per token), and
@@ -1406,12 +1475,12 @@ export const useStore = create<State>((set, get) => ({
 
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
 
+  anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
+
   setAutoSkills: (on) => {
     set((s) => ({ settings: { ...s.settings, autoSkills: on } }))
     get().persist()
   },
-
-  setActiveAbort: (activeAbort) => set({ activeAbort }),
 
   setNvimFile: (abs) => set({ nvimFile: abs }),
   setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),

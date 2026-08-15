@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage, ToolActivity } from '../types'
 import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
+import { copyToClipboard } from '../lib/clipboard'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
@@ -36,11 +37,11 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(code)
+      await copyToClipboard(code)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
-    } catch {
-      /* clipboard unavailable */
+    } catch (err) {
+      console.warn('copy failed', err)
     }
   }
 
@@ -265,7 +266,73 @@ const ALWAYS_VISIBLE_TOOLS = new Set([
  *  search-heavy turn doesn't stack a full-height row per call. Anything in
  *  ALWAYS_VISIBLE_TOOLS always breaks the run and renders as its own full card
  *  (diff/confirmation visible), same as before. */
-function renderSegments(message: ChatMessage): ReactNode[] {
+function SegSteerBubble({
+  message,
+  onRetry,
+}: {
+  message: ChatMessage
+  onRetry?: (id: string) => void
+}) {
+  const dir = useStore((s) => s.dir)
+  const [copied, setCopied] = useState(false)
+
+  const copy = async () => {
+    try {
+      await copyToClipboard(stripBidiMarks(fixZwsp(message.content)))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch (err) {
+      console.warn('copy failed', err)
+    }
+  }
+
+  return (
+    <div className="seg-steer">
+      <div className="seg-steer-label">You</div>
+      <div className="seg-steer-text" dir={dir}>
+        {message.content || '(empty)'}
+      </div>
+      {message.attachments && message.attachments.length > 0 && (
+        <div className="msg-attachments" dir="ltr">
+          {message.attachments.map((a) => (
+            <span className="attachment-chip" key={a}>@ {a}</span>
+          ))}
+        </div>
+      )}
+      {(onRetry || message.content) && (
+        <div className="seg-steer-actions">
+          {onRetry && (
+            <button
+              className="msg-copy msg-retry"
+              onClick={() => onRetry(message.id)}
+              title="Retry"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+              </svg>
+            </button>
+          )}
+          <button className={`msg-copy ${copied ? 'copied' : ''}`} onClick={copy} title="Copy message">
+            {copied ? (
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            ) : (
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+            )}
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): ReactNode[] {
   const nodes: ReactNode[] = []
   let pending: { activity: ToolActivity; index: number }[] = []
 
@@ -293,6 +360,19 @@ function renderSegments(message: ChatMessage): ReactNode[] {
   }
 
   message.segments?.forEach((seg, i) => {
+    if (seg.kind === 'user') {
+      flush(`grp-${i}`)
+      const steerMsg = useStore
+        .getState()
+        .chats.flatMap((c) => c.messages)
+        .find((m) => m.id === seg.id)
+      if (steerMsg) {
+        nodes.push(
+          <SegSteerBubble key={i} message={steerMsg} onRetry={onRetry} />,
+        )
+      }
+      return
+    }
     if (seg.kind === 'text') {
       flush(`grp-${i}`)
       nodes.push(
@@ -344,11 +424,11 @@ export const ChatMessageView = memo(function ChatMessageView({
 
   const copyMessage = async () => {
     try {
-      await navigator.clipboard.writeText(stripBidiMarks(fixZwsp(message.content)))
+      await copyToClipboard(stripBidiMarks(fixZwsp(message.content)))
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
-    } catch {
-      /* clipboard unavailable */
+    } catch (err) {
+      console.warn('copy failed', err)
     }
   }
 
@@ -359,6 +439,10 @@ export const ChatMessageView = memo(function ChatMessageView({
   // runs in — the user doesn't want them rendered in the chat. Keep the message
   // in the data (the agent still receives it) but render nothing.
   if (isModeSwitch) return null
+
+  // A steer confirmed by the backend (steer_applied) is rendered inline inside
+  // the assistant message it interrupted — hide its own otherwise-bottom bubble.
+  if (isUser && message.steerInterleaved) return null
 
   // While the provider is retrying, the assistant message has no content yet —
   // hide the empty placeholder so the retry banner (rendered once, at the END
@@ -422,6 +506,13 @@ export const ChatMessageView = memo(function ChatMessageView({
       {!isSummary && !isModeSwitch && (
         <div className="msg-role">
           {roleLabel}
+        </div>
+      )}
+
+      {isUser && message.steerPending && (
+        <div className="steer-note">
+          <span className="steer-dot">●</span>
+          <span>steering the running agent…</span>
         </div>
       )}
 
@@ -504,7 +595,7 @@ export const ChatMessageView = memo(function ChatMessageView({
              each other in the exact order the agent produced them, with runs of
              2+ read-only tool calls collapsed into one summary (see renderSegments). */
           <div className="msg-bubble segmented">
-            {renderSegments(message)}
+            {renderSegments(message, onRetry)}
           </div>
         ) : (
         <div className="msg-bubble">

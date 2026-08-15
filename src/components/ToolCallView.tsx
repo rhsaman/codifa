@@ -301,6 +301,11 @@ export const ToolCallView = memo(function ToolCallView({
   const hasExpand =
     activity.args || activity.summary || activity.diff
   const isWrite = activity.tool === 'write_file' || activity.tool === 'edit_file'
+  const readPaths = Array.isArray(activity.args?.paths)
+    ? (activity.args.paths as string[])
+    : []
+
+  const fetchSummary = activity.tool === 'fetch_url' ? activity.summary : ''
 
   const revert = async () => {
     if (!activity.diff || !root) return
@@ -350,6 +355,21 @@ export const ToolCallView = memo(function ToolCallView({
             {String(activity.args.text || activity.args.subject || '')}
           </span>
         )}
+        {readPaths.length > 0 && (
+          <>
+            {readPaths.slice(0, 2).map((p, i) => (
+              <span key={i} className="tool-path" title={p}>
+                {p}
+              </span>
+            ))}
+            {readPaths.length > 2 && (
+              <span className="tool-path tool-more">
+                +{readPaths.length - 2} more
+              </span>
+            )}
+          </>
+        )}
+        {fetchSummary && <span className="tool-cmd">{fetchSummary}</span>}
         <span className="tool-ms">{fmtTime(ms)}</span>
         {hasExpand && (
           <span className={`chev ${open ? 'open' : ''}`}>▾</span>

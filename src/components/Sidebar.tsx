@@ -276,7 +276,7 @@ export function Sidebar() {
     }
     return best
   }
-  const usageGroups = new Map<string, Array<{ model: string; input: number; output: number; cost: number | null; lastUsed: number }>>()
+  const usageGroups = new Map<string, Array<{ model: string; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number | null; lastUsed: number }>>()
   if (activeChat?.usage) {
     for (const [model, u] of Object.entries(activeChat.usage)) {
       if (u.input + u.output <= 0) continue
@@ -286,12 +286,20 @@ export function Sidebar() {
       // merged into the ACTIVE provider and never hidden as a single "Unknown".
       const derived = (model.split('/')[0] || 'unknown').trim() || 'unknown'
       const key = p?.id ?? derived
-      const price = p?.pricingMap?.[model] ?? p?.pricingMap?.[p?.model ?? '']
+      const price = p?.pricingMap?.[model]
+      // Cost bills cache-read/cache-write tokens at their own (cheaper) rate
+      // when the provider advertises one — input_tokens already includes the
+      // cache portion, so it must be split out before charging full input.
+      const cacheRead = u.cacheRead ?? 0
+      const cacheWrite = u.cacheWrite ?? 0
       const cost = price
-        ? (u.input / 1_000_000) * price.input + (u.output / 1_000_000) * price.output
+        ? ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
+          (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+          (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
+          (u.output / 1_000_000) * price.output
         : null
       if (!usageGroups.has(key)) usageGroups.set(key, [])
-      usageGroups.get(key)!.push({ model, input: u.input, output: u.output, cost, lastUsed: u.lastUsed ?? 0 })
+      usageGroups.get(key)!.push({ model, input: u.input, output: u.output, cacheRead, cacheWrite, cost, lastUsed: u.lastUsed ?? 0 })
     }
   }
   // Sort each provider group by total usage (heaviest first); ties by most
@@ -559,15 +567,19 @@ export function Sidebar() {
                           onClick={(e) => e.stopPropagation()}
                         />
                       ) : (
-                        <span
-                          className="chat-item-title"
-                          dir={dir}
-                          onDoubleClick={(e) => {
-                            e.stopPropagation()
-                            startRename(c)
-                          }}
-                        >
-                          {prepareContent(titleOf(c), dir)}
+                        <span className="chat-item-title-row" dir={dir}>
+                          <span
+                            className="chat-item-title"
+                            onDoubleClick={(e) => {
+                              e.stopPropagation()
+                              startRename(c)
+                            }}
+                          >
+                            {prepareContent(titleOf(c), dir)}
+                          </span>
+                          {c.messages.some((m) => m.streaming) && (
+                            <span className="chat-item-streaming" title="Agent is working in this chat" />
+                          )}
                         </span>
                       )}
                     </div>

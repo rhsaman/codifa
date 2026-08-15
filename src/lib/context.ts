@@ -92,9 +92,15 @@ export function estimateContextChars(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
   const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
-  for (const m of settled) chars += m.content.length
+  for (const m of settled) {
+    chars += m.content.length
+    // Reasoning text is round-tripped to the model as a ThinkingPart on every
+    // resend (see _to_model_messages), so it occupies context — count it too.
+    if (m.thinking) chars += m.thinking.length
+  }
   if (live) {
     chars += live.content.length
+    if (live.thinking) chars += live.thinking.length
     for (const act of live.toolActivity ?? []) {
       chars += act.tool.length
       if (act.args) chars += JSON.stringify(act.args).length
@@ -121,9 +127,13 @@ export function estimateContextTokens(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
   const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
-  for (const m of settled) weight += weightedCharCount(m.content)
+  for (const m of settled) {
+    weight += weightedCharCount(m.content)
+    if (m.thinking) weight += weightedCharCount(m.thinking)
+  }
   if (live) {
     weight += weightedCharCount(live.content)
+    if (live.thinking) weight += weightedCharCount(live.thinking)
     for (const act of live.toolActivity ?? []) {
       weight += weightedCharCount(act.tool)
       if (act.args) weight += weightedCharCount(JSON.stringify(act.args))

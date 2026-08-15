@@ -556,6 +556,11 @@ def _entry_pricing(entry: dict) -> dict | None:
     MILLION tokens (models.dev's own convention, see ``_models_dev_pricing``
     below) so callers use one unit everywhere. A price of exactly 0 is a real,
     meaningful value (free models) and is kept, not treated as missing.
+
+    When the provider also advertises per-token cache rates
+    (``pricing.cache_read_input_tokens`` / ``pricing.cache_write_input_tokens``,
+    OpenRouter), those are normalized to per-million ``cacheRead`` / ``cacheWrite``
+    so the sidebar cost meter can bill cache-read tokens at the cheaper rate.
     """
     pricing = entry.get("pricing")
     if not isinstance(pricing, dict):
@@ -565,7 +570,17 @@ def _entry_pricing(entry: dict) -> dict | None:
     if prompt is None or completion is None:
         return None
     try:
-        return {"input": float(prompt) * 1_000_000, "output": float(completion) * 1_000_000}
+        out = {
+            "input": float(prompt) * 1_000_000,
+            "output": float(completion) * 1_000_000,
+        }
+        cache_read = pricing.get("cache_read_input_tokens")
+        cache_write = pricing.get("cache_write_input_tokens")
+        if cache_read is not None:
+            out["cacheRead"] = float(cache_read) * 1_000_000
+        if cache_write is not None:
+            out["cacheWrite"] = float(cache_write) * 1_000_000
+        return out
     except (TypeError, ValueError):
         return None
 
@@ -707,7 +722,9 @@ def _models_dev_max_output(catalog: dict, provider_key: str, model_id: str) -> i
 def _models_dev_pricing(catalog: dict, provider_key: str, model_id: str) -> dict | None:
     """Look up ``model_id``'s USD-per-million-token pricing under ``provider_key``
     in a models.dev catalog (native unit there — ``cost.input`` / ``cost.output``,
-    already USD per million tokens, no conversion needed)."""
+    already USD per million tokens, no conversion needed). Cache rates, when the
+    catalog advertises them (``cost.cache_read_input`` / ``cost.cache_write_input``),
+    are surfaced as ``cacheRead`` / ``cacheWrite`` for the meter."""
     models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
     entry = models.get(model_id) or {}
     cost = entry.get("cost") or {}
@@ -715,7 +732,14 @@ def _models_dev_pricing(catalog: dict, provider_key: str, model_id: str) -> dict
     if inp is None or out is None:
         return None
     try:
-        return {"input": float(inp), "output": float(out)}
+        entry_out = {"input": float(inp), "output": float(out)}
+        cache_read = cost.get("cache_read_input")
+        cache_write = cost.get("cache_write_input")
+        if cache_read is not None:
+            entry_out["cacheRead"] = float(cache_read)
+        if cache_write is not None:
+            entry_out["cacheWrite"] = float(cache_write)
+        return entry_out
     except (TypeError, ValueError):
         return None
 

@@ -1996,6 +1996,7 @@ def make_tool_callbacks(
     permit: dict | None = None,
     store: VectorStore | None = None,
     chat_id: str = "",
+    explore_seed: dict | None = None,
 ) -> dict[str, Callable]:
     """Build the agent tools bound to ``root`` with an emit callback.
 
@@ -2050,10 +2051,10 @@ def make_tool_callbacks(
     # that prevent overflow / mid-task truncation.
     if context_window and context_window > 0:
         ctx = int(context_window)
-        tool_out_chars = max(400, min((ctx // 12) - 150, 3_000))
+        tool_out_chars = max(400, min((ctx // 14) - 150, 2_400))
         listing_count = max(15, ctx // 600)
         search_count = max(10, ctx // 500)
-        terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_500, tool_out_chars * 1))
+        terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_000, tool_out_chars * 1))
     else:
         tool_out_chars = MAX_READ_BYTES
         listing_count = 200
@@ -2070,7 +2071,7 @@ def make_tool_callbacks(
     # digest to its task_text, so repeated explore calls in one turn build on
     # earlier findings instead of each starting from zero (the observed 10-15
     # round re-discovery loop for broad styling tasks).
-    _explore_turn_digest: dict[str, str] = {}
+    _explore_turn_digest: dict[str, str] = dict(explore_seed or {})
     # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
     # update_plan (the common case for small tasks) never hit the threshold, so
     # the model could write its final reply with a step still stuck 'in_progress'
@@ -2228,7 +2229,7 @@ def make_tool_callbacks(
         return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
 
     async def update_plan(items: list[dict]) -> str:
-        """Set/update your step-by-step live checklist for the CURRENT task. ALWAYS call FIRST, before touching files — full list with status='pending' for every item, even small requests. Re-call with the SAME full list, marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Never skip. Write items in the SAME language the user is writing in."""
+        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
@@ -2588,7 +2589,7 @@ def make_tool_callbacks(
         # search subagent so it does the interpretation work (and its tokens are
         # accounted to the search model in MODEL USAGE), instead of the parent
         # model reading the raw output directly.
-        if search_model is not None and _is_terminal_search(command):
+        if search_model is not None and _is_terminal_search(command) and len(output) >= 600:
             try:
                 from pydantic_ai import Agent as _SA
                 from pydantic_ai.settings import ModelSettings as _SMS
@@ -2676,8 +2677,8 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
         return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines) + note
 
-    async def read_files_tool(paths: list[str], per_file_chars: int = 6000) -> str:
-        """Read the content of already-identified files for verbatim code you need (JSX/CSS/functions). `paths` = list of workspace-relative file paths (max 5). `per_file_chars` caps each file's returned content (default 6000) so a read can't flood context. Use AFTER you know the exact paths (from fuzzy_find/search_in_files/explore) — not for discovery. One call can pull several known files; skip what you don't need."""
+    async def read_files_tool(paths: list[str], per_file_chars: int = 4000) -> str:
+        """Read the content of already-identified files for verbatim code you need (JSX/CSS/functions). `paths` = list of workspace-relative file paths (max 5). `per_file_chars` caps each file's returned content (default 4000) so a read can't flood context. Use AFTER you know the exact paths (from fuzzy_find/search_in_files/explore) — not for discovery. One call can pull several known files; skip what you don't need."""
         emit({"kind": "tool", "tool": "read_files", "args": {"paths": paths}})
         if not paths:
             emit(_error_result("read_files", "no paths given"))
@@ -2721,7 +2722,7 @@ def make_tool_callbacks(
         # so the sub-agent model sees only relevant data, never megabytes.
         _sub_listing_count = min(listing_count, 30)
         _sub_search_count = min(search_count, 30)
-        _sub_tool_out_chars = max(400, min(tool_out_chars, 7_000))
+        _sub_tool_out_chars = max(400, min(tool_out_chars, 5_000))
 
         def _sub_emit(event: dict) -> None:
             # Forward to the same UI stream (so the user sees live sub-agent
@@ -3041,37 +3042,74 @@ def make_tool_callbacks(
             # Narrow fact-lookups keep the cheap concise-report style/1200 cap.
             if _is_content_gathering(task_text):
                 _sub_report_style = (
-                    " in a report that INCLUDES the verbatim code blocks the "
-                    "task needs (full JSX/CSS/function bodies relevant to the "
-                    "question, each prefixed by its exact file:line). Keep "
-                    "intervening prose under ~150 words — the code blocks are "
-                    "the deliverable, not padding."
+                    "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
+                    "<results>\n"
+                    "<files>\n"
+                    "One line per relevant file: `path:line` — the verbatim code "
+                    "blocks the task needs (full JSX/CSS/function bodies relevant to "
+                    "the question, each prefixed by its exact file:line).\n"
+                    "</files>\n"
+                    "<answer>\n"
+                    "One short paragraph on how the code fits together (under ~150 "
+                    "words — the code blocks are the deliverable, not padding).\n"
+                    "</answer>\n"
+                    "<next_steps>\n"
+                    "Optional: 1-2 follow-up paths the parent could take.\n"
+                    "</next_steps>\n"
+                    "</results>"
                 )
                 _sub_max_tokens = 3000
             else:
                 _sub_report_style = (
-                    " in a CONCISE report (under ~300 words): exact file paths "
-                    "and line numbers, code excerpts ≤ 3 lines unless the "
-                    "multi-line structure is the answer. Do not pad."
+                    "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
+                    "<results>\n"
+                    "<files>\n"
+                    "One line per relevant file: `path:line` (use the exact paths "
+                    "from your tool results).\n"
+                    "</files>\n"
+                    "<answer>\n"
+                    "The direct answer to the task in 1-3 sentences (under ~100 "
+                    "words).\n"
+                    "</answer>\n"
+                    "<next_steps>\n"
+                    "Optional: 1-2 suggested follow-ups, or leave empty.\n"
+                    "</next_steps>\n"
+                    "</results>"
                 )
                 _sub_max_tokens = 1200
 
             sub_agent = _Agent(
                 summarizer_model,
                 system_prompt=(
-                    "You are a read-only exploration sub-agent. "
+                    "You are a read-only exploration sub-agent. Your job is to find the "
+                    "answer FAST and CHEAPLY and hand back a compact structured report. "
+                    "TIME IS PRECIOUS — every search round-trip re-sends your whole "
+                    "transcript, so do not over-explore.\n"
+                    "INTENT (do this before your first search): state in one sentence "
+                    "what you are actually looking for (the literal request vs. the real "
+                    "underlying need) so your searches are targeted, not scattershot.\n"
+                    "PARALLEL-FIRST ACTION: on your very first turn launch 3+ tool calls "
+                    "SIMULTANEOUSLY — fire the fuzzy_find / list_files / search_in_files "
+                    "calls you already know you need in ONE response (batch related terms "
+                    "with regex alternation foo|bar|baz). Do NOT do a serial "
+                    "search→read→decide-next loop.\n"
                     "TOOL CHOICE: use fuzzy_find to locate FILES by name (part of a filename, "
                     "or an extension like 'py'), use list_files to see a directory's contents, "
                     "and use search_in_files only to find CONTENT INSIDE already-identified files "
                     "or to confirm a symbol/string exists. Do NOT search_in_files to discover which "
-                    "files exist — that returns hundreds of noisy matches. Combine multiple search "
-                    "terms with regex alternation (foo|bar|baz). Pass context=5-10 on your first "
-                    "content search of a file. Never repeat a search with only a minor keyword "
-                    "variation. Do NOT search for overly generic terms like 'class', 'function', "
-                    "'def', 'import' or punctuation — use specific, project-relevant keywords. "
-                    "Stop as soon as you have enough to answer. When done, report your findings "
+                    "files exist — that returns hundreds of noisy matches. Never repeat a search "
+                    "with only a minor keyword variation. Do NOT search for overly generic terms "
+                    "like 'class', 'function', 'def', 'import' or punctuation — use specific, "
+                    "project-relevant keywords. Pass context=5-10 on your first content search of "
+                    "a file.\n"
+                    "HARD STOP CONDITIONS — stop as soon as ANY applies: "
+                    "(1) you have enough context to answer the task confidently; "
+                    "(2) the same information keeps appearing across searches (diminishing returns); "
+                    "(3) the last 2 search iterations yielded no new useful information; "
+                    "(4) you found a direct answer. Then report immediately. "
+                    "When done, report your findings "
                     + _sub_report_style
-                    + "ACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
+                    + "\nACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
                     "invent, guess or abbreviate a path. If a search returns no matches, say so "
                     "explicitly instead of assuming it exists. If you are unsure a file exists, "
                     "confirm it with fuzzy_find before citing it. Only cite facts that appear in "

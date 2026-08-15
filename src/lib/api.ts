@@ -17,6 +17,12 @@ export async function ensureSidecar(): Promise<string | null> {
 export interface ModelPricing {
   input: number
   output: number
+  /** USD per MILLION tokens for prompt-cache reads, when the provider advertises
+   *  a separate (cheaper than full input) rate. Falls back to `input` at the
+   *  meter when absent. */
+  cacheRead?: number
+  /** USD per MILLION tokens for prompt-cache writes, when advertised. */
+  cacheWrite?: number
 }
 
 /** Query params / body fields carrying a provider's OAuth credentials. Empty for
@@ -290,6 +296,30 @@ export async function streamChat(
     }
   } finally {
     reader.releaseLock()
+  }
+}
+
+/** Deliver a message to a RUNNING agent for this chat (no abort, injected at
+ *  the next tool call). Returns false if the sidecar is unreachable or the
+ *  chat_id/prompt are invalid. */
+export async function steerChat(
+  chatId: string,
+  id: string,
+  prompt: string,
+): Promise<boolean> {
+  const url = await ensureSidecar()
+  if (!url) return false
+  try {
+    const res = await fetch(`${url}/chat/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, id, prompt }),
+    })
+    if (!res.ok) return false
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
+    return body.ok !== false
+  } catch {
+    return false
   }
 }
 

@@ -20,6 +20,7 @@ import {
 } from "../lib/context";
 import {
   addMemoryNote,
+  steerChat,
   streamChat,
   fetchModels,
   fetchCredits,
@@ -30,6 +31,7 @@ import {
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
 import { prepareContent } from "../lib/bidi";
+import { registerChatSend, sendPendingSteerNext, sendQueuedNext, uid2 } from "../lib/chatSends";
 import {
   GLOBAL_SHORTCUTS,
   PREFIX_LABEL,
@@ -257,8 +259,6 @@ export function ChatPanel() {
   const settings = useStore((s) => s.settings);
   const autoSkills = useStore((s) => s.settings.autoSkills === true);
   const setAutoSkills = useStore((s) => s.setAutoSkills);
-  const storeStreaming = useStore((s) => s.isStreaming);
-  const isThinking = useStore((s) => s.isThinking);
   const modes = useStore((s) => allModes(s.settings));
   const maxHistory = provider.maxHistory ?? DEFAULT_MAX_HISTORY;
   const nvimFile = useStore((s) => s.nvimFile);
@@ -299,7 +299,13 @@ export function ChatPanel() {
 
   const [input, setInput] = useState(chat?.draft?.input ?? "");
   const [busyLocal, setBusy] = useState(false);
-  const busy = busyLocal || storeStreaming;
+  // This chat is busy when THIS chat has a streaming assistant message (so
+  // another chat streaming in the background doesn't lock this composer). The
+  // message-level streaming flag is the source of truth — the global
+  // isStreaming flag stays in the store only as the persist gate.
+  const chatHasStreaming = chat?.messages.some((m) => m.streaming) ?? false;
+  const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
+  const busy = busyLocal || chatHasStreaming;
   // Live thinking pinned to the top while the streaming message carries any
   // thinking text. Deliberately independent of `isThinking`: text chunks toggle
   // that flag on/off mid-turn, which used to flicker the pin on and off as the
@@ -369,6 +375,7 @@ export function ChatPanel() {
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const chatIdRef = useRef(chat?.id ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
   const lastEventAt = useRef(0);
@@ -517,7 +524,6 @@ export function ChatPanel() {
       skillChips,
     });
   }, [chat?.id, input, attachments, images, skillChips]);
-
   // Keep the model context window (and pricing, when the provider advertises
   // it) fresh from the provider's live /models list, so the context meter
   // reflects the model's real capacity and cost (not a hardcoded default).
@@ -655,13 +661,11 @@ export function ChatPanel() {
 
   const ctxPct = contextPercent(contextUsed, ctxWindow);
 
-  const pricing = provider.pricingMap?.[provider.model] ?? null;
-
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
   // survives compacts and chat switches — session totals only ever grow. Each
-  // model is priced with its own advertised rate when the provider publishes
-  // one, falling back to the parent model's rate.
+  // model is priced with its OWN advertised rate when the provider publishes
+  // one — never the parent model's rate (would silently misprice old models).
   const sessionUsage = useMemo(() => {
     const usage = chat?.usage ?? {};
     const out: Array<{
@@ -673,31 +677,39 @@ export function ChatPanel() {
     }> = [];
     for (const [model, u] of Object.entries(usage)) {
       if (u.input + u.output <= 0) continue;
-      const price = provider.pricingMap?.[model] ?? pricing;
+      const price = provider.pricingMap?.[model] ?? null;
+      // input_tokens already includes the cache-read/write portion; bill the
+      // cache lines at their own cheaper rate when advertised, else full input.
+      const cacheRead = u.cacheRead ?? 0;
       const cost = price
-        ? (u.input / 1_000_000) * price.input +
-        (u.output / 1_000_000) * price.output
+        ? ((u.input - cacheRead) / 1_000_000) * price.input +
+          (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+          (u.output / 1_000_000) * price.output
         : null;
       out.push({
         model,
         input: u.input,
         output: u.output,
-        cacheRead: u.cacheRead ?? 0,
+        cacheRead,
         cost,
       });
     }
     out.sort((a, b) => b.input + b.output - (a.input + a.output));
     return out;
-  }, [chat?.usage, provider.pricingMap, pricing]);
+  }, [chat?.usage, provider.pricingMap]);
 
   const send = async (
     text: string,
     atts: string[] = [],
     imgs: Array<{ path: string; name: string }> = [],
     allowCreate = false,
+    reuseMsgId?: string,
   ) => {
     const s = useStore.getState();
-    const chat = s.chats.find((c) => c.id === s.activeChatId);
+    // Use THIS panel's chat (captured at render), never s.activeChatId: a
+    // queued turn drained while the user is viewing ANOTHER chat must still
+    // target this chat's messages/usage.
+    const chat = s.chats.find((c) => c.id === chatIdRef.current) ?? null;
     if (!chat) return;
     // Messages that ask to create/install skills or MCP connectors also grant
     // the create_skill/create_mcp tools — in EVERY mode (ask, plan, coder).
@@ -730,7 +742,10 @@ export function ChatPanel() {
     // Selected skills (chips) and enabled MCP connectors (persistent switches)
     // become an explicit instruction on this turn.
     const skillNotes: string[] = [];
-    for (const chip of skillChips) {
+    // Read from the live chat's draft (not the component closure) so a turn
+    // drained while this panel is unmounted still carries the picked chips.
+    const activeChips = chat.draft?.skillChips ?? skillChips;
+    for (const chip of activeChips) {
       if (chip.kind === "skill") {
         skillNotes.push(
           `Read ${chip.path} and follow its instructions exactly.`,
@@ -777,13 +792,23 @@ export function ChatPanel() {
     }
     setSkillOpen(false);
 
-    const userMsg = s.addMessage({
-      role: "user",
-      content: text,
-      attachments: atts,
-      images: imgs,
-    });
-    const assistantMsg = s.addMessage({
+    // When draining an undelivered steer, REUSE the user message that is
+    // already visible in the transcript instead of creating a new bubble, and
+    // clear its steerPending flag so the drain can't re-pick it.
+    let userMsg: ReturnType<typeof s.addMessage> | undefined;
+    if (reuseMsgId) {
+      userMsg = chat.messages.find((m) => m.id === reuseMsgId);
+      if (userMsg) s.updateMessage(userMsg.id, { steerPending: false });
+    }
+    if (!userMsg) {
+      userMsg = s.addMessage(chat.id, {
+        role: "user",
+        content: text,
+        attachments: atts,
+        images: imgs,
+      });
+    }
+    const assistantMsg = s.addMessage(chat.id, {
       role: "assistant",
       content: "",
       mode: chat.mode,
@@ -827,7 +852,7 @@ export function ChatPanel() {
 
     const abort = new AbortController();
     abortRef.current = abort;
-    useStore.getState().setActiveAbort(abort);
+    useStore.getState().setChatAbort(chat.id, abort);
     setBusy(true);
     setStalled(false);
     lastEventAt.current = Date.now();
@@ -932,7 +957,7 @@ export function ChatPanel() {
       const store = useStore.getState();
       const findMsg = () =>
         store.chats
-          .find((c) => c.id === store.activeChatId)
+          .find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
       if (event.kind === "text") {
         useStore.getState().setStreaming(true, false);
@@ -1047,7 +1072,7 @@ export function ChatPanel() {
         // the summary mid-stream (previously via scrollIntoView) is exactly
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
-        const chatId = store.activeChatId;
+        const chatId = chat.id;
         if (chatId) {
           store.compactChat(chatId, event.content ?? "", maxHistory);
         }
@@ -1102,7 +1127,7 @@ export function ChatPanel() {
         store.updateMessage(assistantMsg.id, {
           content:
             (store.chats
-              .find((c) => c.id === store.activeChatId)
+              .find((c) => c.id === chat.id)
               ?.messages.find((m) => m.id === assistantMsg.id)?.content ?? "") +
             `\n\n> **Error:** ${event.content}`,
           error: true,
@@ -1114,6 +1139,29 @@ export function ChatPanel() {
         // Fold the completed tool calls into content too — the backend fatal
         // arrives as an inline event, not a throw, so the catch path won't run.
         preserveToolActivity();
+      } else if (event.kind === "steer_applied") {
+        // The running agent consumed these steer messages (injected into a tool
+        // result). Move each one inline: hide its own bottom bubble and append
+        // a user segment to the CURRENT assistant message, right after the tool
+        // call that carried it — so the agent's later text and tool calls all
+        // render BELOW the steer, in real order. Also clearthe steerPending flag
+        // so the turn's finally block does NOT re-send it as a new turn.
+        const ids = Array.isArray(event.ids) ? event.ids : [];
+        const segments = findMsg()?.segments ?? [];
+        const nextSegments = [...segments];
+        for (const id of ids) {
+          const userMsg = store.chats
+            .find((c) => c.id === chat.id)
+            ?.messages.find((m) => m.id === id);
+          if (!userMsg || userMsg.role !== "user") continue;
+          nextSegments.push({ kind: "user", id });
+        }
+        if (nextSegments.length > segments.length) {
+          store.updateMessage(assistantMsg.id, { segments: nextSegments });
+        }
+        for (const id of ids) {
+          store.updateMessage(id, { steerPending: false, steerInterleaved: true });
+        }
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -1126,7 +1174,10 @@ export function ChatPanel() {
         // Accrue into the chat-wide cumulative usage (survives compacts and
         // chat switches) so the titlebar can show main + sub-agent session
         // totals and cost separately from the shrinkable current context.
-        store.accrueChatUsage(store.activeChatId, model, {
+        // Attribute to THIS panel's chat (captured at render via chatIdRef),
+        // never s.activeChatId — a turn finished while the user is viewing
+        // another chat must still post to the chat the stream belongs to.
+        store.accrueChatUsage(chat.id, model, {
           input: inputTokens,
           output: outputTokens,
           cacheRead: event.cache_read_tokens ?? 0,
@@ -1181,7 +1232,7 @@ export function ChatPanel() {
               if (all[n]) sel[n] = all[n];
             return sel;
           })(),
-          skills: skillChips
+          skills: activeChips
             .filter((c) => c.kind === "skill")
             .map((c) => c.name),
           autoSkills: s.settings.autoSkills === true,
@@ -1240,7 +1291,7 @@ export function ChatPanel() {
       setPermissionReq(null);
       resolveStuckCards();
       abortRef.current = null;
-      useStore.getState().setActiveAbort(null);
+      useStore.getState().setChatAbort(chat.id, null);
       useStore.getState().setStreaming(false, false);
       useStore
         .getState()
@@ -1248,7 +1299,35 @@ export function ChatPanel() {
       // A turn just completed → usage changed. Refresh the balance chip now.
       setBalanceTick((t) => t + 1);
     }
+    // Auto-drain: this turn ended and other messages are still queued for this
+    // chat (typed while the agent was working, or unconsumed steers) — start
+    // the next one immediately. Runs via the registry so it works even when
+    // this panel is unmounted (user is in another chat).
+    if (chat.id) {
+      const st = useStore.getState();
+      const cNow = st.chats.find((c) => c.id === chat.id);
+      // Drain undelivered steers first (they are real user messages already in
+      // the transcript, reused as the next turn), then queued items.
+      if (cNow) {
+        const pendingSteer = cNow.messages.find(
+          (m) => m.role === "user" && m.steerPending,
+        );
+        if (pendingSteer) {
+          setTimeout(() => sendPendingSteerNext(chat.id), 0);
+        } else {
+          const remaining = cNow.queued?.filter((q) => !q.sent);
+          if (remaining && remaining.length > 0) {
+            setTimeout(() => sendQueuedNext(chat.id), 0);
+          }
+        }
+      }
+    }
   };
+
+  // Expose this chat's latest `send` so queued turns can be drained even while
+  // this panel is unmounted (user viewing another chat). Registered every
+  // render; NEVER deregistered on unmount.
+  registerChatSend(chatIdRef.current, send);
 
   const compactContext = async () => {
     const s = useStore.getState();
@@ -1360,20 +1439,20 @@ export function ChatPanel() {
         break;
       case "/undo":
         if (ch && s.undoMessage()) {
-          s.addMessage({ role: "assistant", content: "↩ Undone." });
+          s.addMessage(ch.id, { role: "assistant", content: "↩ Undone." });
         } else {
-          s.addMessage({ role: "assistant", content: "Nothing to undo." });
+          s.addMessage(ch?.id ?? "", { role: "assistant", content: "Nothing to undo." });
         }
         break;
       case "/redo":
         if (ch && s.redoMessage()) {
-          s.addMessage({ role: "assistant", content: "↪ Redone." });
+          s.addMessage(ch.id, { role: "assistant", content: "↪ Redone." });
         } else {
-          s.addMessage({ role: "assistant", content: "Nothing to redo." });
+          s.addMessage(ch?.id ?? "", { role: "assistant", content: "Nothing to redo." });
         }
         break;
       case "/help":
-        s.addMessage({
+        s.addMessage(ch?.id ?? "", {
           role: "assistant",
           content:
             "**Modes**\n\n" +
@@ -1397,7 +1476,7 @@ export function ChatPanel() {
         const target = word === "/skill" ? "skill" : "MCP connector";
         const rest = v.slice(word.length).trim();
         if (!rest) {
-          s.addMessage({
+          s.addMessage(ch?.id ?? "", {
             role: "assistant",
             content:
               word === "/skill"
@@ -1406,7 +1485,7 @@ export function ChatPanel() {
           });
           return;
         }
-        s.addMessage({
+        s.addMessage(ch?.id ?? "", {
           role: "user",
           content: v,
         });
@@ -1421,7 +1500,7 @@ export function ChatPanel() {
         break;
       }
       default:
-        s.addMessage({
+        s.addMessage(ch?.id ?? "", {
           role: "assistant",
           content: `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
         });
@@ -1438,7 +1517,7 @@ export function ChatPanel() {
       // throttle, streaming reply, etc.), pressing Retry must cancel that run
       // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
       // guard below and nothing happens, even after the user changed the model.
-      const active = useStore.getState().activeAbort;
+      const active = useStore.getState().chatAborts[chatIdRef.current];
       if (active && !active.signal.aborted) {
         active.abort();
       }
@@ -1467,7 +1546,6 @@ export function ChatPanel() {
   );
 
   const submit = () => {
-    if (busy) return;
     const v = input.trim();
     if (!v && images.length === 0) return;
     if (v.startsWith("/")) {
@@ -1477,7 +1555,7 @@ export function ChatPanel() {
       return;
     }
     const ss = useStore.getState();
-    const chatObj = ss.chats.find((c) => c.id === ss.activeChatId);
+    const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
     if (!chatObj) return;
     const rootDir = chatObj.root || ss.root;
     if (!rootDir) {
@@ -1486,12 +1564,50 @@ export function ChatPanel() {
       return;
     }
     setNoRootHint("");
-    setInput("");
-    setCmdOpen(null);
     const atts = attachments;
     const imgs = images;
     setImages([]);
+    // While THIS chat's agent is working, Enter delivers a non-interrupting
+    // steer: the message becomes a REAL user message (visible immediately) and
+    // is POSTed to /chat/steer (injected at the next tool call). If the turn
+    // ends without the backend injecting it, the drain re-sends it as the next
+    // turn REUSING this same message. The input is NOT consumed by the stream —
+    // no abort.
+    if (chatHasStreaming) {
+      const userMsg = ss.addMessage(chatObj.id, {
+        role: "user",
+        content: v,
+        attachments: atts,
+        images: imgs,
+        steerPending: true,
+      });
+      setInput("");
+      setCmdOpen(null);
+      void steerChat(chatObj.id, userMsg.id, v);
+      return;
+    }
+    setInput("");
+    setCmdOpen(null);
     void send(v, atts, imgs);
+  };
+
+  const queueForLater = () => {
+    const v = input.trim();
+    if (!v && images.length === 0) return;
+    const ss = useStore.getState();
+    const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
+    if (!chatObj) return;
+    const atts = attachments;
+    const imgs = images;
+    ss.queueMessage(chatObj.id, {
+      id: uid2(),
+      text: v,
+      attachments: atts,
+      images: imgs,
+      kind: "queue",
+    });
+    setInput("");
+    setImages([]);
   };
 
   const addImage = (p: string, name: string) => {
@@ -1793,7 +1909,7 @@ export function ChatPanel() {
     setAskReq(null);
     setPermissionReq(null);
     abortRef.current?.abort();
-    useStore.getState().activeAbort?.abort();
+    useStore.getState().chatAborts[chatIdRef.current]?.abort();
   };
 
   if (!chat) {
@@ -2470,6 +2586,30 @@ export function ChatPanel() {
               </div>
             )}
 
+          {queuedMsgs.length > 0 && (
+            <div className="attachment-chips queued-chips" dir="ltr">
+              {queuedMsgs.map((q) => (
+                <span
+                  className={`attachment-chip queued-chip${q.kind === "steer" ? " steer-chip" : ""}`}
+                  key={q.id}
+                  title={
+                    q.kind === "steer"
+                      ? "Sent to the running agent — will be addressed now or as the next turn"
+                      : "Queued — auto-sends after the current turn"
+                  }
+                >
+                  {q.kind === "steer" ? "↝" : "⏳"} {q.text.slice(0, 40)}
+                  <button
+                    className="chip-x"
+                    onClick={() => useStore.getState().removeQueuedMessage(chat.id, q.id)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
           <div className="composer-row">
             <span className="composer-left">
               <ModeSelect
@@ -2499,7 +2639,9 @@ export function ChatPanel() {
                     ? toolRunningRef.current
                       ? "Tool is still running… (Stop to cancel)"
                       : "Still waiting for the provider… (Stop to cancel)"
-                    : "Agent is working…"}
+                    : queuedMsgs.length > 0
+                      ? `Agent is working… ${queuedMsgs.length} queued · Enter steers, no interruption`
+                      : "Agent is working… Enter steers, no interruption"}
                 </span>
               )}
             </span>
@@ -2610,15 +2752,34 @@ export function ChatPanel() {
                 )}
               </button>
               {busy ? (
-                <button
-                  className="icon-btn stop-btn"
-                  onClick={stop}
-                  title="Stop"
-                >
-                  <svg viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="6" y="6" width="12" height="12" rx="2" />
-                  </svg>
-                </button>
+                <>
+                  <button
+                    className="icon-btn queue-btn"
+                    onClick={queueForLater}
+                    disabled={!input.trim() && images.length === 0}
+                    title="Queue — send after the current turn finishes (won't interrupt)"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01" />
+                    </svg>
+                  </button>
+                  <button
+                    className="icon-btn stop-btn"
+                    onClick={stop}
+                    title="Stop"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  </button>
+                </>
               ) : (
                 <button
                   className="icon-btn send-btn"

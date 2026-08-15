@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, session, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, session, shell, clipboard } from 'electron'
 import { execFile } from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
@@ -427,6 +427,12 @@ function registerIpc(): void {
   })
   ipcMain.handle('fs:read-image', (_e, absPath: string) => {
     return readImageDataUrl(absPath)
+  })
+
+  // --- clipboard (reliable copy for the renderer) ---------------------------
+  ipcMain.handle('clipboard:write', (_e, text: string) => {
+    clipboard.writeText(typeof text === 'string' ? text : '')
+    return true
   })
 
   // --- global user data folder (Data path in Settings) ----------------------
@@ -975,10 +981,10 @@ app.whenReady().then(async () => {
   // unsigned builds, where Electron would otherwise auto-deny media requests
   // and getUserMedia would fail silently or error out.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'media')
+    callback(permission === 'media' || permission === 'clipboard-sanitized-write')
   })
   session.defaultSession.setPermissionCheckHandler(
-    (_wc, permission) => permission === 'media',
+    (_wc, permission) => permission === 'media' || permission === 'clipboard-sanitized-write',
   )
   // Import any legacy JSON state into the SQLite DB BEFORE the renderer
   // mounts, so the very first store:get already reads from the DB (and the

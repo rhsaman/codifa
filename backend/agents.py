@@ -1528,6 +1528,7 @@ def _tool_event(ev: dict) -> dict:
         "options",
         "scope",
         "status",
+        "model",
     ):
         val = ev.get(key)
         if val is not None:
@@ -5173,6 +5174,10 @@ async def run_agent(
                         "kind": "compact",
                         "content": summary_text or content,
                         "keep": compact_keep,
+                        "model": str(
+                            getattr(compact_model or model, "model_name", "")
+                            or model_name
+                        ),
                     }
                     history = compacted
                     history_messages = _to_model_messages(history)

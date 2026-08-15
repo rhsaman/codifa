@@ -2718,10 +2718,17 @@ def make_tool_callbacks(
 
     async def grep_tool(pattern: str, path: str = "", include: str = "") -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
+        # The search sub-agent model is the one configured for search tools
+        # (grep / glob / list_files). Label the event with it so the UI badge
+        # shows which model this search slot runs on — the main model once the
+        # slot has fallen back earlier in the turn.
+        _search_runner = main_model if _fallback_state.get("search") else search_model
+        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
         emit({
             "kind": "tool",
             "tool": "grep",
             "args": {"pattern": pattern, "path": path, "include": include},
+            "model": _search_runner_name,
         })
         try:
             result = search_in_files(root, pattern, path, 0, include)
@@ -2735,7 +2742,7 @@ def make_tool_callbacks(
             return f"ERROR searching {path}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
+            emit({"kind": "tool_result", "tool": "grep", "summary": "no matches", "model": _search_runner_name})
             return f"No matches for {pattern!r} under {path or '/'}."
         # Hard cap on the total characters returned so a broad search can't
         # flood the context window.
@@ -2759,12 +2766,24 @@ def make_tool_callbacks(
             if len(matches) > shown
             else ""
         )
-        emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
+        emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches", "model": _search_runner_name})
         return f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations."""
-        emit({"kind": "tool", "tool": "run_terminal", "args": {"command": command}})
+        _reader_model = main_model if _fallback_state.get("search") else search_model
+        _reader_model_name = (
+            str(getattr(_reader_model, "model_name", "") or "")
+            if _reader_model is not None
+            else ""
+        )
+        _is_search_cmd = _is_terminal_search(command)
+        emit({
+            "kind": "tool",
+            "tool": "run_terminal",
+            "args": {"command": command},
+            "model": _reader_model_name if _is_search_cmd else "",
+        })
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]
@@ -2857,7 +2876,11 @@ def make_tool_callbacks(
 
     async def glob_tool(pattern: str, path: str = "") -> str:
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files."""
-        emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
+        # Search-slot model label (same as grep): the search sub-agent, or the
+        # main model once the slot has fallen back earlier in the turn.
+        _search_runner = main_model if _fallback_state.get("search") else search_model
+        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
+        emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}, "model": _search_runner_name})
         try:
             result = glob_files(root, pattern, path)
         except PathEscapeError as exc:
@@ -2870,16 +2893,20 @@ def make_tool_callbacks(
             return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
+            emit({"kind": "tool_result", "tool": "glob", "summary": "no matches", "model": _search_runner_name})
             return f"No files match {pattern!r} under {path or '/'}."
         lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
-        emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
+        emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches", "model": _search_runner_name})
         return f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery."""
-        emit({"kind": "tool", "tool": "read", "args": {"filePath": filePath, "offset": offset, "limit": limit}})
+        # Search-slot model label (same as grep/glob): the search sub-agent, or
+        # the main model once the slot has fallen back earlier in the turn.
+        _search_runner = main_model if _fallback_state.get("search") else search_model
+        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
+        emit({"kind": "tool", "tool": "read", "args": {"filePath": filePath, "offset": offset, "limit": limit}, "model": _search_runner_name})
         try:
             target = resolve_safe(root, filePath, allow_coder=True)
         except PathEscapeError as exc:
@@ -2887,7 +2914,7 @@ def make_tool_callbacks(
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
-            return await _read_dir_tool(target, filePath, offset, limit)
+            return await _read_dir_tool(target, filePath, offset, limit, _search_runner_name)
         if not os.path.exists(target):
             msg = "file not found"
             emit(_error_result("read", msg))
@@ -2915,10 +2942,10 @@ def make_tool_callbacks(
             body = f"{body}\n\n(Showing lines {start}-{lines[-1]['line']} of {total}. Use offset={next_line} to continue.)"
         else:
             body = f"{body}\n\n(End of file — total {total} lines)"
-        emit({"kind": "tool_result", "tool": "read", "summary": f"{len(lines)} lines"})
+        emit({"kind": "tool_result", "tool": "read", "summary": f"{len(lines)} lines", "model": _search_runner_name})
         return f"{filePath}\n{body}"
 
-    async def _read_dir_tool(target: str, filePath: str, offset: int, limit: int) -> str:
+    async def _read_dir_tool(target: str, filePath: str, offset: int, limit: int, _model: str = "") -> str:
         """Directory branch of the read tool (opencode-style listing)."""
         try:
             names = sorted(os.listdir(target), key=lambda n: (n.lower(),))
@@ -2942,7 +2969,7 @@ def make_tool_callbacks(
             else f"({len(entries)} entries)"
         )
         body = "\n".join(window) if window else "(empty directory)"
-        emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries"})
+        emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries", "model": _model})
         return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:

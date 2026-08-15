@@ -1926,19 +1926,22 @@ textarea {
   flex-direction: column;
   background: var(--bg-input);
   border: 1px solid var(--border);
-  border-radius: 26px;
+  border-radius: 22px;
   padding: 10px 12px 8px;
-  box-shadow: var(--shadow);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.08),
+    0 8px 24px -12px rgba(0, 0, 0, 0.22);
   transition:
     border-color 0.18s ease,
-    box-shadow 0.18s ease;
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
 }
 
 .composer-inner:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
   box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent),
-    var(--shadow);
+    0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent),
+    0 10px 30px -12px rgba(0, 0, 0, 0.28);
 }
 
 .composer-input {
@@ -1991,7 +1994,8 @@ textarea {
   justify-content: space-between;
   gap: 10px;
   margin-top: 6px;
-  padding-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
 }
 
 .composer-left {
@@ -2182,16 +2186,29 @@ textarea {
 }
 
 .send-btn {
-  width: 34px;
-  height: 34px;
-  background: var(--accent);
+  width: 36px;
+  height: 36px;
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 78%, #000));
   color: var(--on-accent);
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent);
+  box-shadow:
+    0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  transition:
+    background 0.18s ease,
+    transform 0.12s ease,
+    box-shadow 0.18s ease,
+    opacity 0.15s;
 }
 
 .send-btn:not(:disabled):hover {
-  transform: translateY(-1px) scale(1.04);
-  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 45%, transparent);
+  transform: translateY(-1px) scale(1.05);
+  box-shadow:
+    0 5px 14px color-mix(in srgb, var(--accent) 50%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.send-btn:not(:disabled):active {
+  transform: translateY(0) scale(0.96);
 }
 
 .send-btn:disabled {
@@ -2199,6 +2216,7 @@ textarea {
   color: var(--text-dim);
   border: 1px solid var(--border);
   box-shadow: none;
+  cursor: default;
 }
 
 .stop-btn {
@@ -2643,6 +2661,87 @@ textarea {
   font-size: 11px;
   color: var(--accent);
   overflow-wrap: anywhere;
+}
+
+.tool-card-head .tool-cmd.tool-task {
+  display: inline-block;
+  max-width: 38ch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.tool-card-head .tool-badge.tool-sub-count {
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.tool-card-body .tool-sub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg-panel) 55%, transparent);
+}
+
+.tool-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.tool-sub-row + .tool-sub-row {
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.tool-sub-row.running {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.tool-sub-row .tool-sub-name {
+  color: var(--text);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.tool-sub-row .tool-sub-args {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tool-sub-row .tool-sub-summary {
+  color: var(--text-dim);
+  font-style: italic;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: auto;
+  max-width: 34ch;
+}
+
+.tool-sub-row .tool-ms {
+  flex: 0 0 auto;
+  padding-left: 10px;
+}
+
+.tool-sub-list .tool-card {
+  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 60%, transparent);
+}
+
+.tool-sub-list .tool-card-head {
+  padding: 6px 10px;
 }
 
 .spinner {
@@ -4181,15 +4280,18 @@ textarea {
   left: 0;
   right: 0;
   z-index: 30;
-  max-height: 280px;
+  max-height: 300px;
   overflow-y: auto;
   background: var(--bg-alt);
   border: 1px solid var(--border);
-  border-radius: 18px;
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.3);
+  border-radius: 16px;
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.08),
+    0 16px 40px -8px rgba(0, 0, 0, 0.32);
   text-align: left;
   padding: 6px;
   animation: ask-slide-up 0.14s ease-out;
+  backdrop-filter: blur(16px);
 }
 
 .mention-search {
@@ -4198,18 +4300,21 @@ textarea {
   padding: 9px 11px;
   margin: 0 0 5px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 11px;
   background: var(--bg-input);
   color: var(--text);
   font-size: 13px;
   outline: none;
   position: sticky;
   top: 0;
-  transition: border-color 0.14s;
+  transition:
+    border-color 0.14s,
+    box-shadow 0.14s;
 }
 
 .mention-search:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .mention-item {
@@ -4217,11 +4322,13 @@ textarea {
   align-items: center;
   gap: 9px;
   padding: 7px 9px;
-  border-radius: 11px;
+  border-radius: 10px;
   cursor: pointer;
   font-size: 13px;
   color: var(--text);
-  transition: background 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
 }
 
 .mention-item:hover,

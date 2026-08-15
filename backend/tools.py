@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import difflib
+import glob as _pyglob
 import json
 import os
 import re
@@ -418,10 +419,10 @@ def _read_text(path: str) -> tuple[str, bool]:
         return data.decode("utf-8", errors="replace"), truncated
 
 
-# Cache of _walk_files listings per root, so consecutive fuzzy_find / list /
-# search calls inside one turn reuse the same file list instead of re-walking
-# the tree each time (a large repo walk can cost hundreds of ms and is pure
-# repeated work across sibling tool calls). Keyed on root, bounded TTL.
+# Cache of _walk_files listings per root, so consecutive glob / search calls
+# inside one turn reuse the same file list instead of re-walking the tree each
+# time (a large repo walk can cost hundreds of ms and is pure repeated work
+# across sibling tool calls). Keyed on root, bounded TTL.
 _walk_cache: dict[str, tuple[float, Sequence[str]]] = {}
 _WALK_CACHE_TTL = 10.0  # seconds
 
@@ -511,6 +512,43 @@ def read_file(root: str, path: str) -> dict:
     except OSError as exc:
         return {"path": path, "error": str(exc)}
     return {"path": path, "content": content, "truncated": truncated}
+
+
+MAX_LINE_LENGTH = 2000  # chars; lines longer are truncated like opencode's read tool
+
+
+def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
+    """Read a slice of ``path``'s lines, opencode ``read``-style.
+
+    Returns ``{"path", "lines": [{line, text}], "start", "total", "truncated"}``.
+    ``offset`` is 1-indexed; ``limit`` caps the number of lines returned (both
+    defaulted by the caller). Long lines are truncated to ``MAX_LINE_LENGTH``.
+    Reads the file streaming (line by line) so it works on big files.
+    """
+    start = max(1, int(offset or 1))
+    cap = max(1, int(limit or 0))
+    lines: list[dict] = []
+    total = 0
+    truncated = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw in enumerate(fh, 1):
+                total = lineno
+                if lineno < start:
+                    continue
+                text = raw.rstrip("\n")
+                if len(text) > MAX_LINE_LENGTH:
+                    text = text[:MAX_LINE_LENGTH] + f"… (line truncated to {MAX_LINE_LENGTH} chars)"
+                lines.append({"line": lineno, "text": text})
+                if len(lines) >= cap:
+                    truncated = True
+                    # keep scanning to count total lines (cheap) so the footer is right
+                    for _extra in fh:
+                        total += 1
+                    break
+    except (OSError, UnicodeError) as exc:
+        return {"path": path, "error": str(exc), "lines": [], "start": start, "total": 0, "truncated": False}
+    return {"path": path, "lines": lines, "start": start, "total": total, "truncated": truncated}
 
 
 def write_file(root: str, path: str, content: str) -> dict:
@@ -1209,7 +1247,7 @@ def edit_file(
     if truncated:
         return {
             "path": path,
-            "error": "file too large to edit safely (use search_in_files to inspect it in parts instead)",
+            "error": "file too large to edit safely (use read with offset/limit to inspect it in parts instead)",
         }
 
     count = content.count(old_string)
@@ -1446,7 +1484,7 @@ def _self_check_plan_paths(root: str, content: str) -> str:
     )
 
 
-def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
+def _search_python(root: str, query: str, path: str, ctx: int, include: str = "") -> dict:
     """Python fallback for ``search_in_files`` when ripgrep is unavailable.
 
     Walks the tree and matches line-by-line with the same semantics as rg:
@@ -1462,6 +1500,8 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
     except re.error:
         pattern = re.compile(re.escape(query), re.IGNORECASE)
 
+    include_re = _include_glob_to_re(include)
+
     matches: list[dict] = []
     # Same fix as `_rg_search`: a `path` that names a single file searches only
     # that file, instead of silently widening to its parent directory.
@@ -1470,6 +1510,8 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
         if not _is_text_path(file):
             continue
         rel = _display_path(root, file)
+        if include_re is not None and not include_re.search(rel):
+            continue
         try:
             with open(file, "r", encoding="utf-8", errors="ignore") as fh:
                 lines = [ln.rstrip("\n") for ln in fh]
@@ -1496,7 +1538,32 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
     return {"query": query, "matches": matches, "truncated": False}
 
 
-def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
+def _include_glob_to_re(include: str) -> re.Pattern | None:
+    """Convert an opencode-style ``include`` glob (``*.js``, ``*.{ts,tsx}``) to a
+    regex matching relative paths, or ``None`` when there's no filter. Used by the
+    pure-Python search fallback (ripgrep applies ``-g`` natively)."""
+    inc = (include or "").strip()
+    if not inc:
+        return None
+    parts = [i.strip() for i in inc.replace("{", "").replace("}", "").split(",") if i.strip()]
+    chunks: list[str] = []
+    for part in parts:
+        esc = ""
+        i = 0
+        while i < len(part):
+            ch = part[i]
+            if ch == "*":
+                esc += "[^/]*"
+            elif ch == "?":
+                esc += "[^/]"
+            else:
+                esc += re.escape(ch)
+            i += 1
+        chunks.append(esc)
+    return re.compile(r"(?:^|/)(" + "|".join(chunks) + r")$")
+
+
+def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") -> dict | None:
     """Claude-Code-style ripgrep search; returns None when rg is unusable."""
     rg = shutil.which("rg")
     if not rg:
@@ -1526,6 +1593,9 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     cmd = [rg, "--json", "--line-number", "--smart-case", "--color", "never"]
     if ctx > 0:
         cmd += ["--context", str(ctx)]
+    include = (include or "").strip()
+    if include:
+        cmd += ["-g", include.replace("{", "{").replace("}", "}")]
     cmd += ["-e", query, search_arg]
 
     try:
@@ -1575,7 +1645,7 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     return {"query": query, "matches": matches, "truncated": False}
 
 
-def search_in_files(root: str, query: str, path: str = "", context: int = 0) -> dict:
+def search_in_files(root: str, query: str, path: str = "", context: int = 0, include: str = "") -> dict:
     """Search for ``query`` (case-insensitive regex) under ``path``.
 
     Uses ripgrep when available (respecting ``.gitignore``, skipping hidden and
@@ -1583,77 +1653,107 @@ def search_in_files(root: str, query: str, path: str = "", context: int = 0) -> 
     fallback. When ``context > 0``, each match also includes the ``context``
     lines before and after the matching line (returned in the ``context_lines``
     field), so the agent can see surrounding code without reading the whole
-    file.
+    file. ``include`` optionally restricts to files matching a glob (e.g.
+    ``*.ts`` / ``*.{ts,tsx}``).
     """
     ctx = max(0, int(context or 0))
-    result = _rg_search(root, query, path, ctx)
+    result = _rg_search(root, query, path, ctx, include)
     if result is not None:
         return result
-    return _search_python(root, query, path, ctx)
+    return _search_python(root, query, path, ctx, include)
 
 
-def _fuzzy_score(pattern: str, text: str) -> int:
-    """Return a score for how well ``pattern`` matches ``text`` as a subsequence.
+def _glob_python(root: str, pattern: str, target: str, path: str) -> dict:
+    """Python fallback for :func:`glob_files` when ripgrep is unavailable.
 
-    Higher is better. ``pattern`` chars must appear in ``text`` in order
-    (case-insensitive). The match is scored by how much of the pattern matched
-    plus a small bonus for aligned characters and a penalty for gaps.
+    Uses the stdlib ``glob`` with ``recursive=True`` so ``**`` works, then clips
+    results to our usual limits (skips hidden dirs, honours ``_SKIP_DIRS``).
     """
-    pattern = pattern.lower()
-    text = text.lower()
-    if not pattern:
-        return 0
-    score = 0
-    penalty = 0
-    prev_idx = -1
-    for ch in pattern:
-        idx = text.find(ch, prev_idx + 1)
-        if idx == -1:
-            return 0
-        if prev_idx != -1:
-            if idx == prev_idx + 1:
-                score += 8  # consecutive match
-            else:
-                penalty += idx - prev_idx
+    try:
+        matches = _pyglob.glob(os.path.join(target, pattern), recursive=True)
+    except (ValueError, re.error, OSError):
+        return {"pattern": pattern, "matches": [], "error": f"invalid glob: {pattern}"}
+
+    # glob may return directories too; keep files.
+    files: list[str] = []
+    for match in matches:
+        if not os.path.isfile(match):
+            continue
+        rel = _display_path(root, match)
+        files.append(rel)
+        if len(files) >= MAX_SEARCH_RESULTS:
+            break
+    files = _clip_glob_results(files)
+    return {"pattern": pattern, "matches": files, "truncated": len(matches) > len(files)}
+
+
+def _clip_glob_results(paths: list[str]) -> list[str]:
+    """Sort + de-dupe glob matches (rg orders by mtime; Python sort is fine)."""
+    unique: dict[str, None] = dict.fromkeys(paths)
+    return list(unique)
+
+
+def _rg_glob(root: str, pattern: str, target: str, path: str) -> dict | None:
+    """Ripgrep-backed glob file listing; returns None when rg is unusable."""
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    root_real = os.path.realpath(os.path.abspath(root))
+    coder = os.path.realpath(user_coder_dir())
+    cwd = coder if target.startswith(coder + os.sep) else root_real
+    search_arg = os.path.relpath(target, cwd).replace(os.sep, "/")
+    if search_arg in (".", ""):
+        search_arg = "."
+
+    # `rg --files -g <pattern>` lists files whose path matches the glob, still
+    # respecting .gitignore and skipping hidden/binary files.
+    cmd = [rg, "--files", "-g", pattern, search_arg]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=SEARCH_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None  # invalid glob or scan error -> let the Python fallback try
+
+    files: list[str] = []
+    for raw in proc.stdout.splitlines():
+        rel = raw.removeprefix("./")
+        if in_coder := (target.startswith(coder + os.sep)):
+            rel = os.path.join(coder, rel)
+            files.append(_display_path(root, rel))
         else:
-            penalty += idx  # leading gap
-        prev_idx = idx
-    score += pattern.__len__() * 3
-    return max(1, score - penalty)
+            files.append(rel)
+        if len(files) >= MAX_SEARCH_RESULTS:
+            break
+    return {"pattern": pattern, "matches": _clip_glob_results(files), "truncated": len(files) >= MAX_SEARCH_RESULTS}
 
 
-def fuzzy_find_files(root: str, query: str, path: str = "") -> dict:
-    """Fuzzily find files/dirs by name under ``path`` (relative to root).
+def glob_files(root: str, pattern: str, path: str = "") -> dict:
+    """Find files by glob pattern under ``path`` (relative to root).
 
-    Matches by basename using subsequence fuzzy matching (query chars in order).
-    Results are ranked by match score, then by path depth. Useful when the user
-    only remembers part of a filename (litmus -> ``Liteform.tsx``).
+    Matches opencode's ``glob`` tool: ``pattern`` is a glob like ``**/*.js`` or
+    ``src/**/*.ts``. Uses ripgrep when available (respecting ``.gitignore``,
+    skipping hidden/binary files) with a stdlib ``glob`` fallback. Returns a
+    list of relative paths (``matches``), sorted.
     """
+    pattern = (pattern or "").strip()
     target = resolve_safe(root, path, allow_coder=True)
     if not os.path.isdir(target):
-        return {"query": query, "matches": [], "error": "not a directory"}
-
-    query = query.strip()
-    if not query:
-        return {"query": query, "matches": []}
-
-    scored: list[tuple[int, str]] = []
-    for file in _walk_files(target):
-        base = os.path.basename(file)
-        score = _fuzzy_score(query, base)
-        if score <= 0:
-            continue
-        rel = _display_path(root, file)
-        depth = rel.count(os.sep)
-        # Order by score desc, then depth asc. Encode as sortable tuple.
-        scored.append((-score, depth, rel))
-
-    scored.sort()
-    matches = [
-        {"path": rel, "name": os.path.basename(rel)}
-        for _, _, rel in scored[:MAX_SEARCH_RESULTS]
-    ]
-    return {"query": query, "matches": matches, "truncated": len(scored) > MAX_SEARCH_RESULTS}
+        return {"pattern": pattern, "matches": [], "error": "not a directory"}
+    if not pattern:
+        return {"pattern": pattern, "matches": []}
+    result = _rg_glob(root, pattern, target, path)
+    if result is not None:
+        return result
+    return _glob_python(root, pattern, target, path)
 
 
 def summarize_value(value: str) -> str:
@@ -2014,7 +2114,7 @@ def make_tool_callbacks(
     # Correlate every tool call with its result via a per-turn monotonic
     # `call_id`. The UI previously matched tool_results to running cards by
     # (tool name + status) alone, which breaks when the SAME tool runs multiple
-    # times in a turn (e.g. 8× fuzzy_find) or when explore's sub-agent emits
+    # times in a turn (e.g. 8× grep) or when explore's sub-agent emits
     # identically-named tool events into the same stream — results could resolve
     # the wrong card, leaving a genuinely-started card stuck on "running"
     # forever. Wrapping emit here gives each tool→result pair a stable id that
@@ -2496,51 +2596,29 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
-    async def list_files_tool(path: str = "") -> str:
-        """List the entries of one directory. `path` is relative to the workspace root; omit it (or pass \"\") to list the root. Shows ONE level only — not recursive. Directories are marked with a trailing `/`; hidden files are skipped (except .gitignore/.env). Long listings are truncated with an `…(N more)` note."""
-        emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
-        try:
-            result = list_files(root, path)
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit(_error_result("list_files", msg))
-            return f"ERROR listing {path}: {msg}"
-        if "error" in result:
-            emit(_error_result("list_files", result["error"]))
-            return f"ERROR listing {path}: {result['error']}"
-        lines = []
-        for entry in result["entries"][:listing_count]:
-            marker = "/" if entry["kind"] == "dir" else "  "
-            lines.append(f"{marker}{entry['name']}")
-        if len(result["entries"]) > listing_count:
-            lines.append(f"…({len(result['entries']) - listing_count} more entries)")
-        body = "\n".join(lines) if lines else "(empty directory)"
-        emit({"kind": "tool_result", "tool": "list_files", "summary": f"{len(result['entries'])} entries"})
-        return f"DIRECTORY {path or '/'}\n{body}"
-
-    async def search_tool(query: str, path: str = "", context: int = 0) -> str:
-        """Search file CONTENTS under the workspace. `query` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar`. `path` is an optional subdirectory to restrict the search to (omit = whole workspace). `context` = number of surrounding lines to return before/after each match (use 5-10 to see code around a hit). Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
+    async def grep_tool(pattern: str, path: str = "", include: str = "") -> str:
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
         emit({
             "kind": "tool",
-            "tool": "search_in_files",
-            "args": {"query": query, "path": path, "context": context},
+            "tool": "grep",
+            "args": {"pattern": pattern, "path": path, "include": include},
         })
         try:
-            result = search_in_files(root, query, path, context)
+            result = search_in_files(root, pattern, path, 0, include)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit(_error_result("search_in_files", msg))
+            emit(_error_result("grep", msg))
             return f"ERROR searching {path}: {msg}"
         if result.get("error"):
             msg = result["error"]
-            emit(_error_result("search_in_files", msg))
+            emit(_error_result("grep", msg))
             return f"ERROR searching {path}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
-            return f"No matches for {query!r} under {path or '/'}."
+            emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
+            return f"No matches for {pattern!r} under {path or '/'}."
         # Hard cap on the total characters returned so a broad search can't
-        # flood the context window (context lines multiply match size fast).
+        # flood the context window.
         lines: list[str] = []
         total = 0
         shown = 0
@@ -2548,10 +2626,6 @@ def make_tool_callbacks(
             if shown >= search_count:
                 break
             block = [f"{m['file']}:{m['line']}: {m['text']}"]
-            if m.get("context_lines"):
-                for cl in m["context_lines"]:
-                    marker = ">" if cl["line"] == m["line"] else " "
-                    block.append(f"{m['file']}:{cl['line']}: {marker} {cl['text']}")
             block_size = sum(len(b) + 1 for b in block)
             if lines and total + block_size > tool_out_chars:
                 break
@@ -2565,8 +2639,8 @@ def make_tool_callbacks(
             if len(matches) > shown
             else ""
         )
-        emit({"kind": "tool_result", "tool": "search_in_files", "summary": f"{len(matches)} matches"})
-        return f"MATCHES for {query!r}\n" + "\n".join(lines) + note
+        emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
+        return f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations."""
@@ -2655,64 +2729,98 @@ def make_tool_callbacks(
                     return f"$ {command}\n{_search_note}\n{output}" + nudge
         return f"$ {command}\n{output}" + nudge
 
-    async def fuzzy_find_tool(query: str, path: str = "") -> str:
-        """Find FILES/DIRS by partial name. `query` is a plain substring-like match on the file's basename (characters must appear in order, NOT regex) — use when you remember only part of a filename, e.g. `litmus` → `Liteform.tsx`. `path` optionally narrows the subtree (omit = whole workspace). Returns ranked relative paths, truncated at 50."""
-        emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
+    async def glob_tool(pattern: str, path: str = "") -> str:
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files."""
+        emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
         try:
-            result = fuzzy_find_files(root, query, path)
+            result = glob_files(root, pattern, path)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit(_error_result("fuzzy_find", msg))
-            return f"ERROR finding {query!r} under {path or '/'}: {msg}"
+            emit(_error_result("glob", msg))
+            return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
         if "error" in result:
             msg = result["error"]
-            emit(_error_result("fuzzy_find", msg))
-            return f"ERROR finding {query!r} under {path or '/'}: {msg}"
+            emit(_error_result("glob", msg))
+            return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": "no matches"})
-            return f"No files match {query!r} under {path or '/'}."
-        lines = [m["path"] for m in matches[:50]]
+            emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
+            return f"No files match {pattern!r} under {path or '/'}."
+        lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
-        emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
-        return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines) + note
+        emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
+        return f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
 
-    async def read_files_tool(paths: list[str], per_file_chars: int = 4000) -> str:
-        """Read the content of already-identified files for verbatim code you need (JSX/CSS/functions). `paths` = list of workspace-relative file paths (max 5). `per_file_chars` caps each file's returned content (default 4000) so a read can't flood context. Use AFTER you know the exact paths (from fuzzy_find/search_in_files/explore) — not for discovery. One call can pull several known files; skip what you don't need."""
-        emit({"kind": "tool", "tool": "read_files", "args": {"paths": paths}})
-        if not paths:
-            emit(_error_result("read_files", "no paths given"))
-            return "ERROR: pass at least one file path."
-        cap = max(200, min(int(per_file_chars or 6000), 40_000))
-        blocks: list[str] = []
-        shown = 0
-        for p in paths[:5]:
-            shown += 1
-            try:
-                result = read_file(root, p)
-            except PathEscapeError as exc:
-                msg = f"invalid path: {exc}"
-                emit(_error_result("read_files", msg))
-                blocks.append(f"{p}: ERROR {msg}")
+    async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery."""
+        emit({"kind": "tool", "tool": "read", "args": {"filePath": filePath, "offset": offset, "limit": limit}})
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        if os.path.isdir(target):
+            return await _read_dir_tool(target, filePath, offset, limit)
+        if not os.path.exists(target):
+            msg = "file not found"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        if not _is_text_path(target):
+            msg = "binary file (read skipped)"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        excerpt = await asyncio.to_thread(_read_lines_excerpt, target, offset, limit)
+        if excerpt.get("error"):
+            msg = excerpt["error"]
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        lines = excerpt["lines"]
+        start = excerpt["start"]
+        total = excerpt["total"]
+        truncated = excerpt["truncated"]
+        if not lines:
+            msg = f"line offset {start} is past the end of the file ({total} lines)"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        body = "\n".join(f"{ln['line']}: {ln['text']}" for ln in lines)
+        if truncated:
+            next_line = lines[-1]["line"] + 1
+            body = f"{body}\n\n(Showing lines {start}-{lines[-1]['line']} of {total}. Use offset={next_line} to continue.)"
+        else:
+            body = f"{body}\n\n(End of file — total {total} lines)"
+        emit({"kind": "tool_result", "tool": "read", "summary": f"{len(lines)} lines"})
+        return f"{filePath}\n{body}"
+
+    async def _read_dir_tool(target: str, filePath: str, offset: int, limit: int) -> str:
+        """Directory branch of the read tool (opencode-style listing)."""
+        try:
+            names = sorted(os.listdir(target), key=lambda n: (n.lower(),))
+        except PermissionError:
+            msg = "permission denied"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        entries: list[str] = []
+        for name in names:
+            if name.startswith(".") and name not in (".gitignore", ".env"):
                 continue
-            if result.get("error"):
-                blocks.append(f"{p}: ERROR {result['error']}")
-                continue
-            content = result.get("content", "")
-            truncated = result.get("truncated", False)
-            if len(content) > cap:
-                content = content[:cap] + "\n…(truncated to fit context)"
-            blocks.append(f"===== {p} =====\n{content}")
-            emit({
-                "kind": "tool_result",
-                "tool": "read_files",
-                "summary": f"{p} · {len(content)} chars" + (" (truncated)" if truncated or len(result.get('content', '')) > cap else ""),
-            })
-        emit({"kind": "tool_result", "tool": "read_files", "summary": f"{shown} file(s) read"})
-        return "\n\n".join(blocks)
+            full = os.path.join(target, name)
+            marker = "/" if os.path.isdir(full) else ""
+            entries.append(f"{name}{marker}")
+        start = max(1, int(offset or 1))
+        count = max(1, min(int(limit or 2000), 2000))
+        window = entries[start - 1: start - 1 + count]
+        footer = (
+            f"({len(entries)} entries, showing {start}-{start - 1 + len(window)})"
+            if start - 1 + len(window) < len(entries)
+            else f"({len(entries)} entries)"
+        )
+        body = "\n".join(window) if window else "(empty directory)"
+        emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries"})
+        return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
-        """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own list_files/search_in_files/fuzzy_find when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
+        """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
         emit({"kind": "tool", "tool": "explore", "args": {"task": task}})
         if summarizer_model is None:
             emit(_error_result("explore", "unavailable"))
@@ -2841,7 +2949,7 @@ def make_tool_callbacks(
                     _sub_emit(
                         {
                             "kind": "tool_result",
-                            "tool": "search_in_files",
+                            "tool": "grep",
                             "summary": "already searched",
                         }
                     )
@@ -2858,7 +2966,7 @@ def make_tool_callbacks(
                     _sub_emit(
                         {
                             "kind": "tool_result",
-                            "tool": "search_in_files",
+                            "tool": "grep",
                             "summary": "already searched",
                         }
                     )
@@ -2869,74 +2977,101 @@ def make_tool_callbacks(
                     )
             return None
 
-        async def _sub_list_files(path: str = "") -> str:
-            _sub_emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
-            lkey = _sub_search_key("", path) or (path, "")
+        async def _sub_read(filePath: str = "", offset: int = 1, limit: int = 2000) -> str:
+            """Sub-agent read: one file (line-paged) or one directory (listing)."""
+            _sub_emit({
+                "kind": "tool", "tool": "read",
+                "args": {"filePath": filePath, "offset": offset, "limit": limit},
+            })
+            lkey = _sub_search_key("", filePath) or (filePath, "")
             # Listing a directory is idempotent: re-listing the SAME directory
             # later in a run returns the same tree and only re-resends the whole
             # sub-agent transcript for nothing. Fold repeats (the sub-agent
             # re-listed backend/, the root and scripts/ three times during a
             # retry).
             if lkey in _sub_seen_listings:
-                cached = _sub_cached("list_files", lkey)
-                body = cached or f"(no stored result for {path or '/'})"
+                cached = _sub_cached("read", lkey)
+                body = cached or f"(no stored result for {filePath or '/'})"
                 _sub_emit(
                     {
                         "kind": "tool_result",
-                        "tool": "list_files",
-                        "summary": "already listed",
+                        "tool": "read",
+                        "summary": "already read/listed",
                     }
                 )
                 return (
-                    f"ALREADY LISTED: you listed {path or '/'} earlier. Listing from earlier:\n"
+                    f"ALREADY READ: you read {filePath or '/'} earlier. Result from earlier:\n"
                     f"{body}"
                 )
-            _sub_seen_listings.add(lkey)
             try:
-                result = list_files(root, path)
+                target = resolve_safe(root, filePath, allow_coder=True)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("list_files", msg))
-                return f"ERROR listing {path}: {msg}"
-            if "error" in result:
-                _sub_emit(_error_result("list_files", result["error"]))
-                return f"ERROR listing {path}: {result['error']}"
-            lines = []
-            for entry in result["entries"][:_sub_listing_count]:
-                marker = "/" if entry["kind"] == "dir" else "  "
-                lines.append(f"{marker}{entry['name']}")
-            if len(result["entries"]) > _sub_listing_count:
-                lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
-            body = "\n".join(lines) if lines else "(empty directory)"
-            out = f"DIRECTORY {path or '/'}\n{body}"
-            _sub_cache_put("list_files", lkey, out)
-            _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": f"{len(result['entries'])} entries"})
+                _sub_emit(_error_result("read", msg))
+                return f"ERROR reading {filePath}: {msg}"
+            if os.path.isdir(target):
+                result = list_files(root, filePath)
+                if "error" in result:
+                    _sub_emit(_error_result("read", result["error"]))
+                    return f"ERROR reading {filePath}: {result['error']}"
+                lines = []
+                for entry in result["entries"][:_sub_listing_count]:
+                    marker = "/" if entry["kind"] == "dir" else "  "
+                    lines.append(f"{marker}{entry['name']}")
+                if len(result["entries"]) > _sub_listing_count:
+                    lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
+                body = "\n".join(lines) if lines else "(empty directory)"
+                out = f"DIRECTORY {filePath or '/'}\n{body}"
+            else:
+                if not os.path.exists(target):
+                    out = f"ERROR reading {filePath}: file not found"
+                elif not _is_text_path(target):
+                    out = f"ERROR reading {filePath}: binary file (read skipped)"
+                else:
+                    excerpt = _read_lines_excerpt(target, offset, limit)
+                    if excerpt.get("error"):
+                        out = f"ERROR reading {filePath}: {excerpt['error']}"
+                    elif not excerpt["lines"]:
+                        out = f"ERROR reading {filePath}: line offset {offset} is past the end"
+                    else:
+                        rows = [f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]]
+                        if excerpt["truncated"]:
+                            rows.append(
+                                f"\n(Showing lines {excerpt['start']}-{excerpt['lines'][-1]['line']}"
+                                f" of {excerpt['total']}. Use offset={excerpt['lines'][-1]['line'] + 1} to continue.)"
+                            )
+                        else:
+                            rows.append(f"\n(End of file — total {excerpt['total']} lines)")
+                        out = f"{filePath}\n" + "\n".join(rows)
+            _sub_seen_listings.add(lkey)
+            _sub_cache_put("read", lkey, out)
+            _sub_emit({"kind": "tool_result", "tool": "read", "summary": "read"})
             return out
 
-        async def _sub_search(query: str, path: str = "", context: int = 0) -> str:
-            _sub_emit({"kind": "tool", "tool": "search_in_files", "args": {"query": query, "path": path, "context": context}})
-            key = _sub_search_key(query, path)
+        async def _sub_grep(pattern: str, path: str = "", include: str = "") -> str:
+            _sub_emit({"kind": "tool", "tool": "grep", "args": {"pattern": pattern, "path": path, "include": include}})
+            key = _sub_search_key(pattern, path)
             if key[0]:
-                stop = _sub_check_seen("search_in_files", key, query, path)
+                stop = _sub_check_seen("grep", key, pattern, path)
                 if stop is not None:
                     return stop
                 _sub_seen_searches.add(key)
             try:
-                result = search_in_files(root, query, path, context)
+                result = search_in_files(root, pattern, path, 0, include)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("search_in_files", msg))
+                _sub_emit(_error_result("grep", msg))
                 return f"ERROR searching {path}: {msg}"
             if result.get("error"):
                 msg = result["error"]
-                _sub_emit(_error_result("search_in_files", msg))
+                _sub_emit(_error_result("grep", msg))
                 return f"ERROR searching {path}: {msg}"
             matches = result.get("matches", [])
             if not matches:
-                out = f"No matches for {query!r} under {path or '/'}."
+                out = f"No matches for {pattern!r} under {path or '/'}."
                 if key[0]:
-                    _sub_cache_put("search_in_files", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
+                    _sub_cache_put("grep", key, out)
+                _sub_emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
                 return out
             lines: list[str] = []
             total = 0
@@ -2945,10 +3080,6 @@ def make_tool_callbacks(
                 if shown >= _sub_search_count:
                     break
                 block = [f"{m['file']}:{m['line']}: {m['text']}"]
-                if m.get("context_lines"):
-                    for cl in m["context_lines"]:
-                        marker = ">" if cl["line"] == m["line"] else " "
-                        block.append(f"{m['file']}:{cl['line']}: {marker} {cl['text']}")
                 block_size = sum(len(b) + 1 for b in block)
                 if lines and total + block_size > _sub_tool_out_chars:
                     break
@@ -2958,38 +3089,38 @@ def make_tool_callbacks(
                 if total >= _sub_tool_out_chars:
                     break
             note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
-            out = f"MATCHES for {query!r}\n" + "\n".join(lines) + note
+            out = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
             if key[0]:
-                _sub_cache_put("search_in_files", key, out)
-            _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": f"{len(matches)} matches"})
+                _sub_cache_put("grep", key, out)
+            _sub_emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
             return out
 
-        async def _sub_fuzzy_find(query: str, path: str = "") -> str:
-            _sub_emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
-            key = _sub_search_key(query, path)
+        async def _sub_glob(pattern: str, path: str = "") -> str:
+            _sub_emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
+            key = _sub_search_key(pattern, path)
             if key[0]:
-                stop = _sub_check_seen("fuzzy_find", key, query, path)
+                stop = _sub_check_seen("glob", key, pattern, path)
                 if stop is not None:
                     return stop
                 _sub_seen_searches.add(key)
             try:
-                result = fuzzy_find_files(root, query, path)
+                result = glob_files(root, pattern, path)
             except PathEscapeError as exc:
                 msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("fuzzy_find", msg))
-                return f"ERROR finding {query!r} under {path or '/'}: {msg}"
+                _sub_emit(_error_result("glob", msg))
+                return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
             matches = result.get("matches", [])
             if not matches:
-                out = f"No files match {query!r} under {path or '/'}."
+                out = f"No files match glob {pattern!r} under {path or '/'}."
                 if key[0]:
-                    _sub_cache_put("fuzzy_find", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": "no matches"})
+                    _sub_cache_put("glob", key, out)
+                _sub_emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
                 return out
-            lines = [m["path"] for m in matches[:50]]
-            out = f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
+            lines = list(matches[:50])
+            out = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines)
             if key[0]:
-                _sub_cache_put("fuzzy_find", key, out)
-            _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
+                _sub_cache_put("glob", key, out)
+            _sub_emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
             return out
 
         try:
@@ -3089,19 +3220,18 @@ def make_tool_callbacks(
                     "what you are actually looking for (the literal request vs. the real "
                     "underlying need) so your searches are targeted, not scattershot.\n"
                     "PARALLEL-FIRST ACTION: on your very first turn launch 3+ tool calls "
-                    "SIMULTANEOUSLY — fire the fuzzy_find / list_files / search_in_files "
+                    "SIMULTANEOUSLY — fire the glob / grep / read "
                     "calls you already know you need in ONE response (batch related terms "
                     "with regex alternation foo|bar|baz). Do NOT do a serial "
                     "search→read→decide-next loop.\n"
-                    "TOOL CHOICE: use fuzzy_find to locate FILES by name (part of a filename, "
-                    "or an extension like 'py'), use list_files to see a directory's contents, "
-                    "and use search_in_files only to find CONTENT INSIDE already-identified files "
-                    "or to confirm a symbol/string exists. Do NOT search_in_files to discover which "
+                    "TOOL CHOICE: use glob to locate FILES by name pattern like '**/*.py' "
+                    "or 'src/**/*.ts', use read on a directory to see its contents, "
+                    "and use grep only to find CONTENT INSIDE already-identified files "
+                    "or to confirm a symbol/string exists. Do NOT grep to discover which "
                     "files exist — that returns hundreds of noisy matches. Never repeat a search "
                     "with only a minor keyword variation. Do NOT search for overly generic terms "
                     "like 'class', 'function', 'def', 'import' or punctuation — use specific, "
-                    "project-relevant keywords. Pass context=5-10 on your first content search of "
-                    "a file.\n"
+                    "project-relevant keywords.\n"
                     "HARD STOP CONDITIONS — stop as soon as ANY applies: "
                     "(1) you have enough context to answer the task confidently; "
                     "(2) the same information keeps appearing across searches (diminishing returns); "
@@ -3112,7 +3242,7 @@ def make_tool_callbacks(
                     + "\nACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
                     "invent, guess or abbreviate a path. If a search returns no matches, say so "
                     "explicitly instead of assuming it exists. If you are unsure a file exists, "
-                    "confirm it with fuzzy_find before citing it. Only cite facts that appear in "
+                    "confirm it with glob before citing it. Only cite facts that appear in "
                     "your tool results; never rely on memory of files you did not actually see. "
                     "PERSISTENCE: before concluding something 'does not exist' or 'is not handled "
                     "anywhere', try MULTIPLE search phrasings and several likely locations — the "
@@ -3123,9 +3253,9 @@ def make_tool_callbacks(
                     "'not found' immediately."
                 ),
                 tools=[
-                    _Tool(_sub_list_files, name="list_files"),
-                    _Tool(_sub_search, name="search_in_files"),
-                    _Tool(_sub_fuzzy_find, name="fuzzy_find"),
+                    _Tool(_sub_read, name="read"),
+                    _Tool(_sub_grep, name="grep"),
+                    _Tool(_sub_glob, name="glob"),
                 ],
                 model_settings=_ModelSettings(temperature=0.2, max_tokens=_sub_max_tokens),
             )
@@ -3256,7 +3386,7 @@ def make_tool_callbacks(
                                     "the workspace:\n"
                                     + "\n".join(f"- {b}" for b in bad_refs[:15])
                                     + "\n\nCorrect the report: for each, either fix the path to the "
-                                    "REAL file (confirm it with fuzzy_find/search_in_files first) or "
+                                    "REAL file (confirm it with glob/grep first) or "
                                     "remove the fabricated reference entirely. Keep the rest of the "
                                     "report unchanged. Reply with ONLY the corrected report."
                                 ),
@@ -3285,7 +3415,7 @@ def make_tool_callbacks(
             return (
                 f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
                 "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
-                "part yourself with search_in_files."
+                "part yourself with grep/read."
             )
         except Exception as exc:  # noqa: BLE001
             _sub_model = str(getattr(summarizer_model, "model_name", "") or "")
@@ -3980,10 +4110,9 @@ def make_tool_callbacks(
         "update_plan": update_plan,
         "create_skill": create_skill_tool,
         "create_mcp": create_mcp_tool,
-        "list_files": list_files_tool,
-        "search_in_files": search_tool,
-        "fuzzy_find": fuzzy_find_tool,
-        "read_files": read_files_tool,
+        "grep": grep_tool,
+        "glob": glob_tool,
+        "read": read_tool,
         "explore": explore_tool,
         "save_plan": save_plan_tool,
         "web_search": web_search_tool,

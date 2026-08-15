@@ -258,6 +258,7 @@ const ALWAYS_VISIBLE_TOOLS = new Set([
   'memory',
   'create_skill',
   'create_mcp',
+  'explore',
 ])
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of

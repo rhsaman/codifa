@@ -673,6 +673,7 @@ export function ChatPanel() {
       input: number;
       output: number;
       cacheRead: number;
+      cacheWrite: number;
       cost: number | null;
     }> = [];
     for (const [model, u] of Object.entries(usage)) {
@@ -681,9 +682,11 @@ export function ChatPanel() {
       // input_tokens already includes the cache-read/write portion; bill the
       // cache lines at their own cheaper rate when advertised, else full input.
       const cacheRead = u.cacheRead ?? 0;
+      const cacheWrite = u.cacheWrite ?? 0;
       const cost = price
-        ? ((u.input - cacheRead) / 1_000_000) * price.input +
+        ? ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
           (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+          (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
           (u.output / 1_000_000) * price.output
         : null;
       out.push({
@@ -691,6 +694,7 @@ export function ChatPanel() {
         input: u.input,
         output: u.output,
         cacheRead,
+        cacheWrite,
         cost,
       });
     }
@@ -995,16 +999,32 @@ export function ChatPanel() {
           status: "running",
           startedAt: Date.now(),
           callId: typeof event.call_id === "number" ? event.call_id : undefined,
+          sub: event.sub,
         };
-        const current = findMsg()?.toolActivity ?? [];
-        store.updateMessage(assistantMsg.id, {
-          toolActivity: [...current, act],
-          segments: [
-            ...(findMsg()?.segments ?? []),
-            { kind: "tool", index: current.length } as MessageSegment,
-          ],
-          retry: null,
-        });
+        // Sub-agent tool calls (explore's internal read/grep/glob) render
+        // NESTED inside the running explore card, not as top-level cards —
+        // so an explore turn shows one collapsible parent with its details,
+        // never a stack of collapsed fragments.
+        if (event.sub) {
+          const prev = findMsg()?.toolActivity ?? [];
+          const next = prev.map((a): ToolActivity => {
+            if (a.tool === "explore" && a.status === "running") {
+              return { ...a, children: [...(a.children ?? []), act] };
+            }
+            return a;
+          });
+          store.updateMessage(assistantMsg.id, { toolActivity: next });
+        } else {
+          const current = findMsg()?.toolActivity ?? [];
+          store.updateMessage(assistantMsg.id, {
+            toolActivity: [...current, act],
+            segments: [
+              ...(findMsg()?.segments ?? []),
+              { kind: "tool", index: current.length } as MessageSegment,
+            ],
+            retry: null,
+          });
+        }
       } else if (event.kind === "retry") {
         store.updateMessage(assistantMsg.id, {
           retry: {
@@ -1033,26 +1053,35 @@ export function ChatPanel() {
         const current = findMsg()?.toolActivity ?? [];
         const now = Date.now();
         const gotId = typeof event.call_id === "number";
-        const next: ToolActivity[] = current.map((a): ToolActivity => {
+        const resolved = (act: ToolActivity): ToolActivity => {
           // Match by per-call correlation id first (precise — the same tool
           // can run many times, and explore sub-agent events share tool names);
           // fall back to tool-name+status matching when the result has no id.
           const target =
-            gotId && a.status === "running" && a.callId === event.call_id;
+            gotId && act.status === "running" && act.callId === event.call_id;
           const fallback =
-            !gotId && a.tool === event.tool && a.status === "running";
+            !gotId && act.tool === event.tool && act.status === "running";
           if (target || fallback) {
             return {
-              ...a,
+              ...act,
               status: event.status === "error" ? "error" : event.status === "denied" ? "denied" : "done",
               summary: event.summary,
               engine: event.engine,
               items: event.results,
-              elapsedMs: now - (a.startedAt ?? now),
+              elapsedMs: now - (act.startedAt ?? now),
             };
           }
-          return a;
-        });
+          // Sub-agent results resolve a child INSIDE the running explore card,
+          // never a top-level card (sub calls are nested, not standalone).
+          if (event.sub && act.children && act.children.length > 0) {
+            const children = act.children.map(resolved);
+            if (children.some((c, i) => c !== act.children![i])) {
+              return { ...act, children };
+            }
+          }
+          return act;
+        };
+        const next = current.map(resolved);
         store.updateMessage(assistantMsg.id, { toolActivity: next });
       } else if (event.kind === "diff") {
         const current = findMsg()?.toolActivity ?? [];

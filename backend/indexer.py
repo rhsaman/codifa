@@ -1,7 +1,6 @@
 """Incremental workspace file indexing into the vector store (mtime+size + SHA-256).
 
-The agent's file tools (list_files / search_in_files / fuzzy_find) already see
-the live tree, so this indexer is NOT for navigation — it feeds the RAG
+The agent's file tools (glob / grep / read) already see the live tree, so this indexer is NOT for navigation — it feeds the RAG
 retrieval engine (``retrieval.py`` / ``context_builder.py``) so the agent can
 auto-recall *relevant project files* for the current prompt without a
 workspace-wide search.

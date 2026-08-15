@@ -206,6 +206,12 @@ export interface ToolActivity {
   /** Per-call correlation id (backend-assigned) so a tool_result resolves the
    *  exact card it belongs to even when the same tool runs many times. */
   callId?: number
+  /** True for tool calls emitted by a SUB-AGENT (e.g. explore's internal
+   *  read/grep/glob). Rendered nested inside the parent explore card, not as a
+   *  top-level timeline card. */
+  sub?: boolean
+  /** Nested sub-agent tool calls when this is an explore card. */
+  children?: ToolActivity[]
   /** Structured result rows (e.g. web_search hits) shown in the tool card. */
   items?: SearchResultItem[]
   /** Which web-search provider produced these results (e.g. 'tavily'). */
@@ -362,6 +368,9 @@ export interface SidecarEvent {
   results?: SearchResultItem[]
   /** Which web-search provider produced the results (e.g. 'tavily'). */
   engine?: string
+  /** True for events emitted by a sub-agent (explore's internal read/grep/glob)
+   *  — the parent nests these inside the explore card instead of a top-level card. */
+  sub?: boolean
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string

@@ -168,17 +168,17 @@ def _scoped_rels(root: str, attachments: list[str] | None, nvim_file: str) -> se
 
 
 def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
-    """Wrap search_in_files so it only searches the explicitly scoped files.
+    """Wrap grep so it only searches the explicitly scoped files.
 
     Other workspace files are off-limits; calls without a ``path`` (or with a
     path outside the scope) return an error listing the allowed files.
     """
 
-    async def wrapped(query: str, path: str = "", context: int = 0) -> str:
+    async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
         rel = str(path or "").strip().lstrip("/")
         if not rel:
             return (
-                "ERROR: this request is scoped to specific files — search_in_files "
+                "ERROR: this request is scoped to specific files — grep "
                 "requires a `path`. In-scope files: " + ", ".join(sorted(scoped_paths))
             )
         if rel not in scoped_paths:
@@ -186,35 +186,35 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
                 f"ERROR: `{path}` is not in scope for this request. In-scope files: "
                 + ", ".join(sorted(scoped_paths))
             )
-        return await fn(query, rel, context)
+        return await fn(pattern, rel, include)
 
     return wrapped
 
 
 def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
-    """Wrap read_files so it only reads the explicitly scoped files."""
+    """Wrap read so it only reads the explicitly scoped files."""
 
-    async def wrapped(paths: list[str], per_file_chars: int = 6000) -> str:
-        bad = [p for p in paths if str(p).strip().lstrip("/") not in scoped_paths]
-        if bad:
+    async def wrapped(filePath: str, offset: int = 1, limit: int = 2000) -> str:
+        rel = str(filePath or "").strip().lstrip("/")
+        if rel not in scoped_paths:
             return (
-                "ERROR: these paths are not in scope for this request: "
-                + ", ".join(bad)
+                "ERROR: this path is not in scope for this request: "
+                + str(filePath)
                 + ". In-scope files: "
                 + ", ".join(sorted(scoped_paths))
             )
-        return await fn(paths, per_file_chars)
+        return await fn(rel, offset, limit)
 
     return wrapped
 
 
-# Plan mode's OWN list_files/search_in_files/fuzzy_find calls are capped in
-# CODE, not just prompt wording — "TOOL-CALL DISCIPLINE" language alone is not
-# reliably followed by weaker models (prompt enforcement != model compliance).
-# After the limit, further calls are refused with an error that points at
-# `explore` (whose search steps run in an isolated sub-agent and never bloat
-# the parent's resent transcript), so an investigation-heavy plan turn can't
-# quietly burn tokens on many shallow searches of its own.
+# Plan mode's OWN grep/glob calls are capped in CODE, not just prompt wording —
+# "TOOL-CALL DISCIPLINE" language alone is not reliably followed by weaker
+# models (prompt enforcement != model compliance). After the limit, further
+# calls are refused with an error that points at `explore` (whose search steps
+# run in an isolated sub-agent and never bloat the parent's resent transcript),
+# so an investigation-heavy plan turn can't quietly burn tokens on many shallow
+# searches of its own.
 _PLAN_OWN_SEARCH_LIMIT = 15
 # Content-gathering tasks (restyle/refactor/rewrite — see tools._is_content_gathering)
 # need the parent to pull verbatim code from SEVERAL already-known files. Pushing
@@ -226,52 +226,21 @@ _PLAN_CONTENT_OWN_SEARCH_LIMIT = 25
 
 def _search_limit_msg(limit: int) -> str:
     return (
-        f"ERROR: you already used your {limit} own list_files/search_in_files/"
-        "fuzzy_find calls for this turn. Delegate any further investigation to the `explore` tool "
+        f"ERROR: you already used your {limit} own grep/glob "
+        "calls for this turn. Delegate any further investigation to the `explore` tool "
         "— it runs in an isolated sub-agent, so its search steps cost IT context, not you. If you "
         "already have enough to answer, stop scouting now and give your answer."
     )
 
 
-def _wrap_limited_list(
+def _wrap_limited_grep(
     fn: Callable,
     counter: dict,
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
-    tool: str = "list_files",
+    tool: str = "grep",
 ):
-    async def wrapped(path: str = "") -> str:
-        counter["n"] = counter.get("n", 0) + 1
-        if counter["n"] > limit:
-            msg = _search_limit_msg(limit)
-            if emit is not None:
-                # Surface the denial as a REAL error result (UI ✗ and a hard
-                # "stop" signal) instead of a deceptively successful search — a
-                # success-status denial lets the model keep re-opening sibling
-                # searches in overlapping rounds. The tool never actually ran.
-                emit({"kind": "tool", "tool": tool, "args": {"path": path}})
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": tool,
-                        "summary": msg,
-                        "status": "denied",
-                    }
-                )
-            return msg
-        return await fn(path)
-
-    return wrapped
-
-
-def _wrap_limited_search(
-    fn: Callable,
-    counter: dict,
-    limit: int = _PLAN_OWN_SEARCH_LIMIT,
-    emit: Callable[[dict], None] | None = None,
-    tool: str = "search_in_files",
-):
-    async def wrapped(query: str, path: str = "", context: int = 0) -> str:
+    async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
             msg = _search_limit_msg(limit)
@@ -280,7 +249,7 @@ def _wrap_limited_search(
                     {
                         "kind": "tool",
                         "tool": tool,
-                        "args": {"query": query, "path": path, "context": context},
+                        "args": {"pattern": pattern, "path": path, "include": include},
                     }
                 )
                 emit(
@@ -292,24 +261,24 @@ def _wrap_limited_search(
                     }
                 )
             return msg
-        return await fn(query, path, context)
+        return await fn(pattern, path, include)
 
     return wrapped
 
 
-def _wrap_limited_fuzzy(
+def _wrap_limited_glob(
     fn: Callable,
     counter: dict,
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
-    tool: str = "fuzzy_find",
+    tool: str = "glob",
 ):
-    async def wrapped(query: str, path: str = "") -> str:
+    async def wrapped(pattern: str, path: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
             msg = _search_limit_msg(limit)
             if emit is not None:
-                emit({"kind": "tool", "tool": tool, "args": {"query": query, "path": path}})
+                emit({"kind": "tool", "tool": tool, "args": {"pattern": pattern, "path": path}})
                 emit(
                     {
                         "kind": "tool_result",
@@ -319,7 +288,7 @@ def _wrap_limited_fuzzy(
                     }
                 )
             return msg
-        return await fn(query, path)
+        return await fn(pattern, path)
 
     return wrapped
 
@@ -538,18 +507,18 @@ def _wrap_readonly_terminal(fn: Callable):
 
 
 # grep-family tools reachable via run_terminal — all fully replaced by
-# search_in_files (single-file/dir) or explore (broad, isolated). Left
-# reachable through the terminal, a model that hit the list_files/
-# search_in_files/fuzzy_find cap (see _PLAN_OWN_SEARCH_LIMIT) could just shell
-# out to `grep -r` instead and keep searching with no cap and no isolation —
-# a complete, silent bypass of both the search cap AND the system prompt's
-# own "use search_in_files/explore" instruction. This closes that specific
-# hole; it intentionally does NOT touch find/cat/ls (legitimate narrow uses:
-# checking one file exists, reading a build log, listing a directory).
+# grep (single-file/dir) or explore (broad, isolated). Left
+# reachable through the terminal, a model that hit the grep/glob cap (see
+# _PLAN_OWN_SEARCH_LIMIT) could just shell out to `grep -r` instead and keep
+# searching with no cap and no isolation — a complete, silent bypass of both
+# the search cap AND the system prompt's own "use grep/explore" instruction.
+# This closes that specific hole; it intentionally does NOT touch find/cat/ls
+# (legitimate narrow uses: checking one file exists, reading a build log,
+# listing a directory).
 _SEARCH_BYPASS_PROGS = {"rg", "grep", "egrep", "fgrep", "ag", "ack", "ack-grep"}
 _SEARCH_BYPASS_MSG = (
     "ERROR: {prog} via run_terminal is not allowed — it bypasses the search-call "
-    "cap and isolation that search_in_files/explore give you. Use search_in_files "
+    "cap and isolation that grep/explore give you. Use grep "
     "for a targeted look, or explore for anything broader."
 )
 # A python one-liner doing its own file-walk-and-match is the same bypass in
@@ -599,9 +568,9 @@ def _wrap_no_search_bypass(fn: Callable):
 _OPENROUTER_FREE_FALLBACK = "openrouter/free"
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use fuzzy_find for partial filenames, search_in_files for content (pass context 5-10 to see surrounding lines), and read_files to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with list_files, search_in_files, fuzzy_find; use read_files to read files (per-file cap; use its offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. Use fuzzy_find for partial filenames; run_terminal to build/test/lint. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. CODE QUALITY: respect the project's layering and conventions, DRY, no hardcoded values, clean linted code; fix any error you introduce and leave the codebase clean.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with list_files, search_in_files, fuzzy_find and read_files (paged) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode.",
+    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use glob for filenames (patterns like `**/*.ts` or `src/*.py`), grep for content (regex, optionally with include to filter extensions), and read to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring.",
+    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. Use glob to find files by name pattern; run_terminal to build/test/lint. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. CODE QUALITY: respect the project's layering and conventions, DRY, no hardcoded values, clean linted code; fix any error you introduce and leave the codebase clean.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode.",
 }
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -1962,8 +1931,8 @@ def _needs_workspace(prompt: str) -> bool:
 
 # Per-turn own-search quota by task scope (see _task_scope). Narrow/targeted
 # turns get a generous direct allowance so a specific lookup (a symbol, a file,
-# a function) resolves with a few direct search_in_files/fuzzy_find/read_files
-# calls — no explore round-trip. Broad/exploratory turns get a small quota so
+# a function) resolves with a few direct grep/glob/read calls — no explore
+# round-trip. Broad/exploratory turns get a small quota so
 # the model delegates to `explore` (isolated sub-agent context) instead of
 # chaining many cheap searches in the parent's resent transcript. Content-heavy
 # tasks keep the biggest budget: compressing verbatim JSX/CSS through explore's
@@ -2121,8 +2090,8 @@ def _scout_workspace(root: str, max_total: int = _AUTO_SCOUT_MAX_TOTAL) -> str:
     lines: list[str] = []
     lines.append(
         "=== AUTO-SCOUTED WORKSPACE OVERVIEW (do not take this as exhaustive) ===\n"
-        "This already covers the workspace root — do NOT call list_files with an empty "
-        "path again this turn. Go straight to list_files/search_in_files on the specific "
+        "This already covers the workspace root — do NOT list the root again "
+        "this turn. Go straight to glob/read on the specific "
         "subdirectories or files you actually need."
     )
     try:
@@ -2995,7 +2964,7 @@ def _load_attachments(root: str, rels: list[str] | None) -> list[str]:
         if len(content) > _MAX_ATTACHMENT_BYTES:
             content = (
                 content[:_MAX_ATTACHMENT_BYTES]
-                + "\n...(attachment truncated to save context; use search_in_files for specific parts)"
+                + "\n...(attachment truncated to save context; use read with offset/limit for specific parts)"
             )
         display = os.path.relpath(target, resolve_safe(root, ""))
         blocks.append(f"===== ATTACHED FILE: {display} =====\n{content}")
@@ -3460,7 +3429,7 @@ async def run_agent(
             )
 
     # "search" subagent: the explore sub-agent (which runs the existing
-    # search_in_files / fuzzy_find / list_files tools) uses this model when
+    # grep / glob / read tools) uses this model when
     # configured, falling back to the "explore" model, then the parent model.
     search_model = explore_model
     search_built = subagent_models.get("search", "") or ""
@@ -3562,7 +3531,7 @@ async def run_agent(
         for k in ("readFiles", "writeFiles", "runTerminal", "web")
     )
     if has_cap:
-        _READ = {"list_files", "search_in_files", "fuzzy_find", "explore", "read_files"}
+        _READ = {"grep", "glob", "read", "explore"}
         _WRITE = {"write_file", "edit_file", "confirm_action"}
         _TERM = {"run_terminal"}
         _WEB = {"web_search", "fetch_url", "search_console"}
@@ -3603,11 +3572,11 @@ async def run_agent(
     # mode except plan so ask/coder never see it in their tool list.
     if mode != "plan":
         tools.pop("save_plan", None)
-    # `read_files` (verbatim multi-file content) is a plan/coder capability —
-    # ask (mentor) keeps search-with-context so the user learns to find things
+    # `read` (single-path paged file read) is a plan/coder capability — ask
+    # (mentor) keeps grep-with-include so the user learns to find things
     # themselves; and scoped file-turns below also drop it.
     if mode == "ask":
-        tools.pop("read_files", None)
+        tools.pop("read", None)
         # `memory` is a WRITE (the tool call IS the save) — ask is read-only
         # mentor mode; keep `search_memory` (read) so it can still consult
         # past notes. The tool schema sent to ask is thus smaller too.
@@ -3645,25 +3614,25 @@ async def run_agent(
         }
     # When the user explicitly scoped the request to specific files (attached /
     # mentioned files or the open Neovim file), the agent must work ONLY with
-    # those files: workspace-wide discovery tools are removed and search_in_files
+    # those files: workspace-wide discovery tools are removed and grep
     # is restricted to the in-scope paths.
     scoped_paths = _scoped_rels(root, attachments, nvim_file)
     scoped = bool(scoped_paths)
     if scoped:
-        # `explore` spawns a sub-agent with its own list_files/search_in_files
+        # `explore` spawns a sub-agent with its own grep/glob/list_files
         # over the WHOLE workspace, so it must be removed too — otherwise the
         # agent can scan the project despite the scope.
         tools = {
             name: fn
             for name, fn in tools.items()
-            if name not in ("list_files", "fuzzy_find", "explore")
+            if name not in ("glob", "explore")
         }
-        if "search_in_files" in tools:
-            tools["search_in_files"] = _wrap_scoped_search(
-                tools["search_in_files"], scoped_paths
+        if "grep" in tools:
+            tools["grep"] = _wrap_scoped_search(
+                tools["grep"], scoped_paths
             )
-        if "read_files" in tools:
-            tools["read_files"] = _wrap_scoped_read(tools["read_files"], scoped_paths)
+        if "read" in tools:
+            tools["read"] = _wrap_scoped_read(tools["read"], scoped_paths)
         # The read-only terminal (ask/plan) can still leak file names/contents
         # outside the scope via cat/find/rg/ls/git. Restrict it to explicit
         # paths inside the scope. Coder's writable terminal is left alone.
@@ -3677,8 +3646,8 @@ async def run_agent(
                 tools["run_terminal"], root, scoped_paths
             )
     elif mode in ("plan", "ask", "coder"):
-        # Code-enforced cap on this mode's OWN list_files/search_in_files/
-        # fuzzy_find calls per turn (see _PLAN_OWN_SEARCH_LIMIT above) — the
+        # Code-enforced cap on this mode's OWN grep/glob/read calls per turn
+        # (see _PLAN_OWN_SEARCH_LIMIT above) — the
         # system prompt already asks for this, but prompt wording alone is not
         # reliably followed. Originally only Plan (later also Ask) had this
         # backstop; Coder was left uncapped on the assumption that real editing
@@ -3692,7 +3661,7 @@ async def run_agent(
         #
         # The limit is a safety backstop against unfocused shallow-search loops;
         # it is high enough that direct investigation (and content gathering via
-        # read_files) is allowed, while explore remains available for genuinely
+        # read) is allowed, while explore remains available for genuinely
         # broad spans. Content-heavy tasks get extra own-search quota: compressing
         # verbatim JSX/CSS through explore's report summary is what loops it. The
         # parent already identified the files, so let it read/search them directly.
@@ -3709,29 +3678,21 @@ async def run_agent(
             own_search_limit = _TASK_SCOPE_NARROW_LIMIT
         plan_search_counter: dict = {}
         _deny_emit = lambda ev: queue.put_nowait(_tool_event(ev))
-        if "list_files" in tools:
-            tools["list_files"] = _wrap_limited_list(
-                tools["list_files"],
+        if "grep" in tools:
+            tools["grep"] = _wrap_limited_grep(
+                tools["grep"],
                 plan_search_counter,
                 limit=own_search_limit,
                 emit=_deny_emit,
-                tool="list_files",
+                tool="grep",
             )
-        if "search_in_files" in tools:
-            tools["search_in_files"] = _wrap_limited_search(
-                tools["search_in_files"],
+        if "glob" in tools:
+            tools["glob"] = _wrap_limited_glob(
+                tools["glob"],
                 plan_search_counter,
                 limit=own_search_limit,
                 emit=_deny_emit,
-                tool="search_in_files",
-            )
-        if "fuzzy_find" in tools:
-            tools["fuzzy_find"] = _wrap_limited_fuzzy(
-                tools["fuzzy_find"],
-                plan_search_counter,
-                limit=own_search_limit,
-                emit=_deny_emit,
-                tool="fuzzy_find",
+                tool="glob",
             )
     # Steer injection: every tool's result is a delivery point for user
     # messages typed while this run is active. The wrapper drains the per-chat
@@ -3794,7 +3755,7 @@ async def run_agent(
         "\n\nYou are running in the user's desktop IDE. The current open WORKSPACE ROOT is:\n"
         f"{root}"
         "\nUse paths RELATIVE to this folder (e.g. 'src/main.py'), never absolute paths. "
-        "When the user says 'list files', 'show the project', or just 'ls', call list_files with no path to list the workspace root rather than asking for a path. The file tools are sandboxed to this root; any path outside it will be rejected."
+        "When the user says 'list files', 'show the project', or just 'ls', call glob with no path to list the workspace root rather than asking for a path. The file tools are sandboxed to this root; any path outside it will be rejected."
         "\nYou operate ONLY inside this workspace. NEVER read, search or act on anything outside it "
         "(e.g. ~/.config, ~/.cursor, /Users/... or any absolute path not under this root). Skills, "
         "plans and MCP connectors are stored in the app database and are given to you inline, so "
@@ -3827,7 +3788,7 @@ async def run_agent(
 
     # Auto-mention the file currently open in Neovim (if any, and only when it
     # lives inside the workspace root). The agent is told the path but NOT the
-    # full content — it inspects the relevant parts itself via search_in_files,
+    # full content — it inspects the relevant parts itself via read,
     # keeping context use low. 'This file' / 'current file' in the user's message
     # refers to this one. Modes with write access should edit it when targeted.
     nvim_rel = ""
@@ -3844,8 +3805,8 @@ async def run_agent(
             f"\n\n=== NEOVIM (OPEN EDITOR) ===\n"
             f"The user currently has `{nvim_rel}` open in Neovim — this file is their ACTIVE FOCUS. "
             "If they say 'this file', 'the current file', or 'the file I'm working on', they mean this "
-            "one. The file's full content is NOT loaded into your context: use search_in_files (with a "
-            "small `context`) to inspect the relevant parts. In modes with write access, "
+            "one. The file's full content is NOT loaded into your context: use read (with "
+            "offset/limit) to inspect the relevant parts. In modes with write access, "
             "when the request targets this file, edit it directly."
         )
         diag_note = _nvim_diagnostics_note(nvim_diagnostics)
@@ -3867,10 +3828,10 @@ async def run_agent(
             "The user explicitly scoped this request to ONLY these files: "
             + ", ".join("`" + f + "`" for f in sorted(scoped_paths))
             + ". "
-            "You MUST work ONLY with these files — do NOT list, search, fuzzy-find, or inspect any other "
+            "You MUST work ONLY with these files — do NOT list, search, glob, or inspect any other "
             "file in the workspace; the rest of the project is off-limits for this request. The workspace-wide "
-            "discovery tools (list_files, fuzzy_find, explore) are UNAVAILABLE this request. To inspect a "
-            "scoped file, call search_in_files with its exact path; in read-only modes the terminal is also "
+            "discovery system is UNAVAILABLE this request. To inspect a "
+            "scoped file, call read or grep with its exact path; in read-only modes the terminal is also "
             "restricted to explicit paths inside this scope. Attached files are already fully loaded at the top "
             "of the user's message."
         )
@@ -3901,7 +3862,7 @@ async def run_agent(
     system_final += (
         "\n\nSEARCH RULE (strict, always follow): To search or look up anything "
         "inside the project files, ONLY use the subagent search tools "
-        "(search_in_files / fuzzy_find / list_files / explore). "
+        "(grep / glob / read / explore). "
         "Never use any other method (e.g. python scripts or run_terminal tool) "
         "to search or read project files. This applies in every mode."
     )
@@ -3915,15 +3876,15 @@ async def run_agent(
             "investigation to the `explore` tool FIRST and let its isolated "
             "sub-agent do the searching — your own direct search budget this turn "
             "is intentionally small so you don't chain many cheap searches into "
-            "your costly transcript. Use your own list_files/search_in_files/"
-            "fuzzy_find only to pin down a specific location the explore report "
-            "points to; then read_files for verbatim code you already located."
+            "your costly transcript. Use your own grep/glob "
+            "only to pin down a specific location the explore report "
+            "points to; then read for verbatim code you already located."
         )
     elif _turn_scope == "content":
         system_final += (
             "\n\nSCOPE ROUTING (this request): This task needs verbatim code from "
             "several already-known files (styling/refactor/rewrite). Read and search "
-            "those files DIRECTLY with read_files / search_in_files — you have a "
+            "those files DIRECTLY with read / grep — you have a "
             "generous own-search budget for this turn. Use `explore` only for the "
             "parts you genuinely haven't located yet, not to re-read files you "
             "already identified."
@@ -3932,7 +3893,7 @@ async def run_agent(
         system_final += (
             "\n\nSCOPE ROUTING (this request): This is a NARROW/targeted task "
             "(a specific file, function, symbol or bounded pattern). Resolve it "
-            "DIRECTLY with list_files / search_in_files / fuzzy_find / read_files "
+            "DIRECTLY with grep / glob / read "
             "from your own context — do not delegate a single-lookup question to "
             "`explore`. Only fall back to explore if the thing genuinely can't be "
             "narrowed to a few files."
@@ -4030,14 +3991,14 @@ async def run_agent(
     if _rag_injected:
         system_final += (
             "\n\nRAG-AWARE SEARCH (strict, always follow): Before you call ANY "
-            "search/discovery tool (list_files / search_in_files / fuzzy_find / "
-            "explore / search_memory), CHECK the memory and file/web context "
+            "search/discovery tool (grep / glob / "
+            "read / explore / search_memory), CHECK the memory and file/web context "
             "auto-injected above (===== YOUR OWN MEMORY =====, ===== RELEVANT "
             "PROJECT FILES =====, ===== SAVED WEB PAGES =====). It was retrieved "
             "specifically for this request. Only search for information that is "
             "MISSING or not sufficiently specific there — never re-search for "
             "content that block already covers. Read the cited files directly "
-            "(read_files / search_in_files with their paths) when you need more "
+            "(read / grep with their paths) when you need more "
             "detail than the injected snippet."
         )
         # Pass a digest of what RAG already surfaced into explore's sub-agent
@@ -4178,7 +4139,7 @@ async def run_agent(
     # budget scales with the model's context window so small models (e.g. 8k)
     # get a tiny scouting budget that can't overflow the window. Ask (mentor)
     # keeps the fixed small budget instead of the scaled one — its prompt tells
-    # it to inspect only the relevant files via search_in_files, so a large
+    # it to inspect only the relevant files via grep/read directly, so a large
     # auto-scouted dossier per question just burns tokens.
     scout_budget = _AUTO_SCOUT_MAX_TOTAL
     if ctx > 0 and mode != "ask":

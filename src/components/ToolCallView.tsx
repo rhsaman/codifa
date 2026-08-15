@@ -275,6 +275,46 @@ export const ToolGroupView = memo(function ToolGroupView({
 // default would hide the very thing the user needs to see happened).
 const OPEN_BY_DEFAULT = new Set(['write_file', 'edit_file', 'memory', 'create_skill', 'create_mcp', 'web_search'])
 
+function subArgSummary(activity: ToolActivity): string {
+  const args = activity.args
+  if (!args) return ''
+  const path = String(args.filePath ?? args.path ?? '')
+  const pattern = String(args.pattern ?? args.query ?? '')
+  const start = String(args.offset ?? args.start ?? '')
+  const limit = String(args.limit ?? '')
+  let s = path
+  if (start && String(Number(start)) === start && !limit) s += `:${start}`
+  if (pattern) s += s ? ' · ' + pattern : pattern
+  if (limit && s) s += '…'
+  return s
+}
+
+/** Non-collapsable row for ONE sub-agent tool call (explore's internal
+ *  read/grep/glob). Distinct from a collapse card: always fully expanded, no
+ *  chevron, compact single-line with the same detail (path/pattern/status/ms)
+ *  a closed card would show. */
+export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: ToolActivity }) {
+  const [now, setNow] = useState(() => Date.now())
+  const running = activity.status === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 500)
+    return () => clearInterval(t)
+  }, [running])
+  const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  return (
+    <div className={`tool-sub-row ${activity.status}${running ? ' running' : ''}`}>
+      <StatusIcon status={activity.status} />
+      <span className="tool-sub-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+      <span className="tool-sub-args" title={subArgSummary(activity)}>
+        {subArgSummary(activity)}
+      </span>
+      {activity.summary && <span className="tool-sub-summary">{activity.summary}</span>}
+      <span className="tool-ms">{fmtTime(ms)}</span>
+    </div>
+  )
+})
+
 export const ToolCallView = memo(function ToolCallView({
   activity,
   onReverted,
@@ -289,17 +329,17 @@ export const ToolCallView = memo(function ToolCallView({
   // Live elapsed time while the tool is still running.
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    if (activity.status !== 'running') return
+    if (activity.status !== 'running' && !activity.children?.some((c) => c.status === 'running')) return
     const t = setInterval(() => setNow(Date.now()), 500)
     return () => clearInterval(t)
-  }, [activity.status])
+  }, [activity.status, activity.children?.some((c) => c.status === 'running')])
   const ms =
     activity.status === 'running' && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs
 
   const hasExpand =
-    activity.args || activity.summary || activity.diff
+    activity.args || activity.summary || activity.diff || (activity.children && activity.children.length > 0)
   const isWrite = activity.tool === 'write_file' || activity.tool === 'edit_file'
   const readPaths = Array.isArray(activity.args?.paths)
     ? (activity.args.paths as string[])
@@ -339,6 +379,19 @@ export const ToolCallView = memo(function ToolCallView({
         {activity.args && activity.args.path !== undefined && (
           <span className="tool-path">{String(activity.args.path)}</span>
         )}
+        {activity.args && activity.args.filePath !== undefined && (
+          <span className="tool-path" title={String(activity.args.filePath)}>
+            {String(activity.args.filePath)}
+          </span>
+        )}
+        {activity.args &&
+          activity.args.filePath !== undefined &&
+          (String(activity.args.offset ?? 1) !== '1' ||
+            Number(activity.args.limit ?? 2000) < 2000) && (
+            <span className="tool-path">
+              {`${activity.args.offset ?? 1}–${Number(activity.args.offset ?? 1) + Number(activity.args.limit ?? 2000) - 1}`}
+            </span>
+          )}
         {activity.args && activity.args.start !== undefined && (
           <span className="tool-path">
             {String(activity.args.start)}
@@ -349,6 +402,19 @@ export const ToolCallView = memo(function ToolCallView({
         )}
         {activity.args && activity.args.query !== undefined && (
           <span className="tool-cmd">{String(activity.args.query)}</span>
+        )}
+        {activity.args && activity.args.pattern !== undefined && (
+          <span className="tool-cmd">{String(activity.args.pattern)}</span>
+        )}
+        {activity.args && activity.args.task !== undefined && (
+          <span className="tool-cmd tool-task" title={String(activity.args.task)}>
+            {String(activity.args.task)}
+          </span>
+        )}
+        {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
+          <span className="tool-badge tool-sub-count">
+            {activity.children.length} call{activity.children.length === 1 ? '' : 's'}
+          </span>
         )}
         {activity.tool === 'memory' && activity.args && (
           <span className="tool-cmd">
@@ -384,6 +450,16 @@ export const ToolCallView = memo(function ToolCallView({
             </pre>
           )}
           {activity.summary && <div className="tool-summary">{activity.summary}</div>}
+          {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
+            <div className="tool-sub-list">
+              {activity.children.map((child, i) => (
+                <ToolSubRow
+                  key={`${child.tool}-${i}-${child.callId ?? i}`}
+                  activity={child}
+                />
+              ))}
+            </div>
+          )}
           {activity.tool === 'web_search' && activity.items && activity.items.length > 0 && (
             <ul className="web-results">
               {activity.items.map((it, i) => (

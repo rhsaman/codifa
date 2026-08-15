@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useState, type KeyboardEvent } from 'react'
 import type { ToolActivity } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
@@ -298,6 +298,7 @@ export const ToolGroupView = memo(function ToolGroupView({
         ) : (
           <span className="status-ok">✓</span>
         )}
+        <span className="tool-group-stack" aria-hidden="true" />
         <span className="tool-group-label">{activities.length} tool calls</span>
         <span className="tool-group-detail">{detail}</span>
         <span className="tool-ms">{fmtTime(totalMs)}</span>
@@ -377,6 +378,12 @@ export const ToolCallView = memo(function ToolCallView({
 }) {
   const [reverting, setReverting] = useState(false)
   const root = useStore((s) => s.root)
+  // Explore cards are collapsible and start collapsed: the nested
+  // read/grep/glob sub-list is noisy, so it stays hidden until clicked.
+  const [collapsed, setCollapsed] = useState(activity.tool === 'explore')
+  const collapsible =
+    activity.tool === 'explore' &&
+    ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary))
 
   // Live elapsed time while the tool is still running.
   const [now, setNow] = useState(() => Date.now())
@@ -412,8 +419,24 @@ export const ToolCallView = memo(function ToolCallView({
   }
 
   return (
-    <div className={`tool-card ${activity.status}`}>
-      <div className="tool-card-head">
+    <div className={`tool-card ${activity.status}${activity.tool === 'explore' ? ' explore' : ''}`}>
+      <div
+        className={`tool-card-head${collapsible ? ' collapsible' : ''}`}
+        onClick={collapsible ? () => setCollapsed((c) => !c) : undefined}
+        role={collapsible ? 'button' : undefined}
+        tabIndex={collapsible ? 0 : undefined}
+        aria-expanded={collapsible ? !collapsed : undefined}
+        onKeyDown={
+          collapsible
+            ? (e: KeyboardEvent<HTMLDivElement>) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  setCollapsed((c) => !c)
+                }
+              }
+            : undefined
+        }
+      >
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
         {activity.tool === 'web_search' && activity.engine && (
@@ -484,8 +507,10 @@ export const ToolCallView = memo(function ToolCallView({
         {fetchSummary && <span className="tool-cmd">{fetchSummary}</span>}
         {activity.args && <ToolArgs args={activity.args} />}
         <span className="tool-ms">{fmtTime(ms)}</span>
+        {collapsible && <span className={`chev${collapsed ? '' : ' open'}`}>▾</span>}
       </div>
 
+      {!collapsed && (
       <div className="tool-card-body">
           {activity.summary && <div className="tool-summary">{activity.summary}</div>}
           {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
@@ -523,6 +548,7 @@ export const ToolCallView = memo(function ToolCallView({
             <span className="reverted-tag">reverted</span>
           )}
       </div>
+      )}
     </div>
   )
 })

@@ -69,11 +69,12 @@ async def main():
             "plan prompt missing Files: contract"
         print("  issues/1a OK: OUTPUT/REPLY DISCIPLINE + plan Files: contract in system prompts")
 
-        # ---- Issue 1b: narrow tasks get a tighter output budget ----
+        # ---- Issue 1b: narrow tasks get a tighter output budget (proportional) ----
         ctx_floor = 32000
         broad_budget = min(max(1_024, ctx_floor // 4), 8_192)  # = 8000 in mock ctx
-        import agents
-        assert agents._NARROW_OUTPUT_CAP < broad_budget  # sanity: cap is real
+        # New proportional narrow cap: 50% with 2048 floor
+        expected_narrow = max(2048, broad_budget // 2)  # = 4000 for 8000 broad budget
+        assert expected_narrow < broad_budget  # sanity: cap is tighter than broad
 
         _, cap_narrow = await one_turn("coder", "find where foo is defined and fix it")
         _, cap_broad = await one_turn("coder", "how does the whole architecture work end to end")
@@ -81,8 +82,8 @@ async def main():
         broad_body = cap_broad[0]
         n_max = narrow_body.get("max_completion_tokens", narrow_body.get("max_tokens"))
         b_max = broad_body.get("max_completion_tokens", broad_body.get("max_tokens"))
-        assert n_max == agents._NARROW_OUTPUT_CAP, \
-            f"narrow task max output {n_max} != narrow cap {agents._NARROW_OUTPUT_CAP}"
+        assert n_max == expected_narrow, \
+            f"narrow task max output {n_max} != expected proportional cap {expected_narrow}"
         assert b_max == broad_budget, \
             f"broad task max output {b_max} != full budget {broad_budget}"
         print(f"  issues/1b OK: narrow output capped at {n_max}, broad keeps {b_max}")

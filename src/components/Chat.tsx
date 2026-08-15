@@ -310,7 +310,8 @@ export function ChatPanel() {
   // thinking text. Deliberately independent of `isThinking`: text chunks toggle
   // that flag on/off mid-turn, which used to flicker the pin on and off as the
   // model alternated between emitting text and reasoning.
-  const liveThinking = chat?.messages.find((m) => m.streaming)?.thinking ?? "";
+  const streamingMsg = chat?.messages.find((m) => m.streaming) ?? null;
+  const liveThinking = streamingMsg?.thinking ?? "";
   /** The assistant message currently being rate-limited/retried by the provider,
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
@@ -346,18 +347,15 @@ export function ChatPanel() {
   const [skillChips, setSkillChips] = useState<
     Array<{ kind: "skill" | "mcp"; name: string; path?: string }>
   >(chat?.draft?.skillChips ?? []);
-  const [permissionReq, setPermissionReq] = useState<{
-    id: string;
-    action: string;
-    path?: string;
-    reason?: string;
-    scope?: string;
-  } | null>(null);
-  const [askReq, setAskReq] = useState<{
-    id: string;
-    question: string;
-    options: string[];
-  } | null>(null);
+  // Pending ask/permission requests live on the chat in the store
+  // (Chat.pendingAsk / Chat.pendingPermission), NOT local state:
+  // `<ChatPanel key={activeChatId} />` fully unmounts/remounts on every chat
+  // switch, so local state would silently lose a request that arrives while
+  // the user is viewing another chat (the popup would never appear). Deriving
+  // from the reactive `chat` object re-renders this panel whenever the store
+  // updates the field.
+  const askReq = chat?.pendingAsk ?? null;
+  const permissionReq = chat?.pendingPermission ?? null;
   const [askFreeText, setAskFreeText] = useState("");
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
@@ -1000,6 +998,7 @@ export function ChatPanel() {
           startedAt: Date.now(),
           callId: typeof event.call_id === "number" ? event.call_id : undefined,
           sub: event.sub,
+          model: event.model || undefined,
         };
         // Sub-agent tool calls (explore's internal read/grep/glob) render
         // NESTED inside the running explore card, not as top-level cards —
@@ -1149,7 +1148,7 @@ export function ChatPanel() {
           retry: null,
         });
       } else if (event.kind === "permission") {
-        setPermissionReq({
+        useStore.getState().setChatPendingPermission(chat.id, {
           id: event.id ?? "",
           action: event.action ?? "",
           path: event.path,
@@ -1158,7 +1157,7 @@ export function ChatPanel() {
         });
       } else if (event.kind === "ask") {
         setAskFreeText("");
-        setAskReq({
+        useStore.getState().setChatPendingAsk(chat.id, {
           id: event.id ?? "",
           question: event.question ?? "",
           options: Array.isArray(event.options) ? event.options : [],
@@ -1327,8 +1326,8 @@ export function ChatPanel() {
       toolRunningRef.current = false;
       setStalled(false);
       setBusy(false);
-      setAskReq(null);
-      setPermissionReq(null);
+      useStore.getState().setChatPendingAsk(chat.id, null);
+      useStore.getState().setChatPendingPermission(chat.id, null);
       resolveStuckCards();
       abortRef.current = null;
       useStore.getState().setChatAbort(chat.id, null);
@@ -1946,8 +1945,8 @@ export function ChatPanel() {
   };
 
   const stop = () => {
-    setAskReq(null);
-    setPermissionReq(null);
+    useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+    useStore.getState().setChatPendingPermission(chatIdRef.current, null);
     abortRef.current?.abort();
     useStore.getState().chatAborts[chatIdRef.current]?.abort();
   };
@@ -2042,12 +2041,12 @@ export function ChatPanel() {
           titlebarEl,
         )}
 
+      {streamingMsg && (
+        <div className="thinking-pin">
+          <ThinkingBlock text={liveThinking} />
+        </div>
+      )}
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
-        {liveThinking && (
-          <div className="thinking-pin">
-            <ThinkingBlock text={liveThinking} />
-          </div>
-        )}
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
@@ -2185,7 +2184,7 @@ export function ChatPanel() {
                         className="ask-option"
                         onClick={() => {
                           void respondAsk(askReq.id, opt);
-                          setAskReq(null);
+                          useStore.getState().setChatPendingAsk(chatIdRef.current, null);
                         }}
                       >
                         <span className="ask-option-mark">
@@ -2228,7 +2227,7 @@ export function ChatPanel() {
                       ) {
                         e.preventDefault();
                         void respondAsk(askReq.id, askFreeText.trim());
-                        setAskReq(null);
+                        useStore.getState().setChatPendingAsk(chatIdRef.current, null);
                       }
                     }}
                   />
@@ -2239,7 +2238,7 @@ export function ChatPanel() {
                       disabled={!askFreeText.trim()}
                       onClick={() => {
                         void respondAsk(askReq.id, askFreeText.trim());
-                        setAskReq(null);
+                        useStore.getState().setChatPendingAsk(chatIdRef.current, null);
                       }}
                     >
                       {fa ? "ارسال" : "Send"}
@@ -2307,7 +2306,7 @@ export function ChatPanel() {
                     className="btn perm-deny"
                     onClick={() => {
                       void respondPermission(permissionReq.id, false);
-                      setPermissionReq(null);
+                      useStore.getState().setChatPendingPermission(chatIdRef.current, null);
                     }}
                   >
                     {denyLabel}
@@ -2318,7 +2317,7 @@ export function ChatPanel() {
                       className="btn perm-allow"
                       onClick={() => {
                         void respondPermission(permissionReq.id, true);
-                        setPermissionReq(null);
+                        useStore.getState().setChatPendingPermission(chatIdRef.current, null);
                       }}
                     >
                       {fa ? "تأیید" : "Confirm"}
@@ -2330,7 +2329,7 @@ export function ChatPanel() {
                         className="btn perm-allow"
                         onClick={() => {
                           void respondPermission(permissionReq.id, true);
-                          setPermissionReq(null);
+                          useStore.getState().setChatPendingPermission(chatIdRef.current, null);
                         }}
                       >
                         {fa ? "اجازه موقت" : "Allow once"}
@@ -2341,7 +2340,7 @@ export function ChatPanel() {
                         onClick={() => {
                           void respondPermission(permissionReq.id, true);
                           useStore.getState().setOutsideAllowed(true);
-                          setPermissionReq(null);
+                          useStore.getState().setChatPendingPermission(chatIdRef.current, null);
                         }}
                       >
                         {fa ? "همیشه اجازه بده" : "Always allow"}

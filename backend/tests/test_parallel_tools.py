@@ -30,7 +30,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools import make_tool_callbacks  # noqa: E402
+from tools import make_tool_callbacks
 
 
 async def main():

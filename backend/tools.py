@@ -2856,7 +2856,8 @@ def make_tool_callbacks(
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
         """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
-        emit({"kind": "tool", "tool": "explore", "args": {"task": task}})
+        _explore_model_name = str(getattr(explore_model, "model_name", "") or "")
+        emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _explore_model_name})
         if explore_model is None:
             emit(_error_result("explore", "unavailable"))
             return "ERROR: explore is unavailable (no model configured for this session)."
@@ -2875,6 +2876,7 @@ def make_tool_callbacks(
             # the sub-agent's, which is discarded once explore_tool returns.
             event = dict(event)
             event["sub"] = True
+            event.setdefault("model", _explore_model_name)
             emit(event)
 
         # Code-enforced dedup for the sub-agent's search tools. The sub-agent
@@ -3488,7 +3490,7 @@ def make_tool_callbacks(
         if not report:
             emit(_error_result("explore", "no report"))
             return f"The exploration sub-agent found nothing usable for {task!r}."
-        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars"})
+        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _explore_model_name})
         return f"EXPLORE REPORT for {task!r}\n{report}"
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:

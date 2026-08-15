@@ -439,6 +439,11 @@ export const ToolCallView = memo(function ToolCallView({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+        {activity.model && (
+          <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
+            {activity.model}
+          </span>
+        )}
         {activity.tool === 'web_search' && activity.engine && (
           <span className="tool-badge">{activity.engine}</span>
         )}

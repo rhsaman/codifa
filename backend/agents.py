@@ -781,7 +781,10 @@ async def _settings_for(
         # output tokens without hurting quality. Broad/content tasks keep the
         # full budget (their replies can legitimately be longer).
         if scope == "narrow":
-            max_tokens = min(max_tokens, _NARROW_OUTPUT_CAP)
+            # Proportional to model's actual output limit (50% with 2048 floor)
+            # so models with higher capacity (DeepSeek 8K, GPT-4 8K+) get
+            # a usable narrow budget instead of a hard 2K cap.
+            max_tokens = min(max_tokens, max(2048, max_tokens // 2))
         base["max_tokens"] = max_tokens
     # opencode's zen gateway streams CUMULATIVE usage on every chunk (not just
     # the final one). pydantic-ai's default is to SUM per-chunk usage, which
@@ -1169,6 +1172,8 @@ _MAX_OUTPUT_TOKENS = 8_192
 # A targeted lookup/fix needs a short direct reply — the code itself is written
 # through write_file/edit_file tool results, not the model's text — so capping
 # its reply saves real (often expensive) output tokens while keeping full quality.
+# Kept for backward-compat but no longer used directly; narrow cap is now
+# proportional to the model's actual max_tokens (50% with 2048 floor).
 _NARROW_OUTPUT_CAP = 2_048
 
 
@@ -3619,19 +3624,28 @@ async def run_agent(
             cfg = state_db.get_settings() or {}
         except Exception:  # noqa: BLE001
             return None
-        for p in cfg.get("providers") or []:
-            if isinstance(p, dict) and p.get("id") == pid:
-                # API keys / OAuth tokens are stored encrypted in settings.json;
-                # decrypt them so the subagent can actually use the provider.
-                p = {
-                    **p,
-                    "apiKey": decrypt_secret(p.get("apiKey") or ""),
-                    "oauthClientId": decrypt_secret(p.get("oauthClientId") or ""),
-                    "oauthClientSecret": decrypt_secret(p.get("oauthClientSecret") or ""),
-                    "oauthRefreshToken": decrypt_secret(p.get("oauthRefreshToken") or ""),
-                }
-                return p
-        return None
+        providers = [p for p in (cfg.get("providers") or []) if isinstance(p, dict)]
+        match = next((p for p in providers if p.get("id") == pid), None)
+        if match is None:
+            # No saved row has this literal id — but `pid` might be a known
+            # built-in gateway KIND (e.g. "openrouter") while the user's saved
+            # row for that gateway has a different id (auto-generated or
+            # renamed). Fall back to matching by kind so the subagent finds
+            # the user's REAL saved credentials instead of silently falling
+            # through to keyless env-var-only auth, which fails when the key
+            # lives only in Settings and not in an OS environment variable.
+            match = next((p for p in providers if p.get("kind") == pid), None)
+        if match is None:
+            return None
+        # API keys / OAuth tokens are stored encrypted in settings.json;
+        # decrypt them so the subagent can actually use the provider.
+        return {
+            **match,
+            "apiKey": decrypt_secret(match.get("apiKey") or ""),
+            "oauthClientId": decrypt_secret(match.get("oauthClientId") or ""),
+            "oauthClientSecret": decrypt_secret(match.get("oauthClientSecret") or ""),
+            "oauthRefreshToken": decrypt_secret(match.get("oauthRefreshToken") or ""),
+        }
 
     def _resolve_subagent(
         entry: str,

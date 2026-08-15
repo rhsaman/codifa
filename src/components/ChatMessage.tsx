@@ -1,4 +1,11 @@
-import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -83,36 +90,82 @@ const fmtTokens = (n?: number): string => {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
 }
 
+const THINKING_MIN_H = 56
+const THINKING_MAX_H = 320
+const THINKING_DEFAULT_H = 84
+
 export function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(true)
+  const [height, setHeight] = useState(THINKING_DEFAULT_H)
   const textRef = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true)
-  const label = open
-    ? 'Hide thinking'
-    : `Thinking (${localWords(text).toLocaleString()} words)`
+  const drag = useRef<{ startY: number; startH: number } | null>(null)
+  const empty = text.trim().length === 0
+  const label = empty
+    ? 'Thinking…'
+    : open
+      ? 'Hide thinking'
+      : `Thinking (${localWords(text).toLocaleString()} words)`
   useEffect(() => {
     const el = textRef.current
-    if (!el || !open || !stickToBottom.current) return
+    if (!el || !open || empty || !stickToBottom.current) return
     el.scrollTop = el.scrollHeight
-  }, [text, open])
+  }, [text, open, empty])
+
+  const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    drag.current = { startY: e.clientY, startH: height }
+    const onMove = (ev: PointerEvent) => {
+      if (!drag.current) return
+      const next = drag.current.startH + (ev.clientY - drag.current.startY)
+      setHeight(Math.max(THINKING_MIN_H, Math.min(THINKING_MAX_H, next)))
+    }
+    const onUp = () => {
+      drag.current = null
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+  }
+
   return (
-    <div className={`thinking-block ${open ? 'open' : ''}`}>
+    <div
+      className={`thinking-block ${open ? 'open' : ''}${empty ? ' busy' : ''}`}
+    >
       <button className="thinking-head" onClick={() => setOpen((o) => !o)}>
-        <span className="thinking-dot">✦</span>
+        <span className={`thinking-dot${empty ? ' busy' : ''}`}>
+          {empty ? <span className="spinner" /> : '✦'}
+        </span>
         <span className="thinking-label">{label}</span>
-        <span className={`chev ${open ? 'open' : ''}`}>▾</span>
+        {!empty && <span className={`chev ${open ? 'open' : ''}`}>▾</span>}
       </button>
-      {open && (
-        <div
-          className="thinking-text"
-          ref={textRef}
-          onScroll={(e) => {
-            const el = e.currentTarget
-            stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
-          }}
-        >
-          {stripBidiMarks(fixZwsp(text))}
-        </div>
+      {open && !empty && (
+        <>
+          <div
+            className="thinking-text"
+            ref={textRef}
+            style={{ height }}
+            onScroll={(e) => {
+              const el = e.currentTarget
+              stickToBottom.current =
+                el.scrollHeight - el.scrollTop - el.clientHeight < 40
+            }}
+          >
+            {stripBidiMarks(fixZwsp(text))}
+          </div>
+          <div
+            className="thinking-resizer"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize thinking panel"
+            onPointerDown={startResize}
+          >
+            <span className="thinking-resizer-grip" />
+          </div>
+        </>
       )}
     </div>
   )

@@ -30,6 +30,8 @@ export interface ProviderKindMeta {
   editableBaseUrl?: boolean
   /** Read-only base-URL hint shown for built-in providers. */
   baseUrlHint?: string
+  /** Default base URL for built-in providers (used when user doesn't override). */
+  defaultBaseUrl?: string
   /** True = supports Google-style OAuth sign-in. */
   oauth?: boolean
   /** True = model ids carry no provider prefix (opencode). */
@@ -49,6 +51,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     builtin: true,
     unprefixedModelId: true,
     baseUrlHint: 'https://opencode.ai/zen/v1 — routed via the opencode gateway (never OpenRouter).',
+    defaultBaseUrl: 'https://opencode.ai/zen/v1',
   },
   openrouter: {
     kind: 'openrouter',
@@ -59,6 +62,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://openrouter.ai/api/v1',
+    defaultBaseUrl: 'https://openrouter.ai/api/v1',
   },
   google: {
     kind: 'google',
@@ -70,6 +74,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     builtin: true,
     oauth: true,
     baseUrlHint: 'https://generativelanguage.googleapis.com/v1beta/openai — Gemini models via Google.',
+    defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
   },
   nvidia: {
     kind: 'nvidia',
@@ -80,6 +85,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://integrate.api.nvidia.com/v1 — NVIDIA NIM hosted models.',
+    defaultBaseUrl: 'https://integrate.api.nvidia.com/v1',
   },
   cloudflare: {
     kind: 'cloudflare',
@@ -91,6 +97,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     builtin: true,
     baseUrlHint: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 — Workers AI.',
     extraHint: 'Also requires CLOUDFLARE_ACCOUNT_ID in your environment.',
+    defaultBaseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1',
   },
   tokenrouter: {
     kind: 'tokenrouter',
@@ -101,6 +108,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://api.tokenrouter.com/v1 — unified AI model hub.',
+    defaultBaseUrl: 'https://api.tokenrouter.com/v1',
   },
   ollama: {
     kind: 'ollama',

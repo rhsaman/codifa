@@ -212,6 +212,10 @@ export interface ToolActivity {
   sub?: boolean
   /** Nested sub-agent tool calls when this is an explore card. */
   children?: ToolActivity[]
+  /** Which model executed this specific tool call. Empty/absent = the main
+   *  conversation model; set for calls issued by a sub-agent (e.g. explore's
+   *  own resolved model from Settings → Subagents). */
+  model?: string
   /** Structured result rows (e.g. web_search hits) shown in the tool card. */
   items?: SearchResultItem[]
   /** Which web-search provider produced these results (e.g. 'tavily'). */
@@ -337,6 +341,17 @@ export interface Chat {
   draft?: ChatDraft
   /** Messages typed while this chat's agent was working, sent/steered later. */
   queued?: QueuedMessage[]
+  /** A pending `ask_user` request from a RUNNING agent turn. Lives on the chat
+   *  (not local component state) because `<ChatPanel key={activeChatId} />`
+   *  fully unmounts/remounts on every chat switch — local state would silently
+   *  lose the request (and the popup would never appear) if the user isn't
+   *  looking at this exact chat when the `ask` event arrives, or switches away
+   *  and back while the agent is still waiting for a response. */
+  pendingAsk?: { id: string; question: string; options: string[] } | null
+  /** A pending `permission` request from a RUNNING agent turn. Same rationale
+   *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
+   *  on chat switch. */
+  pendingPermission?: { id: string; action: string; path?: string; reason?: string; scope?: string } | null
   createdAt: number
   updatedAt: number
 }
@@ -374,6 +389,10 @@ export interface SidecarEvent {
   /** True for events emitted by a sub-agent (explore's internal read/grep/glob)
    *  — the parent nests these inside the explore card instead of a top-level card. */
   sub?: boolean
+  /** Which model executed this specific event: for 'tool'/'tool_result' kinds,
+   *  the model that ran the call; for 'usage' events, the model the usage
+   *  belongs to. Empty/absent = the main conversation model. */
+  model?: string
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string
@@ -387,8 +406,6 @@ export interface SidecarEvent {
   total_tokens?: number
   cache_read_tokens?: number
   cache_write_tokens?: number
-  /** Model name for per-model usage breakdown (empty = parent). */
-  model?: string
   /** Overflow events are REJECTED (unbilled) requests — never counted in billed totals. */
   unbilled?: boolean
   attempt?: number

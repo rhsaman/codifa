@@ -25,20 +25,26 @@ import { PROVIDER_META } from './provider-meta'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
-// Strip transient, in-memory-only fields from messages before persisting so
-// they never reappear after a restart (e.g. the rate-limit retry banner).
+// Strip transient, in-memory-only fields from messages AND chats before
+// persisting so they never reappear after a restart (e.g. the rate-limit retry
+// banner, or a stale ask/permission popup whose agent is long gone).
 function sanitizeChats(chats: Chat[]): Chat[] {
-  return chats.map((c) => ({
-    ...c,
-    messages: c.messages.map((m) => {
-      const clean = { ...m } as Record<string, unknown>
-      delete clean.retry
-      delete clean.streaming
-      delete clean.thinking
-      delete clean.toolActivity
-      return clean as unknown as ChatMessage
-    }),
-  }))
+  return chats.map((c) => {
+    const clean = { ...c }
+    delete clean.pendingAsk
+    delete clean.pendingPermission
+    return {
+      ...clean,
+      messages: c.messages.map((m) => {
+        const msg = { ...m } as Record<string, unknown>
+        delete msg.retry
+        delete msg.streaming
+        delete msg.thinking
+        delete msg.toolActivity
+        return msg as unknown as ChatMessage
+      }),
+    }
+  })
 }
 
 /** Display labels for the built-in modes (used in the mode-switch history note). */
@@ -185,20 +191,23 @@ export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
 ) as Record<ProviderKind, string>
 
 function defaultProviders(): ProviderConfig[] {
-  const row = (id: ProviderKind, extra: Partial<ProviderConfig> = {}): ProviderConfig => ({
-    id: id === 'ollama' ? 'local' : id,
-    name: PROVIDER_META[id].name,
-    kind: id,
-    apiKey: '',
-    envVar: PROVIDER_META[id].defaultEnvVar,
-    baseUrl: '',
-    model: '',
-    ...extra,
-  })
+  const row = (id: ProviderKind, extra: Partial<ProviderConfig> = {}): ProviderConfig => {
+    const meta = PROVIDER_META[id]
+    return {
+      id: id === 'ollama' ? 'local' : id,
+      name: meta.name,
+      kind: id,
+      apiKey: '',
+      envVar: meta.defaultEnvVar,
+      baseUrl: meta.defaultBaseUrl ?? '',
+      model: '',
+      ...extra,
+    }
+  }
   return [
     row('opencode', { model: 'deepseek-v4-flash-free' }),
     row('openrouter'),
-    row('ollama', { baseUrl: 'http://localhost:11434' }),
+    row('ollama'),
     row('google'),
     row('nvidia'),
     row('cloudflare'),
@@ -397,6 +406,21 @@ interface State {
   ) => void
   /** Zero the cumulative per-model usage of a chat (sidebar "reset" button). */
   resetChatUsage: (chatId: string) => void
+  /** Set/clear a chat's pending `ask_user` request. Stored on the chat (not
+   *  local component state) so it survives the ChatPanel remount that happens
+   *  on every chat switch (`key={activeChatId}`) — otherwise a background
+   *  chat's ask request is silently lost and its popup never appears. */
+  setChatPendingAsk: (
+    chatId: string,
+    req: { id: string; question: string; options: string[] } | null,
+  ) => void
+  /** Set/clear a chat's pending `permission` request. Same rationale as
+   *  `setChatPendingAsk`: stored on the chat so it survives the ChatPanel
+   *  remount on chat switch. */
+  setChatPendingPermission: (
+    chatId: string,
+    req: { id: string; action: string; path?: string; reason?: string; scope?: string } | null,
+  ) => void
   markToolReverted: (messageId: string, index: number) => void
   truncateTo: (messageId: string) => boolean
   clearChat: (id: string) => void
@@ -1340,6 +1364,18 @@ export const useStore = create<State>((set, get) => ({
       ),
     }))
     get().persist()
+  },
+
+  setChatPendingAsk: (chatId, req) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === chatId ? { ...c, pendingAsk: req } : c)),
+    }))
+  },
+
+  setChatPendingPermission: (chatId, req) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === chatId ? { ...c, pendingPermission: req } : c)),
+    }))
   },
 
   markToolReverted: (messageId, index) => {

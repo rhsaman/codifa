@@ -864,6 +864,25 @@ _THROTTLE_MAX_ATTEMPTS = 10
 _RESUME_MAX_TOOLS = 12
 _RESUME_RESULT_MAX = 6_000
 _RESUME_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def _resume_prompt_key(p: str) -> str:
+    """Normalize a turn prompt for resume-matching.
+
+    The frontend may append a skills section ("=== USER-SELECTED SKILLS/TOOLS
+    FOR THIS TURN ===") or an interrupted-plan reminder ("[SYSTEM: a task was
+    interrupted mid-way") to the prompt it sends. Gate (a) of the resume
+    injection compares the retried prompt against the prompt saved when the
+    tools ran, so those suffixes would make an otherwise-identical retry fail
+    the match and re-run the tools. Strip them so resume fires on a genuine
+    retry even when the prompt carries such suffixes.
+    """
+    p = str(p or "").strip()
+    cut = p.split("\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===", 1)[0]
+    cut = cut.split("\n\n[SYSTEM: a task was interrupted mid-way", 1)[0]
+    return cut.strip()
+
+
 _RETRYABLE_PHRASES = (
     "rate limit",
     "ratelimit",
@@ -2706,14 +2725,22 @@ async def _compact_history(
     compact — but it is capped at half the history (and floored at 8) so a
     compact always frees real space instead of becoming a no-op.
 
-    Returns a new, smaller history, or ``None`` if there is nothing to compact
-    OR the summarizing call fails — on failure it does NOT drop the older turns
+    Returns a tuple ``(new_history, recent_kept)`` — ``recent_kept`` is the exact
+    number of recent turns preserved verbatim after the summary, so the caller
+    can tell the frontend to fold precisely those older turns and keep the SAME
+    recent ones (otherwise the summary and the verbatim tail it renders can
+    contradict each other). Returns ``None`` if there is nothing to compact OR
+    the summarizing call fails — on failure it does NOT drop the older turns
     (the caller surfaces a ``compact_failed`` event so the user can retry
     manually rather than silently losing context).
     """
     keep = min(max_history, max(8, len(history) // 2))
-    recent = history[-keep:]
-    older = history[:-keep]
+    # Preserve one fewer recent turn than `keep` so the prepended summary still
+    # fits beside them within the client's "Messages to remember" on the NEXT
+    # resend (summary + recent == keep <= max_history).
+    recent_n = max(1, keep - 1)
+    recent = history[-recent_n:]
+    older = history[:-recent_n]
     if not older:
         return None
 
@@ -2766,9 +2793,12 @@ async def _compact_history(
     if not summary:
         return None  # empty summary — treat as failure, do NOT drop messages
 
-    return [
-        {"role": "system", "content": "[Compacted earlier context]\n" + summary}
-    ] + recent
+    return (
+        [
+            {"role": "system", "content": "[Compacted earlier context]\n" + summary}
+        ] + recent,
+        recent_n,
+    )
 
 
 # Maximum number of auto-extracted memory notes written per run (Hermes-style
@@ -3759,7 +3789,7 @@ async def run_agent(
         root,
         lambda ev: queue.put_nowait(_tool_event(ev)),
         context_window=ctx,
-        summarizer_model=search_model,
+        explore_model=explore_model,
         web_model=web_model,
         search_model=search_model,
         permission_gates=permission_gates,
@@ -4495,7 +4525,8 @@ async def run_agent(
         except (TypeError, ValueError):
             _ts = 0
         if (
-            str(_resume_state.get("prompt", "")) == prompt
+            _resume_prompt_key(str(_resume_state.get("prompt", "")))
+            == _resume_prompt_key(prompt)
             or (
                 _last.get("role") == "assistant"
                 and "[Interrupted before finishing" in str(_last.get("content", ""))
@@ -4525,6 +4556,14 @@ async def run_agent(
                         "run of this turn, with their actual results. Treat them as already "
                         "done — do NOT re-run the same tools. Continue the task from where "
                         "it was cut off."
+                        + (
+                            "\n\nA skill is already attached and active for this turn — do "
+                            "NOT re-run its setup/opening/installation procedure or re-read "
+                            "its instructions as if new; simply continue acting in its role "
+                            "from where the interrupted turn stopped."
+                            if skills
+                            else ""
+                        )
                     ),
                 }
             ]
@@ -5052,6 +5091,9 @@ async def run_agent(
                     max_history=max_history,
                     usage_cap=compact_cap,
                 )
+                compact_keep: int = 0
+                if compacted is not None and isinstance(compacted, tuple):
+                    compacted, compact_keep = compacted
                 # Compaction alone may not free enough room on a small window
                 # (the retried request re-sends the whole turn). If there's no
                 # history left to compress, drop the current turn's auto-scout
@@ -5112,7 +5154,11 @@ async def run_agent(
                             )
                         except Exception:  # noqa: BLE001, S110
                             pass
-                    yield {"kind": "compact", "content": summary_text or content}
+                    yield {
+                        "kind": "compact",
+                        "content": summary_text or content,
+                        "keep": compact_keep,
+                    }
                     history = compacted
                     history_messages = _to_model_messages(history)
                     if resume_note:
@@ -5332,6 +5378,8 @@ async def run_agent(
                     max_history=max_history,
                 )
                 if compacted is not None:
+                    if isinstance(compacted, tuple):
+                        compacted = compacted[0]
                     yield {"kind": "compact", "content": ""}
                     history = compacted
                     history_messages = _to_model_messages(history)

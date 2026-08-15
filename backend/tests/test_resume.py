@@ -204,7 +204,47 @@ async def main():
         assert state_db.load_turn_resume(ws, chat4) is None, "plan scenario left the resume file behind"
         print("  resume/4 OK: checklist preserved on continue")
 
-        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist)")
+        # ==== Scenario 5: REAL Retry — SAME prompt re-sent with a skill suffix.
+        # No marker is present (the frontend retry re-sends only the prompt), so
+        # the normalized gate (a) must fire and NOT re-run the completed tool.
+        chat5 = "chat-resume-5"
+        mock.script = [
+            tool_call("grep", json.dumps({"pattern": "foo", "path": ""})),
+            None,  # hard 400 — the turn errors after the grep completes
+        ]
+        mock.captured = []
+        try:
+            async for _ev in run_agent(
+                prompt="find foo", history=[], **{**common, "chat_id": chat5}
+            ):
+                pass
+        except Exception:  # noqa: BLE001 — the hard error is expected
+            pass
+        resume5 = state_db.load_turn_resume(ws, chat5)
+        assert resume5 and resume5.get("tools"), "retry: resume file missing after error"
+
+        # The frontend retry re-sends the SAME prompt, but (when skills are
+        # active) with a suffixes section appended. Normalize and assert resume.
+        from agents import _resume_prompt_key
+
+        retry_prompt = (
+            "find foo\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\nUse the X skill."
+        )
+        assert _resume_prompt_key(retry_prompt) == "find foo", "prompt normalizer failed"
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        await run_turn(prompt=retry_prompt, history=[], **{**common, "chat_id": chat5})
+        _, call_msg5 = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant" and any(
+                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
+            ),
+        )
+        assert call_msg5, "retry: same-prompt retry did not replay the completed tool"
+        assert state_db.load_turn_resume(ws, chat5) is None, "retry left the resume file behind"
+        print("  resume/5 OK: same-prompt retry (with skill suffix) resumes done work, no re-run")
+
+        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist / retry)")
     finally:
         await stop_server(task)
 

@@ -420,6 +420,11 @@ export const ChatMessageView = memo(function ChatMessageView({
   const settings = useStore((s) => s.settings)
   const [copied, setCopied] = useState(false)
   const [collapsed, setCollapsed] = useState(message.compacted)
+  // The context summary collapses by default — it is a compact checkpoint the
+  // user can expand on demand instead of a wall of text dominating the bubble.
+  const [summaryCollapsed, setSummaryCollapsed] = useState(
+    message.role === 'system' && !message.modeSwitch,
+  )
 
   const modeLabel = (id: string) => getMode(settings, id).label
 
@@ -573,23 +578,26 @@ export const ChatMessageView = memo(function ChatMessageView({
         isModeSwitch ? (
           <div className="mode-switch-note" dir="ltr">{stripBidiMarks(fixZwsp(message.content))}</div>
         ) : isSummary ? (
-          <div className="summary-block">
-            <div className="summary-head">
+          <div className={`summary-block${summaryCollapsed ? ' collapsed' : ''}`}>
+            <div className="summary-head" onClick={() => setSummaryCollapsed((c) => !c)} role="button" tabIndex={0}>
+              <span className={`summary-chevron${summaryCollapsed ? '' : ' open'}`}>▶</span>
               <span className="summary-icon">📎</span>
               <span className="summary-label">Context summary</span>
               <span className="summary-hint">
                 earlier turns collapsed — not re-sent; a fresh reader continues from here
               </span>
             </div>
-            <div className="summary-body chat-message markdown-body">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeHighlight]}
-                components={mdComponents}
-              >
-                {prepareContent(message.content || "(empty summary)", dir)}
-              </ReactMarkdown>
-            </div>
+            {!summaryCollapsed && (
+              <div className="summary-body chat-message markdown-body">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeHighlight]}
+                  components={mdComponents}
+                >
+                  {prepareContent(message.content || "(empty summary)", dir)}
+                </ReactMarkdown>
+              </div>
+            )}
           </div>
         ) : message.segments && message.segments.length > 0 ? (
           /* Claude-style interleaved rendering: text slices and tool cards follow

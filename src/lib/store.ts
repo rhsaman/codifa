@@ -1398,11 +1398,12 @@ export const useStore = create<State>((set, get) => ({
         if (c.id !== id) return c
         const nonSys = c.messages.filter((m) => m.role !== 'system')
         // Keep the last `keep` messages verbatim; fold everything older into the
-        // summary. We keep one fewer than `keep` (see sliceToBudget: the next
-        // turn sends the last `maxHistory` entries, and the appended summary
-        // must survive that slice — so recent (keep-1) + summary = keep total).
-        const recentCount = keep > 0 ? Math.max(keep - 1, 0) : 0
-        const recentStart = Math.max(nonSys.length - recentCount, 0)
+        // summary. `keep` is the EXACT number of recent turns to preserve (the
+        // backend reports it for auto-compact; the manual /compact path passes
+        // maxHistory-1). The summary is appended so the next turn's
+        // sliceToBudget (which sends the last maxHistory entries, system-first)
+        // keeps summary + recent together without contradicting either.
+        const recentStart = Math.max(nonSys.length - keep, 0)
         const compactedIds = new Set(
           nonSys.slice(0, recentStart).map((m) => m.id),
         )
@@ -1421,15 +1422,23 @@ export const useStore = create<State>((set, get) => ({
           id: uid(),
           role: 'system' as const,
           content: summary,
+          usage: undefined as TokenUsage | undefined,
           createdAt: Date.now(),
         }
-        // The summary is appended at the END of the message list — a "context
-        // checkpoint" sitting at the bottom of the scrollback, directly above
-        // the next user turn, rather than wedged mid-list where it reads as a
-        // duplicate bubble. The most recent messages stay verbatim above it.
+        // Insert the summary at the COMPACTION BOUNDARY — right after the folded
+        // older messages and BEFORE the preserved recent ones — so it reads as a
+        // in-conversation checkpoint (like a steer note) with the kept verbatim
+        // turns and any follow-up tool calls AFTER it, instead of a bubble glued
+        // to the bottom of the scrollback. The model still receives it first on
+        // the next request (sliceToBudget sorts system-first).
+        let boundary = 0
+        for (let i = 0; i < messages.length; i++) {
+          if (messages[i].compacted) boundary = i + 1
+        }
+        messages.splice(boundary, 0, summaryMsg)
         return {
           ...c,
-          messages: [...messages, summaryMsg],
+          messages,
           updatedAt: Date.now(),
         }
       }),

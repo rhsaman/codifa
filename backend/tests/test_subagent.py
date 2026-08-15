@@ -103,7 +103,11 @@ async def main():
             provider="custom", model_name="mock-model", base_url=base, api_key="test",
             root=ws, mode="coder", prompt="explore the workspace for foo", history=[],
             chat_id="chat-sub-1",
-            subagent_models={"explore": "mock-model"},
+            subagent_models={
+                "explore": "explore-model",
+                "search": "search-model",
+                "web": "web-model",
+            },
         ):
             events.append(ev)
 
@@ -122,8 +126,13 @@ async def main():
             if m.get("role") == "system"
         )
         assert sub_system, "sub-agent request has no system prompt"
+        # The explore SUB-AGENT must run on the configured EXPLORE model, not the
+        # search model (it used to inherit search through the removed
+        # summarizer_model wiring). Prove the routing by the model in its request.
+        assert str(sub_req.get("model", "")) == "explore-model", \
+            f"explore sub-agent ran on the wrong model: {sub_req.get('model')!r}"
         assert "The exploration is complete." in streamed, "parent never finished after the sub-agent"
-        print("  subagent OK: explore ran its isolated sub-agent and returned a report")
+        print("  subagent OK: explore ran its isolated sub-agent on the explore model and returned a report")
 
         # Opt-in live check of the user's exact scenario: subagent set to
         # "openrouter/free" with no saved OpenRouter row (env-var auth). The

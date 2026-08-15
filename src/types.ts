@@ -351,6 +351,9 @@ export interface SidecarEvent {
   status?: 'error' | 'done' | 'denied'
   /** Per-call correlation id pairing a 'tool' event with its 'tool_result'. */
   call_id?: number
+  /** Number of recent turns the backend preserved verbatim on a 'compact'
+   *  event, so the frontend folds exactly the same older turns. */
+  keep?: number
   diff?: string
   path?: string
   /** Auto-selected skill names (the 'skill' event kind). */

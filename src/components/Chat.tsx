@@ -1103,7 +1103,18 @@ export function ChatPanel() {
         // summary is still fully visible by scrolling up whenever the user wants.
         const chatId = chat.id;
         if (chatId) {
-          store.compactChat(chatId, event.content ?? "", maxHistory);
+          // Auto-compact: the backend tells us exactly how many recent turns it
+          // preserved verbatim (`keep`), so we fold the SAME older turns and keep
+          // the SAME recent ones — the summary never contradicts the tail it
+          // renders next. Fall back to maxHistory on older backends.
+          const backendKeep = Number.isFinite(event.keep) && (event.keep ?? -1) >= 0
+            ? event.keep
+            : undefined;
+          store.compactChat(
+            chatId,
+            event.content ?? "",
+            backendKeep ?? maxHistory,
+          );
         }
       } else if (event.kind === "compact_failed") {
         // Auto-compact failed — the backend did NOT drop any messages. Surface
@@ -1436,7 +1447,7 @@ export function ChatPanel() {
     s.compactChat(
       ch.id,
       `[Compacted conversation]\n${summary.trim()}`,
-      maxHistory,
+      Math.max(maxHistory - 1, 0),
     );
     // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
     // history stays recallable via memory later. Never blocks or throws.

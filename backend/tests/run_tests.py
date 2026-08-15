@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-TESTS = ["test_resume", "test_subagent", "test_issues"]
+TESTS = ["test_resume", "test_subagent", "test_parallel_tools", "test_issues"]
 
 
 async def run_one(name: str) -> bool:

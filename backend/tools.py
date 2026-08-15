@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import difflib
 import glob as _pyglob
 import json
@@ -2086,7 +2087,7 @@ def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
     context_window: int = 0,
-    summarizer_model: Any = None,
+    explore_model: Any = None,
     web_model: Any = None,
     search_model: Any = None,
     permission_gates: dict | None = None,
@@ -2109,18 +2110,26 @@ def make_tool_callbacks(
     shared emit callback aligned with the streaming loop.
     """
 
-    # Correlate every tool call with its result via a per-turn monotonic
-    # `call_id`. The UI previously matched tool_results to running cards by
-    # (tool name + status) alone, which breaks when the SAME tool runs multiple
-    # times in a turn (e.g. 8× grep) or when explore's sub-agent emits
-    # identically-named tool events into the same stream — results could resolve
-    # the wrong card, leaving a genuinely-started card stuck on "running"
-    # forever. Wrapping emit here gives each tool→result pair a stable id that
-    # the frontend can match on; sub-agent events (already tagged `sub=True`)
-    # flow through the same wrapper and get their own ids.
+    # Correlate every tool call with its result via a per-invocation `call_id`.
+    # The UI previously matched tool_results to running cards by (tool name +
+    # status) alone, which breaks when the SAME tool runs multiple times in a
+    # turn (e.g. 8× grep) or when explore's sub-agent emits identically-named
+    # tool events into the same stream — results could resolve the wrong card,
+    # leaving a genuinely-started card stuck on "running" forever.
+    #
+    # Parent tools carry their pairing through a `contextvars.ContextVar` set per
+    # invocation: pydantic-ai runs parallel same-name tool calls as SEPARATE
+    # async tasks (each with a copied context), and each task emits its own
+    # `tool` then its own `tool_result`. Threading the id through the context
+    # keeps tool→result correct even when parallel calls finish OUT of order — a
+    # name-based FIFO (pop the oldest pending id) would otherwise swap the
+    # results and, on a Stop, make the retried model think work was never done,
+    # re-running duplicate tools.
     _call_seq = 0
-    _pending_calls: dict[str, list[int]] = {}
     _pending_sub_calls: dict[str, list[int]] = {}
+    _cur_call_id: contextvars.ContextVar[int] = contextvars.ContextVar(
+        "coder_tool_call_id", default=0
+    )
 
     def _emit(event: dict) -> None:
         nonlocal _call_seq
@@ -2128,21 +2137,49 @@ def make_tool_callbacks(
         kind = ev.get("kind")
         tool = ev.get("tool") or ""
         is_sub = bool(ev.get("sub"))
-        if kind == "tool":
-            _call_seq += 1
-            ev["call_id"] = _call_seq
-            if is_sub:
+        if not is_sub:
+            # Parent tool invocation: read the per-invocation id. The wrapper
+            # below reset it to 0 so the first `tool` emit allocates a fresh id
+            # and the matching `tool_result` (same invocation/context) reuses it.
+            if kind == "tool":
+                cid = _cur_call_id.get()
+                if not cid:
+                    _call_seq += 1
+                    cid = _call_seq
+                    _cur_call_id.set(cid)
+                ev["call_id"] = cid
+            elif kind == "tool_result":
+                cid = _cur_call_id.get()
+                if cid:
+                    ev["call_id"] = cid
+        else:
+            # Sub-agent events flowed through `_sub_emit` (tagged `sub=True`),
+            # they can't be threaded per-invocation from here, so keep the
+            # name-based FIFO correlation for those.
+            if kind == "tool":
+                _call_seq += 1
+                ev["call_id"] = _call_seq
                 _pending_sub_calls.setdefault(tool, []).append(_call_seq)
-            else:
-                _pending_calls.setdefault(tool, []).append(_call_seq)
-        elif kind == "tool_result":
-            queue = _pending_sub_calls if is_sub else _pending_calls
-            if queue.get(tool):
-                ev["call_id"] = queue[tool].pop(0)
+            elif kind == "tool_result":
+                if _pending_sub_calls.get(tool):
+                    ev["call_id"] = _pending_sub_calls[tool].pop(0)
         orig_emit(ev)
 
     orig_emit = emit
     emit = _emit
+
+    def _invoke(fn: Callable) -> Callable:
+        import functools as _functools
+
+        @_functools.wraps(fn)
+        async def wrapped(*args, **kwargs):
+            token = _cur_call_id.set(0)
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                _cur_call_id.reset(token)
+
+        return wrapped
 
     # Reserve headroom so tool outputs + accumulated turn history + reply still fit.
     # Budgets scale with the context window so small models (e.g. 8k) get tight caps
@@ -2820,7 +2857,7 @@ def make_tool_callbacks(
     async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
         """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
         emit({"kind": "tool", "tool": "explore", "args": {"task": task}})
-        if summarizer_model is None:
+        if explore_model is None:
             emit(_error_result("explore", "unavailable"))
             return "ERROR: explore is unavailable (no model configured for this session)."
 
@@ -3210,7 +3247,7 @@ def make_tool_callbacks(
                 _sub_max_tokens = 1200
 
             sub_agent = _Agent(
-                summarizer_model,
+                explore_model,
                 system_prompt=(
                     "You are a read-only exploration sub-agent. Your job is to find the "
                     "answer FAST and CHEAPLY and hand back a compact structured report. "
@@ -3272,7 +3309,7 @@ def make_tool_callbacks(
             # (which then re-pays full discovery overhead in its OWN context).
             # Each retry keeps the result cache (built above), so the fresh model
             # gets its earlier findings back via the dedup instead of re-exploring.
-            _sub_model_name = str(getattr(summarizer_model, "model_name", "") or "")
+            _sub_model_name = str(getattr(explore_model, "model_name", "") or "")
             _sub_request_limit = 10
             _sub_tool_calls_limit = 24
             _sub_widen_retries = 0
@@ -3307,7 +3344,7 @@ def make_tool_callbacks(
                             ),
                             model_settings=_ModelSettings(
                                 timeout=_providers.model_timeout(
-                                    model=summarizer_model, total=90, connect=10, read=90
+                                    model=explore_model, total=90, connect=10, read=90
                                 ),
                                 parallel_tool_calls=True,
                             ),
@@ -3406,7 +3443,7 @@ def make_tool_callbacks(
                                 ),
                                 model_settings=_ModelSettings(
                                     timeout=_providers.model_timeout(
-                                        model=summarizer_model, total=60, connect=10, read=60
+                                        model=explore_model, total=60, connect=10, read=60
                                     ),
                                     parallel_tool_calls=True,
                                 ),
@@ -3428,7 +3465,7 @@ def make_tool_callbacks(
                 "part yourself with grep/read."
             )
         except Exception as exc:  # noqa: BLE001
-            _sub_model = str(getattr(summarizer_model, "model_name", "") or "")
+            _sub_model = str(getattr(explore_model, "model_name", "") or "")
             emit(_error_result("explore", f"failed: {exc}"))
             return (
                 f"ERROR: explore sub-agent failed"
@@ -3444,7 +3481,7 @@ def make_tool_callbacks(
             _usage_event,  # local import: agents.py imports this module at load time
         )
 
-        sub_model_name = str(getattr(summarizer_model, "model_name", "") or "")
+        sub_model_name = str(getattr(explore_model, "model_name", "") or "")
         usage_event = _usage_event(getattr(res, "usage", None), model=sub_model_name)
         if usage_event:
             emit(usage_event)
@@ -3652,13 +3689,13 @@ def make_tool_callbacks(
         # with a tiny token budget) answers the `question` from the extracted
         # text, keeping the main context lean.
         answer = ""
-        if web_model is not None or summarizer_model is not None:
+        if web_model is not None or explore_model is not None:
             try:
                 from pydantic_ai import Agent
                 from pydantic_ai.settings import ModelSettings
 
                 summarizer = Agent(
-                    web_model or summarizer_model,
+                    web_model or explore_model,
                     system_prompt=(
                         "You are a web-page reader. Read the quoted page text and "
                         "answer the user's question with a CONCISE summary (under "
@@ -3674,14 +3711,14 @@ def make_tool_callbacks(
                         f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
                         model_settings=ModelSettings(
                             timeout=_providers.model_timeout(
-                                model=web_model or summarizer_model, total=90, connect=15, read=90
+                                model=web_model or explore_model, total=90, connect=15, read=90
                             )
                         ),
                     ),
                     "web-page summarizer",
                     emit=emit,
                     model_name=str(
-                        getattr(web_model or summarizer_model, "model_name", "") or ""
+                        getattr(web_model or explore_model, "model_name", "") or ""
                     ),
                 )
                 answer = str(getattr(res, "output", "") or "").strip()
@@ -3692,7 +3729,7 @@ def make_tool_callbacks(
                 _usage_ev = _usage_event(
                     getattr(res, "usage", None),
                     model=str(
-                        getattr(web_model or summarizer_model, "model_name", "") or ""
+                        getattr(web_model or explore_model, "model_name", "") or ""
                     ),
                 )
                 if _usage_ev:
@@ -3703,7 +3740,7 @@ def make_tool_callbacks(
                 answer = ""
                 _web_note = _subagent_fail_note(
                     "web",
-                    str(getattr(web_model or summarizer_model, "model_name", "") or ""),
+                    str(getattr(web_model or explore_model, "model_name", "") or ""),
                     exc,
                 )
                 if _web_note:
@@ -4109,7 +4146,7 @@ def make_tool_callbacks(
         )
         return result
 
-    return {
+    _tools = {
         "request_permission": request_permission_tool,
         "confirm_action": confirm_action_tool,
         "ask_user": ask_user_tool,
@@ -4130,3 +4167,8 @@ def make_tool_callbacks(
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
     }
+    # Wrap every parent tool so each invocation gets its own `call_id` context
+    # (see `_emit` above) — robust to parallel same-name tools finishing out of
+    # order. Sub-agent internal tools are separate `_Tool` instances, so only
+    # these first-class tools are threaded per-invocation.
+    return {name: _invoke(fn) for name, fn in _tools.items()}

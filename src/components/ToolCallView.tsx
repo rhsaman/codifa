@@ -28,6 +28,54 @@ function StatusIcon({ status }: { status: ToolActivity['status'] }) {
   return <span className="status-ok">✓</span>
 }
 
+/** Keys already rendered as dedicated chips in the tool-card head. */
+const HEADER_SHOWN_KEYS = new Set([
+  'command',
+  'path',
+  'filePath',
+  'offset',
+  'limit',
+  'start',
+  'end',
+  'query',
+  'pattern',
+  'task',
+  'text',
+  'subject',
+  'paths',
+  'engine',
+])
+
+/** Huge payloads that are never worth showing inline (the diff shows them). */
+const HIDDEN_KEYS = new Set(['content', 'old_string', 'new_string'])
+
+function fmtArgValue(v: unknown): string {
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (Array.isArray(v)) return v.map(fmtArgValue).join(', ')
+  if (v && typeof v === 'object') return JSON.stringify(v)
+  return String(v)
+}
+
+/** Remaining args rendered as clean `key: value` chips inside the card head —
+ *  no raw JSON blob in the body. */
+function ToolArgs({ args }: { args: Record<string, unknown> }) {
+  const entries = Object.entries(args).filter(
+    ([k]) => !HEADER_SHOWN_KEYS.has(k) && !HIDDEN_KEYS.has(k),
+  )
+  if (entries.length === 0) return null
+  return (
+    <span className="tool-args" dir="ltr">
+      {entries.map(([k, v]) => (
+        <span key={k} className="tool-arg">
+          <span className="tool-arg-key">{k}</span>
+          <span className="tool-arg-val">{fmtArgValue(v)}</span>
+        </span>
+      ))}
+    </span>
+  )
+}
+
 type DiffRow =
   | { type: 'hunk' | 'info'; text: string }
   | {
@@ -354,7 +402,7 @@ export const ToolCallView = memo(function ToolCallView({
   }
 
   return (
-    <div className={`tool-card ${activity.status}${isWrite ? ' wide' : ''}`}>
+    <div className={`tool-card ${activity.status}`}>
       <div className="tool-card-head">
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
@@ -424,15 +472,11 @@ export const ToolCallView = memo(function ToolCallView({
           </>
         )}
         {fetchSummary && <span className="tool-cmd">{fetchSummary}</span>}
+        {activity.args && <ToolArgs args={activity.args} />}
         <span className="tool-ms">{fmtTime(ms)}</span>
       </div>
 
       <div className="tool-card-body">
-          {activity.args && Object.keys(activity.args).length > 0 && (
-            <pre className="tool-args" dir="ltr">
-              {JSON.stringify(activity.args, null, 2)}
-            </pre>
-          )}
           {activity.summary && <div className="tool-summary">{activity.summary}</div>}
           {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
             <div className="tool-sub-list">

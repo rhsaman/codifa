@@ -366,16 +366,21 @@ textarea {
 }
 
 .chat-item.active {
+  /* Tinted with the workspace's own color (--ws, the same color as the left
+     indicator bar) so the current chat reads as one cohesive highlighted card
+     instead of a washed-out gray slab. Falls back to --accent when the group
+     has no color. */
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--accent) 16%, transparent),
-    color-mix(in srgb, var(--accent) 7%, transparent)
+    color-mix(in srgb, var(--ws, var(--accent)) 17%, var(--bg-alt)) 0%,
+    color-mix(in srgb, var(--ws, var(--accent)) 8%, var(--bg-alt)) 100%
   );
   color: var(--text);
   font-weight: 500;
   box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
-    0 1px 8px -3px color-mix(in srgb, var(--accent) 35%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--accent)) 15%, transparent),
+    0 3px 14px -6px color-mix(in srgb, var(--ws, var(--accent)) 50%, transparent);
 }
 
 /* In light mode --accent-dim (#eaeaea) is nearly identical to the sidebar's
@@ -384,8 +389,8 @@ textarea {
 [data-theme="light"] .chat-item.active {
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--accent) 18%, transparent),
-    color-mix(in srgb, var(--accent) 8%, transparent)
+    color-mix(in srgb, var(--ws, var(--accent)) 11%, var(--bg-alt)) 0%,
+    color-mix(in srgb, var(--ws, var(--accent)) 5%, var(--bg-alt)) 100%
   );
 }
 
@@ -1489,7 +1494,15 @@ textarea {
   width: 100%;
   min-width: 0;
   height: 100%;
-  background: var(--bg-panel);
+  /* Clean, subtle vertical depth — mirrors the sidebar's gradient so the chat
+     surface reads as one continuous surface instead of a flat slab. No radial
+     smudges: just a faint accent tint at the top that fades out within the
+     first ~260px. */
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--accent) 5%, var(--bg-panel)),
+    var(--bg-panel) 260px
+  );
 }
 
 .chat-toolbar {
@@ -1810,6 +1823,30 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 45%;
+}
+
+.summary-head {
+  cursor: pointer;
+  user-select: none;
+}
+
+.summary-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 9px;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+
+.summary-chevron.open {
+  transform: rotate(90deg);
+}
+
+.summary-block.collapsed .summary-head {
+  border-bottom: none;
 }
 
 .summary-body {
@@ -5023,39 +5060,6 @@ textarea {
     0 0 16px -6px color-mix(in srgb, var(--warning, #d7a03c) 40%, transparent);
 }
 
-/* Write/edit cards go full-width so diffs get maximum room. They break out of
-   the message column's max-width and stretch across the whole chat panel,
-   compensating for the (resizable) sidebar via the --sidebar-w CSS variable
-   that Sidebar.tsx keeps in sync while dragging. */
-.tool-card.wide {
-  position: relative;
-  left: 50%;
-  transform: translateX(-50%);
-  width: calc(100vw - var(--sidebar-w, 264px));
-  max-width: none;
-}
-
-.msg-bubble.segmented > .tool-card.wide {
-  margin: 4px 0;
-}
-
-.tool-card.wide .diff-view,
-.tool-card.wide .diff-side {
-  max-height: none;
-  font-size: clamp(11px, 1.05vw, 12.5px);
-}
-
-/* Narrow windows: the full-bleed trick can overflow the scroll area, so fall
-   back to the normal column width. */
-@media (max-width: 1100px) {
-  .tool-card.wide {
-    position: static;
-    left: auto;
-    transform: none;
-    width: 100%;
-  }
-}
-
 .tool-card-head {
   display: flex;
   align-items: center;
@@ -5282,18 +5286,45 @@ textarea {
     0 1px 2px rgba(0, 0, 0, 0.12);
 }
 
-.tool-args {
+/* Remaining tool args rendered as inline key:value chips in the card head —
+   clean and readable, never a raw JSON blob. */
+.tool-card-head .tool-args {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0 10px;
   margin: 0;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
-  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
-  border-radius: 8px;
-  padding: 7px 9px;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.tool-card-head .tool-arg {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tool-card-head .tool-arg-key {
+  color: var(--accent);
+  opacity: 0.85;
+  flex: 0 0 auto;
+}
+
+.tool-card-head .tool-arg-key::after {
+  content: ':';
+}
+
+.tool-card-head .tool-arg-val {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
 }
 
 .tool-summary {

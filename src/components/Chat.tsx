@@ -980,6 +980,37 @@ export function ChatPanel() {
       } else if (event.kind === "subagent_models") {
         // Debug-only routing info. Deliberately NOT rendered into the chat —
         // the user asked for subagent model lists to stay out of the message.
+        //
+        // It IS used for one thing: registering each subagent's ACTUAL model
+        // into recentModels, mirroring the addRecentModel call the parent
+        // turn makes above. Sidebar's "Model usage" panel groups usage by
+        // provider using recentModels as its STRONGEST signal — without
+        // this, a subagent running a different model than the parent's
+        // configured one (explore auto-picks a cheaper model; a manually
+        // configured subagent can route through an entirely different
+        // provider) has nothing but a weak bare-name match to go on, and can
+        // land under the WRONG provider's group whenever two providers
+        // happen to list a model with the same last path segment (e.g. the
+        // opencode gateway mirrors nearly every model).
+        const models = event.models ?? {};
+        for (const [agent, ranModel] of Object.entries(models)) {
+          // A failed subagent build is reported as "entry ⚠ build failed →
+          // parent" (see agents.py:_routing_label) — not a real model id.
+          if (!ranModel || ranModel.includes("⚠")) continue;
+          const entry = (store.subagentModels?.[agent] || "").trim();
+          // A subagent entry may be "providerId/model", routing it through a
+          // DIFFERENT provider than the parent (mirrors the backend's own
+          // _resolve_subagent parsing). A bare entry — or no entry at all,
+          // i.e. explore's auto-pick — runs on the parent's own provider.
+          const slash = entry.indexOf("/");
+          const prefix = slash > 0 ? entry.slice(0, slash) : "";
+          const explicitProvider = prefix
+            ? store.settings.providers.find(
+                (p) => p.id === prefix || p.kind === prefix,
+              )
+            : undefined;
+          store.addRecentModel(ranModel, explicitProvider?.id ?? activeProvider.id);
+        }
       } else if (event.kind === "tool") {
         toolRunningRef.current = true;
         const act: ToolActivity = {
@@ -1389,54 +1420,126 @@ export function ChatPanel() {
       "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
       "conversation is in another language (e.g. Persian/Farsi), under 150 words, no preamble.\n\n" +
       transcript;
-    let summary = "";
-    let failed = false;
-    let failReason = "";
-    // Run the summarizer as a minimal READ-ONLY request: no tools (every cap
-    // false), no MCP servers, no skills, and the "ask" base prompt. This stops
-    // the summarizer from being hijacked into tool loops or plan output, which
-    // made /compact hang or return non-summary text in coder/plan mode.
-    const ctr = new AbortController();
-    const timeout = setTimeout(() => ctr.abort(), 60_000);
-    try {
-      await streamChat(
-        {
-          provider: getActiveProvider(),
-          root: rootDir,
-          mode: "ask",
-          prompt,
-          history: [],
-          maxHistory: 0,
-          systemPrompt: "",
-          cap: {
-            readFiles: false,
-            writeFiles: false,
-            runTerminal: false,
-            web: false,
-          },
-          mcpServers: {},
-          skills: [],
-          autoSkills: false,
-          signal: ctr.signal,
-        },
-        (ev) => {
-          if (ev.kind === "text") summary += ev.content ?? "";
-          else if (ev.kind === "error") {
-            failed = true;
-            failReason = ev.content ?? "unknown error";
-          }
-        },
-      );
-    } catch (err) {
-      failed = true;
-      failReason =
-        (err as Error).name === "AbortError"
-          ? "timed out after 60s"
-          : (err as Error).message;
-    } finally {
-      clearTimeout(timeout);
-      setBusy(false);
+    // Route through the user's configured "compact" subagent model (Settings →
+    // Subagents) when set, instead of always the chat's active provider/model.
+    // An entry may be "providerId/model" to run on a DIFFERENT provider than
+    // the parent (mirrors the backend's own _resolve_subagent parsing, and the
+    // subagent_models handling above in handleEvent). A bare entry — or none —
+    // runs on the active provider, same as before.
+    const activeProvider = getActiveProvider();
+    const compactEntry = (s.subagentModels?.compact || "").trim();
+    let compactProvider = activeProvider;
+    if (compactEntry) {
+      const slash = compactEntry.indexOf("/");
+      const prefix = slash > 0 ? compactEntry.slice(0, slash) : "";
+      const modelName = slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
+      const explicitProvider = prefix
+        ? s.settings.providers.find((p) => p.id === prefix || p.kind === prefix)
+        : undefined;
+      compactProvider = { ...(explicitProvider ?? compactProvider), model: modelName };
     }
+    // True only when the compact call will actually run on a DIFFERENT
+    // provider/model than the active one — used below to decide whether a
+    // failure is worth retrying on the active model.
+    const usedSubagent =
+      compactEntry.length > 0 &&
+      (compactProvider.id !== activeProvider.id ||
+        compactProvider.model !== activeProvider.model);
+
+    // Run the summarizer as a minimal READ-ONLY request against `providerToUse`:
+    // no tools (every cap false), no MCP servers, no skills, and the "ask" base
+    // prompt. This stops the summarizer from being hijacked into tool loops or
+    // plan output, which made /compact hang or return non-summary text in
+    // coder/plan mode.
+    const runSummarizer = async (
+      providerToUse: typeof activeProvider,
+    ): Promise<{ summary: string; failed: boolean; failReason: string }> => {
+      let summary = "";
+      let failed = false;
+      let failReason = "";
+      const ctr = new AbortController();
+      const timeout = setTimeout(() => ctr.abort(), 60_000);
+      try {
+        await streamChat(
+          {
+            provider: providerToUse,
+            root: rootDir,
+            mode: "ask",
+            prompt,
+            history: [],
+            maxHistory: 0,
+            systemPrompt: "",
+            cap: {
+              readFiles: false,
+              writeFiles: false,
+              runTerminal: false,
+              web: false,
+            },
+            mcpServers: {},
+            skills: [],
+            autoSkills: false,
+            signal: ctr.signal,
+          },
+          (ev) => {
+            if (ev.kind === "text") summary += ev.content ?? "";
+            else if (ev.kind === "error") {
+              failed = true;
+              failReason = ev.content ?? "unknown error";
+            } else if (ev.kind === "usage") {
+              // Manual /compact is a real model call too — accrue its tokens into
+              // the chat's cumulative usage so it shows up in Model usage. This
+              // event kind used to be silently dropped here (handler only looked
+              // at text/error), which is why compact's usage never appeared.
+              if (ev.unbilled) return;
+              const inputTokens = ev.input_tokens ?? 0;
+              const outputTokens = ev.output_tokens ?? 0;
+              if (inputTokens <= 0 && outputTokens <= 0) return;
+              const usageModel =
+                (ev.model || "").trim() || providerToUse.model || "main";
+              useStore.getState().accrueChatUsage(ch.id, usageModel, {
+                input: inputTokens,
+                output: outputTokens,
+                cacheRead: ev.cache_read_tokens ?? 0,
+                cacheWrite: ev.cache_write_tokens ?? 0,
+              });
+            }
+          },
+        );
+      } catch (err) {
+        failed = true;
+        failReason =
+          (err as Error).name === "AbortError"
+            ? "timed out after 60s"
+            : (err as Error).message;
+      } finally {
+        clearTimeout(timeout);
+      }
+      return { summary, failed, failReason };
+    };
+
+    let { summary, failed, failReason } = await runSummarizer(compactProvider);
+    // The configured compact subagent failed (bad model id/key, provider down,
+    // rate limit, etc.) — fall back to the chat's active model once, mirroring
+    // the backend's own subagent-build fallback used for AUTO-compact. Without
+    // this, picking a broken subagent model would silently break manual
+    // /compact instead of degrading to the model that was already working.
+    if (failed && usedSubagent) {
+      const fb = await runSummarizer(activeProvider);
+      if (!fb.failed && fb.summary.trim()) {
+        summary = fb.summary;
+        failed = false;
+        failReason = "";
+      } else {
+        failReason =
+          `compact subagent failed (${failReason || "unknown error"}); ` +
+          `fallback to active model also failed (${fb.failReason || "empty summary"})`;
+        failed = true;
+      }
+    }
+    setBusy(false);
+    // A compact call just completed → usage may have changed. Refresh the
+    // balance chip now, same as a normal turn does.
+    setBalanceTick((t) => t + 1);
     // A summarizer that errored or returned nothing at all is a failed compact
     // — do NOT collapse the real messages behind a fake "(compact failed)"
     // summary. Leave the chat untouched and let the user retry manually.

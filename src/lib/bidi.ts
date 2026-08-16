@@ -78,6 +78,17 @@ const MARKDOWN_BLOCK_START =
 // parens/arrows pinned LTR while never touching markdown delimiters.
 const HAS_STRONG = /[\p{L}\p{N}]/u
 
+// Mirrored bracket characters ( ) [ ] { } need isolation purely because of
+// their MIRRORING behavior, independent of whether the run also has a
+// "strong" letter/digit. A lone ")" (e.g. closing the paren opened by a
+// PREVIOUS isolated run like "grep_tool (") has no strong char, so it used to
+// hit EXCEPTION 2 and stay unwrapped — leaving it in raw RTL context while its
+// matching "(" sits inside a forced-LTR isolate. That mismatch is exactly what
+// renders as a reversed/mirrored paren. Square/curly brackets are included for
+// the same mirroring reason; "]" alone as markdown link syntax is rare enough,
+// and still-unwrapped "**"/"`"/"—"/"؟" etc. (no bracket char) are unaffected.
+const HAS_MIRRORED_BRACKET = /[()[\]{}]/
+
 export function fixMixedText(text: string): string {
   return text.replace(NON_PERSIAN_RUN, (m, offset) => {
     if (!/\S/.test(m)) return m // pure whitespace - nothing to isolate
@@ -86,7 +97,7 @@ export function fixMixedText(text: string): string {
     while (i >= 0 && (text[i] === ' ' || text[i] === '\t')) i--
     const atLineStart = i < 0 || text[i] === '\n'
     if (atLineStart && MARKDOWN_BLOCK_START.test(m)) return m
-    if (!HAS_STRONG.test(m)) return m
+    if (!HAS_STRONG.test(m) && !HAS_MIRRORED_BRACKET.test(m)) return m
     return "\u2066" + m + "\u2069"
   })
 }

@@ -2567,6 +2567,25 @@ def _history_budget(ctx: int, system_text: str, scouted: str, mode: str = "ask")
     return budget
 
 
+def _is_output_budget_exhausted(exc: BaseException) -> bool:
+    """True for pydantic-ai's specific "the model burned its entire per-request
+    `max_tokens` output budget on invisible reasoning/thinking tokens and
+    produced no visible reply" error.
+
+    This is DELIBERATELY checked separately from `_is_context_overflow`: that
+    function's heuristic ("token" + "limit"/"exceed") also matches this
+    message's wording, but the two are not the same failure. A context
+    overflow means the request's INPUT was too big — compacting history
+    genuinely frees room and fixes it. This error means the input was FINE;
+    the model simply spent its whole OUTPUT budget on reasoning before saying
+    anything. Compacting history does nothing for that (the retried request
+    hits the exact same empty-output wall), so callers must not route this
+    into the auto-compact branch — see the dedicated handling in the retry
+    loop, which instead turns reasoning down.
+    """
+    return "exceeded before any response was generated" in str(exc).lower()
+
+
 def _is_context_overflow(exc: BaseException) -> bool:
     """Best-effort detection of a "context window is full" model error.
 
@@ -2757,8 +2776,11 @@ async def _compact_history(
 
     The number of recent turns kept verbatim scales with the client's
     "Messages to remember" (``max_history``) so more recent work survives a
-    compact — but it is capped at half the history (and floored at 8) so a
-    compact always frees real space instead of becoming a no-op.
+    compact. It is capped at half the history so a compact always frees real
+    space instead of becoming a no-op, and that cap has a floor of 8 turns —
+    but ``max_history`` is always the hard ceiling on top of that: if the
+    client's own limit is below 8 (e.g. local providers default to
+    ``LOCAL_MAX_HISTORY=3``), the final kept count is ``max_history``, not 8.
 
     Returns a tuple ``(new_history, recent_kept)`` — ``recent_kept`` is the exact
     number of recent turns preserved verbatim after the summary, so the caller
@@ -4709,6 +4731,11 @@ async def run_agent(
     # `retry_giveup` and stops, so the user can retry manually instead of the
     # app hammering the gateway forever.
     throttle_retries = 0
+    # How many times the empty-output-from-exhausted-budget branch (see
+    # `_is_output_budget_exhausted`) has fired — capped at 1 so a model that
+    # STILL produces nothing after reasoning is turned down fails loudly
+    # instead of retrying the identical request forever.
+    output_budget_retries = 0
     # How many times the end-of-run continuation branch has fired. A provider can
     # finish the stream CLEANLY yet still end the reply mid-word (e.g. a quiet
     # `finish_reason='length'`). We issue ONE bounded follow-up that completes
@@ -5062,6 +5089,53 @@ async def run_agent(
                         "already made changes, so it can't safely auto-retry. "
                         "Wait a moment, then tap Retry to continue from where it "
                         "left off."
+                    ),
+                }
+                return
+            # A model that burned its ENTIRE per-request max_tokens output
+            # budget on invisible reasoning/thinking tokens and produced NO
+            # visible reply surfaces as pydantic-ai's empty-output error. That
+            # wording also contains token + limit/exceed, so _is_context_overflow
+            # below would misclassify it as an input overflow and route it into
+            # auto-compact, which trims HISTORY and does nothing to fix an
+            # OUTPUT-side budget problem, so the retried request hits the exact
+            # same empty-output wall and loops. Handle it here, BEFORE that
+            # misclassification can happen: the established fix in this
+            # codebase for a reasoning model flooding a small budget with
+            # thinking tokens is to turn thinking down - try that once.
+            if (
+                _is_output_budget_exhausted(exc)
+                and not mutating_ran
+                and output_budget_retries < 1
+            ):
+                output_budget_retries += 1
+                if agent_settings.get("thinking") not in (False, None):
+                    agent_settings["thinking"] = False
+                    try:
+                        await asyncio.to_thread(
+                            _append_app_log,
+                            f"[output-budget] {exc!r} - disabling thinking and retrying\n",
+                        )
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    yield _retry_ev(
+                        "retry",
+                        attempt=output_budget_retries,
+                        max_attempts=1,
+                        delay=0,
+                        reason=(
+                            "The model used its whole reply budget on internal "
+                            "reasoning and produced no answer - retrying with "
+                            "reasoning turned down..."
+                        ),
+                    )
+                    continue
+                yield {
+                    "kind": "error",
+                    "content": (
+                        "این مدل قبل از تولید هیچ پاسخی به سقف توکن خروجی رسید و متوقف شد, حتی بعد از خاموش کردن Thinking. "
+                        "از تنظیمات این Provider, Thinking level را روی None بذارید (اگر روی Auto بود), یا مدل "
+                        "دیگری انتخاب کنید - این مدل سقف خروجی خیلی کوچکی دارد (4096 توکن)."
                     ),
                 }
                 return
@@ -5453,7 +5527,14 @@ async def run_agent(
                 if compacted is not None:
                     if isinstance(compacted, tuple):
                         compacted = compacted[0]
-                    yield {"kind": "compact", "content": ""}
+                    yield {
+                        "kind": "compact",
+                        "content": "",
+                        "model": str(
+                            getattr(compact_model or model, "model_name", "")
+                            or model_name
+                        ),
+                    }
                     history = compacted
                     history_messages = _to_model_messages(history)
                     resume_note = _build_resume_note(turn_tool_log)

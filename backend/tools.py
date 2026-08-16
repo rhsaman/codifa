@@ -2768,8 +2768,79 @@ def make_tool_callbacks(
             if len(matches) > shown
             else ""
         )
+        raw = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        # When a dedicated "search" subagent model is configured, pass the raw
+        # matches through the search subagent so it does the interpretation work
+        # (and its tokens are accounted to the search model), instead of the
+        # parent model reading the raw matches directly. On a hard sub-agent
+        # failure the call falls back to the MAIN model (see _run_distill) —
+        # the raw matches are only returned when BOTH models fail.
+        _search_runner = main_model if _fallback_state.get("search") else search_model
+        # NOTE: no `not _fallback_state` guard here — _run_distill itself picks
+        # the main model once the slot has fallen back (sticky), so a later
+        # grep in the same turn still gets distilled (by the main model) instead
+        # of dumping raw matches into the parent context.
+        if _search_runner is not None:
+            try:
+                from pydantic_ai import Agent as _SA
+                from pydantic_ai.settings import ModelSettings as _SMS
+
+                res, ran_model = await _run_distill(
+                    "search",
+                    _search_runner,
+                    "search distiller",
+                    lambda m: _SA(
+                        m,
+                        system_prompt=(
+                            "You are a code-search reader. A regex search of the "
+                            "codebase produced the raw matches below. Distill them "
+                            "into a CONCISE answer (under ~150 words): what was found, "
+                            "exact file paths and line numbers, and a one-line note on "
+                            "the most relevant match. Do not restate the whole raw output."
+                        ),
+                        model_settings=_SMS(temperature=0.2, max_tokens=400),
+                    ),
+                    lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
+                    timeout_total=60,
+                )
+                distilled = str(getattr(res, "output", "") or "").strip()
+                if distilled:
+                    from agents import _usage_event  # local import (circular-safe)
+
+                    _usage_ev = _usage_event(
+                        getattr(res, "usage", None),
+                        model=str(getattr(ran_model, "model_name", "") or ""),
+                    )
+                    if _usage_ev:
+                        emit(_usage_ev)
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "grep",
+                        "summary": f"{len(matches)} matches (distilled)",
+                        "model": str(getattr(ran_model, "model_name", "") or ""),
+                    })
+                    return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+            except Exception as exc:  # noqa: BLE001 — fall back to raw output
+                _ran_name = str(
+                    getattr(
+                        main_model if _fallback_state.get("search") else search_model,
+                        "model_name",
+                        "",
+                    )
+                    or ""
+                )
+                _search_note = _subagent_fail_note("search", _ran_name, exc)
+                if _search_note:
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "grep",
+                        "summary": "search subagent failed — raw matches below",
+                        "status": "error",
+                        "model": _ran_name,
+                    })
+                    return f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n" + "\n".join(lines)
         emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches", "model": _search_runner_name})
-        return f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations."""
@@ -2899,8 +2970,79 @@ def make_tool_callbacks(
             return f"No files match {pattern!r} under {path or '/'}."
         lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
+        raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        # When a dedicated "search" subagent model is configured, pass the raw
+        # matches through the search subagent so it does the interpretation work
+        # (and its tokens are accounted to the search model), instead of the
+        # parent model reading the raw matches directly. On a hard sub-agent
+        # failure the call falls back to the MAIN model (see _run_distill) —
+        # the raw matches are only returned when BOTH models fail.
+        _search_runner = main_model if _fallback_state.get("search") else search_model
+        # NOTE: no `not _fallback_state` guard here — _run_distill itself picks
+        # the main model once the slot has fallen back (sticky), so a later
+        # glob in the same turn still gets distilled (by the main model) instead
+        # of dumping raw matches into the parent context.
+        if _search_runner is not None:
+            try:
+                from pydantic_ai import Agent as _SA
+                from pydantic_ai.settings import ModelSettings as _SMS
+
+                res, ran_model = await _run_distill(
+                    "search",
+                    _search_runner,
+                    "search distiller",
+                    lambda m: _SA(
+                        m,
+                        system_prompt=(
+                            "You are a code-search reader. A glob search of the "
+                            "codebase produced the raw file matches below. Distill them "
+                            "into a CONCISE answer (under ~150 words): what files were found, "
+                            "exact file paths, and a one-line note on the most relevant match. "
+                            "Do not restate the whole raw output."
+                        ),
+                        model_settings=_SMS(temperature=0.2, max_tokens=400),
+                    ),
+                    lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
+                    timeout_total=60,
+                )
+                distilled = str(getattr(res, "output", "") or "").strip()
+                if distilled:
+                    from agents import _usage_event  # local import (circular-safe)
+
+                    _usage_ev = _usage_event(
+                        getattr(res, "usage", None),
+                        model=str(getattr(ran_model, "model_name", "") or ""),
+                    )
+                    if _usage_ev:
+                        emit(_usage_ev)
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "glob",
+                        "summary": f"{len(matches)} matches (distilled)",
+                        "model": str(getattr(ran_model, "model_name", "") or ""),
+                    })
+                    return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+            except Exception as exc:  # noqa: BLE001 — fall back to raw output
+                _ran_name = str(
+                    getattr(
+                        main_model if _fallback_state.get("search") else search_model,
+                        "model_name",
+                        "",
+                    )
+                    or ""
+                )
+                _search_note = _subagent_fail_note("search", _ran_name, exc)
+                if _search_note:
+                    emit({
+                        "kind": "tool_result",
+                        "tool": "glob",
+                        "summary": "search subagent failed — raw matches below",
+                        "status": "error",
+                        "model": _ran_name,
+                    })
+                    return f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n" + "\n".join(lines)
         emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches", "model": _search_runner_name})
-        return f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        return raw
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery."""
@@ -2916,7 +3058,76 @@ def make_tool_callbacks(
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
-            return await _read_dir_tool(target, filePath, offset, limit, _search_runner_name)
+            raw = await _read_dir_tool(target, filePath, offset, limit, _search_runner_name)
+            # When a dedicated "search" subagent model is configured, pass the raw
+            # directory listing through the search subagent so it does the interpretation work
+            # (and its tokens are accounted to the search model). On a hard sub-agent
+            # failure the call falls back to the MAIN model (see _run_distill).
+            _search_runner = main_model if _fallback_state.get("search") else search_model
+            # NOTE: no `not _fallback_state` guard here — _run_distill itself
+            # picks the main model once the slot has fallen back (sticky), so a
+            # later directory read in the same turn still gets distilled (by the
+            # main model) instead of dumping raw entries into the parent context.
+            if _search_runner is not None:
+                try:
+                    from pydantic_ai import Agent as _SA
+                    from pydantic_ai.settings import ModelSettings as _SMS
+
+                    res, ran_model = await _run_distill(
+                        "search",
+                        _search_runner,
+                        "search distiller",
+                        lambda m: _SA(
+                            m,
+                            system_prompt=(
+                                "You are a code-search reader. A directory listing of the "
+                                "codebase produced the raw entries below. Distill them "
+                                "into a CONCISE answer (under ~150 words): what files/directories "
+                                "were found, and a one-line note on the most relevant entries. "
+                                "Do not restate the whole raw output."
+                            ),
+                            model_settings=_SMS(temperature=0.2, max_tokens=400),
+                        ),
+                        lambda: f"DIRECTORY: {filePath}\n\nENTRIES:\n" + raw.split("\n", 1)[1] if "\n" in raw else raw,
+                        timeout_total=60,
+                    )
+                    distilled = str(getattr(res, "output", "") or "").strip()
+                    if distilled:
+                        from agents import _usage_event  # local import (circular-safe)
+
+                        _usage_ev = _usage_event(
+                            getattr(res, "usage", None),
+                            model=str(getattr(ran_model, "model_name", "") or ""),
+                        )
+                        if _usage_ev:
+                            emit(_usage_ev)
+                        emit({
+                            "kind": "tool_result",
+                            "tool": "read",
+                            "summary": f"directory distilled · {len(distilled)} chars",
+                            "model": str(getattr(ran_model, "model_name", "") or ""),
+                        })
+                        return f"DIRECTORY {filePath} (distilled)\n{distilled}"
+                except Exception as exc:  # noqa: BLE001 — fall back to raw output
+                    _ran_name = str(
+                        getattr(
+                            main_model if _fallback_state.get("search") else search_model,
+                            "model_name",
+                            "",
+                        )
+                        or ""
+                    )
+                    _search_note = _subagent_fail_note("search", _ran_name, exc)
+                    if _search_note:
+                        emit({
+                            "kind": "tool_result",
+                            "tool": "read",
+                            "summary": "search subagent failed — raw listing below",
+                            "status": "error",
+                            "model": _ran_name,
+                        })
+                        return f"DIRECTORY {filePath}\n{_search_note}\n" + raw.split("\n", 1)[1] if "\n" in raw else raw
+            return raw
         if not os.path.exists(target):
             msg = "file not found"
             emit(_error_result("read", msg))

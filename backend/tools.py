@@ -88,56 +88,86 @@ async def _run_subagent_call(
     emit: Callable[[dict], None] | None = None,
     model_name: str = "",
 ) -> Any:
-    """Run a sub-agent model call (``factory`` → coroutine) with the shared
-    retry policy: on a transient throttle / retryable error / empty-output
-    error, retry every 30s up to 10 attempts. A hard quota exhaustion or any
-    non-retryable failure (bad key, invalid model) is re-raised immediately so
-    the caller's existing fallback handles it.
-
-    When ``emit`` is provided, each retry is surfaced as a ``retry`` event so
-    the UI shows the sub-agent is retrying (instead of a frozen tool card for
-    up to 5 minutes of silent backoff). Returns the coroutine's result.
+    """Run a sub-agent model call (``factory`` → coroutine) exactly ONCE with
+    NO retry backoff: a transient throttle, retryable, or empty-output error
+    propagates immediately so the caller's per-call fallback handles it FAST.
+    The old 30s x 10 retry policy (up to 5 minutes of silent backoff per call)
+    is what made an explore run feel like it searched for half an hour.
+    Resilience is instead provided per-call by the callers: the explore
+    sub-agent's _PerStepFallbackModel (per-sub-search fallback to the main
+    model) and _run_distill's main-model fallback. Returns the coroutine's
+    result.
     """
-    from agents import (
-        _is_empty_output_error,
-        _is_quota_exhausted,
-        _is_retryable,
-        _is_transient_throttle,
-    )
+    # NO RETRY: a transient throttle, retryable, or empty-output error
+    # propagates immediately so the caller's per-call fallback handles it fast.
+    # The old 30s x 10 backoff (up to 5 minutes of silent stalling per call) is
+    # what made an explore run feel like it searched for half an hour.
+    return await factory()
 
-    attempt = 0
-    while True:
+
+class _PerStepFallbackModel:
+    """A pydantic-ai model wrapper that gives the EXPLORE sub-agent PER-SUB-SEARCH
+    fallback: EVERY model request first tries the primary (sub-agent) model; if
+    that request fails, the SAME request re-runs on the fallback (main) model.
+    Non-sticky — the NEXT request goes back to the primary, so a failing
+    grep/read/glob step falls back individually instead of flipping the whole
+    explore run (or the whole turn) onto the main model.
+
+    ``on_fallback(exc)`` fires when a request moves to the fallback model;
+    ``on_primary()`` fires when a request succeeds on the primary model — the
+    explore tool uses these to label each sub-search's events with the model
+    that ACTUALLY ran. Every other attribute delegates to the primary model so
+    pydantic-ai treats the wrapper like the real model it wraps.
+    """
+
+    def __init__(
+        self,
+        primary: Any,
+        fallback: Any,
+        on_fallback: Callable[[Exception], None] | None = None,
+        on_primary: Callable[[], None] | None = None,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._on_fallback = on_fallback
+        self._on_primary = on_primary
+
+    @property
+    def model_name(self) -> str:
+        return str(getattr(self._primary, "model_name", "") or "")
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate every other attribute (part types, provider, client, ...)
+        # to the primary model so pydantic-ai treats the wrapper like the real
+        # model it wraps. object.__getattribute__ avoids recursion if the
+        # attribute is looked up before __init__ finished assigning _primary.
+        return getattr(object.__getattribute__(self, "_primary"), name)
+
+    async def request(self, messages: list[Any], *, model_settings: Any = None, **kwargs: Any) -> Any:
         try:
-            return await factory()
-        except Exception as exc:
-            retryable = (
-                _is_transient_throttle(exc)
-                or _is_retryable(exc)
-                or _is_empty_output_error(exc)
+            response = await self._primary.request(
+                messages, model_settings=model_settings, **kwargs
             )
-            if (
-                _is_quota_exhausted(exc)
-                or not retryable
-                or attempt >= _SUBAGENT_MAX_ATTEMPTS
-            ):
-                raise
-            attempt += 1
-            if emit is not None:
+            if self._on_primary is not None:
                 try:
-                    emit(
-                        {
-                            "kind": "retry",
-                            "attempt": attempt,
-                            "max_attempts": _SUBAGENT_MAX_ATTEMPTS + 1,
-                            "delay": _SUBAGENT_RETRY_SECONDS,
-                            "reason": f"{label} hit a transient error — retrying",
-                            "model": model_name,
-                            "agent": label,
-                        }
-                    )
+                    self._on_primary()
                 except Exception:  # noqa: BLE001, S110 — cosmetic only
                     pass
-            await asyncio.sleep(_SUBAGENT_RETRY_SECONDS)
+            return response
+        except Exception as exc:
+            if self._on_fallback is not None:
+                try:
+                    self._on_fallback(exc)
+                except Exception:  # noqa: BLE001, S110 — cosmetic only
+                    pass
+            return await self._fallback.request(
+                messages, model_settings=model_settings, **kwargs
+            )
+
+    # request_stream is intentionally NOT defined here: the sub-agents run
+    # non-streaming, so __getattr__ delegates it to the primary model as-is
+    # (a streaming fallback would need an async-context-manager dance that
+    # the sub-agents never exercise).
 
 
 def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
@@ -3167,11 +3197,14 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries", "model": _model})
         return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
-    async def explore_tool(task: str, path_hint: str = "", hints: str = "") -> str:
-        """Delegate a broad, read-only investigation to an ISOLATED sub-agent (its own search loop/context; only its short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components') and `hints` (known symbols/files). Not for a single lookup — search yourself."""
-        # The model that will run this explore call: the explore sub-agent, or
-        # the MAIN model once this slot has fallen back earlier in the turn.
-        _run_model = main_model if _fallback_state.get("explore") else explore_model
+    async def explore_tool(task: str, path_hint: str = "", hints: str = "", subtasks: list[str] | None = None) -> str:
+        """Delegate a broad, read-only investigation to ISOLATED sub-agents that run IN PARALLEL (each has its own search loop/context; only short reports reach you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. For a broad investigation, pass 3+ `subtasks` (one per sub-area) — they run SIMULTANEOUSLY as separate sub-agents, so the whole search finishes in one parallel round instead of N sequential ones. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components'), `hints` (known symbols/files), and `subtasks` (list of specific sub-questions to explore in parallel). Not for a single lookup — search yourself."""
+        # The model that will run this explore call: ALWAYS the explore
+        # sub-agent. Per-sub-search fallback to the MAIN model happens INSIDE
+        # _run_explore (the _PerStepFallbackModel wrapper), so a failed search
+        # never flips the whole explore — or the rest of the turn — onto the
+        # main model (non-sticky).
+        _run_model = explore_model
         _run_model_name = str(getattr(_run_model, "model_name", "") or "")
         emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _run_model_name})
         if explore_model is None:
@@ -3517,13 +3550,18 @@ def make_tool_callbacks(
 
         from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
 
-        async def _run_explore(model: Any) -> str:
-            """Run the isolated exploration sub-agent on ``model`` and return its
-            report. Reuses the dedup caches so a fresh model (a fallback) continues
-            from the failed attempt's findings instead of re-exploring from zero.
-            Raises ``_UsageLimitExceeded`` (step budget — NOT a model failure, so
-            no fallback) or the underlying exception (hard failure) for the caller
-            to decide on falling back to the main model."""
+        async def _run_explore(model: Any, task_text: str) -> str:
+            """Run the isolated exploration sub-agent on ``model`` with the given
+            task text (path_hint/hints already prepended by the caller) and return
+            its report. The model is wrapped in a _PerStepFallbackModel, so every
+            individual grep/read/glob request first tries the sub-agent model and,
+            on a failure, re-runs THAT request on the MAIN model — the next
+            sub-search goes back to the sub-agent model (non-sticky per-sub-search
+            fallback instead of flipping the whole explore). Reuses the dedup
+            caches so a resumed run continues from the failed attempt's findings
+            instead of re-exploring from zero. Raises ``_UsageLimitExceeded``
+            (step budget — NOT a model failure, so no fallback) or the underlying
+            exception when BOTH models fail a step."""
             nonlocal _sub_emit_model_name
             _sub_emit_model_name = str(getattr(model, "model_name", "") or "")
             from pydantic_ai import Agent as _Agent
@@ -3537,12 +3575,47 @@ def make_tool_callbacks(
             from pydantic_ai.settings import ModelSettings as _ModelSettings
             from pydantic_ai.usage import UsageLimits as _UsageLimits
 
-            # Prepend path hint and known hints to the task when given.
-            task_text = task
-            if path_hint:
-                task_text = f"Search ONLY within {path_hint}. {task}"
-            if hints:
-                task_text = f"Known hints: {hints}. {task_text}"
+            # PER-SUB-SEARCH FALLBACK (non-sticky): wrap the model so every
+            # individual grep/read/glob request first tries the sub-agent model
+            # and, on a failure, re-runs THAT request on the MAIN model — the
+            # next sub-search goes back to the sub-agent model. The events for
+            # each sub-search are labeled with the model that ACTUALLY ran it.
+            _primary_name = str(getattr(model, "model_name", "") or "")
+            _fallback_model = main_model if main_model is not None else model
+            _fallback_name = str(getattr(_fallback_model, "model_name", "") or "")
+
+            def _on_step_fallback(exc: Exception) -> None:
+                nonlocal _sub_emit_model_name
+                _sub_emit_model_name = _fallback_name
+                try:
+                    emit(
+                        {
+                            "kind": "retry",
+                            "attempt": 1,
+                            "max_attempts": 1,
+                            "delay": 0,
+                            "reason": (
+                                f"explore sub-search failed on the {_primary_name} model — "
+                                f"using the main model ({_fallback_name}) for THIS search only"
+                            ),
+                            "model": _fallback_name,
+                            "agent": "explore sub-agent",
+                            "fallback": True,
+                        }
+                    )
+                except Exception:  # noqa: BLE001, S110 — cosmetic only
+                    pass
+
+            def _on_step_primary() -> None:
+                nonlocal _sub_emit_model_name
+                _sub_emit_model_name = _primary_name
+
+            _run_model_wrapped = _PerStepFallbackModel(
+                model,
+                _fallback_model,
+                on_fallback=_on_step_fallback,
+                on_primary=_on_step_primary,
+            )
             # Cross-call memory: if earlier explore calls this turn already
             # discovered files/areas, feed them to this fresh sub-agent so it
             # builds on that work instead of re-listing/re-searching from zero.
@@ -3620,7 +3693,7 @@ def make_tool_callbacks(
             # up front is what actually saves tokens.
             _sub_prior_note = _sub_resume_note()
             sub_agent = _Agent(
-                model,
+                _run_model_wrapped,
                 system_prompt=(
                     "You are a read-only exploration sub-agent. Your job is to find the "
                     "answer FAST and CHEAPLY and hand back a compact structured report. "
@@ -3699,40 +3772,36 @@ def make_tool_callbacks(
             _sub_res = None
             while True:
                 try:
-                    _sub_res = await _run_subagent_call(
-                        # Bind the loop variables as defaults so each iteration's
-                        # lambda captures ITS OWN values (B023) — the widen-retry
-                        # below reassigns them, and the lambda must not see the
-                        # post-loop values.
-                        lambda _p=_sub_run_prompt, _r=_sub_request_limit, _t=_sub_tool_calls_limit: sub_agent.run(
-                            _p,
-                            # Was request_limit=10/tool_calls_limit=20 — too tight for a
-                            # genuinely broad investigation in a large codebase, so it hit
-                            # UsageLimitExceeded routinely and told the PARENT to split the
-                            # task into more explore calls. Each new explore call spins up a
-                            # FRESH sub-agent with no memory of what the previous attempt
-                            # already found, so that "split it up and retry" pattern was
-                            # paying the full discovery overhead (re-listing/re-searching
-                            # the same areas) two or three times over for one investigation
-                            # — exactly the repeated-tool-call token burn being reported.
-                            # Doubling the budget lets most broad-but-reasonable tasks
-                            # finish in ONE isolated sub-agent run instead. Still bounded,
-                            # so a truly runaway task fails loudly rather than looping
-                            # forever — it just needs a materially bigger task to get there.
-                            usage_limits=_UsageLimits(
-                                request_limit=_r,
-                                tool_calls_limit=_t,
-                            ),
-                            model_settings=_ModelSettings(
-                                timeout=_providers.model_timeout(
-                                    model=model, total=90, connect=10, read=90
-                                ),
-                                parallel_tool_calls=True,
-                            ),
+                    # Direct run, NO _run_subagent_call retry: per-sub-search
+                    # fallback to the main model happens inside the wrapped model
+                    # (_run_model_wrapped), so a failing grep/read/glob step
+                    # re-runs on the main model immediately instead of stalling
+                    # on a 30s x 10 backoff.
+                    _sub_res = await sub_agent.run(
+                        _sub_run_prompt,
+                        # Was request_limit=10/tool_calls_limit=20 — too tight for a
+                        # genuinely broad investigation in a large codebase, so it hit
+                        # UsageLimitExceeded routinely and told the PARENT to split the
+                        # task into more explore calls. Each new explore call spins up a
+                        # FRESH sub-agent with no memory of what the previous attempt
+                        # already found, so that "split it up and retry" pattern was
+                        # paying the full discovery overhead (re-listing/re-searching
+                        # the same areas) two or three times over for one investigation
+                        # — exactly the repeated-tool-call token burn being reported.
+                        # Doubling the budget lets most broad-but-reasonable tasks
+                        # finish in ONE isolated sub-agent run instead. Still bounded,
+                        # so a truly runaway task fails loudly rather than looping
+                        # forever — it just needs a materially bigger task to get there.
+                        usage_limits=_UsageLimits(
+                            request_limit=_sub_request_limit,
+                            tool_calls_limit=_sub_tool_calls_limit,
                         ),
-                        "explore sub-agent",
-                        emit=emit,
-                        model_name=_sub_model_name,
+                        model_settings=_ModelSettings(
+                            timeout=_providers.model_timeout(
+                                model=model, total=90, connect=10, read=90
+                            ),
+                            parallel_tool_calls=True,
+                        ),
                     )
                     break
                 except _UsageLimitExceeded:
@@ -3854,33 +3923,34 @@ def make_tool_callbacks(
                 emit(_usage_ev)
             return report
 
-        # Run the explore sub-agent, falling back to the MAIN model on a hard
-        # failure (bad key / invalid model / quota exhaustion). Step-budget
+        def _build_task_text(t: str) -> str:
+            text = t
+            if path_hint:
+                text = f"Search ONLY within {path_hint}. {text}"
+            if hints:
+                text = f"Known hints: {hints}. {text}"
+            return text
+
+        # Run the explore sub-agent(s). Per-sub-search fallback to the MAIN
+        # model happens INSIDE _run_explore (the _PerStepFallbackModel wrapper),
+        # so a failing grep/read/glob step never flips the whole explore — or
+        # the rest of the turn — onto the main model (non-sticky). Step-budget
         # exhaustion (_UsageLimitExceeded) is deliberately NOT a fallback — it
         # means the task is too broad, not that the model is broken.
-        try:
-            report = await _run_explore(_run_model)
-        except _UsageLimitExceeded:
-            emit(_error_result("explore", "step budget exceeded"))
-            return (
-                f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
-                "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
-                "part yourself with grep/read."
-            )
-        except Exception as exc:  # noqa: BLE001
-            if _run_model is main_model or main_model is None:
-                emit(_error_result("explore", f"failed: {exc}"))
-                return (
-                    f"ERROR: explore sub-agent failed"
-                    f" ({_run_model_name} model, change it in Settings → Subagents): {exc}"
-                )
-            # Hard failure on the explore sub-agent model → re-run on the main
-            # model for the rest of this turn (sticky), reusing the dedup caches
-            # so the fresh model continues from the failed attempt's findings.
-            _fallback_state["explore"] = True
-            _emit_fallback("explore", "explore sub-agent", _run_model, main_model, exc)
+        if subtasks:
+            # PARALLEL FAN-OUT: run 3+ separate sub-agents SIMULTANEOUSLY
+            # (one per sub-area) so a broad investigation finishes in roughly
+            # one round of sub-agent time instead of N sequential ones. Branches
+            # share the turn-level digest + dedup caches, so duplicate searches
+            # across branches still fold together.
+            _branch_texts = [
+                _build_task_text(t) for t in [task, *subtasks] if t and t.strip()
+            ][:5]  # cap: 1 main + up to 4 subtasks
             try:
-                report = await _run_explore(main_model)
+                _reports = await asyncio.gather(
+                    *[_run_explore(_run_model, t) for t in _branch_texts],
+                    return_exceptions=True,
+                )
             except _UsageLimitExceeded:
                 emit(_error_result("explore", "step budget exceeded"))
                 return (
@@ -3888,20 +3958,34 @@ def make_tool_callbacks(
                     "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
                     "part yourself with grep/read."
                 )
-            except Exception as exc2:  # noqa: BLE001
-                _main_name = str(getattr(main_model, "model_name", "") or "")
-                emit(_error_result("explore", f"failed: {exc2}"))
+            _merged: list[str] = []
+            for _t, _r in zip(_branch_texts, _reports):
+                if isinstance(_r, BaseException):
+                    _r = f"ERROR: explore branch failed: {_r}"
+                _merged.append(f"=== {_t[:120]} ===\n{_r}")
+            report = "\n\n".join(_merged)
+        else:
+            try:
+                report = await _run_explore(_run_model, _build_task_text(task))
+            except _UsageLimitExceeded:
+                emit(_error_result("explore", "step budget exceeded"))
+                return (
+                    f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
+                    "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
+                    "part yourself with grep/read."
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Both the sub-agent model AND the main-model fallback failed a
+                # step, or the run failed outside a model request — surface it.
+                emit(_error_result("explore", f"failed: {exc}"))
                 return (
                     f"ERROR: explore sub-agent failed"
-                    f" ({_main_name} model): {exc2}"
+                    f" ({_run_model_name} model, change it in Settings → Subagents): {exc}"
                 )
-            _ran_model = main_model
-        else:
-            _ran_model = _run_model
         if not report:
             emit(_error_result("explore", "no report"))
             return f"The exploration sub-agent found nothing usable for {task!r}."
-        _ran_model_name = str(getattr(_ran_model, "model_name", "") or "")
+        _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
         emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _ran_model_name})
         return f"EXPLORE REPORT for {task!r}\n{report}"
 

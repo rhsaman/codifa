@@ -415,6 +415,9 @@ export function ChatPanel() {
    *  instead of silently collapsing messages behind a broken summary. Cleared
    *  on the next compact attempt (success or failure). */
   const [compactError, setCompactError] = useState<string | null>(null);
+  /** True while a compact (manual /compact or backend auto-compact) is running —
+   *  shows a "compacting…" loading banner under the messages. */
+  const [compacting, setCompacting] = useState(false);
   /** Shown while the tmux-style Ctrl+X prefix is armed (waiting for the next key). */
   const [prefixNotice, setPrefixNotice] = useState<string | null>(null);
   /** Dismissible error banner (e.g. an unknown slash command) shown at the
@@ -1138,6 +1141,10 @@ export function ChatPanel() {
           return a;
         });
         store.updateMessage(assistantMsg.id, { toolActivity: next });
+      } else if (event.kind === "compact_start") {
+        // Backend is auto-compacting (summarizer running) — show the loading
+        // banner under the messages until the compact/compact_failed event lands.
+        setCompacting(true);
       } else if (event.kind === "compact") {
         // Auto-compact: fold the older messages into the summary. The summary
         // is persisted as a system message so the next request still sends it
@@ -1147,6 +1154,7 @@ export function ChatPanel() {
         // the summary mid-stream (previously via scrollIntoView) is exactly
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
+        setCompacting(false);
         const chatId = chat.id;
         if (chatId) {
           // Auto-compact: the backend tells us exactly how many recent turns it
@@ -1161,12 +1169,19 @@ export function ChatPanel() {
             event.content ?? "",
             backendKeep ?? maxHistory,
           );
+          // Auto-compact completed — surface the same confirmation the manual
+          // /compact path shows, so the user knows older messages were folded
+          // into a summary (auto-dismisses after a few seconds).
+          setCompactNotice(
+            "Context compacted — older messages are collapsed above the summary.",
+          );
         }
       } else if (event.kind === "compact_failed") {
         // Auto-compact failed — the backend did NOT drop any messages. Surface
         // the retry banner so the user can compact manually (the manual path
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
+        setCompacting(false);
         setCompactError(
           event.reason || "Automatic compaction failed — nothing was deleted.",
         );
@@ -1381,6 +1396,7 @@ export function ChatPanel() {
       toolRunningRef.current = false;
       setStalled(false);
       setBusy(false);
+      setCompacting(false);
       useStore.getState().setChatPendingAsk(chat.id, null);
       useStore.getState().setChatPendingPermission(chat.id, null);
       resolveStuckCards();
@@ -1438,6 +1454,7 @@ export function ChatPanel() {
     const rootDir = ch.root || s.root;
     setBusy(true);
     setCompactError(null);
+    setCompacting(true);
     const prompt =
       "Summarize the following conversation into concise notes for continued work. " +
       "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
@@ -1560,6 +1577,7 @@ export function ChatPanel() {
       }
     }
     setBusy(false);
+    setCompacting(false);
     // A compact call just completed → usage may have changed. Refresh the
     // balance chip now, same as a normal turn does.
     setBalanceTick((t) => t + 1);
@@ -2291,8 +2309,18 @@ export function ChatPanel() {
               onCancel={stop}
             />
           )}
-          {(cmdError || compactError || compactNotice || prefixNotice) && (
+          {(cmdError || compactError || compactNotice || prefixNotice || compacting) && (
             <div className="chat-notices">
+              {compacting && (
+                <div className="notice-banner notice-loading" dir="ltr">
+                  <span className="notice-icon">
+                    <span className="spinner" />
+                  </span>
+                  <span className="notice-text">
+                    Compacting context — older messages are being summarized…
+                  </span>
+                </div>
+              )}
               {cmdError && (
                 <div className="notice-banner notice-error" dir="ltr">
                   <span className="notice-icon">⚠</span>

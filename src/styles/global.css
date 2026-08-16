@@ -6848,6 +6848,21 @@ textarea {
   background: color-mix(in srgb, #f08c00 14%, transparent);
 }
 
+.notice-loading {
+  border-left-color: var(--accent);
+}
+
+.notice-loading .notice-icon {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.notice-loading .spinner {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+}
+
 .notice-btn {
   flex: 0 0 auto;
   border: none;

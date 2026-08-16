@@ -719,7 +719,28 @@ def _models_dev_provider_key(provider: str, base_url: str = "") -> str:
         for host, key in _GATEWAY_CATALOG_KEYS:
             if host in base_url:
                 return key
+    # Cloudflare's Workers AI models are cataloged under "cloudflare-workers-ai"
+    # in models.dev (there is no "cloudflare" key).
+    if provider == "cloudflare":
+        return "cloudflare-workers-ai"
     return provider
+
+
+def _models_dev_keys(provider: str, base_url: str, model_id: str) -> list[str]:
+    """Catalog keys to try for a model, most specific first.
+
+    The resolved gateway key (opencode, nvidia, cloudflare-workers-ai, ...) is
+    tried first. Router gateways that proxy upstream providers' models
+    (tokenrouter) additionally try the model id's own provider prefix
+    (``openai/gpt-4o`` -> ``openai``), so their models resolve against the
+    upstream provider's catalog entry instead of an empty "tokenrouter" key.
+    """
+    keys = [_models_dev_provider_key(provider, base_url)]
+    if "/" in (model_id or ""):
+        prefix = model_id.split("/", 1)[0]
+        if prefix and prefix not in keys:
+            keys.append(prefix)
+    return keys
 
 
 # Google's REST /v1beta/models list carries the AUTHORITATIVE per-model context
@@ -774,39 +795,76 @@ async def _google_model_limits(
     return (_google_model_cache[1] if _google_model_cache else {}) or {}
 
 
-def _models_dev_entry(catalog: dict, provider_key: str, model_id: str) -> dict:
+def _normalize_catalog_id(model_id: str) -> str:
+    """Normalize a router-gateway model id to the form models.dev catalogs use.
+
+    TokenRouter renames upstream models with dots and speed suffixes
+    (``anthropic/claude-opus-4.7-fast``) while models.dev keys them with dashes
+    (``claude-opus-4-7``). Lowercase, dots → dashes, and strip common speed
+    suffixes so the underlying catalog entry's context/reasoning still applies.
+    Only ever consulted as a FALLBACK (after exact/stripped/alias lookups miss),
+    so a model the catalog knows verbatim is never affected.
+    """
+    mid = (model_id or "").strip().lower()
+    mid = mid.replace(".", "-")
+    for suffix in ("-fast", "-turbo"):
+        if mid.endswith(suffix):
+            mid = mid[: -len(suffix)]
+            break
+    return mid
+
+
+def _models_dev_entry(catalog: dict, provider_keys: list[str], model_id: str) -> dict:
     """Resolve a model's entry in a models.dev catalog.
 
-    Tries the exact ``model_id`` key first, then the id with any
-    ``<provider>/`` prefix stripped (opencode gateways may present ids as
+    Tries each candidate provider key in order (see ``_models_dev_keys``): the
+    exact ``model_id`` key first, then the id with any ``<provider>/`` prefix
+    stripped (opencode gateways may present ids as
     ``opencode/deepseek-v4-flash-free`` while the catalog keys them bare), then
     scans entries whose ``aliases``/``alias`` array (or ``id`` field) matches —
     so a gateway alias resolves to its catalog entry even when the key differs.
+    Finally, router gateways (tokenrouter) that rename upstream models with dots
+    and speed suffixes are matched via ``_normalize_catalog_id`` so their
+    context/reasoning still resolves against the upstream provider's entry.
     """
-    models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
-    entry = models.get(model_id)
-    if isinstance(entry, dict):
-        return entry
-    stripped = model_id.split("/", 1)[-1]
-    if stripped != model_id:
-        entry = models.get(stripped)
+    for provider_key in provider_keys:
+        models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
+        entry = models.get(model_id)
         if isinstance(entry, dict):
             return entry
-    for candidate in models.values():
-        if not isinstance(candidate, dict):
-            continue
-        if candidate.get("id") == stripped:
-            return candidate
-        for alias in candidate.get("aliases") or candidate.get("alias") or []:
-            if alias == model_id or alias == stripped:
+        stripped = model_id.split("/", 1)[-1]
+        if stripped != model_id:
+            entry = models.get(stripped)
+            if isinstance(entry, dict):
+                return entry
+        for candidate in models.values():
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("id") == stripped:
                 return candidate
+            for alias in candidate.get("aliases") or candidate.get("alias") or []:
+                if alias == model_id or alias == stripped:
+                    return candidate
+        norm = _normalize_catalog_id(stripped)
+        if norm and norm != stripped:
+            entry = models.get(norm)
+            if isinstance(entry, dict):
+                return entry
+            for candidate in models.values():
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("id") == norm:
+                    return candidate
+                for alias in candidate.get("aliases") or candidate.get("alias") or []:
+                    if alias == norm:
+                        return candidate
     return {}
 
 
-def _models_dev_context(catalog: dict, provider_key: str, model_id: str) -> int | None:
-    """Look up ``model_id``'s context window under ``provider_key`` in a
+def _models_dev_context(catalog: dict, provider_keys: list[str], model_id: str) -> int | None:
+    """Look up ``model_id``'s context window under ``provider_keys`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    entry = _models_dev_entry(catalog, provider_key, model_id)
+    entry = _models_dev_entry(catalog, provider_keys, model_id)
     ctx = (entry.get("limit") or {}).get("context")
     try:
         return int(ctx) if ctx else None
@@ -814,10 +872,10 @@ def _models_dev_context(catalog: dict, provider_key: str, model_id: str) -> int 
         return None
 
 
-def _models_dev_max_output(catalog: dict, provider_key: str, model_id: str) -> int | None:
-    """Look up ``model_id``'s max output tokens under ``provider_key`` in a
+def _models_dev_max_output(catalog: dict, provider_keys: list[str], model_id: str) -> int | None:
+    """Look up ``model_id``'s max output tokens under ``provider_keys`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    entry = _models_dev_entry(catalog, provider_key, model_id)
+    entry = _models_dev_entry(catalog, provider_keys, model_id)
     out = (entry.get("limit") or {}).get("output")
     try:
         return int(out) if out else None
@@ -825,26 +883,26 @@ def _models_dev_max_output(catalog: dict, provider_key: str, model_id: str) -> i
         return None
 
 
-def _models_dev_reasoning(catalog: dict, provider_key: str, model_id: str) -> bool | None:
-    """Look up ``model_id``'s reasoning-support flag under ``provider_key`` in a
+def _models_dev_reasoning(catalog: dict, provider_keys: list[str], model_id: str) -> bool | None:
+    """Look up ``model_id``'s reasoning-support flag under ``provider_keys`` in a
     models.dev catalog already fetched via ``_models_dev_catalog`` (the catalog's
     top-level ``reasoning`` boolean — the ``limit``-nested variant on older
     snapshots is also accepted — is the authoritative, community-maintained
     source for which models expose a reasoning mode)."""
-    entry = _models_dev_entry(catalog, provider_key, model_id)
+    entry = _models_dev_entry(catalog, provider_keys, model_id)
     reasoning = entry.get("reasoning")
     if not isinstance(reasoning, bool):
         reasoning = (entry.get("limit") or {}).get("reasoning")
     return reasoning if isinstance(reasoning, bool) else None
 
 
-def _models_dev_pricing(catalog: dict, provider_key: str, model_id: str) -> dict | None:
-    """Look up ``model_id``'s USD-per-million-token pricing under ``provider_key``
+def _models_dev_pricing(catalog: dict, provider_keys: list[str], model_id: str) -> dict | None:
+    """Look up ``model_id``'s USD-per-million-token pricing under ``provider_keys``
     in a models.dev catalog (native unit there — ``cost.input`` / ``cost.output``,
     already USD per million tokens, no conversion needed). Cache rates, when the
     catalog advertises them (``cost.cache_read_input`` / ``cost.cache_write_input``),
     are surfaced as ``cacheRead`` / ``cacheWrite`` for the meter."""
-    entry = _models_dev_entry(catalog, provider_key, model_id)
+    entry = _models_dev_entry(catalog, provider_keys, model_id)
     cost = entry.get("cost") or {}
     inp, out = cost.get("input"), cost.get("output")
     if inp is None or out is None:
@@ -1030,11 +1088,10 @@ async def list_models(
                 # are only kept as a fallback when the catalog doesn't know
                 # the model.
                 catalog = await _models_dev_catalog()
-                dev_key = _models_dev_provider_key(provider, base_url)
                 for m in models:
-                    dev_ctx = _models_dev_context(
-                        catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
-                    )
+                    dev_id = _models_dev_id(provider, m["id"], base_url)
+                    dev_keys = _models_dev_keys(provider, base_url, dev_id)
+                    dev_ctx = _models_dev_context(catalog, dev_keys, dev_id)
                     if dev_ctx:
                         m["context"] = dev_ctx
                     elif (
@@ -1043,19 +1100,13 @@ async def list_models(
                         and m["id"].endswith("-free")
                     ):
                         m["context"] = 200_000
-                    dev_out = _models_dev_max_output(
-                        catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
-                    )
+                    dev_out = _models_dev_max_output(catalog, dev_keys, dev_id)
                     if dev_out:
                         m["max_output"] = dev_out
                     if not m.get("pricing"):
-                        m["pricing"] = _models_dev_pricing(
-                            catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
-                        )
+                        m["pricing"] = _models_dev_pricing(catalog, dev_keys, dev_id)
                     if m.get("reasoning") is None:
-                        m["reasoning"] = _models_dev_reasoning(
-                            catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
-                        )
+                        m["reasoning"] = _models_dev_reasoning(catalog, dev_keys, dev_id)
                 if _provider_meta(provider).get("model_class") == "google":
                     # Google's own REST catalog is the authoritative source for
                     # context (inputTokenLimit) / output (outputTokenLimit) —
@@ -1108,9 +1159,8 @@ async def model_context(
     # even when list_models fails (offline / transient). Exact known models
     # only — never a hardcoded map.
     catalog = await _models_dev_catalog()
-    ctx = _models_dev_context(
-        catalog, _models_dev_provider_key(provider, base_url), _models_dev_id(provider, model, base_url)
-    )
+    dev_id = _models_dev_id(provider, model, base_url)
+    ctx = _models_dev_context(catalog, _models_dev_keys(provider, base_url, dev_id), dev_id)
     if ctx:
         return ctx
     if _provider_meta(provider).get("free_ctx_fallback") and model.endswith("-free"):
@@ -1146,10 +1196,9 @@ async def model_max_output(
         return 0
     model = qualify_model_id(provider, model)
     catalog = await _models_dev_catalog()
+    dev_id = _models_dev_id(provider, model, base_url)
     out = _models_dev_max_output(
-        catalog,
-        _models_dev_provider_key(provider, base_url),
-        _models_dev_id(provider, model, base_url),
+        catalog, _models_dev_keys(provider, base_url, dev_id), dev_id
     )
     if out:
         return out

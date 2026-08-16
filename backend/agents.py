@@ -862,10 +862,9 @@ async def _settings_for(
     if is_free and _provider_meta(provider).get("auto_think"):
         try:
             catalog = await _models_dev_catalog()
+            dev_id = _models_dev_id(provider, model)
             supports_reasoning = _models_dev_reasoning(
-                catalog,
-                _models_dev_provider_key(provider, base_url),
-                _models_dev_id(provider, model),
+                catalog, _models_dev_keys(provider, base_url, dev_id), dev_id
             )
         except Exception:  # noqa: BLE001 — catalog failure just means "no auto-inject"
             supports_reasoning = None

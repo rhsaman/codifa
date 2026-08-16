@@ -17,6 +17,8 @@ import {
   formatCost,
   formatTokens,
   formatTokensK,
+  modelContextWindow,
+  modelReasoning,
 } from "../lib/context";
 import {
   addMemoryNote,
@@ -640,13 +642,7 @@ export function ChatPanel() {
     ).slice(0, 10);
   }, [cmdOpen, cmdQuery]);
 
-  const ctxWindow =
-    (provider.contextMap?.[activeModel] &&
-      provider.contextMap[activeModel] > 0 &&
-      provider.contextMap[activeModel]) ||
-    (provider.contextWindow && provider.contextWindow > 0
-      ? provider.contextWindow
-      : null);
+  const ctxWindow = modelContextWindow(provider, activeModel);
 
   const contextUsed = useMemo(() => {
     // Source of truth: the REAL input+output tokens the provider reported for
@@ -1350,7 +1346,7 @@ export function ChatPanel() {
           thinkingLevel: supportsReasoning(
             activeProvider.model,
             activeProvider.kind,
-            activeProvider.reasoningMap?.[activeProvider.model],
+            modelReasoning(activeProvider, activeProvider.model),
           )
             ? thinkingLevel
             : "",
@@ -2936,7 +2932,7 @@ export function ChatPanel() {
                 <span className="skills-toggle-label">Skills</span>
               </button>
               {provider &&
-                (provider.reasoningMap?.[activeModel] ??
+                (modelReasoning(provider, activeModel) ??
                   supportsReasoning(activeModel, provider.kind)) && (
                   <span
                     className={`thinking-pill${thinkingLevel ? " on" : ""}`}

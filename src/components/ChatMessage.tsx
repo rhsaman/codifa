@@ -14,7 +14,7 @@ import type { ChatMessage, ToolActivity } from '../types'
 import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
 import { defaultMaxHistoryFor, useStore } from '../lib/store'
-import { estimateContextTokens } from '../lib/context'
+import { estimateContextTokens, modelContextWindow } from '../lib/context'
 import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
@@ -564,13 +564,7 @@ export const ChatMessageView = memo(function ChatMessageView({
       st.settings.providers.find((p) => p.id === st.settings.activeProviderId) ??
       st.settings.providers[0]
     const maxHistory = provider?.maxHistory ?? defaultMaxHistoryFor(provider?.kind)
-    const ctxWindow =
-      (provider?.contextMap?.[provider.model] &&
-        provider.contextMap[provider.model] > 0 &&
-        provider.contextMap[provider.model]) ||
-      (provider?.contextWindow && provider.contextWindow > 0
-        ? provider.contextWindow
-        : null)
+    const ctxWindow = modelContextWindow(provider, provider?.model ?? '')
     return estimateContextTokens(
       chat,
       st.settings.systemPrompts?.[chat.mode] ?? '',

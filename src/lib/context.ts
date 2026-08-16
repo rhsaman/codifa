@@ -170,6 +170,46 @@ export function contextPercent(used: number, windowSize: number | null): number 
   return Math.min(100, Math.round((used / windowSize) * 100))
 }
 
+/** Resolve a model's context window from the provider's contextMap, trying
+ *  both the bare id (what the picker stores) and the provider-prefixed id
+ *  (NVIDIA's /models returns "nvidia/<model>" while the picker stores the
+ *  bare form, so the map is keyed by the prefixed id). Falls back to the
+ *  provider-wide contextWindow. */
+export function modelContextWindow(
+  provider: {
+    id?: string
+    contextMap?: Record<string, number>
+    contextWindow?: number
+  } | null | undefined,
+  model: string,
+): number | null {
+  if (!provider) return null
+  const map = provider.contextMap ?? {}
+  const direct = map[model]
+  if (direct && direct > 0) return direct
+  const prefixed = map[`${provider.id ?? ''}/${model}`]
+  if (prefixed && prefixed > 0) return prefixed
+  return provider.contextWindow && provider.contextWindow > 0
+    ? provider.contextWindow
+    : null
+}
+
+/** Resolve a model's reasoning-support flag from the provider's reasoningMap,
+ *  trying both the bare and provider-prefixed id forms (see modelContextWindow).
+ *  Returns null when the map doesn't know the model — callers then fall back
+ *  to the name-based heuristic. */
+export function modelReasoning(
+  provider: { id?: string; reasoningMap?: Record<string, boolean> } | null | undefined,
+  model: string,
+): boolean | null {
+  if (!provider) return null
+  const map = provider.reasoningMap ?? {}
+  const direct = map[model]
+  if (typeof direct === 'boolean') return direct
+  const prefixed = map[`${provider.id ?? ''}/${model}`]
+  return typeof prefixed === 'boolean' ? prefixed : null
+}
+
 /** Format a USD amount for the context-meter cost chip. Tiny amounts (most
  *  single turns) show 4 decimals so they don't all collapse to "$0.00". */
 export function formatCost(usd: number): string {

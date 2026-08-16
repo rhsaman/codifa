@@ -18,6 +18,7 @@ TESTS = [
     "test_parallel_tools",
     "test_issues",
     "test_compact",
+    "test_models_dev",
 ]
 
 

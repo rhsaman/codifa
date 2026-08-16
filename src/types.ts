@@ -95,6 +95,7 @@ export interface ProviderConfig {
   contextMap?: Record<string, number>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
+  reasoningMap?: Record<string, boolean>
   /** Per-provider "Messages to remember" — how many recent user/assistant messages are sent each turn. */
   maxHistory?: number
   thinkingLevel?: ThinkingLevel

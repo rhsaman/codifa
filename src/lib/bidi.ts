@@ -78,18 +78,78 @@ const MARKDOWN_BLOCK_START =
 // parens/arrows pinned LTR while never touching markdown delimiters.
 const HAS_STRONG = /[\p{L}\p{N}]/u
 
-// Mirrored bracket characters ( ) [ ] { } need isolation purely because of
-// their MIRRORING behavior, independent of whether the run also has a
-// "strong" letter/digit. A lone ")" (e.g. closing the paren opened by a
-// PREVIOUS isolated run like "grep_tool (") has no strong char, so it used to
-// hit EXCEPTION 2 and stay unwrapped — leaving it in raw RTL context while its
-// matching "(" sits inside a forced-LTR isolate. That mismatch is exactly what
-// renders as a reversed/mirrored paren. Square/curly brackets are included for
-// the same mirroring reason; "]" alone as markdown link syntax is rare enough,
-// and still-unwrapped "**"/"`"/"—"/"؟" etc. (no bracket char) are unaffected.
-const HAS_MIRRORED_BRACKET = /[()[\]{}]/
+const PERSIAN_CHAR = new RegExp(`[${PERSIAN_RANGE}]`, "u")
+// A "foreign strong" char is a letter/digit that is NOT Persian/Arabic script
+// — i.e. Latin words, ASCII digits, etc. Persian digits (۰-۹) are inside
+// PERSIAN_RANGE, so a run of only Persian digits does NOT count as foreign.
+function isForeignStrong(ch: string): boolean {
+  return HAS_STRONG.test(ch) && !PERSIAN_CHAR.test(ch)
+}
+
+const OPEN_TO_CLOSE: Record<string, string> = { "(": ")", "[": "]", "{": "}" }
+const CLOSE_TO_OPEN: Record<string, string> = { ")": "(", "]": "[", "}": "{" }
+
+// Bracket characters ( ) [ ] { } are MIRRORED glyphs: the browser flips their
+// shape whenever they resolve inside an RTL-level run. That flip is CORRECT
+// and desired for a purely Persian parenthetical like "شما (پروایدر کاستوم)"
+// — it's exactly how RTL text is supposed to curve a bracket around RTL
+// content, so the native/default resolution must be left alone there.
+//
+// The flip only becomes a bug when the bracket wraps or is glued to FOREIGN
+// (Latin/digit) content, e.g. "grep_tool (line 2784)": there the run has no
+// strong RTL neighbor to anchor its direction, so it needs the explicit LRI
+// isolate — and both brackets of that pair must agree (isolate both or
+// neither), or exactly the mismatched-mirroring bug reported shows up.
+//
+// findForeignBrackets scans the whole line once, pairs up every bracket via a
+// stack, and marks BOTH indices of a pair as "needs isolation" only when the
+// pair's inner content contains a foreign strong char, OR the run directly
+// attached before the opening bracket (no Persian in between) does — that
+// second check is what correctly isolates "grep_tool (خط ۲۷۸۴)" even though
+// the content between the parens is pure Persian digits.
+function findForeignBrackets(line: string): Set<number> {
+  const stack: { ch: string; idx: number }[] = []
+  const pairs: [number, number][] = []
+  for (let idx = 0; idx < line.length; idx++) {
+    const ch = line[idx]
+    if (OPEN_TO_CLOSE[ch]) {
+      stack.push({ ch, idx })
+    } else if (CLOSE_TO_OPEN[ch]) {
+      for (let s = stack.length - 1; s >= 0; s--) {
+        if (stack[s].ch === CLOSE_TO_OPEN[ch]) {
+          pairs.push([stack[s].idx, idx])
+          stack.length = s // drop this frame and any unmatched inner ones
+          break
+        }
+      }
+    }
+  }
+  const result = new Set<number>()
+  for (const [start, end] of pairs) {
+    let foreign = false
+    for (let k = start + 1; k < end && !foreign; k++) {
+      if (isForeignStrong(line[k])) foreign = true
+    }
+    if (!foreign) {
+      let i = start - 1
+      while (i >= 0 && line[i] !== "\n" && !PERSIAN_CHAR.test(line[i])) {
+        if (isForeignStrong(line[i])) {
+          foreign = true
+          break
+        }
+        i--
+      }
+    }
+    if (foreign) {
+      result.add(start)
+      result.add(end)
+    }
+  }
+  return result
+}
 
 export function fixMixedText(text: string): string {
+  const foreignBrackets = findForeignBrackets(text)
   return text.replace(NON_PERSIAN_RUN, (m, offset) => {
     if (!/\S/.test(m)) return m // pure whitespace - nothing to isolate
     // True start of a line? (only whitespace between the last \n and the run)
@@ -97,7 +157,21 @@ export function fixMixedText(text: string): string {
     while (i >= 0 && (text[i] === ' ' || text[i] === '\t')) i--
     const atLineStart = i < 0 || text[i] === '\n'
     if (atLineStart && MARKDOWN_BLOCK_START.test(m)) return m
-    if (!HAS_STRONG.test(m) && !HAS_MIRRORED_BRACKET.test(m)) return m
+    // Bracket-only run (e.g. a standalone ")", or ") " when the regex pulls
+    // in trailing whitespace): only isolate it when it contains a bracket
+    // index flagged as foreign — a pure-Persian parenthetical must be left
+    // for the browser's native (correct) mirroring. Scan every char of the
+    // run (not just index 0) since the match can start with whitespace too.
+    if (!HAS_STRONG.test(m)) {
+      let hasForeignBracket = false
+      for (let k = 0; k < m.length; k++) {
+        if ((OPEN_TO_CLOSE[m[k]] || CLOSE_TO_OPEN[m[k]]) && foreignBrackets.has(offset + k)) {
+          hasForeignBracket = true
+          break
+        }
+      }
+      if (!hasForeignBracket) return m
+    }
     return "\u2066" + m + "\u2069"
   })
 }

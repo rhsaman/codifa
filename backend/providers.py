@@ -595,6 +595,21 @@ def _entry_pricing(entry: dict) -> dict | None:
         return None
 
 
+def _entry_reasoning(entry: dict) -> bool | None:
+    """Best-effort reasoning-support flag from a models-listing entry.
+
+    Some gateways advertise a boolean ``reasoning`` field (OpenRouter carries
+    it on newer entries; others use ``supports_reasoning``). Returns None when
+    the payload doesn't say — callers then fall back to the models.dev catalog
+    or a name-based heuristic.
+    """
+    for key in ("reasoning", "supports_reasoning", "reasoning_supported"):
+        val = entry.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
+
+
 def _server_root(base_url: str) -> str:
     """Strip a trailing /v1 so server-level endpoints (/props) resolve."""
     root = base_url.rstrip("/")
@@ -627,7 +642,7 @@ async def _models_dev_catalog() -> dict:
     if _models_dev_cache and now - _models_dev_cache[0] < MODELS_DEV_CACHE_TTL:
         return _models_dev_cache[1]
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(MODELS_DEV_API)
             resp.raise_for_status()
             data = resp.json()
@@ -643,14 +658,33 @@ def _models_dev_id(provider: str, model_id: str) -> str:
     """Normalize a model id to the form models.dev catalogs use.
 
     Google's OpenAI-compatible /models returns ids prefixed with ``models/``
-    (``models/gemini-2.5-flash``) while models.dev keys them bare; openrouter /
-    opencode already match. Stripping the prefix for google (and harmless no-ops
-    elsewhere) lets one catalog lookup serve every provider.
+    (``models/gemini-2.5-flash``) while models.dev keys them bare; opencode-
+    compatible gateways are cataloged under bare ids too, but the UI can hand
+    us ``opencode/deepseek-v4-flash-free`` (the gateway's own /models returns
+    the bare ``deepseek-v4-flash-free``). Stripping the ``models/`` prefix for
+    google and the provider key for opencode (harmless no-ops elsewhere) lets
+    one catalog lookup serve every provider.
     """
     mid = model_id or ""
     if _provider_meta(provider).get("strip_models_prefix") and mid.startswith("models/"):
         return mid[len("models/") :]
+    prefix = _models_dev_provider_key(provider)
+    if prefix and mid.startswith(prefix + "/"):
+        return mid[len(prefix) + 1 :]
     return mid
+
+
+def _models_dev_provider_key(provider: str, base_url: str = "") -> str:
+    """models.dev catalog key for a provider.
+
+    opencode-compatible gateways — the built-in ``opencode`` provider OR any
+    custom provider pointed at ``opencode.ai`` (``is_opencode`` detects the
+    base URL) — are all cataloged under the single ``opencode`` key in
+    models.dev, so lookups must use that key rather than the provider name.
+    """
+    if is_opencode(provider, base_url):
+        return "opencode"
+    return provider
 
 
 # Google's REST /v1beta/models list carries the AUTHORITATIVE per-model context
@@ -705,11 +739,39 @@ async def _google_model_limits(
     return (_google_model_cache[1] if _google_model_cache else {}) or {}
 
 
+def _models_dev_entry(catalog: dict, provider_key: str, model_id: str) -> dict:
+    """Resolve a model's entry in a models.dev catalog.
+
+    Tries the exact ``model_id`` key first, then the id with any
+    ``<provider>/`` prefix stripped (opencode gateways may present ids as
+    ``opencode/deepseek-v4-flash-free`` while the catalog keys them bare), then
+    scans entries whose ``aliases``/``alias`` array (or ``id`` field) matches —
+    so a gateway alias resolves to its catalog entry even when the key differs.
+    """
+    models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
+    entry = models.get(model_id)
+    if isinstance(entry, dict):
+        return entry
+    stripped = model_id.split("/", 1)[-1]
+    if stripped != model_id:
+        entry = models.get(stripped)
+        if isinstance(entry, dict):
+            return entry
+    for candidate in models.values():
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("id") == stripped:
+            return candidate
+        for alias in candidate.get("aliases") or candidate.get("alias") or []:
+            if alias == model_id or alias == stripped:
+                return candidate
+    return {}
+
+
 def _models_dev_context(catalog: dict, provider_key: str, model_id: str) -> int | None:
     """Look up ``model_id``'s context window under ``provider_key`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
-    entry = models.get(model_id) or {}
+    entry = _models_dev_entry(catalog, provider_key, model_id)
     ctx = (entry.get("limit") or {}).get("context")
     try:
         return int(ctx) if ctx else None
@@ -720,13 +782,25 @@ def _models_dev_context(catalog: dict, provider_key: str, model_id: str) -> int 
 def _models_dev_max_output(catalog: dict, provider_key: str, model_id: str) -> int | None:
     """Look up ``model_id``'s max output tokens under ``provider_key`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
-    entry = models.get(model_id) or {}
+    entry = _models_dev_entry(catalog, provider_key, model_id)
     out = (entry.get("limit") or {}).get("output")
     try:
         return int(out) if out else None
     except (TypeError, ValueError):
         return None
+
+
+def _models_dev_reasoning(catalog: dict, provider_key: str, model_id: str) -> bool | None:
+    """Look up ``model_id``'s reasoning-support flag under ``provider_key`` in a
+    models.dev catalog already fetched via ``_models_dev_catalog`` (the catalog's
+    top-level ``reasoning`` boolean — the ``limit``-nested variant on older
+    snapshots is also accepted — is the authoritative, community-maintained
+    source for which models expose a reasoning mode)."""
+    entry = _models_dev_entry(catalog, provider_key, model_id)
+    reasoning = entry.get("reasoning")
+    if not isinstance(reasoning, bool):
+        reasoning = (entry.get("limit") or {}).get("reasoning")
+    return reasoning if isinstance(reasoning, bool) else None
 
 
 def _models_dev_pricing(catalog: dict, provider_key: str, model_id: str) -> dict | None:
@@ -735,8 +809,7 @@ def _models_dev_pricing(catalog: dict, provider_key: str, model_id: str) -> dict
     already USD per million tokens, no conversion needed). Cache rates, when the
     catalog advertises them (``cost.cache_read_input`` / ``cost.cache_write_input``),
     are surfaced as ``cacheRead`` / ``cacheWrite`` for the meter."""
-    models = ((catalog or {}).get(provider_key) or {}).get("models") or {}
-    entry = models.get(model_id) or {}
+    entry = _models_dev_entry(catalog, provider_key, model_id)
     cost = entry.get("cost") or {}
     inp, out = cost.get("input"), cost.get("output")
     if inp is None or out is None:
@@ -878,6 +951,7 @@ async def list_models(
                         if entry.get("name", "").endswith(":latest")
                         else entry.get("name", ""),
                         "context": None,
+                        "reasoning": None,
                     }
                     for entry in data.get("models", [])
                     if entry.get("name")
@@ -909,33 +983,43 @@ async def list_models(
                             "context": _entry_context(entry),
                             "max_output": _entry_max_output(entry),
                             "pricing": _entry_pricing(entry),
+                            "reasoning": _entry_reasoning(entry),
                         }
                     )
-                # Enrich model metadata that the provider's own /models payload
-                # omits. Google (``models/`` prefix), opencode and openrouter
-                # don't all advertise a context window — fill gaps from the
-                # live models.dev catalog (community-maintained, provider- and
-                # model-specific). Only used when the provider entry has no
-                # value, so the API's own numbers always win.
+                # Enrich model metadata from the live models.dev catalog
+                # (community-maintained, provider- and model-specific). The
+                # catalog is the PRIMARY source — provider /models payloads
+                # under-advertise limits (opencode reports 4096 for
+                # deepseek-v4-flash-free while the real limit is 128K) — so its
+                # values override the provider's; the provider's own numbers
+                # are only kept as a fallback when the catalog doesn't know
+                # the model.
                 catalog = await _models_dev_catalog()
+                dev_key = _models_dev_provider_key(provider, base_url)
                 for m in models:
-                    if not m["context"]:
-                        m["context"] = _models_dev_context(
-                            catalog, provider, _models_dev_id(provider, m["id"])
-                        )
-                        if (
-                            not m["context"]
-                            and _provider_meta(provider).get("free_ctx_fallback")
-                            and m["id"].endswith("-free")
-                        ):
-                            m["context"] = 200_000
-                    if not m["max_output"]:
-                        m["max_output"] = _models_dev_max_output(
-                            catalog, provider, _models_dev_id(provider, m["id"])
-                        )
+                    dev_ctx = _models_dev_context(
+                        catalog, dev_key, _models_dev_id(provider, m["id"])
+                    )
+                    if dev_ctx:
+                        m["context"] = dev_ctx
+                    elif (
+                        not m["context"]
+                        and _provider_meta(provider).get("free_ctx_fallback")
+                        and m["id"].endswith("-free")
+                    ):
+                        m["context"] = 200_000
+                    dev_out = _models_dev_max_output(
+                        catalog, dev_key, _models_dev_id(provider, m["id"])
+                    )
+                    if dev_out:
+                        m["max_output"] = dev_out
                     if not m.get("pricing"):
                         m["pricing"] = _models_dev_pricing(
-                            catalog, provider, _models_dev_id(provider, m["id"])
+                            catalog, dev_key, _models_dev_id(provider, m["id"])
+                        )
+                    if m.get("reasoning") is None:
+                        m["reasoning"] = _models_dev_reasoning(
+                            catalog, dev_key, _models_dev_id(provider, m["id"])
                         )
                 if _provider_meta(provider).get("model_class") == "google":
                     # Google's own REST catalog is the authoritative source for
@@ -972,17 +1056,30 @@ async def model_context(
 ) -> int:
     """Resolve a specific model's context-window length (tokens).
 
-    Tries the provider's advertised window first (openrouter ``context_length``,
-    opencode curated map, ollama /api/show, custom ``max_model_len``). Falls
-    back to a conservative floor ONLY when the model is truly unknown — never a
-    hard-coded cap, and never under-reporting a model whose real window the
-    provider advertises.
+    The live models.dev catalog is the PRIMARY source (community-maintained,
+    provider- and model-specific). Falls back to the provider's advertised
+    window (openrouter ``context_length``, opencode curated map, ollama
+    /api/show, custom ``max_model_len``) only when the catalog doesn't know
+    the model, then to a conservative floor ONLY when the model is truly
+    unknown — never a hard-coded cap, and never under-reporting a model whose
+    real window the provider advertises.
 
     Returns 0 when nothing can be determined.
     """
     if not model:
         return 0
     model = qualify_model_id(provider, model)
+    # Known-capacity models resolve from the live models.dev catalog first —
+    # even when list_models fails (offline / transient). Exact known models
+    # only — never a hardcoded map.
+    catalog = await _models_dev_catalog()
+    ctx = _models_dev_context(
+        catalog, _models_dev_provider_key(provider, base_url), _models_dev_id(provider, model)
+    )
+    if ctx:
+        return ctx
+    if _provider_meta(provider).get("free_ctx_fallback") and model.endswith("-free"):
+        return 200_000
     try:
         enlisted = await list_models(
             provider, base_url, api_key, env_var, oauth_token=oauth_token
@@ -990,17 +1087,8 @@ async def model_context(
         for entry in enlisted:
             if entry.get("id") == model and entry.get("context"):
                 return int(entry["context"])
-    except Exception:  # noqa: BLE001, S110 — fall back to models.dev below
+    except Exception:  # noqa: BLE001, S110 — provider lookup is best-effort
         pass
-    # Known-capacity models resolve from the live models.dev catalog even when
-    # list_models fails (offline / transient). Exact known models only — never a
-    # hardcoded map.
-    catalog = await _models_dev_catalog()
-    ctx = _models_dev_context(catalog, provider, _models_dev_id(provider, model))
-    if ctx:
-        return ctx
-    if _provider_meta(provider).get("free_ctx_fallback") and model.endswith("-free"):
-        return 200_000
     return 0
 
 
@@ -1014,13 +1102,30 @@ async def model_max_output(
 ) -> int:
     """Resolve a specific model's max output tokens (best-effort).
 
-    Mirrors model_context(): tries the provider's advertised output limit first
-    (openrouter ``max_completion_tokens``, models.dev ``limit.output``, ollama
-    ``max_tokens``). Returns 0 when nothing can be determined.
+    Mirrors model_context(): the live models.dev catalog is the PRIMARY source
+    (``limit.output``); falls back to the provider's advertised output limit
+    (openrouter ``max_completion_tokens``, ollama ``max_tokens``) only when the
+    catalog doesn't know the model. Returns 0 when nothing can be determined.
     """
     if not model:
         return 0
     model = qualify_model_id(provider, model)
+    catalog = await _models_dev_catalog()
+    out = _models_dev_max_output(
+        catalog,
+        _models_dev_provider_key(provider, base_url),
+        _models_dev_id(provider, model),
+    )
+    if out:
+        return out
+    # opencode-compatible gateways under-advertise output limits in their own
+    # /models payload (deepseek-v4-flash-free reports 4096 while the real limit
+    # is 128K per models.dev) — when the catalog doesn't know the model, report
+    # UNKNOWN (0) rather than the gateway's own under-advertised value:
+    # _settings_for then falls back to the context-scaled budget (capped at
+    # 8192), which is far more useful than a wrong 4096.
+    if is_opencode(provider, base_url):
+        return 0
     try:
         enlisted = await list_models(
             provider, base_url, api_key, env_var, oauth_token=oauth_token
@@ -1028,10 +1133,6 @@ async def model_max_output(
         for entry in enlisted:
             if entry.get("id") == model and entry.get("max_output"):
                 return int(entry["max_output"])
-    except Exception:  # noqa: BLE001, S110 — fall back to models.dev below
+    except Exception:  # noqa: BLE001, S110 — provider lookup is best-effort
         pass
-    catalog = await _models_dev_catalog()
-    out = _models_dev_max_output(catalog, provider, _models_dev_id(provider, model))
-    if out:
-            return out
     return 0

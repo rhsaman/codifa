@@ -2890,6 +2890,72 @@ textarea {
   background: var(--on-accent);
 }
 
+/* ---- reasoning-effort picker (composer, shown for reasoning models) ---- */
+.thinking-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 6px 0 10px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  transition:
+    background 0.14s,
+    box-shadow 0.14s,
+    color 0.14s;
+}
+
+.thinking-pill:hover {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.thinking-pill.on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 20%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.thinking-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+.thinking-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  max-width: 96px;
+  padding: 0 2px;
+}
+
+.thinking-select option {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.thinking-caret {
+  font-size: 9px;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
 /* ---- tool activity ---- */
 .tool-activity {
   display: flex;

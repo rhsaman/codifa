@@ -332,7 +332,7 @@ def _escapes_root(command: str, root: str) -> str | None:
     _SAFE_ABS = ("/dev/null", "/tmp/", "/dev/std", "/dev/fd")
     for m in re.finditer(r"(?:^|[\s;|&])(/[^\s;|&'\"`]*)", command):
         p = m.group(1)
-        if p.startswith(_SAFE_ABS):
+        if p == "/tmp" or p.startswith(_SAFE_ABS):
             continue
         try:
             real = os.path.realpath(p)
@@ -781,83 +781,44 @@ def skill_store_status() -> tuple[VectorStore | None, str]:
     return store, ""
 
 
-_STARTER_SKILLS: list[tuple[str, str, str]] = [
-    (
-        "landing-page-design",
-        "Design high-converting landing pages (structure, copy hierarchy, CTA placement).",
-        (
-            "When asked to design or build a landing page, follow this workflow:\n"
-            "1. Define the single conversion goal and the target visitor.\n"
-            "2. Structure: hero → social proof → features/benefits → how it works → pricing → FAQ → final CTA.\n"
-            "3. Copy hierarchy: one clear headline (H1), one supporting subheadline, scannable benefit bullets.\n"
-            "4. Place exactly one primary CTA above the fold and repeat it after the last section.\n"
-            "5. Keep visual hierarchy: one accent color for CTAs, generous whitespace, consistent spacing scale.\n"
-            "6. Add trust signals near the first CTA (testimonials, logos, ratings)."
-        ),
-    ),
-    (
-        "pricing-page",
-        "Build persuasive pricing pages with clear plans, comparison and FAQ.",
-        (
-            "When asked to build a pricing page:\n"
-            "1. Show 3 plans by default (Starter / Pro / Enterprise), highlighting the middle one as 'Most popular'.\n"
-            "2. Lead with the price anchor (monthly, and annual-with-discount toggle if relevant).\n"
-            "3. List 4-6 concrete features per plan, checked icons; never vague marketing words.\n"
-            "4. Add a comparison table for the key differentiating features.\n"
-            "5. Close with a money-back guarantee + a short FAQ addressing objections."
-        ),
-    ),
-    (
-        "threejs-scroll-storytelling",
-        "Build scroll-driven 3D storytelling pages with Three.js (React Three Fiber).",
-        (
-            "When asked to build a scroll-driven 3D scene with Three.js:\n"
-            "1. Use React Three Fiber (Canvas) with drei helpers; avoid raw WebGL boilerplate.\n"
-            "2. Map page scroll to the scene via useScroll (drei): camera moves or object rotation/position per scroll progress.\n"
-            "3. Keep performance: enable antialias, cap pixelRatio at 2, reuse materials and geometries.\n"
-            "4. Add scroll sections with the canvas fixed behind; each section triggers a scene state change.\n"
-            "5. Fall back gracefully on low-end devices (reduce motion, lower DPR)."
-        ),
-    ),
-    (
-        "git-workflow",
-        "Follow a clean, safe git workflow: status, branch, staged commits, push.",
-        (
-            "When doing git work:\n"
-            "1. Always run `git status` first; review the diff before staging.\n"
-            "2. Work on a descriptive feature branch (git checkout -b <feature>).\n"
-            "3. Stage only intended files (git add <paths>), never secrets or build artifacts.\n"
-            "4. Commit with a concise message in the repo's style; keep changes focused.\n"
-            "5. Pull/merge recent main before pushing to avoid conflicts; push and open a PR when asked."
-        ),
-    ),
-]
+def _builtin_skills_dir() -> str:
+    """Directory of the built-in skill markdown files shipped with the app."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
 
-def seed_starter_skills() -> list[str]:
-    """Install the built-in starter skills on first run (no-op afterwards).
+def sync_builtin_skills() -> list[str]:
+    """Seed built-in skills from ``backend/skills/*.md`` on every startup.
 
-    Seeds only when the skill table is empty, so user edits/deletions are never
-    overwritten. Returns the names that were seeded.
+    Scans the shipped skills folder and seeds any skill that is not already in
+    the app database. Existing skills are never overwritten, so user edits and
+    deletions are respected — adding a new ``.md`` file to the folder makes it a
+    built-in skill on the next startup, with no code change required. Returns
+    the names that were seeded.
     """
+    folder = _builtin_skills_dir()
+    if not os.path.isdir(folder):
+        return []
     try:
         existing = _state_db.list_skills()
     except Exception:  # noqa: BLE001
-        return []
-    if existing:
-        return []
+        existing = []
+    existing_slugs = {s.get("slug") for s in existing}
+    existing_names = {s.get("name") for s in existing}
     seeded: list[str] = []
-    for name, description, body in _STARTER_SKILLS:
-        markdown = (
-            "---\n"
-            f"name: {name}\n"
-            f"description: {description}\n"
-            "---\n\n"
-            f"# {name}\n\n{body}\n"
-        )
-        result = persist_skill(markdown, fallback_name=name)
+    for path in sorted(_pyglob.glob(os.path.join(folder, "*.md"))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        name, _description, _body = _parse_skill_markdown(raw)
+        if not name:
+            name = os.path.splitext(os.path.basename(path))[0]
+        if name in existing_names or slugify(name) in existing_slugs:
+            continue
+        result = persist_skill(raw, fallback_name=name)
         if result.get("ok"):
-            seeded.append(name)
+            seeded.append(result.get("name") or name)
     return seeded
 
 
@@ -1323,6 +1284,24 @@ def _verify_python_syntax(target: str) -> str | None:
     return "OK"
 
 
+def _verify_json_syntax(target: str) -> str | None:
+    """Instant, subprocess-free syntax check for a .json file via json.loads.
+
+    Returns "OK", a short ``JSONDecodeError: ...`` message, or ``None`` if the
+    file can't be read (never raises).
+    """
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError:
+        return None
+    try:
+        json.loads(src)
+    except json.JSONDecodeError as exc:
+        return f"JSONDecodeError: {exc.msg} (line {exc.lineno}, col {exc.colno})"
+    return "OK"
+
+
 def _find_tsc(root: str) -> str | None:
     """Prefer the project's own local tsc (its exact configured version) over
     any globally-installed one; return None if neither exists."""
@@ -1381,10 +1360,11 @@ def _verify_typescript(root: str) -> str | None:
 def verify_edit(root: str, path: str) -> str | None:
     """Best-effort post-write verification for Coder mode's write_file/edit_file.
 
-    Dispatches by extension: .py gets an instant AST syntax check; .ts/.tsx get
-    a debounced project-wide typecheck. Every other extension (and any error
-    resolving the path) returns ``None`` so the caller adds nothing to the tool
-    result — this must never turn a successful write into a reported failure.
+    Dispatches by extension: .py gets an instant AST syntax check; .json gets an
+    instant json.loads check; .ts/.tsx get a debounced project-wide typecheck.
+    Every other extension (and any error resolving the path) returns ``None`` so
+    the caller adds nothing to the tool result — this must never turn a
+    successful write into a reported failure.
     """
     ext = os.path.splitext(path)[1].lower()
     try:
@@ -1393,6 +1373,8 @@ def verify_edit(root: str, path: str) -> str | None:
         return None
     if ext == ".py":
         return _verify_python_syntax(target)
+    if ext == ".json":
+        return _verify_json_syntax(target)
     if ext in (".ts", ".tsx"):
         return _verify_typescript(root)
     return None
@@ -3243,6 +3225,21 @@ def make_tool_callbacks(
             p = re.sub(r"[^a-z0-9_.@/]+", "", (path or "").lower())
             return (q, p)
 
+        # Seed the seen-sets from the turn-level digest so a NEW explore call
+        # (fresh sub-agent, no memory) treats earlier calls' searches/listings as
+        # already done: a re-issued query gets the cached result back instead of
+        # burning a real search. Digest keys are "tool|query|path" — rebuild the
+        # (query, path) tuples for grep/glob/read entries.
+        for _ckey in list(_explore_turn_digest.keys()):
+            _parts = _ckey.split("|", 2)
+            if len(_parts) != 3:
+                continue
+            _ctool, _cq, _cp = _parts
+            if _ctool in ("grep", "glob") and _cq:
+                _sub_seen_searches.add((_cq, _cp))
+            elif _ctool == "read":
+                _sub_seen_listings.add((_cq or _cp, _cp))
+
         def _sub_cache_key(tool: str, key: tuple[str, str]) -> str:
             return f"{tool}|{key[0]}|{key[1]}"
 
@@ -3255,6 +3252,22 @@ def make_tool_callbacks(
             ckey = _sub_cache_key(tool, key)
             _sub_result_cache[ckey] = body
             _explore_turn_digest[ckey] = body
+            _persist_explore_digest()
+
+        def _persist_explore_digest() -> None:
+            """Persist the turn-level explore digest to disk (same resume file
+            the agent's tool-resume uses), so an explore call AFTER a disconnect /
+            app restart still dedups against what was already explored instead of
+            re-discovering from zero. Best-effort + throttled: never raises, and
+            never clobbers the agent's own `tools` resume records — it merges."""
+            if not chat_id:
+                return
+            try:
+                _prev = _state_db.load_turn_resume(root, chat_id) or {}
+                _prev["explore_digest"] = dict(_explore_turn_digest)
+                _state_db.save_turn_resume(root, chat_id, _prev)
+            except Exception:  # noqa: BLE001, S110 — best-effort, never fails the tool
+                pass
 
         def _sub_resume_note() -> str:
             """Distilled summary of the sub-agent's completed tool work, fed back
@@ -3359,12 +3372,15 @@ def make_tool_callbacks(
                 "kind": "tool", "tool": "read",
                 "args": {"filePath": filePath, "offset": offset, "limit": limit},
             })
-            lkey = _sub_search_key("", filePath) or (filePath, "")
+            lkey = _sub_search_key(f"o{int(offset or 1)}l{int(limit or 2000)}", filePath) or (filePath, "")
             # Listing a directory is idempotent: re-listing the SAME directory
             # later in a run returns the same tree and only re-resends the whole
             # sub-agent transcript for nothing. Fold repeats (the sub-agent
             # re-listed backend/, the root and scripts/ three times during a
-            # retry).
+            # retry). The key includes offset/limit so a DIFFERENT line range of
+            # the same file is NOT folded into an earlier read — otherwise the
+            # sub-agent asking for agents.py:3250-3269 after agents.py:3240-3339
+            # gets the old range back forever and loops re-requesting it.
             if lkey in _sub_seen_listings:
                 cached = _sub_cached("read", lkey)
                 body = cached or f"(no stored result for {filePath or '/'})"
@@ -3596,6 +3612,13 @@ def make_tool_callbacks(
                 )
                 _sub_max_tokens = 1200
 
+            # Cross-call dedup seed: earlier explore calls this turn already
+            # read/searched these paths. Feed them into the sub-agent's SYSTEM
+            # PROMPT (not just the task text) so the model KNOWS not to re-issue
+            # those calls — a dedup hit after the fact still costs a full model
+            # round-trip (the whole transcript re-sends), so preventing the call
+            # up front is what actually saves tokens.
+            _sub_prior_note = _sub_resume_note()
             sub_agent = _Agent(
                 model,
                 system_prompt=(
@@ -3603,7 +3626,15 @@ def make_tool_callbacks(
                     "answer FAST and CHEAPLY and hand back a compact structured report. "
                     "TIME IS PRECIOUS — every search round-trip re-sends your whole "
                     "transcript, so do not over-explore.\n"
-                    "INTENT (do this before your first search): state in one sentence "
+                    + (
+                        "ALREADY EXPLORED THIS TURN — do NOT re-read or re-search these; "
+                        "the results are already known. Only dig deeper where the task "
+                        "genuinely needs more than what is listed:\n"
+                        f"{_sub_prior_note}\n"
+                        if _sub_prior_note
+                        else ""
+                    )
+                    + "INTENT (do this before your first search): state in one sentence "
                     "what you are actually looking for (the literal request vs. the real "
                     "underlying need) so your searches are targeted, not scattershot.\n"
                     "PARALLEL-FIRST ACTION: on your very first turn launch 3+ tool calls "

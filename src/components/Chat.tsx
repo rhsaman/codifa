@@ -45,6 +45,7 @@ import type {
   MessageSegment,
   NvimDiagnostic,
   SidecarEvent,
+  ThinkingLevel,
   ToolActivity,
 } from "../types";
 import { ChatMessageView, RetryBanner, ThinkingBlock } from "./ChatMessage";
@@ -56,6 +57,18 @@ import { ToolCallView } from "./ToolCallView";
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
 );
+
+const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
+  ["none", "None"],
+  ["minimal", "Minimal"],
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+  ["xhigh", "Extra high"],
+];
+const THINKING_LABELS = Object.fromEntries(
+  THINKING_OPTIONS,
+) as Record<ThinkingLevel, string>;
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "help", hint: "List all commands" },
@@ -95,6 +108,8 @@ const IMAGE_EXTS = new Set([
   "webp",
   "bmp",
   "avif",
+  "heic",
+  "heif",
 ]);
 
 function relFromRoot(root: string, p: string): string | null {
@@ -323,7 +338,12 @@ export function ChatPanel() {
   );
   const [attLen, setAttLen] = useState(0);
   const [images, setImages] = useState<
-    Array<{ path: string; name: string; dataUrl?: string }>
+    Array<{
+      path: string;
+      name: string;
+      dataUrl?: string;
+      origPath?: string;
+    }>
   >(chat?.draft?.images ?? []);
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
@@ -400,6 +420,7 @@ export function ChatPanel() {
   /** Dismissible error banner (e.g. an unknown slash command) shown at the
    *  bottom of the message list, in the same spot as the retry banner. */
   const [cmdError, setCmdError] = useState<string | null>(null);
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>("medium");
 
   // Switch the CURRENT chat's mode. No UI toast — the agent knows which mode the
   // next message runs in; the user doesn't need a visible confirmation.
@@ -525,6 +546,7 @@ export function ChatPanel() {
         if (cancelled) return;
         useStore.getState().setProviderContextMap(provider.id, res.context);
         useStore.getState().setProviderPricingMap(provider.id, res.pricing);
+        useStore.getState().setProviderReasoningMap(provider.id, res.reasoning);
       })
       .catch(() => undefined);
     return () => {
@@ -1286,8 +1308,9 @@ export function ChatPanel() {
           thinkingLevel: supportsReasoning(
             activeProvider.model,
             activeProvider.kind,
+            activeProvider.reasoningMap?.[activeProvider.model],
           )
-            ? (activeProvider.thinkingLevel ?? "")
+            ? thinkingLevel
             : "",
           mcpServers: (() => {
             const all = s.settings.mcpServers ?? {};
@@ -1668,6 +1691,37 @@ export function ChatPanel() {
       if (!ch) return;
       const msg = ch.messages.find((m) => m.id === id);
       if (!msg || msg.role !== "user" || !msg.content.trim()) return;
+
+      // RESUME, don't restart: if this user's turn left a failed assistant
+      // message behind (partial content + preserved tool activity + plan),
+      // keep it in the transcript and re-run the SAME user message so the
+      // model continues from where it was cut off instead of redoing the
+      // completed work. Only when there is no failed turn to resume do we
+      // fall back to the old truncate-and-restart behavior.
+      const idx = ch.messages.findIndex((m) => m.id === id);
+      const failed = ch.messages
+        .slice(idx + 1)
+        .find((m) => m.role === "assistant" && m.retry);
+      if (failed) {
+        // send() reuses the existing user bubble (no duplicate), clears the
+        // retry banner, and keeps the failed assistant message in history so
+        // the model sees the partial work + preserved tool list and continues
+        // (promptWithResume reinforces the plan continuation).
+        setTimeout(
+          () =>
+            send(
+              msg.content,
+              msg.attachments ?? [],
+              msg.images ?? [],
+              false,
+              msg.id,
+            ),
+          0,
+        );
+        return;
+      }
+
+      // No failed assistant turn to resume — restart from this user message.
       if (!s.truncateTo(id)) return;
       const text = msg.content;
       // Give the abort's finally block a tick to reset busy/streaming state
@@ -1752,19 +1806,27 @@ export function ChatPanel() {
     setImages([]);
   };
 
-  const addImage = (p: string, name: string) => {
-    setImages((imgs) =>
-      imgs.some((i) => i.path === p) ? imgs : [...imgs, { path: p, name }],
-    );
-    void api
-      .readImage(p)
-      .then((dataUrl) => {
-        if (dataUrl)
-          setImages((imgs) =>
-            imgs.map((i) => (i.path === p ? { ...i, dataUrl } : i)),
-          );
-      })
-      .catch(() => undefined);
+  const addImage = async (p: string, name: string) => {
+    // Normalize first: HEIC / oversized / permission-blocked originals are
+    // converted to a readable temp PNG (like screenshots) so the backend can
+    // always load the path we send. Falls back to the original path if
+    // normalization fails.
+    const norm = await api.normalizeImage(p).catch(() => null);
+    const path = norm?.path || p;
+    const dataUrl =
+      norm?.dataUrl ||
+      (await api.readImage(p).catch(() => null)) ||
+      undefined;
+    setImages((imgs) => {
+      const hit = imgs.find((i) => i.origPath === p || i.path === p);
+      if (hit) {
+        if (!dataUrl) return imgs;
+        return imgs.map((i) =>
+          i.origPath === p || i.path === p ? { ...i, dataUrl } : i,
+        );
+      }
+      return [...imgs, { path, name, dataUrl, origPath: p }];
+    });
   };
 
   const addDroppedFile = (p: string, name: string) => {
@@ -1818,15 +1880,25 @@ export function ChatPanel() {
     const path = await api.selectFile();
     if (!path) return;
     const name = path.split(/[\\/]/).pop() || path;
-    setImages((imgs) =>
-      imgs.some((i) => i.path === path) ? imgs : [...imgs, { path, name }],
-    );
-    const dataUrl = await api.readImage(path).catch(() => null);
-    if (dataUrl) {
-      setImages((imgs) =>
-        imgs.map((i) => (i.path === path ? { ...i, dataUrl } : i)),
-      );
-    }
+    // Same normalization as addImage: the backend should always receive a
+    // readable temp PNG path, not the original (possibly HEIC / oversized /
+    // permission-blocked) file.
+    const norm = await api.normalizeImage(path).catch(() => null);
+    const imgPath = norm?.path || path;
+    const dataUrl =
+      norm?.dataUrl ||
+      (await api.readImage(path).catch(() => null)) ||
+      undefined;
+    setImages((imgs) => {
+      const hit = imgs.find((i) => i.origPath === path || i.path === path);
+      if (hit) {
+        if (!dataUrl) return imgs;
+        return imgs.map((i) =>
+          i.origPath === path || i.path === path ? { ...i, dataUrl } : i,
+        );
+      }
+      return [...imgs, { path: imgPath, name, dataUrl, origPath: path }];
+    });
   };
 
   const removeImage = (path: string) => {
@@ -2793,6 +2865,52 @@ export function ChatPanel() {
                 </span>
                 <span className="skills-toggle-label">Skills</span>
               </button>
+              {provider &&
+                (provider.reasoningMap?.[provider.model] ??
+                  supportsReasoning(provider.model, provider.kind)) && (
+                  <span
+                    className={`thinking-pill${thinkingLevel ? " on" : ""}`}
+                    title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
+                  >
+                    <svg
+                      className="thinking-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+                      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+                      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+                      <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+                      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+                      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+                      <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+                      <path d="M6 18a4 4 0 0 1-1.967-.516" />
+                      <path d="M19.967 17.484A4 4 0 0 1 18 18" />
+                    </svg>
+                    <select
+                      className="thinking-select"
+                      value={thinkingLevel}
+                      onChange={(e) =>
+                        setThinkingLevel(e.target.value as ThinkingLevel)
+                      }
+                      aria-label="Reasoning effort for this message"
+                    >
+                      {THINKING_OPTIONS.map(([v, label]) => (
+                        <option key={v} value={v}>
+                          {label}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="thinking-caret" aria-hidden="true">
+                      ▾
+                    </span>
+                  </span>
+                )}
             </span>
             <span className="composer-hint">
               {busy && stalled && (

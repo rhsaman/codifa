@@ -41,6 +41,8 @@ export interface ModelsResult {
   context: Record<string, number>
   /** USD per MILLION tokens, when the provider/models.dev advertises a price. */
   pricing: Record<string, ModelPricing>
+  /** Per-model reasoning-support flag (models.dev limit.reasoning / provider payload). */
+  reasoning: Record<string, boolean>
 }
 
 /**
@@ -123,17 +125,19 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> { 
     throw new Error((body as { detail?: string }).detail || `models request failed (${res.status})`)
   }
   const data = (await res.json()) as {
-    models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null }>
+    models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null; reasoning?: boolean | null }>
   }
   const models: string[] = []
   const context: Record<string, number> = {}
   const pricing: Record<string, ModelPricing> = {}
+  const reasoning: Record<string, boolean> = {}
   for (const m of data.models ?? []) {
     models.push(m.id)
     if (m.context) context[m.id] = m.context
     if (m.pricing) pricing[m.id] = m.pricing
+    if (typeof m.reasoning === 'boolean') reasoning[m.id] = m.reasoning
   }
-  return { models, context, pricing }
+  return { models, context, pricing, reasoning }
 }
 
 export interface CreditsResult {

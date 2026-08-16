@@ -120,7 +120,7 @@ class ChatRequest(BaseModel):
     attachments: list[str] = []
     images: list[str] = []
     system_prompt: str = ""
-    thinking_level: str = ""
+    thinking_level: str = "medium"
     mcp_servers: dict = {}
     context_window: int = 0
     skills: list[str] = []
@@ -1174,11 +1174,12 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110 — broken connectors are handled lazily
         pass
 
-    # Install the built-in starter skills on the very first run (no-op later).
+    # Seed built-in skills from backend/skills/*.md on every startup (no-op for
+    # skills that already exist, so user edits/deletions are never overwritten).
     try:
-        from tools import seed_starter_skills
+        from tools import sync_builtin_skills
 
-        seed_starter_skills()
+        sync_builtin_skills()
     except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
         pass
 

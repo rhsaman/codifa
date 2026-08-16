@@ -21,8 +21,13 @@ const REASONING_PATTERNS: RegExp[] = [
   /\bexp\b.*\breason/i,
 ]
 
-export function supportsReasoning(modelId: string, kind: ProviderKind = 'opencode'): boolean {
+export function supportsReasoning(
+  modelId: string,
+  kind: ProviderKind = 'opencode',
+  reasoning?: boolean | null,
+): boolean {
   const id = (modelId || '').trim()
   if (!id) return false
+  if (typeof reasoning === 'boolean') return reasoning
   return REASONING_PATTERNS.some((re) => re.test(id))
 }

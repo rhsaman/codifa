@@ -4,7 +4,6 @@ import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, Searc
 import { useStore, defaultMaxHistoryFor, flushStateNow } from '../lib/store'
 import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
 import { api } from '../lib/fs'
-import { supportsReasoning } from '../lib/thinking'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
@@ -837,6 +836,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         const res = await fetchModels(cfg)
         if (cancelled) return
         useStore.getState().setProviderContextMap(active.id, res.context)
+        useStore.getState().setProviderReasoningMap(active.id, res.reasoning)
         if (res.models.length > 0) {
           const current = useStore.getState().settings.providers.find((p) => p.id === active.id)
           const existing = current?.models ?? []
@@ -1359,37 +1359,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 )}
               </div>
             )}
-
-            <div className="field">
-              <label>Thinking level</label>
-              {supportsReasoning(cfg.model, cfg.kind) ? (
-                <>
-                  <select
-                    value={cfg.thinkingLevel ?? ''}
-                    onChange={(e) => setCfg({ ...cfg, thinkingLevel: e.target.value as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' })}
-                  >
-                    <option value="">Auto</option>
-                    <option value="none">None</option>
-                    <option value="minimal">Minimal</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="xhigh">Extra high</option>
-                  </select>
-                  <div className="hint">
-                    Controls reasoning effort. For small-context models (e.g. 8K), choose{' '}
-                    <strong>None</strong> or <strong>Minimal</strong> — reasoning tokens are
-                    re-sent every tool call and are the main cause of cut-off / context overflow.
-                  </div>
-                </>
-              ) : (
-                <div className="hint">
-                  This model doesn't expose a reasoning mode — thinking level isn't applied.
-                  Local adapters like llama.cpp only honor reasoning effort on models that
-                  support it (e.g. Qwen3, DeepSeek-R1).
-                </div>
-              )}
-            </div>
 
             <div className="field">
               <label>Models for this provider</label>

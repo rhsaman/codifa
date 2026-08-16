@@ -241,6 +241,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     contextWindow: p.contextWindow,
     contextMap: p.contextMap,
     pricingMap: p.pricingMap,
+    reasoningMap: p.reasoningMap,
     maxHistory: p.maxHistory,
     thinkingLevel: p.thinkingLevel ?? '',
     models: Array.isArray(p.models)
@@ -315,6 +316,7 @@ interface State {
   setProviderModels: (id: string, models: string[]) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
+  setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
   removeProviderModel: (id: string, model: string) => void
   setMcpServers: (mcpServers: Record<string, McpServerConfig>) => void
   addMcpServer: (name: string, cfg: McpServerConfig) => void
@@ -833,6 +835,16 @@ export const useStore = create<State>((set, get) => ({
       settings: {
         ...s.settings,
         providers: s.settings.providers.map((p) => (p.id === id ? { ...p, pricingMap } : p)),
+      },
+    }))
+    get().persist()
+  },
+
+  setProviderReasoningMap: (id, reasoningMap) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => (p.id === id ? { ...p, reasoningMap } : p)),
       },
     }))
     get().persist()

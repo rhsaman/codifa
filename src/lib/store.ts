@@ -14,6 +14,7 @@ import type {
   SearchPluginConfig,
   SearchPluginKind,
   Settings,
+  ThinkingLevel,
   TokenUsage,
   Workspace,
 } from '../types'
@@ -304,6 +305,9 @@ interface State {
   isThinking: boolean
   /** Session-scoped "allow outside-workspace" (reset when the root changes). */
   outsideAllowed: boolean
+  /** Global "Ctrl+X prefix armed" hint. The prefix is app-wide (managed in
+   *  App.tsx), so this lives at the store root, not per-chat. */
+  prefixNotice: string | null
 
   load: () => Promise<void>
   persist: () => void
@@ -392,7 +396,19 @@ interface State {
   setChatMode: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
+  setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
+  setChatAutoSkills: (id: string, on: boolean) => void
+  setChatProvider: (id: string, providerId: string, model: string) => void
   renameChat: (id: string, title: string) => void
+  /** Transient compact/command/stall banners, stored per-chat so they survive
+   *  the ChatPanel remount on chat switch (same rationale as pendingAsk). */
+  setChatCompacting: (id: string, compacting: boolean) => void
+  setChatCompactNotice: (id: string, notice: string | null) => void
+  setChatCompactError: (id: string, error: string | null) => void
+  setChatCmdError: (id: string, error: string | null) => void
+  setChatStalled: (id: string, stalled: boolean) => void
+  /** Set/clear the app-wide Ctrl+X prefix hint. */
+  setPrefixNotice: (notice: string | null) => void
   addMessage: (chatId: string, message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
   /** Record a message typed while the chat's agent is already working. */
@@ -452,10 +468,18 @@ interface State {
 
 function makeChat(mode: AgentMode = 'ask'): Chat {
   const now = Date.now()
+  const s = useStore.getState()
+  const activeProvider =
+    s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
+    s.settings.providers[0]
   return {
     id: uid(),
     title: 'New chat',
     mode,
+    thinkingLevel: 'medium',
+    autoSkills: s.settings.autoSkills === true,
+    providerId: activeProvider?.id,
+    model: activeProvider?.model,
     messages: [],
     createdAt: now,
     updatedAt: now,
@@ -518,6 +542,7 @@ export const useStore = create<State>((set, get) => ({
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
   activeChatId: '',
+  prefixNotice: null,
   settingsOpen: false,
   isStreaming: false,
   isThinking: false,
@@ -556,9 +581,18 @@ export const useStore = create<State>((set, get) => ({
       /* keep the persisted value */
     }
     const loadedChats0 = chats && chats.length > 0 ? chats : []
-    const loadedChats = loadedChats0.map((c) =>
-      c.mode ? { ...c, mode: normalizeMode(c.mode) } : c,
-    ) as Chat[]
+    const loadedChats = loadedChats0.map((c) => {
+      // Transient compact/command/stall banners must never survive a reload —
+      // no request is running after a restart, so a persisted `compacting` or
+      // `stalled` would show a stale loading banner forever.
+      const clean = { ...c }
+      delete clean.compacting
+      delete clean.compactNotice
+      delete clean.compactError
+      delete clean.cmdError
+      delete clean.stalled
+      return clean.mode ? { ...clean, mode: normalizeMode(clean.mode) } : clean
+    }) as Chat[]
     const activeId = loadedChats[loadedChats.length - 1]?.id ?? ''
     // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
     // the in-memory store always works with plaintext.
@@ -1242,6 +1276,24 @@ export const useStore = create<State>((set, get) => ({
       ),
     }))
   },
+  setChatThinkingLevel: (id, level) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, thinkingLevel: level, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
+  setChatAutoSkills: (id, on) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, autoSkills: on, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
+  setChatProvider: (id, providerId, model) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, providerId, model, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
 
   renameChat: (id, title) => {
     set((s) => ({
@@ -1392,6 +1444,40 @@ export const useStore = create<State>((set, get) => ({
     }))
   },
 
+  setChatCompacting: (id, compacting) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, compacting } : c)),
+    }))
+  },
+
+  setChatCompactNotice: (id, compactNotice) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, compactNotice } : c)),
+    }))
+  },
+
+  setChatCompactError: (id, compactError) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, compactError } : c)),
+    }))
+  },
+
+  setChatCmdError: (id, cmdError) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, cmdError } : c)),
+    }))
+  },
+
+  setChatStalled: (id, stalled) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, stalled } : c)),
+    }))
+  },
+
+  setPrefixNotice: (prefixNotice) => {
+    set({ prefixNotice })
+  },
+
   markToolReverted: (messageId, index) => {
     set((s) => ({
       chats: s.chats.map((c) => {
@@ -1459,13 +1545,19 @@ export const useStore = create<State>((set, get) => ({
         )
         // On a repeated /compact, also fold any PREVIOUS system summary so only
         // the newest summary renders as the prominent block (the old ones stay
-        // greyed/collapsible like any other folded message).
+        // in the scrollback like any other folded message).
         for (const m of c.messages) {
           if (m.role === 'system') compactedIds.add(m.id)
         }
+        // Folded messages KEEP their per-turn usage so their token badge stays
+        // visible (the context meter ignores them — it only scans non-compacted
+        // messages). The preserved tail has its usage CLEARED so the context
+        // meter resets to the estimate right after a compact instead of showing
+        // the stale pre-compact total of the last kept exchange. chat.usage
+        // (per-model session totals) is untouched — it only ever grows.
         const messages = c.messages.map((m) =>
           compactedIds.has(m.id)
-            ? { ...m, compacted: true, usage: undefined as TokenUsage | undefined }
+            ? { ...m, compacted: true }
             : { ...m, usage: undefined as TokenUsage | undefined },
         )
         const summaryMsg = {
@@ -1592,4 +1684,19 @@ export function getActiveProvider(): ProviderConfig {
     s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
     s.settings.providers[0]
   )
+}
+
+/** Resolve the provider a chat should run on: the chat's own per-chat override
+ *  (set via the composer picker) when present, else the global active provider.
+ *  The returned provider carries the chat's model override too, so a chat that
+ *  picked a different model sends on that model without touching the global
+ *  default. */
+export function getChatProvider(chatId: string | null | undefined): ProviderConfig {
+  const s = useStore.getState()
+  const ch = chatId ? (s.chats.find((c) => c.id === chatId) ?? null) : null
+  const overrideId = ch?.providerId
+  const p =
+    s.settings.providers.find((x) => x.id === (overrideId ?? s.settings.activeProviderId)) ??
+    s.settings.providers[0]
+  return ch?.model ? { ...p, model: ch.model } : p
 }

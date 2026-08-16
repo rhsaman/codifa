@@ -713,7 +713,7 @@ def _subagent_target(
 
 SYSTEM_PROMPTS: dict[str, str] = {
     "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use glob for filenames (patterns like `**/*.ts` or `src/*.py`), grep for content (regex, optionally with include to filter extensions), and read to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
+    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
     "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
 }
 
@@ -1660,6 +1660,14 @@ def _usage_event(usage, model: str = "") -> dict | None:
         #    است، بنابراین cache را جدا اضافه نمی‌کنیم تا عدد دو بار نشمارده نشود
         #    (کاملاً منطبق با مستندات pydantic-ai و رویه‌ی opencode).
         total_tokens = int(input_tokens) + int(output_tokens)
+
+        # 3b. یک رکورد usage با صفر توکن، دژنره است (درخواست ردشده/خالی که
+        #     provider هیچ توکنی برایش حساب نکرده). اگر emit شود، متر کانتکست
+        #     فرانت‌اند را به ۰٪ گمراه‌کننده می‌برد (و بعد با رسیدن usage واقعی
+        #     «خودش درست می‌شود»). پس آن را emit نمی‌کنیم تا متر به آخرین
+        #     usage واقعی برگردد.
+        if total_tokens <= 0:
+            return None
 
         # 4. اطمینان از اینکه خروجی حتماً عدد صحیح (int) است
         return {
@@ -2832,6 +2840,7 @@ async def _compact_history(
     max_history: int = 10,
     max_chars: int = 30_000,
     usage_cap=None,
+    fallback_model: Any = None,
 ) -> list[dict] | None:
     """Collapse older turns into one short summary note, keeping the most recent
     turns verbatim, so a full window can continue instead of being cut off.
@@ -2852,6 +2861,12 @@ async def _compact_history(
     the summarizing call fails — on failure it does NOT drop the older turns
     (the caller surfaces a ``compact_failed`` event so the user can retry
     manually rather than silently losing context).
+
+    If ``fallback_model`` is provided and differs from ``model``, a failed or
+    empty summarizer run on ``model`` (the configured compact subagent) is
+    retried once on ``fallback_model`` (the main model) — mirroring the manual
+    /compact path, so a flaky compact subagent degrades to the working model
+    instead of surfacing ``compact_failed``.
     """
     keep = min(max_history, max(8, len(history) // 2))
     # Preserve one fewer recent turn than `keep` so the prepended summary still
@@ -2887,8 +2902,7 @@ async def _compact_history(
     if len(text) > max_chars:
         text = text[-max_chars:] + "\n...(older part omitted)"
 
-    summary = ""
-    try:
+    async def _summarize(m: Any) -> str:
         kwargs = {
             "system_prompt": (
                 "You are a code-session context compressor. Read the earlier conversation "
@@ -2918,19 +2932,32 @@ async def _compact_history(
         }
         if usage_cap is not None:
             kwargs["capabilities"] = [usage_cap]
-        summarizer = Agent(model, **kwargs)
+        summarizer = Agent(m, **kwargs)
         result = await summarizer.run(
             text,
             model_settings=ModelSettings(
-                timeout=model_timeout(model=model, total=60, connect=15, read=60)
+                timeout=model_timeout(model=m, total=60, connect=15, read=60)
             ),
         )
-        summary = str(getattr(result, "output", "") or "").strip()
-    except Exception:  # noqa: BLE001
-        return None  # compact failed — do NOT drop messages; caller surfaces a retry
+        return str(getattr(result, "output", "") or "").strip()
 
+    summary = ""
+    try:
+        summary = await _summarize(model)
+    except Exception:  # noqa: BLE001
+        summary = ""
+    # The configured compact subagent failed (bad key, provider down, rate
+    # limit, timeout, empty output) — fall back to the main model once,
+    # mirroring the manual /compact path in the frontend. Without this,
+    # auto-compact fails whenever the compact subagent is flaky, while the
+    # same turn retried manually (or /compact) succeeds.
+    if not summary and fallback_model is not None and fallback_model is not model:
+        try:
+            summary = await _summarize(fallback_model)
+        except Exception:  # noqa: BLE001
+            summary = ""
     if not summary:
-        return None  # empty summary — treat as failure, do NOT drop messages
+        return None  # compact failed — do NOT drop messages; caller surfaces a retry
 
     if existing_summary:
         summary = existing_summary.rstrip() + "\n\n" + summary
@@ -4848,11 +4875,15 @@ async def run_agent(
         tool_steps_turn = 0
         # A mutating tool (write/edit/terminal) that already ran this attempt.
         # Once such a side effect lands, re-running the attempt from scratch
-        # could duplicate it, so we refuse to auto-compact+retry AND refuse to
-        # backoff-and-retry (mirroring the historical `activity_happened` guard).
-        # Read-only tool calls / streamed text do NOT block auto-compact —
-        # otherwise a model that lists/reads files and then overflows on the
-        # very next model request would never auto-compact.
+        # could duplicate it, so we refuse to backoff-and-retry blindly. The
+        # auto-compact / widen-retry paths DO still run after a mutation, but
+        # they feed the turn's tool log back as a resume note ("do NOT repeat")
+        # so the model continues from the completed work instead of re-running
+        # the write — refusing to recover at all would just crash the whole
+        # turn (strictly worse than a possible duplicate). Read-only tool calls
+        # / streamed text do NOT block auto-compact — otherwise a model that
+        # lists/reads files and then overflows on the very next model request
+        # would never auto-compact.
         mutating_ran = False
         # Fresh queue each attempt: `tools`' emit callback closes over the
         # `queue` name (late-bound), so reassigning it here is picked up by
@@ -5235,7 +5266,7 @@ async def run_agent(
             # retry machinery handles it (and, on retry, the scaled usage_limits
             # above give it a higher ceiling) instead of it falling through to
             # the fatal path and killing the turn mid-plan.
-            if isinstance(exc, UsageLimitExceeded) and not mutating_ran:
+            if isinstance(exc, UsageLimitExceeded):
                 exc = _HighWatermark(
                     ctx,
                     ctx,
@@ -5244,8 +5275,12 @@ async def run_agent(
             # Auto-compact: the request itself overflowed the model's context
             # window (not a transient blip). Shrink the body of the turn (history
             # first, then the auto-scout) and retry so the task can actually
-            # finish. Only safe while no mutating tool has run (no side effects
-            # to duplicate). Read-only tool calls / streamed text do NOT block
+            # finish. Runs even after a mutating tool (write/edit/terminal) has
+            # executed: the retried request carries the turn's tool log as a
+            # resume note ("do NOT repeat"), so the model continues from the
+            # completed work instead of re-running it — refusing to compact here
+            # would just crash the whole turn (strictly worse than a possible
+            # duplicate). Read-only tool calls / streamed text do NOT block
             # this — otherwise a model that lists/reads files and then overflows
             # on the very next request would never auto-compact.
             #
@@ -5257,8 +5292,7 @@ async def run_agent(
             # branch below, which feeds back the turn's tool work instead of
             # dropping it on the floor.
             if (
-                not mutating_ran
-                and len(history) > 0
+                len(history) > 0
                 and (
                     _is_context_overflow(exc)
                     or (isinstance(exc, _HighWatermark) and exc.note is None)
@@ -5328,6 +5362,11 @@ async def run_agent(
                     history,
                     max_history=max_history,
                     usage_cap=compact_cap,
+                    fallback_model=(
+                        None
+                        if compact_model is None or compact_model is model
+                        else model
+                    ),
                 )
                 compact_keep: int = 0
                 if compacted is not None and isinstance(compacted, tuple):
@@ -5454,7 +5493,6 @@ async def run_agent(
             if (
                 isinstance(exc, _HighWatermark)
                 and exc.note is not None
-                and not mutating_ran
                 and high_watermark_retries < 2
             ):
                 high_watermark_retries += 1
@@ -5482,7 +5520,6 @@ async def run_agent(
             if (
                 isinstance(exc, _HighWatermark)
                 and exc.note is not None
-                and not mutating_ran
             ):
                 # The single widen-and-resume retry above is exhausted. This is
                 # NOT a real context overflow (the request is still well under
@@ -5562,15 +5599,13 @@ async def run_agent(
             # a full redo instead of continuing. Capped so a provider that keeps
             # dropping mid-stream eventually fails loudly instead of looping.
             #
-            # Deliberately NOT gated on `not mutating_ran` (unlike the widen-retry
-            # branches above): those widen the tool-step BUDGET, handing the model
-            # more room to act, which is reasonably more conservative post-write.
-            # This branch does the opposite — it does not grant anything new, it
-            # just re-delivers the SAME turn_tool_log (which already confirms the
-            # write/edit completed) with an explicit "do NOT repeat this" note.
-            # Refusing to resume here doesn't prevent a duplicate write; it just
-            # crashes the whole turn, which is strictly worse: the user has no
-            # clean way to tell the model what already happened.
+            # NOT gated on `not mutating_ran`: every recovery branch (this one,
+            # the widen-retry above, and auto-compact) now runs even after a
+            # write/edit/terminal has executed, because each re-delivers the
+            # turn_tool_log as a "do NOT repeat this" resume note — refusing to
+            # resume doesn't prevent a duplicate write; it just crashes the
+            # whole turn, which is strictly worse: the user has no clean way to
+            # tell the model what already happened.
             if timeout_recovery_retries < 2 and (
                 isinstance(exc, (TimeoutError, asyncio.TimeoutError))
                 or not str(exc).strip()
@@ -5618,6 +5653,11 @@ async def run_agent(
                     compact_model or model,
                     history,
                     max_history=max_history,
+                    fallback_model=(
+                        None
+                        if compact_model is None or compact_model is model
+                        else model
+                    ),
                 )
                 if compacted is not None:
                     if isinstance(compacted, tuple):

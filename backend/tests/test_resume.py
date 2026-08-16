@@ -78,7 +78,10 @@ async def main():
         tools = [t for t in resume["tools"] if isinstance(t, dict)]
         assert tools and tools[0]["tool"] == "grep", "resume file lost the grep record"
         full_result = tools[0]["result"]
-        assert "MATCHES" in full_result and "app.py" in full_result, \
+        # grep now distills through the search/explore subagent (defaults to the
+        # parent model when no subagent is configured), so the stored result is
+        # the distilled summary — still the FULL tool result the resume replays.
+        assert full_result and "foo" in full_result, \
             f"resume result is not the FULL grep output: {full_result[:200]!r}"
         print("  resume/1 OK: interrupted; file holds full grep result")
 
@@ -113,7 +116,12 @@ async def main():
         chat2 = "chat-resume-2"
         mock.script = [
             tool_call("grep", json.dumps({"pattern": "def", "path": ""})),
-            None,  # next model request gets a hard 400
+            # grep distills through the search subagent (defaults to the parent
+            # model), so this request consumes the next script item — give it a
+            # valid reply so the hard 400 below hits the MAIN model's next
+            # request instead of being swallowed by the distiller fallback.
+            text_reply("distilled summary"),
+            None,  # next MAIN model request gets a hard 400
         ]
         mock.captured = []
         raised = None
@@ -210,7 +218,8 @@ async def main():
         chat5 = "chat-resume-5"
         mock.script = [
             tool_call("grep", json.dumps({"pattern": "foo", "path": ""})),
-            None,  # hard 400 — the turn errors after the grep completes
+            text_reply("distilled summary"),  # search-distiller sub-agent request
+            None,  # hard 400 on the MAIN model — the turn errors after the grep completes
         ]
         mock.captured = []
         try:

@@ -40,6 +40,8 @@ export function ProviderModelSelect() {
   const setProviderConfig = useStore((s) => s.setProviderConfig);
   const setProviderModels = useStore((s) => s.setProviderModels);
   const addRecentModel = useStore((s) => s.addRecentModel);
+  const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
+  const setChatProvider = useStore((s) => s.setChatProvider);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
@@ -67,6 +69,11 @@ export function ProviderModelSelect() {
         // context-meter cost chip have no pricing to look up and always show
         // "—" / $0, even though the backend already resolved real prices.
         useStore.getState().setProviderPricingMap(p.id, res.pricing);
+        // Reasoning support per model (from the backend's models.dev catalog
+        // enrichment) — drives the thinking pill in the composer. Kept in sync
+        // with the context/pricing maps so the toggle appears as soon as the
+        // model list loads, even if the Chat.tsx effect hasn't run yet.
+        useStore.getState().setProviderReasoningMap(p.id, res.reasoning);
       })
       .catch(() => {
         /* keep the provider's saved list when /models is unavailable */
@@ -98,8 +105,13 @@ export function ProviderModelSelect() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const active = providers.find((p) => p.id === activeId) ?? providers[0];
+  // Per-chat model override: each chat remembers its own provider/model choice
+  // (set via this picker), falling back to the global active provider when the
+  // chat has never overridden it.
+  const activeProviderId = chat?.providerId ?? activeId;
+  const active = providers.find((p) => p.id === activeProviderId) ?? providers[0];
   if (!active) return null;
+  const activeModel = chat?.model ?? active.model;
 
   // Fetched models + the provider's saved list (custom-added, from the DB) +
   // current model, minus the models the user explicitly removed.
@@ -179,8 +191,14 @@ export function ProviderModelSelect() {
 
   const pick = (p: ProviderConfig, m: string) => {
     const model = bareModel(p, m);
-    setActiveProvider(p.id);
-    setProviderConfig({ model });
+    if (chat) {
+      // Per-chat: remember THIS chat's provider/model choice only — other
+      // chats and the global default stay untouched.
+      useStore.getState().setChatProvider(chat.id, p.id, model);
+    } else {
+      setActiveProvider(p.id);
+      setProviderConfig({ model });
+    }
     addRecentModel(model, p.id);
     if (!(p.models ?? []).includes(model)) {
       setProviderModels(p.id, [...(p.models ?? []), model]);
@@ -188,7 +206,7 @@ export function ProviderModelSelect() {
     setOpen(false);
   };
 
-  const label = active.model ? modelLabel(active, active.model) : active.name;
+  const label = activeModel ? modelLabel(active, activeModel) : active.name;
 
   return (
     <div className={`pm-select${open ? " open" : ""}`} ref={wrapRef}>
@@ -218,7 +236,7 @@ export function ProviderModelSelect() {
               <div className="pm-recents">
                 <div className="pm-recent-label">Recent</div>
                 {recentsShown.map(({ p, model }) => {
-                  const isCurrent = p.id === activeId && model === active.model;
+                  const isCurrent = p.id === activeProviderId && model === activeModel;
                   return (
                     <button
                       key={`${p.id}/${model}`}
@@ -248,7 +266,7 @@ export function ProviderModelSelect() {
                 <div key={p.id} className={`pm-provider${isOpen ? " open" : ""}`}>
                   <button
                     type="button"
-                    className={`pm-provider-name ${p.id === activeId ? "active" : ""}`}
+                    className={`pm-provider-name ${p.id === activeProviderId ? "active" : ""}`}
                     onClick={() => toggle(p.id)}
                   >
                     <span className="pm-provider-caret">{isOpen ? "▾" : "▸"}</span>
@@ -261,7 +279,7 @@ export function ProviderModelSelect() {
                     <div className="pm-models">
                       {loading && <div className="pm-loading">Fetching models…</div>}
                       {models.map((m) => {
-                        const isCurrent = p.id === activeId && m === active.model;
+                        const isCurrent = p.id === activeProviderId && m === activeModel;
                         return (
                           <button
                             key={m}

@@ -143,10 +143,19 @@ class _PerStepFallbackModel:
         # attribute is looked up before __init__ finished assigning _primary.
         return getattr(object.__getattribute__(self, "_primary"), name)
 
-    async def request(self, messages: list[Any], *, model_settings: Any = None, **kwargs: Any) -> Any:
+    async def request(
+        self,
+        messages: list[Any],
+        model_settings: Any = None,
+        model_request_parameters: Any = None,
+        **kwargs: Any,
+    ) -> Any:
         try:
             response = await self._primary.request(
-                messages, model_settings=model_settings, **kwargs
+                messages,
+                model_settings=model_settings,
+                model_request_parameters=model_request_parameters,
+                **kwargs,
             )
             if self._on_primary is not None:
                 try:
@@ -154,20 +163,39 @@ class _PerStepFallbackModel:
                 except Exception:  # noqa: BLE001, S110 — cosmetic only
                     pass
             return response
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — any primary failure → try the fallback model
             if self._on_fallback is not None:
                 try:
                     self._on_fallback(exc)
                 except Exception:  # noqa: BLE001, S110 — cosmetic only
                     pass
             return await self._fallback.request(
-                messages, model_settings=model_settings, **kwargs
+                messages,
+                model_settings=model_settings,
+                model_request_parameters=model_request_parameters,
+                **kwargs,
             )
 
     # request_stream is intentionally NOT defined here: the sub-agents run
     # non-streaming, so __getattr__ delegates it to the primary model as-is
     # (a streaming fallback would need an async-context-manager dance that
     # the sub-agents never exercise).
+
+
+# pydantic-ai's Agent(...) resolves its model through `models.infer_model`,
+# which returns the model unchanged only when `isinstance(model, Model)`.
+# Register the wrapper as a VIRTUAL subclass of the Model ABC so Agent(...)
+# accepts it instead of parsing it as a model-id string — which crashed with
+# "argument of type '_PerStepFallbackModel' is not iterable" (the `in` check
+# in parse_model_id iterates a non-string). Virtual subclassing keeps the
+# wrapper a plain class, so __getattr__ still delegates every attribute
+# (provider, settings, request_stream, ...) to the primary model.
+try:
+    from pydantic_ai.models import Model as _PAIModel
+
+    _PAIModel.register(_PerStepFallbackModel)
+except Exception:  # noqa: BLE001, S110 — pydantic-ai is a hard dependency; degrade gracefully
+    pass
 
 
 def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
@@ -2855,7 +2883,7 @@ def make_tool_callbacks(
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
-        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations."""
+        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes)."""
         _reader_model = main_model if _fallback_state.get("search") else search_model
         _reader_model_name = (
             str(getattr(_reader_model, "model_name", "") or "")
@@ -3206,23 +3234,37 @@ def make_tool_callbacks(
         # main model (non-sticky).
         _run_model = explore_model
         _run_model_name = str(getattr(_run_model, "model_name", "") or "")
-        emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _run_model_name})
         if explore_model is None:
+            emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": ""})
             emit(_error_result("explore", "unavailable"))
             return "ERROR: explore is unavailable (no model configured for this session)."
 
         # Sub-agent-specific tighter limits — keeps tool output compact
         # so the sub-agent model sees only relevant data, never megabytes.
-        _sub_listing_count = min(listing_count, 30)
-        _sub_search_count = min(search_count, 30)
+        _sub_listing_count = min(listing_count, 15)
+        _sub_search_count = min(search_count, 15)
         _sub_tool_out_chars = max(400, min(tool_out_chars, 5_000))
 
         # The model name stamped on the sub-agent's internal tool events. Updated
         # per _run_explore(model) so a fallback run on the main model labels its
         # read/grep/glob events with the main model, not the failed sub-agent's.
         _sub_emit_model_name = _run_model_name
-
+ 
+        # Per-branch emit state: with a PARALLEL fan-out each branch runs in its
+        # own asyncio task, so a shared mutable model-name variable would race
+        # (one branch fallback would mislabel another branch events). Each
+        # _run_explore branch sets its OWN emit closure into this contextvar —
+        # contextvars are per-task, so the shared sub-tools pick up the right
+        # branch closure (and branch id) automatically.
+        _sub_emit_ctx: contextvars.ContextVar = contextvars.ContextVar(
+            "explore_sub_emit", default=None
+        )
+ 
         def _sub_emit(event: dict) -> None:
+            branch_emit = _sub_emit_ctx.get()
+            if branch_emit is not None:
+                branch_emit(event)
+                return
             # Forward to the same UI stream (so the user sees live sub-agent
             # activity) but tagged `sub=True` so the PARENT's deterministic
             # tool-step budget (see agents.py) does not count these steps —
@@ -3550,7 +3592,7 @@ def make_tool_callbacks(
 
         from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
 
-        async def _run_explore(model: Any, task_text: str) -> str:
+        async def _run_explore_inner(model: Any, task_text: str, state: dict) -> str:
             """Run the isolated exploration sub-agent on ``model`` with the given
             task text (path_hint/hints already prepended by the caller) and return
             its report. The model is wrapped in a _PerStepFallbackModel, so every
@@ -3561,9 +3603,7 @@ def make_tool_callbacks(
             caches so a resumed run continues from the failed attempt's findings
             instead of re-exploring from zero. Raises ``_UsageLimitExceeded``
             (step budget — NOT a model failure, so no fallback) or the underlying
-            exception when BOTH models fail a step."""
-            nonlocal _sub_emit_model_name
-            _sub_emit_model_name = str(getattr(model, "model_name", "") or "")
+            exception when BOTH models fail a step. state["model"] is the per-branch model name stamped on this branch sub-agent events (set by the _run_explore wrapper, updated on per-sub-search fallback)."""
             from pydantic_ai import Agent as _Agent
             from pydantic_ai import Tool as _Tool
             from pydantic_ai.messages import (
@@ -3585,8 +3625,7 @@ def make_tool_callbacks(
             _fallback_name = str(getattr(_fallback_model, "model_name", "") or "")
 
             def _on_step_fallback(exc: Exception) -> None:
-                nonlocal _sub_emit_model_name
-                _sub_emit_model_name = _fallback_name
+                state["model"] = _fallback_name
                 try:
                     emit(
                         {
@@ -3607,8 +3646,7 @@ def make_tool_callbacks(
                     pass
 
             def _on_step_primary() -> None:
-                nonlocal _sub_emit_model_name
-                _sub_emit_model_name = _primary_name
+                state["model"] = _primary_name
 
             _run_model_wrapped = _PerStepFallbackModel(
                 model,
@@ -3764,8 +3802,8 @@ def make_tool_callbacks(
             # Each retry keeps the result cache (built above), so the fresh model
             # gets its earlier findings back via the dedup instead of re-exploring.
             _sub_model_name = str(getattr(model, "model_name", "") or "")
-            _sub_request_limit = 10
-            _sub_tool_calls_limit = 24
+            _sub_request_limit = 6
+            _sub_tool_calls_limit = 12
             _sub_widen_retries = 0
             _sub_overflow_retries = 0
             _sub_run_prompt = task_text
@@ -3811,8 +3849,8 @@ def make_tool_callbacks(
                     if _sub_widen_retries >= 2:
                         raise
                     _sub_widen_retries += 1
-                    _sub_request_limit = min(_sub_request_limit * 2, 40)
-                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 72)
+                    _sub_request_limit = min(_sub_request_limit * 2, 24)
+                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 36)
                     resume_note = _sub_resume_note()
                     if resume_note:
                         _sub_run_prompt = f"{task_text}\n\n{resume_note}"
@@ -3923,6 +3961,27 @@ def make_tool_callbacks(
                 emit(_usage_ev)
             return report
 
+        async def _run_explore(model: Any, task_text: str, branch_id: int = 0) -> str:
+            """Per-branch wrapper: stamps every sub-agent event with this
+            branch id and the model that ACTUALLY ran it (the sub-agent model,
+            or the main model after a per-sub-search fallback). Each branch runs
+            in its own asyncio task, so the contextvar keeps the shared sub-tools
+            pointed at THIS branch closure — no cross-branch races."""
+            state = {"model": str(getattr(model, "model_name", "") or "")}
+
+            def _branch_emit(event: dict) -> None:
+                event = dict(event)
+                event["sub"] = True
+                event["branch"] = branch_id
+                event.setdefault("model", state["model"])
+                emit(event)
+
+            _token = _sub_emit_ctx.set(_branch_emit)
+            try:
+                return await _run_explore_inner(model, task_text, state)
+            finally:
+                _sub_emit_ctx.reset(_token)
+
         def _build_task_text(t: str) -> str:
             text = t
             if path_hint:
@@ -3937,6 +3996,7 @@ def make_tool_callbacks(
         # the rest of the turn — onto the main model (non-sticky). Step-budget
         # exhaustion (_UsageLimitExceeded) is deliberately NOT a fallback — it
         # means the task is too broad, not that the model is broken.
+        _emitted_result = False
         if subtasks:
             # PARALLEL FAN-OUT: run 3+ separate sub-agents SIMULTANEOUSLY
             # (one per sub-area) so a broad investigation finishes in roughly
@@ -3946,9 +4006,25 @@ def make_tool_callbacks(
             _branch_texts = [
                 _build_task_text(t) for t in [task, *subtasks] if t and t.strip()
             ][:5]  # cap: 1 main + up to 4 subtasks
+            # One explore card PER BRANCH (tagged with its branch id) so the UI
+            # shows the parallel fan-out as separate cards, each with its own
+            # sub-agent model badge — not one card hiding N branches.
+            for _bi, _bt in enumerate(_branch_texts):
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "explore",
+                        "args": {"task": _bt},
+                        "model": _run_model_name,
+                        "branch": _bi,
+                    }
+                )
             try:
                 _reports = await asyncio.gather(
-                    *[_run_explore(_run_model, t) for t in _branch_texts],
+                    *[
+                        _run_explore(_run_model, t, i)
+                        for i, t in enumerate(_branch_texts)
+                    ],
                     return_exceptions=True,
                 )
             except _UsageLimitExceeded:
@@ -3959,12 +4035,23 @@ def make_tool_callbacks(
                     "part yourself with grep/read."
                 )
             _merged: list[str] = []
-            for _t, _r in zip(_branch_texts, _reports):
+            for _bi, (_t, _r) in enumerate(zip(_branch_texts, _reports)):
                 if isinstance(_r, BaseException):
                     _r = f"ERROR: explore branch failed: {_r}"
                 _merged.append(f"=== {_t[:120]} ===\n{_r}")
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "explore",
+                        "summary": f"{len(str(_r))} chars",
+                        "model": _run_model_name,
+                        "branch": _bi,
+                    }
+                )
+                _emitted_result = True
             report = "\n\n".join(_merged)
         else:
+            emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _run_model_name})
             try:
                 report = await _run_explore(_run_model, _build_task_text(task))
             except _UsageLimitExceeded:
@@ -3985,8 +4072,9 @@ def make_tool_callbacks(
         if not report:
             emit(_error_result("explore", "no report"))
             return f"The exploration sub-agent found nothing usable for {task!r}."
-        _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
-        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _ran_model_name})
+        if not _emitted_result:
+            _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
+            emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _ran_model_name})
         return f"EXPLORE REPORT for {task!r}\n{report}"
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:

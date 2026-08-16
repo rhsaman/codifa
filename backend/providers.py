@@ -654,7 +654,7 @@ async def _models_dev_catalog() -> dict:
     return (_models_dev_cache[1] if _models_dev_cache else {}) or {}
 
 
-def _models_dev_id(provider: str, model_id: str) -> str:
+def _models_dev_id(provider: str, model_id: str, base_url: str = "") -> str:
     """Normalize a model id to the form models.dev catalogs use.
 
     Google's OpenAI-compatible /models returns ids prefixed with ``models/``
@@ -662,16 +662,43 @@ def _models_dev_id(provider: str, model_id: str) -> str:
     compatible gateways are cataloged under bare ids too, but the UI can hand
     us ``opencode/deepseek-v4-flash-free`` (the gateway's own /models returns
     the bare ``deepseek-v4-flash-free``). Stripping the ``models/`` prefix for
-    google and the provider key for opencode (harmless no-ops elsewhere) lets
-    one catalog lookup serve every provider.
+    google and the ``opencode/`` prefix for opencode lets one catalog lookup
+    serve every provider.
+
+    The provider-key prefix is stripped ONLY for opencode-compatible gateways:
+    models.dev keys opencode entries bare, but keys other providers' entries
+    WITH their own prefix (nvidia: ``nvidia/<model>``), so stripping there
+    would break the lookup and lose the model's context/reasoning metadata.
     """
     mid = model_id or ""
     if _provider_meta(provider).get("strip_models_prefix") and mid.startswith("models/"):
         return mid[len("models/") :]
-    prefix = _models_dev_provider_key(provider)
-    if prefix and mid.startswith(prefix + "/"):
-        return mid[len(prefix) + 1 :]
+    if (
+        _models_dev_provider_key(provider, base_url) == "opencode"
+        and mid.startswith("opencode/")
+    ):
+        return mid[len("opencode/") :]
     return mid
+
+
+# models.dev catalog keys for well-known gateways, detected by base URL so a
+# custom provider pointed at a known gateway (e.g. api.openai.com) still gets
+# the catalog's context/reasoning metadata instead of an empty "custom" key.
+_GATEWAY_CATALOG_KEYS: tuple[tuple[str, str], ...] = (
+    ("api.openai.com", "openai"),
+    ("api.anthropic.com", "anthropic"),
+    ("openrouter.ai", "openrouter"),
+    ("generativelanguage.googleapis.com", "google"),
+    ("integrate.api.nvidia.com", "nvidia"),
+    ("api.deepseek.com", "deepseek"),
+    ("api.mistral.ai", "mistral"),
+    ("api.x.ai", "xai"),
+    ("api.groq.com", "groq"),
+    ("api.together.xyz", "together"),
+    ("api.fireworks.ai", "fireworks"),
+    ("api.cohere.com", "cohere"),
+    ("opencode.ai", "opencode"),
+)
 
 
 def _models_dev_provider_key(provider: str, base_url: str = "") -> str:
@@ -681,9 +708,17 @@ def _models_dev_provider_key(provider: str, base_url: str = "") -> str:
     custom provider pointed at ``opencode.ai`` (``is_opencode`` detects the
     base URL) — are all cataloged under the single ``opencode`` key in
     models.dev, so lookups must use that key rather than the provider name.
+    Custom providers pointed at a well-known gateway (api.openai.com,
+    api.anthropic.com, ...) resolve to that gateway's catalog key too, so
+    their models get the same context/reasoning metadata as the built-in
+    provider.
     """
     if is_opencode(provider, base_url):
         return "opencode"
+    if provider == "custom" and base_url:
+        for host, key in _GATEWAY_CATALOG_KEYS:
+            if host in base_url:
+                return key
     return provider
 
 
@@ -998,7 +1033,7 @@ async def list_models(
                 dev_key = _models_dev_provider_key(provider, base_url)
                 for m in models:
                     dev_ctx = _models_dev_context(
-                        catalog, dev_key, _models_dev_id(provider, m["id"])
+                        catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
                     )
                     if dev_ctx:
                         m["context"] = dev_ctx
@@ -1009,17 +1044,17 @@ async def list_models(
                     ):
                         m["context"] = 200_000
                     dev_out = _models_dev_max_output(
-                        catalog, dev_key, _models_dev_id(provider, m["id"])
+                        catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
                     )
                     if dev_out:
                         m["max_output"] = dev_out
                     if not m.get("pricing"):
                         m["pricing"] = _models_dev_pricing(
-                            catalog, dev_key, _models_dev_id(provider, m["id"])
+                            catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
                         )
                     if m.get("reasoning") is None:
                         m["reasoning"] = _models_dev_reasoning(
-                            catalog, dev_key, _models_dev_id(provider, m["id"])
+                            catalog, dev_key, _models_dev_id(provider, m["id"], base_url)
                         )
                 if _provider_meta(provider).get("model_class") == "google":
                     # Google's own REST catalog is the authoritative source for
@@ -1074,7 +1109,7 @@ async def model_context(
     # only — never a hardcoded map.
     catalog = await _models_dev_catalog()
     ctx = _models_dev_context(
-        catalog, _models_dev_provider_key(provider, base_url), _models_dev_id(provider, model)
+        catalog, _models_dev_provider_key(provider, base_url), _models_dev_id(provider, model, base_url)
     )
     if ctx:
         return ctx
@@ -1114,7 +1149,7 @@ async def model_max_output(
     out = _models_dev_max_output(
         catalog,
         _models_dev_provider_key(provider, base_url),
-        _models_dev_id(provider, model),
+        _models_dev_id(provider, model, base_url),
     )
     if out:
         return out

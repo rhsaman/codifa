@@ -1,6 +1,7 @@
 import {
   memo,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -12,7 +13,8 @@ import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage, ToolActivity } from '../types'
 import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
-import { useStore } from '../lib/store'
+import { defaultMaxHistoryFor, useStore } from '../lib/store'
+import { estimateContextTokens } from '../lib/context'
 import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
@@ -335,10 +337,24 @@ function LiveWorkingStatus({ message }: { message: ChatMessage }) {
   )
 }
 
-function UsageBadge({ input, output, total }: { input: number; output: number; total: number }) {
-  const body = `↑ ${fmtTokens(input)} in · ↓ ${fmtTokens(output)} out`
+function UsageBadge({
+  input,
+  output,
+  total,
+  live,
+}: {
+  input: number
+  output: number
+  total: number
+  live?: boolean
+}) {
+  const body = `↑ ${fmtTokens(input)} in · ↓ ${live ? '…' : fmtTokens(output)} out`
   return (
-    <span className="msg-usage" title={`${total.toLocaleString()} tokens total (${input.toLocaleString()} in, ${output.toLocaleString()} out)`} dir="ltr">
+    <span
+      className={`msg-usage${live ? ' live' : ''}`}
+      title={`${total.toLocaleString()} tokens total (${input.toLocaleString()} in, ${output.toLocaleString()} out)`}
+      dir="ltr"
+    >
       {body}
     </span>
   )
@@ -517,7 +533,6 @@ export const ChatMessageView = memo(function ChatMessageView({
   const dir = useStore((s) => s.dir)
   const settings = useStore((s) => s.settings)
   const [copied, setCopied] = useState(false)
-  const [collapsed, setCollapsed] = useState(message.compacted)
   // The context summary collapses by default — it is a compact checkpoint the
   // user can expand on demand instead of a wall of text dominating the bubble.
   const [summaryCollapsed, setSummaryCollapsed] = useState(
@@ -535,6 +550,35 @@ export const ChatMessageView = memo(function ChatMessageView({
       console.warn('copy failed', err)
     }
   }
+
+  // While a reply is still streaming, the provider hasn't reported real usage
+  // yet (the usage event only fires after each model request completes). Show a
+  // live estimate of the input side so the badge is visible during long
+  // responses; it swaps to the real numbers once the first usage event lands.
+  const liveInput = useMemo(() => {
+    if (!message.streaming || message.usage) return 0
+    const st = useStore.getState()
+    const chat = st.chats.find((c) => c.messages.some((m) => m.id === message.id))
+    if (!chat) return 0
+    const provider =
+      st.settings.providers.find((p) => p.id === st.settings.activeProviderId) ??
+      st.settings.providers[0]
+    const maxHistory = provider?.maxHistory ?? defaultMaxHistoryFor(provider?.kind)
+    const ctxWindow =
+      (provider?.contextMap?.[provider.model] &&
+        provider.contextMap[provider.model] > 0 &&
+        provider.contextMap[provider.model]) ||
+      (provider?.contextWindow && provider.contextWindow > 0
+        ? provider.contextWindow
+        : null)
+    return estimateContextTokens(
+      chat,
+      st.settings.systemPrompts?.[chat.mode] ?? '',
+      maxHistory,
+      ctxWindow ?? undefined,
+      chat.mode,
+    )
+  }, [message.id, message.streaming, message.usage])
 
   const isSummary = message.role === 'system' && !message.modeSwitch
   const isModeSwitch = message.modeSwitch === true
@@ -568,38 +612,6 @@ export const ChatMessageView = memo(function ChatMessageView({
         : isSummary
           ? 'Context summary'
           : 'Assistant'
-
-  // Folded-into-summary messages: a one-line toggle + a compact excerpt. Keep
-  // the raw text greyed out so the scrollback is still inspectable, but the
-  // message is NOT re-sent (the summary replaces it).
-  if (message.compacted) {
-    return (
-      <div className="msg compacted" data-msg-id={message.id}>
-        <div className="msg-role">
-          {roleLabel}
-          {message.usage && (
-            <UsageBadge
-              input={message.usage.inputTokens}
-              output={message.usage.outputTokens}
-              total={message.usage.totalTokens}
-            />
-          )}
-        </div>
-        <button
-          className="compacted-toggle"
-          onClick={() => setCollapsed((c) => !c)}
-          title={collapsed ? 'Show old message' : 'Hide old message'}
-        >
-          <span className={`chev ${collapsed ? '' : 'open'}`}>▸</span>
-          <span className="compacted-preview">
-            {collapsed
-              ? `${message.content.length > 90 ? stripBidiMarks(fixZwsp(message.content.slice(0, 90))) + '…' : stripBidiMarks(fixZwsp(message.content)) || '(no text)'}`
-              : stripBidiMarks(fixZwsp(message.content))}
-          </span>
-        </button>
-      </div>
-    )
-  }
 
   return (
     <div
@@ -730,13 +742,14 @@ export const ChatMessageView = memo(function ChatMessageView({
         )
       )}
 
-      {(message.content || (!isUser && message.usage)) && (
+      {(message.content || (!isUser && (message.usage || message.streaming))) && (
         <div className="msg-actions">
-          {!isUser && message.usage && (
+          {!isUser && (message.usage || message.streaming) && (
             <UsageBadge
-              input={message.usage.inputTokens}
-              output={message.usage.outputTokens}
-              total={message.usage.totalTokens}
+              input={message.usage?.inputTokens ?? liveInput}
+              output={message.usage?.outputTokens ?? 0}
+              total={message.usage?.totalTokens ?? liveInput}
+              live={!message.usage}
             />
           )}
           {message.content && (

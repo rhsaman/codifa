@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, useStore, defaultMaxHistoryFor } from "../lib/store";
+import { getActiveProvider, getChatProvider, useStore, defaultMaxHistoryFor } from "../lib/store";
 import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
 import {
@@ -192,11 +192,17 @@ export function ChatPanel() {
   const chat = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId) ?? null,
   );
-  const provider = useStore(
-    (s) =>
-      s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
-      s.settings.providers[0],
-  );
+  const provider = useStore((s) => {
+    // Per-chat provider override: a chat that picked its own provider/model in
+    // the composer runs on that, falling back to the global active provider.
+    const ch = s.chats.find((c) => c.id === s.activeChatId) ?? null;
+    const overrideId = ch?.providerId;
+    return (
+      s.settings.providers.find((x) => x.id === (overrideId ?? s.settings.activeProviderId)) ??
+      s.settings.providers[0]
+    );
+  });
+  const activeModel = chat?.model ?? provider.model;
   const allProviders = useStore((s) => s.settings.providers);
 
   // Live provider balance (OpenRouter), polled every 60s. Queried for every
@@ -272,8 +278,10 @@ export function ChatPanel() {
   const workspaces = useStore((s) => s.workspaces);
   const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
-  const autoSkills = useStore((s) => s.settings.autoSkills === true);
-  const setAutoSkills = useStore((s) => s.setAutoSkills);
+  const autoSkills = chat?.autoSkills ?? settings.autoSkills === true;
+  const setAutoSkills = (on: boolean) => {
+    if (chat) useStore.getState().setChatAutoSkills(chat.id, on);
+  };
   const modes = useStore((s) => allModes(s.settings));
   const maxHistory = provider.maxHistory ?? defaultMaxHistoryFor(provider.kind);
   const nvimFile = useStore((s) => s.nvimFile);
@@ -349,7 +357,6 @@ export function ChatPanel() {
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
   const [dragOver, setDragOver] = useState(false);
-  const [stalled, setStalled] = useState(false);
   const [noRootHint, setNoRootHint] = useState("");
   const [skillOpen, setSkillOpen] = useState(false);
   const [skillQuery, setSkillQuery] = useState("");
@@ -409,21 +416,24 @@ export function ChatPanel() {
   const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
-  /** Transient confirmation shown after a manual /compact. */
-  const [compactNotice, setCompactNotice] = useState<string | null>(null);
-  /** Set when a compact attempt fails, so the composer can show a retry banner
-   *  instead of silently collapsing messages behind a broken summary. Cleared
-   *  on the next compact attempt (success or failure). */
-  const [compactError, setCompactError] = useState<string | null>(null);
-  /** True while a compact (manual /compact or backend auto-compact) is running —
-   *  shows a "compacting…" loading banner under the messages. */
-  const [compacting, setCompacting] = useState(false);
-  /** Shown while the tmux-style Ctrl+X prefix is armed (waiting for the next key). */
-  const [prefixNotice, setPrefixNotice] = useState<string | null>(null);
-  /** Dismissible error banner (e.g. an unknown slash command) shown at the
-   *  bottom of the message list, in the same spot as the retry banner. */
-  const [cmdError, setCmdError] = useState<string | null>(null);
-  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>("medium");
+  // Transient compact/command/stall banners live on the chat record in the
+  // store (not local component state) for the same reason as pendingAsk:
+  // `<ChatPanel key={activeChatId} />` remounts on every chat switch, so local
+  // state would silently drop these the moment the user looks at another chat
+  // and comes back. Deriving from the reactive `chat` object re-renders this
+  // panel whenever the store updates the field.
+  const compactNotice = chat?.compactNotice ?? null;
+  const compactError = chat?.compactError ?? null;
+  const compacting = chat?.compacting ?? false;
+  const cmdError = chat?.cmdError ?? null;
+  const stalled = chat?.stalled ?? false;
+  /** The Ctrl+X prefix is app-wide (managed in App.tsx), so its hint lives at
+   *  the store root — it survives chat switches too. */
+  const prefixNotice = useStore((s) => s.prefixNotice ?? null);
+  const thinkingLevel = chat?.thinkingLevel ?? "medium";
+  const setThinkingLevel = (lv: ThinkingLevel) => {
+    if (chat) useStore.getState().setChatThinkingLevel(chat.id, lv);
+  };
 
   // Switch the CURRENT chat's mode. No UI toast — the agent knows which mode the
   // next message runs in; the user doesn't need a visible confirmation.
@@ -441,12 +451,6 @@ export function ChatPanel() {
     changeMode(next);
   };
 
-  useEffect(() => {
-    if (!compactNotice) return;
-    const t = setTimeout(() => setCompactNotice(null), 4000);
-    return () => clearTimeout(t);
-  }, [compactNotice]);
-
   // Stable ref so the global coder:cmd listener below always invokes the latest
   // handleCommand (fresh closures over chat/compact/busy state).
   const handleCommandRef = useRef<(v: string) => Promise<void>>(() =>
@@ -460,7 +464,7 @@ export function ChatPanel() {
     };
     const onPrefix = (e: Event) => {
       const active = (e as CustomEvent<boolean>).detail === true;
-      setPrefixNotice(
+      useStore.getState().setPrefixNotice(
         active
           ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(PREFIX_SHORTCUTS)
               .map((k) => (k === " " ? "Space" : k))
@@ -637,9 +641,9 @@ export function ChatPanel() {
   }, [cmdOpen, cmdQuery]);
 
   const ctxWindow =
-    (provider.contextMap?.[provider.model] &&
-      provider.contextMap[provider.model] > 0 &&
-      provider.contextMap[provider.model]) ||
+    (provider.contextMap?.[activeModel] &&
+      provider.contextMap[activeModel] > 0 &&
+      provider.contextMap[activeModel]) ||
     (provider.contextWindow && provider.contextWindow > 0
       ? provider.contextWindow
       : null);
@@ -652,9 +656,10 @@ export function ChatPanel() {
     // knowable from the frontend, so a blind character estimate of `history`
     // alone was structurally unable to match it (it could only ever see the
     // conversation text, not the backend-only additions). Because compacted
-    // messages are excluded and their `usage` is cleared, this naturally
-    // resets to a small number right after a compact, then reflects real
-    // usage again once the first post-compact reply completes. Falls back to
+    // messages are excluded from this scan and the preserved tail's usage is
+    // cleared on compact, this naturally resets to a small number right after
+    // a compact, then reflects real usage again once the first post-compact
+    // reply completes. Falls back to
     // the character-based estimate only when no real usage exists yet (a
     // brand new chat, or the brief window between a compact and the next
     // completed reply).
@@ -662,7 +667,11 @@ export function ChatPanel() {
     const active = msgs.filter((m) => !m.compacted);
     for (let i = active.length - 1; i >= 0; i--) {
       const u = active[i].usage;
-      if (u) return u.totalTokens;
+      // A 0-token usage record is degenerate (a rejected/empty request the
+      // provider never billed — e.g. a sub-agent request that reported 0/0).
+      // Treat it as "no real usage" and keep scanning for the last completed
+      // exchange with REAL tokens, so the meter never flashes a misleading 0%.
+      if (u && u.totalTokens > 0) return u.totalTokens;
     }
     return estimateContextTokens(
       chat,
@@ -750,7 +759,7 @@ export function ChatPanel() {
     }
     const rootDir = chat.root || s.root;
     if (!rootDir) return;
-    const activeProvider = getActiveProvider();
+    const activeProvider = getChatProvider(chat.id);
     if (!activeProvider.model) {
       s.setSettingsOpen(true);
       return;
@@ -872,7 +881,7 @@ export function ChatPanel() {
     abortRef.current = abort;
     useStore.getState().setChatAbort(chat.id, abort);
     setBusy(true);
-    setStalled(false);
+    useStore.getState().setChatStalled(chat.id, false);
     lastEventAt.current = Date.now();
     stalledSinceRef.current = null;
     watchdogAbortedRef.current = false;
@@ -914,7 +923,7 @@ export function ChatPanel() {
         stalledSinceRef.current = null;
         return;
       }
-      setStalled(true);
+      useStore.getState().setChatStalled(chat.id, true);
       if (stalledSinceRef.current == null) stalledSinceRef.current = Date.now();
       if (Date.now() - stalledSinceRef.current > HARD_STALL_GRACE_MS) {
         watchdogAbortedRef.current = true;
@@ -971,7 +980,7 @@ export function ChatPanel() {
 
     const handleEvent = (event: SidecarEvent) => {
       lastEventAt.current = Date.now();
-      setStalled(false);
+      useStore.getState().setChatStalled(chat.id, false);
       const store = useStore.getState();
       const findMsg = () =>
         store.chats
@@ -1045,6 +1054,7 @@ export function ChatPanel() {
           startedAt: Date.now(),
           callId: typeof event.call_id === "number" ? event.call_id : undefined,
           sub: event.sub,
+          branch: typeof event.branch === "number" ? event.branch : undefined,
           model: event.model || undefined,
         };
         // Sub-agent tool calls (explore's internal read/grep/glob) render
@@ -1053,8 +1063,13 @@ export function ChatPanel() {
         // never a stack of collapsed fragments.
         if (event.sub) {
           const prev = findMsg()?.toolActivity ?? [];
+          const branch = typeof event.branch === "number" ? event.branch : undefined;
           const next = prev.map((a): ToolActivity => {
             if (a.tool === "explore" && a.status === "running") {
+              // Parallel fan-out: nest each branch's sub-events under ITS OWN
+              // explore card (matched by branch id). Legacy single-branch events
+              // (no branch id) still nest into the running explore card.
+              if (branch !== undefined && a.branch !== branch) return a;
               return { ...a, children: [...(a.children ?? []), act] };
             }
             return a;
@@ -1101,15 +1116,20 @@ export function ChatPanel() {
         const current = findMsg()?.toolActivity ?? [];
         const now = Date.now();
         const gotId = typeof event.call_id === "number";
+        const gotBranch = typeof event.branch === "number";
         const resolved = (act: ToolActivity): ToolActivity => {
           // Match by per-call correlation id first (precise — the same tool
           // can run many times, and explore sub-agent events share tool names);
-          // fall back to tool-name+status matching when the result has no id.
+          // then by parallel fan-out branch id (each branch's explore card gets
+          // its own result); fall back to tool-name+status matching when the
+          // result has neither id nor branch.
           const target =
             gotId && act.status === "running" && act.callId === event.call_id;
+          const branchMatch =
+            gotBranch && act.status === "running" && act.branch === event.branch;
           const fallback =
-            !gotId && act.tool === event.tool && act.status === "running";
-          if (target || fallback) {
+            !gotId && !gotBranch && act.tool === event.tool && act.status === "running";
+          if (target || branchMatch || fallback) {
             return {
               ...act,
               status: event.status === "error" ? "error" : event.status === "denied" ? "denied" : "done",
@@ -1144,7 +1164,11 @@ export function ChatPanel() {
       } else if (event.kind === "compact_start") {
         // Backend is auto-compacting (summarizer running) — show the loading
         // banner under the messages until the compact/compact_failed event lands.
-        setCompacting(true);
+        // Stored per-chat so it survives a chat switch mid-compact; clear any
+        // stale notice/error so the loading banner replaces them.
+        useStore.getState().setChatCompacting(chat.id, true);
+        useStore.getState().setChatCompactNotice(chat.id, null);
+        useStore.getState().setChatCompactError(chat.id, null);
       } else if (event.kind === "compact") {
         // Auto-compact: fold the older messages into the summary. The summary
         // is persisted as a system message so the next request still sends it
@@ -1154,7 +1178,7 @@ export function ChatPanel() {
         // the summary mid-stream (previously via scrollIntoView) is exactly
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
-        setCompacting(false);
+        useStore.getState().setChatCompacting(chat.id, false);
         const chatId = chat.id;
         if (chatId) {
           // Auto-compact: the backend tells us exactly how many recent turns it
@@ -1171,9 +1195,11 @@ export function ChatPanel() {
           );
           // Auto-compact completed — surface the same confirmation the manual
           // /compact path shows, so the user knows older messages were folded
-          // into a summary (auto-dismisses after a few seconds).
-          setCompactNotice(
-            "Context compacted — older messages are collapsed above the summary.",
+          // into a summary. Stored per-chat so it's still there if the user
+          // switches away and comes back (no auto-dismiss — dismissed via ✕).
+          useStore.getState().setChatCompactNotice(
+            chat.id,
+            "Context compacted — older messages are summarized above.",
           );
         }
       } else if (event.kind === "compact_failed") {
@@ -1181,8 +1207,9 @@ export function ChatPanel() {
         // the retry banner so the user can compact manually (the manual path
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
-        setCompacting(false);
-        setCompactError(
+        useStore.getState().setChatCompacting(chat.id, false);
+        useStore.getState().setChatCompactError(
+          chat.id,
           event.reason || "Automatic compaction failed — nothing was deleted.",
         );
       } else if (event.kind === "plan") {
@@ -1271,7 +1298,7 @@ export function ChatPanel() {
         const inputTokens = event.input_tokens ?? 0;
         const outputTokens = event.output_tokens ?? 0;
         const total = event.total_tokens ?? inputTokens + outputTokens;
-        const model = (event.model || "").trim() || provider.model || "main";
+        const model = (event.model || "").trim() || activeModel || "main";
         // Accrue into the chat-wide cumulative usage (survives compacts and
         // chat switches) so the titlebar can show main + sub-agent session
         // totals and cost separately from the shrinkable current context.
@@ -1301,7 +1328,7 @@ export function ChatPanel() {
         // The backend signals the end of the stream with a "done" event.
         // Clear the stall hint immediately and refresh the watchdog clock so a
         // queued stall-timer callback can't re-set it after the stream closes.
-        setStalled(false);
+        useStore.getState().setChatStalled(chat.id, false);
         lastEventAt.current = Date.now();
         resolveStuckCards();
       }
@@ -1337,7 +1364,7 @@ export function ChatPanel() {
           skills: activeChips
             .filter((c) => c.kind === "skill")
             .map((c) => c.name),
-          autoSkills: s.settings.autoSkills === true,
+          autoSkills: chat?.autoSkills ?? s.settings.autoSkills === true,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
@@ -1394,9 +1421,9 @@ export function ChatPanel() {
       lastEventAt.current = Date.now();
       stalledSinceRef.current = null;
       toolRunningRef.current = false;
-      setStalled(false);
+      useStore.getState().setChatStalled(chat.id, false);
       setBusy(false);
-      setCompacting(false);
+      useStore.getState().setChatCompacting(chat.id, false);
       useStore.getState().setChatPendingAsk(chat.id, null);
       useStore.getState().setChatPendingPermission(chat.id, null);
       resolveStuckCards();
@@ -1453,8 +1480,9 @@ export function ChatPanel() {
       .slice(-120000);
     const rootDir = ch.root || s.root;
     setBusy(true);
-    setCompactError(null);
-    setCompacting(true);
+    useStore.getState().setChatCompactError(ch.id, null);
+    useStore.getState().setChatCompactNotice(ch.id, null);
+    useStore.getState().setChatCompacting(ch.id, true);
     const prompt =
       "Summarize the following conversation into concise notes for continued work. " +
       "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
@@ -1466,7 +1494,7 @@ export function ChatPanel() {
     // the parent (mirrors the backend's own _resolve_subagent parsing, and the
     // subagent_models handling above in handleEvent). A bare entry — or none —
     // runs on the active provider, same as before.
-    const activeProvider = getActiveProvider();
+    const activeProvider = getChatProvider(ch.id);
     const compactEntry = (s.subagentModels?.compact || "").trim();
     let compactProvider = activeProvider;
     if (compactEntry) {
@@ -1559,11 +1587,13 @@ export function ChatPanel() {
 
     let { summary, failed, failReason } = await runSummarizer(compactProvider);
     // The configured compact subagent failed (bad model id/key, provider down,
-    // rate limit, etc.) — fall back to the chat's active model once, mirroring
-    // the backend's own subagent-build fallback used for AUTO-compact. Without
-    // this, picking a broken subagent model would silently break manual
-    // /compact instead of degrading to the model that was already working.
-    if (failed && usedSubagent) {
+    // rate limit, etc.) OR returned an empty summary (no error) — fall back to
+    // the chat's active model once, mirroring the backend's own subagent-build
+    // fallback used for AUTO-compact. An empty summary is just as useless as a
+    // failure, so it must trigger the same fallback. Without this, picking a
+    // broken subagent model would silently break manual /compact instead of
+    // degrading to the model that was already working.
+    if ((failed || !summary.trim()) && usedSubagent) {
       const fb = await runSummarizer(activeProvider);
       if (!fb.failed && fb.summary.trim()) {
         summary = fb.summary;
@@ -1577,7 +1607,7 @@ export function ChatPanel() {
       }
     }
     setBusy(false);
-    setCompacting(false);
+    useStore.getState().setChatCompacting(ch.id, false);
     // A compact call just completed → usage may have changed. Refresh the
     // balance chip now, same as a normal turn does.
     setBalanceTick((t) => t + 1);
@@ -1585,7 +1615,7 @@ export function ChatPanel() {
     // — do NOT collapse the real messages behind a fake "(compact failed)"
     // summary. Leave the chat untouched and let the user retry manually.
     if (failed || !summary.trim()) {
-      setCompactError(failReason || "empty summary");
+      useStore.getState().setChatCompactError(ch.id, failReason || "empty summary");
       return;
     }
     s.compactChat(
@@ -1598,8 +1628,9 @@ export function ChatPanel() {
     addMemoryNote(rootDir, `[Compacted conversation]\n${summary.trim()}`).catch(
       () => { },
     );
-    setCompactNotice(
-      "Context compacted — older messages are collapsed above the summary.",
+    useStore.getState().setChatCompactNotice(
+      ch.id,
+      "Context compacted — older messages are summarized above.",
     );
     // Stay where the user is (normally the bottom, where the live conversation
     // continues). The messages-change effect below keeps the view pinned to
@@ -1684,7 +1715,8 @@ export function ChatPanel() {
         break;
       }
       default:
-        setCmdError(
+        useStore.getState().setChatCmdError(
+          ch?.id ?? "",
           `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
         );
     }
@@ -2196,7 +2228,7 @@ export function ChatPanel() {
               <span className="badge-provider">
                 {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
               </span>
-              {provider.model || "no model"}
+              {activeModel || "no model"}
             </span>
             <span
               className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
@@ -2328,7 +2360,7 @@ export function ChatPanel() {
                   <button
                     type="button"
                     className="notice-dismiss"
-                    onClick={() => setCmdError(null)}
+                    onClick={() => useStore.getState().setChatCmdError(chat.id, null)}
                     title="Dismiss"
                   >
                     ✕
@@ -2352,7 +2384,7 @@ export function ChatPanel() {
                   <button
                     type="button"
                     className="notice-dismiss"
-                    onClick={() => setCompactError(null)}
+                    onClick={() => useStore.getState().setChatCompactError(chat.id, null)}
                     title="Dismiss"
                   >
                     ✕
@@ -2363,6 +2395,16 @@ export function ChatPanel() {
                 <div className="notice-banner notice-info" dir="ltr">
                   <span className="notice-icon">✓</span>
                   <span className="notice-text">{compactNotice}</span>
+                  <button
+                    type="button"
+                    className="notice-dismiss"
+                    onClick={() =>
+                      useStore.getState().setChatCompactNotice(chat.id, null)
+                    }
+                    title="Dismiss"
+                  >
+                    ✕
+                  </button>
                 </div>
               )}
               {prefixNotice && (
@@ -2894,8 +2936,8 @@ export function ChatPanel() {
                 <span className="skills-toggle-label">Skills</span>
               </button>
               {provider &&
-                (provider.reasoningMap?.[provider.model] ??
-                  supportsReasoning(provider.model, provider.kind)) && (
+                (provider.reasoningMap?.[activeModel] ??
+                  supportsReasoning(activeModel, provider.kind)) && (
                   <span
                     className={`thinking-pill${thinkingLevel ? " on" : ""}`}
                     title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}

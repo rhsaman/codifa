@@ -211,6 +211,10 @@ export interface ToolActivity {
    *  read/grep/glob). Rendered nested inside the parent explore card, not as a
    *  top-level timeline card. */
   sub?: boolean
+  /** Parallel explore fan-out branch id (0-based). Lets the UI nest each
+   *  branch's sub-agent events under ITS OWN explore card instead of dumping
+   *  every branch into one card. */
+  branch?: number
   /** Nested sub-agent tool calls when this is an explore card. */
   children?: ToolActivity[]
   /** Which model executed this specific tool call. Empty/absent = the main
@@ -233,7 +237,9 @@ export interface TokenUsage {
 
 /** Per-chat cumulative token usage, keyed by model id ("" = main model). These
  *  session totals survive compacts and reloads and only ever grow, unlike a
- *  single message's `TokenUsage` which is per-turn and cleared on compact. */
+ *  single message's `TokenUsage` which is per-turn: compacted messages keep
+ *  theirs (badge stays visible) while the preserved tail is cleared on compact
+ *  so the context meter resets to the estimate. */
 export interface ChatUsage {
   [modelId: string]: {
     input: number
@@ -335,6 +341,14 @@ export interface Chat {
   id: string
   title: string
   mode: AgentMode
+  /** Per-chat reasoning effort override (defaults to the provider default). */
+  thinkingLevel?: ThinkingLevel
+  /** Per-chat auto-skills toggle (defaults to the global setting). */
+  autoSkills?: boolean
+  /** Per-chat provider override (defaults to the global active provider). */
+  providerId?: string
+  /** Per-chat model override (defaults to the global active provider's model). */
+  model?: string
   root?: string
   messages: ChatMessage[]
   /** Cumulative per-model token usage for this chat (session totals). */
@@ -353,6 +367,16 @@ export interface Chat {
    *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
    *  on chat switch. */
   pendingPermission?: { id: string; action: string; path?: string; reason?: string; scope?: string } | null
+  /** Transient compact/command/stall banners, kept on the chat (not local
+   *  component state) for the same reason as `pendingAsk`: `<ChatPanel
+   *  key={activeChatId} />` remounts on every chat switch, so local state would
+   *  silently drop these the moment the user looks at another chat and comes
+   *  back. Cleared on load — nothing is running after a restart. */
+  compacting?: boolean
+  compactNotice?: string | null
+  compactError?: string | null
+  cmdError?: string | null
+  stalled?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -390,6 +414,10 @@ export interface SidecarEvent {
   /** True for events emitted by a sub-agent (explore's internal read/grep/glob)
    *  — the parent nests these inside the explore card instead of a top-level card. */
   sub?: boolean
+  /** Parallel explore fan-out branch id (0-based). The backend emits one explore
+   *  card per branch and tags each branch's sub-events with its id, so the UI
+   *  nests each branch's read/grep/glob under ITS OWN card. */
+  branch?: number
   /** Which model executed this specific event: for 'tool'/'tool_result' kinds,
    *  the model that ran the call; for 'usage' events, the model the usage
    *  belongs to. Empty/absent = the main conversation model. */

@@ -360,6 +360,11 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
     <div className={`tool-sub-row ${activity.status}${running ? ' running' : ''}`}>
       <StatusIcon status={activity.status} />
       <span className="tool-sub-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+      {activity.model && (
+        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
+          {activity.model}
+        </span>
+      )}
       <span className="tool-sub-args" title={subArgSummary(activity)}>
         {subArgSummary(activity)}
       </span>

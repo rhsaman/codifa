@@ -1752,6 +1752,11 @@ textarea {
   margin-left: auto;
 }
 
+.msg-usage.live {
+  opacity: 1;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
 .msg-copy {
   display: inline-flex;
   align-items: center;
@@ -1888,53 +1893,6 @@ textarea {
 
 .msg[data-is-summary] .summary-block {
   border-right: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-/* ---- folded (compacted) old messages ---- */
-.msg.compacted {
-  opacity: 0.62;
-}
-
-.compacted-toggle {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  width: 100%;
-  background: color-mix(in srgb, var(--bg-input) 55%, var(--bg));
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  padding: 7px 10px;
-  cursor: pointer;
-  text-align: left;
-  font-size: 12px;
-  color: var(--text-dim);
-  transition:
-    opacity 0.15s,
-    background 0.15s;
-}
-
-.compacted-toggle:hover {
-  opacity: 1;
-  background: var(--bg-input);
-}
-
-.compacted-toggle .chev {
-  flex: 0 0 auto;
-  margin-top: 1px;
-  transition: transform 0.15s;
-}
-
-.compacted-toggle .chev.open {
-  transform: rotate(90deg);
-}
-
-.compacted-preview {
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.chat-messages[data-dir="rtl"] .compacted-toggle {
-  text-align: right;
 }
 
 .empty-state {

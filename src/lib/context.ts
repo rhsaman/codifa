@@ -86,7 +86,13 @@ export function estimateContextChars(
   const msgs = chat?.messages ?? []
   let chars = 0
   chars += systemPrompt.length
-  chars += 2200 // builtin system prompt + auto-scout/workspace note
+  // Builtin system prompt + auto-scout/workspace note. The real prompt is
+  // several thousand chars (mode prompt + tool guidance + workspace note), so
+  // a flat 2200-char floor under-estimates a fresh chat to ~0% on large
+  // windows — which is exactly what the meter showed during thinking (before
+  // the first real usage event arrives). Use a realistic floor so the estimate
+  // lands in the same ballpark as the post-reply usage.
+  chars += 16000
   const active = msgs.filter((m) => !m.compacted)
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
@@ -121,7 +127,9 @@ export function estimateContextTokens(
   const msgs = chat?.messages ?? []
   let weight = 0
   weight += weightedCharCount(systemPrompt)
-  weight += 2200 // builtin system prompt + auto-scout/workspace note
+  // Same realistic floor as estimateContextChars (see note there): the builtin
+  // prompt + workspace note is thousands of chars, not 2200.
+  weight += 16000
   const active = msgs.filter((m) => !m.compacted)
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',

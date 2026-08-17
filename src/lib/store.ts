@@ -132,7 +132,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const memory = { taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, maxNotes: memoryMaxNotes, slidingTtl: memorySlidingTtl }
   const writes: Promise<unknown>[] = [
@@ -146,7 +146,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -181,8 +181,7 @@ export const DEFAULT_MAX_HISTORY = 10
 export const LOCAL_MAX_HISTORY = 3
 
 /** Resolve the default "Messages to remember" for a provider kind: local
- *  providers get `LOCAL_MAX_HISTORY`, everything else `DEFAULT_MAX_HISTORY`.
- *  An explicit per-provider `maxHistory` always overrides this at call sites. */
+ *  providers get `LOCAL_MAX_HISTORY`, everything else `DEFAULT_MAX_HISTORY`. */
 export function defaultMaxHistoryFor(kind: ProviderKind | undefined | null): number {
   return PROVIDER_META[kind ?? 'custom']?.local ? LOCAL_MAX_HISTORY : DEFAULT_MAX_HISTORY
 }
@@ -243,7 +242,6 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     contextMap: p.contextMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
-    maxHistory: p.maxHistory,
     thinkingLevel: p.thinkingLevel ?? '',
     models: Array.isArray(p.models)
       ? p.models.map((m) => (unprefixed ? m.replace(/^opencode\//, '') : m))
@@ -286,7 +284,6 @@ interface State {
   root: string
   theme: 'dark' | 'light'
   dir: 'rtl' | 'ltr'
-  maxHistory: number
   recentModels: RecentModel[]
   sidebarOpen: boolean
   workspaceColors: Record<string, string>
@@ -328,8 +325,8 @@ interface State {
   removeMcpServer: (name: string) => void
   setMcpEnabled: (name: string, on: boolean) => void
   setSystemPrompt: (mode: AgentMode, text: string) => void
-  /** Toggle auto-skill selection (RAG) in Coder mode. */
-  setAutoSkills: (on: boolean) => void
+  /** Pre-emptive auto-compact threshold (percent of context window, 50–95). */
+  setCompactThreshold: (pct: number) => void
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
@@ -341,7 +338,6 @@ interface State {
   toggleTheme: () => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
-  setMaxHistory: (n: number) => void
   fontSize: number
   setFontSize: (n: number) => void
   /** Directory for the per-workspace RAG vector store; "" = default. */
@@ -397,7 +393,6 @@ interface State {
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
   setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
-  setChatAutoSkills: (id: string, on: boolean) => void
   setChatProvider: (id: string, providerId: string, model: string) => void
   renameChat: (id: string, title: string) => void
   /** Transient compact/command/stall banners, stored per-chat so they survive
@@ -477,7 +472,6 @@ function makeChat(mode: AgentMode = 'ask'): Chat {
     title: 'New chat',
     mode,
     thinkingLevel: 'medium',
-    autoSkills: s.settings.autoSkills === true,
     providerId: activeProvider?.id,
     model: activeProvider?.model,
     messages: [],
@@ -507,12 +501,11 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], autoSkills: false },
+  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactThreshold: 80 },
   builtinMcp: [],
   root: '',
   theme: 'dark',
   dir: 'rtl',
-  maxHistory: DEFAULT_MAX_HISTORY,
   fontSize: 14,
   vectorDbPath: '',
   memoryTtlDays: 180,
@@ -648,6 +641,12 @@ export const useStore = create<State>((set, get) => ({
       mcpEnabled: Array.isArray(raw.mcpEnabled)
         ? raw.mcpEnabled.filter((n: string) => !!raw.mcpServers?.[n])
         : [],
+      compactThreshold:
+        typeof raw.compactThreshold === 'number' &&
+        raw.compactThreshold >= 50 &&
+        raw.compactThreshold <= 95
+          ? raw.compactThreshold
+          : 80,
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
@@ -715,7 +714,6 @@ export const useStore = create<State>((set, get) => ({
       builtinMcp: builtins,
       root,
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
-      maxHistory: typeof raw.maxHistory === 'number' && raw.maxHistory > 0 ? raw.maxHistory : DEFAULT_MAX_HISTORY,
       fontSize,
       vectorDbPath: typeof raw.vectorDbPath === 'string' ? raw.vectorDbPath : '',
       memoryTtlDays: typeof raw.memoryTtlDays === 'number' && raw.memoryTtlDays > 0 ? raw.memoryTtlDays : 180,
@@ -995,11 +993,6 @@ export const useStore = create<State>((set, get) => ({
   toggleDir: () => {
     const next = get().dir === 'rtl' ? 'ltr' : 'rtl'
     get().setDir(next)
-  },
-
-  setMaxHistory: (maxHistory) => {
-    set({ maxHistory })
-    get().persist()
   },
 
   setFontSize: (fontSize) => {
@@ -1282,12 +1275,6 @@ export const useStore = create<State>((set, get) => ({
     }))
     get().persist()
   },
-  setChatAutoSkills: (id, on) => {
-    set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, autoSkills: on, updatedAt: Date.now() } : c)),
-    }))
-    get().persist()
-  },
   setChatProvider: (id, providerId, model) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, providerId, model, updatedAt: Date.now() } : c)),
@@ -1536,13 +1523,21 @@ export const useStore = create<State>((set, get) => ({
         // Keep the last `keep` messages verbatim; fold everything older into the
         // summary. `keep` is the EXACT number of recent turns to preserve (the
         // backend reports it for auto-compact; the manual /compact path passes
-        // maxHistory-1). The summary is appended so the next turn's
-        // sliceToBudget (which sends the last maxHistory entries, system-first)
-        // keeps summary + recent together without contradicting either.
+        // 1 — opencode-style, only the last message survives verbatim). The
+        // summary is appended so the next turn's sliceToBudget (which sends the
+        // last maxHistory entries, system-first) keeps summary + recent together
+        // without contradicting either.
         const recentStart = Math.max(nonSys.length - keep, 0)
         const compactedIds = new Set(
           nonSys.slice(0, recentStart).map((m) => m.id),
         )
+        // Never fold a message that is STILL STREAMING: the summary must land
+        // BEFORE the live reply so the rest of the stream renders after the
+        // checkpoint (a steer message added mid-stream would otherwise push the
+        // streaming reply above the summary and the tail would contradict it).
+        for (const m of c.messages) {
+          if (m.streaming) compactedIds.delete(m.id)
+        }
         // On a repeated /compact, also fold any PREVIOUS system summary so only
         // the newest summary renders as the prominent block (the old ones stay
         // in the scrollback like any other folded message).
@@ -1551,24 +1546,25 @@ export const useStore = create<State>((set, get) => ({
         }
         // Folded messages KEEP their per-turn usage so their token badge stays
         // visible (the context meter ignores them — it only scans non-compacted
-        // messages). The preserved tail ALSO keeps its usage: clearing it made
-        // the context meter fall back to the character estimate right after a
-        // compact, which is structurally LOWER than the real input+output the
-        // provider reported (it can't see the backend-only additions — base
-        // system prompt, RAG block, memory notes, auto-scout dossier). The user
-        // saw the meter dip to a misleadingly small number before the next
-        // exchange's usage event corrected it. Keeping the last completed
-        // exchange's usage keeps the meter stable; it settles to the real
-        // post-compact value once the next reply completes. chat.usage
-        // (per-model session totals) is untouched — it only ever grows.
+        // messages). The preserved tail, however, has its usage CLEARED: that
+        // usage is the PRE-compact input+output of the last exchange, and
+        // keeping it pinned the context meter at the pre-compact size after
+        // every compact ("manual compact doesn't lower the meter"). With the
+        // tail's usage cleared, the meter falls back to the post-compact
+        // estimate (system prompt + summary + preserved tail) until the next
+        // real usage event lands. chat.usage (per-model session totals) is
+        // untouched — it only ever grows.
         const messages = c.messages.map((m) =>
-          compactedIds.has(m.id) ? { ...m, compacted: true } : m,
+          compactedIds.has(m.id)
+            ? { ...m, compacted: true }
+            : { ...m, usage: undefined },
         )
         const summaryMsg = {
           id: uid(),
           role: 'system' as const,
           content: summary,
           usage: undefined as TokenUsage | undefined,
+          compacted: false,
           createdAt: Date.now(),
         }
         // Insert the summary at the COMPACTION BOUNDARY — right after the folded
@@ -1646,8 +1642,8 @@ export const useStore = create<State>((set, get) => ({
 
   anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
 
-  setAutoSkills: (on) => {
-    set((s) => ({ settings: { ...s.settings, autoSkills: on } }))
+  setCompactThreshold: (pct: number) => {
+    set((s) => ({ settings: { ...s.settings, compactThreshold: pct } }))
     get().persist()
   },
 

@@ -2,6 +2,7 @@ import { memo, useEffect, useState, type KeyboardEvent } from 'react'
 import type { ToolActivity } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
+import { fixZwsp } from '../lib/bidi'
 
 const TOOL_LABEL: Record<string, string> = {
   write_file: 'write_file',
@@ -50,7 +51,7 @@ const HEADER_SHOWN_KEYS = new Set([
 const HIDDEN_KEYS = new Set(['content', 'old_string', 'new_string'])
 
 function fmtArgValue(v: unknown): string {
-  if (typeof v === 'string') return v
+  if (typeof v === 'string') return fixZwsp(v)
   if (typeof v === 'number' || typeof v === 'boolean') return String(v)
   if (Array.isArray(v)) return v.map(fmtArgValue).join(', ')
   if (v && typeof v === 'object') return JSON.stringify(v)
@@ -480,14 +481,14 @@ export const ToolCallView = memo(function ToolCallView({
           </span>
         )}
         {activity.args && activity.args.query !== undefined && (
-          <span className="tool-cmd">{String(activity.args.query)}</span>
+          <span className="tool-cmd">{fixZwsp(String(activity.args.query))}</span>
         )}
         {activity.args && activity.args.pattern !== undefined && (
-          <span className="tool-cmd">{String(activity.args.pattern)}</span>
+          <span className="tool-cmd">{fixZwsp(String(activity.args.pattern))}</span>
         )}
         {activity.args && activity.args.task !== undefined && (
           <span className="tool-cmd tool-task" title={String(activity.args.task)}>
-            {String(activity.args.task)}
+            {fixZwsp(String(activity.args.task))}
           </span>
         )}
         {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
@@ -497,7 +498,7 @@ export const ToolCallView = memo(function ToolCallView({
         )}
         {activity.tool === 'memory' && activity.args && (
           <span className="tool-cmd">
-            {String(activity.args.text || activity.args.subject || '')}
+            {fixZwsp(String(activity.args.text || activity.args.subject || ''))}
           </span>
         )}
         {readPaths.length > 0 && (
@@ -514,7 +515,7 @@ export const ToolCallView = memo(function ToolCallView({
             )}
           </>
         )}
-        {fetchSummary && <span className="tool-cmd">{fetchSummary}</span>}
+        {fetchSummary && <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>}
         {activity.args && <ToolArgs args={activity.args} />}
         <span className="tool-ms">{fmtTime(ms)}</span>
         {collapsible && <span className={`chev${collapsed ? '' : ' open'}`}>▾</span>}
@@ -522,7 +523,7 @@ export const ToolCallView = memo(function ToolCallView({
 
       {!collapsed && (
       <div className="tool-card-body">
-          {activity.summary && <div className="tool-summary">{activity.summary}</div>}
+          {activity.summary && <div className="tool-summary">{fixZwsp(activity.summary)}</div>}
           {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
             <div className="tool-sub-list">
               {activity.children.map((child, i) => (

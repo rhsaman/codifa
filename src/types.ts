@@ -96,8 +96,6 @@ export interface ProviderConfig {
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   reasoningMap?: Record<string, boolean>
-  /** Per-provider "Messages to remember" — how many recent user/assistant messages are sent each turn. */
-  maxHistory?: number
   thinkingLevel?: ThinkingLevel
   models?: string[]
   /** Models the user explicitly removed; hidden from the live /models catalog. */
@@ -118,7 +116,6 @@ export interface Settings {
   fontSize?: number
   root?: string
   dir?: 'rtl' | 'ltr'
-  maxHistory?: number
   compact?: boolean
   recentModels?: RecentModel[]
   sidebarOpen?: boolean
@@ -154,13 +151,14 @@ export interface Settings {
    *  workspace's chats does NOT remove the workspace itself). Empty workspaces
    *  still render. Order is user-controlled (drag-and-drop in the sidebar). */
   workspaces?: Workspace[]
-  /** Auto-use skills in Coder mode: pick the most relevant skills for each
-   * message via RAG. Default off. */
-  autoSkills?: boolean
   /** Per-subagent model overrides (namespace / explorer / vision / compact).
    *  Each key maps to a model from the active provider, or empty = use the
    *  parent model. */
   subagentModels?: Record<string, string>
+  /** Pre-emptive auto-compact threshold as a PERCENTAGE of the context window
+   *  (50–95, default 80). When real usage (input + output) crosses this, the
+   *  backend compacts before the window overflows. */
+  compactThreshold?: number
   /** Memory TTL / cache config — configurable from Settings → Memory. */
   memory?: {
     /** TASK memory lifetime in hours (default 6). */
@@ -311,12 +309,11 @@ export interface ChatMessage {
 }
 
 /** Pending composer state scoped to one chat (labels below the input), so
- *  mentions / skills / MCP chips picked in one chat never leak into another. */
+ *  mentions / MCP chips picked in one chat never leak into another. */
 export interface ChatDraft {
   input?: string
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
-  skillChips?: Array<{ kind: 'skill' | 'mcp'; name: string; path?: string }>
   /** True while the composer's mention of a Neovim file was active, so a queued
    *  turn started from another chat can reproduce the mention. */
   nvimMentioned?: string
@@ -343,8 +340,6 @@ export interface Chat {
   mode: AgentMode
   /** Per-chat reasoning effort override (defaults to the provider default). */
   thinkingLevel?: ThinkingLevel
-  /** Per-chat auto-skills toggle (defaults to the global setting). */
-  autoSkills?: boolean
   /** Per-chat provider override (defaults to the global active provider). */
   providerId?: string
   /** Per-chat model override (defaults to the global active provider's model). */

@@ -1,254 +1,64 @@
 // Persian/Arabic script ranges (incl. Persian digits ۰-۹, punctuation ، ؛ ؟,
-// presentation forms) - anything OUTSIDE these ranges (Latin, digits, arrows,
-// punctuation, markdown syntax, whitespace...) is treated as a "foreign" run.
+// presentation forms). Used by context.ts for token-count weighting.
 export const PERSIAN_RANGE =
   "\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF"
-// \u200C/\u200D (ZWNJ/ZWJ) are excluded from the match so they stay glued to
-// the Persian word they join (e.g. "می‌کنم") instead of getting isolated on
-// their own.
-const NON_PERSIAN_RUN = new RegExp(`[^${PERSIAN_RANGE}\\u200C\\u200D\\n]+`, "g")
 
-// Bidi format / isolate / embedding control characters that models commonly
-// inject into their own output (FSI⁦/PDI⁩, LRM, RLM, ALM, LRI/RLI, LRE/RLE...).
-// Left in place they fight the LRI/PDI isolation below: inside an RTL
-// paragraph FSI/PDI resolve to RTL and mirror parens/arrows ("sometimes
-// reversed"), and a mark landing before `#` or `**` also breaks markdown
-// parsing. We strip them so the ONLY bidi controls in rendered RTL text are the
-// app's own deterministic LRI/PDI pairs. ZWNJ/ZWJ (U+200C/U+200D) are NOT
-// stripped — Persian word-joining depends on them. ZWSP (U+200B) is NOT in this
-// list either: models use it as an invisible WORD SEPARATOR between words, so
-// stripping it glues Persian text together ("نکتههای مهم" → "نکتههایمهم"). It is
-// handled separately by fixZwsp (see below).
-const BIDI_MARKS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g
+// Bidi ISOLATE / EMBEDDING control characters that models commonly inject into
+// their own output (FSI⁦/PDI⁩, LRI/RLI, LRE/RLE/PDF/LRO/RLO). Left in place they
+// fight the browser's native bidi resolution: inside an RTL paragraph FSI/PDI
+// resolve to RTL and mirror parens/arrows ("sometimes reversed"), and a mark
+// landing before `#` or `**` also breaks markdown parsing. We strip them so the
+// ONLY bidi controls in rendered text are the browser's own (via dir="auto" /
+// unicode-bidi: plaintext on the message containers).
+//
+// NOT stripped here: ZWNJ/ZWJ (U+200C/U+200D — Persian word-joining depends on
+// them), and the invisible WORD SEPARATORS ZWSP/LRM/RLM/ALM (U+200B/U+200E/
+// U+200F/U+061C) — models emit those BETWEEN words instead of a regular space,
+// so deleting them glues mixed-script text together ("سلام world" → "سلامworld").
+// They are handled by fixZwsp below, which converts them to a space when they
+// actually sit between two words.
+const BIDI_MARKS = /[\u202A-\u202E\u2066-\u2069]/g
 
 export function stripBidiMarks(text: string): string {
   return text.replace(BIDI_MARKS, "")
 }
 
-// Zero-Width Space (U+200B): models emit it between words as an invisible word
-// separator (tokenizer/bidi safety), so simply deleting it glues Persian words
-// together. A run of ZWSPs flanked by two word characters (letters/digits —
-// Persian or Latin) is a real word boundary → replace the WHOLE run with a
-// single regular space. Matching \u200B+ (not one char) matters: models
-// sometimes emit \u200B\u200B between words, and a per-char check would drop
-// both (each neighbor is another ZWSP, not a word char) → words glued. Any
-// other ZWSP (at an edge, beside punctuation, inside code) is dropped.
-const ZWSP = /\u200B/g
-const ZWSP_BETWEEN_WORDS = /(?<=[\p{L}\p{N}])\u200B+(?=[\p{L}\p{N}])/gu
+// Invisible word separators that models emit between words as a tokenizer/bidi
+// safety measure instead of a regular space:
+//   ZWSP (U+200B), LRM (U+200E), RLM (U+200F), ALM (U+061C).
+// Simply deleting them glues Persian and English words together ("سلام world" →
+// "سلامworld"). A run of these flanked by two word characters (letters/digits —
+// Persian or Latin), by a word character and a markdown INLINE opener
+// (* _ ` [ — so "سلام\u200B**world**" keeps its space too), or by a word
+// character and a bracket that belongs to the neighbouring word (")" ends a
+// word like "(world)", "(" starts one — so "سلام\u200B(world)" and
+// "(world)\u200Bسلام" keep their spaces), is a real word boundary → replace the
+// WHOLE run with a single regular space. Matching the run (not one char)
+// matters: models sometimes emit several separators in a row, and a per-char
+// check would drop them all (each neighbor is another separator, not a word
+// char) → words glued. Any other separator (at an edge, beside punctuation,
+// inside code) is dropped.
+const INVISIBLE_SEP = /[\u200B\u200E\u200F\u061C]/g
+const INVISIBLE_SEP_BETWEEN_WORDS =
+  /(?<=[\p{L}\p{N}\)\]])[\u200B\u200E\u200F\u061C]+(?=[\p{L}\p{N}(*_`\[])/gu
 
 export function fixZwsp(text: string): string {
-  return text.replace(ZWSP_BETWEEN_WORDS, " ").replace(ZWSP, "")
+  return text.replace(INVISIBLE_SEP_BETWEEN_WORDS, " ").replace(INVISIBLE_SEP, "")
 }
 
-// Markdown BLOCK syntax that must sit at the true start of a line to parse
-// (headings, lists, blockquotes, tables, code fences, thematic breaks). If an
-// FSI char (U+2068) is inserted before these, CommonMark treats the line as a
-// plain paragraph and the markdown renders as literal text in RTL messages.
-const MARKDOWN_BLOCK_START =
-  /^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s?|\||`{3,}|~{3,}|[-*_]{3,}|=+)/
-
-// Wraps every contiguous non-Persian run (English words, numbers, arrows,
-// paths, markdown table pipes, etc.) in a single LRI/PDI isolate pair.
-//
-// This MUST wrap each run as one unit, not token-by-token: isolating "1",
-// "->", "2" separately leaves three adjacent neutral runs with nothing to
-// pin their relative order, so the RTL paragraph reorders them and "1->2"
-// renders as "2->1". Wrapping the whole "1->2" run once keeps its internal
-// order fixed while still letting it sit correctly inside RTL text (and RTL
-// table cells).
-//
-// LRI (U+2066), not FSI (U+2068): FSI auto-detects the isolate's direction
-// from its first STRONG character, and digits/parens/arrows/pipes are all
-// bidi-"weak" or "neutral" — they carry no strong direction. A run like
-// "(2024)" or a lone "->"/"→" has no strong char at all, so FSI falls back
-// to the surrounding paragraph direction (RTL here). Inside an RTL-resolved
-// isolate, bidi-mirrored glyphs (parentheses, arrow characters) get flipped
-// to their mirror image for correct RTL presentation — which is exactly why
-// "(" rendered as ")" and "→" rendered as "←". LRI forces the isolate itself
-// to always resolve LTR regardless of content, which is what every one of
-// these runs (English words, numbers, arrows, paths, markdown syntax) is.
-//
-// EXCEPTION 1: markdown block syntax at the start of a line is NOT isolated
-// (see MARKDOWN_BLOCK_START above) so headings/lists/blockquotes/tables/code
-// fences still parse in RTL messages.
-// EXCEPTION 2: runs with NO strong character — pure punctuation / markdown
-// delimiters such as "**", ":**", "`", "]", "—" or "؟". Wrapping these in LRI
-// silently breaks CommonMark *inline* parsing: an LRI before "**" prevents
-// emphasis from opening, and a ":" landing inside the same isolated run as the
-// closing "**" prevents it from closing ("**text:**" is a real common pattern).
-// Runs that carry at least one letter/digit (English words, "(Performance)",
-// "1->2", paths, "→ 2024") are still wrapped exactly as before — that keeps
-// parens/arrows pinned LTR while never touching markdown delimiters.
-//
-// EXCEPTION 3 (arrows): arrows (→ ← ⇒ ⇐ and ASCII "->" "=>" "<-") are bidi-
-// MIRRORED glyphs — in an RTL run "→" flips to "←" and "->" to "-<", reversing
-// the intended flow in Persian sentences like "…نیست) → parent.Level != Customer".
-// A lone arrow run has no strong char, so EXCEPTION 2 would leave it unisolated
-// and it would mirror. Arrows are NOT markdown delimiters, so a no-strong run
-// containing one IS safe to isolate — unless it also carries inline markdown
-// delimiters (* _ ` [ ]), where isolating would break parsing ("**→**").
-const HAS_STRONG = /[\p{L}\p{N}]/u
-const ARROW = /[→←⇒⇐↔⇔↖↗↘↙↑↓]|(?:->|<-|=>)/
-const MARKDOWN_INLINE_DELIM = /[*_`[\]]/
-
-const PERSIAN_CHAR = new RegExp(`[${PERSIAN_RANGE}]`, "u")
-// A "foreign strong" char is a letter/digit that is NOT Persian/Arabic script
-// — i.e. Latin words, ASCII digits, etc. Persian digits (۰-۹) are inside
-// PERSIAN_RANGE, so a run of only Persian digits does NOT count as foreign.
-function isForeignStrong(ch: string): boolean {
-  return HAS_STRONG.test(ch) && !PERSIAN_CHAR.test(ch)
-}
-
-const OPEN_TO_CLOSE: Record<string, string> = { "(": ")", "[": "]", "{": "}" }
-const CLOSE_TO_OPEN: Record<string, string> = { ")": "(", "]": "[", "}": "{" }
-
-// Bracket characters ( ) [ ] { } are MIRRORED glyphs: the browser flips their
-// shape whenever they resolve inside an RTL-level run. That flip is CORRECT
-// and desired for a purely Persian parenthetical like "شما (پروایدر کاستوم)"
-// — it's exactly how RTL text is supposed to curve a bracket around RTL
-// content, so the native/default resolution must be left alone there.
-//
-// The flip only becomes a bug when the bracket wraps or is glued to FOREIGN
-// (Latin/digit) content, e.g. "grep_tool (line 2784)": there the run has no
-// strong RTL neighbor to anchor its direction, so it needs the explicit LRI
-// isolate — and both brackets of that pair must agree (isolate both or
-// neither), or exactly the mismatched-mirroring bug reported shows up.
-//
-// findForeignBrackets scans the whole line once, pairs up every bracket via a
-// stack, and marks BOTH indices of a pair as "needs isolation" only when the
-// pair's inner content contains a foreign strong char, OR the run directly
-// attached before the opening bracket (no Persian in between) does — that
-// second check is what correctly isolates "grep_tool (خط ۲۷۸۴)" even though
-// the content between the parens is pure Persian digits.
-function findForeignBrackets(line: string): Set<number> {
-  const stack: { ch: string; idx: number }[] = []
-  const pairs: [number, number][] = []
-  for (let idx = 0; idx < line.length; idx++) {
-    const ch = line[idx]
-    if (OPEN_TO_CLOSE[ch]) {
-      stack.push({ ch, idx })
-    } else if (CLOSE_TO_OPEN[ch]) {
-      for (let s = stack.length - 1; s >= 0; s--) {
-        if (stack[s].ch === CLOSE_TO_OPEN[ch]) {
-          pairs.push([stack[s].idx, idx])
-          stack.length = s // drop this frame and any unmatched inner ones
-          break
-        }
-      }
-    }
-  }
-  const result = new Set<number>()
-  for (const [start, end] of pairs) {
-    let foreign = false
-    for (let k = start + 1; k < end && !foreign; k++) {
-      if (isForeignStrong(line[k])) foreign = true
-    }
-    if (!foreign) {
-      let i = start - 1
-      while (i >= 0 && line[i] !== "\n" && !PERSIAN_CHAR.test(line[i])) {
-        if (isForeignStrong(line[i])) {
-          foreign = true
-          break
-        }
-        i--
-      }
-    }
-    // Mirror image of the check above: the run glued AFTER the closing bracket
-    // is foreign too. Without it "سلام (نکته) grep" flips: the "(" sits between
-    // two Persian chars (resolves RTL → mirrors to ")") while the ")" sits
-    // between Persian (RTL) and the LRI-isolated "grep" (LTR), resolves to the
-    // RTL paragraph level and mirrors to "(" — the reported "reversed paren".
-    // Isolating both brackets keeps the pair literal and consistent. [ ] pairs
-    // are skipped: they are markdown link syntax and must stay untouched.
-    if (!foreign && line[start] !== "[") {
-      let j = end + 1
-      while (j < line.length && line[j] !== "\n" && !PERSIAN_CHAR.test(line[j])) {
-        if (isForeignStrong(line[j])) {
-          foreign = true
-          break
-        }
-        j++
-      }
-    }
-    if (foreign) {
-      result.add(start)
-      result.add(end)
-    }
-  }
-  return result
-}
-
-function fixRtlText(text: string): string {
-  const foreignBrackets = findForeignBrackets(text)
-  return text.replace(NON_PERSIAN_RUN, (m, offset) => {
-    if (!/\S/.test(m)) return m // pure whitespace - nothing to isolate
-    // True start of a line? (only whitespace between the last \n and the run)
-    let i = offset - 1
-    while (i >= 0 && (text[i] === ' ' || text[i] === '\t')) i--
-    const atLineStart = i < 0 || text[i] === '\n'
-    if (atLineStart && MARKDOWN_BLOCK_START.test(m)) return m
-    // Bracket-only run (e.g. a standalone ")", or ") " when the regex pulls
-    // in trailing whitespace): only isolate it when it contains a bracket
-    // index flagged as foreign — a pure-Persian parenthetical must be left
-    // for the browser's native (correct) mirroring. Scan every char of the
-    // run (not just index 0) since the match can start with whitespace too.
-    if (!HAS_STRONG.test(m)) {
-      let hasForeignBracket = false
-      for (let k = 0; k < m.length; k++) {
-        if ((OPEN_TO_CLOSE[m[k]] || CLOSE_TO_OPEN[m[k]]) && foreignBrackets.has(offset + k)) {
-          hasForeignBracket = true
-          break
-        }
-      }
-      // Arrow runs (see EXCEPTION 3) must be pinned LTR or they mirror to the
-      // wrong direction inside RTL text. Skip runs that also carry markdown
-      // inline delimiters so "**→**" keeps parsing.
-      const hasArrow = ARROW.test(m) && !MARKDOWN_INLINE_DELIM.test(m)
-      if (!hasForeignBracket && !hasArrow) return m
-    }
-    return "\u2066" + m + "\u2069"
-  })
-}
-
-// In LTR paragraphs this is the mirror image of fixRtlText: wrap every
-// contiguous Persian run in an RLI/PDI isolate so Persian words render RTL
-// (correct letter order & shaping) inside otherwise-LTR text — no direction
-// switch needed, and mixed Persian/English no longer falls apart. Trailing
-// ASCII sentence punctuation (. ! ? ; :) is glued INTO the run so it lands on
-// the correct (left) side: inside an RLI isolate a trailing neutral after RTL
-// text resolves RTL. Brackets are deliberately left alone here — isolating
-// them can break markdown links, and in LTR text parens around Persian already
-// resolve acceptably (literal, not flipped).
-const PERSIAN_RUN = new RegExp(
-  `[${PERSIAN_RANGE}\\u200C\\u200D]+[.!?;:]*`,
-  "g",
-)
-
-function fixLtrText(text: string): string {
-  return text.replace(PERSIAN_RUN, (m) => {
-    if (!/\S/.test(m)) return m
-    return "\u2067" + m + "\u2069"
-  })
-}
-
-export function fixMixedText(text: string, dir: 'rtl' | 'ltr'): string {
-  return dir === 'ltr' ? fixLtrText(text) : fixRtlText(text)
-}
-
-export function prepareContent(text: string, dir: 'rtl' | 'ltr'): string {
+// Prepare message content for rendering. Direction is handled natively by the
+// browser (dir="auto" / unicode-bidi: plaintext on the message containers), so
+// we no longer inject LRI/PDI/RLI isolates by hand — that manual injection was
+// the source of the reversed-paren / flipped-arrow / glued-word bugs. All that
+// remains is stripping model-injected bidi control chars and normalizing the
+// invisible word separators, both of which are safe and direction-agnostic.
+export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   if (!text) return text
   const cleaned = stripBidiMarks(text)
   const parts = cleaned.split(/```/g)
   const fixed = parts.map((p, i) => {
     if (i % 2 === 1) return p // inside code block, don't modify
-    const p2 = fixZwsp(p)
-    return p2
-      .split('\n')
-      // Table rows (GFM) contain pipes mid-line; isolating those lines inserts
-      // FSI/PDI control chars that break remark-gfm's pipe parsing, so tables
-      // render as plain text. Skip any line containing '|' entirely.
-      .map((line) => (line.includes('|') ? line : fixMixedText(line, dir)))
-      .join('\n')
+    return fixZwsp(p)
   })
   return fixed.join('```')
 }

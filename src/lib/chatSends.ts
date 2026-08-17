@@ -7,8 +7,8 @@
  *
  * The stored function must only depend on (a) its chatId argument and (b)
  * mutable store state read at call time — NOT on React component state that
- * goes stale when the panel unmounts (see the skillChips/nvimMentioned draft
- * changes in Chat.tsx for why).
+ * goes stale when the panel unmounts (see the nvimMentioned draft changes in
+ * Chat.tsx for why).
  */
 
 import type { QueuedMessage } from "../types"

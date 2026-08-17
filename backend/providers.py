@@ -11,16 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
+from collections.abc import Sequence
 
 import httpx
+from openai.types import chat
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.settings import ModelSettings
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OPENCODE_BASE = "https://opencode.ai/zen/v1"
@@ -398,6 +404,72 @@ def _expand_base(template: str, provider: str) -> str:
     if meta_base := _provider_meta(provider).get("env_base_url"):
         base = os.environ.get(meta_base) or base
     return base.rstrip("/")
+
+
+def _is_deepseek_reasoning_model(model: str) -> bool:
+    """DeepSeek reasoning models require `reasoning_content` round-trip on every
+    assistant message while thinking is active; plain chat models (deepseek-chat
+    / deepseek-v3) don't and can ignore the extra field.
+
+    Matches deepseek-reasoner / deepseek-r1 / deepseek-v4* / deepseek-v3.1*
+    (and any id carrying "thinking"/"reason"), but NOT deepseek-chat / v3.
+    """
+    m = (model or "").lower()
+    if "deepseek" not in m:
+        return False
+    return any(token in m for token in ("reasoner", "r1", "v4", "v3.1", "thinking", "reason"))
+
+
+class _ReasoningBackfillChatModel(OpenAIChatModel):
+    """OpenAIChatModel that ALWAYS backfills the `reasoning_content` field on
+    assistant tool-call messages for DeepSeek reasoning models.
+
+    pydantic-ai's stock backfill (openai.py `_map_messages`) only adds the
+    empty field while SOME message in the conversation carries a ThinkingPart
+    (`thinking_active`). Gateways that strip `reasoning_content` from the
+    streamed response (TokenRouter) never produce a ThinkingPart, so the stock
+    backfill never fires and the upstream DeepSeek API rejects the request
+    with `messages[N].reasoning_content is required for thinking tool-call
+    history`. Forcing the field here satisfies the round-trip requirement even
+    when no thinking text was ever captured (fresh-chat tool loop, stripped
+    gateway stream, resume_tool replay).
+    """
+
+    async def _map_messages(
+        self,
+        messages: Sequence[ModelMessage],
+        model_request_parameters: ModelRequestParameters,
+        *,
+        model_settings: ModelSettings | None = None,
+    ) -> list[chat.ChatCompletionMessageParam]:
+        mapped = await super()._map_messages(
+            messages, model_request_parameters, model_settings=model_settings
+        )
+        profile = self.profile or {}
+        field = profile.get("openai_chat_thinking_field")
+        if field and profile.get("openai_chat_send_back_thinking_parts") == "field":
+            # Some gateways (TokenRouter) strip an EMPTY `reasoning_content`
+            # from the request before forwarding to DeepSeek, which then 400s
+            # with `reasoning_content is required for thinking tool-call
+            # history`. A non-empty placeholder survives the gateway; direct
+            # DeepSeek accepts the empty string, so the default stays "".
+            placeholder = profile.get("openai_chat_thinking_backfill", "")
+            for message in mapped:
+                if (
+                    message.get("role") == "assistant"
+                    and message.get("tool_calls")
+                    and not message.get(field)
+                ):
+                    # `not message.get(field)` covers BOTH a missing field AND
+                    # the empty `''` that pydantic-ai's stock backfill injects
+                    # while ANY message carries a ThinkingPart. Gateways that
+                    # strip an EMPTY `reasoning_content` (TokenRouter) then
+                    # drop it and DeepSeek 400s — replacing it with the
+                    # placeholder keeps the field alive through the gateway.
+                    message[field] = placeholder  # type: ignore[typeddict-item]
+        return mapped
+
+
 def build_model(
     provider: str,
     model: str,
@@ -486,13 +558,24 @@ def build_model(
     # `The reasoning_content in the thinking mode must be passed back to the API`,
     # killing long tool-loop turns. Declare `reasoning_content` as the thinking
     # field and send it back on every turn so pydantic-ai round-trips thinking
-    # and backfills the empty field on tool calls.
+    # and backfills the empty field on tool calls. The backfill is FORCED for
+    # these models (see `_ReasoningBackfillChatModel`) because pydantic-ai only
+    # backfills while SOME message carries a ThinkingPart — gateways that strip
+    # `reasoning_content` from the stream never produce one.
     profile = None
-    if "deepseek" in (model or "").lower():
+    if _is_deepseek_reasoning_model(model):
         profile = {
             "openai_chat_thinking_field": "reasoning_content",
             "openai_chat_send_back_thinking_parts": "field",
         }
+        if provider == "tokenrouter":
+            # TokenRouter strips an EMPTY `reasoning_content` from the request
+            # before forwarding to DeepSeek, which then 400s with
+            # `reasoning_content is required for thinking tool-call history`
+            # (verified live: `""` → 400, `" "` → 200). Backfill with a
+            # non-empty placeholder so the field survives the gateway.
+            profile["openai_chat_thinking_backfill"] = " "
+        return _ReasoningBackfillChatModel(model, provider=provider_obj, profile=profile)
     return OpenAIChatModel(model, provider=provider_obj, profile=profile)
 
 
@@ -811,7 +894,44 @@ def _normalize_catalog_id(model_id: str) -> str:
         if mid.endswith(suffix):
             mid = mid[: -len(suffix)]
             break
+    # TokenRouter also serves DATED and FREE variants of upstream models
+    # ("deepseek-v4-pro-0813-free", "deepseek-v4-flash-0731") while models.dev
+    # keys the BASE model ("deepseek-v4-pro"). Strip a trailing "-free" and a
+    # trailing date stamp so the variant resolves to the base entry's
+    # context/reasoning instead of falling through to unknown (0).
+    while mid.endswith("-free"):
+        mid = mid[: -len("-free")]
+    mid = re.sub(r"-\d{4,8}$", "", mid)
     return mid
+
+
+# Reverse index of models.dev catalog entries by bare model id (the id after
+# the last '/'), cached per catalog fetch so router-gateway lookups of bare ids
+# ("deepseek-v4-pro") resolve without scanning the whole catalog per model.
+_models_dev_bare_cache: tuple[dict, dict[str, dict]] | None = None
+
+
+def _models_dev_bare_index(catalog: dict) -> dict[str, dict]:
+    """Map bare model ids ("deepseek-v4-pro") to their catalog entry.
+
+    Keyed on the catalog dict's identity (a stored reference, not ``id()``) so
+    a fresh ``_models_dev_catalog`` fetch rebuilds the index while the cached
+    dict reuses it. First entry wins for a bare id that appears under several
+    providers (all the same model).
+    """
+    global _models_dev_bare_cache
+    if _models_dev_bare_cache and _models_dev_bare_cache[0] is catalog:
+        return _models_dev_bare_cache[1]
+    index: dict[str, dict] = {}
+    for provider_data in (catalog or {}).values():
+        for entry in ((provider_data or {}).get("models") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            bare = (entry.get("id") or "").split("/")[-1]
+            if bare and bare not in index:
+                index[bare] = entry
+    _models_dev_bare_cache = (catalog, index)
+    return index
 
 
 def _models_dev_entry(catalog: dict, provider_keys: list[str], model_id: str) -> dict:
@@ -858,6 +978,28 @@ def _models_dev_entry(catalog: dict, provider_keys: list[str], model_id: str) ->
                 for alias in candidate.get("aliases") or candidate.get("alias") or []:
                     if alias == norm:
                         return candidate
+    # Router gateways (tokenrouter) present some upstream models BARE
+    # ("deepseek-v4-pro" — no provider prefix), so `_models_dev_keys` only
+    # yields the gateway's own (uncataloged) key and every per-provider lookup
+    # above misses. When NONE of the candidate keys exist in the catalog, fall
+    # back to the reverse index of bare ids (exact, then normalized) so the
+    # model's context/reasoning still resolves against the upstream provider's
+    # catalog entry.
+    if not any((catalog or {}).get(key) for key in provider_keys):
+        bare_index = _models_dev_bare_index(catalog)
+        candidates = [model_id]
+        if "/" in model_id:
+            candidates.append(model_id.split("/", 1)[-1])
+        for candidate in candidates:
+            entry = bare_index.get(candidate)
+            if isinstance(entry, dict):
+                return entry
+        for candidate in candidates:
+            norm = _normalize_catalog_id(candidate)
+            if norm and norm != candidate:
+                entry = bare_index.get(norm)
+                if isinstance(entry, dict):
+                    return entry
     return {}
 
 

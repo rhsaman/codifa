@@ -198,8 +198,6 @@ export interface StreamParams {
   mcpServers?: Record<string, McpServerConfig>
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
-  /** Auto-pick the most relevant skills (Coder mode) via RAG. */
-  autoSkills?: boolean
   /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
   allowCreate?: boolean
   /** Per-mode tool capabilities sent to the backend for tool gating. */
@@ -216,6 +214,9 @@ export interface StreamParams {
   vectorConfig?: { ttl_days: number; max_docs: number; max_chunks: number }
   /** Per-subagent model overrides (explore, vision, compact). */
   subagentModels?: Record<string, string>
+  /** Pre-emptive auto-compact threshold as a FRACTION of the context window
+   *  (0.5–0.95, default 0.8). */
+  compactThreshold?: number
   signal?: AbortSignal
 }
 
@@ -245,14 +246,13 @@ export async function streamChat(
       prompt: params.prompt,
       chat_id: params.chatId ?? '',
       history: params.history,
-      max_history: params.maxHistory ?? params.provider.maxHistory ?? 10,
+      max_history: params.maxHistory ?? 10,
       attachments: params.attachments ?? [],
       images: params.images ?? [],
       system_prompt: params.systemPrompt ?? '',
       thinking_level: params.thinkingLevel ?? '',
       mcp_servers: params.mcpServers ?? {},
       skills: params.skills ?? [],
-      auto_skills: params.autoSkills ?? false,
       allow_create: params.allowCreate ?? false,
       cap: params.cap ?? {},
       allow_outside: params.allowOutside ?? false,
@@ -261,6 +261,7 @@ export async function streamChat(
       vector_db_path: params.vectorDbPath ?? "",
       vector_config: params.vectorConfig ?? null,
       subagent_models: params.subagentModels ?? {},
+      compact_threshold: params.compactThreshold ?? 0.8,
       context_window: params.provider.contextWindow ?? 0,
     }),
   })

@@ -2618,6 +2618,12 @@ textarea {
   left: auto;
   right: 0;
   transform: none;
+  /* The entrance animation (mode-menu-in) reads --mode-x; without this the
+     popup inherits -50% from .mode-menu and animates in shifted left (centered
+     on the button) before snapping right-aligned — reads as "opens in the
+     wrong place". Pin it to the button's right edge for the whole animation. */
+  --mode-x: 0;
+  transform-origin: bottom right;
   min-width: 280px;
   overflow: hidden;
 }
@@ -2777,77 +2783,6 @@ textarea {
   line-height: 1.4;
 }
 
-/* ---- auto-use skills switch (composer) ---- */
-.skills-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 30px;
-  padding: 0 12px;
-  border: none;
-  border-radius: 999px;
-  background: var(--bg-input);
-  color: var(--text-dim);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-  white-space: nowrap;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
-  transition:
-    background 0.14s,
-    box-shadow 0.14s,
-    color 0.14s;
-}
-
-.skills-toggle:hover {
-  background: var(--accent-dim);
-  color: var(--text);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-.skills-toggle-track {
-  position: relative;
-  width: 26px;
-  height: 14px;
-  border-radius: 999px;
-  background: var(--border);
-  transition: background 0.16s;
-  flex: 0 0 auto;
-}
-
-.skills-toggle-knob {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--text-dim);
-  transition:
-    left 0.16s,
-    background 0.16s;
-}
-
-.skills-toggle.on {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 20%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-.skills-toggle.on .skills-toggle-track {
-  background: var(--accent);
-}
-
-.skills-toggle.on .skills-toggle-knob {
-  left: 14px;
-  background: var(--on-accent);
-}
-
 /* ---- reasoning-effort picker (composer, shown for reasoning models) ---- */
 .thinking-pill {
   position: relative;
@@ -2912,6 +2847,36 @@ textarea {
   font-size: 9px;
   opacity: 0.7;
   pointer-events: none;
+}
+
+/* Reasoning-effort pill is now a button opening a custom popup (replaces the
+   native <select>): the button fills the pill, the popup reuses .mode-menu. */
+.thinking-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.thinking-label {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.thinking-menu {
+  left: 0;
+  --mode-x: 0;
+  transform: translateX(0);
+  transform-origin: bottom left;
+  min-width: 260px;
 }
 
 /* ---- tool activity ---- */
@@ -4600,6 +4565,33 @@ textarea {
   backdrop-filter: blur(22px) saturate(1.2);
 }
 
+.mention-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+.mention-head-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.mention-head-count {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-input);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
 .mention-search {
   width: 100%;
   box-sizing: border-box;
@@ -4620,7 +4612,7 @@ textarea {
 .mention-search:focus {
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+    0 0 0 3px color-mix(in srgb, var(--link) 20%, transparent);
 }
 
 .mention-item {
@@ -4644,7 +4636,9 @@ textarea {
 }
 
 .mention-item.kbd:not(:hover) {
-  outline: 1px solid var(--accent);
+  /* Keyboard-selected item: blue ring instead of var(--accent), which renders
+     as a white outline in the dark theme. */
+  outline: 1px solid color-mix(in srgb, var(--link) 50%, transparent);
   outline-offset: -1px;
 }
 
@@ -4734,12 +4728,12 @@ textarea {
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-track {
-  background: var(--accent);
+  background: var(--link);
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-knob {
   left: 16px;
-  background: var(--on-accent);
+  background: #fff;
 }
 
 .mention-empty {
@@ -4795,9 +4789,9 @@ textarea {
 }
 
 /* File chip: a small paper-clip icon so plain file paths read as "file
-   badges" instead of bare text. Skill/queue/image chips already carry their
-   own icon or thumbnail, so they opt out. */
-.attachment-chip:not(.skill-chip):not(.queued-chip):not(.image-chip)::before {
+   badges" instead of bare text. Queue/image chips already carry their own
+   icon or thumbnail, so they opt out. */
+.attachment-chip:not(.queued-chip):not(.image-chip)::before {
   content: "📎";
   flex: 0 0 auto;
   font-size: 10px;
@@ -4827,36 +4821,6 @@ textarea {
 .chip-x:hover {
   background: color-mix(in srgb, var(--danger) 16%, transparent);
   color: var(--danger);
-}
-
-/* Skill chip: warm amber glass, colored halo on hover/focus. */
-.attachment-chip.skill-chip {
-  border: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, #f5a524 26%, var(--bg-panel)),
-    color-mix(in srgb, #f5a524 12%, var(--bg-panel))
-  );
-  color: var(--text);
-  gap: 5px;
-  padding: 4px 10px 4px 5px;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #f5a524 35%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.15),
-    0 4px 14px -6px rgba(245, 165, 36, 0.55);
-}
-
-.attachment-chip.skill-chip.mcp-chip {
-  border: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--link) 24%, var(--bg-panel)),
-    color-mix(in srgb, var(--link) 11%, var(--bg-panel))
-  );
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--link) 35%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.15),
-    0 4px 14px -6px color-mix(in srgb, var(--link) 50%, transparent);
 }
 
 /* Messages typed while the agent is working: steer chips (already delivered to
@@ -4892,29 +4856,64 @@ textarea {
   padding-bottom: 2px;
 }
 
-/* Small icon inside a chip: solid colored capsule with a white glyph. */
-.chip-icon-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 17px;
-  height: 17px;
-  border-radius: 999px;
-  font-size: 9px;
-  flex: 0 0 auto;
-  background: linear-gradient(to bottom, #ffc64d, #f5a524);
-  color: #3a2500;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.4),
-    0 1px 3px rgba(245, 165, 36, 0.5);
+/* Pending messages rendered as bubbles at the END of the transcript (replaces
+   the old chips above the composer). Distinct from real sent messages: dashed
+   border + tinted background + pending icon/label, so a queued item never
+   reads as an already-delivered user message. */
+.queued-bubbles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 4px;
 }
 
-.mcp-chip .chip-icon-badge {
-  background: linear-gradient(to bottom, color-mix(in srgb, var(--link) 80%, #fff), var(--link));
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.35),
-    0 1px 3px color-mix(in srgb, var(--link) 50%, transparent);
+.queued-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: color-mix(in srgb, #3b82f6 7%, var(--bg-input));
+  border: 1px dashed color-mix(in srgb, #3b82f6 50%, var(--border));
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+
+.queued-bubble.steer {
+  background: color-mix(in srgb, #10b981 7%, var(--bg-input));
+  border-color: color-mix(in srgb, #10b981 50%, var(--border));
+}
+
+.queued-bubble-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queued-bubble-icon {
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.queued-bubble-label {
+  flex: 1;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+.queued-bubble-x {
+  flex: 0 0 auto;
+}
+
+.queued-bubble-text {
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-messages[data-dir="rtl"] .queued-bubble-text {
+  text-align: right;
 }
 
 /* ---- retry banner ---- */
@@ -6769,6 +6768,7 @@ textarea {
 }
 
 .notice-banner {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -6780,6 +6780,25 @@ textarea {
   color: var(--text);
   font-size: 12px;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 16%, transparent);
+  animation: notice-in 0.25s ease;
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+@keyframes notice-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.notice-leaving {
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
 }
 
 .notice-icon {
@@ -6812,11 +6831,36 @@ textarea {
 
 .notice-info {
   border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg));
 }
 
 .notice-info .notice-icon {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* Auto-dismissing info notices (e.g. "Context compacted") show a thin progress
+   bar that drains over the same 4.5s the banner stays visible, so the user can
+   tell it will disappear on its own. */
+.notice-info::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  animation: notice-progress 4.5s linear forwards;
+}
+
+@keyframes notice-progress {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 0%;
+  }
 }
 
 .notice-prefix {

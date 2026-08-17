@@ -56,12 +56,7 @@ export function ModeSelect({
                 <span className="mode-menu-label">{m.label}</span>
                 <span className="mode-menu-desc">{m.description}</span>
               </span>
-              <span className="mode-menu-cap">
-                {m.capabilities.writeFiles ? "✍️" : ""}
-                {m.capabilities.runTerminal ? "⌨️" : ""}
-                {m.capabilities.web ? "🌐" : ""}
-              </span>
-            </button>
+              </button>
           ))}
         </div>
       )}

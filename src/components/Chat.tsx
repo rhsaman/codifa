@@ -71,6 +71,15 @@ const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
 const THINKING_LABELS = Object.fromEntries(
   THINKING_OPTIONS,
 ) as Record<ThinkingLevel, string>;
+const THINKING_DESCS: Record<ThinkingLevel, string> = {
+  "": "Default reasoning",
+  none: "No reasoning — fastest replies",
+  minimal: "Minimal reasoning — quick replies",
+  low: "Light reasoning — faster replies",
+  medium: "Balanced reasoning — default",
+  high: "Deep reasoning — better answers",
+  xhigh: "Maximum effort — best answers",
+};
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "help", hint: "List all commands" },
@@ -172,7 +181,16 @@ function sliceToBudget(
     coder: 140000,
   };
   const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? "ask"] ?? budget);
-  const recent = history.slice(-maxHistory);
+  // Compact summaries (system role) stand in for the folded older turns — they
+  // must ALWAYS survive the maxHistory slice, or the model loses the whole
+  // compacted context once the chat grows past maxHistory after a compact and
+  // "starts from scratch". Slice only the non-system turns to maxHistory, then
+  // re-prepend every system message (the budget loop below already keeps them).
+  const systems = history.filter((m) => m.role === "system");
+  const recent = [
+    ...systems,
+    ...history.filter((m) => m.role !== "system").slice(-maxHistory),
+  ];
   const kept: typeof history = [];
   let acc = 0;
   for (const m of [...recent].reverse()) {
@@ -280,12 +298,8 @@ export function ChatPanel() {
   const workspaces = useStore((s) => s.workspaces);
   const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
-  const autoSkills = chat?.autoSkills ?? settings.autoSkills === true;
-  const setAutoSkills = (on: boolean) => {
-    if (chat) useStore.getState().setChatAutoSkills(chat.id, on);
-  };
   const modes = useStore((s) => allModes(s.settings));
-  const maxHistory = provider.maxHistory ?? defaultMaxHistoryFor(provider.kind);
+  const maxHistory = defaultMaxHistoryFor(provider.kind);
   const nvimFile = useStore((s) => s.nvimFile);
   const nvimDiags = useStore((s) => s.nvimDiagnostics);
   const nvimDiagCounts = useMemo(() => {
@@ -373,9 +387,6 @@ export function ChatPanel() {
   const [transcribing, setTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
-  const [skillChips, setSkillChips] = useState<
-    Array<{ kind: "skill" | "mcp"; name: string; path?: string }>
-  >(chat?.draft?.skillChips ?? []);
   // Pending ask/permission requests live on the chat in the store
   // (Chat.pendingAsk / Chat.pendingPermission), NOT local state:
   // `<ChatPanel key={activeChatId} />` fully unmounts/remounts on every chat
@@ -393,11 +404,10 @@ export function ChatPanel() {
   const filteredMcp = Object.keys(mcpConnectors).filter(
     (name) => !skillQ || name.toLowerCase().includes(skillQ),
   );
-  const skillOptions: Array<{
-    kind: "skill" | "mcp";
-    name: string;
-    path?: string;
-  }> = [...filteredMcp.map((name) => ({ kind: "mcp" as const, name }))];
+  const skillOptions = filteredMcp.map((name) => ({
+    kind: "mcp" as const,
+    name,
+  }));
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
@@ -436,6 +446,50 @@ export function ChatPanel() {
   const setThinkingLevel = (lv: ThinkingLevel) => {
     if (chat) useStore.getState().setChatThinkingLevel(chat.id, lv);
   };
+
+  // Reasoning-effort popup (replaces the native <select>): open state + close
+  // on outside click / Escape.
+  const [thinkingOpen, setThinkingOpen] = useState(false);
+  const thinkingRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!thinkingOpen) return;
+    function onDocClick(e: MouseEvent) {
+      if (thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+        setThinkingOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setThinkingOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [thinkingOpen]);
+
+  // Auto-dismiss the "Context compacted" notice: show it ~4.5s, fade out over
+  // 0.5s, then clear it from the store. Per-chat, so switching away and back
+  // restarts the countdown instead of leaving a stale banner forever.
+  const [noticeLeaving, setNoticeLeaving] = useState(false);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!chat?.compactNotice) {
+      setNoticeLeaving(false);
+      return;
+    }
+    setNoticeLeaving(false);
+    noticeTimerRef.current = setTimeout(() => {
+      setNoticeLeaving(true);
+      noticeTimerRef.current = setTimeout(() => {
+        useStore.getState().setChatCompactNotice(chat.id, null);
+      }, 500);
+    }, 4500);
+    return () => {
+      if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    };
+  }, [chat?.id, chat?.compactNotice]);
 
   // Switch the CURRENT chat's mode. No UI toast — the agent knows which mode the
   // next message runs in; the user doesn't need a visible confirmation.
@@ -540,9 +594,8 @@ export function ChatPanel() {
       input,
       attachments,
       images,
-      skillChips,
     });
-  }, [chat?.id, input, attachments, images, skillChips]);
+  }, [chat?.id, input, attachments, images]);
   // Keep the model context window (and pricing, when the provider advertises
   // it) fresh from the provider's live /models list, so the context meter
   // reflects the model's real capacity and cost (not a hardcoded default).
@@ -645,30 +698,37 @@ export function ChatPanel() {
   const ctxWindow = modelContextWindow(provider, activeModel);
 
   const contextUsed = useMemo(() => {
-    // Source of truth: the REAL input+output tokens the provider reported for
-    // the last completed exchange (message.usage), which already reflects
-    // whatever the backend actually sent — base system prompt, auto-scout
-    // dossier, RAG block and injected memory notes included. None of that is
-    // knowable from the frontend, so a blind character estimate of `history`
-    // alone was structurally unable to match it (it could only ever see the
-    // conversation text, not the backend-only additions). Because compacted
-    // messages are excluded from this scan and the preserved tail's usage is
-    // cleared on compact, this naturally resets to a small number right after
-    // a compact, then reflects real usage again once the first post-compact
-    // reply completes. Falls back to
-    // the character-based estimate only when no real usage exists yet (a
-    // brand new chat, or the brief window between a compact and the next
-    // completed reply).
+    // Take the LAST assistant message that reported real output tokens and sum
+    // input + output — the provider's real usage, no character estimate — so
+    // the meter can't overshoot and then "fall back down" when the first usage
+    // event lands. input_tokens already includes the cache-read/write portion
+    // (see the backend's _usage_event), so cache is NOT added again: adding it
+    // double-counted and inflated the meter past the real window usage, which
+    // also made it disagree with the backend's pre-emptive compact trigger
+    // (input + output) and show >100% while no compaction fired. Because the
+    // backend reports the FULL prompt's input tokens on every request, the sum
+    // is monotonic across a tool loop: the meter only grows within a turn,
+    // never oscillates. With no real usage yet (brand-new chat, or right after
+    // a compact) it falls back to the estimate below — never a dash.
     const msgs = chat?.messages ?? [];
     const active = msgs.filter((m) => !m.compacted);
     for (let i = active.length - 1; i >= 0; i--) {
-      const u = active[i].usage;
-      // A 0-token usage record is degenerate (a rejected/empty request the
-      // provider never billed — e.g. a sub-agent request that reported 0/0).
-      // Treat it as "no real usage" and keep scanning for the last completed
-      // exchange with REAL tokens, so the meter never flashes a misleading 0%.
-      if (u && u.totalTokens > 0) return u.totalTokens;
+      const m = active[i];
+      const u = m.usage;
+      if (m.role === "assistant" && u && u.outputTokens > 0) {
+        return u.inputTokens + u.outputTokens;
+      }
     }
+    // No real usage yet (brand-new chat, or right after a compact cleared the
+    // tail's usage). Fall back to the character estimate — system prompt +
+    // summary + preserved tail + the in-flight turn's own content/thinking/tool
+    // payload — so the meter shows the ACTUAL context size instead of hiding
+    // behind a dash. This is what makes the meter visibly drop after /compact
+    // AND keep showing the reduced value while the next turn is thinking: the
+    // estimate already includes the live message, so it tracks the first real
+    // usage event closely instead of growing with the live text and then
+    // jumping (the old "oscillating meter" complaint was the per-message badge
+    // estimating live; the titlebar meter just needs the estimate, not a dash).
     return estimateContextTokens(
       chat,
       systemPrompt,
@@ -762,19 +822,9 @@ export function ChatPanel() {
     }
     s.addRecentModel(activeProvider.model, activeProvider.id);
 
-    // Selected skills (chips) and enabled MCP connectors (persistent switches)
-    // become an explicit instruction on this turn.
+    // Enabled MCP connectors (persistent switches) become an explicit
+    // instruction on this turn.
     const skillNotes: string[] = [];
-    // Read from the live chat's draft (not the component closure) so a turn
-    // drained while this panel is unmounted still carries the picked chips.
-    const activeChips = chat.draft?.skillChips ?? skillChips;
-    for (const chip of activeChips) {
-      if (chip.kind === "skill") {
-        skillNotes.push(
-          `Read ${chip.path} and follow its instructions exactly.`,
-        );
-      }
-    }
     for (const name of s.settings.mcpEnabled ?? []) {
       if (s.settings.mcpServers?.[name]) {
         skillNotes.push(
@@ -1275,6 +1325,17 @@ export function ChatPanel() {
           // inflated to ~100% (the reason the provider cut the stream). Don't
           // persist it: the meter must fall back to the last completed turn.
           usage: undefined,
+          // Surface a Retry banner for plain backend errors too (not just
+          // retry_giveup/watchdog) so there's a one-click resume path.
+          // retryMessage treats `error` as a failed turn, so the partial
+          // stream + completed tools are kept instead of truncate-and-restart.
+          retry: {
+            attempt: 1,
+            maxAttempts: 1,
+            delay: 0,
+            reason: event.content ?? "The backend returned an error.",
+            gaveUp: true,
+          },
         });
         // Fold the completed tool calls into content too — the backend fatal
         // arrives as an inline event, not a throw, so the catch path won't run.
@@ -1327,15 +1388,24 @@ export function ChatPanel() {
         // request REPLACES the previous while streaming) — it is NOT the
         // accumulated whole-turn total, which would re-count the growing
         // prompt on every tool-loop resend.
-        store.updateMessage(assistantMsg.id, {
-          usage: {
-            inputTokens,
-            outputTokens,
-            totalTokens: total,
-            cacheReadTokens: event.cache_read_tokens ?? 0,
-            cacheWriteTokens: event.cache_write_tokens ?? 0,
-          },
-        });
+        //
+        // Sub-agent usage (explore/search/web sub-models) runs in isolated
+        // transcripts that are discarded when the tool returns — it never
+        // enters the parent's growing context, so it must NOT replace the
+        // message badge / context meter (that made the meter bounce between
+        // the parent's large request and each small sub-agent request). It
+        // still accrues into the chat-wide session totals above.
+        if (!event.sub) {
+          store.updateMessage(assistantMsg.id, {
+            usage: {
+              inputTokens,
+              outputTokens,
+              totalTokens: total,
+              cacheReadTokens: event.cache_read_tokens ?? 0,
+              cacheWriteTokens: event.cache_write_tokens ?? 0,
+            },
+          });
+        }
       } else if (event.kind === "done") {
         // The backend signals the end of the stream with a "done" event.
         // Clear the stall hint immediately and refresh the watchdog clock so a
@@ -1373,10 +1443,6 @@ export function ChatPanel() {
               if (all[n]) sel[n] = all[n];
             return sel;
           })(),
-          skills: activeChips
-            .filter((c) => c.kind === "skill")
-            .map((c) => c.name),
-          autoSkills: chat?.autoSkills ?? s.settings.autoSkills === true,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
@@ -1389,6 +1455,7 @@ export function ChatPanel() {
             max_chunks: s.memoryMaxChunks,
           },
           subagentModels: s.subagentModels,
+          compactThreshold: (s.settings.compactThreshold ?? 80) / 100,
           signal: abort.signal,
         },
         handleEvent,
@@ -1442,9 +1509,23 @@ export function ChatPanel() {
       abortRef.current = null;
       useStore.getState().setChatAbort(chat.id, null);
       useStore.getState().setStreaming(false, false);
-      useStore
+      // Keep the retry banner when this turn ended in a failure the user can
+      // act on (retry_giveup / watchdog / backend error). Clearing `retry`
+      // here would make the banner vanish the instant the stream closes, and
+      // the next Retry click would fall back to truncate-and-restart, losing
+      // the partial turn. Only clear it for clean/aborted runs.
+      const curMsg = useStore
         .getState()
-        .updateMessage(assistantMsg.id, { streaming: false, retry: null });
+        .chats.find((c) => c.id === chat.id)
+        ?.messages.find((m) => m.id === assistantMsg.id);
+      const keepRetry =
+        !!curMsg?.error ||
+        (!!curMsg?.retry &&
+          (curMsg.retry.gaveUp === true || curMsg.retry.watchdog === true));
+      useStore.getState().updateMessage(assistantMsg.id, {
+        streaming: false,
+        ...(keepRetry ? {} : { retry: null }),
+      });
       // A turn just completed → usage changed. Refresh the balance chip now.
       setBalanceTick((t) => t + 1);
     }
@@ -1479,13 +1560,47 @@ export function ChatPanel() {
   registerChatSend(chatIdRef.current, send);
 
   const compactContext = async () => {
-    const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === s.activeChatId);
+    let s = useStore.getState();
+    let ch = s.chats.find((c) => c.id === s.activeChatId);
+    if (!ch) return;
+
+    // Queue behind any in-flight stream on THIS chat: running the summarizer
+    // concurrently with the agent interleaves two model streams (usage events,
+    // text deltas), and the summarizer's completion then folds messages under
+    // the still-streaming reply — which makes the context meter dip and jump.
+    // Wait for the stream to finish, then compact.
+    const chatId = ch.id;
+    const chatStreaming = () => {
+      const st = useStore.getState();
+      const c = st.chats.find((x) => x.id === chatId);
+      return c?.messages.some((m) => m.streaming) ?? false;
+    };
+    if (chatStreaming()) {
+      setBusy(true);
+      useStore.getState().setChatCompacting(chatId, true);
+      await new Promise<void>((resolve) => {
+        const unsub = useStore.subscribe((state) => {
+          const c = state.chats.find((x) => x.id === chatId);
+          if (!c?.messages.some((m) => m.streaming)) {
+            unsub();
+            resolve();
+          }
+        });
+      });
+    }
+
+    // Re-read state after the wait — messages may have changed while streaming.
+    s = useStore.getState();
+    ch = s.chats.find((c) => c.id === s.activeChatId);
     if (!ch) return;
     const msgs = ch.messages.filter(
       (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
     );
-    if (msgs.length === 0) return;
+    if (msgs.length === 0) {
+      setBusy(false);
+      useStore.getState().setChatCompacting(chatId, false);
+      return;
+    }
     const transcript = msgs
       .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
       .join("\n\n")
@@ -1557,7 +1672,6 @@ export function ChatPanel() {
             },
             mcpServers: {},
             skills: [],
-            autoSkills: false,
             signal: ctr.signal,
           },
           (ev) => {
@@ -1633,7 +1747,7 @@ export function ChatPanel() {
     s.compactChat(
       ch.id,
       `[Compacted conversation]\n${summary.trim()}`,
-      Math.max(maxHistory - 1, 0),
+      1, // opencode-style: keep only the last message verbatim
     );
     // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
     // history stays recallable via memory later. Never blocks or throws.
@@ -1763,7 +1877,14 @@ export function ChatPanel() {
       const idx = ch.messages.findIndex((m) => m.id === id);
       const failed = ch.messages
         .slice(idx + 1)
-        .find((m) => m.role === "assistant" && m.retry);
+        .find(
+          (m) =>
+            m.role === "assistant" &&
+            (m.retry ||
+              m.error ||
+              (typeof m.content === "string" &&
+                m.content.includes("[Interrupted before finishing"))),
+        );
       if (failed) {
         // send() reuses the existing user bubble (no duplicate), clears the
         // retry banner, and keeps the failed assistant message in history so
@@ -2088,22 +2209,6 @@ export function ChatPanel() {
     setSkillIdx(0);
   };
 
-  const toggleSkillChip = (item: {
-    kind: "skill" | "mcp";
-    name: string;
-    path?: string;
-  }) => {
-    setSkillChips((chips) => {
-      const exists = chips.some(
-        (c) => c.kind === item.kind && c.name === item.name,
-      );
-      return exists
-        ? chips.filter((c) => !(c.kind === item.kind && c.name === item.name))
-        : [...chips, item];
-    });
-    setSkillOpen(false);
-  };
-
   const onInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const v = e.target.value;
     const prev = input;
@@ -2246,23 +2351,29 @@ export function ChatPanel() {
               className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: estimate of the current window (of the model's ${formatTokens(ctxWindow)} window).`
-                  : "Context used: estimate of the current window."
+                  ? `Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact (of the model's ${formatTokens(ctxWindow)} window).`
+                  : "Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact."
               }
               dir="ltr"
             >
-              {ctxPct !== null && (
+              {ctxPct !== null && contextUsed > 0 && (
                 <span className="context-meter-track">
                   <span
                     className="context-meter-fill"
-                    style={{ width: `${ctxPct}%` }}
+                    style={{ width: `${Math.min(100, ctxPct)}%` }}
                   />
                 </span>
               )}
               <span className="context-meter-text">
-                {formatTokens(contextUsed)}
-                {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
-                {ctxPct !== null ? ` (${ctxPct}%)` : ""}
+                {contextUsed > 0 ? (
+                  <>
+                    {formatTokens(contextUsed)}
+                    {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
+                    {ctxPct !== null ? ` (${ctxPct}%)` : ""}
+                  </>
+                ) : (
+                  "—"
+                )}
               </span>
             </span>
             {shownBal && (
@@ -2331,6 +2442,70 @@ export function ChatPanel() {
               )}
             </Fragment>
           ))}
+          {queuedMsgs.length > 0 && (
+            <div className="queued-bubbles">
+              {queuedMsgs.map((q) => (
+                <div
+                  className={`queued-bubble${q.kind === "steer" ? " steer" : ""}`}
+                  key={q.id}
+                  title={
+                    q.kind === "steer"
+                      ? "Sent to the running agent — will be addressed now or as the next turn"
+                      : "Queued — auto-sends after the current turn"
+                  }
+                >
+                  <div className="queued-bubble-head">
+                    <span className="queued-bubble-icon">
+                      {q.kind === "steer" ? "↝" : "⏳"}
+                    </span>
+                    <span className="queued-bubble-label">
+                      {q.kind === "steer"
+                        ? "Steering the running agent…"
+                        : "Queued — auto-sends after the current turn"}
+                    </span>
+                    <button
+                      className="chip-x queued-bubble-x"
+                      onClick={() =>
+                        useStore.getState().removeQueuedMessage(chat.id, q.id)
+                      }
+                      title="Remove from queue"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="queued-bubble-text" dir="auto">
+                    {prepareContent(q.text, dir) || "(empty)"}
+                  </div>
+                  {q.attachments && q.attachments.length > 0 && (
+                    <div className="msg-attachments" dir="ltr">
+                      {q.attachments.map((a) => (
+                        <span className="attachment-chip" key={a}>
+                          @ {a}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {q.images && q.images.length > 0 && (
+                    <div className="msg-images" dir="ltr">
+                      {q.images.map((img) => (
+                        <div
+                          className="msg-image"
+                          key={img.path}
+                          title={img.name}
+                        >
+                          {img.dataUrl ? (
+                            <img src={img.dataUrl} alt={img.name} />
+                          ) : (
+                            <span className="msg-image-ph">{img.name}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           {retryingMsg?.retry && (
             <RetryBanner
               attempt={retryingMsg.retry.attempt}
@@ -2404,8 +2579,25 @@ export function ChatPanel() {
                 </div>
               )}
               {compactNotice && (
-                <div className="notice-banner notice-info" dir="ltr">
-                  <span className="notice-icon">✓</span>
+                <div
+                  className={`notice-banner notice-info${noticeLeaving ? " notice-leaving" : ""}`}
+                  dir="ltr"
+                >
+                  <span className="notice-icon">
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  </span>
                   <span className="notice-text">{compactNotice}</span>
                   <button
                     type="button"
@@ -2485,7 +2677,7 @@ export function ChatPanel() {
                     {fa ? "عامل سوالی از شما دارد" : "The agent has a question"}
                   </span>
                 </div>
-                <div className="ask-card-question">
+                <div className="ask-card-question" dir="auto">
                   {prepareContent(askReq.question, fa ? "rtl" : "ltr")}
                 </div>
                 {askReq.options.length > 0 && (
@@ -2514,7 +2706,7 @@ export function ChatPanel() {
                             <path d="M9 18l6-6-6-6" />
                           </svg>
                         </span>
-                        <span className="ask-option-text">
+                        <span className="ask-option-text" dir="auto">
                           {prepareContent(opt, fa ? "rtl" : "ltr")}
                         </span>
                       </button>
@@ -2599,7 +2791,7 @@ export function ChatPanel() {
                   </span>
                   <span className="ask-card-title">{title}</span>
                 </div>
-                <div className="ask-card-question">
+                <div className="ask-card-question" dir="auto">
                   {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
                 </div>
                 {permissionReq.path ? (
@@ -2608,7 +2800,7 @@ export function ChatPanel() {
                   </code>
                 ) : null}
                 {permissionReq.reason ? (
-                  <div className="perm-reason">
+                  <div className="perm-reason" dir="auto">
                     {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
                   </div>
                 ) : null}
@@ -2693,6 +2885,13 @@ export function ChatPanel() {
             )}
             {skillOpen && (
               <div className="mention-popup" ref={skillPopupRef} dir="ltr">
+                <div className="mention-head">
+                  <span className="mention-head-icon">⚡</span>
+                  <span>MCP tools</span>
+                  <span className="mention-head-count">
+                    {filteredMcp.length}
+                  </span>
+                </div>
                 <input
                   className="mention-search"
                   type="text"
@@ -2770,6 +2969,7 @@ export function ChatPanel() {
                         setMcpEnabled(name, !on);
                       }}
                     >
+                      <span className="mention-icon-badge mcp">⚡</span>
                       <span className="mention-rel">{name}</span>
                       <span className="mcp-switch">
                         <span className="mcp-switch-track">
@@ -2851,28 +3051,9 @@ export function ChatPanel() {
             </button>
           )}
 
-          {(attachments.length > 0 ||
-            images.length > 0 ||
-            skillChips.some((c) => c.kind === "skill")) && (
-              <div className="attachment-chips" dir="ltr">
-                {skillChips
-                  .filter((c) => c.kind === "skill")
-                  .map((c) => (
-                    <span
-                      className="attachment-chip skill-chip"
-                      key={`${c.kind}-${c.name}`}
-                    >
-                      <span className="chip-icon-badge">✦</span>
-                      {c.name}
-                      <button
-                        className="chip-x"
-                        onClick={() => toggleSkillChip(c)}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                {attachments.map((a) => (
+          {(attachments.length > 0 || images.length > 0) && (
+            <div className="attachment-chips" dir="ltr">
+              {attachments.map((a) => (
                   <span className="attachment-chip" key={a}>
                     {a}
                     <button
@@ -2902,30 +3083,6 @@ export function ChatPanel() {
               </div>
             )}
 
-          {queuedMsgs.length > 0 && (
-            <div className="attachment-chips queued-chips" dir="ltr">
-              {queuedMsgs.map((q) => (
-                <span
-                  className={`attachment-chip queued-chip${q.kind === "steer" ? " steer-chip" : ""}`}
-                  key={q.id}
-                  title={
-                    q.kind === "steer"
-                      ? "Sent to the running agent — will be addressed now or as the next turn"
-                      : "Queued — auto-sends after the current turn"
-                  }
-                >
-                  {q.kind === "steer" ? "↝" : "⏳"} {q.text.slice(0, 40)}
-                  <button
-                    className="chip-x"
-                    onClick={() => useStore.getState().removeQueuedMessage(chat.id, q.id)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
           <div className="composer-row">
             <span className="composer-left">
               <ModeSelect
@@ -2934,65 +3091,73 @@ export function ChatPanel() {
                 iconOnly
                 onChange={changeMode}
               />
-              <ProviderModelSelect />
-              <button
-                type="button"
-                className={`skills-toggle${autoSkills ? " on" : ""}`}
-                onClick={() => setAutoSkills(!autoSkills)}
-                title="Auto-use skills — pick the most relevant skills for each message (Coder mode)"
-                aria-pressed={autoSkills}
-              >
-                <span className="skills-toggle-track">
-                  <span className="skills-toggle-knob" />
-                </span>
-                <span className="skills-toggle-label">Skills</span>
-              </button>
               {provider &&
                 (modelReasoning(provider, activeModel) ??
                   supportsReasoning(activeModel, provider.kind)) && (
                   <span
                     className={`thinking-pill${thinkingLevel ? " on" : ""}`}
-                    title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
+                    ref={thinkingRef}
                   >
-                    <svg
-                      className="thinking-icon"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
-                      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
-                      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
-                      <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
-                      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
-                      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
-                      <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
-                      <path d="M6 18a4 4 0 0 1-1.967-.516" />
-                      <path d="M19.967 17.484A4 4 0 0 1 18 18" />
-                    </svg>
-                    <select
-                      className="thinking-select"
-                      value={thinkingLevel}
-                      onChange={(e) =>
-                        setThinkingLevel(e.target.value as ThinkingLevel)
-                      }
+                    <button
+                      type="button"
+                      className="thinking-pill-btn"
+                      onClick={() => setThinkingOpen((o) => !o)}
+                      title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
                       aria-label="Reasoning effort for this message"
+                      aria-expanded={thinkingOpen}
                     >
-                      {THINKING_OPTIONS.map(([v, label]) => (
-                        <option key={v} value={v}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                    <span className="thinking-caret" aria-hidden="true">
-                      ▾
-                    </span>
+                      <svg
+                        className="thinking-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+                        <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+                        <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+                        <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+                        <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+                        <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+                        <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+                        <path d="M6 18a4 4 0 0 1-1.967-.516" />
+                        <path d="M19.967 17.484A4 4 0 0 1 18 18" />
+                      </svg>
+                      <span className="thinking-label">
+                        {THINKING_LABELS[thinkingLevel] ?? "Medium"}
+                      </span>
+                      <span className="mode-select-caret" aria-hidden="true">
+                        {thinkingOpen ? "▲" : "▼"}
+                      </span>
+                    </button>
+                    {thinkingOpen && (
+                      <div className="mode-menu thinking-menu">
+                        {THINKING_OPTIONS.map(([v, label]) => (
+                          <button
+                            key={v}
+                            type="button"
+                            className={`mode-menu-item thinking-item${thinkingLevel === v ? " active" : ""}`}
+                            onClick={() => {
+                              setThinkingLevel(v);
+                              setThinkingOpen(false);
+                            }}
+                          >
+                            <span className="mode-menu-text">
+                              <span className="mode-menu-label">{label}</span>
+                              <span className="mode-menu-desc">
+                                {THINKING_DESCS[v]}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </span>
                 )}
+              <ProviderModelSelect />
             </span>
             <span className="composer-hint">
               {busy && stalled && (

@@ -64,7 +64,7 @@ from providers import (
     _expand_base,
     _models_dev_catalog,
     _models_dev_id,
-    _models_dev_provider_key,
+    _models_dev_keys,
     _models_dev_reasoning,
     _provider_meta,
     build_model,
@@ -78,6 +78,7 @@ from providers import (
 from retrieval import RetrievalSettings
 from secret_utils import decrypt_secret
 from tools import (
+    _SCOUT_CTX,
     LOG_FILENAME,
     PathEscapeError,
     _is_content_gathering,
@@ -221,10 +222,10 @@ def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
 # Plan mode's OWN grep/glob calls are capped in CODE, not just prompt wording —
 # "TOOL-CALL DISCIPLINE" language alone is not reliably followed by weaker
 # models (prompt enforcement != model compliance). After the limit, further
-# calls are auto-delegated to `explore` (whose search steps run in an isolated
-# sub-agent and never bloat the parent's resent transcript), so an
-# investigation-heavy plan turn can't quietly burn tokens on many shallow
-# searches of its own.
+# calls are DENIED with a note pointing at `explore`; the model itself decides
+# whether to call it (opencode-style — no auto-delegation, no surprise
+# sub-agent spawns). An investigation-heavy plan turn can't quietly burn tokens
+# on many shallow searches of its own.
 _PLAN_OWN_SEARCH_LIMIT = 20
 
 
@@ -234,37 +235,19 @@ def _wrap_limited_grep(
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
     tool: str = "grep",
-    delegate: Callable | None = None,
 ):
     async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
-            # Prompt wording alone is not reliably followed by weaker models:
-            # an over-quota search that would otherwise be DENIED with a "use
-            # explore" note is instead AUTO-DELEGATED to the explore sub-agent
-            # exactly once (isolated context). This is what actually guarantees
-            # the sub-agent gets used when the parent over-searches itself.
-            if counter["n"] == limit + 1 and delegate is not None:
-                task = (
-                    f"Find every occurrence matching the pattern {pattern!r}"
-                    f"{f' restricted to {path!r}' if path else ' across the workspace'}"
-                    f"{f' with file-type filter {include!r}' if include else ''}"
-                    " and report the file:line locations with a short snippet for each, "
-                    "plus a one-paragraph summary of what you found and which files matter."
-                )
-                try:
-                    report = await delegate(task=task, path_hint=path, hints=include)
-                except Exception as exc:  # noqa: BLE001
-                    report = f"ERROR: delegated search failed: {exc}"
-                return (
-                    "[NOTE: your own grep/glob budget for this turn is used up — this "
-                    "search was delegated to the explore sub-agent (isolated context).]\n\n"
-                    + report
-                )
+            # The cap is a safety backstop, not a router: an over-quota search is
+            # DENIED with a note, and the model decides whether to call `explore`
+            # (isolated sub-agent context) — exactly like opencode, no
+            # auto-delegation.
             msg = (
-                "ERROR: your own grep/glob calls for this turn are used up and the broad "
-                "search was already delegated to the explore sub-agent — read its report "
-                "above and stop making more grep/glob calls."
+                "ERROR: your own grep/glob calls for this turn are used up. "
+                "Stop making more grep/glob calls — if you still need to "
+                "investigate, call the explore tool ONCE with the whole question "
+                "(it runs in an isolated sub-agent)."
             )
             if emit is not None:
                 emit(
@@ -294,31 +277,17 @@ def _wrap_limited_glob(
     limit: int = _PLAN_OWN_SEARCH_LIMIT,
     emit: Callable[[dict], None] | None = None,
     tool: str = "glob",
-    delegate: Callable | None = None,
 ):
     async def wrapped(pattern: str, path: str = "") -> str:
         counter["n"] = counter.get("n", 0) + 1
         if counter["n"] > limit:
-            if counter["n"] == limit + 1 and delegate is not None:
-                task = (
-                    f"Find all files matching the glob pattern {pattern!r}"
-                    f"{f' under {path!r}' if path else ' in the workspace'}"
-                    " and report the matching paths with a short description of each, "
-                    "plus a one-paragraph summary of what you found and which files matter."
-                )
-                try:
-                    report = await delegate(task=task, path_hint=path)
-                except Exception as exc:  # noqa: BLE001
-                    report = f"ERROR: delegated search failed: {exc}"
-                return (
-                    "[NOTE: your own grep/glob budget for this turn is used up — this "
-                    "search was delegated to the explore sub-agent (isolated context).]\n\n"
-                    + report
-                )
+            # Same backstop as grep: DENIED with a note, model decides whether
+            # to call `explore` — no auto-delegation (opencode-style).
             msg = (
-                "ERROR: your own grep/glob calls for this turn are used up and the broad "
-                "search was already delegated to the explore sub-agent — read its report "
-                "above and stop making more grep/glob calls."
+                "ERROR: your own grep/glob calls for this turn are used up. "
+                "Stop making more grep/glob calls — if you still need to "
+                "investigate, call the explore tool ONCE with the whole question "
+                "(it runs in an isolated sub-agent)."
             )
             if emit is not None:
                 emit(
@@ -716,6 +685,24 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use explore only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
     "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use explore for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
 }
+
+# Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
+# 1) The agent never leaves dead code in the work it does. 2) Dead code or bugs
+# that existed BEFORE the agent's work are reported as notes, not silently fixed.
+# 3) Replies stay short but precise and complete.
+_UNIVERSAL_RULES = (
+    "\n\nUNIVERSAL RULES (apply in every mode):\n"
+    "1. DEAD CODE: never leave dead code behind in code you write or modify — "
+    "no unused variables, functions, imports or parameters, no commented-out "
+    "code, no unreachable branches. Remove it as you go.\n"
+    "2. PRE-EXISTING ISSUES: if you notice dead code or bugs that existed BEFORE "
+    "your work (not caused by you), do NOT silently fix them — report them "
+    "briefly as notes/suggestions (e.g. 'this function is unused — should be "
+    "deleted', 'there's a bug here: ...').\n"
+    "3. CONCISE ANSWERS: keep every reply short but precise and complete — easy "
+    "to understand. No verbose filler, no restating what the user already knows, "
+    "no long intros or summaries."
+)
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
     "ask": ModelSettings(temperature=0.4),
@@ -1741,6 +1728,14 @@ class _HighWatermark(Exception):
         self.note = note
 
 
+class _TestVerifyNeeded(Exception):
+    """Control-flow signal: a test-related coder task finished WITHOUT running
+    the project's tests. The except chain catches it, feeds the completed tool
+    work back as a resume note, and re-runs ONCE with an explicit instruction
+    to run the tests and confirm green before the final message.
+    """
+
+
 class _UsageCapability(AbstractCapability[Any]):
     """Reports per-request token usage from the provider in real time.
 
@@ -1757,10 +1752,16 @@ class _UsageCapability(AbstractCapability[Any]):
         on_usage,
         context_limit: int,
         state: dict,
+        compact_threshold: float | None = None,
     ) -> None:
         self._on_usage = on_usage
         self._context_limit = context_limit
         self._state = state
+        self._compact_threshold = (
+            compact_threshold
+            if compact_threshold is not None
+            else _preemptive_compact_fraction(context_limit)
+        )
 
     async def after_model_request(
         self,
@@ -1779,11 +1780,19 @@ class _UsageCapability(AbstractCapability[Any]):
             except Exception:  # noqa: BLE001, S110 — best-effort usage callback
                 pass
         if self._context_limit > 0:
-            total = usage.get("input_tokens", 0) if usage else 0
+            # Predict the NEXT request's input: this request's output is
+            # appended to the conversation and re-sent, so input + output is
+            # what will actually occupy the window next round. Compacting on
+            # input alone let a reply with large output push the context meter
+            # past 100% while the trigger (input only) never fired — the exact
+            # "over 100% but no compact" case. Matches the frontend meter.
+            total = (
+                usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                if usage
+                else 0
+            )
             self._state["last"] = total
-            if total >= int(
-                self._context_limit * _preemptive_compact_fraction(self._context_limit)
-            ):
+            if total >= int(self._context_limit * self._compact_threshold):
                 self._state["hit"] = True
         return response
 
@@ -2407,6 +2416,45 @@ _TASK_NARROW_KEYWORDS = (
 )
 
 
+# --- test verification (never finish a test task with red tests) ---------- #
+# Prompt-level signal that a coder task is about writing/fixing/running tests.
+# English "test" is matched as a whole word so "latest"/"contest" never trip
+# it; Persian "تست" is unambiguous and matched as a substring.
+_TEST_TASK_RE = re.compile(
+    r"(?:\btest(?:s|ing)?\b|pytest|vitest|jest|junit|\bspec\b)",
+    re.IGNORECASE,
+)
+
+# Terminal commands that actually run the project's tests. A `run_terminal`
+# call matching this satisfies the test-verification step.
+_TEST_CMD_RE = re.compile(
+    r"(pytest|vitest|jest|node --test|node:test|npm test|npm run test|"
+    r"yarn test|pnpm test|bun test|cargo test|go test|mvn test|gradle test|"
+    r"\./gradlew test|ant test|dotnet test|flutter test|mix test|rake test|"
+    r"rspec|phpunit|tox|nox|python -m unittest|run_tests|test\.py|test\.ts|test\.js)",
+    re.IGNORECASE,
+)
+
+
+def _is_test_task(prompt: str, picked_skills: Sequence[dict] | None = None) -> bool:
+    """True when the prompt (or an attached skill) is about tests.
+
+    Drives both the prompt-level TEST VERIFICATION RULE and the loop-level
+    ``_TestVerifyNeeded`` follow-up in ``run_agent``.
+    """
+    p = (prompt or "").lower()
+    if "تست" in p:
+        return True
+    if _TEST_TASK_RE.search(p):
+        return True
+    if picked_skills:
+        for s in picked_skills:
+            slug = slugify(s.get("name", ""))
+            if "test" in slug or "تست" in slug:
+                return True
+    return False
+
+
 def _task_scope(prompt: str) -> str:
     """Classify a task's search scope: ``narrow`` | ``broad`` | ``content``.
 
@@ -2591,7 +2639,12 @@ def _fit_history(history: list[dict], budget_chars: int) -> list[dict]:
     acc = 0
     for turn in reversed(history):
         c = len(str(turn.get("content", "")))
-        if acc + c > budget_chars and kept:
+        is_system = turn.get("role") == "system"
+        # Compact summaries (system role) stand in for the folded older turns —
+        # never drop them to the char budget (mirrors the frontend's
+        # sliceToBudget), or the model loses the compacted context and
+        # "starts from scratch" on the next turn.
+        if acc + c > budget_chars and kept and not is_system:
             break
         kept.append(turn)
         acc += c
@@ -2844,13 +2897,10 @@ async def _compact_history(
     """Collapse older turns into one short summary note, keeping the most recent
     turns verbatim, so a full window can continue instead of being cut off.
 
-    The number of recent turns kept verbatim scales with the client's
-    "Messages to remember" (``max_history``) so more recent work survives a
-    compact. It is capped at half the history so a compact always frees real
-    space instead of becoming a no-op, and that cap has a floor of 8 turns —
-    but ``max_history`` is always the hard ceiling on top of that: if the
-    client's own limit is below 8 (e.g. local providers default to
-    ``LOCAL_MAX_HISTORY=3``), the final kept count is ``max_history``, not 8.
+    Only the LAST message is kept verbatim (opencode-style) — everything older
+    is folded into the summary, so a compact always frees the maximum space.
+    The summary + last message is what the model receives next, which is enough
+    for the current task to continue seamlessly.
 
     Returns a tuple ``(new_history, recent_kept)`` — ``recent_kept`` is the exact
     number of recent turns preserved verbatim after the summary, so the caller
@@ -2867,13 +2917,12 @@ async def _compact_history(
     /compact path, so a flaky compact subagent degrades to the working model
     instead of surfacing ``compact_failed``.
     """
-    keep = min(max_history, max(8, len(history) // 2))
-    # Preserve one fewer recent turn than `keep` so the prepended summary still
-    # fits beside them within the client's "Messages to remember" on the NEXT
-    # resend (summary + recent == keep <= max_history).
-    recent_n = max(1, keep - 1)
-    recent = history[-recent_n:]
-    older = history[:-recent_n]
+    # opencode-style: keep ONLY the last message verbatim; everything older is
+    # folded into the summary. The summary + last message is what the model
+    # receives next, so the compact frees the maximum space.
+    recent_n = 1
+    recent = history[-1:]
+    older = history[:-1]
     if not older:
         return None
 
@@ -3131,52 +3180,35 @@ def _load_skills(root: str) -> list[dict]:
     return skills
 
 
-import re as _re
-
-_WANTS_SKILL_CATALOG_RE = _re.compile(
-    r"(what skills|list.{0,20}skill|skills? (?:do|have|are|available)|which skill|"
-    r"چه اسکیل|اسکیل.{0,10}دارم|لیست.{0,10}اسکیل|اسکیل.{0,10}(?:چه|کدوم|لیست)|"
-    r"what can you do|abilities|قابلیت|توانایی|اسکیل ها|اسکیلهای|"
-    r"show.+skill|installed skill|نصب.{0,10}اسکیل)",
-    _re.IGNORECASE,
-)
-
-
-def _skills_section(skills: list[dict]) -> str:
-    """Index of available skills for the system prompt.
+def _skills_section(skills: list[dict], picked: list[dict] | None = None) -> str:
+    """Progressive-disclosure skill index for the system prompt.
 
     Skills come from the app database and cannot be reached through the
-    project-sandboxed read tool, so their full content is inlined — fine since
-    skills are few and small.
+    project-sandboxed read tool, so a used skill's body must be inlined. But
+    only the picked/selected skills get their full body — every other skill
+    stays as a compact name + description line, so the agent always knows what
+    exists without paying the token cost of every body on every turn (the
+    opencode/codex discovery → activation model).
     """
     if not skills:
         return ""
+    picked_paths = {s["path"] for s in (picked or [])}
     lines = [
         "\n\n=== AVAILABLE SKILLS ===",
         (
             "These skills are available. If the user's request matches one, follow its "
-            "instructions exactly. The full skill content is given inline below."
+            "instructions exactly. Full instructions are given inline for the skills "
+            "that match this request; the rest are listed by name + description."
         ),
     ]
     for s in skills:
         name = s["name"]
         desc = f" — {s['description']}" if s["description"] else ""
-        body = s["content"]
-        lines.append(f"- {name}{desc} (skill):\n{body}")
-    return "\n".join(lines)
-
-
-def _skills_catalog_section(skills: list[dict]) -> str:
-    """Compact name+description catalog, sent when no skill specifically
-    matches so the agent isn't blind to what exists (e.g. "which skills do I
-    have?"). Kept tiny: names + one-line descriptions, no bodies."""
-    if not skills:
-        return ""
-    lines = ["\n\n=== AVAILABLE SKILLS (names + descriptions) ==="]
-    for s in skills:
-        name = s["name"]
-        desc = f" — {s['description']}" if s["description"] else ""
-        lines.append(f"- {name}{desc}")
+        if s["path"] in picked_paths:
+            body = s["content"]
+            lines.append(f"- {name}{desc} (skill):\n{body}")
+        else:
+            lines.append(f"- {name}{desc}")
     return "\n".join(lines)
 
 
@@ -3257,6 +3289,55 @@ def _sync_skills_to_store(store: VectorStore | None, skills: list[dict]) -> None
         _skill_sync_cache.pop(store.db_path, None)
 
 
+def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[dict]:
+    """Skills whose NAME or DESCRIPTION literally contains a significant prompt
+    keyword (see ``_fts_keywords``).
+
+    This is the precise, language-exact tier of skill selection: e5 cosine sits
+    in a compressed band (~0.78-0.83) where the top-1 is often noise, but a
+    skill whose name/description literally contains the prompt's keyword (e.g.
+    "تست" -> a testing skill, "git" -> git-workflow) is a strong signal the
+    embedding can't reliably reproduce. Name hits weigh double — a skill NAMED
+    "Testing" is far more specific than one that merely mentions "test".
+    Returns skills ordered by hit weight (then name, for stability); ``[]``
+    when no keyword matches. Never raises.
+    """
+    tokens = _fts_keywords(prompt, max_terms=8)
+    if not tokens:
+        return []
+
+    def _kw_in(tl: str, hay: str) -> bool:
+        # Exact substring, plus a light English-plural fallback ("tests" ->
+        # "test" matches a description that says "testing").
+        return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
+
+    scored: list[tuple[int, dict]] = []
+    for s in skills:
+        name = str(s.get("name") or "").lower()
+        desc = str(s.get("description") or "").lower()
+        name_hits = 0
+        desc_hits = 0
+        for t in tokens:
+            tl = t.lower()
+            if _kw_in(tl, name):
+                name_hits += 1
+            elif _kw_in(tl, desc):
+                desc_hits += 1
+        if name_hits or desc_hits:
+            scored.append((name_hits * 2 + desc_hits, s))
+    scored.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
+    return [s for _, s in reversed(scored)]
+
+
+# Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
+# selection. Measured on the real skill set: irrelevant prompts ("یه کد پایتون
+# بنویس", "تست بنویس برای پروژه") score a compressed band where the top-1
+# beats the runner-up by only ~0.004-0.006, while genuine matches ("طراحی UI
+# برای داشبورد", "یه لندینگ پیج طراحی کن") clear ~0.007-0.028. Below this the
+# top-1 is indistinguishable from noise, so nothing is attached.
+_SKILL_GAP_MIN = 0.004
+
+
 def _auto_select_skills(
     store: VectorStore | None,
     skills: list[dict],
@@ -3265,24 +3346,32 @@ def _auto_select_skills(
     rel_gap: float = 0.02,
     min_abs: float = 0.79,
 ) -> list[dict]:
-    """Pick the most relevant skills for ``prompt`` via RAG similarity.
+    """Pick the most relevant skills for ``prompt``.
 
-    Skill passages must already be indexed in the store (see
-    ``_sync_skills_to_store``). Mean-pooled e5 cosine sits in a compressed band:
-    genuine matches score ~0.79-0.83 while noise (greetings, small talk) lands
-    below ~0.75, so a *relative* gate alone is too fragile — the top candidate
-    must clear an absolute floor (``min_abs``) AND the best score should beat
-    the average by at least ``rel_gap`` (tail near-ties within the gap are kept
-    as candidates). Both gates were tightened (0.76→0.79, 0.015→0.02) after a
-    skill set dominated by near-duplicate design skills (8 of 10) scored
-    0.76-0.82 on unrelated prompts ("رفع باگ", "یه کد پایتون بنویس", ...) and
-    got auto-attached on every turn; measured on that set, 0.79/0.02 rejects
-    greetings/small-talk and code prompts while a landing-page request (0.82,
-    gap 0.040), a git request (0.82, gap 0.043) and dashboard/color prompts
-    (0.80-0.82) still pass. A single installed skill still works (no minimum
-    candidate count). Candidates are mapped back to the loaded skill dicts by
-    their ``path`` key. Falls back to ``[]`` when the store is unavailable or
-    nothing clears the gate — never raises.
+    Two tiers, because mean-pooled e5 cosine alone sits in a compressed band
+    (~0.78-0.83) where the top-1 is often noise (measured: "تست بنویس برای
+    پروژه" scored brainstorming 0.8078 / project-planning 0.8046 — irrelevant
+    winners over a real testing skill):
+
+    1. KEYWORD tier (precise): significant prompt words matched against each
+       skill's NAME + DESCRIPTION (``_skill_keyword_matches``). A skill whose
+       name/description literally contains a prompt keyword is a strong,
+       language-exact signal — this is what makes a skill reliably findable
+       even when the embedding band can't tell it apart. Ranked by hit weight
+       (name hits double) then semantic score.
+
+    2. SEMANTIC tier (fallback): when no keyword matches, rank by e5 cosine.
+       The absolute floor (``min_abs``) rejects greetings/small-talk; a
+       top-vs-runner-up gap gate (``_SKILL_GAP_MIN``) rejects the compressed-
+       band noise measured on irrelevant prompts (gap ~0.004-0.006) while
+       genuine matches clear it (gap ~0.007-0.028). A single installed skill
+       needs no gap — it clears the absolute floor or it doesn't. Near-ties
+       within ``rel_gap`` of the best are all returned (not just the top-1):
+       with a compressed band the model is better placed to pick among them.
+
+    Returns up to ``top_k`` skills. Candidates are mapped back to the loaded
+    skill dicts by their ``path`` key. Falls back to ``[]`` when the store is
+    unavailable or nothing clears the gate — never raises.
     """
     if not prompt or not skills or store is None:
         return []
@@ -3295,37 +3384,40 @@ def _auto_select_skills(
             prompt, kind=KIND_SKILL, top_k=max(len(skills) * 4, 8), min_score=0.0
         )
     except Exception:  # noqa: BLE001
-        return []
-    seen: set[str] = set()
-    scores: list[tuple[float, str]] = []
+        hits = []
+    sem: dict[str, float] = {}
     for hit in hits:
         key = hit.get("key")
-        if not key or key in seen or key not in by_path:
-            continue
-        seen.add(key)
-        scores.append((float(hit.get("score", 0.0)), key))
-    scores.sort(key=lambda x: x[0], reverse=True)
+        if key and key not in sem and key in by_path:
+            sem[key] = float(hit.get("score", 0.0))
+
+    # Tier 1: exact keyword match on name/description — precise, wins outright.
+    kw = _skill_keyword_matches(prompt, skills)
+    if kw:
+        ranked = sorted(kw, key=lambda s: sem.get(s["path"], 0.0), reverse=True)
+        return ranked[:top_k]
+
+    # Tier 2: semantic-only fallback.
+    scores = sorted(sem.items(), key=lambda x: x[1], reverse=True)
     if not scores:
         return []
-    best_score = scores[0][0]
+    best_score = scores[0][1]
     # Absolute gate: a compressed-band top score means the prompt didn't
     # genuinely match anything (greetings, small talk) — do not attach a skill.
     if best_score < min_abs:
         return []
-    # Relative gate: unusable unless the best skill clearly stands out.
-    mean = sum(s for s, _ in scores) / len(scores)
-    if best_score - mean < rel_gap:
+    # Relative gate: the top candidate must stand out from the runner-up, or
+    # the band is just noise. A single skill needs no gap.
+    if len(scores) > 1 and best_score - scores[1][1] < _SKILL_GAP_MIN:
         return []
     picked: list[dict] = []
-    for score, key in scores[:top_k]:
+    for key, score in scores[:top_k]:
         if score < best_score - rel_gap:  # drop the long tail of near-ties
             break
         skill = by_path[key]
         if skill not in picked:
             picked.append(skill)
-    # Keep token cost low without hurting quality: feed the model only the
-    # single most relevant skill (full body) — extra near-ties dilute focus.
-    return picked[:1]
+    return picked[:top_k]
 
 
 def _run_mcp_config(servers: dict) -> str | None:
@@ -3660,8 +3752,6 @@ async def run_agent(
     env_var: str = "",
     oauth_token: str = "",
     mcp_servers: dict | None = None,
-    skills_selected: list[str] | None = None,
-    auto_skills: bool = False,
     allow_create: bool = False,
     cap: dict | None = None,
     permission_gates: dict | None = None,
@@ -3675,6 +3765,7 @@ async def run_agent(
     retrieval_config: dict | None = None,
     subagent_models: dict | None = None,
     chat_id: str = "",
+    compact_threshold: float | None = None,
 ) -> AsyncIterator[dict]:
     """Run the agent and yield SSE events (text deltas + tool activity)."""
 
@@ -3779,6 +3870,7 @@ async def run_agent(
         )[1],
         context_limit=ctx,
         state=early_usage_state,
+        compact_threshold=compact_threshold,
     )
 
     # Build dedicated subagent models when the user picks one in Settings →
@@ -4127,21 +4219,17 @@ async def run_agent(
         # work needs more of its own searches — in practice it showed the same
         # unfocused pattern as Ask: burn through many direct calls, hit some
         # internal ceiling, then retry with a slightly different query instead
-        # of stopping to delegate. The cap pushes broad investigation onto
-        # `explore` (isolated sub-agent context, itself uncapped) instead of
-        # burning the parent's own tool-call budget and tokens on many shallow
-        # searches.
+        # of stopping. The cap keeps an investigation-heavy turn from burning
+        # the parent's own tool-call budget and tokens on many shallow searches.
         #
         # The limit is a safety backstop against unfocused shallow-search loops;
         # it is high enough that direct investigation (and content gathering via
-        # read) is allowed, while explore remains available for genuinely
-        # broad spans. Content-heavy tasks get extra own-search quota: compressing
-        # verbatim JSX/CSS through explore's report summary is what loops it. The
-        # parent already identified the files, so let it read/search them directly.
-        # Task scope picks the per-turn quota: narrow/targeted lookups resolve
-        # directly with a generous allowance; broad/exploratory turns get a small
-        # quota so the model delegates to explore early instead of chaining cheap
-        # searches in its own costly transcript.
+        # read) is allowed. Task scope picks the per-turn quota: narrow/targeted
+        # lookups resolve directly with a generous allowance; broad/exploratory
+        # turns get a small quota so the model reaches for `explore` early
+        # instead of chaining cheap searches in its own costly transcript.
+        # Over-quota calls are DENIED with a note — the model itself decides
+        # whether to call explore (opencode-style, no auto-delegation).
         _turn_task_scope = _task_scope(prompt or "")
         if _turn_task_scope == "broad":
             own_search_limit = _TASK_SCOPE_BROAD_LIMIT
@@ -4151,11 +4239,6 @@ async def run_agent(
             own_search_limit = _TASK_SCOPE_NARROW_LIMIT
         plan_search_counter: dict = {}
         _deny_emit = lambda ev: queue.put_nowait(_tool_event(ev))
-        # When a broad task exhausts its own-search quota, the FIRST over-quota
-        # grep/glob call is auto-delegated to the explore sub-agent (delegate)
-        # instead of merely being denied — weak models otherwise ignore the
-        # "use explore" note and keep looping shallow searches of their own.
-        _explore_delegate = tools.get("explore")
         if "grep" in tools:
             tools["grep"] = _wrap_limited_grep(
                 tools["grep"],
@@ -4163,7 +4246,6 @@ async def run_agent(
                 limit=own_search_limit,
                 emit=_deny_emit,
                 tool="grep",
-                delegate=_explore_delegate,
             )
         if "glob" in tools:
             tools["glob"] = _wrap_limited_glob(
@@ -4172,7 +4254,6 @@ async def run_agent(
                 limit=own_search_limit,
                 emit=_deny_emit,
                 tool="glob",
-                delegate=_explore_delegate,
             )
 
     # Steer injection: every tool's result is a delivery point for user
@@ -4242,12 +4323,44 @@ async def run_agent(
                     _prev_resume = state_db.load_turn_resume(root, chat_id) or {}
                     _prev_resume["prompt"] = prompt
                     _prev_resume["tools"] = list(resume_buffer)
+                    # Also snapshot the text streamed so far this turn, so a
+                    # retry can continue the reply from where it stopped instead
+                    # of re-streaming it (token waste). `reply_chunks` lives in
+                    # the enclosing run scope and is populated before any tool
+                    # runs; guard anyway in case a tool fires before the stream
+                    # loop starts.
+                    try:
+                        _prev_resume["partial"] = "".join(reply_chunks)
+                    except (NameError, UnboundLocalError):
+                        pass
+                    _prev_resume["ts"] = time.time()
                     state_db.save_turn_resume(root, chat_id, _prev_resume)
                 except Exception:  # noqa: BLE001, S110 — best-effort, never fails the tool
                     pass
             return result
 
         return wrapped
+
+    def _save_partial_resume() -> None:
+        """Persist the text streamed so far for a turn that died mid-stream.
+
+        Called on every terminal failure path (fatal error, retry_giveup, ...)
+        so a later run can continue the partial reply instead of restarting and
+        re-consuming tokens. Loads the existing state first so completed-tool
+        records are preserved. Best-effort, never raises.
+        """
+        try:
+            _chunks = "".join(reply_chunks)
+        except (NameError, UnboundLocalError):
+            _chunks = ""
+        try:
+            _prev = state_db.load_turn_resume(root, chat_id) or {}
+            _prev["prompt"] = prompt
+            _prev["partial"] = _chunks
+            _prev["ts"] = time.time()
+            state_db.save_turn_resume(root, chat_id, _prev)
+        except Exception:  # noqa: BLE001, S110 — best-effort, never raises
+            pass
 
     if chat_id:
         tools = {name: _steer_wrap(fn, chat_id) for name, fn in tools.items()}
@@ -4361,7 +4474,7 @@ async def run_agent(
     # The built-in mode prompt is ALWAYS the base. A user-supplied custom
     # system prompt (from Settings → Prompts) is APPENDED on top rather than
     # replacing the defaults, so the built-in instructions always stay active.
-    base_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["ask"])
+    base_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["ask"]) + _UNIVERSAL_RULES
     # The mode declaration comes FIRST so a mid-chat mode switch (Coder ↔ Plan)
     # re-orients the agent immediately — buried at the end of a long prompt it
     # was easy to miss and the agent kept behaving as the previous mode.
@@ -4549,16 +4662,14 @@ async def run_agent(
             pass
 
     skills = _load_skills(root)
-    if skills_selected:
-        wanted = {str(n).strip().lower() for n in skills_selected if str(n).strip()}
-        skills = [s for s in skills if s["name"].strip().lower() in wanted]
-    elif auto_skills and prompt:
+    picked: list[dict] = []
+    skill_note = ""
+    if prompt:
         # RAG auto-selection: index the skills, retrieve the ones closest to the
-        # user's message, and feed only those to the agent. Runs in all three
-        # modes (ask / coder / plan) — a vectorized skill is useful context
-        # regardless of which mode is asking, not just Coder.
-        picked = []
-        skill_note = ""
+        # user's message, and feed only those to the agent. Always on — there is
+        # no toggle (matches opencode/codex, where selection is automatic and
+        # quiet). Runs in all three modes (ask / coder / plan) — a vectorized
+        # skill is useful context regardless of which mode is asking.
         skill_store = None
         try:
             skill_store = open_skill_store()
@@ -4576,47 +4687,52 @@ async def run_agent(
                 picked = []
                 skill_note = f"skills not indexed: {exc}"
         if picked:
-            skills = picked
             yield {"kind": "skill", "skills": [s["name"] for s in picked]}
         elif skill_note:
             # Surface only the notable cases (nothing installed, index
             # unavailable, indexing failed). "No match" is the routine outcome
-            # and stays quiet so it doesn't spam every Coder-mode message.
-            skills = []
+            # and stays quiet so it doesn't spam every message.
             yield {"kind": "skill", "skills": [], "note": skill_note}
         else:
-            # No skill specifically matched this prompt. Keep a compact
+            # No skill specifically matched this prompt. Keep the compact
             # catalog available so the agent can still answer "what skills do
             # I have?" and knows what exists for future requests.
-            skills_to_catalog = _load_skills(root)
             yield {"kind": "skill", "skills": []}
-            skills = (
-                skills_to_catalog
-                if (skills_to_catalog and _WANTS_SKILL_CATALOG_RE.search(prompt or ""))
-                else []
-            )
-    else:
-        skills = []
+
+    # Progressive disclosure: names + descriptions of every skill are always
+    # injected so the agent knows what exists; full bodies only for the
+    # picked/selected skills (see _skills_section).
     if skills:
-        catalog_like = _WANTS_SKILL_CATALOG_RE.search(prompt or "")
-        full_content = bool(skills and all(s.get("content") for s in skills))
-        if not catalog_like or full_content:
-            section = _skills_section(skills)
-            # In Ask mode an explicitly attached skill turns the agent INTO the
-            # role that skill defines (mentor/seo/translator/...). Make that role
-            # header prominent so it is not buried below the mentor framing.
-            if mode == "ask":
-                names = ", ".join(f'"{s["name"]}"' for s in skills)
-                section = (
-                    f"\n\n=== YOUR ROLE (from attached skill{'' if len(skills) == 1 else 's'}: {names}) ===\n"
-                    "You are now the expert, specialist or persona that this(these) "
-                    "skill(s) define. Adopt the role's knowledge, tone and instructions "
-                    "exactly — this overrides the general Ask-mode mentor framing for "
-                    "this message. Answer strictly as that role.\n" + section
-                )
-            system_final += section
-        else:
-            system_final += _skills_catalog_section(skills)
+        section = _skills_section(skills, picked)
+        # In Ask mode an explicitly attached skill turns the agent INTO the
+        # role that skill defines (mentor/seo/translator/...). Make that role
+        # header prominent so it is not buried below the mentor framing.
+        if picked and mode == "ask":
+            names = ", ".join(f'"{s["name"]}"' for s in picked)
+            section = (
+                f"\n\n=== YOUR ROLE (from attached skill{'' if len(picked) == 1 else 's'}: {names}) ===\n"
+                "You are now the expert, specialist or persona that this(these) "
+                "skill(s) define. Adopt the role's knowledge, tone and instructions "
+                "exactly — this overrides the general Ask-mode mentor framing for "
+                "this message. Answer strictly as that role.\n" + section
+            )
+        system_final += section
+
+    # TEST VERIFICATION RULE: a coder task about tests must run the project's
+    # real test command and see it pass before the agent may declare done. This
+    # is the prompt-level half of the guarantee; the loop-level half (a bounded
+    # forced follow-up when the turn finished without running any test command)
+    # lives in the retry loop below (see `_TestVerifyNeeded`).
+    if mode == "coder" and _is_test_task(prompt, picked):
+        system_final += (
+            "\n\nTEST VERIFICATION RULE (strict, always follow): This task "
+            "involves tests. Before your final message you MUST run the "
+            "project's real test command (pytest, vitest/node:test, cargo test, "
+            "go test, JUnit, ...) and observe it PASS (exit 0). If the tests "
+            "fail, fix the code and re-run until they pass. NEVER declare the "
+            "task done with failing tests. In your final message, state the "
+            "exact command you ran and its result."
+        )
 
     # A plan saved by an earlier plan-mode run in this workspace is injected so
     # Coder (or a plan retry) can continue it without the user retyping it.
@@ -4687,6 +4803,16 @@ async def run_agent(
             scouted = ""
     if scouted:
         user_content.append(scouted)
+        # Hand the scout to the explore sub-agent too (via contextvar): the
+        # sub-agent runs in an isolated context that never sees the main
+        # prompt, so without this it re-globs the root to orient itself — a
+        # duplicate of the auto-scout. The contextvar propagates into the
+        # explore tool call (same task tree), which folds the root listing
+        # into the sub-agent's system prompt.
+        try:
+            _SCOUT_CTX.set(scouted)
+        except Exception:  # noqa: BLE001, S110 — cosmetic only, never fails the turn
+            pass
 
     # Durable interrupted-turn resume: if a PREVIOUS run of THIS chat was cut
     # off — user Stop, an error, or the app closing mid-stream — the backend
@@ -4712,7 +4838,12 @@ async def run_agent(
             ]
     except Exception:  # noqa: BLE001 — best-effort, never fails the run
         resume_tools = []
-    if resume_tools:
+    # The text the interrupted run had already streamed before it died. Saved by
+    # `_resume_wrap` (per completed tool) and `_save_partial_resume` (on every
+    # terminal failure), so even a turn that never completed a tool can resume
+    # its partial reply instead of restarting and re-consuming tokens.
+    _resume_partial = str(_resume_state.get("partial") or "").strip()
+    if resume_tools or _resume_partial:
         # Only inject when this run plausibly continues the interrupted turn:
         # the same prompt re-sent, the interrupted assistant message still the
         # last one in history (its folded marker), or the interruption was
@@ -4722,8 +4853,11 @@ async def run_agent(
         _last = history[-1] if history else {}
         _inject = False
         try:
-            _ts = float(resume_tools[-1].get("ts", 0))
-        except (TypeError, ValueError):
+            _ts = float(
+                _resume_state.get("ts")
+                or (resume_tools[-1].get("ts", 0) if resume_tools else 0)
+            )
+        except (TypeError, ValueError, IndexError):
             _ts = 0
         if (
             _resume_prompt_key(str(_resume_state.get("prompt", "")))
@@ -4740,38 +4874,68 @@ async def run_agent(
             # ToolCallPart `ModelResponse` followed by its ToolReturnPart
             # `ModelRequest` (with the FULL result), and the trailing system
             # record instructs the model to treat them as already done.
-            history = (
-                history
-                + [
-                    {
-                        "role": "resume_tool",
-                        "tool": str(_t["tool"]),
-                        "args": _json_safe(_t.get("args")) or {},
-                        "result": str(_t.get("result") or ""),
-                        "call_id": f"resume-{_i}",
-                    }
-                    for _i, _t in enumerate(resume_tools)
-                ]
-                + [
+            if resume_tools:
+                history = (
+                    history
+                    + [
+                        {
+                            "role": "resume_tool",
+                            "tool": str(_t["tool"]),
+                            "args": _json_safe(_t.get("args")) or {},
+                            "result": str(_t.get("result") or ""),
+                            "call_id": f"resume-{_i}",
+                        }
+                        for _i, _t in enumerate(resume_tools)
+                    ]
+                    + [
+                        {
+                            "role": "system",
+                            "content": (
+                                "The tool calls above were completed in the PREVIOUS (interrupted) "
+                                "run of this turn, with their actual results. Treat them as already "
+                                "done — do NOT re-run the same tools. Continue the task from where "
+                                "it was cut off."
+                                + (
+                                    "\n\nA skill is already attached and active for this turn — do "
+                                    "NOT re-run its setup/opening/installation procedure or re-read "
+                                    "its instructions as if new; simply continue acting in its role "
+                                    "from where the interrupted turn stopped."
+                                    if skills
+                                    else ""
+                                )
+                            ),
+                        }
+                    ]
+                )
+            if _resume_partial:
+                # The interrupted assistant message (with the partial reply) is
+                # usually already in history — the frontend keeps it and folds
+                # the "[Interrupted before finishing" marker into it. Only
+                # inject the partial text when it is NOT already there (e.g. a
+                # hard app close before the frontend could persist it), so we
+                # never duplicate it. The continuation note is always added so
+                # the model continues the reply instead of restarting it.
+                _partial_seen = any(
+                    m.get("role") == "assistant"
+                    and _resume_partial in str(m.get("content") or "")
+                    for m in history[-8:]
+                )
+                if not _partial_seen:
+                    history = history + [
+                        {"role": "assistant", "content": _resume_partial}
+                    ]
+                history = history + [
                     {
                         "role": "system",
                         "content": (
-                            "The tool calls above were completed in the PREVIOUS (interrupted) "
-                            "run of this turn, with their actual results. Treat them as already "
-                            "done — do NOT re-run the same tools. Continue the task from where "
-                            "it was cut off."
-                            + (
-                                "\n\nA skill is already attached and active for this turn — do "
-                                "NOT re-run its setup/opening/installation procedure or re-read "
-                                "its instructions as if new; simply continue acting in its role "
-                                "from where the interrupted turn stopped."
-                                if skills
-                                else ""
-                            )
+                            "The assistant reply above was cut off mid-generation in a "
+                            "PREVIOUS (interrupted) run of this turn. Continue the reply "
+                            "from exactly where it stopped — do NOT restart the answer, "
+                            "do NOT repeat text already written, and do NOT re-run tools "
+                            "whose work is already reflected in it."
                         ),
                     }
                 ]
-            )
 
     # Keep the history small enough that the model's context window still has
     # room for the system prompt, scouting, tool-loop re-sends and the reply.
@@ -4863,6 +5027,13 @@ async def run_agent(
     # from scratch. Reset per turn — a fresh prompt must not inherit stale
     # tool results from a previous turn.
     turn_tool_log: list[str] = []
+    # Test verification: a test-related coder task must run the project's test
+    # command and see it pass before the agent may finish. `test_cmd_ran` is
+    # sticky across attempts (a throttle retry must not forget a test run);
+    # `test_verify_retries` bounds the forced follow-up to ONE.
+    test_verify_needed = mode == "coder" and _is_test_task(prompt, picked)
+    test_cmd_ran = False
+    test_verify_retries = 0
     while True:
         attempt += 1
         # Reset the pre-emptive compact watermark per attempt: it is set by the
@@ -5035,6 +5206,16 @@ async def run_agent(
                                 f"{_trim_log_text(_fmt_log_args(item.get('args')))}"
                                 f")"
                             )
+                            # A terminal command that runs the project's tests
+                            # satisfies the test-verification step (see the
+                            # `_TestVerifyNeeded` branch below).
+                            if (
+                                item.get("tool") == "run_terminal"
+                                and _TEST_CMD_RE.search(
+                                    str((item.get("args") or {}).get("command", ""))
+                                )
+                            ):
+                                test_cmd_ran = True
                         elif item.get("kind") == "tool_result" and item.get("tool"):
                             turn_tool_log.append(
                                 f"- {item.get('tool')} result: "
@@ -5144,6 +5325,19 @@ async def run_agent(
                         )
                     except Exception:  # noqa: BLE001, S110 — best-effort
                         pass
+            # TEST VERIFICATION: a test-related coder task that finished without
+            # running any test command gets ONE bounded follow-up turn that
+            # forces the run-and-see-green step before the agent may finish.
+            # The except chain below turns this into a resume note + re-run.
+            if (
+                test_verify_needed
+                and not test_cmd_ran
+                and _reply.strip()
+                and test_verify_retries < 1
+            ):
+                test_verify_retries += 1
+                raise _TestVerifyNeeded()
+
             # The turn finished cleanly, so any interrupted-turn resume state
             # for this chat is consumed — a future run must NOT replay these
             # tool calls (they're complete, and this reply stands in for them).
@@ -5158,6 +5352,12 @@ async def run_agent(
                 pass
             break  # success, exit the retry loop
         except Exception as exc:
+            # The turn died without a clean finish (or is about to retry) —
+            # snapshot the partial reply so a later run can continue from it.
+            # Saved on EVERY error (including retryable ones): the file is
+            # overwritten as the run progresses and removed on a clean finish,
+            # so a stale snapshot can never leak into a successful turn.
+            _save_partial_resume()
             # A short-lived free-tier throttle (e.g. `429 FreeUsageLimitError:
             # Rate limit exceeded. Please try again later.`) is NOT a hard quota
             # and NOT a fatal failure — the gateway just wants us to wait. Retry
@@ -5210,6 +5410,36 @@ async def run_agent(
                     ),
                 }
                 return
+            # TEST VERIFICATION follow-up: the turn finished cleanly but never
+            # ran the project's tests. Feed the completed tool work back as a
+            # resume note and re-run ONCE with an explicit instruction to run
+            # the tests and confirm green before the final message. Bounded by
+            # `test_verify_retries` (see the raise site above), so a model that
+            # still won't run tests can't spin an endless loop.
+            if isinstance(exc, _TestVerifyNeeded):
+                resume_note = _build_resume_note(turn_tool_log)
+                note = (
+                    "TEST VERIFICATION REQUIRED: You finished this task WITHOUT "
+                    "running the project's tests. Before your final message, run "
+                    "the project's real test command (pytest / vitest / cargo "
+                    "test / go test / JUnit / ...) and confirm it PASSES (exit 0). "
+                    "If tests fail, fix the code and re-run until green. Do NOT "
+                    "repeat completed work — only run the tests and report the "
+                    "exact command and its result."
+                )
+                if resume_note:
+                    note += "\n\nWork already completed this turn:\n" + resume_note
+                history_messages = history_messages + [
+                    ModelRequest(parts=[SystemPromptPart(content=note)])
+                ]
+                yield _retry_ev(
+                    "retry",
+                    attempt=attempt,
+                    max_attempts=_RETRIES,
+                    delay=0,
+                    reason="running the project's tests before finishing (test verification)",
+                )
+                continue
             # A model that burned its ENTIRE per-request max_tokens output
             # budget on invisible reasoning/thinking tokens and produced NO
             # visible reply surfaces as pydantic-ai's empty-output error. That
@@ -5370,104 +5600,69 @@ async def run_agent(
                 compact_keep: int = 0
                 if compacted is not None and isinstance(compacted, tuple):
                     compacted, compact_keep = compacted
-                # Compaction alone may not free enough room on a small window
-                # (the retried request re-sends the whole turn). If there's no
-                # history left to compress, drop the current turn's auto-scout
-                # so the retry can actually fit.
-                # Build the resume note from this turn's tool work BEFORE the
-                # compact / scout-drop decision — even if history can't be
-                # compressed further, the model must still know what was already
-                # completed so it doesn't start from zero.
-                resume_note = _build_resume_note(turn_tool_log)
 
-                if compacted is None and not compact_failed_sent:
-                    compact_failed_sent = True
-                    yield {
-                        "kind": "compact_failed",
-                        "reason": (
-                            "Automatic compaction failed (summarizer produced no usable "
-                            "summary). Nothing was deleted — use the Retry button below or "
-                            "type /compact to compact manually."
-                        ),
-                    }
+                if compacted is None:
+                    if not compact_failed_sent:
+                        compact_failed_sent = True
+                        yield {
+                            "kind": "compact_failed",
+                            "reason": (
+                                "Automatic compaction failed (summarizer produced no usable "
+                                "summary). Nothing was deleted — use the Retry button below or "
+                                "type /compact to compact manually."
+                            ),
+                        }
+                    # Stop like opencode: with the context window full and no
+                    # usable summary, the agent cannot continue this turn. The
+                    # frontend surfaces the Retry banner so the user can compact
+                    # manually (/compact or Retry) and then re-prompt.
+                    return
 
-                if compacted is None and scouted and not scout_dropped:
-                    scout_dropped = True
-                    user_content = [
-                        c
-                        for c in user_content
-                        if not (isinstance(c, str) and c == scouted)
-                    ]
-                    if resume_note:
-                        history_messages = history_messages + [
-                            ModelRequest(parts=[SystemPromptPart(content=resume_note)])
-                        ]
-                    yield _retry_ev(
-                        "retry",
-                        attempt=attempt,
-                        max_attempts=_RETRIES,
-                        delay=0,
-                        reason="overflowed — dropped auto-scout",
+                summary_text = ""
+                if compacted and compacted[0].get("role") == "system":
+                    summary_text = compacted[0].get("content", "")
+                    summary_text = summary_text.removeprefix(
+                        "[Compacted earlier context]\n"
                     )
-                    continue
-                if compacted is not None:
-                    summary_text = ""
-                    if compacted and compacted[0].get("role") == "system":
-                        summary_text = compacted[0].get("content", "")
-                        summary_text = summary_text.removeprefix(
-                            "[Compacted earlier context]\n"
+                if summary_text and vector_store is not None:
+                    # Persist the compact summary to short-term (~24h) RAG
+                    # memory so the thread's history stays recallable without
+                    # bloating the durable long-term notes. Best-effort.
+                    try:
+                        remember(
+                            root,
+                            "[Compact summary] " + summary_text,
+                            vector_store,
+                            memory_type="short_term",
                         )
-                    if summary_text and vector_store is not None:
-                        # Persist the compact summary to short-term (~24h) RAG
-                        # memory so the thread's history stays recallable without
-                        # bloating the durable long-term notes. Best-effort.
-                        try:
-                            remember(
-                                root,
-                                "[Compact summary] " + summary_text,
-                                vector_store,
-                                memory_type="short_term",
-                            )
-                        except Exception:  # noqa: BLE001, S110
-                            pass
-                    yield {
-                        "kind": "compact",
-                        "content": summary_text or content,
-                        "keep": compact_keep,
-                        "model": str(
-                            getattr(compact_model or model, "model_name", "")
-                            or model_name
-                        ),
-                    }
-                    history = compacted
-                    history_messages = _to_model_messages(history)
-                    if resume_note:
-                        history_messages = history_messages + [
-                            ModelRequest(parts=[SystemPromptPart(content=resume_note)])
-                        ]
-                    yield _retry_ev(
-                        "retry",
-                        attempt=attempt,
-                        max_attempts=_RETRIES,
-                        delay=0,
-                        reason="auto-compacted context",
-                    )
-                    continue
-                # History cannot shrink further and scout is already dropped.
-                # Feed the resume note as a last-resort system message so the
-                # model retries with awareness of completed tool work.
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                yield {
+                    "kind": "compact",
+                    "content": summary_text or content,
+                    "keep": compact_keep,
+                    "model": str(
+                        getattr(compact_model or model, "model_name", "")
+                        or model_name
+                    ),
+                }
+                # Like opencode: after compacting, rebuild the request from the
+                # new checkpoint and retry the step (auto-continue).
+                history = compacted
+                history_messages = _to_model_messages(history)
+                resume_note = _build_resume_note(turn_tool_log)
                 if resume_note:
                     history_messages = history_messages + [
                         ModelRequest(parts=[SystemPromptPart(content=resume_note)])
                     ]
-                    yield _retry_ev(
-                        "retry",
-                        attempt=attempt,
-                        max_attempts=_RETRIES,
-                        delay=0,
-                        reason="history can't compact — resuming with tool results",
-                    )
-                    continue
+                yield _retry_ev(
+                    "retry",
+                    attempt=attempt,
+                    max_attempts=_RETRIES,
+                    delay=0,
+                    reason="auto-compacted context",
+                )
+                continue
             # A tool-loop step-budget / request-budget hit is NOT a real near-overflow
             # (the request is still well under the window) — it just means the task
             # legitimately needs more tool calls than the budget allows. Instead of
@@ -5641,11 +5836,23 @@ async def run_agent(
             # history shrinks what the retry re-sends, sometimes enough to get
             # across the line — so do ONE compacted resume before the fatal path
             # instead of failing after 2 retries.
+            # Only compact when the transcript is actually large enough to
+            # matter: compacting a nearly-empty conversation (e.g. 1% of the
+            # window) just summarizes nothing, burns a summarizer call, and
+            # shows a misleading "Context compacted" notice. The last parent
+            # request's real usage is the best proxy for transcript size; fall
+            # back to a history-length check when the provider reports no
+            # usage (some gateways report 0).
+            _transcript_large = (
+                early_usage_state.get("last", 0) >= int(ctx * 0.25)
+                or len(history) >= 12
+            )
             if (
                 not compact_after_drop_retried
                 and timeout_recovery_retries >= 2
                 and _is_retryable(exc)
                 and not _is_quota_exhausted(exc)
+                and _transcript_large
             ):
                 compact_after_drop_retried = True
                 # Same compact_start contract as the overflow path: tell the
@@ -5668,11 +5875,13 @@ async def run_agent(
                     ),
                 )
                 if compacted is not None:
+                    compact_keep = 0
                     if isinstance(compacted, tuple):
-                        compacted = compacted[0]
+                        compacted, compact_keep = compacted
                     yield {
                         "kind": "compact",
                         "content": "",
+                        "keep": compact_keep,
                         "model": str(
                             getattr(compact_model or model, "model_name", "")
                             or model_name

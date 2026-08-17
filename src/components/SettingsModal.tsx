@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
-import { useStore, defaultMaxHistoryFor, flushStateNow } from '../lib/store'
+import { useStore, flushStateNow } from '../lib/store'
 import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
@@ -469,6 +469,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
   const memorySlidingTtl = useStore((s) => s.memorySlidingTtl)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
+  const compactThreshold = useStore((s) => s.settings.compactThreshold ?? 80)
+  const setCompactThreshold = useStore((s) => s.setCompactThreshold)
   const root = useStore((s) => s.root)
 
   const providers = settings.providers
@@ -484,7 +486,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Google OAuth sign-in progress: "" idle, "busy" while the consent window is
   // open, "ok"/"error" + message when the flow settles.
   const [oauthState, setOauthState] = useState<{ status: string; msg: string }>({ status: '', msg: '' })
-  const [maxHistoryInput, setMaxHistoryInput] = useState(String(active.maxHistory ?? defaultMaxHistoryFor(active.kind)))
   const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
   // Which credential source the provider being edited will use: 'env' (an
   // environment variable that must already exist) or 'key' (an API key stored
@@ -504,7 +505,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'fonts' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models'>('providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'fonts' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models' | 'general'>('providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
     clientId: googleProvider?.oauthClientId ?? '',
@@ -798,7 +799,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     setCfg({ ...active })
     setCustomModel('')
-    setMaxHistoryInput(String(active.maxHistory ?? defaultMaxHistoryFor(active.kind)))
   }, [editId, active.id])
 
   // Derive the credential method when switching providers: a saved API key wins,
@@ -915,9 +915,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }
 
   const save = async () => {
-    const historyN = parseInt(maxHistoryInput, 10)
-    const cfgWithHistory =
-      !Number.isNaN(historyN) && historyN > 0 ? { ...cfg, maxHistory: historyN } : { ...cfg, maxHistory: undefined }
     // Providers that REQUIRE a credential must not be saved in a broken state
     // (empty env var + no saved key + no OAuth) — that is exactly how a user
     // ends up with the "Set the GOOGLE_API_KEY environment variable" error.
@@ -939,7 +936,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     // The active model is chosen ONLY from the composer model picker — changing
     // the "Active model" dropdown here must NOT switch the chat's model. Strip
     // `model` so this provider save keeps the currently-selected model intact.
-    const { model: _model, ...cfgPersistFull } = cfgWithHistory
+    const { model: _model, ...cfgPersistFull } = cfg
     // Get live models/removedModels from store to avoid normalizing them to empty arrays
     const liveProvider = useStore.getState().settings.providers.find((p) => p.id === active.id)
     const { models: _models, removedModels: _removed, ...cfgPersist } = cfgPersistFull
@@ -1075,6 +1072,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="7" y="7" width="10" height="10" rx="1.5" />
           <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5 6.5 6.5M17.5 17.5l2 2M4.5 19.5l2-2M17.5 6.5l2-2" />
+        </svg>
+      ),
+    },
+    {
+      id: 'general',
+      label: 'General',
+      group: 'App',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
         </svg>
       ),
     },
@@ -1399,23 +1407,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 <button className="btn tiny" onClick={addCustomModel} disabled={!customModel.trim()}>
                   Add
                 </button>
-              </div>
-            </div>
-
-            <div className="field">
-              <label>Context &amp; History</label>
-              <label className="field-label">Messages to remember</label>
-              <input
-                type="number"
-                min={1}
-                value={maxHistoryInput}
-                onChange={(e) => setMaxHistoryInput(e.target.value)}
-              />
-              <div className="hint">
-                Only the most recent N user/assistant messages are sent to the model each turn.
-              </div>
-              <div className="hint">
-                Type <code>/compact</code> in the chat to summarize &amp; compact the context manually.
               </div>
             </div>
           </>
@@ -2032,6 +2023,36 @@ Caps on total stored documents and chunks per workspace; the oldest are evicted 
                   </div>
                 </div>
               </div>
+            </div>
+        </>
+        )}
+
+        {tab === 'general' && (
+        <>
+            <div className="field">
+              <div className="field-head">
+                <label>Auto-compact threshold</label>
+              </div>
+              <div className="hint">
+                When real context usage (input + output tokens) crosses this percentage of
+                the model's window, the conversation is compacted automatically before it
+                overflows. Lower = compact sooner (keeps the window roomier); higher =
+                compact later (keeps more recent turns in full).
+              </div>
+              <div className="font-size-row">
+                <span className="font-size-label">50%</span>
+                <input
+                  type="range"
+                  min={50}
+                  max={95}
+                  step={5}
+                  value={compactThreshold}
+                  onChange={(e) => setCompactThreshold(Number(e.target.value))}
+                />
+                <span className="font-size-label">95%</span>
+                <span className="font-size-value">{compactThreshold}%</span>
+              </div>
+              <div className="hint">Applies on the next message. Default: 80%.</div>
             </div>
         </>
         )}

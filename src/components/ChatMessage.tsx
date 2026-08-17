@@ -1,7 +1,6 @@
 import {
   memo,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -13,8 +12,7 @@ import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage, ToolActivity } from '../types'
 import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
-import { defaultMaxHistoryFor, useStore } from '../lib/store'
-import { estimateContextTokens, modelContextWindow } from '../lib/context'
+import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
@@ -161,6 +159,7 @@ export function ThinkingBlock({ text }: { text: string }) {
             className="thinking-text"
             ref={textRef}
             style={{ height }}
+            dir="auto"
             onScroll={(e) => {
               const el = e.currentTarget
               stickToBottom.current =
@@ -405,7 +404,7 @@ function SegSteerBubble({
   return (
     <div className="seg-steer">
       <div className="seg-steer-label">You</div>
-      <div className="seg-steer-text" dir={dir}>
+      <div className="seg-steer-text" dir="auto">
         {prepareContent(message.content, dir) || '(empty)'}
       </div>
       {message.attachments && message.attachments.length > 0 && (
@@ -492,7 +491,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
     if (seg.kind === 'text') {
       flush(`grp-${i}`)
       nodes.push(
-        <div key={i} className="chat-message markdown-body">
+        <div key={i} className="chat-message markdown-body" dir="auto">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             rehypePlugins={[rehypeHighlight]}
@@ -534,11 +533,10 @@ export const ChatMessageView = memo(function ChatMessageView({
   const dir = useStore((s) => s.dir)
   const settings = useStore((s) => s.settings)
   const [copied, setCopied] = useState(false)
-  // The context summary collapses by default — it is a compact checkpoint the
-  // user can expand on demand instead of a wall of text dominating the bubble.
-  const [summaryCollapsed, setSummaryCollapsed] = useState(
-    message.role === 'system' && !message.modeSwitch,
-  )
+  // The context summary is EXPANDED by default — the user asked to see the
+  // compact checkpoint between responses instead of a collapsed header. It can
+  // still be collapsed on demand.
+  const [summaryCollapsed, setSummaryCollapsed] = useState(false)
 
   const modeLabel = (id: string) => getMode(settings, id).label
 
@@ -552,28 +550,11 @@ export const ChatMessageView = memo(function ChatMessageView({
     }
   }
 
-  // While a reply is still streaming, the provider hasn't reported real usage
-  // yet (the usage event only fires after each model request completes). Show a
-  // live estimate of the input side so the badge is visible during long
-  // responses; it swaps to the real numbers once the first usage event lands.
-  const liveInput = useMemo(() => {
-    if (!message.streaming || message.usage) return 0
-    const st = useStore.getState()
-    const chat = st.chats.find((c) => c.messages.some((m) => m.id === message.id))
-    if (!chat) return 0
-    const provider =
-      st.settings.providers.find((p) => p.id === st.settings.activeProviderId) ??
-      st.settings.providers[0]
-    const maxHistory = provider?.maxHistory ?? defaultMaxHistoryFor(provider?.kind)
-    const ctxWindow = modelContextWindow(provider, provider?.model ?? '')
-    return estimateContextTokens(
-      chat,
-      st.settings.systemPrompts?.[chat.mode] ?? '',
-      maxHistory,
-      ctxWindow ?? undefined,
-      chat.mode,
-    )
-  }, [message.id, message.streaming, message.usage])
+  // No live token estimate while streaming: the char-based estimate overshot
+  // and then "fell back down" to the real provider numbers once the usage event
+  // landed, which made the badge flicker up/down during long replies. The badge
+  // now appears only once real usage exists (same as the titlebar meter), so it
+  // stays stable.
 
   const isSummary = message.role === 'system' && !message.modeSwitch
   const isModeSwitch = message.modeSwitch === true
@@ -600,12 +581,12 @@ export const ChatMessageView = memo(function ChatMessageView({
   }
   const roleLabel = isUser
     ? 'You'
-    : message.role === 'tool'
-      ? 'Tools'
-      : message.mode
-        ? modeLabel(message.mode)
-        : isSummary
-          ? 'Context summary'
+    : isSummary
+      ? 'Context summary'
+      : message.role === 'tool'
+        ? 'Tools'
+        : message.mode
+          ? modeLabel(message.mode)
           : 'Assistant'
 
   return (
@@ -614,18 +595,9 @@ export const ChatMessageView = memo(function ChatMessageView({
       data-msg-id={message.id}
       data-is-summary={isSummary ? 'true' : undefined}
     >
-      {!isSummary && !isModeSwitch && (
-        <div className="msg-role">
-          {roleLabel}
-        </div>
-      )}
-
-      {isUser && message.steerPending && (
-        <div className="steer-note">
-          <span className="steer-dot">●</span>
-          <span>steering the running agent…</span>
-        </div>
-      )}
+      <div className="msg-role">
+        {roleLabel}
+      </div>
 
       {!isUser && message.streaming && !message.retry && (
         <LiveWorkingStatus message={message} />
@@ -648,7 +620,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                 <span className="plan-item-mark">
                   {item.status === 'completed' ? '✓' : item.status === 'in_progress' ? '●' : '○'}
                 </span>
-                <span className="plan-item-content">
+                <span className="plan-item-content" dir="auto">
                   {prepareContent(item.content, dir)}
                 </span>
               </li>
@@ -681,7 +653,7 @@ export const ChatMessageView = memo(function ChatMessageView({
 
       {(isSummary || message.content || (message.segments && message.segments.length > 0)) && (
         isModeSwitch ? (
-          <div className="mode-switch-note" dir="ltr">{stripBidiMarks(fixZwsp(message.content))}</div>
+          <div className="mode-switch-note" dir="ltr">{prepareContent(message.content, 'ltr')}</div>
         ) : isSummary ? (
           <div className={`summary-block${summaryCollapsed ? ' collapsed' : ''}`}>
             <div className="summary-head" onClick={() => setSummaryCollapsed((c) => !c)} role="button" tabIndex={0}>
@@ -689,16 +661,16 @@ export const ChatMessageView = memo(function ChatMessageView({
               <span className="summary-icon">📎</span>
               <span className="summary-label">Context summary</span>
               {summaryCollapsed && message.content && (
-                <span className="summary-preview">
-                  {stripBidiMarks(fixZwsp(message.content))}
+                <span className="summary-preview" dir="auto">
+                  {prepareContent(message.content, dir)}
                 </span>
               )}
               <span className="summary-hint">
-                earlier turns collapsed — not re-sent; a fresh reader continues from here
+                earlier turns folded into this summary — the agent still receives it
               </span>
             </div>
             {!summaryCollapsed && (
-              <div className="summary-body chat-message markdown-body">
+              <div className="summary-body chat-message markdown-body" dir="auto">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeHighlight]}
@@ -716,14 +688,24 @@ export const ChatMessageView = memo(function ChatMessageView({
           <div className="msg-bubble segmented">
             {renderSegments(message, onRetry)}
           </div>
+        ) : isUser && message.steerPending ? (
+          <div className="queued-bubble steer" dir={dir}>
+            <div className="queued-bubble-head">
+              <span className="queued-bubble-icon">↝</span>
+              <span className="queued-bubble-label">Steering the running agent…</span>
+            </div>
+            <div className="queued-bubble-text" dir="auto">
+              {prepareContent(message.content, dir)}
+            </div>
+          </div>
         ) : (
         <div className="msg-bubble">
           {isUser ? (
-            <div className="chat-message user-text" dir={dir}>
+            <div className="chat-message user-text" dir="auto">
               {prepareContent(message.content, dir)}
             </div>
           ) : (
-            <div className="chat-message markdown-body">
+            <div className="chat-message markdown-body" dir="auto">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 rehypePlugins={[rehypeHighlight]}
@@ -737,14 +719,13 @@ export const ChatMessageView = memo(function ChatMessageView({
         )
       )}
 
-      {(message.content || (!isUser && (message.usage || message.streaming))) && (
+      {((message.content && !message.steerPending) || (!isUser && (message.usage || message.streaming))) && (
         <div className="msg-actions">
-          {!isUser && (message.usage || message.streaming) && (
+          {!isUser && message.usage && (
             <UsageBadge
-              input={message.usage?.inputTokens ?? liveInput}
-              output={message.usage?.outputTokens ?? 0}
-              total={message.usage?.totalTokens ?? liveInput}
-              live={!message.usage}
+              input={message.usage.inputTokens}
+              output={message.usage.outputTokens}
+              total={message.usage.totalTokens}
             />
           )}
           {message.content && (

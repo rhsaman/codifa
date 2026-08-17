@@ -57,7 +57,14 @@ function budgetedSettledHistory(
     coder: 140000,
   }
   const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? 'ask'] ?? budget)
-  const recent = rest.slice(-maxHistory)
+  // Compact summaries (system role) must always survive the maxHistory slice —
+  // mirrors sliceToBudget in Chat.tsx, so the estimate matches what is really
+  // sent (the summary stands in for the folded older turns).
+  const systems = rest.filter((m) => m.role === 'system')
+  const recent = [
+    ...systems,
+    ...rest.filter((m) => m.role !== 'system').slice(-maxHistory),
+  ]
   const kept: Chat['messages'] = []
   let acc = 0
   for (const m of [...recent].reverse()) {
@@ -167,7 +174,9 @@ export function formatTokensK(n: number): string {
 
 export function contextPercent(used: number, windowSize: number | null): number | null {
   if (!windowSize || windowSize <= 0) return null
-  return Math.min(100, Math.round((used / windowSize) * 100))
+  // No 100% cap — mirrors opencode's TUI meter, which reports the raw
+  // percentage even past the window (e.g. "105%") so an overflow is visible.
+  return Math.round((used / windowSize) * 100)
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying

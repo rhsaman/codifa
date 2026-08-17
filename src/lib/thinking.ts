@@ -10,7 +10,7 @@ import type { ProviderKind } from '../types'
 
 const REASONING_PATTERNS: RegExp[] = [
   /\b(qwen3|qwq)\b/i,
-  /deepseek[-_]?r1\b/i,
+  /deepseek[-_.]?(r1|v4|v3\.1)\b/i,
   /\b(o1|o3|o4)([-._-]|$)/i,
   /\bgpt[-_.]?5/i,
   /\breason(er|ing)?\b/i,

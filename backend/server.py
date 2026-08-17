@@ -123,8 +123,6 @@ class ChatRequest(BaseModel):
     thinking_level: str = "medium"
     mcp_servers: dict = {}
     context_window: int = 0
-    skills: list[str] = []
-    auto_skills: bool = False
     allow_create: bool = False
     # Mode capabilities: tool access per mode, so the backend can gate tools
     # data-driven instead of hardcoding mode names. Optional for backward compat.
@@ -158,6 +156,10 @@ class ChatRequest(BaseModel):
     # Per-subagent model overrides: {"explore": "model-id", "vision": "...", "compact": "..."}.
     # Missing / empty dict = use the parent model for every subagent.
     subagent_models: dict = {}
+    # Pre-emptive auto-compact threshold as a fraction of the context window
+    # (0.5–0.95). When real usage (input + output) crosses this, the run
+    # compacts before the window overflows. Default 0.80.
+    compact_threshold: float = 0.8
 
 
 class ModelsRequest(BaseModel):
@@ -850,8 +852,6 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 thinking_level=req.thinking_level,
                 mcp_servers=req.mcp_servers,
                 context_window=req.context_window,
-                skills_selected=req.skills,
-                auto_skills=req.auto_skills,
                 allow_create=req.allow_create,
                 cap=req.cap,
                 permission_gates=PERMISSION_GATES,
@@ -865,6 +865,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 retrieval_config=req.retrieval_config,
                 subagent_models=req.subagent_models,
                 chat_id=req.chat_id,
+                compact_threshold=req.compact_threshold,
             ):
                 yield _sse(event)
 

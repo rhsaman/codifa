@@ -253,7 +253,74 @@ async def main():
         assert state_db.load_turn_resume(ws, chat5) is None, "retry left the resume file behind"
         print("  resume/5 OK: same-prompt retry (with skill suffix) resumes done work, no re-run")
 
-        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist / retry)")
+        # ==== Scenario 6: NO tool completed, but text streamed — the partial
+        # reply must be injected so the model continues instead of restarting.
+        # Simulates a hard app close where the interrupted assistant message
+        # was never persisted, so the partial text is NOT in history.
+        chat6 = "chat-resume-6"
+        state_db.save_turn_resume(ws, chat6, {
+            "prompt": "find foo",
+            "tools": [],
+            "partial": "Let me search for that.\nRunning grep...",
+            "ts": time.time(),
+        })
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        history6 = [
+            {"role": "user", "content": "find foo"},
+        ]
+        await run_turn(prompt="continue", history=history6, **{**common, "chat_id": chat6})
+        _, partial_msg = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "assistant"
+            and "Let me search for that." in (m.get("content") or ""),
+        )
+        assert partial_msg, "partial reply was not injected into the continue request"
+        _, cont_note = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "system"
+            and "cut off mid-generation" in (m.get("content") or ""),
+        )
+        assert cont_note, "continuation note missing when partial was injected"
+        assert state_db.load_turn_resume(ws, chat6) is None, \
+            "partial scenario left the resume file behind"
+        print("  resume/6 OK: partial reply injected (no completed tools)")
+
+        # ==== Scenario 6b: partial ALREADY in history (the frontend kept the
+        # failed message with the folded marker) — must NOT be duplicated; only
+        # the continuation note is added.
+        chat6b = "chat-resume-6b"
+        state_db.save_turn_resume(ws, chat6b, {
+            "prompt": "find foo",
+            "tools": [],
+            "partial": "Let me search for that.\nRunning grep...",
+            "ts": time.time(),
+        })
+        mock.script = [text_reply("Done")]
+        mock.captured = []
+        history6b = [
+            {"role": "user", "content": "find foo"},
+            {"role": "assistant",
+             "content": "Let me search for that.\nRunning grep...[Interrupted before finishing. Already done this turn — do NOT repeat these: ]"},
+        ]
+        await run_turn(prompt="continue", history=history6b, **{**common, "chat_id": chat6b})
+        partial_count = sum(
+            1 for body in mock.captured for m in body.get("messages", [])
+            if m.get("role") == "assistant"
+            and "Let me search for that." in (m.get("content") or "")
+        )
+        assert partial_count == 1, f"partial reply duplicated: {partial_count}"
+        _, cont_note6b = find_in_request(
+            mock.captured,
+            lambda m: m.get("role") == "system"
+            and "cut off mid-generation" in (m.get("content") or ""),
+        )
+        assert cont_note6b, "continuation note missing when partial already in history"
+        assert state_db.load_turn_resume(ws, chat6b) is None, \
+            "partial-in-history scenario left the resume file behind"
+        print("  resume/6b OK: partial not duplicated; continuation note added")
+
+        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist / retry / partial)")
     finally:
         await stop_server(task)
 

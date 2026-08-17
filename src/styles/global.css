@@ -3022,6 +3022,28 @@ textarea {
   padding-left: 10px;
 }
 
+/* Sub-agent model badge: small tonal pill inside the sub-row, so the model
+   that ACTUALLY ran each read/grep/glob is visible at a glance (the sub-agent
+   model, or the main model after a per-sub-search fallback). The generic
+   .tool-badge style is scoped to .tool-card-head, so sub-rows need their own. */
+.tool-sub-row .tool-model-badge {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--tool-color, var(--accent)) 12%, transparent);
+  border: none;
+  border-radius: 999px;
+  padding: 1px 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 18ch;
+  flex: 0 0 auto;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
 .tool-sub-list .tool-card {
   background: color-mix(in srgb, var(--bg-raised, var(--bg)) 60%, transparent);
 }

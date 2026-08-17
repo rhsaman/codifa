@@ -5648,6 +5648,15 @@ async def run_agent(
                 and not _is_quota_exhausted(exc)
             ):
                 compact_after_drop_retried = True
+                # Same compact_start contract as the overflow path: tell the
+                # frontend a summarizer is running so it shows the "compacting…"
+                # banner instead of a silent stall while _compact_history runs.
+                yield {
+                    "kind": "compact_start",
+                    "model": str(
+                        getattr(compact_model or model, "model_name", "") or ""
+                    ),
+                }
                 compacted = await _compact_history(
                     compact_model or model,
                     history,

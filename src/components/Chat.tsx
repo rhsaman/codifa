@@ -1113,7 +1113,25 @@ export function ChatPanel() {
         const now = Date.now();
         const gotId = typeof event.call_id === "number";
         const gotBranch = typeof event.branch === "number";
-        const resolved = (act: ToolActivity): ToolActivity => {
+        const resolved = (act: ToolActivity, isTop: boolean): ToolActivity => {
+          // Sub-agent results resolve a child INSIDE the running explore card,
+          // never a top-level card (sub calls are nested, not standalone). A
+          // sub-result shares the branch id with its parent card, so matching
+          // it against the top level would mark the branch card "done" on its
+          // FIRST sub-search — children stay stuck "running" and every later
+          // sub-event is dropped (nesting only targets running explore cards).
+          // That is exactly the "parallel explores freeze / only one comes"
+          // symptom. So for sub-results, skip the top-level match entirely and
+          // only recurse into children.
+          if (event.sub && isTop) {
+            if (act.children && act.children.length > 0) {
+              const children = act.children.map((c) => resolved(c, false));
+              if (children.some((c, i) => c !== act.children![i])) {
+                return { ...act, children };
+              }
+            }
+            return act;
+          }
           // Match by per-call correlation id first (precise — the same tool
           // can run many times, and explore sub-agent events share tool names);
           // then by parallel fan-out branch id (each branch's explore card gets
@@ -1136,17 +1154,15 @@ export function ChatPanel() {
               elapsedMs: now - (act.startedAt ?? now),
             };
           }
-          // Sub-agent results resolve a child INSIDE the running explore card,
-          // never a top-level card (sub calls are nested, not standalone).
-          if (event.sub && act.children && act.children.length > 0) {
-            const children = act.children.map(resolved);
+          if (act.children && act.children.length > 0) {
+            const children = act.children.map((c) => resolved(c, false));
             if (children.some((c, i) => c !== act.children![i])) {
               return { ...act, children };
             }
           }
           return act;
         };
-        const next = current.map(resolved);
+        const next = current.map((a) => resolved(a, true));
         store.updateMessage(assistantMsg.id, { toolActivity: next });
       } else if (event.kind === "diff") {
         const current = findMsg()?.toolActivity ?? [];
@@ -2230,8 +2246,8 @@ export function ChatPanel() {
               className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: estimate of the current window (of the model's ${formatTokens(ctxWindow)} window) — resets on compact.`
-                  : "Context used: estimate of the current window — resets on compact."
+                  ? `Context used: estimate of the current window (of the model's ${formatTokens(ctxWindow)} window).`
+                  : "Context used: estimate of the current window."
               }
               dir="ltr"
             >

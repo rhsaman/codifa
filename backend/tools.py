@@ -2167,7 +2167,20 @@ def make_tool_callbacks(
     # results and, on a Stop, make the retried model think work was never done,
     # re-running duplicate tools.
     _call_seq = 0
-    _pending_sub_calls: dict[str, list[int]] = {}
+    # Globally-unique explore branch ids: branch ids are per-explore-call
+    # (0..N) if keyed by enumerate, so TWO parallel explore calls (the parent
+    # can issue several in one parallel-tool-calls response) both emit branch
+    # 0,1,2 — the frontend nests a sub-event into ANY running explore card with
+    # the matching branch id, so call #2's sub-searches land on call #1's
+    # still-running cards too ("all parallel explores show the same
+    # sub-searches"). A single monotonic counter makes every branch id unique
+    # across ALL explore calls in this run.
+    _branch_seq = 0
+    # Sub-agent tool→result correlation: name-based FIFO keyed per
+    # (branch, tool). Parallel explore branches each get their own queue, so
+    # out-of-order completion across branches can't swap call_ids (branch 1's
+    # grep result popping branch 0's id would resolve the wrong child row).
+    _pending_sub_calls: dict[tuple[object, str], list[int]] = {}
     _cur_call_id: contextvars.ContextVar[int] = contextvars.ContextVar(
         "coder_tool_call_id", default=0
     )
@@ -2196,14 +2209,17 @@ def make_tool_callbacks(
         else:
             # Sub-agent events flowed through `_sub_emit` (tagged `sub=True`),
             # they can't be threaded per-invocation from here, so keep the
-            # name-based FIFO correlation for those.
+            # name-based FIFO correlation for those — keyed per (branch, tool)
+            # so parallel explore branches don't share one FIFO (out-of-order
+            # completion would otherwise swap call_ids across branches).
+            _fifo_key = (ev.get("branch"), tool)
             if kind == "tool":
                 _call_seq += 1
                 ev["call_id"] = _call_seq
-                _pending_sub_calls.setdefault(tool, []).append(_call_seq)
+                _pending_sub_calls.setdefault(_fifo_key, []).append(_call_seq)
             elif kind == "tool_result":
-                if _pending_sub_calls.get(tool):
-                    ev["call_id"] = _pending_sub_calls[tool].pop(0)
+                if _pending_sub_calls.get(_fifo_key):
+                    ev["call_id"] = _pending_sub_calls[_fifo_key].pop(0)
         orig_emit(ev)
 
     orig_emit = emit
@@ -2334,6 +2350,17 @@ def make_tool_callbacks(
     # earlier findings instead of each starting from zero (the observed 10-15
     # round re-discovery loop for broad styling tasks).
     _explore_turn_digest: dict[str, str] = dict(explore_seed or {})
+    # Turn-level SHARED dedup state for CONCURRENT explore calls. The parent
+    # model emits N explore tool calls in ONE response and pydantic-ai runs
+    # them CONCURRENTLY (agents.py parallel_tool_calls=True) — so each call
+    # used to seed its own per-call seen-sets from the digest at start, which
+    # is EMPTY for all of them (none has finished yet), and every parallel call
+    # re-discovered the same files/searches from zero (the "5 explores with
+    # identical sub-searches" symptom). These sets/locks live at TURN level so
+    # the first call to touch a file/search does the work and the others reuse
+    # the cached result instead of re-running it.
+    _explore_seen_listings: set[tuple[str, str]] = set()
+    _explore_locks: dict[str, asyncio.Lock] = {}
     # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
     # update_plan (the common case for small tasks) never hit the threshold, so
     # the model could write its final reply with a step still stuck 'in_progress'
@@ -2903,8 +2930,19 @@ def make_tool_callbacks(
             emit(_error_result("run_terminal", msg))
             return f"ERROR running {command!r}: {msg}"
         output = result["output"].strip()
+        # Truncate from the MIDDLE, not the tail: test runners (pytest, jest,
+        # vitest, npm test...) print their pass/fail summary and failure
+        # tracebacks at the END of output, so a tail-cut used to discard exactly
+        # the part that proves a test failed, leaving the model with only
+        # head-of-run progress noise and no way to tell success from failure.
         if len(output) > terminal_out_chars:
-            output = output[:terminal_out_chars] + "\n…(output truncated to fit context)"
+            _head_chars = terminal_out_chars // 3
+            _tail_chars = terminal_out_chars - _head_chars
+            output = (
+                output[:_head_chars]
+                + f"\n…({len(output) - terminal_out_chars} chars truncated)…\n"
+                + output[-_tail_chars:]
+            )
         summary = f"exit {result['exit_code']} · {len(output)} chars"
         nudge = _format_plan_nudge_suffix(_plan_nudge_due())
         if not output:
@@ -2985,7 +3023,11 @@ def make_tool_callbacks(
                     )
                     return f"$ {command}\n{_search_note}\n{output}" + nudge
         emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
-        return f"$ {command}\n{output}" + nudge
+        # Exit code used to live ONLY in the emit() summary (UI-only) — the
+        # model never saw it in the text it actually reads, so it had to guess
+        # pass/fail purely from output text. Prepending it explicitly gives the
+        # model a hard, unambiguous signal to check before declaring success.
+        return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "") -> str:
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files."""
@@ -3226,6 +3268,7 @@ def make_tool_callbacks(
         return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
     async def explore_tool(task: str, path_hint: str = "", hints: str = "", subtasks: list[str] | None = None) -> str:
+        nonlocal _branch_seq
         """Delegate a broad, read-only investigation to ISOLATED sub-agents that run IN PARALLEL (each has its own search loop/context; only short reports reach you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. For a broad investigation, pass 3+ `subtasks` (one per sub-area) — they run SIMULTANEOUSLY as separate sub-agents, so the whole search finishes in one parallel round instead of N sequential ones. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components'), `hints` (known symbols/files), and `subtasks` (list of specific sub-questions to explore in parallel). Not for a single lookup — search yourself."""
         # The model that will run this explore call: ALWAYS the explore
         # sub-agent. Per-sub-search fallback to the MAIN model happens INSIDE
@@ -3259,6 +3302,31 @@ def make_tool_callbacks(
         _sub_emit_ctx: contextvars.ContextVar = contextvars.ContextVar(
             "explore_sub_emit", default=None
         )
+
+        # Per-branch dedup for SEARCHES only. READS dedup against the SHARED
+        # turn-level _explore_seen_listings (defined in make_tool_callbacks): a
+        # read is idempotent — same
+        # path+offset+limit always yields the same bytes — so sharing is safe
+        # and lets every parallel branch reuse the first branch's reads instead
+        # of each re-reading the same files (the "all parallel explores show
+        # the same sub-searches" symptom). SEARCHES stay per-branch: a SHARED
+        # search seen-set would fold branch B's broader query into branch A's
+        # more-specific one ("fastapi" folded into "fastapiroutes"), making
+        # every branch reuse the first branch's cached findings and converge on
+        # the same searches. Each _run_explore branch sets its OWN search-set
+        # copy (seeded from the turn-level digest = prior work) into this
+        # contextvar; the shared sub-tools read per-branch searches + the
+        # SHARED listings, so branches stay independent on searches while
+        # never re-reading files another branch already read this call.
+        _sub_seen_searches_ctx: contextvars.ContextVar = contextvars.ContextVar(
+            "explore_sub_seen_searches", default=None
+        )
+
+        def _sub_seen() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+            searches = _sub_seen_searches_ctx.get()
+            if searches is None:
+                searches = _sub_seen_searches
+            return searches, _explore_seen_listings
  
         def _sub_emit(event: dict) -> None:
             branch_emit = _sub_emit_ctx.get()
@@ -3292,7 +3360,6 @@ def make_tool_callbacks(
         # prior attempt, so its re-issued queries get the cached results back
         # instead of a dead-end "use the result you already have" it never got.
         _sub_seen_searches: set[tuple[str, str]] = set()
-        _sub_seen_listings: set[tuple[str, str]] = set()
         _sub_result_cache: dict[str, str] = dict(_explore_turn_digest)
 
         def _sub_search_key(query: str, path: str) -> tuple[str, str]:
@@ -3313,13 +3380,21 @@ def make_tool_callbacks(
             if _ctool in ("grep", "glob") and _cq:
                 _sub_seen_searches.add((_cq, _cp))
             elif _ctool == "read":
-                _sub_seen_listings.add((_cq or _cp, _cp))
+                _explore_seen_listings.add((_cq or _cp, _cp))
 
         def _sub_cache_key(tool: str, key: tuple[str, str]) -> str:
             return f"{tool}|{key[0]}|{key[1]}"
 
         def _sub_cached(tool: str, key: tuple[str, str]) -> str | None:
-            return _sub_result_cache.get(_sub_cache_key(tool, key))
+            ckey = _sub_cache_key(tool, key)
+            body = _sub_result_cache.get(ckey)
+            if body is None:
+                # Live cross-call check: parallel explore calls each snapshot
+                # the digest at start, so a read another call completed AFTER
+                # this call's seed is not in _sub_result_cache yet — check the
+                # shared turn-level digest directly.
+                body = _explore_turn_digest.get(ckey)
+            return body
 
         def _sub_cache_put(tool: str, key: tuple[str, str], body: str) -> None:
             """Store a tool result in BOTH the per-call cache and the turn-level
@@ -3400,7 +3475,32 @@ def make_tool_callbacks(
             return bad
 
         def _sub_check_seen(tool: str, key: tuple[str, str], query: str, path: str) -> str | None:
-            for seen_key in _sub_seen_searches:
+            # LIVE cross-call check FIRST: a PARALLEL explore call (same turn)
+            # may have already run this exact search — its result is in the
+            # SHARED turn-level digest, but this branch's per-branch search-set
+            # was seeded at START (when the digest was still empty for all
+            # concurrent calls), so it's not in _seen_searches yet. Checking the
+            # shared digest here is what makes the 2nd..Nth concurrent explore
+            # call reuse the first call's findings instead of re-searching the
+            # same area from scratch. Exact-key only — no broader/narrower
+            # folding across calls (that stays per-branch below, so branches
+            # don't converge on the first branch's queries).
+            cached = _sub_cached(tool, key)
+            if cached is not None:
+                _sub_emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": tool,
+                        "summary": "already searched",
+                    }
+                )
+                return (
+                    f"ALREADY SEARCHED: you ran this exact search "
+                    f"({query!r} under {path or '/'}) earlier. Result from earlier:\n"
+                    f"{cached}"
+                )
+            _seen_searches, _ = _sub_seen()
+            for seen_key in _seen_searches:
                 # Exact repeat: return the cached result (real data, even for a
                 # fresh model on retry), not a dead-end "use your memory".
                 if key == seen_key:
@@ -3456,143 +3556,171 @@ def make_tool_callbacks(
             # the same file is NOT folded into an earlier read — otherwise the
             # sub-agent asking for agents.py:3250-3269 after agents.py:3240-3339
             # gets the old range back forever and loops re-requesting it.
-            if lkey in _sub_seen_listings:
-                cached = _sub_cached("read", lkey)
-                body = cached or f"(no stored result for {filePath or '/'})"
-                _sub_emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "read",
-                        "summary": "already read/listed",
-                    }
-                )
-                return (
-                    f"ALREADY READ: you read {filePath or '/'} earlier. Result from earlier:\n"
-                    f"{body}"
-                )
-            try:
-                target = resolve_safe(root, filePath, allow_coder=True)
-            except PathEscapeError as exc:
-                msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("read", msg))
-                return f"ERROR reading {filePath}: {msg}"
-            if os.path.isdir(target):
-                result = list_files(root, filePath)
-                if "error" in result:
-                    _sub_emit(_error_result("read", result["error"]))
-                    return f"ERROR reading {filePath}: {result['error']}"
-                lines = []
-                for entry in result["entries"][:_sub_listing_count]:
-                    marker = "/" if entry["kind"] == "dir" else "  "
-                    lines.append(f"{marker}{entry['name']}")
-                if len(result["entries"]) > _sub_listing_count:
-                    lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
-                body = "\n".join(lines) if lines else "(empty directory)"
-                out = f"DIRECTORY {filePath or '/'}\n{body}"
-            else:
-                if not os.path.exists(target):
-                    out = f"ERROR reading {filePath}: file not found"
-                elif not _is_text_path(target):
-                    out = f"ERROR reading {filePath}: binary file (read skipped)"
+            #
+            # Per-key lock across CONCURRENT explore calls: the parent emits N
+            # explore calls in one response and pydantic-ai runs them at the
+            # same time, so two calls can reach this read before EITHER has
+            # cached it — without the lock both re-read the file from scratch.
+            # The lock serializes them: first does the work + caches, the rest
+            # re-check the digest and get "already read/listed".
+            _lock = _explore_locks.setdefault(
+                _sub_cache_key("read", lkey), asyncio.Lock()
+            )
+            async with _lock:
+                if lkey in _sub_seen()[1] or _sub_cache_key("read", lkey) in _explore_turn_digest:
+                    cached = _sub_cached("read", lkey)
+                    body = cached or f"(no stored result for {filePath or '/'})"
+                    _sub_emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "read",
+                            "summary": "already read/listed",
+                        }
+                    )
+                    return (
+                        f"ALREADY READ: you read {filePath or '/'} earlier. Result from earlier:\n"
+                        f"{body}"
+                    )
+                try:
+                    target = resolve_safe(root, filePath, allow_coder=True)
+                except PathEscapeError as exc:
+                    msg = f"invalid path: {exc}"
+                    _sub_emit(_error_result("read", msg))
+                    return f"ERROR reading {filePath}: {msg}"
+                if os.path.isdir(target):
+                    result = list_files(root, filePath)
+                    if "error" in result:
+                        _sub_emit(_error_result("read", result["error"]))
+                        return f"ERROR reading {filePath}: {result['error']}"
+                    lines = []
+                    for entry in result["entries"][:_sub_listing_count]:
+                        marker = "/" if entry["kind"] == "dir" else "  "
+                        lines.append(f"{marker}{entry['name']}")
+                    if len(result["entries"]) > _sub_listing_count:
+                        lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
+                    body = "\n".join(lines) if lines else "(empty directory)"
+                    out = f"DIRECTORY {filePath or '/'}\n{body}"
                 else:
-                    excerpt = _read_lines_excerpt(target, offset, limit)
-                    if excerpt.get("error"):
-                        out = f"ERROR reading {filePath}: {excerpt['error']}"
-                    elif not excerpt["lines"]:
-                        out = f"ERROR reading {filePath}: line offset {offset} is past the end"
+                    if not os.path.exists(target):
+                        out = f"ERROR reading {filePath}: file not found"
+                    elif not _is_text_path(target):
+                        out = f"ERROR reading {filePath}: binary file (read skipped)"
                     else:
-                        rows = [f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]]
-                        if excerpt["truncated"]:
-                            rows.append(
-                                f"\n(Showing lines {excerpt['start']}-{excerpt['lines'][-1]['line']}"
-                                f" of {excerpt['total']}. Use offset={excerpt['lines'][-1]['line'] + 1} to continue.)"
-                            )
+                        excerpt = _read_lines_excerpt(target, offset, limit)
+                        if excerpt.get("error"):
+                            out = f"ERROR reading {filePath}: {excerpt['error']}"
+                        elif not excerpt["lines"]:
+                            out = f"ERROR reading {filePath}: line offset {offset} is past the end"
                         else:
-                            rows.append(f"\n(End of file — total {excerpt['total']} lines)")
-                        out = f"{filePath}\n" + "\n".join(rows)
-            _sub_seen_listings.add(lkey)
-            _sub_cache_put("read", lkey, out)
-            _sub_emit({"kind": "tool_result", "tool": "read", "summary": "read"})
-            return out
+                            rows = [f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]]
+                            if excerpt["truncated"]:
+                                rows.append(
+                                    f"\n(Showing lines {excerpt['start']}-{excerpt['lines'][-1]['line']}"
+                                    f" of {excerpt['total']}. Use offset={excerpt['lines'][-1]['line'] + 1} to continue.)"
+                                )
+                            else:
+                                rows.append(f"\n(End of file — total {excerpt['total']} lines)")
+                            out = f"{filePath}\n" + "\n".join(rows)
+                _sub_seen()[1].add(lkey)
+                _sub_cache_put("read", lkey, out)
+                _sub_emit({"kind": "tool_result", "tool": "read", "summary": "read"})
+                return out
 
         async def _sub_grep(pattern: str, path: str = "", include: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "grep", "args": {"pattern": pattern, "path": path, "include": include}})
             key = _sub_search_key(pattern, path)
-            if key[0]:
-                stop = _sub_check_seen("grep", key, pattern, path)
-                if stop is not None:
-                    return stop
-                _sub_seen_searches.add(key)
-            try:
-                result = search_in_files(root, pattern, path, 0, include)
-            except PathEscapeError as exc:
-                msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("grep", msg))
-                return f"ERROR searching {path}: {msg}"
-            if result.get("error"):
-                msg = result["error"]
-                _sub_emit(_error_result("grep", msg))
-                return f"ERROR searching {path}: {msg}"
-            matches = result.get("matches", [])
-            if not matches:
-                out = f"No matches for {pattern!r} under {path or '/'}."
+            # Per-key lock across CONCURRENT explore calls (see _sub_read): the
+            # parent emits N explore calls in one response and they run at the
+            # same time, so two calls can issue the SAME grep before either has
+            # cached it. Serialize them: first searches + caches, the rest
+            # re-check the digest via _sub_check_seen and get the cached result.
+            _lock = _explore_locks.setdefault(
+                _sub_cache_key("grep", key), asyncio.Lock()
+            )
+            async with _lock:
+                if key[0]:
+                    stop = _sub_check_seen("grep", key, pattern, path)
+                    if stop is not None:
+                        return stop
+                    _sub_seen()[0].add(key)
+                try:
+                    result = search_in_files(root, pattern, path, 0, include)
+                except PathEscapeError as exc:
+                    msg = f"invalid path: {exc}"
+                    _sub_emit(_error_result("grep", msg))
+                    return f"ERROR searching {path}: {msg}"
+                if result.get("error"):
+                    msg = result["error"]
+                    _sub_emit(_error_result("grep", msg))
+                    return f"ERROR searching {path}: {msg}"
+                matches = result.get("matches", [])
+                if not matches:
+                    out = f"No matches for {pattern!r} under {path or '/'}."
+                    if key[0]:
+                        _sub_cache_put("grep", key, out)
+                    _sub_emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
+                    return out
+                lines: list[str] = []
+                total = 0
+                shown = 0
+                for m in matches:
+                    if shown >= _sub_search_count:
+                        break
+                    block = [f"{m['file']}:{m['line']}: {m['text']}"]
+                    block_size = sum(len(b) + 1 for b in block)
+                    if lines and total + block_size > _sub_tool_out_chars:
+                        break
+                    lines.extend(block)
+                    shown += 1
+                    total += block_size
+                    if total >= _sub_tool_out_chars:
+                        break
+                note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
+                out = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
                 if key[0]:
                     _sub_cache_put("grep", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
+                _sub_emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
                 return out
-            lines: list[str] = []
-            total = 0
-            shown = 0
-            for m in matches:
-                if shown >= _sub_search_count:
-                    break
-                block = [f"{m['file']}:{m['line']}: {m['text']}"]
-                block_size = sum(len(b) + 1 for b in block)
-                if lines and total + block_size > _sub_tool_out_chars:
-                    break
-                lines.extend(block)
-                shown += 1
-                total += block_size
-                if total >= _sub_tool_out_chars:
-                    break
-            note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
-            out = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-            if key[0]:
-                _sub_cache_put("grep", key, out)
-            _sub_emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
-            return out
 
         async def _sub_glob(pattern: str, path: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
             key = _sub_search_key(pattern, path)
-            if key[0]:
-                stop = _sub_check_seen("glob", key, pattern, path)
-                if stop is not None:
-                    return stop
-                _sub_seen_searches.add(key)
-            try:
-                result = glob_files(root, pattern, path)
-            except PathEscapeError as exc:
-                msg = f"invalid path: {exc}"
-                _sub_emit(_error_result("glob", msg))
-                return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
-            matches = result.get("matches", [])
-            if not matches:
-                out = f"No files match glob {pattern!r} under {path or '/'}."
+            # Per-key lock across CONCURRENT explore calls (see _sub_read/_sub_grep).
+            _lock = _explore_locks.setdefault(
+                _sub_cache_key("glob", key), asyncio.Lock()
+            )
+            async with _lock:
+                if key[0]:
+                    stop = _sub_check_seen("glob", key, pattern, path)
+                    if stop is not None:
+                        return stop
+                    _sub_seen()[0].add(key)
+                try:
+                    result = glob_files(root, pattern, path)
+                except PathEscapeError as exc:
+                    msg = f"invalid path: {exc}"
+                    _sub_emit(_error_result("glob", msg))
+                    return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
+                matches = result.get("matches", [])
+                if not matches:
+                    out = f"No files match glob {pattern!r} under {path or '/'}."
+                    if key[0]:
+                        _sub_cache_put("glob", key, out)
+                    _sub_emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
+                    return out
+                lines = list(matches[:50])
+                out = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines)
                 if key[0]:
                     _sub_cache_put("glob", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
+                _sub_emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
                 return out
-            lines = list(matches[:50])
-            out = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines)
-            if key[0]:
-                _sub_cache_put("glob", key, out)
-            _sub_emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
-            return out
 
         from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
 
-        async def _run_explore_inner(model: Any, task_text: str, state: dict) -> str:
+        async def _run_explore_inner(
+            model: Any, task_text: str, state: dict,
+            branch_index: int = 0, branch_total: int = 1,
+        ) -> str:
             """Run the isolated exploration sub-agent on ``model`` with the given
             task text (path_hint/hints already prepended by the caller) and return
             its report. The model is wrapped in a _PerStepFallbackModel, so every
@@ -3730,6 +3858,23 @@ def make_tool_callbacks(
             # round-trip (the whole transcript re-sends), so preventing the call
             # up front is what actually saves tokens.
             _sub_prior_note = _sub_resume_note()
+            # Parallel fan-out: tell this branch it is ONE of N siblings, each
+            # investigating a DIFFERENT sub-area. Without this, every branch
+            # reads the same generic system prompt and fires the same generic
+            # first-round searches (glob **/*.py, read the root, grep the task's
+            # headline keyword) — the "all parallel explores search the same
+            # thing" symptom. Naming the branch's own sub-area and warning it
+            # off its siblings' areas keeps the fan-out actually parallel.
+            _branch_note = ""
+            if branch_total > 1:
+                _branch_note = (
+                    f"You are branch {branch_index + 1} of {branch_total} in a "
+                    "PARALLEL exploration. Your SIBLING branches are investigating "
+                    "the OTHER sub-areas of the same investigation — do NOT search "
+                    "for them. Focus ONLY on YOUR assigned sub-area below; if a "
+                    "search would cover the whole workspace or another branch's "
+                    "area, narrow it to your sub-area first.\n"
+                )
             sub_agent = _Agent(
                 _run_model_wrapped,
                 system_prompt=(
@@ -3737,6 +3882,7 @@ def make_tool_callbacks(
                     "answer FAST and CHEAPLY and hand back a compact structured report. "
                     "TIME IS PRECIOUS — every search round-trip re-sends your whole "
                     "transcript, so do not over-explore.\n"
+                    + _branch_note
                     + (
                         "ALREADY EXPLORED THIS TURN — do NOT re-read or re-search these; "
                         "the results are already known. Only dig deeper where the task "
@@ -3802,8 +3948,22 @@ def make_tool_callbacks(
             # Each retry keeps the result cache (built above), so the fresh model
             # gets its earlier findings back via the dedup instead of re-exploring.
             _sub_model_name = str(getattr(model, "model_name", "") or "")
-            _sub_request_limit = 6
-            _sub_tool_calls_limit = 12
+            # Start content-gathering tasks (broad/verbatim-code investigations,
+            # same classifier that already drives _sub_max_tokens above) with a
+            # BIGGER initial budget instead of the narrow-lookup default. The
+            # narrow default routinely wasn't enough for a genuinely broad task,
+            # forcing a UsageLimitExceeded → widen → resume round trip: a full
+            # extra sequential sub-agent request purely to discover "the budget
+            # was too small", before the actual widened run even starts. Sizing
+            # the STARTING budget correctly for the task kind skips that wasted
+            # round trip for the common broad-task case; narrow lookups keep the
+            # tight default since they rarely need more.
+            if _is_content_gathering(task_text):
+                _sub_request_limit = 12
+                _sub_tool_calls_limit = 24
+            else:
+                _sub_request_limit = 6
+                _sub_tool_calls_limit = 12
             _sub_widen_retries = 0
             _sub_overflow_retries = 0
             _sub_run_prompt = task_text
@@ -3961,7 +4121,10 @@ def make_tool_callbacks(
                 emit(_usage_ev)
             return report
 
-        async def _run_explore(model: Any, task_text: str, branch_id: int = 0) -> str:
+        async def _run_explore(
+            model: Any, task_text: str, branch_id: int = 0,
+            branch_index: int = 0, branch_total: int = 1,
+        ) -> str:
             """Per-branch wrapper: stamps every sub-agent event with this
             branch id and the model that ACTUALLY ran it (the sub-agent model,
             or the main model after a per-sub-search fallback). Each branch runs
@@ -3977,9 +4140,22 @@ def make_tool_callbacks(
                 emit(event)
 
             _token = _sub_emit_ctx.set(_branch_emit)
+            # Per-branch dedup for SEARCHES only: copy the digest-seeded shared
+            # search set so this branch dedups against its OWN searches + prior
+            # explore calls, never against other branches' concurrent searches
+            # (a shared search seen-set folded branch B's broader search into
+            # branch A's more-specific one, making all branches converge on the
+            # same searches). READS are NOT copied: they share the turn-level
+            # _explore_seen_listings so parallel branches reuse each other's
+            # file reads instead of each reading the same files.
+            _seen_token = _sub_seen_searches_ctx.set(set(_sub_seen_searches))
             try:
-                return await _run_explore_inner(model, task_text, state)
+                return await _run_explore_inner(
+                    model, task_text, state,
+                    branch_index=branch_index, branch_total=branch_total,
+                )
             finally:
+                _sub_seen_searches_ctx.reset(_seen_token)
                 _sub_emit_ctx.reset(_token)
 
         def _build_task_text(t: str) -> str:
@@ -3989,6 +4165,70 @@ def make_tool_callbacks(
             if hints:
                 text = f"Known hints: {hints}. {text}"
             return text
+
+        _SUBTASK_STOPWORDS = {
+            # Persian function words (no content signal)
+            "و", "در", "به", "از", "که", "را", "با", "برای", "این", "آن",
+            "های", "ها", "یا", "نیز", "هم", "بر", "تا", "شود", "می", "شده",
+            "است", "بود", "دارد", "کردن", "بررسی", "مربوط", "باید", "خود",
+            "یک", "دو", "بعد", "قبل", "مثل", "طور", "روی", "بین", "کنار",
+            "داخل", "خارج", "همه", "هر", "چند", "چه", "چی", "کجا", "چرا",
+            # English function words
+            "the", "a", "an", "of", "to", "in", "for", "and", "or", "on",
+            "with", "at", "by", "is", "are", "it", "its", "as", "be", "been",
+            "was", "were", "do", "does", "did", "not", "no", "this", "that",
+            "these", "those", "from", "into", "about", "over", "under", "out",
+            "up", "down", "off", "than", "then", "so", "if", "but", "also",
+            "very", "just", "only", "more", "most", "some", "any", "all",
+            "each", "every", "both", "few", "other", "such", "which", "what",
+            "when", "where", "who", "whom", "how", "why", "can", "could",
+            "will", "would", "shall", "should", "may", "might", "must",
+            "have", "has", "had", "having", "being", "get", "gets", "got",
+            "make", "makes", "made", "use", "uses", "used", "using", "find",
+            "finds", "found", "look", "looks", "looked", "see", "sees", "saw",
+            "check", "checks", "checked", "need", "needs", "needed", "want",
+            "wants", "wanted", "know", "knows", "knew", "tell", "tells",
+            "told", "show", "shows", "showed", "given", "give", "gives",
+            "take", "takes", "took", "put", "puts", "set", "sets", "let",
+            "lets", "go", "goes", "went", "come", "comes", "came", "back",
+            "front", "top", "bottom", "left", "right", "side", "part",
+            "parts", "way", "ways", "thing", "things", "one", "two", "three",
+            "first", "second", "third", "last", "next", "new", "old", "big",
+            "small", "large", "main", "same", "different", "other", "another",
+        }
+
+        def _subtask_similar(a: str, b: str) -> float:
+            """Dice coefficient over normalized keyword sets — 1.0 = identical,
+            0.0 = no shared keywords. Stopwords (function words) are stripped so
+            two subtasks that merely share "بررسی فایل ... در backend" don't
+            collide; only real content-word overlap counts."""
+            def _tokens(s: str) -> set[str]:
+                # Keep dotted names (a.go, userCommision.go, backend/tools.py)
+                # as SINGLE tokens — splitting on "." would drop the content
+                # word and leave only "go" (a stopword) behind.
+                toks = set(re.findall(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", (s or "").lower()))
+                return {t for t in toks if t not in _SUBTASK_STOPWORDS and len(t) > 1}
+            ta, tb = _tokens(a), _tokens(b)
+            if not ta or not tb:
+                return 0.0
+            return 2.0 * len(ta & tb) / (len(ta) + len(tb))
+
+        def _dedup_subtasks(texts: list[str]) -> list[str]:
+            """Drop subtasks that are exact or near-duplicates of the main task
+            or of an earlier subtask (Dice >= 0.7 on normalized keywords), so
+            parallel branches don't all search the same area from the start.
+            The main task is always kept; the 5-branch cap applies after dedup.
+            This is a CODE backstop — the model's subtasks are often
+            near-duplicates of each other, and every duplicate spawns a branch
+            that re-searches the same area from scratch."""
+            kept: list[str] = []
+            for t in texts:
+                if not t or not t.strip():
+                    continue
+                if any(_subtask_similar(t, k) >= 0.7 for k in kept):
+                    continue
+                kept.append(t)
+            return kept
 
         # Run the explore sub-agent(s). Per-sub-search fallback to the MAIN
         # model happens INSIDE _run_explore (the _PerStepFallbackModel wrapper),
@@ -4000,30 +4240,60 @@ def make_tool_callbacks(
         if subtasks:
             # PARALLEL FAN-OUT: run 3+ separate sub-agents SIMULTANEOUSLY
             # (one per sub-area) so a broad investigation finishes in roughly
-            # one round of sub-agent time instead of N sequential ones. Branches
-            # share the turn-level digest + dedup caches, so duplicate searches
-            # across branches still fold together.
+            # one round of sub-agent time instead of N sequential ones. Each
+            # branch dedups against its OWN searches + the turn-level digest
+            # (prior explore calls), NOT against other branches' concurrent
+            # searches — a shared seen-set made every branch reuse the first
+            # branch's cached findings and converge on the same searches.
+            # CODE-LEVEL backstop (not just a prompt hint) against near-duplicate
+            # subtasks: the model often emits subtasks that are near-duplicates
+            # of the main task or of each other, and every such duplicate spawns
+            # a branch that re-searches the same area from scratch — the "5
+            # explores with identical sub-searches" symptom. Dedup on normalized
+            # keyword overlap (Dice >= 0.7) BEFORE spawning; the main task is
+            # always kept.
+            #
+            # Fan-out cap is DYNAMIC, not fixed at 5: a genuinely broad task
+            # (8-10 areas) used to hit the 5-branch wall and force the model to
+            # call explore MULTIPLE times sequentially — extra round trips
+            # instead of one full parallel fan-out. Content-gathering tasks get
+            # a wider cap (10) since they're the broad investigations that
+            # benefit from full parallelization; narrow lookups keep 5 (the
+            # model rarely needs more, and each branch is a live sub-agent).
+            _branch_cap = 10 if _is_content_gathering(task) else 5
             _branch_texts = [
-                _build_task_text(t) for t in [task, *subtasks] if t and t.strip()
-            ][:5]  # cap: 1 main + up to 4 subtasks
+                _build_task_text(t)
+                for t in _dedup_subtasks([task, *subtasks])
+            ][:_branch_cap]  # 1 main + up to (cap-1) subtasks
             # One explore card PER BRANCH (tagged with its branch id) so the UI
             # shows the parallel fan-out as separate cards, each with its own
-            # sub-agent model badge — not one card hiding N branches.
-            for _bi, _bt in enumerate(_branch_texts):
+            # sub-agent model badge — not one card hiding N branches. Branch ids
+            # come from a GLOBAL counter (not enumerate): two explore calls in
+            # one parallel-tool-calls response must not both use 0..N, or the
+            # frontend would nest one call's sub-events into the other call's
+            # still-running cards (the "all parallel explores show the same
+            # sub-searches" symptom).
+            _branch_ids: list[int] = []
+            for _bt in _branch_texts:
+                _branch_seq += 1
+                _branch_ids.append(_branch_seq)
                 emit(
                     {
                         "kind": "tool",
                         "tool": "explore",
                         "args": {"task": _bt},
                         "model": _run_model_name,
-                        "branch": _bi,
+                        "branch": _branch_seq,
                     }
                 )
             try:
                 _reports = await asyncio.gather(
                     *[
-                        _run_explore(_run_model, t, i)
-                        for i, t in enumerate(_branch_texts)
+                        _run_explore(
+                            _run_model, t, i,
+                            branch_index=bi, branch_total=len(_branch_texts),
+                        )
+                        for bi, (i, t) in enumerate(zip(_branch_ids, _branch_texts))
                     ],
                     return_exceptions=True,
                 )
@@ -4045,7 +4315,7 @@ def make_tool_callbacks(
                         "tool": "explore",
                         "summary": f"{len(str(_r))} chars",
                         "model": _run_model_name,
-                        "branch": _bi,
+                        "branch": _branch_ids[_bi],
                     }
                 )
                 _emitted_result = True

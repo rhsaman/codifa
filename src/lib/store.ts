@@ -1551,14 +1551,18 @@ export const useStore = create<State>((set, get) => ({
         }
         // Folded messages KEEP their per-turn usage so their token badge stays
         // visible (the context meter ignores them — it only scans non-compacted
-        // messages). The preserved tail has its usage CLEARED so the context
-        // meter resets to the estimate right after a compact instead of showing
-        // the stale pre-compact total of the last kept exchange. chat.usage
+        // messages). The preserved tail ALSO keeps its usage: clearing it made
+        // the context meter fall back to the character estimate right after a
+        // compact, which is structurally LOWER than the real input+output the
+        // provider reported (it can't see the backend-only additions — base
+        // system prompt, RAG block, memory notes, auto-scout dossier). The user
+        // saw the meter dip to a misleadingly small number before the next
+        // exchange's usage event corrected it. Keeping the last completed
+        // exchange's usage keeps the meter stable; it settles to the real
+        // post-compact value once the next reply completes. chat.usage
         // (per-model session totals) is untouched — it only ever grows.
         const messages = c.messages.map((m) =>
-          compactedIds.has(m.id)
-            ? { ...m, compacted: true }
-            : { ...m, usage: undefined as TokenUsage | undefined },
+          compactedIds.has(m.id) ? { ...m, compacted: true } : m,
         )
         const summaryMsg = {
           id: uid(),

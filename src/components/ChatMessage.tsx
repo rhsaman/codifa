@@ -97,6 +97,7 @@ const THINKING_MAX_H = 320
 const THINKING_DEFAULT_H = 84
 
 export function ThinkingBlock({ text }: { text: string }) {
+  const dir = useStore((s) => s.dir)
   const [open, setOpen] = useState(false)
   const [height, setHeight] = useState(THINKING_DEFAULT_H)
   const textRef = useRef<HTMLDivElement>(null)
@@ -166,7 +167,7 @@ export function ThinkingBlock({ text }: { text: string }) {
                 el.scrollHeight - el.scrollTop - el.clientHeight < 40
             }}
           >
-            {stripBidiMarks(fixZwsp(text))}
+            {prepareContent(text, dir)}
           </div>
           <div
             className="thinking-resizer"
@@ -405,7 +406,7 @@ function SegSteerBubble({
     <div className="seg-steer">
       <div className="seg-steer-label">You</div>
       <div className="seg-steer-text" dir={dir}>
-        {message.content || '(empty)'}
+        {prepareContent(message.content, dir) || '(empty)'}
       </div>
       {message.attachments && message.attachments.length > 0 && (
         <div className="msg-attachments" dir="ltr">

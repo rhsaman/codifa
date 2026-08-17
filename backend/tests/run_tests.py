@@ -16,6 +16,8 @@ TESTS = [
     "test_resume",
     "test_subagent",
     "test_parallel_tools",
+    "test_parallel_explore",
+    "test_parallel_explore_calls",
     "test_issues",
     "test_compact",
     "test_models_dev",

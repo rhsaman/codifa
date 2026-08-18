@@ -18,6 +18,27 @@ import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
 
+// Cache prepareContent per message id so re-renders with UNCHANGED content
+// (dir toggles, parent re-renders that don't recreate the message, memo
+// defeats) don't re-run the bidi-mark strip + ZWSP-fix passes over every
+// message on every paint. The cached text is validated on each hit, so a
+// STREAMING message (same id, growing content) always recomputes instead of
+// showing stale text. FIFO-bounded so long sessions can't leak memory.
+const preparedCache = new Map<string, { text: string; out: string }>()
+const PREPARED_CACHE_MAX = 400
+function cachedPrepare(id: string, text: string, dir?: 'rtl' | 'ltr'): string {
+  if (!text) return text
+  const hit = preparedCache.get(id)
+  if (hit && hit.text === text) return hit.out
+  const out = prepareContent(text, dir)
+  if (preparedCache.size >= PREPARED_CACHE_MAX) {
+    const oldest = preparedCache.keys().next().value
+    if (oldest !== undefined) preparedCache.delete(oldest)
+  }
+  preparedCache.set(id, { text, out })
+  return out
+}
+
 function textFromChildren(node: ReactNode): string {
   if (node == null || node === false) return ''
   if (typeof node === 'string' || typeof node === 'number') return String(node)
@@ -406,7 +427,7 @@ function SegSteerBubble({
     <div className="seg-steer">
       <div className="seg-steer-label">You</div>
       <div className="seg-steer-text" dir={detectDir(message.content)}>
-        {prepareContent(message.content, dir) || '(empty)'}
+        {cachedPrepare(message.id, message.content, dir) || '(empty)'}
       </div>
       {message.attachments && message.attachments.length > 0 && (
         <div className="msg-attachments" dir="ltr">
@@ -498,7 +519,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
             rehypePlugins={[rehypeHighlight]}
             components={mdComponents}
           >
-            {prepareContent(seg.text, useStore.getState().dir)}
+            {cachedPrepare(`${message.id}:seg:${i}`, seg.text, useStore.getState().dir)}
           </ReactMarkdown>
         </div>,
       )
@@ -534,10 +555,9 @@ export const ChatMessageView = memo(function ChatMessageView({
   const dir = useStore((s) => s.dir)
   const settings = useStore((s) => s.settings)
   const [copied, setCopied] = useState(false)
-  // The context summary is EXPANDED by default — the user asked to see the
-  // compact checkpoint between responses instead of a collapsed header. It can
-  // still be collapsed on demand.
-  const [summaryCollapsed, setSummaryCollapsed] = useState(false)
+  // The context summary is COLLAPSED by default — it's a long folded dump of
+  // earlier turns, so the chat stays compact. Clicking the header expands it.
+  const [summaryCollapsed, setSummaryCollapsed] = useState(true)
 
   const modeLabel = (id: string) => getMode(settings, id).label
 
@@ -597,6 +617,14 @@ export const ChatMessageView = memo(function ChatMessageView({
       data-is-summary={isSummary ? 'true' : undefined}
     >
       <div className="msg-role">
+        {isUser && (
+          <span className="msg-role-avatar" aria-hidden="true">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="8" r="4" />
+              <path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" />
+            </svg>
+          </span>
+        )}
         {roleLabel}
       </div>
 
@@ -622,7 +650,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                   {item.status === 'completed' ? '✓' : item.status === 'in_progress' ? '●' : '○'}
                 </span>
                 <span className="plan-item-content" dir="auto">
-                  {prepareContent(item.content, dir)}
+                  {cachedPrepare(`${message.id}:plan:${i}`, item.content, dir)}
                 </span>
               </li>
             ))}
@@ -654,7 +682,7 @@ export const ChatMessageView = memo(function ChatMessageView({
 
       {(isSummary || message.content || (message.segments && message.segments.length > 0)) && (
         isModeSwitch ? (
-          <div className="mode-switch-note" dir="ltr">{prepareContent(message.content, 'ltr')}</div>
+          <div className="mode-switch-note" dir="ltr">{cachedPrepare(message.id, message.content, 'ltr')}</div>
         ) : isSummary ? (
           <div className={`summary-block${summaryCollapsed ? ' collapsed' : ''}`}>
             <div className="summary-head" onClick={() => setSummaryCollapsed((c) => !c)} role="button" tabIndex={0}>
@@ -663,7 +691,7 @@ export const ChatMessageView = memo(function ChatMessageView({
               <span className="summary-label">Context summary</span>
               {summaryCollapsed && message.content && (
                 <span className="summary-preview" dir="auto">
-                  {prepareContent(message.content, dir)}
+                  {cachedPrepare(message.id, message.content, dir)}
                 </span>
               )}
               <span className="summary-hint">
@@ -677,7 +705,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                   rehypePlugins={[rehypeHighlight]}
                   components={mdComponents}
                 >
-                  {prepareContent(message.content || "(empty summary)", dir)}
+                  {cachedPrepare(`${message.id}:summary`, message.content || "(empty summary)", dir)}
                 </ReactMarkdown>
               </div>
             )}
@@ -717,14 +745,19 @@ export const ChatMessageView = memo(function ChatMessageView({
               </button>
             </div>
             <div className="queued-bubble-text" dir={detectDir(message.content)}>
-              {prepareContent(message.content, dir)}
+              {cachedPrepare(message.id, message.content, dir)}
             </div>
           </div>
         ) : (
         <div className="msg-bubble">
           {isUser ? (
-            <div className="chat-message user-text" dir="auto">
-              {prepareContent(message.content, dir)}
+            /* Same fixed dir as the composer (dir={dir}): dir="auto" resolved
+               from the first strong char only, so a user message starting with
+               a Latin word/digit (e.g. "API key رو بده") flipped to LTR and the
+               72ch box hugged the LEFT side even in RTL mode. A fixed dir keeps
+               the rendered bubble identical to what the user typed. */
+            <div className="chat-message user-text" dir={dir}>
+              {cachedPrepare(message.id, message.content, dir)}
             </div>
           ) : (
             <div className="chat-message markdown-body" dir="auto">
@@ -733,7 +766,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                 rehypePlugins={[rehypeHighlight]}
                 components={mdComponents}
               >
-                {prepareContent(message.content, dir)}
+                {cachedPrepare(message.id, message.content, dir)}
               </ReactMarkdown>
             </div>
           )}

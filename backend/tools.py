@@ -90,6 +90,17 @@ _SUB_AGENT_BRANCH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
     "coder_sub_agent_branch", default=0
 )
 
+# Set by agents.py after per-mode capability filtering: the parent agent's
+# ACTUAL toolset for this run (write tools stripped in plan/ask, read-only
+# terminal, etc.). The general sub-agent builds its tools from THIS instead of
+# the full registry, so a `task` call can never hand a read-only mode's
+# sub-agent write_file/edit_file/confirm_action (the "edited files while in
+# plan mode" bypass). None = fall back to the full registry (task invoked
+# outside a normal agent run).
+_PARENT_TOOLS_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "coder_parent_tools", default=None
+)
+
 # Per-branch early-stop state for the EXPLORE sub-agent (set by _run_explore):
 # {"streak": consecutive empty tool results, "found_any": any non-empty result
 # so far, "threshold": empty_stop_after for this thoroughness}. The sub-tools
@@ -511,6 +522,11 @@ _SKIP_DIRS = {
     ".tox", ".mypy_cache", ".pytest_cache", "out", "bin", "obj",
 }
 
+# ripgrep globs that exclude the deny-list dirs even when `--hidden` is passed
+# (rg would otherwise search inside `.git`/`node_modules` once hidden files are
+# enabled). `.DS_Store` is a file, so it needs its own negation glob.
+_RG_EXCLUDE_GLOBS = ["!{" + ",".join(sorted(_SKIP_DIRS)) + "}/**", "!.DS_Store"]
+
 _TERMINAL_BLOCK = [
     (r"^\s*sudo\b", "sudo (privilege escalation) is blocked"),
     (r"^\s*su\b", "su (user switch) is blocked"),
@@ -519,7 +535,7 @@ _TERMINAL_BLOCK = [
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\*", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\s", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+~", "destructive rm on the home directory is blocked"),
-    (r"\bopen\b", "the macOS `open` launcher is blocked"),
+    (r"(^|[;&|]\s*)open\b", "the macOS `open` launcher is blocked"),
     (r"dd\s+if=", "dd is blocked"),
     (r"(>|>>)\s*/dev/(sd|disk)", "raw disk access is blocked"),
     (r":\(\)\{", "fork bombs are blocked"),
@@ -698,11 +714,17 @@ def _walk_files(root: str) -> Sequence[str]:
         return cached[1]
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
+        # Keep hidden dirs like `.config`/`.github` (config files are real
+        # workspace content the agent must see) but skip the deny-list
+        # (`.git`, `.cache`, `node_modules`, …) — mirrors the renderer's
+        # quick-open walk so Ctrl+P and the agent agree on what is visible.
         dirnames[:] = [
             d for d in dirnames
-            if not d.startswith(".") and d not in _SKIP_DIRS
+            if d not in _SKIP_DIRS
         ]
         for name in filenames:
+            if name == ".DS_Store":
+                continue
             found.append(os.path.join(dirpath, name))
             if len(found) >= MAX_FILES:
                 break
@@ -742,13 +764,15 @@ def list_files(root: str, path: str = "") -> dict:
         return {"path": path, "error": "permission denied"}
 
     for name in names:
-        if name.startswith(".") and name not in (".gitignore", ".env"):
+        if name == ".DS_Store":
             continue
         full = os.path.join(target, name)
         try:
             if os.path.islink(full):
                 kind = "link"
             elif os.path.isdir(full):
+                if name in _SKIP_DIRS:
+                    continue
                 kind = "dir"
             else:
                 kind = "file"
@@ -1840,7 +1864,10 @@ def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") ->
 
     # rg itself skips binary files, respects .gitignore and skips hidden files
     # unless --hidden is passed; exit codes: 0 = matches, 1 = none, 2 = error.
-    cmd = [rg, "--json", "--line-number", "--smart-case", "--color", "never"]
+    # --hidden makes config files (`.config`, `.github`, …) searchable; the
+    # deny-list globs keep `.git`/`node_modules`/… out even when hidden.
+    cmd = [rg, "--json", "--line-number", "--smart-case", "--color", "never", "--hidden"]
+    cmd += _RG_EXCLUDE_GLOBS
     if ctx > 0:
         cmd += ["--context", str(ctx)]
     include = (include or "").strip()
@@ -1956,8 +1983,9 @@ def _rg_glob(root: str, pattern: str, target: str, path: str) -> dict | None:
         search_arg = "."
 
     # `rg --files -g <pattern>` lists files whose path matches the glob, still
-    # respecting .gitignore and skipping hidden/binary files.
-    cmd = [rg, "--files", "-g", pattern, search_arg]
+    # respecting .gitignore and skipping hidden/binary files. --hidden + the
+    # deny-list globs make config files findable without exposing `.git` etc.
+    cmd = [rg, "--files", "--hidden", "-g", pattern, *_RG_EXCLUDE_GLOBS, search_arg]
     try:
         proc = subprocess.run(
             cmd,
@@ -2414,6 +2442,8 @@ def make_tool_callbacks(
     web_model: Any = None,
     search_model: Any = None,
     main_model: Any = None,
+    vision_model: Any = None,
+    image_uris: list[str] | None = None,
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
     permit: dict | None = None,
@@ -4717,10 +4747,16 @@ def make_tool_callbacks(
         # The general sub-agent inherits the parent's tools minus `task` (no
         # nested sub-agents) and minus the plan/checklist tools that would
         # pollute the parent's UI state (opencode's general denies todowrite).
+        # Inherit the PARENT's actual (mode-filtered) toolset — set by agents.py
+        # after capability filtering — so a plan/ask-mode `task` call cannot hand
+        # the sub-agent write tools (the read-only bypass). Fall back to the full
+        # registry only when no parent toolset was recorded.
+        _parent_tools = _PARENT_TOOLS_CTX.get()
+        _tool_source = _parent_tools if _parent_tools is not None else _tools
         _general_tools = [
             _Tool(_invoke(fn), name=name)
-            for name, fn in _tools.items()
-            if name not in ("task", "update_plan", "save_plan")
+            for name, fn in _tool_source.items()
+            if name not in ("task", "update_plan", "save_plan", "vision")
         ]
         _sub_agent = _Agent(
             _general_model,
@@ -4770,6 +4806,91 @@ def make_tool_callbacks(
         if _usage_ev:
             emit(_usage_ev)
         emit({"kind": "tool_result", "tool": "task", "summary": f"{len(_output)} chars", "model": _general_name, "branch": _ecall})
+        return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
+
+    async def vision_tool(prompt: str) -> str:
+        """Analyze the image(s) attached to the current message using the
+        vision sub-agent (Settings → Subagents → Vision model).
+
+        The main model cannot see the images directly (they are kept out of its
+        request when a vision model is configured), so it delegates to this
+        tool: a tool-less sub-agent runs on the configured vision model with
+        the images + this prompt, and its analysis is returned as the tool
+        result. The main model then writes the final answer.
+        """
+        from pydantic_ai import Agent as _Agent
+        from pydantic_ai.messages import ImageUrl as _ImgUrl
+        from pydantic_ai.settings import ModelSettings as _ModelSettings
+        from pydantic_ai.usage import UsageLimits as _UsageLimits
+
+        nonlocal _task_call_seq
+        _imgs = [u for u in (image_uris or []) if u]
+        _vmodel = vision_model if vision_model is not None else main_model
+        _vname = (
+            str(getattr(_vmodel, "model_name", "") or "")
+            if _vmodel is not None
+            else ""
+        )
+        _ecall = _task_call_seq + 1
+        _task_call_seq = _ecall
+        emit({"kind": "tool", "tool": "vision", "args": {"prompt": prompt}, "model": _vname, "branch": _ecall})
+        if not _imgs:
+            emit(_error_result("vision", "no images"))
+            return "ERROR: no image is attached to this message — nothing to analyze."
+        if _vmodel is None:
+            emit(_error_result("vision", "unavailable"))
+            return "ERROR: the vision model is unavailable (no model configured for this session)."
+        _tid = f"vision-{uuid.uuid4().hex[:8]}"
+        _sub_agent = _Agent(
+            _vmodel,
+            system_prompt=(
+                "You are a vision analysis sub-agent. The main agent delegated an "
+                "image analysis task to you. Look carefully at the attached "
+                "image(s) and reply with a precise, concise analysis (under ~300 "
+                "words) that answers the task. Include the exact details (text, "
+                "numbers, layout, colors, UI elements, errors) the main agent "
+                "needs — it cannot see the image, your report is its only view."
+            ),
+            model_settings=_ModelSettings(temperature=0.2, max_tokens=2000),
+        )
+        _token = _SUB_AGENT_CTX.set(True)
+        _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
+        _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
+        try:
+            _res = await _run_subagent_call(
+                lambda: _sub_agent.run(
+                    [prompt, *[_ImgUrl(url=u) for u in _imgs]],
+                    usage_limits=_UsageLimits(request_limit=3),
+                    model_settings=_ModelSettings(
+                        timeout=_providers.model_timeout(
+                            model=_vmodel, total=120, connect=10, read=120
+                        ),
+                    ),
+                ),
+                "vision sub-agent",
+                emit=emit,
+                model_name=_vname,
+            )
+        except Exception as exc:  # noqa: BLE001
+            emit(_error_result("vision", f"failed: {exc}"))
+            return (
+                f"ERROR: the vision sub-agent failed"
+                f" ({_vname} model, change it in Settings → Subagents): {exc}"
+            )
+        finally:
+            _SUB_AGENT_CTX.reset(_token)
+            _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
+            _TASK_DEPTH_CTX.reset(_depth_token)
+        _output = str(getattr(_res, "output", "") or "").strip()
+        from agents import _usage_event  # local import (circular-safe)
+
+        _usage_ev = _usage_event(getattr(_res, "usage", None), model=_vname)
+        if _usage_ev:
+            emit(_usage_ev)
+        emit({"kind": "tool_result", "tool": "vision", "summary": f"{len(_output)} chars", "model": _vname, "branch": _ecall})
+        if not _output:
+            emit(_error_result("vision", "no report"))
+            return "ERROR: the vision sub-agent produced no usable analysis."
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
@@ -5488,6 +5609,12 @@ def make_tool_callbacks(
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
     }
+    # The `vision` tool is only meaningful when a dedicated vision model is
+    # configured AND this turn actually carries images — otherwise the main
+    # model sees the images directly (or there is nothing to analyze), so the
+    # tool would only clutter the schema.
+    if vision_model is not None and any(u for u in (image_uris or [])):
+        _tools["vision"] = vision_tool
     # Wrap every parent tool so each invocation gets its own `call_id` context
     # (see `_emit` above) — robust to parallel same-name tools finishing out of
     # order. Sub-agent internal tools are separate `_Tool` instances, so only

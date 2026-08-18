@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen, session, shell, clipboard } from 'electron'
-import { execFile } from 'child_process'
+import { execFile, execFileSync, spawn } from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
 import * as fs from 'fs'
@@ -97,6 +97,22 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
+/** True when `pid`'s process name is nvim (or starts with nvim, e.g. nvim-qt).
+ *  macOS `lsof -U` ignores `-c`/`-p` filters and returns EVERY unix socket on
+ *  the system (Docker, cmux, Macs Fan Control, …), so the lsof fallback must
+ *  verify the socket's owner process is actually nvim before querying it. */
+function pidIsNvim(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).trim()
+    const bin = out.split(/\s+/)[0] ?? ''
+    const base = path.basename(bin)
+    return base === 'nvim' || base.startsWith('nvim')
+  } catch {
+    return false
+  }
+}
+
 async function walkNvimSocketDir(dir: string, depth: number, acc: string[]): Promise<void> {
   let entries
   try {
@@ -122,11 +138,54 @@ async function walkNvimSocketDir(dir: string, depth: number, acc: string[]): Pro
   }
 }
 
+/** Resolve the nvim binary used for RPC queries. Prefers `nvim` on PATH (fast
+ *  path, covers brew/standard installs); falls back to the executable that
+ *  launched the socket's owner process, so installs outside a GUI-launched
+ *  PATH (mise, nix, ~/.local/bin) still work. */
+function nvimBinary(socket: string): string {
+  for (const d of TOOL_PATH.split(':')) {
+    if (!d) continue
+    try {
+      if (fs.existsSync(path.join(d, 'nvim'))) return 'nvim'
+    } catch {
+      /* ignore */
+    }
+  }
+  const pid = nvimSocketPid(socket)
+  if (pid) {
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).trim()
+      const bin = out.split(/\s+/)[0]
+      if (bin && fs.existsSync(bin)) return bin
+    } catch {
+      /* ignore */
+    }
+  }
+  return 'nvim'
+}
+
 /** Unix sockets listening for nvim RPC. Discovered by globbing nvim's socket
  *  dirs (pid-liveness filtered) so it works without Full Disk Access; falls
  *  back to `lsof` for custom `--listen <socket>` paths the glob can't see. */
 async function findNvimSockets(): Promise<string[]> {
   const found: string[] = []
+  // $NVIM_LISTEN_ADDRESS is the canonical way nvim advertises its server. When
+  // set (a wrapper/alias that runs `nvim --listen ...`), it is authoritative
+  // and may point at a custom socket path OR a TCP address (host:port) — both
+  // work with `nvim --server <addr> --remote-expr`.
+  const envSock = process.env.NVIM_LISTEN_ADDRESS
+  if (envSock) {
+    const p = envSock.replace(/^~/, os.homedir())
+    if (p.startsWith('/')) {
+      try {
+        if (fs.statSync(p).isSocket()) found.push(p)
+      } catch {
+        /* not a socket yet — fall through to discovery */
+      }
+    } else if (p.includes(':')) {
+      found.push(p) // TCP form (e.g. 127.0.0.1:7777)
+    }
+  }
   for (const root of nvimSocketRoots()) {
     if (!root) continue
     await walkNvimSocketDir(root, 0, found)
@@ -134,22 +193,31 @@ async function findNvimSockets(): Promise<string[]> {
   const uniq = [...new Set(found)]
   if (uniq.length > 0) return uniq
   // Fallback for non-default socket names (user passed `--listen`): enumerate
-  // via lsof, keeping only genuine `nvim.<pid>.0` server sockets (this avoids
-  // this app's own `nvim --server --remote-expr` subprocesses and stale ones).
+  // via lsof. macOS lsof IGNORES `-c nvim`/`-p` filters when `-U` is used (it
+  // returns EVERY unix socket on the system — Docker, cmux, Macs Fan Control,
+  // …), so we parse the owner PID lsof DOES report and only keep sockets whose
+  // owning process is verifiably an nvim binary. Connected (client) sockets are
+  // skipped; genuine servers are validated below by actually querying them with
+  // `--remote-expr`.
   return new Promise((resolve) => {
     execFile(
       'lsof',
-      ['-nP', '-c', 'nvim', '-U', '-F0n'],
+      ['-nP', '-U', '-F0n'],
       { timeout: 5000, env: { ...process.env, PATH: TOOL_PATH } },
       (err, stdout) => {
         if (err || !stdout) return resolve([])
         const out: string[] = []
+        let ownerPid = 0
         for (const rec of stdout.split('\0')) {
+          if (rec.startsWith('p')) {
+            ownerPid = Number(rec.slice(1)) || 0
+            continue
+          }
           if (!rec.startsWith('n')) continue
-          let p = rec.slice(1)
-          if (p.startsWith('->')) p = p.slice(2) // connected socket form
+          const p = rec.slice(1)
+          if (p.startsWith('->')) continue // connected client socket, not a server
           if (!p.startsWith('/')) continue
-          if (!/nvim\.\d+\.0$/.test(p)) continue
+          if (!pidIsNvim(ownerPid)) continue // owner must be an nvim process
           try {
             if (fs.statSync(p).isSocket()) out.push(p)
           } catch {
@@ -162,20 +230,58 @@ async function findNvimSockets(): Promise<string[]> {
   })
 }
 
+/** Run one `nvim --server <socket> --remote-expr ...` query with a hard-kill
+ *  guarantee. `execFile`'s `timeout` only sends SIGTERM, which nvim IGNORES
+ *  when it is blocked on a foreign (non-nvim) socket — that is exactly how the
+ *  app leaked 268 orphaned `nvim --server` processes (parent=launchd) against
+ *  Docker/cmux/Macs Fan Control sockets. So we spawn, and on timeout send
+ *  SIGTERM first, then SIGKILL after a short grace period so nothing survives. */
+function runNvimQuery(socket: string, args: string[]): Promise<{ code: number | null; stdout: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(nvimBinary(socket), ['--server', socket, ...args], {
+      env: { ...process.env, PATH: TOOL_PATH },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let settled = false
+    let termTimer: ReturnType<typeof setTimeout> | undefined
+    let killTimer: ReturnType<typeof setTimeout> | undefined
+    const finish = (code: number | null): void => {
+      if (settled) return
+      settled = true
+      if (termTimer) clearTimeout(termTimer)
+      if (killTimer) clearTimeout(killTimer)
+      resolve({ code, stdout })
+    }
+    child.stdout.on('data', (d) => {
+      stdout += String(d)
+    })
+    child.on('error', () => finish(null))
+    child.on('close', (code) => finish(code))
+    termTimer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        /* already gone */
+      }
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          /* already gone */
+        }
+      }, 500)
+    }, 1500)
+  })
+}
+
 /** Ask one nvim instance for the absolute path of its currently focused buffer
  *  (`expand('%:p')` returns '' for unnamed buffers). */
 function queryNvimBuffer(socket: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile(
-      'nvim',
-      ['--server', socket, '--remote-expr', 'expand("%:p")'],
-      { timeout: 1500, env: { ...process.env, PATH: TOOL_PATH } },
-      (err, stdout) => {
-        if (err) return resolve(null)
-        const v = String(stdout ?? '').trim()
-        resolve(v || null)
-      },
-    )
+  return runNvimQuery(socket, ['--remote-expr', 'expand("%:p")']).then(({ code, stdout }) => {
+    if (code !== 0) return null
+    const v = stdout.trim()
+    return v || null
   })
 }
 
@@ -193,31 +299,24 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
  *  buffer path uses, so no config/helper files are needed.
  */
 function queryNvimDiagnostics(socket: string): Promise<unknown[]> {
-  return new Promise((resolve) => {
-    const body =
-      "function() local ok,res=pcall(function() " +
-      "local d=vim.lsp.diagnostic.get(0) or {} local a={} " +
-      "for _,x in ipairs(d) do a[#a+1]={lnum=x.lnum,col=x.col,end_lnum=x.end_lnum," +
-      "end_col=x.end_col,severity=x.severity,source=x.source,code=x.code,message=x.message} end " +
-      "local enc=vim.json and function(t) return vim.json.encode(t) end or function(t) return vim.fn.json_encode(t) end " +
-      "return enc(a) end) " +
-      "return ok and res or \"[]\" end"
-    execFile(
-      'nvim',
-      ['--server', socket, '--remote-expr', `luaeval('(${body})()')`],
-      { timeout: 1500, env: { ...process.env, PATH: TOOL_PATH } },
-      (err, stdout) => {
-        if (err) return resolve([])
-        const raw = String(stdout ?? '').trim()
-        if (!raw) return resolve([])
-        try {
-          const parsed = JSON.parse(raw)
-          resolve(Array.isArray(parsed) ? parsed : [])
-        } catch {
-          resolve([])
-        }
-      },
-    )
+  const body =
+    "function() local ok,res=pcall(function() " +
+    "local d=vim.lsp.diagnostic.get(0) or {} local a={} " +
+    "for _,x in ipairs(d) do a[#a+1]={lnum=x.lnum,col=x.col,end_lnum=x.end_lnum," +
+    "end_col=x.end_col,severity=x.severity,source=x.source,code=x.code,message=x.message} end " +
+    "local enc=vim.json and function(t) return vim.json.encode(t) end or function(t) return vim.fn.json_encode(t) end " +
+    "return enc(a) end) " +
+    "return ok and res or \"[]\" end"
+  return runNvimQuery(socket, ['--remote-expr', `luaeval('(${body})()')`]).then(({ code, stdout }) => {
+    if (code !== 0) return []
+    const raw = String(stdout ?? '').trim()
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
   })
 }
 

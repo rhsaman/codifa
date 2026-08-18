@@ -1246,7 +1246,16 @@ export const useStore = create<State>((set, get) => ({
       // Opening a chat clears its green "new message" dot.
       unreadChats: s.unreadChats.filter((cid) => cid !== id),
     }))
-    get().persist()
+    // Switching chats changes only TRANSIENT state: activeChatId and
+    // unreadChats are never serialized (see writeStateNow), so the old
+    // get().persist() here was pure overhead ON THE CLICK PATH — it
+    // synchronously deep-copied (sanitizeChats) and IPC-structured-cloned
+    // EVERY chat and message before React could render the switch, so the
+    // sidebar highlight + panel swap lagged by however long the whole store
+    // took to copy (grows with TOTAL data, not the active chat's message
+    // count). Debounce instead: a real change persists on its own, and
+    // flushPendingPersist on beforeunload still covers a quick quit.
+    persistSoon()
   },
 
   setChatMode: (id, mode) => {

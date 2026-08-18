@@ -1,20 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore, workspaceKey } from '../lib/store'
+import { themeById } from '../lib/themes'
 import type { Chat, ChatMessage, ProviderConfig, Workspace } from '../types'
 import { api } from '../lib/fs'
 import { prepareContent } from '../lib/bidi'
 import { formatTokens, formatCost } from '../lib/context'
-
-const WORKSPACE_COLORS = [
-  '#ef4444',
-  '#f97316',
-  '#eab308',
-  '#22c55e',
-  '#14b8a6',
-  '#3b82f6',
-  '#8b5cf6',
-  '#ec4899',
-]
 
 function titleOf(chat: Chat): string {
   if (chat.title && chat.title !== 'New chat') return chat.title
@@ -131,6 +121,7 @@ export function Sidebar() {
   const workspaces = useStore((s) => s.workspaces)
   const activeChatId = useStore((s) => s.activeChatId)
   const workspaceColors = useStore((s) => s.workspaceColors)
+  const theme = useStore((s) => s.theme)
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces)
   const pinnedChats = useStore((s) => s.pinnedChats)
   const unreadChats = useStore((s) => s.unreadChats)
@@ -170,7 +161,7 @@ export function Sidebar() {
   const [todoCollapsed, setTodoCollapsed] = useState(false)
   const [usageCollapsed, setUsageCollapsed] = useState(false)
   const [todoHeight, setTodoHeight] = useState(320)
-  const [usageHeight, setUsageHeight] = useState(320)
+  const [usageHeight, setUsageHeight] = useState(200)
   // Tracks CLOSED groups (not open ones) so every provider starts expanded
   // by default — the user has to collapse a group explicitly to hide it.
   const [usageGroupsClosed, setUsageGroupsClosed] = useState<Set<string>>(new Set())
@@ -490,7 +481,7 @@ export function Sidebar() {
           return (
             <div
               key={g.key}
-              className={`sidebar-group${isPinned ? ' pinned' : ''}${dragKey === g.key ? ' dragging' : ''}${dragOverKey === g.key && dragKey && dragKey !== g.key ? ' drop-target' : ''}`}
+              className={`sidebar-group${isPinned ? ' pinned' : ''}${color ? ' ws-colored' : ''}${dragKey === g.key ? ' dragging' : ''}${dragOverKey === g.key && dragKey && dragKey !== g.key ? ' drop-target' : ''}`}
               style={color ? { '--ws': color } as React.CSSProperties : undefined}
               draggable
               onDragStart={(e) => onDragStart(e, g.key)}
@@ -503,7 +494,7 @@ export function Sidebar() {
                   <svg className="sidebar-group-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                     <path d={isCollapsed ? 'M6 9l6 6 6-6' : 'M18 15l-6-6-6 6'} />
                   </svg>
-                  {color && <span className="sidebar-ws-dot" style={{ background: color }} title="Workspace color" />}
+                  {color && <span className="sidebar-ws-dot" style={{ background: color, color }} title="Workspace color" />}
                   <svg className="sidebar-group-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
                   </svg>
@@ -559,7 +550,7 @@ export function Sidebar() {
                 </div>
                 {colorOpen === g.key && (
                   <div className="color-popover" onClick={(e) => e.stopPropagation()}>
-                    {WORKSPACE_COLORS.map((c2) => (
+                    {themeById(theme).workspaceColors.map((c2) => (
                       <button
                         key={c2}
                         className="color-swatch"
@@ -812,8 +803,10 @@ export function Sidebar() {
                     usageDrag.current = { startY: e.clientY, startH: usageHeight }
                     const onMove = (ev: MouseEvent) => {
                       if (!usageDrag.current) return
+                      // No fixed cap: the panel can grow as tall as the window
+                      // allows (minus room for the sidebar header + footer).
                       setUsageHeight(
-                        Math.max(60, Math.min(760, usageDrag.current.startH - (ev.clientY - usageDrag.current.startY))),
+                        Math.max(60, Math.min(window.innerHeight - 140, usageDrag.current.startH - (ev.clientY - usageDrag.current.startY))),
                       )
                     }
                     const onUp = () => {

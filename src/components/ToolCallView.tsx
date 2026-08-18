@@ -16,6 +16,7 @@ const TOOL_LABEL: Record<string, string> = {
   ask_user: 'ask_user',
   fetch_url: 'fetch_url',
   task: 'task',
+  vision: 'vision',
 }
 
 /** A task card running the explore agent (opencode-style subagent). */

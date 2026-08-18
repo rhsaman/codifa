@@ -32,14 +32,11 @@ export function resolveSafe(root: string, relPath: string): string {
   return path.join(anchorReal, path.relative(anchor, candidate))
 }
 
+/** Directories excluded from file listings / quick-open / search. Mirrors
+ *  backend/tools.py `_SKIP_DIRS` so the agent, Ctrl+P and the file tree all
+ *  agree on what is visible. Hidden dirs NOT in this set (`.config`, `.github`,
+ *  …) stay visible — config files are real workspace content. */
 const SKIP_DIRS = new Set([
-  'node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist',
-  'release', 'coverage', '.idea', '.vscode', 'vendor',
-])
-
-/** Directories excluded from the quick-open index. Mirrors backend/tools.py
- *  `_SKIP_DIRS` so the agent and Ctrl+P agree on what is visible. */
-const WALK_SKIP_DIRS = new Set([
   'node_modules', '.git', '.venv', 'venv', '__pycache__', '.next',
   '.nuxt', 'dist', 'dist-electron', 'release', 'build', 'coverage',
   '.cache', '.idea', '.vscode', '.DS_Store', 'target', 'vendor',
@@ -70,9 +67,10 @@ export function walkWorkspace(root: string): { rel: string; name: string }[] {
       if (out.length >= MAX_WALK_FILES) break
       const full = path.join(dir, e.name)
       if (e.isDirectory()) {
-        if (WALK_SKIP_DIRS.has(e.name)) continue
+        if (SKIP_DIRS.has(e.name)) continue
         stack.push(full)
       } else if (e.isFile()) {
+        if (e.name === '.DS_Store') continue
         out.push({
           rel: path.relative(root, full).split(path.sep).join('/'),
           name: e.name,
@@ -100,8 +98,8 @@ export function listDir(root: string, relPath: string): { name: string; kind: st
   }
   const entries: { name: string; kind: string; path: string }[] = []
   for (const name of dirents) {
-    if (name.name.startsWith('.') && name.name !== '.gitignore' && name.name !== '.env') continue
     if (name.isDirectory() && SKIP_DIRS.has(name.name)) continue
+    if (name.isFile() && name.name === '.DS_Store') continue
     let kind = 'file'
     if (name.isSymbolicLink()) kind = 'link'
     else if (name.isDirectory()) kind = 'dir'
@@ -175,9 +173,10 @@ function walkFiles(root: string): string[] {
     for (const e of entries) {
       const full = path.join(dir, e.name)
       if (e.isDirectory()) {
-        if (e.name.startsWith('.') || SKIP_DIRS.has(e.name)) continue
+        if (SKIP_DIRS.has(e.name)) continue
         stack.push(full)
       } else if (e.isFile()) {
+        if (e.name === '.DS_Store') continue
         out.push(full)
         if (out.length >= MAX_SEARCH_FILES) return out
       }

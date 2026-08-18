@@ -69,7 +69,6 @@ from providers import (
     _provider_meta,
     build_model,
     is_opencode,
-    list_models,
     model_context,
     model_max_output,
     model_timeout,
@@ -78,6 +77,7 @@ from providers import (
 from retrieval import RetrievalSettings
 from secret_utils import decrypt_secret
 from tools import (
+    _PARENT_TOOLS_CTX,
     _SCOUT_CTX,
     LOG_FILENAME,
     PathEscapeError,
@@ -1568,6 +1568,10 @@ def _build_resume_note(
         )
     partial = partial_reply.strip()
     if partial:
+        # Cap the tail so a long streamed reply can't overflow the window on a
+        # retry — the END is what matters for continuing, so keep the last chunk.
+        if len(partial) > 2000:
+            partial = "…" + partial[-2000:]
         parts.append(
             "Your reply was cut off mid-stream. Continue it EXACTLY from where it "
             "stopped — do NOT restart from the beginning:\n"
@@ -3890,78 +3894,7 @@ def _append_app_log(line: str) -> None:
         pass
 
 
-# Model-name quality signals: when auto-selecting a cheap explore model, models
-# carrying one of these substrings are preferred over the raw-cheapest-by-price
-# model, so we never pick an unusably weak or non-instruction-tuned model just
-# because its price tag is lowest. (See _auto_explore_model below.)
-_FAST_MODEL_HINTS = ("flash", "mini", "haiku", "small", "lite", "fast")
 
-# Hardcoded known-fast/cheap model ids per provider kind, used ONLY when the
-# provider's /models endpoint yields no pricing data at all. Manual config in
-# Settings → Subagents always wins; these are a last-resort default so explore
-# never silently inherits the expensive parent model.
-_CHEAP_EXPLORE_FALLBACK: dict[str, str] = {
-    "openrouter": _OPENROUTER_FREE_FALLBACK,
-    "opencode": "free",
-    "google": "gemini-2.0-flash-lite",
-    "nvidia": "meta/llama-3.3-70b-instruct",
-    "cloudflare": "@cf/meta/llama-3.3-70b-instruct-a1b-instruct",
-}
-
-
-async def _auto_explore_model(
-    provider: str,
-    base_url: str,
-    api_key: str,
-    env_var: str,
-    oauth_token: str,
-    parent_model: str,
-) -> str:
-    """Pick the cheapest usable model on the CURRENT provider for the explore
-    subagent when the user hasn't set one in Settings → Subagents.
-
-    Priority:
-    1. Priced models from the provider's live /models catalog — cheapest
-       combined input+output per-million-token price, but restricted to models
-       with a quality signal (``_FAST_MODEL_HINTS``) when any priced entry has
-       one, so a mispriced/unusable model never wins on price alone.
-    2. A hardcoded known-fast/cheap id per provider kind when the catalog has
-       no pricing (``_CHEAP_EXPLORE_FALLBACK``).
-    3. The parent model when nothing above resolves (build failed / unknown).
-
-    Always returns a model id that ``build_model`` can attempt; the caller
-    falls back to the parent if this id still fails to build.
-    """
-    parent_model = qualify_model_id(provider, parent_model)
-    candidates: list[str] = []
-    try:
-        for entry in await list_models(
-            provider, base_url, api_key, env_var, oauth_token=oauth_token
-        ):
-            mid = entry.get("id") or ""
-            pricing = entry.get("pricing")
-            if not mid or not pricing:
-                continue
-            inp = pricing.get("input")
-            out = pricing.get("output")
-            if inp is None or out is None:
-                continue
-            try:
-                total = float(inp) + float(out)
-            except (TypeError, ValueError):
-                continue
-            candidates.append((total, mid))
-    except Exception:  # noqa: BLE001 — catalog fetch failure → fallback tier
-        candidates = []
-    if candidates:
-        fast = [
-            c for c in candidates if any(h in c[1].lower() for h in _FAST_MODEL_HINTS)
-        ]
-        pool = fast or candidates
-        for total, mid in sorted(pool, key=lambda c: (c[0], c[1])):
-            if qualify_model_id(provider, mid) != parent_model:
-                return mid
-    return _CHEAP_EXPLORE_FALLBACK.get(provider) or parent_model
 
 
 async def run_agent(
@@ -4191,29 +4124,8 @@ async def run_agent(
     _sub = _build_subagent(explore_built)
     if _sub is not None:
         explore_model, _ = _sub
-    elif not explore_built:
-        # No manual explore config in Settings → Subagents: auto-select the
-        # cheapest usable model on the CURRENT provider (by /models pricing,
-        # else a per-kind cheap fallback) so explore doesn't silently inherit
-        # the expensive parent model. Manual config always wins — this branch
-        # only runs when the slot is empty.
-        try:
-            auto_id = await _auto_explore_model(
-                provider, base_url, api_key, env_var, oauth_token, model_name
-            )
-            if auto_id and auto_id != model_name:
-                _sub = _build_subagent(auto_id)
-                if _sub is not None:
-                    explore_model, _ = _sub
-                    print(
-                        f"[subagent auto] explore → {auto_id} (parent {model_name})",
-                        flush=True,
-                    )
-        except Exception as exc:  # noqa: BLE001 — auto-pick is best-effort
-            print(
-                f"[subagent auto] explore auto-pick failed: {exc!r} — parent {model_name}",
-                flush=True,
-            )
+    # No manual explore config in Settings → Subagents: explore runs on the
+    # parent model (default). Manual config always wins.
 
     # "search" subagent: the explore sub-agent (which runs the existing
     # grep / glob / read tools) uses this model when
@@ -4276,13 +4188,11 @@ async def run_agent(
         ev.update(kw)
         return ev
 
-    # When images are attached and the user picked a dedicated vision model,
-    # swap the parent model so the vision-capable model processes the images.
-    if vision_model and image_uris:
-        model = vision_model
-    # Label every live usage event with the model that ACTUALLY ran this turn,
-    # so the per-chat chips can break consumption out by model id even when the
-    # vision model took over for image turns.
+    # The MAIN model always runs the turn. When a dedicated vision model is
+    # configured and images are attached, the images are NOT sent to the main
+    # model (it may not support them) — the `vision` tool hands them to a
+    # vision sub-agent and returns its analysis as a tool result, so the main
+    # model stays in charge and writes the final answer.
     early_usage_state["model_name"] = str(
         getattr(model, "model_name", "") or model_name
     )
@@ -4313,6 +4223,8 @@ async def run_agent(
         web_model=web_model,
         search_model=search_model,
         main_model=model,
+        vision_model=vision_model,
+        image_uris=image_uris,
         permission_gates=permission_gates,
         ask_gates=ask_gates,
         permit={"outside": allow_outside},
@@ -4416,6 +4328,17 @@ async def run_agent(
     # is restricted to the in-scope paths.
     scoped_paths = _scoped_rels(root, attachments, nvim_file)
     scoped = bool(scoped_paths)
+    # Sub-agents must inherit the parent's ACTUAL (mode-filtered) toolset, not
+    # the full registry — otherwise a `task` call from plan/ask mode spawns a
+    # general sub-agent that still has write_file/edit_file/confirm_action and a
+    # writable terminal, bypassing the read-only guarantee (the observed "agent
+    # edited files while in plan mode" bug). Set BEFORE the per-turn search-limit
+    # wraps (those cap the PARENT's own searches; a sub-agent's isolated
+    # transcript has its own usage limits) and before the steer/resume wraps (a
+    # sub-agent's transcript is discarded, so steers drained by its tools would
+    # be lost). When the request is file-scoped, `task` is removed from the
+    # parent's tools anyway, so this never leaks scope.
+    _PARENT_TOOLS_CTX.set(tools)
     if scoped:
         # `task` spawns a sub-agent with its own grep/glob/list_files
         # over the WHOLE workspace, so it must be removed too — otherwise the
@@ -4852,25 +4775,29 @@ async def run_agent(
     if rag_block:
         system_final += rag_block
 
-    # RAG-ready pointer: whatever memory/file/web context was auto-injected above
-    # is ALREADY in this turn's context. Tell the model to check it FIRST before
-    # any search/explore call, so it doesn't re-search for content that's already
-    # sitting in front of it (the "YOUR OWN MEMORY" / "RELEVANT PROJECT FILES" /
-    # "SAVED WEB PAGES" blocks).
+    # Context-first pointer: whatever memory/file/web context was auto-injected
+    # above, plus files already read and work already done earlier in THIS
+    # conversation, is ALREADY in the model's context. Tell it to check that
+    # FIRST before any search/explore call, so it doesn't re-search for content
+    # already sitting in front of it (the "YOUR OWN MEMORY" / "RELEVANT PROJECT
+    # FILES" / "SAVED WEB PAGES" blocks, and earlier tool results in this chat).
     _rag_injected = bool(learned_memory or rag_block)
+    system_final += (
+        "\n\nCONTEXT-FIRST RULE (strict, always follow, in every mode): Before "
+        "you call ANY search/discovery tool (grep / glob / read / explore / "
+        "search_memory), CHECK what is ALREADY in your context: (1) the RAG "
+        "blocks auto-injected for this request (===== YOUR OWN MEMORY =====, "
+        "===== RELEVANT PROJECT FILES =====, ===== SAVED WEB PAGES =====) when "
+        "present, and (2) the conversation itself — files you already read or "
+        "searched, code you already wrote or changed, and answers you already "
+        "gave earlier in this session. NEVER re-search for information you "
+        "already have in context: re-searching wastes tokens and time. Only "
+        "search for information that is genuinely MISSING or not sufficiently "
+        "specific in what you already have. When you need more detail than the "
+        "snippet already in context, read that file directly (read / grep with "
+        "its exact path) instead of running a fresh search."
+    )
     if _rag_injected:
-        system_final += (
-            "\n\nRAG-AWARE SEARCH (strict, always follow): Before you call ANY "
-            "search/discovery tool (grep / glob / "
-            "read / explore / search_memory), CHECK the memory and file/web context "
-            "auto-injected above (===== YOUR OWN MEMORY =====, ===== RELEVANT "
-            "PROJECT FILES =====, ===== SAVED WEB PAGES =====). It was retrieved "
-            "specifically for this request. Only search for information that is "
-            "MISSING or not sufficiently specific there — never re-search for "
-            "content that block already covers. Read the cited files directly "
-            "(read / grep with their paths) when you need more "
-            "detail than the injected snippet."
-        )
         # Pass a digest of what RAG already surfaced into explore's sub-agent
         # task text (via the shared cross-call seed dict), so a same-turn explore
         # call builds on it instead of independently re-discovering the same files.
@@ -5203,9 +5130,29 @@ async def run_agent(
             ModelRequest(parts=[SystemPromptPart(content=tool_reuse_note)])
         ] + history_messages
 
+    # Image turn with a dedicated vision model: the images are NOT attached to
+    # the main model's message (it may not support them) — the `vision` tool
+    # hands them to the vision sub-agent instead. Tell the main model to call
+    # it, or it might answer without ever looking at the images.
+    if vision_model and image_uris:
+        history_messages = [
+            ModelRequest(parts=[SystemPromptPart(content=(
+                "The user attached image(s) to this message, but you cannot see "
+                "them directly. Call the `vision` tool to analyze them, then "
+                "base your answer on its report. If you need a closer look at a "
+                "specific detail, call `vision` again with a more specific "
+                "prompt."
+            ))])
+        ] + history_messages
+
     if prompt:
         user_content.append(prompt)
-    user_content += [ImageUrl(url=uri) for uri in image_uris]
+    # With a dedicated vision model the images stay OUT of the main model's
+    # request (it may not support image parts) — the `vision` tool delivers
+    # them to the vision sub-agent. Without one, images go straight to the
+    # parent (it may or may not support them; a rejection retries without).
+    if not (vision_model and image_uris):
+        user_content += [ImageUrl(url=uri) for uri in image_uris]
 
     # Retry loop: a transient failure (429 / 5xx / connection blip) on the
     # model call is retried with backoff, but ONLY while nothing has been
@@ -5260,6 +5207,14 @@ async def run_agent(
     # from scratch. Reset per turn — a fresh prompt must not inherit stale
     # tool results from a previous turn.
     turn_tool_log: list[str] = []
+    # The reply text accumulated across ALL attempts of this turn. Deliberately
+    # NOT reset per attempt: a retry (throttle, dropped connection, compact)
+    # continues from the partial text a previous attempt already streamed, and
+    # `_save_partial_resume` / resume notes must carry the FULL accumulated
+    # reply so the model keeps writing from where the user last saw it — and
+    # the final `_reply` handed to auto-memory/plan-save is the whole reply,
+    # not just the last attempt's continuation.
+    reply_chunks: list[str] = []
     # Test verification: a test-related coder task must run the project's test
     # command and see it pass before the agent may finish. `test_cmd_ran` is
     # sticky across attempts (a throttle retry must not forget a test run);
@@ -5384,7 +5339,6 @@ async def run_agent(
                 producer_task = asyncio.create_task(producer())
 
                 error: BaseException | None = None
-                reply_chunks: list[str] = []
                 tools_used: list[str] = []
                 try:
                     while True:
@@ -5583,6 +5537,14 @@ async def run_agent(
             except Exception:  # noqa: BLE001, S110 — best-effort
                 pass
             break  # success, exit the retry loop
+        except asyncio.CancelledError:
+            # Client aborted (Stop / watchdog / disconnect): `asyncio.CancelledError`
+            # is a BaseException, so the `except Exception` handler below never
+            # runs — snapshot the partial reply + completed tools here so a Retry
+            # resumes from where the stream was cut instead of restarting. The
+            # accumulated `reply_chunks` (all attempts) is what the user last saw.
+            _save_partial_resume()
+            raise
         except Exception as exc:
             # The turn died without a clean finish (or is about to retry) —
             # snapshot the partial reply so a later run can continue from it.
@@ -5618,6 +5580,19 @@ async def run_agent(
                     )
                     return
                 delay = _THROTTLE_BASE_SECONDS
+                # Resume, don't restart: the retried request re-sends the SAME
+                # `history_messages` (which lacks this attempt's streamed text and
+                # tool calls), so without a resume note the model would redo the
+                # work and the frontend would append a duplicated reply. Feed back
+                # the partial reply + completed tool log so it continues exactly
+                # where the throttle cut it off.
+                _throttle_resume = _build_resume_note(
+                    turn_tool_log, partial_reply="".join(reply_chunks)
+                )
+                if _throttle_resume:
+                    history_messages = history_messages + [
+                        ModelRequest(parts=[SystemPromptPart(content=_throttle_resume)])
+                    ]
                 yield _retry_ev(
                     "retry",
                     attempt=throttle_retries,
@@ -5698,6 +5673,20 @@ async def run_agent(
                         )
                     except Exception:  # noqa: BLE001, S110
                         pass
+                    # Resume, don't restart: if read-only tools already ran this
+                    # attempt, feed them back so the retried request continues
+                    # from them instead of re-running (the retried request
+                    # re-sends the same `history_messages`, which lacks this
+                    # attempt's tool calls).
+                    _budget_resume = _build_resume_note(
+                        turn_tool_log, partial_reply="".join(reply_chunks)
+                    )
+                    if _budget_resume:
+                        history_messages = history_messages + [
+                            ModelRequest(
+                                parts=[SystemPromptPart(content=_budget_resume)]
+                            )
+                        ]
                     yield _retry_ev(
                         "retry",
                         attempt=output_budget_retries,
@@ -5924,7 +5913,9 @@ async def run_agent(
             ):
                 high_watermark_retries += 1
                 tool_steps_cap = min(int(tool_steps_cap * 2), 150)
-                resume_note = _build_resume_note(turn_tool_log)
+                resume_note = _build_resume_note(
+                    turn_tool_log, partial_reply="".join(reply_chunks)
+                )
                 if resume_note:
                     history_messages = history_messages + [
                         ModelRequest(parts=[SystemPromptPart(content=resume_note)])
@@ -6036,21 +6027,17 @@ async def run_agent(
                 or _is_retryable(exc)
             ):
                 timeout_recovery_retries += 1
-                if turn_tool_log:
-                    # Only the tail matters and must stay small so the resume note
-                    # itself can't overflow the window. Cap the note words.
-                    tail = turn_tool_log[-40:]
-                    omitted = len(turn_tool_log) - len(tail)
-                    resume_lines = "\n".join(tail)
-                    if omitted > 0:
-                        resume_lines += f"\n({omitted} earlier steps omitted)"
-                    resume_note = (
-                        "Tool work already done so far in THIS turn — do NOT repeat "
-                        "or re-do any of it; continue from where you stopped:\n"
-                        f"{resume_lines}"
-                    )
+                # Resume, don't restart: feed back BOTH the completed tool log
+                # and the text streamed so far, so the retried request continues
+                # the reply from where the connection dropped instead of
+                # restarting it (the frontend appends streamed text, so a
+                # restart would duplicate the partial reply).
+                _drop_resume = _build_resume_note(
+                    turn_tool_log, partial_reply="".join(reply_chunks)
+                )
+                if _drop_resume:
                     history_messages = history_messages + [
-                        ModelRequest(parts=[SystemPromptPart(content=resume_note)])
+                        ModelRequest(parts=[SystemPromptPart(content=_drop_resume)])
                     ]
                 yield _retry_ev(
                     "retry",

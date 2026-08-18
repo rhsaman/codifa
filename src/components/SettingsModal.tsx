@@ -110,7 +110,7 @@ function SubagentModelSelect({
   // Legacy values may still be a bare model id or carry an old prefix — resolve
   // a readable label in every case.
   const currentLabel = (() => {
-    if (!current) return 'Use parent model'
+    if (!current) return 'Main model'
     const slash = current.indexOf('/')
     if (slash > 0) {
       const pid = current.slice(0, slash)
@@ -206,10 +206,6 @@ function SubagentModelSelect({
           and immediately accepts typing to filter. */}
       <div className={`model-select combo${open ? ' open' : ''}`} ref={wrapRef}>
         <div className="model-select-combo-box">
-          <svg className="model-select-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <circle cx="11" cy="11" r="7" />
-            <path d="m20 20-3.2-3.2" />
-          </svg>
           <input
             ref={inputRef}
             className="model-select-combo-input"
@@ -236,7 +232,7 @@ function SubagentModelSelect({
                 onMouseDown={(e) => { e.preventDefault(); onSelect(agent, ''); closeMenu(); inputRef.current?.blur() }}
                 type="button"
               >
-                Use parent model
+                Main model
               </button>
               {visibleProviders.map(({ p, models }) => {
                 const isOpen = q ? true : expanded.has(p.id)
@@ -1954,7 +1950,7 @@ Caps on total stored documents and chunks per workspace; the oldest are evicted 
             </div>
             <div className="hint">
               Pick separate models for the built-in subagents. Leave a field empty to
-              use the parent model (the one chosen in the composer). The explore subagent
+              use the main model (the one chosen in the composer). The explore subagent
               runs read-only searches; using a small/fast model here saves time and tokens.
             </div>
 

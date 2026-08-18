@@ -496,19 +496,20 @@ textarea {
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
 }
 
-/* Steady "new message" dot in the theme's accent color: a background chat's
-   turn finished while the user was looking at another chat. Replaces the
-   blinking streaming dot once the turn completes; cleared when the user opens
-   that chat (setActiveChat). */
+/* Steady "new message" dot in the theme's success (green) color: a background
+   chat's turn finished while the user was looking at another chat. Green is
+   deliberately distinct from the blinking accent-blue streaming dot, so a new
+   message is instantly recognizable. Replaces the blinking streaming dot once
+   the turn completes; cleared when the user opens that chat (setActiveChat). */
 .chat-item-unread {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--success);
   flex: 0 0 auto;
   box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent),
-    0 0 12px color-mix(in srgb, var(--accent) 45%, transparent);
+    0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent),
+    0 0 12px color-mix(in srgb, var(--success) 45%, transparent);
   animation: chat-unread-pop 0.3s ease-out;
 }
 @keyframes chat-unread-pop {
@@ -768,6 +769,22 @@ textarea {
 .sidebar-group-head:hover {
   background: color-mix(in srgb, var(--ws, transparent) 18%, var(--bg-input));
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 14%, transparent);
+}
+
+/* Workspace-colored group: the header label takes the workspace hue the user
+   picked (muted blend with the theme text so it stays readable on the theme
+   bg), and the head tint is a touch stronger so the chosen color reads
+   clearly in the sidebar. */
+.sidebar-group.ws-colored .sidebar-group-label {
+  color: color-mix(in srgb, var(--ws) 72%, var(--text));
+}
+
+.sidebar-group.ws-colored .sidebar-group-head {
+  background: color-mix(in srgb, var(--ws) 13%, var(--bg-input));
+}
+
+.sidebar-group.ws-colored .sidebar-group-head:hover {
+  background: color-mix(in srgb, var(--ws) 20%, var(--bg-input));
 }
 
 .sidebar-group-toggle {
@@ -1834,6 +1851,36 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* The chat renders every message in a single commit; skip rendering/layout
+     of off-screen messages entirely and let the browser lay them out on demand
+     as the user scrolls. contain-intrinsic-size keeps the scrollbar stable. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 140px;
+}
+
+/* "Load earlier messages" row shown at the top of the transcript until every
+   message is rendered (lazy paging). It also auto-triggers on scroll-to-top. */
+.load-older-row {
+  display: flex;
+  justify-content: center;
+  padding: 2px 0 6px;
+  flex: 0 0 auto;
+}
+
+.load-older-btn {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg-panel) 70%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.load-older-btn:hover {
+  color: var(--text);
+  border-color: var(--accent-dim);
 }
 
 .msg-role {
@@ -1851,16 +1898,29 @@ textarea {
   letter-spacing: 0.8px;
 }
 
-.msg.user .msg-role::before {
-  content: "";
-  display: inline-block;
-  width: 6px;
-  height: 6px;
+/* Small accent avatar (person icon) before the "You" label so the bubble
+   reads as the user's own at a glance. */
+.msg-role-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  margin-inline-end: 6px;
-  background: var(--accent);
-  vertical-align: 1px;
-  opacity: 0.7;
+  margin-inline-end: 7px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 24%, var(--bg-panel)),
+    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
+  );
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  vertical-align: -4px;
+}
+
+.msg-role-avatar svg {
+  width: 10px;
+  height: 10px;
 }
 
 .steer-note {
@@ -1924,10 +1984,17 @@ textarea {
 }
 
 .seg-steer {
-  background: var(--bg-input);
+  /* Same surface as a real user bubble (accent-tinted bg-input + tailed
+     radius) so an interleaved steer reads as the user's own message, not a
+     tool card. */
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 7%, var(--bg-input)),
+    var(--bg-input)
+  );
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 8px 12px;
+  border-radius: 14px 14px 14px 6px;
+  padding: 10px 14px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1958,6 +2025,10 @@ textarea {
   opacity: 1;
 }
 
+.chat-messages[data-dir="rtl"] .seg-steer {
+  border-radius: 14px 14px 6px 14px;
+}
+
 .chat-messages[data-dir="rtl"] .seg-steer-text {
   text-align: right;
 }
@@ -1969,18 +2040,33 @@ textarea {
 .msg.user .msg-bubble {
   background: linear-gradient(
     180deg,
-    color-mix(in srgb, var(--accent) 7%, var(--bg-input)),
-    var(--bg-input)
+    color-mix(in srgb, var(--accent) 9%, var(--bg-input)),
+    color-mix(in srgb, var(--accent) 3%, var(--bg-input))
   );
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border));
   border-radius: 14px 14px 14px 6px;
   /* The base .msg-bubble only pads 4px horizontally — that's what glued the
      text to the corner. User bubbles get real breathing room. */
   padding: 10px 14px;
+  /* Soft depth: a faint accent glow + inner top highlight so the bubble
+     reads as a raised card instead of a flat rectangle. */
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 12%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 8px 20px -10px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .chat-messages[data-dir="rtl"] .msg.user .msg-bubble {
+  /* direction: rtl is what actually pins the 72ch user-text box to the RIGHT
+     edge. The box's own dir="rtl" only right-aligns text INSIDE it; a block
+     box's position is decided by its PARENT's direction, and .msg-bubble
+     otherwise inherits ltr from the root — so the box hugged the left even in
+     RTL mode. */
+  direction: rtl;
   text-align: right;
+  /* RTL tail on the bottom-RIGHT (the user's side); the base rule's
+     bottom-left 6px is the LTR tail. */
+  border-radius: 14px 14px 6px 14px;
 }
 
 .chat-messages[data-dir="ltr"] .msg.user .msg-bubble {
@@ -4456,17 +4542,9 @@ textarea {
   align-items: center;
 }
 
-.model-select-search-icon {
-  position: absolute;
-  left: 11px;
-  color: var(--text-dim);
-  opacity: 0.8;
-  pointer-events: none;
-}
-
 .model-select-combo-input {
   width: 100%;
-  padding: 8px 30px 8px 32px;
+  padding: 8px 30px 8px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-input);
@@ -5056,12 +5134,51 @@ textarea {
 /* File chip: a small paper-clip icon so plain file paths read as "file
    badges" instead of bare text. Queue/image chips already carry their own
    icon or thumbnail, so they opt out. */
-.attachment-chip:not(.queued-chip):not(.image-chip)::before {
+.attachment-chip:not(.file-chip):not(.queued-chip):not(.image-chip)::before {
   content: "📎";
   flex: 0 0 auto;
   font-size: 10px;
   opacity: 0.75;
   filter: saturate(0.6);
+}
+
+/* Input file badge: inline file icon + mono file name (full path in tooltip).
+   Neutral panel look to match the other chips; accent only on the icon. */
+.attachment-chip.file-chip {
+  position: relative;
+  gap: 6px;
+  padding: 3px 8px 3px 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg-panel) 94%, var(--text) 6%),
+    color-mix(in srgb, var(--bg-panel) 98%, var(--text) 2%)
+  );
+  max-width: 46ch;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+
+.attachment-chip.file-chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.chip-file-icon {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+  opacity: 0.85;
+}
+
+.chip-file-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
 }
 
 .chip-x {
@@ -7140,6 +7257,139 @@ textarea {
   background: color-mix(in srgb, var(--link) 16%, transparent);
 }
 
+.nvim-lsp {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 1px 2px;
+  transition: box-shadow 0.12s;
+}
+
+.nvim-lsp:hover,
+.nvim-lsp.open {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text) 18%, transparent);
+}
+
+/* ---- nvim LSP diagnostics popover (click the counts to open) ---- */
+.nvim-wrap {
+  position: relative;
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.nvim-lsp-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  width: min(560px, calc(100vw - 32px));
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px -8px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.nvim-lsp-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.nvim-lsp-pop-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nvim-lsp-pop-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nvim-lsp-pop-close:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.nvim-lsp-pop-list {
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nvim-diag {
+  display: grid;
+  grid-template-columns: 16px 44px 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 6px;
+  align-items: start;
+  padding: 5px 7px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.45;
+  background: color-mix(in srgb, var(--bg-input) 55%, transparent);
+}
+
+.nvim-diag-sev {
+  grid-row: 1 / span 2;
+  font-weight: 700;
+  text-align: center;
+}
+
+.nvim-diag-error .nvim-diag-sev {
+  color: var(--danger);
+}
+
+.nvim-diag-warning .nvim-diag-sev {
+  color: var(--thinking);
+}
+
+.nvim-diag-info .nvim-diag-sev,
+.nvim-diag-hint .nvim-diag-sev {
+  color: var(--link);
+}
+
+.nvim-diag-loc {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.nvim-diag-msg {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.nvim-diag-src {
+  grid-column: 2 / -1;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 /* ---- unified chat notices (bottom of the message list) ---- */
 .chat-notices {
   display: flex;
@@ -7201,13 +7451,13 @@ textarea {
 }
 
 .notice-error {
-  border-left-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg));
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg));
 }
 
 .notice-error .notice-icon {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
 
 .notice-info {
@@ -7263,6 +7513,25 @@ textarea {
 }
 
 .notice-loading .spinner {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+}
+
+/* "Still waiting for the provider…" — same warning hue as the context meter
+   when it crosses the warn threshold, so a stalled turn reads as a warning,
+   not an error. */
+.notice-warn {
+  border-left-color: var(--thinking);
+  background: color-mix(in srgb, var(--thinking) 7%, var(--bg));
+}
+
+.notice-warn .notice-icon {
+  color: var(--thinking);
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+}
+
+.notice-warn .spinner {
   width: 12px;
   height: 12px;
   border-width: 2px;

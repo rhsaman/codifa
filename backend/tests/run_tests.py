@@ -4,6 +4,7 @@ Usage:  python3 backend/tests/run_tests.py
 Each module runs its own in-process mock server against the real backend.
 """
 import asyncio
+import contextvars
 import importlib
 import os
 import sys
@@ -42,7 +43,18 @@ async def run_one(name: str) -> bool:
     print(f"\n=== {name} ===")
     try:
         mod = importlib.import_module(name)
-        await mod.main()
+        # Run each module in a FRESH contextvars context: the modules share one
+        # process/event loop, and tools.py/agents.py keep run-scoped state in
+        # contextvars (e.g. _PARENT_TOOLS_CTX, set by run_agent and never
+        # reset). Without isolation that state leaks into the next module —
+        # e.g. test_task_general_agent's general sub-agent inherited the
+        # PREVIOUS run's tool closures (bound to a dead emit callback), so its
+        # read event never reached the test's listener. A fresh context resets
+        # every contextvar to its default, matching production where each
+        # request runs in its own task context.
+        ctx = contextvars.Context()
+        task = ctx.run(asyncio.create_task, mod.main())
+        await task
     except Exception as exc:  # noqa: BLE001
         print(f"FAILED {name}: {exc!r}")
         import traceback

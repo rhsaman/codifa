@@ -3,36 +3,14 @@ export interface Theme {
   name: string
   blurb?: string
   vars: Record<string, string>
+  /** Accent swatches for the workspace color picker — always drawn from the
+   *  theme's own palette so a custom workspace color harmonizes with it. */
+  workspaceColors: string[]
 }
 
 export const DEFAULT_THEME = 'catppuccin'
 
 export const THEMES: Theme[] = [
-  {
-    id: 'codefa',
-    name: 'CodeFa Default',
-    blurb: 'look of the app before themes were added',
-    vars: {
-      '--bg': '#212121',
-      '--bg-alt': '#171717',
-      '--bg-panel': '#212121',
-      '--bg-input': '#2f2f2f',
-      '--bg-hover': '#2f2f2f',
-      '--border': '#424242',
-      '--text': '#d0d0d0',
-      '--text-dim': '#a3a3a3',
-      '--accent': '#ececec',
-      '--accent-dim': '#3f3f3f',
-      '--on-accent': '#111111',
-      '--danger': '#e5484d',
-      '--success': '#46a758',
-      '--link': '#58a6ff',
-      '--tool-single': '#58a6ff',
-      '--tool-group': '#a78bfa',
-      '--tool-explore': '#2dd4bf',
-      '--thinking': '#f2b344',
-    },
-  },
   {
     id: 'claude',
     name: 'Claude',
@@ -57,6 +35,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#6bb8a8',
       '--thinking': '#e8c468',
     },
+    workspaceColors: [
+      '#e5484d', // red
+      '#e8c468', // yellow
+      '#46a758', // green
+      '#6bb8a8', // teal
+      '#e88d67', // orange
+      '#d97757', // terracotta
+      '#a78bfa', // purple
+      '#f0eee6', // cream
+    ],
   },
   {
     id: 'tokyonight',
@@ -82,10 +70,20 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#73daca',
       '--thinking': '#e0af68',
     },
+    workspaceColors: [
+      '#f7768e', // red
+      '#e0af68', // yellow
+      '#9ece6a', // green
+      '#73daca', // teal
+      '#7aa2f7', // blue
+      '#bb9af7', // purple
+      '#ff9e64', // orange
+      '#c0caf5', // light
+    ],
   },
   {
     id: 'catppuccin',
-    name: 'Catppuccin',
+    name: 'Catppuccin Mocha',
     blurb: 'catppuccin/nvim mocha',
     vars: {
       '--bg': '#1e1e2e',
@@ -107,6 +105,121 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#94e2d5',
       '--thinking': '#f9e2af',
     },
+    workspaceColors: [
+      '#f38ba8', // red
+      '#fab387', // peach
+      '#f9e2af', // yellow
+      '#a6e3a1', // green
+      '#94e2d5', // teal
+      '#89b4fa', // blue
+      '#cba6f7', // mauve
+      '#f5c2e7', // pink
+    ],
+  },
+  {
+    id: 'catppuccin-macchiato',
+    name: 'Catppuccin Macchiato',
+    blurb: 'catppuccin/nvim macchiato',
+    vars: {
+      '--bg': '#24273a',
+      '--bg-alt': '#1e2030',
+      '--bg-panel': '#363a4f',
+      '--bg-input': '#363a4f',
+      '--bg-hover': '#494d64',
+      '--border': '#494d64',
+      '--text': '#cad3f5',
+      '--text-dim': '#a5adcb',
+      '--accent': '#8aadf4',
+      '--accent-dim': '#494d64',
+      '--on-accent': '#181926',
+      '--danger': '#ed8796',
+      '--success': '#a6da95',
+      '--link': '#8aadf4',
+      '--tool-single': '#8aadf4',
+      '--tool-group': '#c6a0f6',
+      '--tool-explore': '#8bd5ca',
+      '--thinking': '#eed49f',
+    },
+    workspaceColors: [
+      '#ed8796', // red
+      '#f5a97f', // peach
+      '#eed49f', // yellow
+      '#a6da95', // green
+      '#8bd5ca', // teal
+      '#8aadf4', // blue
+      '#c6a0f6', // mauve
+      '#f5bde6', // pink
+    ],
+  },
+  {
+    id: 'catppuccin-frappe',
+    name: 'Catppuccin Frappé',
+    blurb: 'catppuccin/nvim frappé',
+    vars: {
+      '--bg': '#303446',
+      '--bg-alt': '#292c3c',
+      '--bg-panel': '#414559',
+      '--bg-input': '#414559',
+      '--bg-hover': '#51576d',
+      '--border': '#51576d',
+      '--text': '#c6d0f5',
+      '--text-dim': '#a5adce',
+      '--accent': '#8caaee',
+      '--accent-dim': '#51576d',
+      '--on-accent': '#232634',
+      '--danger': '#e78284',
+      '--success': '#a6d189',
+      '--link': '#8caaee',
+      '--tool-single': '#8caaee',
+      '--tool-group': '#ca9ee6',
+      '--tool-explore': '#81c8be',
+      '--thinking': '#e5c890',
+    },
+    workspaceColors: [
+      '#e78284', // red
+      '#ef9f76', // peach
+      '#e5c890', // yellow
+      '#a6d189', // green
+      '#81c8be', // teal
+      '#8caaee', // blue
+      '#ca9ee6', // mauve
+      '#f4b8e4', // pink
+    ],
+  },
+  {
+    id: 'catppuccin-latte',
+    name: 'Catppuccin Latte',
+    blurb: 'catppuccin/nvim latte (light)',
+    vars: {
+      '--bg': '#eff1f5',
+      '--bg-alt': '#e6e9ef',
+      '--bg-panel': '#ccd0da',
+      '--bg-input': '#ccd0da',
+      '--bg-hover': '#bcc0cc',
+      '--border': '#bcc0cc',
+      '--text': '#4c4f69',
+      '--text-dim': '#6c6f85',
+      '--accent': '#1e66f5',
+      '--accent-dim': '#bcc0cc',
+      '--on-accent': '#eff1f5',
+      '--danger': '#d20f39',
+      '--success': '#40a02b',
+      '--link': '#1e66f5',
+      '--tool-single': '#1e66f5',
+      '--tool-group': '#8839ef',
+      '--tool-explore': '#179299',
+      '--thinking': '#df8e1d',
+    },
+    workspaceColors: [
+      '#d20f39', // red
+      '#fe640b', // peach
+      '#df8e1d', // yellow
+      '#40a02b', // green
+      '#179299', // teal
+      '#1e66f5', // blue
+      '#8839ef', // mauve
+      '#ea76cb', // pink
+    ],
   },
   {
     id: 'gruvbox',
@@ -132,6 +245,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#8ec07c',
       '--thinking': '#fabd2f',
     },
+    workspaceColors: [
+      '#fb4934', // red
+      '#fabd2f', // yellow
+      '#b8bb26', // green
+      '#8ec07c', // aqua
+      '#83a598', // blue
+      '#d3869b', // purple
+      '#fe8019', // orange
+      '#ebdbb2', // cream
+    ],
   },
   {
     id: 'dracula',
@@ -157,6 +280,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#50fa7b',
       '--thinking': '#f1fa8c',
     },
+    workspaceColors: [
+      '#ff5555', // red
+      '#f1fa8c', // yellow
+      '#50fa7b', // green
+      '#8be9fd', // cyan
+      '#bd93f9', // purple
+      '#ff79c6', // pink
+      '#ffb86c', // orange
+      '#f8f8f2', // white
+    ],
   },
   {
     id: 'nord',
@@ -182,6 +315,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#88c0d0',
       '--thinking': '#ebcb8b',
     },
+    workspaceColors: [
+      '#bf616a', // red
+      '#ebcb8b', // yellow
+      '#a3be8c', // green
+      '#88c0d0', // cyan
+      '#81a1c1', // blue
+      '#b48ead', // purple
+      '#d08770', // orange
+      '#d8dee9', // light
+    ],
   },
   {
     id: 'rose-pine',
@@ -207,6 +350,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#f6c177',
       '--thinking': '#f6c177',
     },
+    workspaceColors: [
+      '#eb6f92', // red
+      '#f6c177', // yellow
+      '#9ccfd8', // teal
+      '#31748f', // blue
+      '#c4a7e7', // purple
+      '#ebbcba', // rose
+      '#d7827e', // love
+      '#e0def4', // light
+    ],
   },
   {
     id: 'one-dark',
@@ -232,6 +385,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#56b6c2',
       '--thinking': '#e5c07b',
     },
+    workspaceColors: [
+      '#e06c75', // red
+      '#e5c07b', // yellow
+      '#98c379', // green
+      '#56b6c2', // cyan
+      '#61afef', // blue
+      '#c678dd', // purple
+      '#d19a66', // orange
+      '#abb2bf', // light
+    ],
   },
   {
     id: 'monokai',
@@ -257,6 +420,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#a6e22e',
       '--thinking': '#e6db74',
     },
+    workspaceColors: [
+      '#f92672', // red
+      '#e6db74', // yellow
+      '#a6e22e', // green
+      '#66d9ef', // cyan
+      '#ae81ff', // purple
+      '#fd971f', // orange
+      '#f8f8f2', // white
+      '#75715e', // gray
+    ],
   },
   {
     id: 'kanagawa',
@@ -282,6 +455,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#6a9589',
       '--thinking': '#dca561',
     },
+    workspaceColors: [
+      '#c34043', // red
+      '#dca561', // yellow
+      '#76946a', // green
+      '#6a9589', // teal
+      '#7e9cd8', // blue
+      '#957fb8', // purple
+      '#7fb4ca', // cyan
+      '#dcd7ba', // light
+    ],
   },
   {
     id: 'everforest',
@@ -307,6 +490,16 @@ export const THEMES: Theme[] = [
       '--tool-explore': '#7fbbb3',
       '--thinking': '#dbbc7f',
     },
+    workspaceColors: [
+      '#e67e80', // red
+      '#dbbc7f', // yellow
+      '#a7c080', // green
+      '#83c092', // teal
+      '#7fbbb3', // blue
+      '#d699b6', // purple
+      '#e69875', // orange
+      '#d3c6aa', // light
+    ],
   },
 ]
 

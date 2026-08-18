@@ -411,6 +411,18 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
+  /** Lazy transcript: only the last MSG_PAGE messages render on mount (and on
+   *  every chat switch — the panel is keyed by activeChatId). Older messages
+   *  load progressively on scroll-to-top or via the "load older" button, so a
+   *  long history never blocks the first paint of a chat.
+   *  The slice is applied at render time over `chat.messages`, so streaming
+   *  appends at the bottom always show. */
+  const MSG_PAGE = 30;
+  const [msgLimit, setMsgLimit] = useState(MSG_PAGE);
+  /** When older messages are prepended above the viewport, remember the
+   *  pre-append scrollHeight so a layout effect can re-anchor the scroll
+   *  position (otherwise the content visibly jumps). */
+  const prependAnchorRef = useRef<number | null>(null);
   /** Bumped to force the transcript to the bottom even when the user scrolled
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
   const [scrollTick, setScrollTick] = useState(0);
@@ -431,6 +443,8 @@ export function ChatPanel() {
   const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
+  /** Whether the LSP diagnostics popover under the nvim label is open. */
+  const [lspOpen, setLspOpen] = useState(false);
   // Transient compact/command/stall banners live on the chat record in the
   // store (not local component state) for the same reason as pendingAsk:
   // `<ChatPanel key={activeChatId} />` remounts on every chat switch, so local
@@ -649,6 +663,12 @@ export function ChatPanel() {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     stickToBottom.current = atBottom;
     setShowJump(!atBottom);
+    // Reached the top with older messages still unrendered → load the previous
+    // page. Anchored via prependAnchorRef so the viewport doesn't jump.
+    if (el.scrollTop < 40 && chat && chat.messages.length > msgLimit) {
+      prependAnchorRef.current = el.scrollHeight;
+      setMsgLimit((n) => Math.min(chat.messages.length, n + MSG_PAGE));
+    }
   };
 
   /** Force the transcript to the bottom regardless of where the user scrolled
@@ -663,6 +683,17 @@ export function ChatPanel() {
     if (!stickToBottom.current) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [chat?.messages, scrollTick]);
+
+  // Keep the viewport pinned when older messages are prepended above it
+  // (lazy paging on scroll-to-top / "load older"): the browser grows the
+  // scrollHeight by exactly the height of the new content, so re-anchor by
+  // that delta BEFORE paint to avoid a visible jump.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || prependAnchorRef.current == null) return;
+    el.scrollTop += el.scrollHeight - prependAnchorRef.current;
+    prependAnchorRef.current = null;
+  }, [msgLimit]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -1940,40 +1971,18 @@ export function ChatPanel() {
     [busy, send, maxHistory],
   );
 
-  // Retry icon on a USER message: unlike the error banner (which resumes the
-  // interrupted turn), this ALWAYS deletes everything below the message and
-  // re-runs it from scratch — the chat continues from that message onward.
-  const restartFromMessage = useCallback(
-    (id: string) => {
-      // Cancel any in-flight run first, same as retryMessage.
-      const active = useStore.getState().chatAborts[chatIdRef.current];
-      if (active && !active.signal.aborted) {
-        active.abort();
-      }
-      const s = useStore.getState();
-      const ch = s.chats.find((c) => c.id === s.activeChatId);
-      if (!ch) return;
-      const msg = ch.messages.find((m) => m.id === id);
-      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
-      // Delete this message and everything below it, then re-send from scratch.
-      if (!s.truncateTo(id)) return;
-      const text = msg.content;
-      // Give the abort's finally block a tick to reset busy/streaming state
-      // before re-sending (send() re-sets busy=true itself, but the abort's
-      // finally would otherwise clear it mid-run).
-      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
-    },
-    [send],
-  );
-
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
   // recreated `onRetry` per render would defeat it. Route through a ref instead.
   const retryMessageRef = useRef(retryMessage);
   retryMessageRef.current = retryMessage;
-  const restartFromMessageRef = useRef(restartFromMessage);
-  restartFromMessageRef.current = restartFromMessage;
+  // EVERY Retry action resumes: when the user's turn left a failed assistant
+  // message behind (partial content + preserved tool activity + plan), re-run
+  // the SAME user message so the model continues from where it was cut off
+  // instead of redoing the completed work (the backend feeds the partial reply
+  // and completed tools back as a resume note). Only when there is no failed
+  // turn to resume does retryMessage fall back to truncate-and-restart.
   const onRetry = useMemo(
-    () => (id: string) => restartFromMessageRef.current(id),
+    () => (id: string) => retryMessageRef.current(id),
     [],
   );
 
@@ -2481,8 +2490,29 @@ export function ChatPanel() {
               </div>
             </div>
           )}
-          {chat.messages.map((m: ChatMessage) => (
-            <Fragment key={m.id}>
+          {msgLimit < chat.messages.length && (
+            <div className="load-older-row">
+              <button
+                className="load-older-btn"
+                onClick={() => {
+                  prependAnchorRef.current =
+                    scrollRef.current?.scrollHeight ?? null;
+                  setMsgLimit((n) =>
+                    Math.min(chat.messages.length, n + MSG_PAGE),
+                  );
+                }}
+              >
+                Load{" "}
+                {Math.min(MSG_PAGE, chat.messages.length - msgLimit)} earlier
+                message
+                {chat.messages.length - msgLimit === 1 ? "" : "s"}…
+              </button>
+            </div>
+          )}
+          {chat.messages
+            .slice(Math.max(0, chat.messages.length - msgLimit))
+            .map((m: ChatMessage) => (
+              <Fragment key={m.id}>
               <ChatMessageView message={m} onRetry={onRetry} />
               {/* Newer messages render tool cards inline via `segments`; only
                   older persisted messages without segments keep the stacked
@@ -2600,7 +2630,7 @@ export function ChatPanel() {
               onCancel={stop}
             />
           )}
-          {(cmdError || compactError || compactNotice || prefixNotice || compacting) && (
+          {(cmdError || compactError || compactNotice || prefixNotice || compacting || (busy && stalled)) && (
             <div className="chat-notices">
               {compacting && (
                 <div className="notice-banner notice-loading" dir="ltr">
@@ -2609,6 +2639,18 @@ export function ChatPanel() {
                   </span>
                   <span className="notice-text">
                     Compacting context — older messages are being summarized…
+                  </span>
+                </div>
+              )}
+              {busy && stalled && (
+                <div className="notice-banner notice-warn" dir="ltr">
+                  <span className="notice-icon">
+                    <span className="spinner" />
+                  </span>
+                  <span className="notice-text">
+                    {toolRunningRef.current
+                      ? "Tool is still running… (Stop to cancel)"
+                      : "Still waiting for the provider… (Stop to cancel)"}
                   </span>
                 </div>
               )}
@@ -3081,62 +3123,171 @@ export function ChatPanel() {
           </div>
 
           {nvimLabel && (
-            <button
-              type="button"
-              className={`nvim-label${nvimMentioned ? " selected" : ""}`}
-              dir="ltr"
-              title={
-                nvimMentioned
-                  ? "Will be mentioned in your next message — click to deselect"
-                  : `Open in Neovim: ${nvimFile} — click to mention in your next message`
-              }
-              onClick={() => setNvimMentioned((m) => !m)}
-            >
-              <span className="nvim-glyph">nvim</span>
-              <span className="nvim-file">{nvimBadge}</span>
-              {nvimDiagCounts.error +
-                nvimDiagCounts.warning +
-                nvimDiagCounts.info +
-                nvimDiagCounts.hint >
-                0 && (
-                  <span className="nvim-lsp" dir="ltr">
-                    {nvimDiagCounts.error > 0 && (
-                      <span className="lsp-count lsp-error" title="LSP errors">
-                        {nvimDiagCounts.error}✕
-                      </span>
-                    )}
-                    {nvimDiagCounts.warning > 0 && (
-                      <span
-                        className="lsp-count lsp-warning"
-                        title="LSP warnings"
-                      >
-                        {nvimDiagCounts.warning}!
-                      </span>
-                    )}
-                    {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
-                      <span className="lsp-count lsp-info" title="LSP info/hints">
-                        {nvimDiagCounts.info + nvimDiagCounts.hint}·
-                      </span>
-                    )}
-                  </span>
-                )}
-              <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
-            </button>
+            <div className="nvim-wrap">
+              <button
+                type="button"
+                className={`nvim-label${nvimMentioned ? " selected" : ""}`}
+                dir="ltr"
+                title={
+                  nvimMentioned
+                    ? "Will be mentioned in your next message — click to deselect"
+                    : `Open in Neovim: ${nvimFile} — click to mention in your next message`
+                }
+                onClick={() => setNvimMentioned((m) => !m)}
+              >
+                <span className="nvim-glyph">nvim</span>
+                <span className="nvim-file">{nvimBadge}</span>
+                {nvimDiagCounts.error +
+                  nvimDiagCounts.warning +
+                  nvimDiagCounts.info +
+                  nvimDiagCounts.hint >
+                  0 && (
+                    <span
+                      className={`nvim-lsp${lspOpen ? " open" : ""}`}
+                      dir="ltr"
+                      role="button"
+                      tabIndex={0}
+                      title="LSP diagnostics — click to view"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setLspOpen((v) => !v);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setLspOpen((v) => !v);
+                        }
+                      }}
+                    >
+                      {nvimDiagCounts.error > 0 && (
+                        <span className="lsp-count lsp-error" title="LSP errors">
+                          {nvimDiagCounts.error}✕
+                        </span>
+                      )}
+                      {nvimDiagCounts.warning > 0 && (
+                        <span
+                          className="lsp-count lsp-warning"
+                          title="LSP warnings"
+                        >
+                          {nvimDiagCounts.warning}!
+                        </span>
+                      )}
+                      {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
+                        <span
+                          className="lsp-count lsp-info"
+                          title="LSP info/hints"
+                        >
+                          {nvimDiagCounts.info + nvimDiagCounts.hint}·
+                        </span>
+                      )}
+                    </span>
+                  )}
+                <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
+              </button>
+              {lspOpen && nvimDiags.length > 0 && (
+                <div
+                  className="nvim-lsp-pop"
+                  dir="ltr"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="nvim-lsp-pop-head">
+                    <span className="nvim-lsp-pop-title">
+                      LSP diagnostics — {nvimBadge}
+                    </span>
+                    <button
+                      type="button"
+                      className="nvim-lsp-pop-close"
+                      onClick={() => setLspOpen(false)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="nvim-lsp-pop-list">
+                    {nvimDiags.map((d, i) => {
+                      const sev =
+                        d.severity === 1 ||
+                        d.severity === "Error" ||
+                        d.severity === "error"
+                          ? "error"
+                          : d.severity === 2 ||
+                              d.severity === "Warning" ||
+                              d.severity === "warning"
+                            ? "warning"
+                            : d.severity === 3 ||
+                                d.severity === "Information" ||
+                                d.severity === "information"
+                              ? "info"
+                              : "hint";
+                      const loc = `${(d.lnum ?? 0) + 1}:${(d.col ?? 0) + 1}`;
+                      const src =
+                        d.source
+                          ? `${d.source}${d.code != null ? ` ${d.code}` : ""}`
+                          : "";
+                      return (
+                        <div
+                          key={i}
+                          className={`nvim-diag nvim-diag-${sev}`}
+                        >
+                          <span className="nvim-diag-sev">
+                            {sev === "error"
+                              ? "✕"
+                              : sev === "warning"
+                                ? "!"
+                                : "·"}
+                          </span>
+                          <span className="nvim-diag-loc">{loc}</span>
+                          <span className="nvim-diag-msg">{d.message}</span>
+                          {src && (
+                            <span className="nvim-diag-src">{src}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           {(attachments.length > 0 || images.length > 0) && (
             <div className="attachment-chips" dir="ltr">
-              {attachments.map((a) => (
-                  <span className="attachment-chip" key={a}>
-                    {a}
+              {attachments.map((a) => {
+                const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
+                const name = idx >= 0 ? a.slice(idx + 1) : a;
+                return (
+                  <span
+                    className="attachment-chip file-chip"
+                    key={a}
+                    title={a}
+                  >
+                    <svg
+                      className="chip-file-icon"
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 2v6h6" />
+                      <path d="M9 13h6" />
+                      <path d="M9 17h6" />
+                    </svg>
+                    <span className="chip-file-name">{name}</span>
                     <button
                       className="chip-x"
                       onClick={() => removeAttachment(a)}
+                      title="Remove"
                     >
                       ×
                     </button>
                   </span>
-                ))}
+                );
+              })}
                 {images.map((img) => (
                   <span className="attachment-chip image-chip" key={img.path}>
                     {img.dataUrl ? (
@@ -3232,15 +3383,7 @@ export function ChatPanel() {
                 )}
               <ProviderModelSelect />
             </span>
-            <span className="composer-hint">
-              {busy && stalled && (
-                <span className="composer-working warn">
-                  {toolRunningRef.current
-                    ? "Tool is still running… (Stop to cancel)"
-                    : "Still waiting for the provider… (Stop to cancel)"}
-                </span>
-              )}
-            </span>
+            <span className="composer-hint" />
             <div className="composer-actions">
               <button
                 className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}

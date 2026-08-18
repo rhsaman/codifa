@@ -1037,6 +1037,21 @@ def _retryable_by_type(exc: BaseException) -> bool:
     return False
 
 
+def _is_read_timeout(exc: BaseException) -> bool:
+    """True when ``exc`` (or its ``__cause__`` chain) is a read timeout — the
+    provider sent no data for the whole read window (httpx.ReadTimeout /
+    httpcore.ReadTimeout). The server uses this to show the "tap Retry" hint
+    instead of the generic "just wait" message."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if "ReadTimeout" in type(cur).__name__:
+            return True
+        cur = cur.__cause__
+    return False
+
+
 def _is_retryable(exc: BaseException) -> bool:
     """Best-effort check for whether ``exc`` looks like a transient provider
     error worth retrying (429 / 5xx / connection blips) rather than a hard

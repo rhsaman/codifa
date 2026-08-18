@@ -1,6 +1,7 @@
 import {
   memo,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -15,7 +16,9 @@ import { copyToClipboard } from '../lib/clipboard'
 import { cancelSteer } from '../lib/api'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
+import { splitSections } from '../lib/sections'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
+import { ReadingMode } from './ReadingMode'
 import 'highlight.js/styles/github-dark.min.css'
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
@@ -413,12 +416,18 @@ const ALWAYS_VISIBLE_TOOLS = new Set([
  *  search-heavy turn doesn't stack a full-height row per call. Anything in
  *  ALWAYS_VISIBLE_TOOLS always breaks the run and renders as its own full card
  *  (diff/confirmation visible), same as before. */
-function SegSteerBubble({
+/** Shared rendering for a user message bubble + its action buttons (retry/copy).
+ *  Used both for standalone user messages and for interleaved steer segments so
+ *  the icons always match the main user message. `className` is applied to the
+ *  bubble wrapper (e.g. "seg-steer" for the interleaved steer look). */
+function UserMessageBubble({
   message,
   onRetry,
+  className,
 }: {
   message: ChatMessage
   onRetry?: (id: string) => void
+  className?: string
 }) {
   const dir = useStore((s) => s.dir)
   const [copied, setCopied] = useState(false)
@@ -434,20 +443,21 @@ function SegSteerBubble({
   }
 
   return (
-    <div className="seg-steer">
-      <div className="seg-steer-label">You</div>
-      <div className="seg-steer-text" dir={detectDir(message.content)}>
-        {cachedPrepare(message.id, message.content, dir) || '(empty)'}
-      </div>
-      {message.attachments && message.attachments.length > 0 && (
-        <div className="msg-attachments" dir="ltr">
-          {message.attachments.map((a) => (
-            <span className="attachment-chip" key={a}>@ {a}</span>
-          ))}
+    <>
+      <div className={`msg-bubble${className ? ` ${className}` : ''}`}>
+        <div className="chat-message user-text" dir={dir}>
+          {cachedPrepare(message.id, message.content, dir) || '(empty)'}
         </div>
-      )}
-      {(onRetry || message.content) && (
-        <div className="seg-steer-actions">
+        {message.attachments && message.attachments.length > 0 && (
+          <div className="msg-attachments" dir="ltr">
+            {message.attachments.map((a) => (
+              <span className="attachment-chip" key={a}>@ {a}</span>
+            ))}
+          </div>
+        )}
+      </div>
+      {message.content && (
+        <div className="msg-actions">
           {onRetry && (
             <button
               className="msg-copy msg-retry"
@@ -475,6 +485,32 @@ function SegSteerBubble({
           </button>
         </div>
       )}
+    </>
+  )
+}
+
+function SegSteerBubble({
+  message,
+  onRetry,
+}: {
+  message: ChatMessage
+  onRetry?: (id: string) => void
+}) {
+  // Render the EXACT same structure as a standalone user message (role header
+  // + bubble + actions) so an interleaved steer is pixel-identical to the
+  // user's own messages — the .msg.user wrapper reuses the same CSS.
+  return (
+    <div className="msg user seg-steer">
+      <div className="msg-role">
+        <span className="msg-role-avatar" aria-hidden="true">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="8" r="4" />
+            <path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" />
+          </svg>
+        </span>
+        You
+      </div>
+      <UserMessageBubble message={message} onRetry={onRetry} />
     </div>
   )
 }
@@ -589,6 +625,14 @@ export const ChatMessageView = memo(function ChatMessageView({
 
   const isSummary = message.role === 'system' && !message.modeSwitch
   const isModeSwitch = message.modeSwitch === true
+
+  // Reading mode: only assistant replies with ≥2 headed sections get the
+  // "مطالعه" button — short answers don't need a two-pane viewer.
+  const [reading, setReading] = useState(false)
+  const sections = useMemo(
+    () => (!isUser && !isSummary ? splitSections(message.content) : []),
+    [message.content, isUser, isSummary],
+  )
 
   // Mode-switch notices exist so the model knows which mode the next message
   // runs in — the user doesn't want them rendered in the chat. Keep the message
@@ -758,35 +802,31 @@ export const ChatMessageView = memo(function ChatMessageView({
               {cachedPrepare(message.id, message.content, dir)}
             </div>
           </div>
+        ) : isUser ? (
+          /* Same fixed dir as the composer (dir={dir}): dir="auto" resolved
+             from the first strong char only, so a user message starting with
+             a Latin word/digit (e.g. "API key رو بده") flipped to LTR and the
+             72ch box hugged the LEFT side even in RTL mode. A fixed dir keeps
+             the rendered bubble identical to what the user typed. */
+          <UserMessageBubble message={message} onRetry={onRetry} />
         ) : (
         <div className="msg-bubble">
-          {isUser ? (
-            /* Same fixed dir as the composer (dir={dir}): dir="auto" resolved
-               from the first strong char only, so a user message starting with
-               a Latin word/digit (e.g. "API key رو بده") flipped to LTR and the
-               72ch box hugged the LEFT side even in RTL mode. A fixed dir keeps
-               the rendered bubble identical to what the user typed. */
-            <div className="chat-message user-text" dir={dir}>
+          <div className="chat-message markdown-body" dir="auto">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeHighlight]}
+              components={mdComponents}
+            >
               {cachedPrepare(message.id, message.content, dir)}
-            </div>
-          ) : (
-            <div className="chat-message markdown-body" dir="auto">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeHighlight]}
-                components={mdComponents}
-              >
-                {cachedPrepare(message.id, message.content, dir)}
-              </ReactMarkdown>
-            </div>
-          )}
+            </ReactMarkdown>
+          </div>
         </div>
         )
       )}
 
-      {((message.content && !message.steerPending) || (!isUser && (message.usage || message.streaming))) && (
+      {!isUser && (message.content || message.usage || message.streaming) && (
         <div className="msg-actions">
-          {!isUser && message.usage && (
+          {message.usage && (
             <UsageBadge
               input={message.usage.inputTokens}
               output={message.usage.outputTokens}
@@ -795,18 +835,6 @@ export const ChatMessageView = memo(function ChatMessageView({
           )}
           {message.content && (
             <>
-              {isUser && onRetry && (
-                <button
-                  className="msg-copy msg-retry"
-                  onClick={() => onRetry(message.id)}
-                  title="Retry"
-                >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                    <path d="M3 3v5h5" />
-                  </svg>
-                </button>
-              )}
               <button className={`msg-copy ${copied ? 'copied' : ''}`} onClick={copyMessage} title="Copy message">
                 {copied ? (
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -820,10 +848,25 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
                 {copied ? 'Copied' : 'Copy'}
               </button>
+              {!isUser && !isSummary && !message.streaming && sections.length >= 2 && (
+                <button
+                  className="msg-copy msg-read"
+                  onClick={() => setReading(true)}
+                  title="حالت مطالعه — خواندن بخشها جداگانه و سوال از هر بخش"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                  </svg>
+                  مطالعه
+                </button>
+              )}
             </>
           )}
         </div>
       )}
+
+      {reading && <ReadingMode message={message} onClose={() => setReading(false)} />}
     </div>
   )
 })

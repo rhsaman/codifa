@@ -26,6 +26,18 @@ interface Group {
   chats: Chat[]
 }
 
+/** Persisted sidebar UI state (localStorage `coder:sidebarUi`): collapse
+ *  toggles + panel heights for workspace groups, Todos and Model usage, so the
+ *  layout the user left comes back exactly as it was after a restart. */
+interface SidebarUiState {
+  todoCollapsed?: boolean
+  usageCollapsed?: boolean
+  todoHeight?: number
+  usageHeight?: number
+  usageGroupsClosed?: string[]
+  collapsedGroups?: string[]
+}
+
 /**
  * Build sidebar groups from the PERSISTED workspace list (workspaces are
  * first-class and outlive their chats), then attach chats by workspace key.
@@ -125,7 +137,17 @@ export function Sidebar() {
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces)
   const pinnedChats = useStore((s) => s.pinnedChats)
   const unreadChats = useStore((s) => s.unreadChats)
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  // Persisted sidebar UI state (collapse toggles + panel heights) — read once
+  // per mount, same localStorage pattern as coder:sidebarWidth below.
+  const [savedUi] = useState<SidebarUiState>(() => {
+    try {
+      const raw = localStorage.getItem('coder:sidebarUi')
+      return raw ? (JSON.parse(raw) as SidebarUiState) : {}
+    } catch {
+      return {}
+    }
+  })
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(savedUi.collapsedGroups ?? []))
   const [colorOpen, setColorOpen] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -158,15 +180,74 @@ export function Sidebar() {
 
   // ---- Footer panel state (todos + model usage), VSCode-style: each panel is
   // collapsible and its content height is user-resizable via a drag handle. ----
-  const [todoCollapsed, setTodoCollapsed] = useState(false)
-  const [usageCollapsed, setUsageCollapsed] = useState(false)
-  const [todoHeight, setTodoHeight] = useState(320)
-  const [usageHeight, setUsageHeight] = useState(200)
+  const [todoCollapsed, setTodoCollapsed] = useState(() => savedUi.todoCollapsed ?? false)
+  const [usageCollapsed, setUsageCollapsed] = useState(() => savedUi.usageCollapsed ?? false)
+  const [todoHeight, setTodoHeight] = useState(() => savedUi.todoHeight ?? 320)
+  const [usageHeight, setUsageHeight] = useState(() => savedUi.usageHeight ?? 200)
   // Tracks CLOSED groups (not open ones) so every provider starts expanded
   // by default — the user has to collapse a group explicitly to hide it.
-  const [usageGroupsClosed, setUsageGroupsClosed] = useState<Set<string>>(new Set())
+  const [usageGroupsClosed, setUsageGroupsClosed] = useState<Set<string>>(() => new Set(savedUi.usageGroupsClosed ?? []))
   const todoDrag = useRef<{ startY: number; startH: number } | null>(null)
   const usageDrag = useRef<{ startY: number; startH: number } | null>(null)
+
+  // Persist the panel/group UI state whenever it changes, so collapse toggles
+  // and panel heights survive restarts. Debounced: a height drag fires
+  // setTodoHeight/setUsageHeight on every mousemove, and writing localStorage
+  // per frame would lag the drag — the write lands 250ms after the drag
+  // settles, and the app-close flush below guarantees the final value.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          'coder:sidebarUi',
+          JSON.stringify({
+            todoCollapsed,
+            usageCollapsed,
+            todoHeight,
+            usageHeight,
+            usageGroupsClosed: [...usageGroupsClosed],
+            collapsedGroups: [...collapsed],
+          }),
+        )
+      } catch {
+        /* quota / serialization errors — the layout just won't persist */
+      }
+    }, 250)
+    return () => clearTimeout(t)
+  }, [todoCollapsed, usageCollapsed, todoHeight, usageHeight, usageGroupsClosed, collapsed])
+
+  // Flush the latest sidebar UI state synchronously on app close, so a toggle
+  // or resize made right before quitting is never lost to the debounce above.
+  // Also flushes on the store's `coder:flush-ui` event (dispatched before every
+  // store flush, including the main process's `flush-persist` on quit) so the
+  // layout survives even when the renderer's beforeunload runs late.
+  useEffect(() => {
+    const flush = () => {
+      try {
+        localStorage.setItem(
+          'coder:sidebarUi',
+          JSON.stringify({
+            todoCollapsed,
+            usageCollapsed,
+            todoHeight,
+            usageHeight,
+            usageGroupsClosed: [...usageGroupsClosed],
+            collapsedGroups: [...collapsed],
+          }),
+        )
+      } catch {
+        /* quota / serialization errors — the layout just won't persist */
+      }
+    }
+    window.addEventListener('coder:flush-ui', flush)
+    window.addEventListener('beforeunload', flush)
+    window.addEventListener('pagehide', flush)
+    return () => {
+      window.removeEventListener('coder:flush-ui', flush)
+      window.removeEventListener('beforeunload', flush)
+      window.removeEventListener('pagehide', flush)
+    }
+  }, [todoCollapsed, usageCollapsed, todoHeight, usageHeight, usageGroupsClosed, collapsed])
 
   // Sidebar width — drag-resizable on the right edge (VSCode-style), persisted
   // locally so the layout survives restarts.

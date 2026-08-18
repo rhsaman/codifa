@@ -37,17 +37,11 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "github-actions"
 
-      - name: Compute next version + create tag
+      - name: Read version from package.json + create tag
         id: tag
         run: |
-          # Highest existing v* tag (or v0.0.0 if none)
-          latest="$(git tag --list 'v*' --sort=-v:refname | head -1)"
-          latest="${latest:-v0.0.0}"
-          # Next patch version
-          v="$(node -e "
-            const [maj, min, pat] = process.argv[1].replace(/^v/, '').split('.').map(Number);
-            console.log(\`\${maj}.\${min}.\${pat + 1}\`);
-          " "$latest")"
+          # Version comes from package.json (you control the bump)
+          v="$(node -e "console.log(require('./package.json').version)")"
           tag="v$v"
           if git rev-parse -q --verify "$tag" >/dev/null 2>&1; then
             echo "Tag $tag already exists; skipping."

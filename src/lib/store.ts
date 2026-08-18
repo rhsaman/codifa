@@ -105,10 +105,23 @@ function flushPendingPersist(): Promise<unknown> {
     clearTimeout(persistTimer)
     persistTimer = undefined
   }
+  // Mounted chat panels keep their scroll position in a ref (not the store) so
+  // scrolling never re-renders the transcript. Before ANY flush — including the
+  // main process's `flush-persist` on quit, which runs before the renderer's
+  // `beforeunload` — ask them to push the latest position into the store so the
+  // snapshot below includes it. The Sidebar also flushes its localStorage UI
+  // state here, so a toggle/resize made right before quitting is never lost to
+  // the debounce.
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('coder:flush-ui'))
+  }
   return writeStateNow(useStore.getState())
 }
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
+    void flushPendingPersist()
+  })
+  window.addEventListener('pagehide', () => {
     void flushPendingPersist()
   })
   // The main process asks the renderer to flush right before quitting, then
@@ -313,6 +326,10 @@ interface State {
 
   load: () => Promise<void>
   persist: () => void
+  /** Force an immediate full-state write to the sidecar (clears any pending
+   *  debounced persist). Used on app close so a scroll position / UI state
+   *  updated right before quitting is never lost to a timer. */
+  flushNow: () => void
 
   setProviderConfig: (patch: Partial<ProviderConfig>) => void
   updateProvider: (id: string, patch: Partial<ProviderConfig>) => void
@@ -399,6 +416,14 @@ interface State {
   setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
   setChatProvider: (id: string, providerId: string, model: string) => void
   renameChat: (id: string, title: string) => void
+  /** Create a new chat pre-seeded with one section of a previous answer, so the
+   *  user can ask follow-up questions about that section in isolation (reading
+   *  mode → "سوال از این بخش"). Inherits the source chat's root/mode/provider. */
+  forkSection: (messageId: string, sectionTitle: string, sectionContent: string) => void
+  /** Transient flag: focus the composer on the next ChatPanel mount (set by
+   *  forkSection so the user can immediately type their question). */
+  focusComposer: boolean
+  setFocusComposer: (v: boolean) => void
   /** Transient compact/command/stall banners, stored per-chat so they survive
    *  the ChatPanel remount on chat switch (same rationale as pendingAsk). */
   setChatCompacting: (id: string, compacting: boolean) => void
@@ -406,6 +431,12 @@ interface State {
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
   setChatStalled: (id: string, stalled: boolean) => void
+  /** Per-chat scroll restoration anchor (see Chat.scrollPos). */
+  setChatScrollPos: (id: string, pos: { id: string; offset: number; atBottom: boolean } | null) => void
+  /** In-memory-only scroll anchor update (no persist) — used by the
+   *  `coder:flush-ui` handler to push a panel's ref-held position into the
+   *  store right before a flush writes the snapshot. */
+  setChatScrollPosMem: (id: string, pos: { id: string; offset: number; atBottom: boolean } | null) => void
   /** Set/clear the app-wide Ctrl+X prefix hint. */
   setPrefixNotice: (notice: string | null) => void
   addMessage: (chatId: string, message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
@@ -541,6 +572,7 @@ export const useStore = create<State>((set, get) => ({
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
   activeChatId: '',
+  focusComposer: false,
   unreadChats: [],
   prefixNotice: null,
   settingsOpen: false,
@@ -773,6 +805,10 @@ export const useStore = create<State>((set, get) => ({
       return
     }
     writeStateNow(get())
+  },
+
+  flushNow: () => {
+    flushPendingPersist()
   },
 
   setProviderConfig: (patch) => {
@@ -1314,6 +1350,30 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  forkSection: (messageId, sectionTitle, sectionContent) => {
+    const s = useStore.getState()
+    const src = s.chats.find((c) => c.messages.some((m) => m.id === messageId))
+    if (!src) return
+    // Same workspace + mode as the source chat, so the follow-up lives next to
+    // the original conversation and behaves identically (tools, modes, …).
+    const chatId = s.newChatInRoot(src.root ?? '', src.mode)
+    if (src.providerId) {
+      useStore.getState().setChatProvider(chatId, src.providerId, src.model ?? '')
+    }
+    const label = sectionTitle.trim() || 'بخش'
+    // Seed the new chat with the section's full content as its first message —
+    // the agent receives the whole history, so it knows exactly what the
+    // follow-up question is about without the rest of the long answer.
+    const context = `📌 بخش «${label}» از پاسخ قبلی:\n\n${sectionContent.trim()}`
+    useStore.getState().addMessage(chatId, { role: 'user', content: context })
+    useStore.getState().renameChat(chatId, label)
+    // The ChatPanel remounts on the chat switch (key={activeChatId}); this flag
+    // makes it focus the composer so the user can type their question at once.
+    useStore.getState().setFocusComposer(true)
+  },
+
+  setFocusComposer: (v) => set({ focusComposer: v }),
+
   addMessage: (chatId, message) => {
     const id = uid()
     const full: ChatMessage = { ...message, id, createdAt: Date.now() }
@@ -1503,6 +1563,24 @@ export const useStore = create<State>((set, get) => ({
   setChatStalled: (id, stalled) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, stalled } : c)),
+    }))
+  },
+
+  setChatScrollPos: (id, pos) => {
+    set((s) => ({
+      // Deliberately NOT bumping updatedAt: scrolling shouldn't reorder chats.
+      chats: s.chats.map((c) => (c.id === id ? { ...c, scrollPos: pos } : c)),
+    }))
+    get().persist()
+  },
+
+  // In-memory-only variant: updates the store WITHOUT persisting. Used by the
+  // `coder:flush-ui` handler so a chat panel can push its ref-held scroll
+  // position into the store right before a flush writes the snapshot — no
+  // redundant write, no recursion into persist().
+  setChatScrollPosMem: (id, pos) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, scrollPos: pos } : c)),
     }))
   },
 

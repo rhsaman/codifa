@@ -17,6 +17,7 @@
     "preview": "vite preview",
     "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:backend:live": "cd backend && .venv/bin/python tests/run_tests.py",
+    "test:frontend": "bash test/run-frontend.sh",
     "dist": "npm run build && npm run setup && electron-builder",
     "dist:mac": "npm run build && npm run setup && electron-builder --mac",
     "dist:win": "npm run build && npm run setup && electron-builder --win",

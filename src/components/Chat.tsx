@@ -274,9 +274,9 @@ export function ChatPanel() {
     balanceTick,
   ]);
 
-  // Which provider's balance the header chip displays: the active provider if it
-  // returns a number, otherwise the first configured provider with a balance
-  // (OpenRouter) so the chip always shows a real remaining amount.
+  // Which provider's balance the header chip displays: only the active provider
+  // (the one the main model belongs to). If it has no balance endpoint, show
+  // nothing — never fall back to another provider.
   let shownBal: {
     provider: (typeof allProviders)[number];
     amount: number;
@@ -284,14 +284,6 @@ export function ChatPanel() {
   const activeBal = provider ? creditMap[provider.id] : undefined;
   if (activeBal && activeBal.balance !== undefined) {
     shownBal = { provider, amount: activeBal.balance };
-  } else {
-    for (const p of allProviders) {
-      const b = creditMap[p.id];
-      if (b && b.balance !== undefined) {
-        shownBal = { provider: p, amount: b.balance };
-        break;
-      }
-    }
   }
   const root = useStore((s) => s.root);
   const dir = useStore((s) => s.dir);
@@ -409,7 +401,11 @@ export function ChatPanel() {
     name,
   }));
   const scrollRef = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
+  // Per-chat scroll restoration: captured once per mount (the panel remounts on
+  // every chat switch via key={activeChatId}). If the user last left this chat
+  // scrolled up, don't auto-pin to the bottom on return.
+  const [initialScrollPos] = useState(() => chat?.scrollPos ?? null);
+  const stickToBottom = useRef(!initialScrollPos || initialScrollPos.atBottom);
   const [showJump, setShowJump] = useState(false);
   /** Lazy transcript: only the last MSG_PAGE messages render on mount (and on
    *  every chat switch — the panel is keyed by activeChatId). Older messages
@@ -418,11 +414,43 @@ export function ChatPanel() {
    *  The slice is applied at render time over `chat.messages`, so streaming
    *  appends at the bottom always show. */
   const MSG_PAGE = 30;
-  const [msgLimit, setMsgLimit] = useState(MSG_PAGE);
+  // Extra messages rendered ABOVE the restore anchor so the saved viewport can
+  // be positioned exactly: the anchor isn't the first rendered message, so the
+  // restore has real content above it to scroll against (and the messages the
+  // user saw above the anchor are actually there).
+  const SCROLL_RESTORE_BUFFER = 5;
+  const [msgLimit, setMsgLimit] = useState(() => {
+    // Restoring a scrolled-up position: render enough history so the anchor
+    // message exists on the first paint (no flash of the wrong viewport), plus
+    // a small buffer above it for an exact restore.
+    const pos = chat?.scrollPos;
+    if (pos && !pos.atBottom && chat) {
+      const idx = chat.messages.findIndex((m) => m.id === pos.id);
+      if (idx >= 0) {
+        const start = Math.max(0, idx - SCROLL_RESTORE_BUFFER);
+        return Math.max(MSG_PAGE, chat.messages.length - start);
+      }
+    }
+    return MSG_PAGE;
+  });
   /** When older messages are prepended above the viewport, remember the
    *  pre-append scrollHeight so a layout effect can re-anchor the scroll
    *  position (otherwise the content visibly jumps). */
   const prependAnchorRef = useRef<number | null>(null);
+  /** True once the saved scroll position has been restored this mount. */
+  const restoredRef = useRef(false);
+  /** Last computed scroll anchor (updated on every user scroll; flushed to the
+   *  store on unmount / app close so a quick chat switch never loses the
+   *  viewport). */
+  const lastScrollPosRef = useRef<{ id: string; offset: number; atBottom: boolean } | null>(null);
+  /** While a saved viewport is being restored, keep re-anchoring to it as the
+   *  content around the anchor actually renders (content-visibility placeholders
+   *  → real heights, images, code blocks). Cleared once stable or when the user
+   *  scrolls away. */
+  const restoreTargetRef = useRef<{ id: string; offset: number } | null>(null);
+  /** The scrollTop the restore last set — used to tell programmatic re-anchors
+   *  apart from a real user scroll (which cancels the restore). */
+  const restoreScrollRef = useRef<number | null>(null);
   /** Bumped to force the transcript to the bottom even when the user scrolled
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
   const [scrollTick, setScrollTick] = useState(0);
@@ -657,9 +685,43 @@ export function ChatPanel() {
     });
   }, [wroot, attachments]);
 
+  /** Snapshot the current viewport as a message-anchored scroll position. */
+  const computeScrollPos = (el: HTMLDivElement): { id: string; offset: number; atBottom: boolean } | null => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    const msgs = el.querySelectorAll<HTMLElement>("[data-msg-id]");
+    if (msgs.length === 0) return null;
+    if (atBottom) {
+      return { id: msgs[msgs.length - 1].dataset.msgId ?? "", offset: 0, atBottom: true };
+    }
+    const containerRect = el.getBoundingClientRect();
+    let anchor: HTMLElement | null = null;
+    for (const m of msgs) {
+      if (m.getBoundingClientRect().bottom >= containerRect.top) {
+        anchor = m;
+        break;
+      }
+    }
+    if (!anchor) anchor = msgs[msgs.length - 1];
+    return {
+      id: anchor.dataset.msgId ?? "",
+      offset: anchor.getBoundingClientRect().top - containerRect.top,
+      atBottom: false,
+    };
+  };
+
   const onChatScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    // If the user scrolls away from the position the restore set, stop
+    // re-anchoring (the restore is only for the initial viewport).
+    if (
+      restoreTargetRef.current &&
+      restoreScrollRef.current !== null &&
+      el.scrollTop !== restoreScrollRef.current
+    ) {
+      restoreTargetRef.current = null;
+      restoreScrollRef.current = null;
+    }
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     stickToBottom.current = atBottom;
     setShowJump(!atBottom);
@@ -669,6 +731,11 @@ export function ChatPanel() {
       prependAnchorRef.current = el.scrollHeight;
       setMsgLimit((n) => Math.min(chat.messages.length, n + MSG_PAGE));
     }
+    // Remember where the user left this chat — in-memory only. No store write
+    // per scroll (that lagged the UI); the position is flushed to the store on
+    // chat switch (unmount) and on app close (pagehide/beforeunload) below.
+    const pos = computeScrollPos(el);
+    if (pos) lastScrollPosRef.current = pos;
   };
 
   /** Force the transcript to the bottom regardless of where the user scrolled
@@ -677,6 +744,15 @@ export function ChatPanel() {
     stickToBottom.current = true;
     setShowJump(false);
     setScrollTick((t) => t + 1);
+    // The user is pinned to the newest messages — record it so a later chat
+    // switch / restart restores the bottom instead of a stale scrolled-up spot.
+    if (chat?.id) {
+      const el = scrollRef.current;
+      const msgs = el?.querySelectorAll<HTMLElement>("[data-msg-id]") ?? [];
+      const lastId = msgs.length ? (msgs[msgs.length - 1].dataset.msgId ?? "") : "";
+      lastScrollPosRef.current = { id: lastId, offset: 0, atBottom: true };
+      useStore.getState().setChatScrollPos(chat.id, lastScrollPosRef.current);
+    }
   };
 
   useEffect(() => {
@@ -695,6 +771,30 @@ export function ChatPanel() {
     const content = el?.firstElementChild;
     if (!el) return;
     const reconcile = () => {
+      // While restoring a saved viewport, re-anchor to it on every content
+      // resize — content-visibility: auto lays off-screen messages out with
+      // 140px placeholders on a fresh mount, and images/code blocks settle
+      // later, so the anchor's real position only stabilizes over time.
+      const target = restoreTargetRef.current;
+      if (target) {
+        const a = el.querySelector<HTMLElement>(`[data-msg-id="${target.id}"]`);
+        if (a) {
+          const cRect = el.getBoundingClientRect();
+          const aRect = a.getBoundingClientRect();
+          const desired = el.scrollTop + (aRect.top - cRect.top - target.offset);
+          if (Math.abs(desired - el.scrollTop) > 1) {
+            restoreScrollRef.current = desired;
+            el.scrollTop = desired;
+          } else {
+            restoreTargetRef.current = null;
+            restoreScrollRef.current = null;
+          }
+        } else {
+          restoreTargetRef.current = null;
+          restoreScrollRef.current = null;
+        }
+        return;
+      }
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
       if (stickToBottom.current) {
         el.scrollTop = el.scrollHeight;
@@ -721,12 +821,96 @@ export function ChatPanel() {
     prependAnchorRef.current = null;
   }, [msgLimit]);
 
+  // Restore the saved scroll position once the anchor message is rendered.
+  // Runs before paint, so the viewport lands where the user left it without a
+  // visible jump. Fires once per mount (restoredRef).
+  useLayoutEffect(() => {
+    if (restoredRef.current) return;
+    const pos = initialScrollPos;
+    if (!pos || pos.atBottom) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const anchor = el.querySelector<HTMLElement>(`[data-msg-id="${pos.id}"]`);
+    if (!anchor) {
+      // Anchor gone (e.g. compacted away) → fall back to the newest messages.
+      restoredRef.current = true;
+      stickToBottom.current = true;
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    restoredRef.current = true;
+    const containerRect = el.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    el.scrollTop += anchorRect.top - containerRect.top - pos.offset;
+    setShowJump(false);
+    // content-visibility: auto skips off-screen messages on a fresh mount, so
+    // the first pass lands near the anchor using 140px placeholders — the
+    // restored viewport can be off by the difference between placeholder and
+    // real heights. Keep re-anchoring (via the ResizeObserver reconcile above)
+    // as the browser actually renders the content around the anchor, until the
+    // position stabilizes or the user scrolls away.
+    restoreTargetRef.current = { id: pos.id, offset: pos.offset };
+    restoreScrollRef.current = el.scrollTop;
+  }, [initialScrollPos, msgLimit]);
+
+  // Flush the saved scroll position on unmount (chat switch) and on app close
+  // (pagehide/beforeunload) so the last viewport is never lost. The store write
+  // is cheap here — it happens once per switch/close, not per scroll.
+  useEffect(() => {
+    const cid = chat?.id;
+    // Push the ref-held position into the store WITHOUT persisting. Used by the
+    // `coder:flush-ui` event (dispatched by the store right before any flush,
+    // including the main process's `flush-persist` on quit — which runs before
+    // this component's beforeunload handler) so the snapshot always includes it.
+    const pushToStore = () => {
+      if (!cid) return;
+      if (lastScrollPosRef.current) {
+        useStore.getState().setChatScrollPosMem(cid, lastScrollPosRef.current);
+      }
+    };
+    // Unmount (chat switch): push + persist so the position survives.
+    const flush = () => {
+      pushToStore();
+      if (cid && lastScrollPosRef.current) {
+        useStore.getState().persist();
+      }
+    };
+    // App close: push the position into the store AND force an immediate write,
+    // so it survives even if the store's own beforeunload flush already ran.
+    const flushOnClose = () => {
+      pushToStore();
+      useStore.getState().flushNow();
+    };
+    window.addEventListener('coder:flush-ui', pushToStore);
+    window.addEventListener('pagehide', flushOnClose);
+    window.addEventListener('beforeunload', flushOnClose);
+    return () => {
+      window.removeEventListener('coder:flush-ui', pushToStore);
+      window.removeEventListener('pagehide', flushOnClose);
+      window.removeEventListener('beforeunload', flushOnClose);
+      flush();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat?.id]);
+
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [input]);
+
+  // forkSection (reading mode → "سوال از این بخش") sets this flag so the
+  // freshly-created chat's composer is focused on mount, letting the user type
+  // their follow-up question immediately. The panel remounts per chat
+  // (key={activeChatId}), so a mount-only effect is the right hook.
+  useEffect(() => {
+    const s = useStore.getState();
+    if (!s.focusComposer) return;
+    s.setFocusComposer(false);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const onToggleMode = () => {
@@ -1107,15 +1291,19 @@ export function ChatPanel() {
           ?.messages.find((m) => m.id === assistantMsg.id);
       if (event.kind === "text") {
         useStore.getState().setStreaming(true, false);
+        const prev = findMsg()?.content ?? "";
+        const chunk = event.content ?? "";
         store.updateMessage(assistantMsg.id, {
-          content: (findMsg()?.content ?? "") + (event.content ?? ""),
-          segments: appendTextSegment(findMsg()?.segments, event.content ?? ""),
+          content: prev + chunk,
+          segments: appendTextSegment(findMsg()?.segments, chunk),
           retry: null,
         });
       } else if (event.kind === "thinking") {
         useStore.getState().setStreaming(true, true);
+        const prevT = findMsg()?.thinking ?? "";
+        const chunkT = event.content ?? "";
         store.updateMessage(assistantMsg.id, {
-          thinking: (findMsg()?.thinking ?? "") + (event.content ?? ""),
+          thinking: prevT + chunkT,
           retry: null,
         });
       } else if (event.kind === "skill") {
@@ -2482,7 +2670,22 @@ export function ChatPanel() {
                 title={`${shownBal.provider.name} balance`}
                 dir="ltr"
               >
-                💳 ${shownBal.amount.toFixed(2)}
+                <svg
+                  className="titlebar-balance-icon"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
+                  <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
+                  <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
+                </svg>
+                ${shownBal.amount.toFixed(2)}
               </span>
             )}
           </div>,

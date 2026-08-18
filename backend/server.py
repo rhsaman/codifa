@@ -47,7 +47,13 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import providers
-from agents import _drain_steer, _enqueue_steer, _remove_steer, run_agent
+from agents import (
+    _drain_steer,
+    _enqueue_steer,
+    _is_read_timeout,
+    _remove_steer,
+    run_agent,
+)
 
 
 def wants_skill_or_mcp(text: str) -> bool:
@@ -628,6 +634,15 @@ def _sse(obj: dict) -> str:
 
 def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     text = str(exc)
+    # httpx.ReadTimeout / httpcore.ReadTimeout: the provider sent no data for
+    # the whole read window (300s). The run already retried + resumed, so the
+    # actionable advice is "tap Retry", not the generic "just wait" hint below.
+    if _is_read_timeout(exc):
+        return (
+            "The provider didn't send any data for over 5 minutes (read timeout). "
+            "Tap Retry to resume from where it left off — or switch to a faster "
+            "model in Settings if this keeps happening."
+        )
     # A bare `asyncio.TimeoutError` (and similar) has an EMPTY str() — the type
     # name is the only clue. Turn it into a readable timeout message so the user
     # isn't left with the generic fallback at the bottom.

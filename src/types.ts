@@ -372,6 +372,11 @@ export interface Chat {
   compactError?: string | null
   cmdError?: string | null
   stalled?: boolean
+  /** Per-chat scroll restoration anchor: the message id at the top of the
+   *  viewport when the user last scrolled, plus the pixel offset from that
+   *  message's top to the viewport top. `atBottom` means the user was pinned
+   *  to the newest messages. Restored on chat switch / app restart. */
+  scrollPos?: { id: string; offset: number; atBottom: boolean } | null
   createdAt: number
   updatedAt: number
 }

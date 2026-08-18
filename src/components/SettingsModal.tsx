@@ -1291,7 +1291,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   </button>
                 </div>
                 <div className="hint">
-                  CodeFa uses the method you choose — never both. Picking a name in "Env var name" alone is
+                  Codifa uses the method you choose — never both. Picking a name in "Env var name" alone is
                   not a key: the variable must actually exist in your environment.
                 </div>
 
@@ -1309,15 +1309,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     {envVarValue === true ? (
                       <div className="env-key-hint">
                         <span className="status-dot ok" />
-                        {cfg.envVar} is set in your environment — CodeFa will use it.
+                        {cfg.envVar} is set in your environment — Codifa will use it.
                       </div>
                     ) : envVarValue === false ? (
                       <>
                         <div className="env-key-hint fail">
                           <span className="status-dot fail" />
-                          <strong>{cfg.envVar}</strong> is not set in your environment. CodeFa only sees
+                          <strong>{cfg.envVar}</strong> is not set in your environment. Codifa only sees
                           variables that exist in your OS before it starts (launches from Finder/Dock
-                          ignore your shell profile). Either export it and restart CodeFa, or paste the
+                          ignore your shell profile). Either export it and restart Codifa, or paste the
                           key value below — it will be saved encrypted instead.
                         </div>
                         <div className="cred-inline-fallback">

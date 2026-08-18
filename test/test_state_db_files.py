@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import tempfile
 
-tmp = tempfile.mkdtemp(prefix="codefa-test-")
+tmp = tempfile.mkdtemp(prefix="codifa-test-")
 os.environ["CODER_DATA_DIR"] = tmp
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
 

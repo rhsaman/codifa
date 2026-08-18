@@ -1166,13 +1166,13 @@ async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CODEFA agent sidecar")
+    parser = argparse.ArgumentParser(description="Codifa agent sidecar")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     # Central file logging: every Python logger (retrieval, vector_store, and any
-    # future module) appends WARNING+ to <data root>/codefa.log so a packaged app
+    # future module) appends WARNING+ to <data root>/codifa.log so a packaged app
     # whose stderr is not captured still leaves a persistent error trail behind.
     try:
         import logging
@@ -1182,7 +1182,7 @@ def main() -> None:
         _log_dir = user_coder_dir()
         os.makedirs(_log_dir, exist_ok=True)
         _handler = logging.FileHandler(
-            os.path.join(_log_dir, "codefa.log"), encoding="utf-8"
+            os.path.join(_log_dir, "codifa.log"), encoding="utf-8"
         )
         _handler.setFormatter(
             logging.Formatter(

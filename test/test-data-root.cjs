@@ -13,7 +13,7 @@ const os = require('os')
 const path = require('path')
 const Module = require('module')
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'codefa-dataroot-'))
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'codifa-dataroot-'))
 const fakeHome = path.join(tmp, 'home')
 const fakeUserData = path.join(tmp, 'userData')
 fs.mkdirSync(fakeHome, { recursive: true })

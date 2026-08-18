@@ -2,7 +2,7 @@ import { execSync } from 'child_process'
 import { existsSync } from 'fs'
 import { join } from 'path'
 
-const PRODUCT = (process.env.npm_package_productName) || 'CODEFA'
+const PRODUCT = (process.env.npm_package_productName) || 'Codifa'
 
 export default async function afterSign(context) {
   const { appOutDir, packager } = context

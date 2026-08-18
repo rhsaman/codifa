@@ -874,7 +874,7 @@ def user_coder_dir() -> str:
 
 # Name of the app-level log file written into the user data dir (see
 # user_coder_dir). All best-effort error/diagnostic logging lands here.
-LOG_FILENAME = "codefa.log"
+LOG_FILENAME = "codifa.log"
 
 _cache: Cache | None = None
 

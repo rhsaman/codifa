@@ -1,7 +1,7 @@
 """Repro: why does 'پروژه رو پوش کن تو گیت' pick design skills?
 
 Runs the REAL skill selection pipeline against the user's real data root
-(~/.codefa) and prints every layer: keyword tokens, keyword-tier matches,
+(~/.codifa) and prints every layer: keyword tokens, keyword-tier matches,
 semantic scores, and the final picks.
 """
 import os

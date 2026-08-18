@@ -5,6 +5,7 @@ import { Sidebar } from './components/Sidebar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { DownloadModelGate } from './components/DownloadModelGate'
+import { LoadingScreen } from './components/LoadingScreen'
 import { getModelsStatus } from './lib/api'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
@@ -174,11 +175,7 @@ export default function App() {
   }, [])
 
   if (!loaded || embeddingGate === 'unknown') {
-    return (
-      <div className="empty-state" style={{ display: 'flex', height: '100vh', alignItems: 'center' }}>
-        Loading…
-      </div>
-    )
+    return <LoadingScreen />
   }
 
   if (embeddingGate === 'missing') {

@@ -684,6 +684,32 @@ export function ChatPanel() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [chat?.messages, scrollTick]);
 
+  // The jump-to-bottom button is driven by onChatScroll, which only fires on
+  // user scrolls. Async growth of the transcript (images decoding, fonts, code
+  // highlighting) can silently push the viewport off-bottom — on mount or
+  // while pinned — without any scroll event, leaving the button hidden until
+  // the user scrolls. Watch the message list's size and reconcile: re-pin when
+  // the user never scrolled up, otherwise surface the jump button.
+  useEffect(() => {
+    const el = scrollRef.current;
+    const content = el?.firstElementChild;
+    if (!el) return;
+    const reconcile = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      if (stickToBottom.current) {
+        el.scrollTop = el.scrollHeight;
+      } else if (!atBottom) {
+        setShowJump(true);
+      }
+    };
+    const ro = new ResizeObserver(reconcile);
+    if (content) ro.observe(content);
+    ro.observe(el);
+    return () => ro.disconnect();
+    // Re-subscribe per transcript page so the current list node is observed
+    // (the panel also remounts per chat, so this is cheap).
+  }, [chat?.messages, msgLimit]);
+
   // Keep the viewport pinned when older messages are prepended above it
   // (lazy paging on scroll-to-top / "load older"): the browser grows the
   // scrollHeight by exactly the height of the new content, so re-anchor by
@@ -1370,6 +1396,11 @@ export function ChatPanel() {
           options: Array.isArray(event.options) ? event.options : [],
         });
       } else if (event.kind === "error") {
+        // A backend error while the summarizer was supposedly running means the
+        // compact can't complete either — never leave the "Compacting context"
+        // banner stuck next to the error. Clear it defensively (the backend's
+        // own compact_failed event already does this on its normal path).
+        useStore.getState().setChatCompacting(chat.id, false);
         store.updateMessage(assistantMsg.id, {
           content:
             (store.chats

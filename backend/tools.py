@@ -535,7 +535,7 @@ _TERMINAL_BLOCK = [
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\*", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\s", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+~", "destructive rm on the home directory is blocked"),
-    (r"(^|[;&|]\s*)open\b", "the macOS `open` launcher is blocked"),
+    (r"(^\s*|[;&|]\s*|\$\s*\(\s*)open\b", "the macOS `open` launcher is blocked"),
     (r"dd\s+if=", "dd is blocked"),
     (r"(>|>>)\s*/dev/(sd|disk)", "raw disk access is blocked"),
     (r":\(\)\{", "fork bombs are blocked"),

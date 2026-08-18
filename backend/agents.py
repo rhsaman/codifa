@@ -6127,6 +6127,21 @@ async def run_agent(
                         reason="connection dropped repeatedly — compacted and resuming",
                     )
                     continue
+                else:
+                    # Compact failed during recovery. The frontend set
+                    # `compacting` from compact_start and would otherwise keep
+                    # showing the "Compacting context" banner next to the retry
+                    # error. Emit compact_failed so it clears the banner and
+                    # surfaces the failure; the turn still continues below
+                    # (unlike the overflow path, the context window isn't full —
+                    # the connection just dropped, so retrying is still viable).
+                    yield {
+                        "kind": "compact_failed",
+                        "reason": (
+                            "Automatic compaction during recovery failed — "
+                            "retrying without compacting."
+                        ),
+                    }
             if (
                 activity_happened
                 or attempt > _RETRIES

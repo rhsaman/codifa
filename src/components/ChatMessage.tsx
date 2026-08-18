@@ -26,8 +26,7 @@ import 'highlight.js/styles/github-dark.min.css'
 // showing stale text. FIFO-bounded so long sessions can't leak memory.
 const preparedCache = new Map<string, { text: string; out: string }>()
 const PREPARED_CACHE_MAX = 400
-function cachedPrepare(id: string, text: string, dir?: 'rtl' | 'ltr'): string {
-  if (!text) return text
+function computePrepared(id: string, text: string, dir?: 'rtl' | 'ltr'): string {
   const hit = preparedCache.get(id)
   if (hit && hit.text === text) return hit.out
   const out = prepareContent(text, dir)
@@ -37,6 +36,17 @@ function cachedPrepare(id: string, text: string, dir?: 'rtl' | 'ltr'): string {
   }
   preparedCache.set(id, { text, out })
   return out
+}
+function cachedPrepare(id: string, text: string, dir?: 'rtl' | 'ltr'): string {
+  if (!text) return text
+  return computePrepared(id, text, dir)
+}
+/** For content with no stable id (the thinking block only receives `text`):
+ *  key by the text itself — prepareContent is deterministic, so equal text
+ *  always yields equal output. */
+function cachedPrepareText(text: string, dir?: 'rtl' | 'ltr'): string {
+  if (!text) return text
+  return computePrepared(`t:${text}`, text, dir)
 }
 
 function textFromChildren(node: ReactNode): string {
@@ -188,7 +198,7 @@ export function ThinkingBlock({ text }: { text: string }) {
                 el.scrollHeight - el.scrollTop - el.clientHeight < 40
             }}
           >
-            {prepareContent(text, dir)}
+            {cachedPrepareText(text, dir)}
           </div>
           <div
             className="thinking-resizer"

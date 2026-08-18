@@ -689,7 +689,8 @@ SYSTEM_PROMPTS: dict[str, str] = {
 # Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
 # 1) The agent never leaves dead code in the work it does. 2) Dead code or bugs
 # that existed BEFORE the agent's work are reported as notes, not silently fixed.
-# 3) Replies stay short but precise and complete.
+# 3) Replies stay short but precise and complete. 4) Code is written to stay
+# extensible for future needs — never a one-off hack for only the current case.
 _UNIVERSAL_RULES = (
     "\n\nUNIVERSAL RULES (apply in every mode):\n"
     "1. DEAD CODE: never leave dead code behind in code you write or modify — "
@@ -701,7 +702,13 @@ _UNIVERSAL_RULES = (
     "deleted', 'there's a bug here: ...').\n"
     "3. CONCISE ANSWERS: keep every reply short but precise and complete — easy "
     "to understand. No verbose filler, no restating what the user already knows, "
-    "no long intros or summaries."
+    "no long intros or summaries.\n"
+    "4. EXTENSIBLE CODE: write, fix and edit code so it stays usable and "
+    "extensible for future needs — general, parameterized, configurable, "
+    "following the project's existing patterns — never a one-off hack that only "
+    "serves the specific case in front of you. When a small generalization (a "
+    "parameter, a lookup table/registry, a shared helper) makes the solution "
+    "serve a whole class of similar tasks instead of one instance, prefer it."
 )
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -3269,13 +3276,15 @@ def _sync_skills_to_store(store: VectorStore | None, skills: list[dict]) -> None
     for s in skills:
         name = s["name"]
         desc = s.get("description") or ""
-        body = s.get("content") or ""
+        # Index ONLY the name+description passage. The body is instructions for
+        # the model, not a description of what the skill IS — embedding it
+        # inflates semantic scores with irrelevant content (measured: the
+        # Testing skill's body made it top-scorer for "یه کد پایتون بنویس").
+        # Selection should match the skill's purpose, so the body stays out of
+        # the vector index.
         prefix = f"{name}. {desc}".strip()
-        texts = [prefix] if prefix else []
-        if body:
-            texts.append(body[:2000])
-        if texts:
-            entries.append((s["path"], KIND_SKILL, name, texts))
+        if prefix:
+            entries.append((s["path"], KIND_SKILL, name, [prefix]))
         # Drop any legacy ~/.coder/skills/<slug>/SKILL.md vector id from before
         # skills moved to the db://skills/<slug> scheme, so they don't linger.
         try:
@@ -3289,7 +3298,86 @@ def _sync_skills_to_store(store: VectorStore | None, skills: list[dict]) -> None
         _skill_sync_cache.pop(store.db_path, None)
 
 
-def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[dict]:
+# Persian → English tech-term aliases so a Persian prompt can match an
+# English-named skill ("گیت" -> git-workflow, "سئو" -> seo-optimization).
+# Both the prompt token and its alias are matched against skill names and
+# descriptions. This is what makes skills reliably findable across languages
+# when the embedding band can't tell them apart.
+_SKILL_ALIASES: dict[str, str] = {
+    # git / version control
+    "گیت": "git",
+    "پوش": "push",
+    "کامیت": "commit",
+    "برنچ": "branch",
+    "مرج": "merge",
+    "ریپو": "repo",
+    # testing
+    "تست": "test",
+    # web / design
+    "طراحی": "design",
+    "داشبورد": "dashboard",
+    "وبسایت": "website",
+    "سایت": "site",
+    "لندینگ": "landing",
+    "پیج": "page",
+    "فرانتاند": "frontend",
+    "بکاند": "backend",
+    "ریاکت": "react",
+    "نود": "node",
+    "وب": "web",
+    "ادمین": "admin",
+    "موبایل": "mobile",
+    "دسکتاپ": "desktop",
+    "اپ": "app",
+    # content / writing
+    "ایمیل": "email",
+    "مقاله": "article",
+    "خلاصه": "summar",
+    "ترجمه": "translate",
+    "سئو": "seo",
+    "قیمت": "pricing",
+    "فروش": "pricing",
+    "گزارش": "report",
+    # infra / data
+    "پایتون": "python",
+    "دیتابیس": "database",
+    "سرور": "server",
+    "داکر": "docker",
+    "دیپلوی": "deploy",
+    "کلاد": "cloud",
+    "ایپیآی": "api",
+    "دیتا": "data",
+    "تحلیل": "analysis",
+}
+
+# Generic / ambiguous words that are NOT distinctive skill signals. A word like
+# "پروژه" (project) appears in too many descriptions, and "رسمی" is a homonym
+# ("formal email" vs "راهنمای رسمی" = official guide in a design skill) — a
+# literal match on these produces false positives, so they are dropped before
+# keyword matching. Keep this list small and focused on words that measurably
+# misfire; distinctive terms must stay out of it.
+_SKILL_WEAK_KEYWORDS: set[str] = {
+    # Persian
+    "پروژه", "کار", "بنویس", "بساز", "ساخت", "ساختن", "رسمی", "کمک",
+    "بهتر", "درست", "کن", "کردن", "میخوام", "لطفا", "باید", "میشه",
+    "برام", "بده", "ادامه", "ببین", "چرا", "چطوری", "سلام", "خوبی",
+    "مرسی", "ممنون", "یه", "یک", "رو", "تو", "که", "این", "اون",
+    "بعد", "الان", "فقط", "خیلی", "جدید", "بزرگ", "کوچک", "هوش",
+    "متن", "کاربر", "سیستم", "برنامه", "فایل", "پوشه", "داخل", "خارج",
+    # English
+    "project", "write", "build", "make", "help", "better", "fix",
+    "work", "want", "please", "need", "create", "do", "get", "use",
+    "can", "will", "would", "should", "about", "with", "from", "into",
+    "your", "this", "that", "some", "new", "good", "great", "hello",
+    "hi", "thanks", "thank", "code", "run", "show", "tell", "give",
+    "add", "change", "update", "set", "find", "search", "open", "close",
+    "start", "stop", "check", "see", "look", "read", "send", "call",
+    "go", "back", "just", "only", "very", "really", "also", "still",
+    "even", "let", "put", "take", "make", "know", "think", "say",
+}
+
+
+def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, dict]]:
     """Skills whose NAME or DESCRIPTION literally contains a significant prompt
     keyword (see ``_fts_keywords``).
 
@@ -3297,45 +3385,78 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[dict]:
     in a compressed band (~0.78-0.83) where the top-1 is often noise, but a
     skill whose name/description literally contains the prompt's keyword (e.g.
     "تست" -> a testing skill, "git" -> git-workflow) is a strong signal the
-    embedding can't reliably reproduce. Name hits weigh double — a skill NAMED
-    "Testing" is far more specific than one that merely mentions "test".
-    Returns skills ordered by hit weight (then name, for stability); ``[]``
-    when no keyword matches. Never raises.
+    embedding can't reliably reproduce. Two guards keep it precise:
+
+    * ``_SKILL_WEAK_KEYWORDS`` — generic/ambiguous words (پروژه، بنویس، رسمی،
+      project, write, ...) are dropped first, so a "formal email" request can't
+      match a design skill whose description says "راهنمای رسمی" (official).
+    * ``_SKILL_ALIASES`` — a Persian token is also matched by its English alias
+      ("گیت" -> "git"), so Persian prompts reach English-named skills.
+
+    A NAME hit is categorically stronger than a description mention — a skill
+    NAMED "Testing" is unambiguous, while "test" in decision-making's
+    "test assumptions" is a false positive. So when any skill has a name hit,
+    only name-hit skills are returned; description-only matches are used only
+    when nothing matched by name.
+
+    Returns ``(weight, skill)`` pairs ordered by weight (name hits double, then
+    name, for stability); ``[]`` when no keyword matches. Never raises.
     """
     tokens = _fts_keywords(prompt, max_terms=8)
     if not tokens:
         return []
+    tokens = [t for t in tokens if t.lower() not in _SKILL_WEAK_KEYWORDS]
+    if not tokens:
+        return []
+
+    def _forms(t: str) -> list[str]:
+        tl = t.lower()
+        alias = _SKILL_ALIASES.get(tl)
+        return [tl, alias.lower()] if alias else [tl]
 
     def _kw_in(tl: str, hay: str) -> bool:
         # Exact substring, plus a light English-plural fallback ("tests" ->
         # "test" matches a description that says "testing").
         return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
 
-    scored: list[tuple[int, dict]] = []
+    name_hit: list[tuple[int, dict]] = []
+    desc_only: list[tuple[int, dict]] = []
     for s in skills:
         name = str(s.get("name") or "").lower()
         desc = str(s.get("description") or "").lower()
         name_hits = 0
         desc_hits = 0
         for t in tokens:
-            tl = t.lower()
-            if _kw_in(tl, name):
-                name_hits += 1
-            elif _kw_in(tl, desc):
-                desc_hits += 1
-        if name_hits or desc_hits:
-            scored.append((name_hits * 2 + desc_hits, s))
-    scored.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
-    return [s for _, s in reversed(scored)]
+            for form in _forms(t):
+                if _kw_in(form, name):
+                    name_hits += 1
+                    break
+                if _kw_in(form, desc):
+                    desc_hits += 1
+                    break
+        if name_hits:
+            name_hit.append((name_hits * 2 + desc_hits, s))
+        elif desc_hits:
+            desc_only.append((desc_hits, s))
+
+    def _sort(pool: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
+        pool.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
+        return list(reversed(pool))
+
+    # Name hits win outright; description-only matches fill in only when no
+    # skill is named after a prompt keyword.
+    return _sort(name_hit) if name_hit else _sort(desc_only)
 
 
 # Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
 # selection. Measured on the real skill set: irrelevant prompts ("یه کد پایتون
-# بنویس", "تست بنویس برای پروژه") score a compressed band where the top-1
-# beats the runner-up by only ~0.004-0.006, while genuine matches ("طراحی UI
-# برای داشبورد", "یه لندینگ پیج طراحی کن") clear ~0.007-0.028. Below this the
-# top-1 is indistinguishable from noise, so nothing is attached.
-_SKILL_GAP_MIN = 0.004
+# بنویس", "پروژه رو پوش کن تو گیت") score a compressed band (~0.78-0.83) where
+# the top-1 is often noise, while genuine matches ("تست بنویس برای پروژه",
+# "طراحی UI برای داشبورد") clear ~0.84. The keyword tier (with Persian→English
+# aliases) is the primary selector; the semantic tier is a high-confidence
+# safety net that only fires on unambiguous matches, so both the absolute floor
+# and the gap are deliberately strict.
+_SKILL_GAP_MIN = 0.008
 
 
 def _auto_select_skills(
@@ -3344,30 +3465,32 @@ def _auto_select_skills(
     prompt: str,
     top_k: int = 3,
     rel_gap: float = 0.02,
-    min_abs: float = 0.79,
+    min_abs: float = 0.84,
 ) -> list[dict]:
     """Pick the most relevant skills for ``prompt``.
 
     Two tiers, because mean-pooled e5 cosine alone sits in a compressed band
-    (~0.78-0.83) where the top-1 is often noise (measured: "تست بنویس برای
-    پروژه" scored brainstorming 0.8078 / project-planning 0.8046 — irrelevant
-    winners over a real testing skill):
+    (~0.78-0.83) where the top-1 is often noise (measured: "پروژه رو پوش کن تو
+    گیت" scored Testing 0.788 / design skills 0.775 — irrelevant winners over
+    the real git-workflow skill, and "یه کد پایتون بنویس" scored Testing 0.831):
 
     1. KEYWORD tier (precise): significant prompt words matched against each
-       skill's NAME + DESCRIPTION (``_skill_keyword_matches``). A skill whose
-       name/description literally contains a prompt keyword is a strong,
-       language-exact signal — this is what makes a skill reliably findable
-       even when the embedding band can't tell it apart. Ranked by hit weight
-       (name hits double) then semantic score.
+       skill's NAME + DESCRIPTION (``_skill_keyword_matches``). Generic words
+       (پروژه/بنویس/رسمی/...) are dropped and Persian tokens are expanded by
+       their English alias ("گیت" -> git), so a skill whose name/description
+       contains a distinctive prompt word is found exactly — this is what makes
+       a skill reliably findable even when the embedding band can't tell it
+       apart. Ranked by hit weight (name hits double) then semantic score.
 
-    2. SEMANTIC tier (fallback): when no keyword matches, rank by e5 cosine.
-       The absolute floor (``min_abs``) rejects greetings/small-talk; a
-       top-vs-runner-up gap gate (``_SKILL_GAP_MIN``) rejects the compressed-
-       band noise measured on irrelevant prompts (gap ~0.004-0.006) while
-       genuine matches clear it (gap ~0.007-0.028). A single installed skill
-       needs no gap — it clears the absolute floor or it doesn't. Near-ties
-       within ``rel_gap`` of the best are all returned (not just the top-1):
-       with a compressed band the model is better placed to pick among them.
+    2. SEMANTIC tier (high-confidence fallback): only when no keyword matches.
+       The absolute floor (``min_abs``) and the top-vs-runner-up gap gate
+       (``_SKILL_GAP_MIN``) are deliberately strict because the compressed band
+       makes low scores indistinguishable from noise — measured irrelevant
+       prompts top out at ~0.83 while genuine matches clear ~0.84. A single
+       installed skill needs no gap — it clears the absolute floor or it
+       doesn't. Near-ties within ``rel_gap`` of the best are all returned (not
+       just the top-1): with a compressed band the model is better placed to
+       pick among them.
 
     Returns up to ``top_k`` skills. Candidates are mapped back to the loaded
     skill dicts by their ``path`` key. Falls back to ``[]`` when the store is
@@ -3394,8 +3517,15 @@ def _auto_select_skills(
     # Tier 1: exact keyword match on name/description — precise, wins outright.
     kw = _skill_keyword_matches(prompt, skills)
     if kw:
-        ranked = sorted(kw, key=lambda s: sem.get(s["path"], 0.0), reverse=True)
-        return ranked[:top_k]
+        # _skill_keyword_matches already puts name-hit skills first; within
+        # that ordering break weight ties by semantic score so a name-hit
+        # skill is never outranked by a description-only match that happens
+        # to embed closer to the prompt.
+        ranked = sorted(
+            kw,
+            key=lambda ws: (-ws[0], -sem.get(ws[1]["path"], 0.0)),
+        )
+        return [s for _, s in ranked[:top_k]]
 
     # Tier 2: semantic-only fallback.
     scores = sorted(sem.items(), key=lambda x: x[1], reverse=True)
@@ -4385,6 +4515,12 @@ async def run_agent(
         except Exception as exc:  # noqa: BLE001
             print(f"[coder] mcp config ignored: {exc}", flush=True)
             toolsets = None
+        if toolsets:
+            # Surface which MCP connectors were active for this turn, mirroring
+            # the "Auto-selected skills" note. MCP tool calls run through
+            # pydantic-ai's toolset machinery and never emit `tool` events, so
+            # without this the user has no way to see MCP was in play.
+            yield {"kind": "mcp", "servers": list((mcp_servers or {}).keys())}
 
     workspace_note = (
         "\n\nYou are running in the user's desktop IDE. The current open WORKSPACE ROOT is:\n"

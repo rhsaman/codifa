@@ -377,7 +377,7 @@ export interface Chat {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'subagent_models' | 'steer_applied'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -395,6 +395,8 @@ export interface SidecarEvent {
   skills?: string[]
   /** Informational note on a 'skill' event with an empty skills list (why no skill was auto-applied). */
   note?: string
+  /** MCP connector names active for this turn (the 'mcp' event kind). */
+  servers?: string[]
   /** Per-subagent model routing (the 'subagent_models' event kind): which model actually ran for explore/search/web/compact/vision. */
   models?: Record<string, string>
   /** update_plan items: [{ content, status }] */

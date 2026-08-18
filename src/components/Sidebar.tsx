@@ -426,6 +426,7 @@ export function Sidebar() {
           const isCollapsed = collapsed.has(g.key)
           const color = workspaceColors[g.key]
           const isPinned = pinnedWorkspaces.includes(g.key)
+          const pendingCount = g.chats.filter((c) => c.pendingAsk || c.pendingPermission).length
           return (
             <div
               key={g.key}
@@ -448,6 +449,14 @@ export function Sidebar() {
                   </svg>
                   <span className="sidebar-group-label">{g.label}</span>
                   <span className="sidebar-group-count">{g.chats.length}</span>
+                  {pendingCount > 0 && (
+                    <span
+                      className="sidebar-group-pending"
+                      title={`${pendingCount} chat${pendingCount > 1 ? 's' : ''} waiting for you`}
+                    >
+                      {pendingCount}
+                    </span>
+                  )}
                 </button>
                 <div className="sidebar-group-actions">
                   <button
@@ -588,6 +597,28 @@ export function Sidebar() {
                           </span>
                           {c.messages.some((m) => m.streaming) && (
                             <span className="chat-item-streaming" title="Agent is working in this chat" />
+                          )}
+                          {c.pendingPermission && (
+                            <span
+                              className="chat-item-pending permission"
+                              title={`Needs permission: ${c.pendingPermission.action}${c.pendingPermission.path ? ` · ${c.pendingPermission.path}` : ''}`}
+                            >
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                              </svg>
+                            </span>
+                          )}
+                          {c.pendingAsk && (
+                            <span
+                              className="chat-item-pending ask"
+                              title={`Asks you: ${c.pendingAsk.question}`}
+                            >
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="10" />
+                                <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
+                                <path d="M12 17h.01" />
+                              </svg>
+                            </span>
                           )}
                         </span>
                       )}

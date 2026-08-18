@@ -411,6 +411,9 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
+  /** Bumped to force the transcript to the bottom even when the user scrolled
+   *  up (send / queue / steer). The auto-scroll effect depends on it. */
+  const [scrollTick, setScrollTick] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const chatIdRef = useRef(chat?.id ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -648,10 +651,18 @@ export function ChatPanel() {
     setShowJump(!atBottom);
   };
 
+  /** Force the transcript to the bottom regardless of where the user scrolled
+   *  (used when the user sends / queues / steers a message). */
+  const forceScrollToBottom = () => {
+    stickToBottom.current = true;
+    setShowJump(false);
+    setScrollTick((t) => t + 1);
+  };
+
   useEffect(() => {
     if (!stickToBottom.current) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [chat?.messages]);
+  }, [chat?.messages, scrollTick]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -787,6 +798,7 @@ export function ChatPanel() {
     imgs: Array<{ path: string; name: string }> = [],
     allowCreate = false,
     reuseMsgId?: string,
+    forceScroll = false,
   ) => {
     const s = useStore.getState();
     // Use THIS panel's chat (captured at render), never s.activeChatId: a
@@ -889,6 +901,10 @@ export function ChatPanel() {
       segments: [],
       streaming: true,
     });
+    // User-initiated sends jump to the bottom even if they scrolled up (the
+    // auto-drain path passes forceScroll=false so it never yanks the user away
+    // from history they are reading).
+    if (forceScroll) forceScrollToBottom();
 
     // Clear any lingering retry banner from a previous message before sending.
     for (const m of chat.messages) {
@@ -1055,6 +1071,14 @@ export function ChatPanel() {
         } else if (event.note) {
           store.updateMessage(assistantMsg.id, {
             content: `> ${event.note}\n\n` + (findMsg()?.content ?? ""),
+          });
+        }
+      } else if (event.kind === "mcp") {
+        const servers = Array.isArray(event.servers) ? event.servers : [];
+        if (servers.length > 0) {
+          const note = `> 🔌 **MCP: ${servers.join(", ")}**\n\n`;
+          store.updateMessage(assistantMsg.id, {
+            content: note + (findMsg()?.content ?? ""),
           });
         }
       } else if (event.kind === "subagent_models") {
@@ -1962,12 +1986,13 @@ export function ChatPanel() {
       });
       setInput("");
       setCmdOpen(null);
+      forceScrollToBottom();
       void steerChat(chatObj.id, userMsg.id, v);
       return;
     }
     setInput("");
     setCmdOpen(null);
-    void send(v, atts, imgs);
+    void send(v, atts, imgs, false, undefined, true);
   };
 
   const queueForLater = () => {
@@ -1985,6 +2010,7 @@ export function ChatPanel() {
       images: imgs,
       kind: "queue",
     });
+    forceScrollToBottom();
     setInput("");
     setImages([]);
   };

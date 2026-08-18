@@ -866,9 +866,13 @@ def persist_skill(
         store = open_skill_store()
     if store is not None:
         try:
+            # Index only the name+description passage (same as
+            # _sync_skills_to_store): the body is instructions, not a
+            # description of what the skill IS, and embedding it inflates
+            # semantic scores with irrelevant content.
             store.upsert_doc(
                 path, KIND_SKILL, name,
-                [f"{name}. {description}", body[:2000]],
+                [f"{name}. {description}"],
             )
             if previous_name and previous_name != name:
                 prev_slug = slugify(previous_name)

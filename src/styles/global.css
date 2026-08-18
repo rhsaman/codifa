@@ -453,6 +453,47 @@ textarea {
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
 }
 
+/* Attention badge for chats waiting on the user — a permission request
+   (amber shield) or a question popup (blue ?). Distinct colors so they stand
+   out from the streaming dot and are noticeable from another chat. */
+.chat-item-pending {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: #fff;
+  animation: chat-streaming-pulse 1.2s ease-in-out infinite;
+}
+.chat-item-pending.permission {
+  background: #f59e0b;
+}
+.chat-item-pending.ask {
+  background: #3b82f6;
+}
+
+/* Group-level attention badge (count of chats waiting on the user), so a
+   pending ask/permission is visible even when the workspace group is
+   collapsed. */
+.sidebar-group-pending {
+  flex: 0 0 auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  background: #f59e0b;
+  animation: chat-streaming-pulse 1.2s ease-in-out infinite;
+}
+
 @keyframes chat-streaming-pulse {
   0%,
   100% {
@@ -1558,10 +1599,15 @@ textarea {
   position: relative;
 }
 
+/* Floating "jump to bottom" pill. Was `position: absolute` — which anchors it
+   to the bottom of the CONTENT, so scrolling up carried it out of view (the
+   exact moment you need it). `position: sticky` pins it to the bottom of the
+   scrollport instead, so it floats above the last visible message. */
 .scroll-jump {
-  position: absolute;
-  right: 18px;
+  position: sticky;
   bottom: 14px;
+  align-self: flex-end;
+  margin-inline-end: 4px;
   z-index: 30;
   width: 34px;
   height: 34px;
@@ -1575,6 +1621,9 @@ textarea {
   cursor: pointer;
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
   animation: popover-in 0.15s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.15s ease;
 }
 
 .scroll-jump svg {
@@ -1585,6 +1634,11 @@ textarea {
 .scroll-jump:hover {
   background: var(--accent-dim);
   color: var(--text);
+  transform: translateY(-1px);
+}
+
+.scroll-jump:active {
+  transform: translateY(0) scale(0.96);
 }
 
 .chat-messages {
@@ -1608,6 +1662,26 @@ textarea {
   text-transform: uppercase;
   letter-spacing: 0.6px;
   color: var(--text-dim);
+}
+
+/* User messages get a small identity dot before the "You" label so the
+   bubble reads as the user's own at a glance. */
+.msg.user .msg-role {
+  color: color-mix(in srgb, var(--text) 78%, var(--accent));
+  font-weight: 600;
+  letter-spacing: 0.8px;
+}
+
+.msg.user .msg-role::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-inline-end: 6px;
+  background: var(--accent);
+  vertical-align: 1px;
+  opacity: 0.7;
 }
 
 .steer-note {
@@ -1714,12 +1788,24 @@ textarea {
 }
 
 .msg.user .msg-bubble {
-  background: var(--bg-input);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 7%, var(--bg-input)),
+    var(--bg-input)
+  );
   border: 1px solid var(--border);
+  border-radius: 14px 14px 14px 6px;
+  /* The base .msg-bubble only pads 4px horizontally — that's what glued the
+     text to the corner. User bubbles get real breathing room. */
+  padding: 10px 14px;
 }
 
 .chat-messages[data-dir="rtl"] .msg.user .msg-bubble {
   text-align: right;
+}
+
+.chat-messages[data-dir="ltr"] .msg.user .msg-bubble {
+  border-radius: 14px 6px 14px 14px;
 }
 
 .msg.error .msg-bubble {
@@ -7368,10 +7454,15 @@ textarea {
 
 /* 5) Chat bubbles keep their surface + shadow, errors get a danger ring. */
 .msg.user .msg-bubble {
-  background: var(--bg-input);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 8%, var(--bg-input)),
+    var(--bg-input)
+  );
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.05);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 8px 20px -10px rgba(0, 0, 0, 0.3);
 }
 
 .msg.error .msg-bubble {

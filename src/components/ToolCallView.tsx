@@ -15,7 +15,12 @@ const TOOL_LABEL: Record<string, string> = {
   memory: 'memory',
   ask_user: 'ask_user',
   fetch_url: 'fetch_url',
+  task: 'task',
 }
+
+/** A task card running the explore agent (opencode-style subagent). */
+const isExploreCard = (a: ToolActivity) =>
+  a.tool === 'task' && a.args?.subagent_type === 'explore'
 
 function fmtTime(ms?: number): string {
   if (!ms) return ''
@@ -41,6 +46,10 @@ const HEADER_SHOWN_KEYS = new Set([
   'query',
   'pattern',
   'task',
+  'description',
+  'subagent_type',
+  'prompt',
+  'task_id',
   'text',
   'subject',
   'paths',
@@ -275,8 +284,8 @@ export const ToolGroupView = memo(function ToolGroupView({
 }) {
   const [open, setOpen] = useState(false)
   const running = activities.some((a) => a.activity.status === 'running')
-  const errored = activities.some((a) => a.activity.status === 'error')
-  const denied = activities.some((a) => a.activity.status === 'denied')
+  const errored = activities.every((a) => a.activity.status === 'error')
+  const denied = activities.every((a) => a.activity.status === 'denied')
   const totalMs = activities.reduce((sum, a) => sum + (a.activity.elapsedMs || 0), 0)
 
   const counts: Record<string, number> = {}
@@ -384,11 +393,12 @@ export const ToolCallView = memo(function ToolCallView({
 }) {
   const [reverting, setReverting] = useState(false)
   const root = useStore((s) => s.root)
-  // Explore cards are collapsible and start collapsed: the nested
-  // read/grep/glob sub-list is noisy, so it stays hidden until clicked.
-  const [collapsed, setCollapsed] = useState(activity.tool === 'explore')
+  // Task cards (explore/general sub-agents) are collapsible and start
+  // collapsed: the nested read/grep/glob sub-list is noisy, so it stays
+  // hidden until clicked.
+  const [collapsed, setCollapsed] = useState(isExploreCard(activity))
   const collapsible =
-    activity.tool === 'explore' &&
+    activity.tool === 'task' &&
     ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary))
 
   // Live elapsed time while the tool is still running.
@@ -425,7 +435,7 @@ export const ToolCallView = memo(function ToolCallView({
   }
 
   return (
-    <div className={`tool-card ${activity.status}${activity.tool === 'explore' ? ' explore' : ''}`}>
+    <div className={`tool-card ${activity.status}${isExploreCard(activity) ? ' explore' : ''}`}>
       <div
         className={`tool-card-head${collapsible ? ' collapsible' : ''}`}
         onClick={collapsible ? () => setCollapsed((c) => !c) : undefined}
@@ -444,11 +454,18 @@ export const ToolCallView = memo(function ToolCallView({
         }
       >
         <StatusIcon status={activity.status} />
-        <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+        <span className="tool-name">
+          {isExploreCard(activity)
+            ? 'explore'
+            : TOOL_LABEL[activity.tool] ?? activity.tool}
+        </span>
         {activity.model && (
           <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
             {activity.model}
           </span>
+        )}
+        {activity.tool === 'task' && !!activity.args?.subagent_type && (
+          <span className="tool-badge">{String(activity.args.subagent_type)}</span>
         )}
         {activity.tool === 'web_search' && activity.engine && (
           <span className="tool-badge">{activity.engine}</span>
@@ -486,12 +503,12 @@ export const ToolCallView = memo(function ToolCallView({
         {activity.args && activity.args.pattern !== undefined && (
           <span className="tool-cmd">{fixZwsp(String(activity.args.pattern))}</span>
         )}
-        {activity.args && activity.args.task !== undefined && (
-          <span className="tool-cmd tool-task" title={String(activity.args.task)}>
-            {fixZwsp(String(activity.args.task))}
+        {activity.args && activity.args.description !== undefined && (
+          <span className="tool-cmd tool-task" title={String(activity.args.description)}>
+            {fixZwsp(String(activity.args.description))}
           </span>
         )}
-        {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
+        {activity.tool === 'task' && activity.children && activity.children.length > 0 && (
           <span className="tool-badge tool-sub-count">
             {activity.children.length} call{activity.children.length === 1 ? '' : 's'}
           </span>
@@ -524,7 +541,7 @@ export const ToolCallView = memo(function ToolCallView({
       {!collapsed && (
       <div className="tool-card-body">
           {activity.summary && <div className="tool-summary">{fixZwsp(activity.summary)}</div>}
-          {activity.tool === 'explore' && activity.children && activity.children.length > 0 && (
+          {activity.tool === 'task' && activity.children && activity.children.length > 0 && (
             <div className="tool-sub-list">
               {activity.children.map((child, i) => (
                 <ToolSubRow

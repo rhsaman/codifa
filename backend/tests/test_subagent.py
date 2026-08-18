@@ -1,9 +1,10 @@
 """Live test: the explore SUB-AGENT runs end-to-end.
 
-The parent model calls `explore`; explore spins up an ISOLATED pydantic-ai
-sub-agent (its own model request against the mock, JSON not SSE) which produces
-a report; explore returns that report to the parent. If any link is broken the
-tool falls back to "unavailable"/"failed"/"step budget exceeded".
+The parent model calls `task` (subagent_type='explore'); task spins up an
+ISOLATED pydantic-ai sub-agent (its own model request against the mock, JSON
+not SSE) which produces a report; task returns that report to the parent. If
+any link is broken the tool falls back to "unavailable"/"failed"/"step budget
+exceeded".
 """
 import asyncio
 import json
@@ -92,7 +93,11 @@ async def main():
             fh.write("def foo():\n    return 42\n")
 
         mock.script = [
-            tool_call("explore", json.dumps({"task": "find where foo is defined"})),
+            tool_call("task", json.dumps({
+                "description": "find foo",
+                "prompt": "find where foo is defined",
+                "subagent_type": "explore",
+            })),
             text_reply("SUBAGENT REPORT: foo is defined in app.py:1"),
             text_reply("Done. The exploration is complete."),
         ]
@@ -115,9 +120,9 @@ async def main():
             f"expected parent+sub-agent requests, got {len(mock.captured)}"
         print("  subagent OK: 3 model requests (parent x2 + sub-agent x1)")
 
-        tool_results = [e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "explore"]
+        tool_results = [e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "task"]
         assert tool_results and "chars" in tool_results[0].get("summary", ""), \
-            f"unexpected explore result: {tool_results[0] if tool_results else 'none'}"
+            f"unexpected task result: {tool_results[0] if tool_results else 'none'}"
         streamed = "".join(e.get("content", "") for e in events if e.get("kind") == "text")
         assert "SUBAGENT REPORT" not in streamed, "sub-agent report leaked into parent stream"
         sub_req = mock.captured[1]

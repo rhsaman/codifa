@@ -27,23 +27,56 @@ export function stripBidiMarks(text: string): string {
 // safety measure instead of a regular space:
 //   ZWSP (U+200B), LRM (U+200E), RLM (U+200F), ALM (U+061C).
 // Simply deleting them glues Persian and English words together ("سلام world" →
-// "سلامworld"). A run of these flanked by two word characters (letters/digits —
-// Persian or Latin), by a word character and a markdown INLINE opener
-// (* _ ` [ — so "سلام\u200B**world**" keeps its space too), or by a word
-// character and a bracket that belongs to the neighbouring word (")" ends a
-// word like "(world)", "(" starts one — so "سلام\u200B(world)" and
-// "(world)\u200Bسلام" keep their spaces), is a real word boundary → replace the
-// WHOLE run with a single regular space. Matching the run (not one char)
+// "سلامworld"), so a separator run is converted to a single regular space
+// whenever it actually marks a word boundary. Matching the run (not one char)
 // matters: models sometimes emit several separators in a row, and a per-char
 // check would drop them all (each neighbor is another separator, not a word
-// char) → words glued. Any other separator (at an edge, beside punctuation,
-// inside code) is dropped.
-const INVISIBLE_SEP = /[\u200B\u200E\u200F\u061C]/g
-const INVISIBLE_SEP_BETWEEN_WORDS =
-  /(?<=[\p{L}\p{N}\)\]])[\u200B\u200E\u200F\u061C]+(?=[\p{L}\p{N}(*_`\[])/gu
+// char) → words glued.
+//
+// A run is a word boundary when the character BEFORE it wants a space after it
+// and the character AFTER it wants a space before it:
+//   LEFT  — letters/digits, closing brackets ) ], dashes — – (Persian wraps —
+//           in spaces), and pause punctuation ، ؛ ؟ ! . , : ; — the separator
+//           then belongs to the FOLLOWING word ("سلام،\u200Bجهان" → "سلام، جهان").
+//   RIGHT — letters/digits, opening brackets ( [, markdown inline openers
+//           * _ `, dashes, and opening/ambiguous quotes.
+// A run at the very START or END of a text slice also becomes a space: during
+// streaming the slice boundary can split "word\u200B" from the next chunk
+// "جهان", and a rule demanding BOTH neighbors would delete the separator at
+// that moment → the words glue across the split. A leading/trailing space is
+// invisible, so this is safe. Any other run — beside real whitespace (a space
+// already exists), beside a newline, or beside attaching punctuation that
+// would make "سلام ." wrong — is dropped.
+const INVISIBLE_SEP = /[\u200B\u200E\u200F\u061C]+/g
+const LEFT_WORDISH = /[\p{L}\p{N}\)\]\u060C\u061B\u061F,.;!?:»«\u2013\u2014"']/u
+const RIGHT_WORDISH = /[\p{L}\p{N}(*_`\[\u2013\u2014«»"']/u
 
 export function fixZwsp(text: string): string {
-  return text.replace(INVISIBLE_SEP_BETWEEN_WORDS, " ").replace(INVISIBLE_SEP, "")
+  return text.replace(INVISIBLE_SEP, (sep, offset) => {
+    const before = text[offset - 1]
+    const after = text[offset + sep.length]
+    // Real whitespace on either side → a space already exists (or the
+    // separator sits beside a newline): drop it.
+    if (before && /\s/u.test(before)) return ""
+    if (after && /\s/u.test(after)) return ""
+    // Slice edge: keep a space (invisible) so a separator split across two
+    // streamed chunks / segments can't glue the words on each side.
+    const leftOk = before === undefined ? true : LEFT_WORDISH.test(before)
+    const rightOk = after === undefined ? true : RIGHT_WORDISH.test(after)
+    return leftOk && rightOk ? " " : ""
+  })
+}
+
+// Direction for UI containers that must line up with the app's RTL/LTR toggle
+// (ask cards, steer/queue bubbles, composer). dir="auto" alone resolves from
+// the FIRST strong character, so a mostly-Persian message that opens with a
+// Latin word or digit ("API key رو بده", "3 فایل باز کن") renders LTR and
+// flips sides between the composer (which forces the app-wide dir) and the
+// bubble. Any Persian/Arabic character in the text means the user expects RTL
+// layout — decide from the whole text, not the first char.
+const RTL_CHAR_RE = new RegExp(`[${PERSIAN_RANGE}]`)
+export function detectDir(text: string): 'rtl' | 'ltr' {
+  return RTL_CHAR_RE.test(text) ? 'rtl' : 'ltr'
 }
 
 // Prepare message content for rendering. Direction is handled natively by the

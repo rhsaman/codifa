@@ -23,6 +23,7 @@ import { deleteMcp, listMcp, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
 import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
+import { DEFAULT_THEME } from './themes'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -282,7 +283,7 @@ interface State {
   /** Names of built-in MCP connectors (e.g. "docker") that can't be removed. */
   builtinMcp: string[]
   root: string
-  theme: 'dark' | 'light'
+  theme: string
   dir: 'rtl' | 'ltr'
   recentModels: RecentModel[]
   sidebarOpen: boolean
@@ -297,6 +298,10 @@ interface State {
   /** Project roots whose workspace was deleted — their vector store is removed. */
   deletedWorkspaceRoots: string[]
   activeChatId: string
+  /** Chat ids whose agent FINISHED a turn (sent a message) while the user was
+   *  looking at another chat → steady green dot in the sidebar. Session-scoped
+   *  (not persisted); cleared when the user opens the chat (setActiveChat). */
+  unreadChats: string[]
   settingsOpen: boolean
   isStreaming: boolean
   isThinking: boolean
@@ -334,8 +339,7 @@ interface State {
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
   toggleSidebar: () => void
-  setTheme: (theme: 'dark' | 'light') => void
-  toggleTheme: () => void
+  setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
   fontSize: number
@@ -406,6 +410,8 @@ interface State {
   setPrefixNotice: (notice: string | null) => void
   addMessage: (chatId: string, message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
+  /** Remove a message from a chat's thread (e.g. cancelling a pending steer). */
+  removeMessage: (chatId: string, id: string) => void
   /** Record a message typed while the chat's agent is already working. */
   queueMessage: (chatId: string, msg: Omit<QueuedMessage, 'createdAt'>) => void
   removeQueuedMessage: (chatId: string, id: string) => void
@@ -504,7 +510,7 @@ export const useStore = create<State>((set, get) => ({
   settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactThreshold: 80 },
   builtinMcp: [],
   root: '',
-  theme: 'dark',
+  theme: DEFAULT_THEME,
   dir: 'rtl',
   fontSize: 14,
   vectorDbPath: '',
@@ -535,6 +541,7 @@ export const useStore = create<State>((set, get) => ({
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
   activeChatId: '',
+  unreadChats: [],
   prefixNotice: null,
   settingsOpen: false,
   isStreaming: false,
@@ -978,11 +985,9 @@ export const useStore = create<State>((set, get) => ({
   setTheme: (theme) => {
     set({ theme })
     document.documentElement.dataset.theme = theme
-  },
-
-  toggleTheme: () => {
-    const next = get().theme === 'dark' ? 'light' : 'dark'
-    get().setTheme(next)
+    try {
+      localStorage.setItem('coder:theme', theme)
+    } catch {}
   },
 
   setDir: (dir) => {
@@ -1158,7 +1163,13 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
-      return { chats, activeChatId, deletedChatIds: [...s.deletedChatIds, id], pinnedChats: s.pinnedChats.filter((k) => k !== id) }
+      return {
+        chats,
+        activeChatId,
+        deletedChatIds: [...s.deletedChatIds, id],
+        pinnedChats: s.pinnedChats.filter((k) => k !== id),
+        unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
     })
     get().persist()
   },
@@ -1183,6 +1194,7 @@ export const useStore = create<State>((set, get) => ({
         pinnedWorkspaces,
         pinnedChats,
         activeChatId,
+        unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
         deletedChatIds: [
           ...s.deletedChatIds,
           ...s.chats.filter((c) => workspaceKey(c.root ?? '') === key).map((c) => c.id),
@@ -1229,7 +1241,11 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setActiveChat: (id) => {
-    set({ activeChatId: id })
+    set((s) => ({
+      activeChatId: id,
+      // Opening a chat clears its green "new message" dot.
+      unreadChats: s.unreadChats.filter((cid) => cid !== id),
+    }))
     get().persist()
   },
 
@@ -1302,14 +1318,14 @@ export const useStore = create<State>((set, get) => ({
           ? {
               ...c,
               messages: [...c.messages, full],
-              // A chat's sidebar position only changes when its agent's turn
-              // COMPLETES (see updateMessage). Sending a user message or the
-              // streaming assistant message must NOT float the chat to the top
-              // mid-run, or two concurrent chats keep swapping places. Instant
-              // completed assistant replies (undo/redo/help/skill confirmations)
-              // still bump, since they're finished turns.
+              // The sidebar sorts by the most recent message activity: sending
+              // a user message, or a completed assistant reply, floats the
+              // chat to the top of its group. Streaming assistant deltas stay
+              // put mid-run so two concurrent chats don't keep swapping places
+              // while the agent streams — the final setStreaming(false) bumps.
               updatedAt:
-                !message.streaming && message.role === 'assistant'
+                !message.streaming &&
+                (message.role === 'user' || message.role === 'assistant')
                   ? Date.now()
                   : c.updatedAt,
               title: c.messages.length === 0 && message.role === 'user' ? message.content.slice(0, 48) : c.title,
@@ -1320,6 +1336,17 @@ export const useStore = create<State>((set, get) => ({
     })
     get().persist()
     return full
+  },
+
+  removeMessage: (chatId, id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === chatId
+          ? { ...c, messages: c.messages.filter((m) => m.id !== id) }
+          : c,
+      ),
+    }))
+    get().persist()
   },
 
   queueMessage: (chatId, msg) => {
@@ -1361,8 +1388,9 @@ export const useStore = create<State>((set, get) => ({
   },
 
   updateMessage: (id, patch) => {
-    set((s) => ({
-      chats: s.chats.map((c) => {
+    let completedChatId: string | null = null
+    set((s) => {
+      const chats = s.chats.map((c) => {
         const msg = c.messages.find((m) => m.id === id)
         if (!msg) return c
         // Only the turn-completion transition (streaming true -> false) moves
@@ -1370,13 +1398,21 @@ export const useStore = create<State>((set, get) => ({
         // not reorder it, or two concurrent chats trade places constantly.
         const completes =
           msg.streaming === true && patch.streaming === false
+        if (completes) completedChatId = c.id
         return {
           ...c,
           messages: c.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
           updatedAt: completes ? Date.now() : c.updatedAt,
         }
-      }),
-    }))
+      })
+      // A turn finishing in a chat the user is NOT looking at = new message in
+      // the background → steady green dot in the sidebar until the user opens it.
+      const unreadChats =
+        completedChatId && completedChatId !== s.activeChatId && !s.unreadChats.includes(completedChatId)
+          ? [...s.unreadChats, completedChatId]
+          : s.unreadChats
+      return { chats, unreadChats }
+    })
     // updateMessage fires on every SSE token while streaming — persisting the
     // whole chats array each time is what hammers coder.db / app-state-cache.json.
     // Skip it during streaming; the final state is persisted once the stream ends

@@ -24,6 +24,7 @@ export const api = {
   selectFolder: () => window.coder.selectFolder(),
   selectFile: () => window.coder.selectFile(),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => window.coder.fsList(root, rel),
+  fsWalk: (root: string): Promise<WorkspaceFile[]> => window.coder.fsWalk(root),
   fsRead: (root: string, rel: string): Promise<{ content: string }> => window.coder.fsRead(root, rel),
   fsWrite: (root: string, rel: string, content: string): Promise<boolean> =>
     window.coder.fsWrite(root, rel, content),
@@ -66,7 +67,7 @@ export const api = {
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'dist-electron',
   'release', 'build', 'coverage', '.idea', '.vscode', '.next', 'out', 'target',
-  'node_modules/.cache',
+  'node_modules/.cache', 'vendor',
 ])
 const MAX_INDEXED = 800
 
@@ -76,6 +77,11 @@ export interface WorkspaceFile {
 }
 
 export async function workspaceFiles(root: string): Promise<WorkspaceFile[]> {
+  // Single-pass walk in the main process: fast, no per-directory IPC, and no
+  // 800-file cap that used to silently drop whole subfolders (e.g. the second
+  // of two project folders). Falls back to the old per-dir walk if unavailable.
+  const walked = await api.fsWalk(root).catch(() => null)
+  if (walked) return walked
   const out: WorkspaceFile[] = []
   const stack: string[] = ['']
   while (stack.length > 0 && out.length < MAX_INDEXED) {

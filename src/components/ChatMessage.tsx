@@ -10,8 +10,9 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage, ToolActivity } from '../types'
-import { fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
+import { detectDir, fixZwsp, prepareContent, stripBidiMarks } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
+import { cancelSteer } from '../lib/api'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { ToolCallView, ToolGroupView } from './ToolCallView'
@@ -404,7 +405,7 @@ function SegSteerBubble({
   return (
     <div className="seg-steer">
       <div className="seg-steer-label">You</div>
-      <div className="seg-steer-text" dir="auto">
+      <div className="seg-steer-text" dir={detectDir(message.content)}>
         {prepareContent(message.content, dir) || '(empty)'}
       </div>
       {message.attachments && message.attachments.length > 0 && (
@@ -691,10 +692,31 @@ export const ChatMessageView = memo(function ChatMessageView({
         ) : isUser && message.steerPending ? (
           <div className="queued-bubble steer" dir={dir}>
             <div className="queued-bubble-head">
-              <span className="queued-bubble-icon">↝</span>
+              <span className="queued-bubble-icon">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 14L4 9l5-5" />
+                  <path d="M4 9h10a5 5 0 015 5v6" />
+                </svg>
+              </span>
               <span className="queued-bubble-label">Steering the running agent…</span>
+              <span className="queued-bubble-pulse" />
+              <button
+                className="chip-x queued-bubble-x"
+                onClick={() => {
+                  const s = useStore.getState()
+                  const chat = s.chats.find((c) =>
+                    c.messages.some((m) => m.id === message.id),
+                  )
+                  if (!chat) return
+                  s.removeMessage(chat.id, message.id)
+                  void cancelSteer(chat.id, message.id)
+                }}
+                title="Cancel steer — remove this message"
+              >
+                ×
+              </button>
             </div>
-            <div className="queued-bubble-text" dir="auto">
+            <div className="queued-bubble-text" dir={detectDir(message.content)}>
               {prepareContent(message.content, dir)}
             </div>
           </div>

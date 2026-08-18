@@ -276,6 +276,21 @@ export async function streamChat(
   const decoder = new TextDecoder()
   let buffer = ''
 
+  // Parse one complete SSE frame (everything between two blank lines).
+  const parseFrame = (frame: string) => {
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (!raw) continue
+      try {
+        const event = JSON.parse(raw) as SidecarEvent
+        onEvent(event)
+      } catch {
+        /* skip malformed frame */
+      }
+    }
+  }
+
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -286,19 +301,16 @@ export async function streamChat(
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const chunk = buffer.slice(0, idx)
         buffer = buffer.slice(idx + 2)
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue
-          const raw = line.slice(6).trim()
-          if (!raw) continue
-          try {
-            const event = JSON.parse(raw) as SidecarEvent
-            onEvent(event)
-          } catch {
-            /* skip malformed frame */
-          }
-        }
+        parseFrame(chunk)
       }
     }
+    // Flush whatever is left after the last blank line: the final SSE frame
+    // usually arrives WITHOUT a trailing "\n\n" (the stream just closes), so
+    // without this the LAST text/done/usage event is silently dropped and the
+    // streamed message looks truncated — "the ending gets deleted". Also flush
+    // any pending multi-byte UTF-8 tail (decoder.decode() with no args).
+    buffer += decoder.decode()
+    if (buffer.trim()) parseFrame(buffer)
   } finally {
     reader.releaseLock()
   }
@@ -325,6 +337,21 @@ export async function steerChat(
     return body.ok !== false
   } catch {
     return false
+  }
+}
+
+/** Cancel a pending steer message (user deleted it before the agent read it). */
+export async function cancelSteer(chatId: string, id: string): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/chat/steer/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, id }),
+    })
+  } catch {
+    /* best effort */
   }
 }
 

@@ -7,6 +7,7 @@ import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
+import { THEMES } from '../lib/themes'
 
 const KIND_LABELS: Record<ProviderKind, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -472,6 +473,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const compactThreshold = useStore((s) => s.settings.compactThreshold ?? 80)
   const setCompactThreshold = useStore((s) => s.setCompactThreshold)
   const root = useStore((s) => s.root)
+  const theme = useStore((s) => s.theme)
+  const setTheme = useStore((s) => s.setTheme)
 
   const providers = settings.providers
   // Which provider's config is being EDITED in this dialog. Deliberately NOT
@@ -505,7 +508,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'fonts' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models' | 'general'>('providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models' | 'general'>('providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
     clientId: googleProvider?.oauthClientId ?? '',
@@ -1055,12 +1058,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       ),
     },
     {
-      id: 'fonts',
-      label: 'Fonts',
+      id: 'appearance',
+      label: 'Appearance',
       group: 'App',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M6 19 10.5 5h1L16 19M7.5 14.5h7" />
+          <path d="M12 22a10 10 0 1 1 10-10c0 2-1.5 3-3 3h-2a3 3 0 0 0-3 3v1c0 1.5-1 2-2 2Z" />
         </svg>
       ),
     },
@@ -1088,7 +1091,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     },
   ]
 
-  // Tabs 'providers' / 'modes' / 'fonts' / 'auth' edit LOCAL buffered state
+  // Tabs 'providers' / 'modes' / / 'auth' edit LOCAL buffered state
   // (`cfg`, `promptDrafts`, `googleAuthDraft`) that is only committed to the
   // store when Save is pressed — every other tab (plugins, mcp, skills,
   // memory, subagents, models) writes straight to the store as the user
@@ -1099,7 +1102,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // switching tabs. Collapsing it to this one boolean keeps the rule simple
   // and visible: buffered tabs always show Cancel+Save, every other tab
   // always shows a single Done button.
-  const hasBufferedEdits = tab === 'providers' || tab === 'modes' || tab === 'fonts' || tab === 'auth'
+  const hasBufferedEdits = tab === 'providers' || tab === 'modes' || tab === 'auth'
   // Auto-save tabs: Done force-flushes any pending state to disk before
   // closing (a change made while a reply is streaming could otherwise be
   // lost) — previously this required an extra, easy-to-miss "Save" click on
@@ -1557,8 +1560,39 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </>
         )}
 
-        {tab === 'fonts' && (
+        {tab === 'appearance' && (
         <>
+            <div className="field">
+              <div className="field-head">
+                <label>Theme</label>
+              </div>
+              <div className="hint">
+                Color scheme for the whole app - pick one of the top Neovim
+                themes, plus the Claude app look. New themes are added in the
+                themes.ts file.
+              </div>
+              <div className="theme-grid">
+                {THEMES.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={`theme-card${theme === t.id ? ' active' : ''}`}
+                    onClick={() => setTheme(t.id)}
+                    title={t.blurb ?? t.name}
+                  >
+                    <span className="theme-swatch" aria-hidden>
+                      <i style={{ background: t.vars['--bg'] ?? 'var(--bg)' }}></i>
+                      <i style={{ background: t.vars['--bg-panel'] ?? 'var(--bg-panel)' }}></i>
+                      <i style={{ background: t.vars['--accent'] ?? 'var(--accent)' }}></i>
+                      <i style={{ background: t.vars['--link'] ?? 'var(--link)' }}></i>
+                      <i style={{ background: t.vars['--danger'] ?? 'var(--danger)' }}></i>
+                    </span>
+                    <span className="theme-name">{t.name}</span>
+                    <span className="theme-check">{theme === t.id ? '✓' : ''}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="field">
               <label>Font Size</label>
               <div className="font-size-row">

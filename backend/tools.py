@@ -11,6 +11,7 @@ import ast
 import asyncio
 import contextvars
 import difflib
+import functools
 import glob as _pyglob
 import json
 import os
@@ -26,6 +27,7 @@ from typing import Any
 
 import providers as _providers
 import state_db as _state_db
+from agent_registry import AGENTS
 from cache import Cache, cache_path_for
 from embeddings import EmbedderUnavailableError
 from memory_manager import MEM_SHORT_TERM, MemoryConfig, MemoryManager
@@ -60,22 +62,71 @@ _SUBAGENT_MAX_ATTEMPTS = 10
 
 # Set by agents.py before each agent run: the AUTO-SCOUTED WORKSPACE OVERVIEW
 # text (root listing — _AUTO_SCOUT_KEY_FILES is empty, so it's just the tiny
-# root-entries line). explore_tool reads it to tell the sub-agent the root is
-# already listed, so it doesn't re-glob the root to orient itself (a duplicate
-# of the main agent's auto-scout).
+# root-entries line). task_tool reads it to tell the explore sub-agent the root
+# is already listed, so it doesn't re-glob the root to orient itself (a
+# duplicate of the main agent's auto-scout).
 _SCOUT_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
     "coder_scout_ctx", default=""
 )
+
+# Sub-agent depth limit (opencode's `subagent_depth`, default 1): the parent can
+# spawn a sub-agent, but a sub-agent cannot spawn another. The `task` tool
+# checks this before running; the general sub-agent's tools exclude `task` so
+# nesting is impossible anyway — this is a belt-and-suspenders guard.
+_SUBAGENT_DEPTH_LIMIT = 1
+_TASK_DEPTH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "coder_task_depth", default=0
+)
+
+# Set while a GENERAL sub-agent runs: its tool calls reuse the PARENT's tool
+# functions (which emit into the same stream), and these flags make `_emit` tag
+# them `sub=True` and stamp the task card's branch id on them, so they nest
+# under the task card and never count against the parent's deterministic
+# tool-step budget (they run in an isolated transcript, like explore's).
+_SUB_AGENT_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "coder_sub_agent_ctx", default=False
+)
+_SUB_AGENT_BRANCH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "coder_sub_agent_branch", default=0
+)
+
+# Per-branch early-stop state for the EXPLORE sub-agent (set by _run_explore):
+# {"streak": consecutive empty tool results, "found_any": any non-empty result
+# so far, "threshold": empty_stop_after for this thoroughness}. The sub-tools
+# update it via _sub_track_result; _PerStepFallbackModel.request() reads it to
+# stop a fruitless search early (no more model round-trips = no more token
+# burn) instead of letting it run the whole budget. `found_any` guards quality:
+# a search that HAS found useful info is never hard-stopped with "not found" —
+# it raises _SubEarlyStop so the findings-so-far are returned as the report.
+_sub_empty_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "explore_sub_empty", default=None
+)
+
+
+def _thoroughness_from_prompt(text: str) -> str:
+    """Parse the thoroughness level out of a task prompt.
+
+    opencode passes thoroughness in the task prompt TEXT (the explore agent
+    description tells the model to "specify the desired thoroughness level:
+    quick / medium / very thorough"), not as a structured param. Parse it back
+    out so the sub-agent prompt adapts (quick/medium/very thorough).
+    """
+    low = (text or "").lower()
+    if "very thorough" in low or "comprehensive" in low or "exhaustive" in low:
+        return "very thorough"
+    if "quick" in low or "fast" in low or "brief" in low or "minimal" in low:
+        return "quick"
+    return "medium"
 
 
 def _is_content_gathering(text: str) -> bool:
     """Heuristic for whether a task needs substantial verbatim content from
     several files (styling / refactor / rewrite) rather than a narrow lookup.
 
-    Drives two behaviors: (1) ``explore_tool`` gives content-heavy tasks a bigger
+    Drives two behaviors: (1) ``task_tool`` gives content-heavy tasks a bigger
     report budget and allows verbatim code blocks; (2) the plan/coder agent's
     own-search quota is bumped so it can gather content from known files itself
-    instead of looping explore. Keyword-based on purpose — cheap and stable —
+    instead of looping task/explore. Keyword-based on purpose — cheap and stable —
     not a full classifier. ``path_hint``/``hints`` presence alone does NOT count:
     a scoped question can still be a short fact-lookup.
     """
@@ -150,6 +201,50 @@ def _thoroughness_prompt(thoroughness: str) -> str:
     )
 
 
+def _explore_usage_limits(
+    thoroughness: str, content_gathering: bool = False
+) -> dict:
+    """Per-thoroughness explore sub-agent budgets (request/tool-call caps and
+    widen caps).
+
+    Every sub-agent model request re-sends the whole transcript to the model,
+    so the REQUEST count is the dominant search-TIME cost — bounding it is what
+    keeps an explore search fast. ``quick`` must finish in a couple of
+    round-trips; ``medium`` gets the standard sweep; ``very thorough`` the
+    widest. Content-gathering tasks (refactor / restyle / verbatim-code
+    lookups) keep a high floor so a broad investigation finishes in ONE run
+    instead of hitting the budget and forcing the parent to split it up (each
+    split re-pays the discovery overhead). The widen-and-resume loop in
+    _run_explore_inner still lets a legitimately broad search continue past
+    the base cap (up to ``*_cap``, at most ``widen_max`` extra runs), so these
+    caps bound search TIME, not search QUALITY — a progressing search is never
+    cut off mid-investigation, only a runaway loop is.
+    """
+    base = {
+        "quick": (3, 6),
+        "medium": (6, 12),
+        "very thorough": (12, 24),
+    }
+    req, calls = base.get((thoroughness or "medium").strip().lower(), (6, 12))
+    if content_gathering:
+        req = max(req, 12)
+        calls = max(calls, 24)
+    return {
+        "request_limit": req,
+        "tool_calls_limit": calls,
+        "request_cap": min(req * 2, 24),
+        "tool_calls_cap": min(calls * 2, 36),
+        "widen_max": 1 if (thoroughness or "").strip().lower() == "quick" else 2,
+        # Consecutive EMPTY sub-search results allowed before the explore stops
+        # early (no more model round-trips). Scales with thoroughness so a
+        # "very thorough" sweep can still try multiple phrasings (persistence)
+        # before concluding not-found; quick stops almost immediately.
+        "empty_stop_after": {"quick": 2, "medium": 3, "very thorough": 4}.get(
+            (thoroughness or "medium").strip().lower(), 3
+        ),
+    }
+
+
 async def _run_subagent_call(
     factory: Callable[[], Any],
     label: str,
@@ -172,6 +267,25 @@ async def _run_subagent_call(
     # The old 30s x 10 backoff (up to 5 minutes of silent stalling per call) is
     # what made an explore run feel like it searched for half an hour.
     return await factory()
+
+
+class _SubEarlyStop(Exception):
+    """Raised by the explore model wrapper when the sub-agent's last searches
+    were ALL empty but it HAD found useful information earlier (diminishing
+    returns — the prompt's hard-stop condition #3). The run is stopped so the
+    findings-so-far are returned as the report instead of burning more tokens
+    on fruitless searches."""
+
+
+def _sub_stop_report(streak: int) -> str:
+    """Report text returned when a fruitless explore is stopped early (nothing
+    useful was found at all — `found_any` is False, so "not found" is honest)."""
+    return (
+        "SEARCH STOPPED EARLY — the last "
+        f"{streak} searches returned no results, so the explore stopped to "
+        "avoid wasting tokens. Report: the requested information was not "
+        "found in the workspace with the searches performed."
+    )
 
 
 class _PerStepFallbackModel:
@@ -219,6 +333,28 @@ class _PerStepFallbackModel:
         model_request_parameters: Any = None,
         **kwargs: Any,
     ) -> Any:
+        # EARLY STOP (token waste guard): if this branch's last searches were
+        # all empty (streak >= threshold), do NOT call the model again — every
+        # request re-sends the whole transcript, so a fruitless search burning
+        # the full budget is pure token waste. If the sub-agent HAD found
+        # something earlier (found_any), raise _SubEarlyStop so the findings
+        # so far are returned as the report (never discard partial findings);
+        # otherwise return a "not found" report directly.
+        _est = _sub_empty_ctx.get()
+        if _est is not None and _est["streak"] >= _est["threshold"]:
+            if _est["found_any"]:
+                raise _SubEarlyStop()
+            from pydantic_ai.messages import (
+                ModelResponse as _MR,
+            )
+            from pydantic_ai.messages import (
+                TextPart as _TP,
+            )
+
+            return _MR(
+                parts=[_TP(content=_sub_stop_report(_est["streak"]))],
+                model_name=self.model_name,
+            )
         try:
             response = await self._primary.request(
                 messages,
@@ -2212,12 +2348,62 @@ def _explore_task_similar(a: str, b: str) -> float:
 
 def _explore_paths_compat(a: str, b: str) -> bool:
     """True when two explore path_hints constrain the same area: equal, one empty
-    (unconstrained), or one is a sub-path of the other."""
+    (unconstrained), or one is a sub-path of the other.
+
+    Retained for compatibility with older callers; the task tool no longer takes
+    a structured path_hint (the model puts the scope in the prompt text)."""
     a = (a or "").strip().strip("/")
     b = (b or "").strip().strip("/")
     if not a or not b:
         return True
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def _tool_event(ev: dict) -> dict:
+    """Shape a tool event for the SSE stream: whitelist the fields the UI can
+    render. LIVES HERE (not in agents.py) so the backend tests can import it
+    without pulling in agents' heavy dependencies.
+
+    IMPORTANT: the whitelist MUST include ``branch`` — the frontend routes a
+    task call's sub-events to ITS OWN card by this id (Chat.tsx). When it was
+    missing, ``branch`` was stripped from every event, and the frontend fell
+    back to nesting every sub-event into EVERY running task card — three
+    parallel explores all showed the same stats ("116 calls · 109.5s" on each
+    card)."""
+    kind = ev.get("kind", "tool_result")
+    if kind == "usage":
+        # Usage events carry token/cost/model fields the UI needs verbatim —
+        # they are NOT tool activity, so pass them through untouched (the
+        # explore sub-agent emits them through the same emit callback).
+        return dict(ev)
+    if kind not in ("tool", "tool_result", "diff", "plan", "permission", "ask"):
+        kind = "tool_result"
+    out: dict = {"kind": kind, "tool": ev.get("tool", "")}
+    for key in (
+        "args",
+        "summary",
+        "path",
+        "diff",
+        "content",
+        "items",
+        "results",
+        "engine",
+        "call_id",
+        "id",
+        "action",
+        "reason",
+        "sub",
+        "question",
+        "options",
+        "scope",
+        "status",
+        "model",
+        "branch",
+    ):
+        val = ev.get(key)
+        if val is not None:
+            out[key] = val
+    return out
 
 
 def make_tool_callbacks(
@@ -2266,12 +2452,12 @@ def make_tool_callbacks(
     _call_seq = 0
     # Unique id per explore CALL: stamped on the explore card, its tool_result
     # and every sub-event so the frontend routes a call's sub-events to ITS OWN
-    # card even when two explore calls run concurrently (the parent can issue
+    # card even when two task calls run concurrently (the parent can issue
     # several in one parallel-tool-calls response). Without it, both calls'
-    # sub-events nest into the first running explore card ("all parallel
-    # explores show the same sub-searches"). One id per call — there is no
-    # fan-out into multiple sub-agents anymore.
-    _explore_call_seq = 0
+    # sub-events nest into the first running task card ("all parallel explores
+    # show the same sub-searches"). One id per call — there is no fan-out into
+    # multiple sub-agents anymore.
+    _task_call_seq = 0
     # Sub-agent tool→result correlation: name-based FIFO keyed per
     # (parent call id, tool). Concurrent explore calls each get their own queue,
     # so out-of-order completion across calls can't swap call_ids (call 2's
@@ -2295,6 +2481,16 @@ def make_tool_callbacks(
             # the parent's context) while still accruing it into the chat-wide
             # session totals.
             ev["sub"] = True
+        if _SUB_AGENT_CTX.get():
+            # A GENERAL sub-agent is running: its tool calls reuse the PARENT's
+            # tool functions, so tag them `sub=True` (they run in an isolated
+            # transcript — never count against the parent's tool-step budget)
+            # and stamp the task card's branch id so the frontend nests them
+            # under that card.
+            ev["sub"] = True
+            _br = _SUB_AGENT_BRANCH_CTX.get()
+            if _br:
+                ev["branch"] = _br
         is_sub = bool(ev.get("sub"))
         if not is_sub:
             # Parent tool invocation: read the per-invocation id. The wrapper
@@ -3385,8 +3581,31 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries", "model": _model})
         return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
-    async def explore_tool(task: str, path_hint: str = "", hints: str = "", thoroughness: str = "medium") -> str:
-        """Delegate a broad, read-only investigation to ONE ISOLATED sub-agent (its own search loop/context; only a short report reaches you). Use instead of a long chain of your own grep/glob/read when a question spans MANY files or an unfamiliar area. The sub-agent is a file-search specialist (like opencode's `explore`): it searches with glob/grep/read itself, in parallel tool calls, and hands back a compact structured report. Pass a clear, SPECIFIC `task`; optionally `path_hint` (subdir, e.g. 'src/components'), `hints` (known symbols/files), and `thoroughness` ('quick' | 'medium' | 'very thorough' — how deep to sweep; default 'medium'). Not for a single lookup — search yourself."""
+    async def task_tool(description: str, prompt: str, subagent_type: str, task_id: str = "") -> str:
+        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description — for the 'explore' agent, specify the desired thoroughness level ('quick' | 'medium' | 'very thorough'). `subagent_type`: the specialized agent to use — 'explore' (fast codebase search: find files by pattern, search code, answer codebase questions) or 'general' (general-purpose research / multi-step tasks). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        # --- opencode-style task tool dispatch ---
+        # Validate the subagent_type against the agent registry (opencode:
+        # "Unknown agent type: X is not a valid agent type").
+        if subagent_type not in AGENTS:
+            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
+            emit(_error_result("task", f"Unknown agent type: {subagent_type} is not a valid agent type"))
+            return f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
+        # Sub-agent depth limit (opencode's subagent_depth, default 1): a
+        # sub-agent cannot spawn another sub-agent.
+        if _TASK_DEPTH_CTX.get() >= _SUBAGENT_DEPTH_LIMIT:
+            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
+            emit(_error_result("task", "subagent depth limit reached"))
+            return (
+                f"ERROR: subagent depth limit reached ({_SUBAGENT_DEPTH_LIMIT}) — "
+                "a sub-agent cannot spawn another sub-agent."
+            )
+        # General-purpose sub-agent: inherits the parent's tools minus `task`.
+        if subagent_type == "general":
+            return await _run_general_task(description, prompt, task_id)
+        # --- explore agent (the file-search specialist) ---
+        # opencode passes thoroughness in the task prompt text, not a structured
+        # param — parse it back out so the sub-agent prompt adapts.
+        thoroughness = _thoroughness_from_prompt(prompt)
         # The model that will run this explore call: ALWAYS the explore
         # sub-agent. Per-sub-search fallback to the MAIN model happens INSIDE
         # _run_explore (the _PerStepFallbackModel wrapper), so a failed search
@@ -3395,30 +3614,30 @@ def make_tool_callbacks(
         _run_model = explore_model
         _run_model_name = str(getattr(_run_model, "model_name", "") or "")
         if explore_model is None:
-            emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": ""})
-            emit(_error_result("explore", "unavailable"))
-            return "ERROR: explore is unavailable (no model configured for this session)."
+            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
+            emit(_error_result("task", "unavailable"))
+            return "ERROR: the explore agent is unavailable (no model configured for this session)."
 
-        # CODE-LEVEL DEDUP of explore CALLS: the parent model often fires several
-        # explore calls in ONE parallel-tool-calls response with near-identical
-        # tasks (same area rephrased, or the same task with a different
+        # CODE-LEVEL DEDUP of explore task calls: the parent model often fires several
+        # task calls in ONE parallel-tool-calls response with near-identical
+        # prompts (same area rephrased, or the same task with a different
         # thoroughness). Each used to spawn its own sub-agent card — the
         # "چند تا اکسپلور با ساب ایجنت های مثل هم" symptom. A near-duplicate
-        # (containment >= 0.8 on the task text + compatible path_hint) reuses the
+        # (containment >= 0.8 on the prompt text) reuses the
         # earlier report instead of spawning another sub-agent — unless the NEW
         # call explicitly asks for deeper thoroughness than the earlier one ran.
         def _explore_reuse(prior: dict) -> str:
             return (
-                "[NOTE: this explore task is nearly identical to an explore already "
+                "[NOTE: this task is nearly identical to an explore task already "
                 "run this turn — reusing its report instead of spawning another "
                 "sub-agent.]\n\n"
                 + str(prior.get("report") or "")
             )
 
         def _explore_sig_matches(ent: dict) -> bool:
-            if not _explore_paths_compat(ent.get("path_hint", ""), path_hint):
+            if ent.get("subagent_type") != "explore":
                 return False
-            if _explore_task_similar(ent.get("task", ""), task) < 0.8:
+            if _explore_task_similar(ent.get("prompt", ""), prompt) < 0.8:
                 return False
             prior_thorough = str(ent.get("thoroughness") or "medium")
             # the new call explicitly wants a deeper sweep
@@ -3489,11 +3708,49 @@ def make_tool_callbacks(
             # activity) but tagged `sub=True` so the PARENT's deterministic
             # tool-step budget (see agents.py) does not count these steps —
             # they never enter the parent model's own resent transcript, only
-            # the sub-agent's, which is discarded once explore_tool returns.
+            # the sub-agent's, which is discarded once the task tool returns.
             event = dict(event)
             event["sub"] = True
             event.setdefault("model", _sub_emit_model_name)
             emit(event)
+
+        # Early-stop tracking: consecutive EMPTY tool results (grep/glob with no
+        # matches, read errors) increment the branch streak; any real content
+        # resets it and marks the branch as having found something. The model
+        # wrapper (_PerStepFallbackModel.request) reads this to stop a fruitless
+        # explore before it burns the whole budget on re-sent transcripts.
+        def _sub_track_result(out: str) -> None:
+            st = _sub_empty_ctx.get()
+            if st is None:
+                return
+            low = (out or "").strip().lower()
+            if (
+                not low
+                or low.startswith(
+                    ("error", "no matches", "no files match", "(no ")
+                )
+            ):
+                st["streak"] += 1
+            else:
+                st["streak"] = 0
+                st["found_any"] = True
+
+        def _sub_tracked(fn):
+            # functools.wraps is REQUIRED: pydantic-ai builds each tool's JSON
+            # schema from inspect.signature, and without it the wrapper's
+            # (*args, **kwargs) signature produced a garbage schema
+            # ({"additionalProperties": true, "properties": {"args": ...}}) —
+            # models then called read/grep/glob with an `args` list plus an
+            # `additionalProperty` key, and every sub-search crashed with
+            # "unexpected keyword argument". wraps exposes __wrapped__ so the
+            # real signature drives the schema.
+            @functools.wraps(fn)
+            async def _wrapped(*args, **kwargs):
+                out = await fn(*args, **kwargs)
+                _sub_track_result(out)
+                return out
+
+            return _wrapped
 
         # Code-enforced dedup for the sub-agent's search tools. The sub-agent
         # model repeatedly re-searches the same area with only minor keyword
@@ -3693,6 +3950,7 @@ def make_tool_callbacks(
                     )
             return None
 
+        @_sub_tracked
         async def _sub_read(filePath: str = "", offset: int = 1, limit: int = 2000) -> str:
             """Sub-agent read: one file (line-paged) or one directory (listing)."""
             _sub_emit({
@@ -3778,6 +4036,7 @@ def make_tool_callbacks(
                 _sub_emit({"kind": "tool_result", "tool": "read", "summary": "read"})
                 return out
 
+        @_sub_tracked
         async def _sub_grep(pattern: str, path: str = "", include: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "grep", "args": {"pattern": pattern, "path": path, "include": include}})
             key = _sub_search_key(pattern, path)
@@ -3834,6 +4093,7 @@ def make_tool_callbacks(
                 _sub_emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
                 return out
 
+        @_sub_tracked
         async def _sub_glob(pattern: str, path: str = "") -> str:
             _sub_emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
             key = _sub_search_key(pattern, path)
@@ -3875,7 +4135,7 @@ def make_tool_callbacks(
             thoroughness: str = "medium",
         ) -> str:
             """Run the isolated exploration sub-agent on ``model`` with the given
-            task text (path_hint/hints already prepended by the caller) and return
+            task text (the task tool's ``prompt``) and return
             its report. The model is wrapped in a _PerStepFallbackModel, so every
             individual grep/read/glob request first tries the sub-agent model and,
             on a failure, re-runs THAT request on the MAIN model — the next
@@ -4117,12 +4377,19 @@ def make_tool_callbacks(
             # the STARTING budget correctly for the task kind skips that wasted
             # round trip for the common broad-task case; narrow lookups keep the
             # tight default since they rarely need more.
-            if _is_content_gathering(task_text):
-                _sub_request_limit = 12
-                _sub_tool_calls_limit = 24
-            else:
-                _sub_request_limit = 6
-                _sub_tool_calls_limit = 12
+            # Per-thoroughness budgets (search TIME bound): quick = 2-3 model
+            # round-trips / 6 sub-searches max, medium = standard sweep, very
+            # thorough = widest. Content-gathering keeps a high floor (12 req /
+            # 24 calls) so a broad refactor/restyle investigation finishes in
+            # ONE run (see _explore_usage_limits).
+            _expl_limits = _explore_usage_limits(
+                thoroughness, _is_content_gathering(task_text)
+            )
+            _sub_request_limit = _expl_limits["request_limit"]
+            _sub_tool_calls_limit = _expl_limits["tool_calls_limit"]
+            _sub_request_cap = _expl_limits["request_cap"]
+            _sub_tool_calls_cap = _expl_limits["tool_calls_cap"]
+            _sub_widen_max = _expl_limits["widen_max"]
             _sub_widen_retries = 0
             _sub_overflow_retries = 0
             _sub_run_prompt = task_text
@@ -4188,6 +4455,19 @@ def make_tool_callbacks(
                         }
                     )
                     continue
+                except _SubEarlyStop:
+                    # The sub-agent HAD found useful info earlier but its last
+                    # searches were ALL empty (diminishing returns — the prompt's
+                    # hard-stop condition #3). Never discard partial findings and
+                    # never burn more tokens: return the cached findings so far
+                    # as the report.
+                    _resume_note = _sub_resume_note()
+                    return (
+                        "EXPLORATION STOPPED EARLY — the last searches returned "
+                        "no new information (diminishing returns), so the explore "
+                        "stopped to avoid wasting tokens. Findings so far:\n"
+                        f"{_resume_note or '(none captured)'}"
+                    )
                 except Exception as exc:
                     # A provider context overflow inside the sub-agent's own
                     # isolated window: its transcript got too big. Resume ONCE
@@ -4309,6 +4589,15 @@ def make_tool_callbacks(
             # _explore_seen_listings so parallel branches reuse each other's
             # file reads instead of each reading the same files.
             _seen_token = _sub_seen_searches_ctx.set(set(_sub_seen_searches))
+            _empty_token = _sub_empty_ctx.set(
+                {
+                    "streak": 0,
+                    "found_any": False,
+                    "threshold": _explore_usage_limits(thoroughness)[
+                        "empty_stop_after"
+                    ],
+                }
+            )
             try:
                 return await _run_explore_inner(
                     model, task_text, state,
@@ -4316,16 +4605,9 @@ def make_tool_callbacks(
                     thoroughness=thoroughness,
                 )
             finally:
+                _sub_empty_ctx.reset(_empty_token)
                 _sub_seen_searches_ctx.reset(_seen_token)
                 _sub_emit_ctx.reset(_token)
-
-        def _build_task_text(t: str) -> str:
-            text = t
-            if path_hint:
-                text = f"Search ONLY within {path_hint}. {text}"
-            if hints:
-                text = f"Known hints: {hints}. {text}"
-            return text
 
         # Run the explore sub-agent. Per-sub-search fallback to the MAIN model
         # happens INSIDE _run_explore (the _PerStepFallbackModel wrapper), so a
@@ -4334,25 +4616,26 @@ def make_tool_callbacks(
         # exhaustion (_UsageLimitExceeded) is deliberately NOT a fallback — it
         # means the task is too broad, not that the model is broken.
         #
-        # ONE sub-agent per explore call, exactly like opencode's `explore`
-        # agent (mode: subagent, read-only, thoroughness quick|medium|very
-        # thorough). The sub-agent does the searching itself with parallel tool
-        # calls (glob/grep/read) — there is NO fan-out into multiple sibling
+        # ONE sub-agent per task call, exactly like opencode's `explore` agent
+        # (mode: subagent, read-only, thoroughness quick|medium|very thorough).
+        # The sub-agent does the searching itself with parallel tool calls
+        # (glob/grep/read) — there is NO fan-out into multiple sibling
         # sub-agents, which is what produced "چند تا اکسپلور با ساب ایجنت های
         # مثل هم" (several explore cards with near-identical sub-searches).
-        nonlocal _explore_call_seq
-        _ecall = _explore_call_seq + 1
-        _explore_call_seq = _ecall
-        emit({"kind": "tool", "tool": "explore", "args": {"task": task}, "model": _run_model_name, "branch": _ecall})
+        nonlocal _task_call_seq
+        _ecall = _task_call_seq + 1
+        _task_call_seq = _ecall
+        _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": _run_model_name, "branch": _ecall})
         # Register this call as IN-FLIGHT so a concurrent near-duplicate (parent
-        # fires N explore calls in one parallel-tool-calls response) awaits THIS
+        # fires N task calls in one parallel-tool-calls response) awaits THIS
         # call's report instead of spawning its own sub-agent. Resolved in
         # `_finish` on every exit path so a waiting duplicate never hangs.
         _loop = asyncio.get_running_loop()
         _future: asyncio.Future = _loop.create_future()
         _inflight_ent = {
-            "task": task,
-            "path_hint": path_hint,
+            "prompt": prompt,
+            "subagent_type": "explore",
             "thoroughness": thoroughness,
             "future": _future,
         }
@@ -4368,37 +4651,126 @@ def make_tool_callbacks(
 
         try:
             report = await _run_explore(
-                _run_model, _build_task_text(task), branch_id=_ecall,
+                _run_model, prompt, branch_id=_ecall,
                 thoroughness=thoroughness,
             )
         except _UsageLimitExceeded:
-            emit(_error_result("explore", "step budget exceeded"))
+            emit(_error_result("task", "step budget exceeded"))
             return _finish(
-                f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
-                "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
-                "part yourself with grep/read."
+                f'<task id="{_tid}" state="error">\n<task_result>\n'
+                "The explore agent did not finish within its step budget — the task was likely too "
+                "broad. Split it into smaller, more specific task calls, or investigate the remaining "
+                "part yourself with grep/read.\n</task_result>\n</task>"
             )
         except Exception as exc:  # noqa: BLE001
             # Both the sub-agent model AND the main-model fallback failed a
             # step, or the run failed outside a model request — surface it.
-            emit(_error_result("explore", f"failed: {exc}"))
+            emit(_error_result("task", f"failed: {exc}"))
             return _finish(
-                f"ERROR: explore sub-agent failed"
-                f" ({_run_model_name} model, change it in Settings → Subagents): {exc}"
+                f'<task id="{_tid}" state="error">\n<task_result>\n'
+                f"ERROR: the explore sub-agent failed"
+                f" ({_run_model_name} model, change it in Settings → Subagents): {exc}\n</task_result>\n</task>"
             )
         if not report:
-            emit(_error_result("explore", "no report"))
-            return _finish(f"The exploration sub-agent found nothing usable for {task!r}.")
+            emit(_error_result("task", "no report"))
+            return _finish(
+                f'<task id="{_tid}" state="error">\n<task_result>\n'
+                f"The exploration sub-agent found nothing usable for {prompt!r}.\n</task_result>\n</task>"
+            )
         _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
-        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars", "model": _ran_model_name, "branch": _ecall})
-        _final = f"EXPLORE REPORT for {task!r}\n{report}"
+        emit({"kind": "tool_result", "tool": "task", "summary": f"{len(report)} chars", "model": _ran_model_name, "branch": _ecall})
+        _final = f'<task id="{_tid}" state="completed">\n<task_result>\n{report}\n</task_result>\n</task>'
         _explore_call_log.append({
-            "task": task,
-            "path_hint": path_hint,
+            "prompt": prompt,
+            "subagent_type": "explore",
             "thoroughness": thoroughness,
             "report": _final,
         })
         return _finish(_final)
+
+    async def _run_general_task(description: str, prompt: str, task_id: str) -> str:
+        """Run the `general` sub-agent (opencode's general agent).
+
+        A general-purpose sub-agent that inherits the parent's tools minus
+        `task` (no nested sub-agents — opencode's subagent_depth=1 default) and
+        runs on the MAIN model. Its tool events are tagged ``sub=True`` via
+        ``_SUB_AGENT_CTX`` and routed to this task card via
+        ``_SUB_AGENT_BRANCH_CTX``, so they never count against the parent's
+        deterministic tool-step budget (they run in an isolated transcript).
+        """
+        from pydantic_ai import Agent as _Agent
+        from pydantic_ai import Tool as _Tool
+        from pydantic_ai.settings import ModelSettings as _ModelSettings
+        from pydantic_ai.usage import UsageLimits as _UsageLimits
+
+        _general_model = main_model if main_model is not None else explore_model
+        if _general_model is None:
+            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": "general"}, "model": ""})
+            emit(_error_result("task", "unavailable"))
+            return "ERROR: the general agent is unavailable (no model configured for this session)."
+        _general_name = str(getattr(_general_model, "model_name", "") or "")
+        nonlocal _task_call_seq
+        _ecall = _task_call_seq + 1
+        _task_call_seq = _ecall
+        _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": "general"}, "model": _general_name, "branch": _ecall})
+        # The general sub-agent inherits the parent's tools minus `task` (no
+        # nested sub-agents) and minus the plan/checklist tools that would
+        # pollute the parent's UI state (opencode's general denies todowrite).
+        _general_tools = [
+            _Tool(_invoke(fn), name=name)
+            for name, fn in _tools.items()
+            if name not in ("task", "update_plan", "save_plan")
+        ]
+        _sub_agent = _Agent(
+            _general_model,
+            system_prompt=(
+                "You are a general-purpose sub-agent. The main agent delegated a "
+                "task to you. Work through it independently with your tools, then "
+                "reply with a concise final result (under ~300 words unless the "
+                "task needs more). You run in an isolated context — the main agent "
+                "only sees your final reply, so include the concrete findings, "
+                "exact paths and any numbers it needs. Do not ask the user "
+                "questions; do not call the task tool."
+            ),
+            tools=_general_tools,
+            model_settings=_ModelSettings(
+                temperature=0.2,
+                max_tokens=2000,
+                parallel_tool_calls=True,
+            ),
+        )
+        _token = _SUB_AGENT_CTX.set(True)
+        _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
+        _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
+        try:
+            _res = await _run_subagent_call(
+                lambda: _sub_agent.run(
+                    prompt,
+                    usage_limits=_UsageLimits(request_limit=12, tool_calls_limit=24),
+                    model_settings=_ModelSettings(
+                        timeout=_providers.model_timeout(
+                            model=_general_model, total=120, connect=10, read=120
+                        ),
+                        parallel_tool_calls=True,
+                    ),
+                ),
+                "general sub-agent",
+                emit=emit,
+                model_name=_general_name,
+            )
+        finally:
+            _SUB_AGENT_CTX.reset(_token)
+            _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
+            _TASK_DEPTH_CTX.reset(_depth_token)
+        _output = str(getattr(_res, "output", "") or "").strip()
+        from agents import _usage_event  # local import (circular-safe)
+
+        _usage_ev = _usage_event(getattr(_res, "usage", None), model=_general_name)
+        if _usage_ev:
+            emit(_usage_ev)
+        emit({"kind": "tool_result", "tool": "task", "summary": f"{len(_output)} chars", "model": _general_name, "branch": _ecall})
+        return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
         # The model that will distill the results: the web sub-agent, or the
@@ -5109,7 +5481,7 @@ def make_tool_callbacks(
         "grep": grep_tool,
         "glob": glob_tool,
         "read": read_tool,
-        "explore": explore_tool,
+        "task": task_tool,
         "save_plan": save_plan_tool,
         "web_search": web_search_tool,
         "search_console": search_console_tool,

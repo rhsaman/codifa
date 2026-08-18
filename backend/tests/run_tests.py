@@ -18,16 +18,23 @@ TESTS = [
     "test_parallel_tools",
     "test_parallel_explore",
     "test_parallel_explore_calls",
+    "test_parallel_explore_attribution",
     "test_parallel_explore_share",
     "test_parallel_explore_reads",
     "test_parallel_explore_scout",
     "test_explore_subtask_dedup",
     "test_explore_single_fanout",
     "test_explore_scout_root",
+    "test_task_unknown_agent",
+    "test_task_general_agent",
+    "test_task_depth_limit",
     "test_delegate_broad",
     "test_issues",
     "test_compact",
     "test_models_dev",
+    "test_subagent_fallback",
+    "test_explore_search_time",
+    "test_explore_fallback",
 ]
 
 

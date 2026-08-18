@@ -109,7 +109,7 @@ Output lands in `release/`.
    API, or a local endpoint (Ollama / llama.cpp / vLLM); enter your API key /
    base URL and choose a model.
 3. Choose an agent mode: **Ask**, **Plan** or **Coder**.
-4. Type a message and press `Cmd/Ctrl+Enter` (or use the mic button). The agent
+4. Type a message and press `Enter` (or use the mic button). The agent
    streams its reply and uses its tools to inspect or modify files — always
    confined to the folder you opened. In **Plan** mode the finished plan is saved
    for that project and auto-loaded on your next Plan/Coder run. If you ask the
@@ -126,7 +126,8 @@ Output lands in `release/`.
 
 | Shortcut              | Action                                             |
 | --------------------- | -------------------------------------------------- |
-| `Cmd/Ctrl+Enter`      | Send chat message                                  |
+| `Enter`                | Send message (`Shift+Enter` = newline)            |
+| `Cmd/Ctrl+Enter`      | Queue the message (sends after the current turn, won't interrupt) |
 | `Cmd/Ctrl+M`          | Cycle agent mode (Ask / Plan / Coder)              |
 | `Cmd/Ctrl+P`          | Quick-open / search overlay (`⌘⇧F` = content grep) |
 | `Cmd/Ctrl+B`          | Toggle sidebar                                     |
@@ -248,7 +249,7 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 
 ۳. حالتِ عامل را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
 
-۴. پیام خود را بنویسید و `Cmd/Ctrl+Enter` را بزنید (یا دکمهٔ میکروفون را
+۴. پیام خود را بنویسید و `Enter` را بزنید (یا دکمهٔ میکروفون را
 فشار دهید). عامل پاسخ را زنده نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از
 ابزارهایش بهره می‌گیرد — همیشه فقط در همان پوشه‌ای که باز کرده‌اید. در حالتِ
 برنامه، برنامهٔ نهایی برای همان پروژه ذخیره و در اجرای بعدیِ حالت
@@ -266,7 +267,8 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 
 | میان‌بر                | کارکرد                                                |
 | ---------------------- | ----------------------------------------------------- |
-| `Cmd/Ctrl+Enter`       | ارسال پیام گفتگو                                      |
+| `Enter`               | ارسال پیام (`Shift+Enter` = خط جدید)                |
+| `Cmd/Ctrl+Enter`       | صف‌کردن پیام (بعد از پایان ترنِ فعلی ارسال می‌شود، بدون قطع) |
 | `Cmd/Ctrl+M`           | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
 | `Cmd/Ctrl+P`           | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا)    |
 | `Cmd/Ctrl+B`           | نمایش/پنهان‌کردن نوار کناری                           |

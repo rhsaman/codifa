@@ -47,7 +47,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import providers
-from agents import _drain_steer, _enqueue_steer, run_agent
+from agents import _drain_steer, _enqueue_steer, _remove_steer, run_agent
 
 
 def wants_skill_or_mcp(text: str) -> bool:
@@ -914,6 +914,20 @@ async def chat_steer(req: SteerRequest) -> dict:
     if not req.chat_id or not req.prompt.strip():
         return {"ok": False, "error": "chat_id and prompt are required"}
     await _enqueue_steer(req.chat_id, {"id": req.id, "prompt": req.prompt.strip()})
+    return {"ok": True}
+
+
+class SteerCancelRequest(BaseModel):
+    chat_id: str = ""
+    id: str = ""
+
+
+@app.post("/chat/steer/cancel")
+async def chat_steer_cancel(req: SteerCancelRequest) -> dict:
+    """Drop a pending steer from the inbox (user cancelled it before delivery)."""
+    if not req.chat_id or not req.id:
+        return {"ok": False, "error": "chat_id and id are required"}
+    await _remove_steer(req.chat_id, req.id)
     return {"ok": True}
 
 

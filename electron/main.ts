@@ -10,6 +10,7 @@ import { registerSecretsIpc } from './secrets'
 import { buildOverlayHtml } from './captureOverlay'
 import {
   listDir,
+  walkWorkspace,
   readFileSafe,
   readImageDataUrl,
   writeFileSafe,
@@ -411,6 +412,9 @@ function registerIpc(): void {
   // --- safe file system -----------------------------------------------------
   ipcMain.handle('fs:list', (_e, root: string, rel: string) => {
     return listDir(root, rel)
+  })
+  ipcMain.handle('fs:walk', (_e, root: string) => {
+    return walkWorkspace(root)
   })
   ipcMain.handle('fs:read', (_e, root: string, rel: string) => {
     return readFileSafe(root, rel)

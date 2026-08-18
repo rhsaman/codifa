@@ -15,9 +15,8 @@ for _p in (_HERE, os.path.dirname(_HERE)):
 # Use the REAL user data root (skills live there).
 os.environ.pop("CODER_DATA_DIR", None)
 
-import agents  # noqa: E402
-import state_db  # noqa: E402
-from tools import open_skill_store  # noqa: E402
+import agents
+from tools import open_skill_store
 
 PROMPTS = [
     "پروژه رو پوش کن تو گیت",
@@ -55,7 +54,7 @@ def main() -> None:
             key = hit.get("key")
             if key and key not in sem and key in by_path:
                 sem[key] = float(hit.get("score", 0.0))
-        print(f"  semantic scores (top 8):")
+        print("  semantic scores (top 8):")
         for key, score in sorted(sem.items(), key=lambda x: x[1], reverse=True)[:8]:
             print(f"    {score:.4f}  {by_path[key]['name']!r}")
 

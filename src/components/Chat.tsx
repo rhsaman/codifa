@@ -32,7 +32,7 @@ import {
 } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
-import { prepareContent } from "../lib/bidi";
+import { detectDir, prepareContent } from "../lib/bidi";
 import { registerChatSend, sendPendingSteerNext, sendQueuedNext, uid2 } from "../lib/chatSends";
 import {
   GLOBAL_SHORTCUTS,
@@ -1127,18 +1127,19 @@ export function ChatPanel() {
           branch: typeof event.branch === "number" ? event.branch : undefined,
           model: event.model || undefined,
         };
-        // Sub-agent tool calls (explore's internal read/grep/glob) render
-        // NESTED inside the running explore card, not as top-level cards —
-        // so an explore turn shows one collapsible parent with its details,
-        // never a stack of collapsed fragments.
+        // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
+        // general sub-agent reusing the parent's tools) render NESTED inside
+        // the running task card, not as top-level cards — so a task turn shows
+        // one collapsible parent with its details, never a stack of collapsed
+        // fragments.
         if (event.sub) {
           const prev = findMsg()?.toolActivity ?? [];
           const branch = typeof event.branch === "number" ? event.branch : undefined;
           const next = prev.map((a): ToolActivity => {
-            if (a.tool === "explore" && a.status === "running") {
+            if (a.tool === "task" && a.status === "running") {
               // Parallel fan-out: nest each branch's sub-events under ITS OWN
-              // explore card (matched by branch id). Legacy single-branch events
-              // (no branch id) still nest into the running explore card.
+              // task card (matched by branch id). Legacy single-branch events
+              // (no branch id) still nest into the running task card.
               if (branch !== undefined && a.branch !== branch) return a;
               return { ...a, children: [...(a.children ?? []), act] };
             }
@@ -1939,12 +1940,40 @@ export function ChatPanel() {
     [busy, send, maxHistory],
   );
 
+  // Retry icon on a USER message: unlike the error banner (which resumes the
+  // interrupted turn), this ALWAYS deletes everything below the message and
+  // re-runs it from scratch — the chat continues from that message onward.
+  const restartFromMessage = useCallback(
+    (id: string) => {
+      // Cancel any in-flight run first, same as retryMessage.
+      const active = useStore.getState().chatAborts[chatIdRef.current];
+      if (active && !active.signal.aborted) {
+        active.abort();
+      }
+      const s = useStore.getState();
+      const ch = s.chats.find((c) => c.id === s.activeChatId);
+      if (!ch) return;
+      const msg = ch.messages.find((m) => m.id === id);
+      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
+      // Delete this message and everything below it, then re-send from scratch.
+      if (!s.truncateTo(id)) return;
+      const text = msg.content;
+      // Give the abort's finally block a tick to reset busy/streaming state
+      // before re-sending (send() re-sets busy=true itself, but the abort's
+      // finally would otherwise clear it mid-run).
+      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
+    },
+    [send],
+  );
+
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
   // recreated `onRetry` per render would defeat it. Route through a ref instead.
   const retryMessageRef = useRef(retryMessage);
   retryMessageRef.current = retryMessage;
+  const restartFromMessageRef = useRef(restartFromMessage);
+  restartFromMessageRef.current = restartFromMessage;
   const onRetry = useMemo(
-    () => (id: string) => retryMessageRef.current(id),
+    () => (id: string) => restartFromMessageRef.current(id),
     [],
   );
 
@@ -2306,6 +2335,11 @@ export function ChatPanel() {
       startCmd();
       return;
     }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      if (busy) queueForLater();
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       submit();
@@ -2474,6 +2508,7 @@ export function ChatPanel() {
                 <div
                   className={`queued-bubble${q.kind === "steer" ? " steer" : ""}`}
                   key={q.id}
+                  dir={dir}
                   title={
                     q.kind === "steer"
                       ? "Sent to the running agent — will be addressed now or as the next turn"
@@ -2482,13 +2517,24 @@ export function ChatPanel() {
                 >
                   <div className="queued-bubble-head">
                     <span className="queued-bubble-icon">
-                      {q.kind === "steer" ? "↝" : "⏳"}
+                      {q.kind === "steer" ? (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M9 14L4 9l5-5" />
+                          <path d="M4 9h10a5 5 0 015 5v6" />
+                        </svg>
+                      ) : (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="M12 7v5l3 3" />
+                        </svg>
+                      )}
                     </span>
                     <span className="queued-bubble-label">
                       {q.kind === "steer"
                         ? "Steering the running agent…"
                         : "Queued — auto-sends after the current turn"}
                     </span>
+                    <span className="queued-bubble-pulse" />
                     <button
                       className="chip-x queued-bubble-x"
                       onClick={() =>
@@ -2499,7 +2545,7 @@ export function ChatPanel() {
                       ×
                     </button>
                   </div>
-                  <div className="queued-bubble-text" dir="auto">
+                  <div className="queued-bubble-text" dir={detectDir(q.text)}>
                     {prepareContent(q.text, dir) || "(empty)"}
                   </div>
                   {q.attachments && q.attachments.length > 0 && (
@@ -2682,7 +2728,7 @@ export function ChatPanel() {
       >
         {askReq &&
           (() => {
-            const fa = /[\u0600-\u06FF]/.test(askReq.question);
+            const fa = detectDir(askReq.question) === "rtl";
             return (
               <div className="ask-card" dir={fa ? "rtl" : "ltr"}>
                 <div className="ask-card-head">
@@ -2704,7 +2750,7 @@ export function ChatPanel() {
                     {fa ? "عامل سوالی از شما دارد" : "The agent has a question"}
                   </span>
                 </div>
-                <div className="ask-card-question" dir="auto">
+                <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
                   {prepareContent(askReq.question, fa ? "rtl" : "ltr")}
                 </div>
                 {askReq.options.length > 0 && (
@@ -2733,7 +2779,7 @@ export function ChatPanel() {
                             <path d="M9 18l6-6-6-6" />
                           </svg>
                         </span>
-                        <span className="ask-option-text" dir="auto">
+                        <span className="ask-option-text" dir={detectDir(opt)}>
                           {prepareContent(opt, fa ? "rtl" : "ltr")}
                         </span>
                       </button>
@@ -2782,7 +2828,7 @@ export function ChatPanel() {
           })()}
         {permissionReq &&
           (() => {
-            const fa = /[\u0600-\u06FF]/.test(permissionReq.action);
+            const fa = detectDir(permissionReq.action) === "rtl";
             const isConfirm = permissionReq.scope === "confirm";
             const title = isConfirm
               ? fa
@@ -2818,7 +2864,7 @@ export function ChatPanel() {
                   </span>
                   <span className="ask-card-title">{title}</span>
                 </div>
-                <div className="ask-card-question" dir="auto">
+                <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
                   {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
                 </div>
                 {permissionReq.path ? (
@@ -2827,7 +2873,7 @@ export function ChatPanel() {
                   </code>
                 ) : null}
                 {permissionReq.reason ? (
-                  <div className="perm-reason" dir="auto">
+                  <div className="perm-reason" dir={detectDir(permissionReq.reason)}>
                     {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
                   </div>
                 ) : null}

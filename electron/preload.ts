@@ -32,6 +32,8 @@ const api = {
   selectFolder: (): Promise<string | null> => ipcRenderer.invoke('dialog:select-folder'),
   selectFile: (): Promise<string | null> => ipcRenderer.invoke('dialog:select-file'),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => ipcRenderer.invoke('fs:list', root, rel),
+  fsWalk: (root: string): Promise<{ rel: string; name: string }[]> =>
+    ipcRenderer.invoke('fs:walk', root),
   fsRead: (root: string, rel: string): Promise<{ content: string }> => ipcRenderer.invoke('fs:read', root, rel),
   fsWrite: (root: string, rel: string, content: string): Promise<boolean> =>
     ipcRenderer.invoke('fs:write', root, rel, content),

@@ -2,7 +2,10 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
 import { flushStateNow } from './lib/store'
+import { injectThemeStyles } from './lib/themes'
 import './styles/global.css'
+
+injectThemeStyles()
 
 const container = document.getElementById('root')
 if (!container) throw new Error('root element missing')

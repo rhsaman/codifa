@@ -54,6 +54,10 @@ export interface GlobalShortcut {
 
 export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Enter", label: "Send message (Shift+Enter = newline)" },
+  {
+    keys: "Cmd/Ctrl+Enter",
+    label: "Queue the message (sends after the current turn, won't interrupt)",
+  },
   { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Coder)" },
   { keys: "/", label: "Open command palette" },
   { keys: "Cmd/Ctrl+M", label: "Cycle agent mode (Ask / Plan / Coder)" },

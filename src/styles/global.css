@@ -1,29 +1,29 @@
 :root {
-  --bg: #212121;
-  --bg-alt: #171717;
-  --bg-panel: #212121;
-  --bg-input: #2f2f2f;
-  --bg-hover: #2f2f2f;
-  --border: #424242;
-  --text: #d0d0d0;
-  --text-dim: #a3a3a3;
-  --accent: #ececec;
-  --accent-dim: #3f3f3f;
-  --on-accent: #111111;
-  --danger: #e5484d;
-  --success: #46a758;
-  --link: #58a6ff;
+  --bg: #1e1e2e;
+  --bg-alt: #181825;
+  --bg-panel: #313244;
+  --bg-input: #313244;
+  --bg-hover: #45475a;
+  --border: #45475a;
+  --text: #cdd6f4;
+  --text-dim: #a6adc8;
+  --accent: #89b4fa;
+  --accent-dim: #45475a;
+  --on-accent: #11111b;
+  --danger: #f38ba8;
+  --success: #a6e3a1;
+  --link: #89b4fa;
   /* Tool-call category accents: single cards (blue), grouped calls (violet)
      and explore (teal) each get their own color identity so the timeline
      reads at a glance. */
-  --tool-single: #58a6ff;
-  --tool-group: #a78bfa;
-  --tool-explore: #2dd4bf;
+  --tool-single: #89b4fa;
+  --tool-group: #cba6f7;
+  --tool-explore: #94e2d5;
   /* Live thinking panel (pinned above the chat while the model reasons). */
-  --thinking: #f2b344;
+  --thinking: #f9e2af;
   --radius: 14px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
-  --focus-ring: 0 0 0 2px rgba(236, 236, 236, 0.25);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--text) 25%, transparent);
   /* Near-invisible separators — the "borderless" replacement for gray/white
      outlines: a hairline tinted from the text color instead of a solid box. */
   --hairline: color-mix(in srgb, var(--text) 10%, transparent);
@@ -121,38 +121,6 @@
   src: url("../../fonts/IRANYekanX-ExtraBlack.ttf") format("truetype");
   font-weight: 950;
   font-display: swap;
-}
-
-[data-theme="light"] {
-  --bg: #f7f7f8;
-  --bg-alt: #ececef;
-  --bg-panel: #ffffff;
-  --bg-input: #f1f1f3;
-  --bg-hover: #e1e1e5;
-  --border: #e2e2e5;
-  --text: #1a1a1a;
-  --text-dim: #76767c;
-  --accent: #1a1a1a;
-  --accent-dim: #eaeaea;
-  --on-accent: #ffffff;
-  --danger: #e5484d;
-  --success: #2f9e44;
-  --link: #0969da;
-  --tool-single: #0969da;
-  --tool-group: #7c3aed;
-  --tool-explore: #0d9488;
-  --thinking: #b45309;
-  --shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-  --focus-ring: 0 0 0 2px rgba(26, 26, 26, 0.12);
-  --hairline: color-mix(in srgb, var(--text) 8%, transparent);
-  --shadow-pop:
-    inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    0 4px 14px rgba(0, 0, 0, 0.1),
-    0 28px 64px -20px rgba(0, 0, 0, 0.28);
-  --shadow-card:
-    inset 0 1px 0 rgba(255, 255, 255, 0.8),
-    0 1px 2px rgba(0, 0, 0, 0.06),
-    0 10px 24px -14px rgba(0, 0, 0, 0.16);
 }
 
 * {
@@ -339,6 +307,86 @@ textarea {
   transform: scale(0.98);
 }
 
+.sidebar-search {
+  flex: 0 0 auto;
+  padding: 0 10px 8px;
+}
+
+/* The box wraps icon + input + clear so the icon and clear button center
+   against the INPUT's height — positioning against the outer container put
+   them a few px off because of the container's bottom padding. */
+.sidebar-search-box {
+  position: relative;
+}
+
+.sidebar-search-icon {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  padding: 8px 34px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+
+.sidebar-search-input:hover {
+  border-color: color-mix(in srgb, var(--text) 18%, var(--border));
+}
+
+/* The "Search chats…" hint is English copy — always render it LTR and
+   left-aligned, even when the app UI (and the typed query) is RTL. */
+.sidebar-search-input::placeholder {
+  color: var(--text-dim);
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: plaintext;
+}
+
+.sidebar-search-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.sidebar-search-clear {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    color 0.12s,
+    background 0.12s;
+}
+
+.sidebar-search-clear:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
 .sidebar-list {
   flex: 1 1 auto;
   overflow-y: auto;
@@ -378,32 +426,20 @@ textarea {
 }
 
 .chat-item.active {
-  /* Tinted with the workspace's own color (--ws, the same color as the left
-     indicator bar) so the current chat reads as one cohesive highlighted card
-     instead of a washed-out gray slab. Falls back to --accent when the group
-     has no color. */
+  /* Tinted with the theme's main accent color (--accent) so the current chat
+     reads as one cohesive highlighted card in the active theme — independent
+     of the workspace color, which stays on the group header dot. */
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--ws, var(--accent)) 17%, var(--bg-alt)) 0%,
-    color-mix(in srgb, var(--ws, var(--accent)) 8%, var(--bg-alt)) 100%
+    color-mix(in srgb, var(--accent) 20%, var(--bg-alt)) 0%,
+    color-mix(in srgb, var(--accent) 9%, var(--bg-alt)) 100%
   );
   color: var(--text);
   font-weight: 500;
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent),
-    inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--accent)) 15%, transparent),
-    0 3px 14px -6px color-mix(in srgb, var(--ws, var(--accent)) 50%, transparent);
-}
-
-/* In light mode --accent-dim (#eaeaea) is nearly identical to the sidebar's
-   --bg-alt (#ececef), so the active chat is invisible — use a clearly darker
-   gray instead. */
-[data-theme="light"] .chat-item.active {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--ws, var(--accent)) 11%, var(--bg-alt)) 0%,
-    color-mix(in srgb, var(--ws, var(--accent)) 5%, var(--bg-alt)) 100%
-  );
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 25%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 3px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .chat-item.active::before {
@@ -414,8 +450,8 @@ textarea {
   bottom: 18%;
   width: 3px;
   border-radius: 3px;
-  background: var(--ws, var(--accent));
-  box-shadow: 0 0 8px 1px color-mix(in srgb, var(--ws, var(--accent)) 50%, transparent);
+  background: var(--accent);
+  box-shadow: 0 0 8px 1px color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
 .chat-item-icon {
@@ -434,13 +470,20 @@ textarea {
 }
 
 /* Row that keeps the streaming dot inline with the chat title instead of a
-   full-width flex child below it (.chat-item is a column layout). */
+   full-width flex child below it (.chat-item is a column layout). Right
+   padding keeps long titles from running under the ⋯ kebab button. */
 .chat-item-title-row {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
+  padding-right: 28px;
+}
+
+/* Pinned chats tint their title with the accent color. */
+.chat-item.pinned .chat-item-title {
+  color: var(--accent);
 }
 
 /* Live streaming dot for chats whose agent is working in the background. */
@@ -451,6 +494,39 @@ textarea {
   background: var(--accent, #3b82f6);
   flex: 0 0 auto;
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
+}
+
+/* Steady "new message" dot in the theme's accent color: a background chat's
+   turn finished while the user was looking at another chat. Replaces the
+   blinking streaming dot once the turn completes; cleared when the user opens
+   that chat (setActiveChat). */
+.chat-item-unread {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent),
+    0 0 12px color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: chat-unread-pop 0.3s ease-out;
+}
+@keyframes chat-unread-pop {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+  70% {
+    transform: scale(1.25);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+/* Unread chats read a touch stronger, so the new message is easy to spot. */
+.chat-item.unread .chat-item-title {
+  font-weight: 600;
 }
 
 /* Attention badge for chats waiting on the user — a permission request
@@ -464,14 +540,14 @@ textarea {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  color: #fff;
+  color: var(--on-accent);
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
 }
 .chat-item-pending.permission {
-  background: #f59e0b;
+  background: var(--thinking);
 }
 .chat-item-pending.ask {
-  background: #3b82f6;
+  background: var(--link);
 }
 
 /* Group-level attention badge (count of chats waiting on the user), so a
@@ -489,8 +565,8 @@ textarea {
   font-size: 10px;
   font-weight: 700;
   line-height: 1;
-  color: #fff;
-  background: #f59e0b;
+  color: var(--on-accent);
+  background: var(--thinking);
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
 }
 
@@ -506,92 +582,147 @@ textarea {
   }
 }
 
-/* Action icons (pin / rename / delete) sit ABOVE the chat title. Always laid
-   out (never display:none) so the row heights stay constant and the list never
-   "jumps"; only the opacity toggles. */
-.chat-item-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 2px;
-  min-height: 22px;
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    opacity 0.12s ease,
-    transform 0.12s ease;
+/* Per-chat ⋮ (kebab) menu. One small button at the item's right edge opens
+   a popup with Pin / Rename / Delete on click — far less intrusive than
+   three always-revealed icons, and only the 22px kebab itself stops the
+   click (so it never blocks opening the chat). The menu is a DOM descendant
+   of the wrap, so hovering it keeps :hover alive on the wrap. It opens via
+   the .open class (click state in Sidebar.tsx) instead of :hover, so moving
+   the mouse from the button to the popup never closes it mid-flight. */
+.chat-item-kebab-wrap {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  z-index: 5;
 }
 
-.chat-item:hover .chat-item-actions,
-.chat-item.active .chat-item-actions,
-.chat-item.pinned .chat-item-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.chat-item-edit,
-.chat-item-remove,
-.chat-item-pin {
-  flex: 0 0 auto;
+.chat-item-kebab {
   width: 22px;
   height: 22px;
+  border: none;
   border-radius: 7px;
+  background: none;
+  color: var(--text-dim);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 16px;
-  line-height: 1;
-  color: var(--text-dim);
-  opacity: 1;
-  pointer-events: auto;
+  cursor: pointer;
+  opacity: 0.5;
   transition:
-    background 0.12s,
+    opacity 0.12s,
     color 0.12s,
-    box-shadow 0.12s;
+    background 0.12s;
 }
 
-.chat-item-edit svg,
-.chat-item-pin svg {
-  width: 14px;
-  height: 14px;
+.chat-item:hover .chat-item-kebab,
+.chat-item.active .chat-item-kebab,
+.chat-item-kebab-wrap:hover .chat-item-kebab,
+.chat-item-kebab-wrap:focus-within .chat-item-kebab {
+  opacity: 1;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
 }
 
-.chat-item-edit:hover {
+.chat-item-kebab:hover {
+  background: var(--bg-hover);
+}
+
+.chat-item-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 168px;
+  padding: 5px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
+  box-shadow:
+    0 10px 30px -8px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(10px);
+}
+
+.chat-item-kebab-wrap.open .chat-item-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: chat-menu-pop 0.12s ease-out;
+}
+
+@keyframes chat-menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.chat-item-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.chat-item-menu-btn svg {
+  flex: 0 0 auto;
+  opacity: 0.85;
+}
+
+.chat-item-menu-btn:hover {
   background: var(--bg-hover);
   color: var(--text);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 8%, transparent);
 }
 
-.chat-item-pin:hover {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+.chat-item-menu-btn.active {
   color: var(--accent);
 }
 
-.chat-item-pin.active {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+.chat-item-menu-btn.danger {
+  color: var(--danger);
 }
 
-.chat-item.pinned .chat-item-title {
-  color: var(--accent);
-}
-
-.chat-item-remove:hover {
-  background: var(--danger);
-  color: #fff;
-  box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--danger) 55%, transparent);
+.chat-item-menu-btn.danger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
 
 .chat-rename-input {
   flex: 1 1 auto;
   min-width: 0;
   padding: 3px 7px;
-  border: 1px solid var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
   border-radius: 8px;
-  background: var(--bg-panel);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-panel));
   color: var(--text);
   font-size: 13px;
   font-family: inherit;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.chat-rename-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
 .sidebar-group {
@@ -623,6 +754,11 @@ textarea {
   width: 100%;
   padding: 4px 6px 4px 8px;
   border-radius: 10px;
+  /* Workspace-colored at all times, not just on hover: each group carries
+     its own --ws hue (set inline per group), so every workspace header
+     keeps its color even when the cursor is elsewhere. */
+  background: color-mix(in srgb, var(--ws, transparent) 10%, var(--bg-input));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 8%, transparent);
   transition:
     background 0.12s,
     color 0.12s,
@@ -630,8 +766,8 @@ textarea {
 }
 
 .sidebar-group-head:hover {
-  background: color-mix(in srgb, var(--ws, transparent) 12%, var(--bg-input));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 10%, transparent);
+  background: color-mix(in srgb, var(--ws, transparent) 18%, var(--bg-input));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 14%, transparent);
 }
 
 .sidebar-group-toggle {
@@ -659,9 +795,9 @@ textarea {
 }
 
 .sidebar-group-actions {
-  /* Same reasoning as .chat-item-edit/.chat-item-remove above: keep the
-     buttons in the layout at all times (fixed 24px height) so the group
-     header doesn't grow taller on hover and shift every group below it. */
+  /* Keep the buttons in the layout at all times (fixed 24px height) so the
+     group header doesn't grow taller on hover and shift every group below
+     it (same fixed-size reasoning as the per-chat ⋯ kebab button). */
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -1280,6 +1416,11 @@ textarea {
   white-space: pre-wrap;
   overflow-wrap: break-word;
   font-size: var(--chat-font-size);
+  line-height: 1.68;
+}
+
+.chat-message.user-text {
+  max-width: 72ch;
 }
 
 /* Markdown-rendered content must NOT use pre-wrap: react-markdown emits literal
@@ -1303,7 +1444,7 @@ textarea {
 }
 
 .markdown-body {
-  line-height: 1.6;
+  line-height: 1.68;
 }
 
 /* Tight, consistent vertical rhythm for rendered markdown. The browser's
@@ -1311,10 +1452,13 @@ textarea {
    compact them and collapse the trailing margin on the last element. */
 .markdown-body p,
 .markdown-body blockquote,
-.markdown-body pre,
 .markdown-body table,
 .markdown-body hr {
-  margin: 0 0 2.5em;
+  margin: 0 0 1.15em;
+}
+
+.markdown-body pre {
+  margin: 0.2em 0 1.4em;
 }
 
 .markdown-body ul,
@@ -1382,6 +1526,19 @@ textarea {
 
 .markdown-body h6 {
   font-size: 1em;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  max-width: 72ch;
 }
 
 .markdown-body hr {
@@ -1850,8 +2007,8 @@ textarea {
   margin-right: auto;
   font-family: var(--font-mono);
   font-size: 10.5px;
-  color: var(--text-dim);
-  opacity: 0.75;
+  color: color-mix(in srgb, var(--accent) 78%, var(--text-dim));
+  opacity: 0.85;
   white-space: nowrap;
 }
 
@@ -2318,7 +2475,7 @@ textarea {
 }
 
 .mic-btn.recording {
-  color: #fff;
+  color: var(--on-accent);
   background: var(--danger, #e5484d);
   border-color: transparent;
   box-shadow:
@@ -3460,8 +3617,8 @@ textarea {
 }
 
 .badge.mcp-builtin {
-  color: var(--info, #4da3ff);
-  border-color: var(--info, #4da3ff);
+  color: var(--link);
+  border-color: var(--link);
 }
 
 .mcp-summary {
@@ -4513,7 +4670,7 @@ textarea {
 
 /* Provider balance chip in the chat titlebar (next to the context meter). */
 .titlebar-balance {
-  color: var(--success);
+  color: var(--accent);
   font-weight: 600;
   font-size: 13px;
   font-variant-numeric: tabular-nums;
@@ -4779,8 +4936,8 @@ textarea {
 }
 
 .mention-icon-badge.skill {
-  background: color-mix(in srgb, #f5a524 16%, var(--bg-input));
-  color: #f5a524;
+  background: color-mix(in srgb, var(--thinking) 16%, var(--bg-input));
+  color: var(--thinking);
 }
 
 .mention-icon-badge.mcp {
@@ -4932,32 +5089,33 @@ textarea {
 }
 
 /* Messages typed while the agent is working: steer chips (already delivered to
-   the running agent) and queue chips (auto-send after the current turn). */
+   the running agent) and queue chips (auto-send after the current turn). Both
+   use the theme accent so they read as part of the app's palette. */
 .attachment-chip.queued-chip {
   border: none;
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, #3b82f6 22%, var(--bg-panel)),
-    color-mix(in srgb, #3b82f6 10%, var(--bg-panel))
+    color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
   );
   max-width: 56ch;
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #3b82f6 35%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.15),
-    0 4px 14px -6px rgba(59, 130, 246, 0.55);
+    0 4px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .attachment-chip.queued-chip.steer-chip {
   border: none;
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, #10b981 22%, var(--bg-panel)),
-    color-mix(in srgb, #10b981 10%, var(--bg-panel))
+    color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
   );
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #10b981 35%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.15),
-    0 4px 14px -6px rgba(16, 185, 129, 0.55);
+    0 4px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .queued-chips {
@@ -4971,56 +5129,163 @@ textarea {
 .queued-bubbles {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   margin: 14px 0 4px;
 }
 
 .queued-bubble {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  background: color-mix(in srgb, #3b82f6 7%, var(--bg-input));
-  border: 1px dashed color-mix(in srgb, #3b82f6 50%, var(--border));
-  border-radius: var(--radius);
-  padding: 10px 14px;
+  gap: 8px;
+  border-radius: 14px;
+  padding: 12px 14px 12px 16px;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--link) 10%, var(--bg-panel)),
+    color-mix(in srgb, var(--link) 4%, var(--bg-panel))
+  );
+  border: 1px solid color-mix(in srgb, var(--link) 26%, var(--border));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--link) 16%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px color-mix(in srgb, var(--link) 40%, transparent);
+}
+
+/* soft accent bar on the leading edge */
+.queued-bubble::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(
+    to bottom,
+    var(--link),
+    color-mix(in srgb, var(--link) 35%, transparent)
+  );
 }
 
 .queued-bubble.steer {
-  background: color-mix(in srgb, #10b981 7%, var(--bg-input));
-  border-color: color-mix(in srgb, #10b981 50%, var(--border));
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--success) 10%, var(--bg-panel)),
+    color-mix(in srgb, var(--success) 4%, var(--bg-panel))
+  );
+  border-color: color-mix(in srgb, var(--success) 26%, var(--border));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--success) 16%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px color-mix(in srgb, var(--success) 40%, transparent);
+}
+
+.queued-bubble.steer::before {
+  background: linear-gradient(
+    to bottom,
+    var(--success),
+    color-mix(in srgb, var(--success) 35%, transparent)
+  );
 }
 
 .queued-bubble-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .queued-bubble-icon {
-  font-size: 11px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
   flex: 0 0 auto;
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
+}
+
+.queued-bubble.steer .queued-bubble-icon {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
 }
 
 .queued-bubble-label {
   flex: 1;
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--text);
+}
+
+/* animated "pending" dot */
+.queued-bubble-pulse {
+  --pulse: var(--link);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--pulse);
+  animation: queued-pulse 1.8s ease-out infinite;
+}
+
+.queued-bubble.steer .queued-bubble-pulse {
+  --pulse: var(--success);
+}
+
+@keyframes queued-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse) 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .queued-bubble-pulse {
+    animation: none;
+  }
 }
 
 .queued-bubble-x {
   flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  font-size: 19px;
+  font-weight: 500;
+  line-height: 1;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text-dim) 9%, transparent);
+  color: var(--text-dim);
+}
+
+.queued-bubble-x:hover {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
 }
 
 .queued-bubble-text {
   font-size: 13px;
+  line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  padding-left: 30px;
+}
+
+.chat-messages[data-dir="rtl"] .queued-bubble::before {
+  left: auto;
+  right: 0;
 }
 
 .chat-messages[data-dir="rtl"] .queued-bubble-text {
+  padding-left: 0;
+  padding-right: 30px;
   text-align: right;
 }
 
@@ -5030,9 +5295,9 @@ textarea {
   align-items: center;
   gap: 8px;
   border: 1px solid var(--border);
-  border-left: 3px solid #fbbf24;
+  border-left: 3px solid var(--thinking);
   border-radius: var(--radius);
-  background: color-mix(in srgb, #fbbf24 8%, var(--bg));
+  background: color-mix(in srgb, var(--thinking) 8%, var(--bg));
   margin: 4px 0;
   padding: 7px 12px;
   font-size: 12px;
@@ -5040,7 +5305,7 @@ textarea {
 }
 
 .retry-banner .spinner {
-  border-top-color: #fbbf24;
+  border-top-color: var(--thinking);
 }
 
 .retry-banner .retry-reason {
@@ -5080,8 +5345,8 @@ textarea {
   padding: 3px 12px;
   font-size: 12px;
   font-weight: 600;
-  color: #1f2937;
-  background: #fbbf24;
+  color: var(--on-accent);
+  background: var(--thinking);
   border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -5091,8 +5356,8 @@ textarea {
 }
 
 .retry-banner .retry-btn:hover {
-  background: #fcd34d;
-  color: #1f2937;
+  background: color-mix(in srgb, var(--thinking) 82%, white);
+  color: var(--on-accent);
 }
 
 /* Sub-agent model hard-failed → tool fell back to the MAIN model. Distinct
@@ -5346,8 +5611,8 @@ textarea {
 .tool-card.denied {
   box-shadow:
     var(--shadow-card),
-    0 0 0 1px color-mix(in srgb, var(--warning, #d7a03c) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--warning, #d7a03c) 40%, transparent);
+    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent),
+    0 0 16px -6px color-mix(in srgb, var(--thinking) 40%, transparent);
 }
 
 /* Explore gets its own teal identity — tinted surface + tree-shaped sub-call
@@ -5523,8 +5788,8 @@ textarea {
 }
 
 .status-denied {
-  color: var(--warning, #d7a03c);
-  background: color-mix(in srgb, var(--warning, #d7a03c) 18%, transparent);
+  color: var(--thinking);
+  background: color-mix(in srgb, var(--thinking) 18%, transparent);
 }
 
 .tool-card-body {
@@ -5570,8 +5835,8 @@ textarea {
     var(--shadow-card),
     0 3px 0 -1px color-mix(in srgb, var(--tool-color) 14%, transparent),
     0 6px 0 -2px color-mix(in srgb, var(--tool-color) 8%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--warning, #d7a03c) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--warning, #d7a03c) 40%, transparent);
+    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent),
+    0 0 16px -6px color-mix(in srgb, var(--thinking) 40%, transparent);
 }
 
 .tool-group.error {
@@ -5800,19 +6065,19 @@ textarea {
 }
 
 .diff-view .diff-add {
-  background: color-mix(in srgb, #22c55e 14%, transparent);
-  color: #4ade80;
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
   padding: 0 10px;
   white-space: pre;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #22c55e 65%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--success) 65%, transparent);
 }
 
 .diff-view .diff-del {
-  background: color-mix(in srgb, #ef4444 14%, transparent);
-  color: #f87171;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
   padding: 0 10px;
   white-space: pre;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #ef4444 65%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 65%, transparent);
 }
 
 .diff-view .diff-context {
@@ -5823,11 +6088,11 @@ textarea {
 }
 
 .diff-view .diff-hunk {
-  color: #8ab4f8;
+  color: var(--link);
   padding: 0 10px;
-  background: color-mix(in srgb, #8ab4f8 10%, transparent);
+  background: color-mix(in srgb, var(--link) 10%, transparent);
   font-weight: 600;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #8ab4f8 55%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--link) 55%, transparent);
 }
 
 /* ---- side-by-side diff ---- */
@@ -5876,17 +6141,17 @@ textarea {
 .diff-side-head > span:nth-child(1) {
   grid-column: 1 / 3;
   padding: 3px 10px;
-  color: #fca5a5;
-  background: color-mix(in srgb, #ef4444 12%, var(--bg-panel));
-  border-bottom: 1px solid color-mix(in srgb, #ef4444 24%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-panel));
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
 }
 
 .diff-side-head > span:nth-child(2) {
   grid-column: 3 / 5;
   padding: 3px 10px;
-  color: #86efac;
-  background: color-mix(in srgb, #22c55e 12%, var(--bg-panel));
-  border-bottom: 1px solid color-mix(in srgb, #22c55e 24%, transparent);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, var(--bg-panel));
+  border-bottom: 1px solid color-mix(in srgb, var(--success) 24%, transparent);
 }
 
 .diff-side-num {
@@ -5922,26 +6187,26 @@ textarea {
 
 .diff-side-row.del > .diff-side-num:first-child,
 .diff-side-row.mod > .diff-side-num:first-child {
-  color: #f87171;
-  background: color-mix(in srgb, #ef4444 18%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
 }
 
 .diff-side-row.add > .diff-side-num:nth-child(3),
 .diff-side-row.mod > .diff-side-num:nth-child(3) {
-  color: #4ade80;
-  background: color-mix(in srgb, #22c55e 18%, transparent);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 18%, transparent);
 }
 
 .diff-side-cell.diff-del {
-  background: color-mix(in srgb, #ef4444 14%, transparent);
-  color: #f87171;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #ef4444 65%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 65%, transparent);
 }
 
 .diff-side-cell.diff-add {
-  background: color-mix(in srgb, #22c55e 14%, transparent);
-  color: #4ade80;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #22c55e 65%, transparent);
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--success) 65%, transparent);
 }
 
 .diff-side-cell.diff-context {
@@ -5950,11 +6215,11 @@ textarea {
 }
 
 .diff-side-row.mod > .diff-side-cell.diff-del {
-  background: color-mix(in srgb, #ef4444 8%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
 
 .diff-side-row.mod > .diff-side-cell.diff-add {
-  background: color-mix(in srgb, #22c55e 8%, transparent);
+  background: color-mix(in srgb, var(--success) 8%, transparent);
 }
 
 .diff-side-meta {
@@ -5964,10 +6229,10 @@ textarea {
 }
 
 .diff-side-meta.hunk {
-  color: #8ab4f8;
-  background: color-mix(in srgb, #8ab4f8 10%, transparent);
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 10%, transparent);
   font-weight: 600;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, #8ab4f8 55%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--link) 55%, transparent);
 }
 
 .diff-side-meta.info {
@@ -5978,11 +6243,11 @@ textarea {
 
 /* ---- context meter warning ---- */
 .context-meter.warn .context-meter-text {
-  color: #fbbf24;
+  color: var(--thinking);
 }
 
 .context-meter.warn .context-meter-fill {
-  background: #fbbf24;
+  background: var(--thinking);
 }
 
 /* ---- search overlay ---- */
@@ -6738,8 +7003,8 @@ textarea {
   max-width: 100%;
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, #22c55e 18%, var(--bg-panel)),
-    color-mix(in srgb, #22c55e 8%, var(--bg-panel))
+    color-mix(in srgb, var(--success) 18%, var(--bg-panel)),
+    color-mix(in srgb, var(--success) 8%, var(--bg-panel))
   );
   border: none;
   border-radius: 999px;
@@ -6749,9 +7014,9 @@ textarea {
   color: var(--text);
   cursor: pointer;
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #22c55e 24%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--success) 24%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.14),
-    0 4px 12px -6px rgba(34, 197, 94, 0.45);
+    0 4px 12px -6px color-mix(in srgb, var(--success) 45%, transparent);
   transition:
     box-shadow 0.15s,
     background 0.15s,
@@ -6761,26 +7026,26 @@ textarea {
 .nvim-label:hover {
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, #22c55e 26%, var(--bg-panel)),
-    color-mix(in srgb, #22c55e 13%, var(--bg-panel))
+    color-mix(in srgb, var(--success) 26%, var(--bg-panel)),
+    color-mix(in srgb, var(--success) 13%, var(--bg-panel))
   );
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #22c55e 26%, transparent),
-    0 0 0 3px color-mix(in srgb, #22c55e 14%, transparent),
-    0 4px 14px -6px rgba(34, 197, 94, 0.55);
+    inset 0 1px 0 color-mix(in srgb, var(--success) 26%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent),
+    0 4px 14px -6px color-mix(in srgb, var(--success) 55%, transparent);
 }
 
 .nvim-label.selected {
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, #22c55e 34%, var(--bg-input)),
-    color-mix(in srgb, #22c55e 18%, var(--bg-input))
+    color-mix(in srgb, var(--success) 34%, var(--bg-input)),
+    color-mix(in srgb, var(--success) 18%, var(--bg-input))
   );
   color: var(--text);
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #22c55e 30%, transparent),
-    0 0 0 3px color-mix(in srgb, #22c55e 16%, transparent),
-    0 4px 14px -6px rgba(34, 197, 94, 0.6);
+    inset 0 1px 0 color-mix(in srgb, var(--success) 30%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent),
+    0 4px 14px -6px color-mix(in srgb, var(--success) 60%, transparent);
 }
 
 .nvim-glyph {
@@ -6789,8 +7054,12 @@ textarea {
   justify-content: center;
   padding: 2px 7px;
   border-radius: 999px;
-  background: linear-gradient(to bottom, #34d399, #16a34a);
-  color: #fff;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--success) 85%, white),
+    color-mix(in srgb, var(--success) 60%, var(--bg))
+  );
+  color: var(--on-accent);
   font-weight: 700;
   font-size: 9px;
   letter-spacing: 0.06em;
@@ -6818,8 +7087,8 @@ textarea {
   height: 17px;
   flex: 0 0 auto;
   border-radius: 999px;
-  background: color-mix(in srgb, #22c55e 20%, transparent);
-  color: #22c55e;
+  background: color-mix(in srgb, var(--success) 20%, transparent);
+  color: var(--success);
   font-weight: 700;
   font-size: 11px;
   line-height: 1;
@@ -6829,11 +7098,15 @@ textarea {
 }
 
 .nvim-label.selected .nvim-check {
-  background: linear-gradient(to bottom, #34d399, #16a34a);
-  color: #fff;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--success) 85%, white),
+    color-mix(in srgb, var(--success) 60%, var(--bg))
+  );
+  color: var(--on-accent);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.35),
-    0 1px 3px rgba(22, 163, 74, 0.5);
+    inset 0 1px 0 color-mix(in srgb, var(--success) 35%, transparent),
+    0 1px 3px color-mix(in srgb, var(--success) 50%, transparent);
 }
 
 .nvim-lsp {
@@ -6853,18 +7126,18 @@ textarea {
 }
 
 .nvim-lsp .lsp-error {
-  color: #ff6b6b;
-  background: color-mix(in srgb, #ff6b6b 16%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
 }
 
 .nvim-lsp .lsp-warning {
-  color: #ffd166;
-  background: color-mix(in srgb, #ffd166 16%, transparent);
+  color: var(--thinking);
+  background: color-mix(in srgb, var(--thinking) 16%, transparent);
 }
 
 .nvim-lsp .lsp-info {
-  color: #74c0fc;
-  background: color-mix(in srgb, #74c0fc 16%, transparent);
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 16%, transparent);
 }
 
 /* ---- unified chat notices (bottom of the message list) ---- */
@@ -6928,13 +7201,13 @@ textarea {
 }
 
 .notice-error {
-  border-left-color: #e03131;
-  background: color-mix(in srgb, #e03131 7%, var(--bg));
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg));
 }
 
 .notice-error .notice-icon {
-  color: #e03131;
-  background: color-mix(in srgb, #e03131 14%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
 .notice-info {
@@ -6972,12 +7245,12 @@ textarea {
 }
 
 .notice-prefix {
-  border-left-color: #f08c00;
+  border-left-color: var(--thinking);
 }
 
 .notice-prefix .notice-icon {
-  color: #f08c00;
-  background: color-mix(in srgb, #f08c00 14%, transparent);
+  color: var(--thinking);
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
 }
 
 .notice-loading {
@@ -7413,10 +7686,6 @@ textarea {
   box-shadow: 2px 0 10px -6px rgba(0, 0, 0, 0.22);
 }
 
-[data-theme="light"] .sidebar {
-  box-shadow: 2px 0 10px -6px rgba(0, 0, 0, 0.1);
-}
-
 /* 3) Hairlines: separators tinted from the text color — the borderless
       substitute that reads as depth, not an outline. */
 .sidebar-footer,
@@ -7524,7 +7793,7 @@ textarea {
 
 .retry-banner {
   border: none;
-  border-left: 3px solid #fbbf24;
+  border-left: 3px solid var(--thinking);
 }
 
 /* 7) Small controls: tonal fills + glow, no borders. */
@@ -7614,7 +7883,7 @@ textarea {
 }
 
 .badge.mcp-builtin {
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--info, #4da3ff) 45%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--link) 45%, transparent);
 }
 
 .empty-mode.active {
@@ -7675,4 +7944,64 @@ textarea {
 
 .msg-image {
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.14);
+}
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.theme-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+.theme-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 2px 10px -4px rgba(0, 0, 0, 0.4);
+  transform: translateY(-1px);
+}
+.theme-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 2px 10px -4px rgba(0, 0, 0, 0.4);
+}
+.theme-swatch {
+  display: flex;
+  gap: 4px;
+}
+.theme-swatch i {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.theme-name {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.theme-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }

@@ -130,16 +130,32 @@ export function Sidebar() {
   const chats = useStore((s) => s.chats)
   const workspaces = useStore((s) => s.workspaces)
   const activeChatId = useStore((s) => s.activeChatId)
-  const theme = useStore((s) => s.theme)
   const workspaceColors = useStore((s) => s.workspaceColors)
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces)
   const pinnedChats = useStore((s) => s.pinnedChats)
+  const unreadChats = useStore((s) => s.unreadChats)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [colorOpen, setColorOpen] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [dragKey, setDragKey] = useState<string | null>(null)
   const [dragOverKey, setDragOverKey] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+
+  // Click-based kebab menu: opens on click, stays open while hovering the
+  // popup (no hover-gap race), and closes on outside click or re-click.
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
+  useEffect(() => {
+    if (!menuOpenId) return
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node | null
+      if (!(t instanceof Element) || !t.closest('.chat-item-kebab-wrap')) {
+        setMenuOpenId(null)
+      }
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [menuOpenId])
 
   const open = useStore((s) => s.sidebarOpen)
   const dir = useStore((s) => s.dir)
@@ -191,6 +207,22 @@ export function Sidebar() {
   const recentModels = useStore((s) => s.recentModels)
 
   const groups = buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats)
+
+  // Sidebar search: match chat title or any message content (case-insensitive).
+  // While searching, groups keep their workspace context but only matching
+  // chats are shown and empty groups are hidden.
+  const searching = search.trim().length > 0
+  const matchesQuery = (chat: Chat, q: string): boolean => {
+    const query = q.trim().toLowerCase()
+    if (!query) return true
+    if ((chat.title || '').toLowerCase().includes(query)) return true
+    return chat.messages.some((m) => m.content.toLowerCase().includes(query))
+  }
+  const visibleGroups = searching
+    ? groups
+        .map((g) => ({ ...g, chats: g.chats.filter((c) => matchesQuery(c, search)) }))
+        .filter((g) => g.chats.length > 0)
+    : groups
 
   // Live plan checklist of the ACTIVE chat surfaced in the sidebar footer. Uses
   // the latest message that carries a non-empty plan; hidden only when no plan
@@ -419,11 +451,39 @@ export function Sidebar() {
         </button>
       </div>
 
+      <div className="sidebar-search">
+        <div className="sidebar-search-box">
+          <svg className="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="11" cy="11" r="7" />
+            <path d="M21 21l-4.3-4.3" />
+          </svg>
+          <input
+            className="sidebar-search-input"
+            type="text"
+            placeholder="Search chats…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            spellCheck={false}
+            dir={dir}
+          />
+          {search && (
+            <button className="sidebar-search-clear" title="Clear search" onClick={() => setSearch('')}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
+
       <div className="sidebar-list">
         {colorOpen !== null && <div className="color-backdrop" onClick={() => setColorOpen(null)} />}
         {chats.length === 0 && <div className="sidebar-empty">No conversations yet</div>}
-        {groups.map((g) => {
-          const isCollapsed = collapsed.has(g.key)
+        {searching && chats.length > 0 && visibleGroups.length === 0 && (
+          <div className="sidebar-empty">No chats match “{search.trim()}”</div>
+        )}
+        {visibleGroups.map((g) => {
+          const isCollapsed = collapsed.has(g.key) && !searching
           const color = workspaceColors[g.key]
           const isPinned = pinnedWorkspaces.includes(g.key)
           const pendingCount = g.chats.filter((c) => c.pendingAsk || c.pendingPermission).length
@@ -527,48 +587,73 @@ export function Sidebar() {
                 <div className="sidebar-group-chats" style={color ? { '--ws': color } as React.CSSProperties : undefined}>
                   {g.chats.map((c) => {
                     const isPinnedChat = pinnedChats.includes(c.id)
+                    const hasStreaming = c.messages.some((m) => m.streaming)
+                    const hasUnread = !hasStreaming && c.id !== activeChatId && unreadChats.includes(c.id)
                     return (
                       <div
                         key={c.id}
-                        className={`chat-item ${c.id === activeChatId ? 'active' : ''}${isPinnedChat ? ' pinned' : ''}`}
+                        className={`chat-item ${c.id === activeChatId ? 'active' : ''}${isPinnedChat ? ' pinned' : ''}${hasUnread ? ' unread' : ''}`}
                         onClick={() => useStore.getState().setActiveChat(c.id)}
                         title={prepareContent(titleOf(c), dir)}
                       >
-                      <div className="chat-item-actions">
+                      <div className={`chat-item-kebab-wrap${menuOpenId === c.id ? ' open' : ''}`}>
                         <button
-                          className={`chat-item-pin${isPinnedChat ? ' active' : ''}`}
-                          title={isPinnedChat ? 'Unpin conversation' : 'Pin to top'}
+                          className="chat-item-kebab"
+                          title="Chat actions"
+                          aria-label="Chat actions"
+                          aria-expanded={menuOpenId === c.id}
                           onClick={(e) => {
                             e.stopPropagation()
-                            useStore.getState().togglePinChat(c.id)
+                            setMenuOpenId(menuOpenId === c.id ? null : c.id)
                           }}
                         >
-                          <svg width="11" height="11" viewBox="0 0 24 24" fill={isPinnedChat ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                            <circle cx="12" cy="5" r="1.6" />
+                            <circle cx="12" cy="12" r="1.6" />
+                            <circle cx="12" cy="19" r="1.6" />
                           </svg>
                         </button>
-                        <button
-                          className="chat-item-edit"
-                          title="Rename conversation"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            startRename(c)
-                          }}
-                        >
-                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                          </svg>
-                        </button>
-                        <button
-                          className="chat-item-remove"
-                          title="Delete conversation"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            if (window.confirm('Delete this conversation?')) useStore.getState().deleteChat(c.id)
-                          }}
-                        >
-                          ×
-                        </button>
+                        <div className={`chat-item-menu${menuOpenId === c.id ? ' open' : ''}`} role="menu" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            className={`chat-item-menu-btn${isPinnedChat ? ' active' : ''}`}
+                            role="menuitem"
+                            onClick={() => {
+                              useStore.getState().togglePinChat(c.id)
+                              setMenuOpenId(null)
+                            }}
+                          >
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinnedChat ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+                            </svg>
+                            {isPinnedChat ? 'Unpin' : 'Pin to top'}
+                          </button>
+                          <button
+                            className="chat-item-menu-btn"
+                            role="menuitem"
+                            onClick={() => {
+                              startRename(c)
+                              setMenuOpenId(null)
+                            }}
+                          >
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+                            </svg>
+                            Rename
+                          </button>
+                          <button
+                            className="chat-item-menu-btn danger"
+                            role="menuitem"
+                            onClick={() => {
+                              if (window.confirm('Delete this conversation?')) useStore.getState().deleteChat(c.id)
+                              setMenuOpenId(null)
+                            }}
+                          >
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+                            </svg>
+                            Delete
+                          </button>
+                        </div>
                       </div>
                       {renamingId === c.id ? (
                         <input
@@ -595,8 +680,11 @@ export function Sidebar() {
                           >
                             {prepareContent(titleOf(c), dir)}
                           </span>
-                          {c.messages.some((m) => m.streaming) && (
+                          {hasStreaming && (
                             <span className="chat-item-streaming" title="Agent is working in this chat" />
+                          )}
+                          {hasUnread && (
+                            <span className="chat-item-unread" title="New message from the agent — click to view" />
                           )}
                           {c.pendingPermission && (
                             <span
@@ -799,14 +887,6 @@ export function Sidebar() {
             )}
           </div>
         )}
-        <button
-          className="sidebar-foot-btn"
-          title="Toggle theme"
-          onClick={() => useStore.getState().toggleTheme()}
-        >
-          {theme === 'dark' ? '☀️' : '🌙'}
-          <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>
-        </button>
         <button
           className="sidebar-foot-btn"
           title="Settings (⌘,)"

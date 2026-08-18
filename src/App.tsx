@@ -7,6 +7,7 @@ import { SearchOverlay } from './components/SearchOverlay'
 import { DownloadModelGate } from './components/DownloadModelGate'
 import { getModelsStatus } from './lib/api'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
+import { DEFAULT_THEME, THEMES } from './lib/themes'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -37,8 +38,12 @@ export default function App() {
   }
 
   useEffect(() => {
-    const t = localStorage.getItem('coder:theme')
-    useStore.getState().setTheme(t === 'light' ? 'light' : 'dark')
+    let saved = DEFAULT_THEME
+    try {
+      const t = localStorage.getItem('coder:theme')
+      if (t && THEMES.some((th) => th.id === t)) saved = t
+    } catch {}
+    useStore.getState().setTheme(saved)
     void load()
   }, [load])
 

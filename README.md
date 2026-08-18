@@ -1,16 +1,16 @@
 <div align="center">
 
-# 💻 Codefa
+# 💻 Codifa
 
 **The offline-first AI coding assistant for your own machine.**
 
-Codefa is a desktop IDE-style workspace — file explorer, Monaco editor and a
+Codifa is a desktop IDE-style workspace — file explorer, Monaco editor and a
 streaming AI chat — powered by a real **agent** that reads, searches and edits
 your code _itself_, confined to the folder you choose. Bring your own model:
 OpenRouter, any OpenAI-compatible API, or a fully local endpoint. Type, or just
 talk (local Whisper). Nothing leaves your machine unless you want it to.
 
-کدفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری تمام‌عیار با کاوشگر فایل،
+کدیفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری تمام‌عیار با کاوشگر فایل،
 ویرایشگر کد و چتِ هوش مصنوعیِ زنده. در قلب آن یک **عامل واقعی** نشسته که
 فایل‌های شما را خودش می‌خواند، جستجو و ویرایش می‌کند — و همه‌چیز فقط در همان
 پوشه‌ای که انتخاب کرده‌اید. مدل‌تان را خودتان بیاورید: OpenRouter، هر API سازگار
@@ -77,7 +77,7 @@ npm run dev
 
 Opens the Electron window with a hot-reloading renderer. The Python sidecar
 (FastAPI + Pydantic AI) is auto-spawned on an ephemeral localhost port. When
-launched from the packaged `.app`, Codefa also merges the GUI PATH with your
+launched from the packaged `.app`, Codifa also merges the GUI PATH with your
 login-shell path so tools like `docker` (used by MCP stdio connectors) are found.
 
 ### 🏗️ Building / packaging
@@ -93,13 +93,13 @@ npm run dist:linux  # only Linux (AppImage)
 Output lands in `release/`.
 
 > **macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
-> notarized), so the first launch from Finder may show _"CODEFA has been blocked
+> notarized), so the first launch from Finder may show _"Codifa has been blocked
 > because it may reduce your privacy…"_. This is expected for locally-built apps.
 > Fix: right-click the app → **Open** → **Open**. If copied from a download,
 > also clear the quarantine flag:
 >
 > ```bash
-> xattr -dr com.apple.quarantine /path/to/CODEFA.app
+> xattr -dr com.apple.quarantine /path/to/Codifa.app
 > ```
 
 ### 🖱️ Usage
@@ -230,13 +230,13 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 خروجی در پوشهٔ `release/` قرار می‌گیرد.
 
 > **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
-> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«CODEFA به
+> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«Codifa به
 > خاطر کاهش حریم خصوصی مسدود شده است»_ را نشان دهد. این برای برنامه‌های
 > ساخته‌شدهٔ محلی طبیعی است. راه‌حل: روی برنامه کلیک راست کنید ← **Open** ←
 > **Open**. اگر از اینترنت کپی شده است، فلگ قرنطینه را هم پاک کنید:
 >
 > ```bash
-> xattr -dr com.apple.quarantine /path/to/CODEFA.app
+> xattr -dr com.apple.quarantine /path/to/Codifa.app
 > ```
 
 ### 🖱️ کاربرد

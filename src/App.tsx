@@ -194,7 +194,7 @@ export default function App() {
             <path d="M4 6h16M4 12h16M4 18h10" />
           </svg>
         </button>
-        <span className="app-title">CODEFA</span>
+        <span className="app-title">Codifa</span>
         <div id="titlebar-toolbar" />
         <button
           className="workspace-btn"

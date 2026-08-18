@@ -879,7 +879,7 @@ function Ae() {
     height: 900,
     minWidth: 980,
     minHeight: 640,
-    title: "CODEFA",
+    title: "Codifa",
     icon: c.join(import.meta.dirname, "../build/icon.png"),
     backgroundColor: "#1e1e1e",
     autoHideMenuBar: !he,

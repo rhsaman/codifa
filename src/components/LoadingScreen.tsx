@@ -1,6 +1,6 @@
 export function LoadingScreen() {
   return (
-    <div className="loading-screen" role="status" aria-label="Loading CODEFA">
+    <div className="loading-screen" role="status" aria-label="Loading Codifa">
       <div className="loading-screen__glow" />
       <div className="loading-screen__grid" />
       <div className="loading-screen__content">
@@ -16,7 +16,7 @@ export function LoadingScreen() {
             </svg>
           </div>
         </div>
-        <h1 className="loading-wordmark">CODEFA</h1>
+        <h1 className="loading-wordmark">Codifa</h1>
         <p className="loading-status">
           <span className="loading-status__label">Loading workspace</span>
           <span className="loading-dots" aria-hidden="true">

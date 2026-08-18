@@ -96,7 +96,7 @@ def _oauth_redirect_uri() -> str:
     return f"http://127.0.0.1:{_SIDECAR_PORT}/oauth/google/callback"
 
 
-app = FastAPI(title="CODEFA agent sidecar")
+app = FastAPI(title="Codifa agent sidecar")
 
 app.add_middleware(
     CORSMiddleware,

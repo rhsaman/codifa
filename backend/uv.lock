@@ -612,7 +612,7 @@ wheels = [
 ]
 
 [[package]]
-name = "codefa"
+name = "codifa"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

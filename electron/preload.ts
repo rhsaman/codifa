@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import type { UpdateInfo, UpdateProgress } from './updater'
 
 export interface RegionRect {
   x: number
@@ -91,7 +92,16 @@ const api = {
     ipcRenderer.on('nvim:file', listener)
     return () => ipcRenderer.removeListener('nvim:file', listener)
   },
+  checkForUpdates: (): Promise<UpdateInfo> => ipcRenderer.invoke('updater:check'),
+  startUpdate: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('updater:start'),
+  onUpdateProgress: (cb: (p: UpdateProgress) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, p: UpdateProgress): void => cb(p)
+    ipcRenderer.on('updater:progress', listener)
+    return () => ipcRenderer.removeListener('updater:progress', listener)
+  },
 }
+
+export type { UpdateInfo, UpdateProgress }
 
 contextBridge.exposeInMainWorld('coder', api)
 

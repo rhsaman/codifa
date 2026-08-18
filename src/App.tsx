@@ -9,6 +9,7 @@ import { LoadingScreen } from './components/LoadingScreen'
 import { getModelsStatus } from './lib/api'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
+import { UpdateButton } from './components/UpdateButton'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -196,6 +197,7 @@ export default function App() {
         </button>
         <span className="app-title">Codifa</span>
         <div id="titlebar-toolbar" />
+        <UpdateButton />
         <button
           className="workspace-btn"
           title={activeChatRoot || 'No workspace open — pick a folder for this chat'}

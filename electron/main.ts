@@ -22,6 +22,7 @@ import {
   coderDirWrite,
   coderDirDelete,
 } from './ipc/fs'
+import { checkForUpdates, startUpdate } from './updater'
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
@@ -382,7 +383,7 @@ function createWindow(): void {
     height: 900,
     minWidth: 980,
     minHeight: 640,
-    title: 'CODEFA',
+    title: 'Codifa',
     icon: path.join(import.meta.dirname, '../build/icon.png'),
     backgroundColor: '#1e1e1e',
     autoHideMenuBar: !isDev,
@@ -411,6 +412,10 @@ function registerIpc(): void {
 
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
+
+  // --- app updates (GitHub releases) ---------------------------------------
+  ipcMain.handle('updater:check', () => checkForUpdates())
+  ipcMain.handle('updater:start', () => startUpdate(mainWindow))
 
   // --- neovim open-file state ----------------------------------------------
   ipcMain.handle('nvim:get', () => ({ abs: lastNvimAbs, diagnostics: lastNvimDiags }))

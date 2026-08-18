@@ -1431,6 +1431,104 @@ textarea {
   color: var(--accent);
 }
 
+/* ----- update button (titlebar, next to the workspace picker) ----- */
+.update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.update-btn::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
+  animation: update-dot 2s ease-out infinite;
+}
+
+@keyframes update-dot {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+
+.update-btn:hover {
+  background: linear-gradient(135deg, var(--accent), #74c7ec);
+  color: var(--on-accent);
+  border-color: transparent;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.update-btn:active {
+  transform: translateY(0);
+}
+
+.update-btn:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+.update-btn.downloading::before,
+.update-btn.installing::before,
+.update-btn.done::before,
+.update-btn.error::before {
+  display: none;
+}
+
+.update-ring {
+  transform: rotate(-90deg);
+  flex-shrink: 0;
+}
+
+.update-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, var(--accent) 22%, transparent);
+  stroke-width: 3.5;
+}
+
+.update-ring-bar {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  stroke-dasharray: 100;
+  transition: stroke-dashoffset 0.25s ease;
+}
+
+.update-btn.done {
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  background: color-mix(in srgb, var(--success) 14%, var(--bg-input));
+  color: var(--success);
+}
+
+.update-btn.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-input));
+  color: var(--danger);
+}
+
 /* ----- ensure RTL/LTR correctness for mixed scripts ----- */
 .chat-message {
   white-space: pre-wrap;

@@ -2667,7 +2667,8 @@ export function ChatPanel() {
               strokeLinecap="round"
               strokeLinejoin="round"
             >
-              <path d="M12 5v14M5 12l7 7 7-7" />
+              <path d="M6 5.5l6 6 6-6" />
+              <path d="M6 12.5l6 6 6-6" />
             </svg>
           </button>
         )}

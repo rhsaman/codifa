@@ -45,7 +45,7 @@ def _raw_models_root() -> str:
 
         root = data_root()
     except Exception:  # noqa: BLE001 — standalone fallback
-        root = os.path.join(os.path.expanduser("~"), ".codefa")
+        root = os.path.join(os.path.expanduser("~"), ".codifa")
     return os.path.join(root, "models")
 
 

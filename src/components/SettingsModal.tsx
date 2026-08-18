@@ -1805,7 +1805,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 <input
                   value={dataPath}
                   onChange={(e) => setDataPath(e.target.value)}
-                  placeholder="~/.codefa"
+                  placeholder="~/.codifa"
                   dir="ltr"
                   disabled={migrating}
                 />
@@ -1822,11 +1822,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 </div>
               )}
               <div className="hint">
-                All app data lives under this path — settings (<code>settings.json</code>), chats,
-                vector stores, models, memory, skills, MCP connectors and plans. Moving the path
-                copies every file to the new location and empties the old one. The default
-                <code>~/.codefa</code> resolves the same on macOS, Linux and Windows
-                (<code>~/</code> = the home directory).
+                All app data lives under this path: settings (<code>settings.json</code>), chats,
+                vector stores, models, memory, skills, MCP connectors, and plans. Moving the path
+                copies every file to the new location and empties the old one. The default{' '}
+                <code>~/.codifa</code> works the same on macOS, Linux, and Windows
+                (<code>~/</code> = your home directory).
               </div>
               {dataMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{dataMsg}</div>}
             </div>

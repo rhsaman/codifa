@@ -128,7 +128,7 @@ export interface Settings {
   memoryMaxDocs?: number
   memoryMaxChunks?: number
   /** User-level data root: app DB (coder.db), skills/plans/mcp files and the
-   *  vector store all live under this folder. Default: ~/.codefa. */
+   *  vector store all live under this folder. Default: ~/.codifa. */
   dataPath?: string
   /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */
   whisperModel?: string

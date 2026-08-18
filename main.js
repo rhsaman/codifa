@@ -6,7 +6,7 @@ import * as o from "fs";
 import * as Re from "net";
 import * as k from "fs/promises";
 import * as Ie from "crypto";
-const $e = ".codefa", Ce = ".coder";
+const $e = ".codifa", Ce = ".coder";
 let S = null;
 function q() {
   return c.join(v.getPath("userData"), "data-root.json");

@@ -15,7 +15,7 @@ export function resolveSafe(root: string, relPath: string): string {
   if (!rel) return rootReal
   const candidate = path.join(rootReal, rel)
   // Walk up to the nearest EXISTING ancestor (the target itself may not exist
-  // yet) and resolve THAT, so a brand-new nested path (e.g. .codefa/skills/x)
+  // yet) and resolve THAT, so a brand-new nested path (e.g. .codifa/skills/x)
   // can be created without the intermediate directories existing. If that
   // ancestor is a symlink, realpathSync resolves its target and the containment
   // check below still catches any escape out of the root.
@@ -248,7 +248,7 @@ export function baseName(relPath: string): string {
 
 // --------------------------------------------------------------------------- //
 // Persistence: settings + chats stored in the sidecar SQLite DB under the
-// configurable data root (default ~/.codefa). Skills/MCP files also resolve
+// configurable data root (default ~/.codifa). Skills/MCP files also resolve
 // against that same root.
 // --------------------------------------------------------------------------- //
 

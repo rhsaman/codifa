@@ -151,7 +151,7 @@ class ChatRequest(BaseModel):
     # (<data>/plan/<workspace>/<chat-id>/plan.md) instead of per workspace.
     chat_id: str = ""
     # Directory for the per-workspace RAG vector store (memory + web chunks).
-    # Empty string = default (~/.codefa/vector-db).
+    # Empty string = default (~/.codifa/vector-db).
     vector_db_path: str = ""
     # Size / TTL bounds for the RAG store (max_docs, max_chunks, ttl_days).
     # None = backend defaults.
@@ -237,7 +237,7 @@ async def ask_respond(req: AskResponse) -> dict:
 # Persisted as plain files in the user data root (backend/state_db.py): a
 # settings.json plus per-chat JSON files under chats/<workspace>/. Electron's
 # main process reads/writes state through these endpoints; the data root
-# defaults to ~/.codefa (configurable via CODER_DATA_DIR).
+# defaults to ~/.codifa (configurable via CODER_DATA_DIR).
 
 
 @app.get("/app/state")

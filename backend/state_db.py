@@ -1,7 +1,7 @@
 """File-based app state store (settings + chats + skills + MCP + plans).
 
 All user data now lives as plain JSON / markdown files under the user-level
-data root (default ``~/.codefa``, configurable by Electron via
+data root (default ``~/.codifa``, configurable by Electron via
 ``CODER_DATA_DIR``), replacing the old SQLite ``coder.db``:
 
     {data_root}/
@@ -42,13 +42,13 @@ _LOCK = threading.RLock()
 def data_root() -> str:
     """The sidecar's user-level data root (set by Electron via CODER_DATA_DIR).
 
-    When run standalone (no Electron), falls back to the default ``~/.codefa``
+    When run standalone (no Electron), falls back to the default ``~/.codifa``
     and, on first use, non-destructively copies any pre-1.2 ``~/.coder`` root
     into it so existing data survives the rename.
     """
     base = os.environ.get("CODER_DATA_DIR", "").strip()
     if not base:
-        base = os.path.join(os.path.expanduser("~"), ".codefa")
+        base = os.path.join(os.path.expanduser("~"), ".codifa")
         _migrate_legacy_root(base)
     os.makedirs(base, exist_ok=True)
     return base
@@ -75,7 +75,7 @@ def bootstrap() -> None:
 
 
 def _migrate_legacy_root(new_default: str) -> None:
-    """Copy ``~/.coder`` → ``~/.codefa`` once (never delete the source)."""
+    """Copy ``~/.coder`` → ``~/.codifa`` once (never delete the source)."""
     if os.path.exists(new_default):
         return  # already migrated or fresh install
     legacy = os.path.join(os.path.expanduser("~"), ".coder")

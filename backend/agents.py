@@ -3973,7 +3973,7 @@ async def run_agent(
             f"  system_chars={len(system_final)} scout_chars={len(scouted)} "
             f"history_msgs={len(history)} tools={len(registered)} toolsets={0 if toolsets is None else len(toolsets)}"
         )
-        # Also persist to ~/.codefa/codefa.log so a packaged app (whose stderr is
+        # Also persist to ~/.codifa/codefa.log so a packaged app (whose stderr is
         # not written anywhere readable) still leaves the full traceback behind
         # for diagnosis. Best-effort: never raise from a logger.
         try:

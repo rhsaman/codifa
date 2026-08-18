@@ -7,7 +7,7 @@ import * as path from 'path'
 /**
  * App state store (settings + chats + plans + skills + MCP connectors).
  * This module owns the location logic: resolves the configurable "Data path"
- * (default ~/.codefa), boots it, and moves all app data when the user changes
+ * (default ~/.codifa), boots it, and moves all app data when the user changes
  * the path in Settings.
  *
  * User data lives as PLAIN FILES under the data root (owned by the sidecar's
@@ -18,7 +18,7 @@ import * as path from 'path'
  * app owns.
  */
 
-const DEFAULT_DATA_DIR = '.codefa'
+const DEFAULT_DATA_DIR = '.codifa'
 /** The pre-1.2 default root; copied into the new default on first launch
  *  (non-destructively) so existing users keep their data after the rename. */
 const LEGACY_DATA_DIR = '.coder'
@@ -33,7 +33,7 @@ export function resolveDataPath(): string {
   return getDataRoot()
 }
 
-/** The active data root (default ~/.codefa unless the user moved it). */
+/** The active data root (default ~/.codifa unless the user moved it). */
 export function getDataRoot(): string {
   if (cachedRoot) return cachedRoot
   try {

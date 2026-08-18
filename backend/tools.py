@@ -859,7 +859,7 @@ def write_file(root: str, path: str, content: str) -> dict:
 
 
 def user_coder_dir() -> str:
-    """Return the user-level data root (default ``~/.codefa``), creating it.
+    """Return the user-level data root (default ``~/.codifa``), creating it.
 
     The state DB (settings, chats, skills, MCP connectors) and the vector
     stores live here (global, shared across all workspaces), not inside each
@@ -926,7 +926,7 @@ def open_vector_store(
     """Open (or create) the workspace's RAG vector store for durable memory.
 
     One sqlite file per workspace under ``base_dir`` (default
-    ``~/.codefa/vector-db``). Returns ``None`` when it can't be opened so
+    ``~/.codifa/vector-db``). Returns ``None`` when it can't be opened so
     callers degrade gracefully — never raises.
     """
     base_dir = base_dir or _state_db.vector_db_dir()
@@ -957,7 +957,7 @@ def open_skill_store(base_dir: str = "") -> VectorStore | None:
     """Open (or create) the global skill vector store (``skills.vectors.sqlite``).
 
     Skills are indexed globally (not per workspace), so they live in one
-    sqlite file under ``base_dir`` (default ``~/.codefa/vector-db``). Returns
+    sqlite file under ``base_dir`` (default ``~/.codifa/vector-db``). Returns
     ``None`` when it can't be opened so callers degrade gracefully.
     """
     base_dir = base_dir or _state_db.vector_db_dir()

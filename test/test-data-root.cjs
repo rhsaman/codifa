@@ -1,7 +1,7 @@
-/* One-off test for the ~/.coder → ~/.codefa one-time migration in
+/* One-off test for the ~/.coder → ~/.codifa one-time migration in
  * electron/store-db.ts. Bundles the real module with esbuild, mocks
  * electron.app, and asserts:
- *   1. getDataRoot() resolves to ~/.codefa
+ *   1. getDataRoot() resolves to ~/.codifa
  *   2. legacy ~/.coder contents are COPIED (source untouched)
  *   3. a second call is a no-op (no double copy, cached root wins)
  *   4. a custom pointer (data-root.json) still wins over the default
@@ -54,9 +54,9 @@ Module._load = function (request, ...rest) {
 const mod = require(outfile)
 const { getDataRoot } = mod
 
-// --- Test 1: default resolves to ~/.codefa and migrates legacy ---
+// --- Test 1: default resolves to ~/.codifa and migrates legacy ---
 const root = getDataRoot()
-const expected = path.join(fakeHome, '.codefa')
+const expected = path.join(fakeHome, '.codifa')
 if (root !== expected) throw new Error(`root=${root} expected=${expected}`)
 if (!fs.existsSync(path.join(expected, 'settings.json'))) throw new Error('settings.json not migrated')
 if (!fs.existsSync(path.join(expected, 'chats', 'ws1', 'c1.json'))) throw new Error('chat not migrated')
@@ -64,7 +64,7 @@ if (!fs.existsSync(path.join(expected, 'skills', 'my-skill', 'skill.md'))) throw
 if (!fs.existsSync(path.join(expected, 'vector-db', 'ws1.sqlite'))) throw new Error('vector-db not migrated')
 // Source must be untouched (copy, not move).
 if (!fs.existsSync(path.join(legacy, 'settings.json'))) throw new Error('legacy source was deleted!')
-console.log('PASS test1: ~/.codefa created, legacy contents copied, source intact')
+console.log('PASS test1: ~/.codifa created, legacy contents copied, source intact')
 
 // --- Test 2: cached root wins on second call, no re-copy / no crash ---
 const root2 = getDataRoot()

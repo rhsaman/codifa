@@ -117,9 +117,9 @@ Output lands in `release/`.
    it saves them into the app itself — it never writes files into other tools'
    config folders, even if the source's instructions say so.
 
-> 💡 The app **Data path** is configurable. Its default is `~/.codefa` on every
-> OS: `~/.codefa` (macOS), `/home/<user>/.codefa` (Linux) and
-> `C:\Users\<user>\.codefa` (Windows). Changing it moves your data to the new
+> 💡 The app **Data path** is configurable. Its default is `~/.codifa` on every
+> OS: `~/.codifa` (macOS), `/home/<user>/.codifa` (Linux) and
+> `C:\Users\<user>\.codifa` (Windows). Changing it moves your data to the new
 > folder, keeping a backup of the old one — all from **Settings → Memory**.
 
 ### ⌨️ Keyboard shortcuts
@@ -259,8 +259,8 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد.
 
 > 💡 «مسیر داده» برنامه قابل تنظیم است و پیش‌فرض آن در هر سیستم‌عاملی
-> `~/.codefa` است: `~/.codefa` (مک)، `/home/<user>/.codefa` (لینوکس) و
-> `C:\Users\<user>\.codefa` (ویندوز). تغییر آن، داده‌هایتان را به پوشهٔ جدید
+> `~/.codifa` است: `~/.codifa` (مک)، `/home/<user>/.codifa` (لینوکس) و
+> `C:\Users\<user>\.codifa` (ویندوز). تغییر آن، داده‌هایتان را به پوشهٔ جدید
 > منتقل و از پوشهٔ قبلی پشتیبان نگه می‌دارد — همه از **تنظیمات ← حافظه**.
 
 ### ⌨️ میان‌برهای صفحه‌کلید

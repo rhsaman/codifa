@@ -66,7 +66,7 @@ export function DownloadModelGate({ onReady }: Props) {
       })
   }
 
-  const target = (dataPath && dataPath.trim() ? dataPath : '~/.codefa') + '/models'
+  const target = (dataPath && dataPath.trim() ? dataPath : '~/.codifa') + '/models'
 
   return (
     <div className="download-gate">

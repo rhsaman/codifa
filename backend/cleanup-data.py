@@ -9,7 +9,7 @@ Removes only clearly disposable files that the app itself regenerates:
 The active data root is resolved the same way the app resolves it:
   1. Electron's data-root.json pointer (userData dir)
   2. CODER_DATA_DIR env var
-  3. default ~/.codefa
+  3. default ~/.codifa
 
 Run:  python backend/cleanup-data.py
 """
@@ -49,7 +49,7 @@ def resolve_data_root() -> str:
     if env:
         return os.path.abspath(env)
     # 3. default
-    return os.path.join(os.path.expanduser("~"), ".codefa")
+    return os.path.join(os.path.expanduser("~"), ".codifa")
 
 
 # -- cleanup ---------------------------------------------------------------- #

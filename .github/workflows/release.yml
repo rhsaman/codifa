@@ -93,9 +93,6 @@ jobs:
       - name: Create backend virtualenv (uv sync)
         run: npm run setup
 
-      - name: Set version from tag
-        run: npm version ${{ needs.tag-version.outputs.version }} --no-git-tag-version
-
       - name: Build renderer + electron
         run: npm run build
 

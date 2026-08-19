@@ -9165,3 +9165,177 @@ textarea {
     animation: none;
   }
 }
+
+/* ── Inputs: borderless well, visible in every theme ───────────────────────
+   Bare inputs (no class) inside settings/plugin/cred/mcp/data rows fell back
+   to the browser default (white box, black text) — invisible in dark themes.
+   Give them the same borderless well treatment as the classed inputs above:
+   a tonal surface + inset highlight, never an outline. */
+.plugin-fields input,
+.cred-block input,
+.cred-inline-fallback input,
+.mcp-fields input,
+.data-path-row input {
+  border: none;
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 11px;
+  font-size: 12.5px;
+  outline: none;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Standalone .system-prompt textareas (mode cards, skill cards) — same
+   borderless well. .skill-raw keeps its own min-height (180px). */
+.system-prompt {
+  width: 100%;
+  border: none;
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 11px;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.plugin-fields input:focus,
+.cred-block input:focus,
+.cred-inline-fallback input:focus,
+.mcp-fields input:focus,
+.data-path-row input:focus,
+.system-prompt:focus {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Sidebar search: drop the hard outline, keep the well + accent focus. */
+.sidebar-search-input {
+  border: none;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.sidebar-search-input:hover {
+  background: color-mix(in srgb, var(--bg-input) 94%, var(--text) 6%);
+}
+
+.sidebar-search-input:focus {
+  border: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* ── Input polish: smooth, beautiful interactions ─────────────────────────
+   One cohesive treatment across every input in the app: gentle hover lift,
+   a soft accent glow on focus, accent caret, and consistent placeholder. */
+.field input,
+.field select,
+.field textarea.system-prompt,
+.download-gate-input,
+.model-add-input,
+.model-picker-input,
+.model-select-search,
+.model-select-combo-input,
+.model-select-btn,
+.active-model-display,
+.dir-toggle,
+.new-skill-form input,
+.settings-search input[type="search"],
+.sidebar-search-input,
+.ask-input,
+.pm-search,
+.chat-rename-input,
+.plugin-fields input,
+.cred-block input,
+.cred-inline-fallback input,
+.mcp-fields input,
+.data-path-row input,
+.system-prompt {
+  caret-color: var(--accent);
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.2s ease,
+    border-color 0.16s ease;
+}
+
+.field input::placeholder,
+.field select::placeholder,
+.field textarea.system-prompt::placeholder,
+.download-gate-input::placeholder,
+.model-add-input::placeholder,
+.model-picker-input::placeholder,
+.model-select-search::placeholder,
+.model-select-combo-input::placeholder,
+.new-skill-form input::placeholder,
+.settings-search input[type="search"]::placeholder,
+.sidebar-search-input::placeholder,
+.ask-input::placeholder,
+.pm-search::placeholder,
+.chat-rename-input::placeholder,
+.plugin-fields input::placeholder,
+.cred-block input::placeholder,
+.cred-inline-fallback input::placeholder,
+.mcp-fields input::placeholder,
+.data-path-row input::placeholder,
+.system-prompt::placeholder {
+  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
+  opacity: 1;
+}
+
+/* Gentle hover lift: the field brightens slightly, hinting it's editable. */
+.field input:hover,
+.field select:hover,
+.field textarea.system-prompt:hover,
+.download-gate-input:hover,
+.model-add-input:hover,
+.model-picker-input:hover,
+.model-select-search:hover,
+.model-select-combo-input:hover,
+.dir-toggle:hover,
+.new-skill-form input:hover,
+.settings-search input[type="search"]:hover,
+.sidebar-search-input:hover,
+.ask-input:hover,
+.pm-search:hover,
+.plugin-fields input:hover,
+.cred-block input:hover,
+.cred-inline-fallback input:hover,
+.mcp-fields input:hover,
+.data-path-row input:hover,
+.system-prompt:hover {
+  background-color: color-mix(in srgb, var(--bg-input) 93%, var(--text) 7%);
+}
+
+/* Focus: soft accent glow — ring + outer bloom, never a hard outline. */
+.field input:focus,
+.field select:focus,
+.field textarea.system-prompt:focus,
+.download-gate-input:focus,
+.model-add-input:focus,
+.model-picker-input:focus,
+.model-select-search:focus,
+.model-select-combo-input:focus,
+.dir-toggle:focus,
+.new-skill-form input:focus,
+.settings-search input[type="search"]:focus,
+.sidebar-search-input:focus,
+.ask-input:focus,
+.pm-search:focus,
+.plugin-fields input:focus,
+.cred-block input:focus,
+.cred-inline-fallback input:focus,
+.mcp-fields input:focus,
+.data-path-row input:focus,
+.system-prompt:focus {
+  background-color: color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}

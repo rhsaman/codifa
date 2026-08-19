@@ -1,5 +1,6 @@
 import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, SidecarEvent } from '../types'
 import { api } from './fs'
+import { modelContextWindow } from './context'
 
 let sidecarUrl: string | null = null
 
@@ -262,7 +263,7 @@ export async function streamChat(
       vector_config: params.vectorConfig ?? null,
       subagent_models: params.subagentModels ?? {},
       compact_threshold: params.compactThreshold ?? 0.8,
-      context_window: params.provider.contextWindow ?? 0,
+      context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
     }),
   })
 

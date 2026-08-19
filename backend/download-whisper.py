@@ -46,8 +46,10 @@ def main() -> int:
     import time
 
     print(f"Downloading {args.model} -> {model_download.whisper_dir()} ...")
-    while model_download.download_state(model_download.KIND_WHISPER):
+    while True:
         state = model_download.download_state(model_download.KIND_WHISPER) or {}
+        if not state:
+            break
         if state.get("state") == "error":
             print(f"Download failed: {state.get('error')}")
             return 1

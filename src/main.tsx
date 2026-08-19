@@ -1,7 +1,6 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
-import { flushStateNow } from './lib/store'
 import { injectThemeStyles } from './lib/themes'
 import './styles/global.css'
 
@@ -10,13 +9,9 @@ injectThemeStyles()
 const container = document.getElementById('root')
 if (!container) throw new Error('root element missing')
 
-// Flush any deferred store writes (e.g. a subagent model / setting changed
-// while a reply was streaming, whose persistSoon() timer never fired) before
-// the window tears down. Electron's main process flushes its own queue in
-// will-quit, so the renderer just needs to hand its state over via IPC.
-window.addEventListener('beforeunload', () => {
-  flushStateNow()
-})
+// Flush-on-quit is handled by the main process: it sends `flush-persist` to
+// the renderer and waits for the `flush-persist-done` ACK (see src/lib/store.ts
+// and electron/main.ts), so no fire-and-forget flush is needed here.
 
 createRoot(container).render(
   <React.StrictMode>

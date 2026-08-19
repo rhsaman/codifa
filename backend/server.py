@@ -218,7 +218,7 @@ async def permission_respond(req: PermissionResponse) -> dict:
     """Resolve a pending outside-workspace permission / confirm_action request from the agent."""
     fut = PERMISSION_GATES.pop(req.id, None)
     if fut is None or fut.done():
-        return {"status": "missing"}
+        raise HTTPException(status_code=404, detail="permission request not found or already resolved")
     fut.set_result(req.allowed)
     return {"status": "ok"}
 
@@ -228,7 +228,7 @@ async def ask_respond(req: AskResponse) -> dict:
     """Resolve a pending ask_user question (multiple-choice or free-text) from the agent."""
     fut = ASK_GATES.pop(req.id, None)
     if fut is None or fut.done():
-        return {"status": "missing"}
+        raise HTTPException(status_code=404, detail="question not found or already answered")
     fut.set_result(req.answer)
     return {"status": "ok"}
 
@@ -361,7 +361,7 @@ async def oauth_google_result(state: str = "") -> dict:
     if result is None:
         return {"status": "pending"}
     if "error" in result:
-        return {"status": "error", "message": result["error"]}
+        raise HTTPException(status_code=400, detail=result["error"])
     return {"status": "ok", **result}
 
 
@@ -900,7 +900,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # Clear any unconsumed steers for this chat so they don't leak into
             # a future run of the same chat (the frontend re-sends them as the
             # next turn via its own queue).
-            _drain_steer(req.chat_id)
+            await _drain_steer(req.chat_id)
             yield _sse({"kind": "done"})
 
     return StreamingResponse(
@@ -927,7 +927,7 @@ async def chat_steer(req: SteerRequest) -> dict:
     the frontend auto-sends it as the next turn.
     """
     if not req.chat_id or not req.prompt.strip():
-        return {"ok": False, "error": "chat_id and prompt are required"}
+        raise HTTPException(status_code=400, detail="chat_id and prompt are required")
     await _enqueue_steer(req.chat_id, {"id": req.id, "prompt": req.prompt.strip()})
     return {"ok": True}
 
@@ -941,7 +941,7 @@ class SteerCancelRequest(BaseModel):
 async def chat_steer_cancel(req: SteerCancelRequest) -> dict:
     """Drop a pending steer from the inbox (user cancelled it before delivery)."""
     if not req.chat_id or not req.id:
-        return {"ok": False, "error": "chat_id and id are required"}
+        raise HTTPException(status_code=400, detail="chat_id and id are required")
     await _remove_steer(req.chat_id, req.id)
     return {"ok": True}
 
@@ -1009,12 +1009,12 @@ async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
         raise HTTPException(status_code=400, detail="invalid project root")
     store = open_vector_store(req.root, req.vector_db_path)
     if store is None:
-        return MemoryClearResponse(ok=False, error="could not open vector store")
+        raise HTTPException(status_code=503, detail="could not open vector store")
     try:
         store.clear()
         return MemoryClearResponse(ok=True)
     except Exception as exc:  # noqa: BLE001
-        return MemoryClearResponse(ok=False, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"could not clear vector store: {exc}") from exc
 
 
 @app.post("/memory/add")
@@ -1024,10 +1024,10 @@ async def memory_add(req: MemoryAddRequest) -> MemoryAddResponse:
     if not req.root or not os.path.isdir(req.root):
         raise HTTPException(status_code=400, detail="invalid project root")
     if not req.text or not req.text.strip():
-        return MemoryAddResponse(ok=False, error="empty text")
+        raise HTTPException(status_code=400, detail="empty text")
     store = open_vector_store(req.root, req.vector_db_path)
     if store is None:
-        return MemoryAddResponse(ok=False, error="could not open vector store")
+        raise HTTPException(status_code=503, detail="could not open vector store")
     try:
         res = remember(
             req.root,
@@ -1036,13 +1036,15 @@ async def memory_add(req: MemoryAddRequest) -> MemoryAddResponse:
             memory_type=req.memory_type if req.memory_type in ("short_term", "long_term") else "short_term",
         )
         if res.get("error"):
-            return MemoryAddResponse(ok=False, error=str(res["error"]))
+            raise HTTPException(status_code=400, detail=str(res["error"]))
         return MemoryAddResponse(
             ok=True,
             skipped=res.get("skipped", ""),
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
-        return MemoryAddResponse(ok=False, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"could not save memory note: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1134,10 +1136,7 @@ async def index_status(
 async def index_run(req: IndexRunRequest) -> IndexRunResponse:
     from indexer import index_workspace
 
-    try:
-        store = _open_store(req.root, req.vector_db_path)
-    except HTTPException as exc:
-        return IndexRunResponse(error=str(exc.detail))
+    store = _open_store(req.root, req.vector_db_path)
     try:
         result = index_workspace(
             store,
@@ -1146,7 +1145,7 @@ async def index_run(req: IndexRunRequest) -> IndexRunResponse:
         )
         return IndexRunResponse(ok=True, **result)
     except Exception as exc:  # noqa: BLE001
-        return IndexRunResponse(error=str(exc))
+        raise HTTPException(status_code=500, detail=f"indexing failed: {exc}") from exc
 
 
 @app.post("/cleanup/run")
@@ -1154,15 +1153,12 @@ async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
     from cleanup import run_cleanup
     from tools import _memory_manager
 
-    try:
-        store = _open_store(req.root, req.vector_db_path)
-    except HTTPException as exc:
-        return CleanupRunResponse(error=str(exc.detail))
+    store = _open_store(req.root, req.vector_db_path)
     try:
         report = run_cleanup(store, req.root, memory_manager=_memory_manager(req.root, store))
         return CleanupRunResponse(ok=True, **report)
     except Exception as exc:  # noqa: BLE001
-        return CleanupRunResponse(error=str(exc))
+        raise HTTPException(status_code=500, detail=f"cleanup failed: {exc}") from exc
 
 
 def main() -> None:

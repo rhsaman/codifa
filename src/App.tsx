@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
@@ -22,6 +22,19 @@ export default function App() {
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const [searchOpen, setSearchOpen] = useState(false)
   const [embeddingGate, setEmbeddingGate] = useState<'unknown' | 'ready' | 'missing'>('unknown')
+  const [loadError, setLoadError] = useState<string | null>(null)
+
+  // Loads persisted state. On failure we surface the error on the loading
+  // screen (with a Retry button) instead of trapping the user on an endless
+  // spinner — `load()` only sets store state at the very end, so a failed
+  // attempt leaves nothing half-applied and retrying is safe.
+  const runLoad = useCallback(() => {
+    setLoadError(null)
+    load().catch((err: unknown) => {
+      console.error('[app] failed to load state:', err)
+      setLoadError(err instanceof Error ? err.message : String(err))
+    })
+  }, [load])
 
   // tmux-style prefix sequence (Ctrl+X then u/r/c/x). The flag lives in a ref
   // so the window listener reads the latest state without re-subscribing.
@@ -46,8 +59,8 @@ export default function App() {
       if (t && THEMES.some((th) => th.id === t)) saved = t
     } catch {}
     useStore.getState().setTheme(saved)
-    void load()
-  }, [load])
+    runLoad()
+  }, [load, runLoad])
 
   // First-run "download essential model" gate: RAG memory and skill
   // auto-selection need the on-device embedding model. Until a ready
@@ -174,6 +187,10 @@ export default function App() {
       window.removeEventListener('blur', cancelPrefix)
     }
   }, [])
+
+  if (loadError) {
+    return <LoadingScreen error={loadError} onRetry={runLoad} />
+  }
 
   if (!loaded || embeddingGate === 'unknown') {
     return <LoadingScreen />

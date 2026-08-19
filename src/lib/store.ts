@@ -119,10 +119,13 @@ function flushPendingPersist(): Promise<unknown> {
 }
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
-    void flushPendingPersist()
+    // Best-effort fallback for teardown that bypasses the main process (e.g. a
+    // renderer crash). The reliable path is the `flush-persist` ACK below; here
+    // we only make sure an error is never silently swallowed.
+    flushPendingPersist().catch((err) => console.error('state flush on unload failed:', err))
   })
   window.addEventListener('pagehide', () => {
-    void flushPendingPersist()
+    flushPendingPersist().catch((err) => console.error('state flush on pagehide failed:', err))
   })
   // The main process asks the renderer to flush right before quitting, then
   // waits for this ACK before flushing its own queue — closing the race where
@@ -130,7 +133,7 @@ if (typeof window !== 'undefined') {
   // main flush had already run and was silently dropped.
   api.onFlushPersist(() => {
     flushPendingPersist()
-      .catch(() => {})
+      .catch((err) => console.error('state flush on quit failed:', err))
       .finally(() => {
         api.flushPersistDone()
       })

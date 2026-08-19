@@ -1,6 +1,16 @@
-export function LoadingScreen() {
+export function LoadingScreen({
+  error,
+  onRetry,
+}: {
+  error?: string | null
+  onRetry?: () => void
+}) {
   return (
-    <div className="loading-screen" role="status" aria-label="Loading Codifa">
+    <div
+      className="loading-screen"
+      role={error ? 'alert' : 'status'}
+      aria-label={error ? 'Codifa failed to load' : 'Loading Codifa'}
+    >
       <div className="loading-screen__glow" />
       <div className="loading-screen__grid" />
       <div className="loading-screen__content">
@@ -17,14 +27,28 @@ export function LoadingScreen() {
           </div>
         </div>
         <h1 className="loading-wordmark">Codifa</h1>
-        <p className="loading-status">
-          <span className="loading-status__label">Loading workspace</span>
-          <span className="loading-dots" aria-hidden="true">
-            <i />
-            <i />
-            <i />
-          </span>
-        </p>
+        {error ? (
+          <>
+            <p className="loading-status loading-status--error">
+              Failed to load your data
+            </p>
+            <p className="load-error-detail">{error}</p>
+            {onRetry && (
+              <button className="btn" onClick={onRetry}>
+                Retry
+              </button>
+            )}
+          </>
+        ) : (
+          <p className="loading-status">
+            <span className="loading-status__label">Loading workspace</span>
+            <span className="loading-dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+          </p>
+        )}
       </div>
     </div>
   )

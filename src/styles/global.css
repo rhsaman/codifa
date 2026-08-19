@@ -8825,6 +8825,20 @@ textarea {
   font-weight: 500;
 }
 
+.loading-status--error {
+  color: var(--danger);
+}
+
+.load-error-detail {
+  max-width: 420px;
+  margin: 0;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 .loading-dots {
   display: inline-flex;
   gap: 4px;

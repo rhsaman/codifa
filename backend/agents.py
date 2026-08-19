@@ -106,12 +106,13 @@ STEER_INBOX: dict[str, list[dict]] = {}
 _STEER_LOCK = asyncio.Lock()
 
 
-def _drain_steer(chat_id: str) -> list[dict]:
-    """Pop and return all pending steer messages for a chat (sync, non-blocking)."""
-    items = STEER_INBOX.get(chat_id) or []
-    if items:
-        STEER_INBOX[chat_id] = []
-    return items
+async def _drain_steer(chat_id: str) -> list[dict]:
+    """Pop and return all pending steer messages for a chat."""
+    async with _STEER_LOCK:
+        items = STEER_INBOX.get(chat_id) or []
+        if items:
+            STEER_INBOX[chat_id] = []
+        return items
 
 
 async def _enqueue_steer(chat_id: str, item: dict) -> None:
@@ -4433,7 +4434,7 @@ async def run_agent(
         @_functools.wraps(fn)
         async def wrapped(*args, **kwargs):
             result = await fn(*args, **kwargs)
-            steers = _drain_steer(chat_id)
+            steers = await _drain_steer(chat_id)
             if not steers:
                 return result
             note = (
@@ -4652,27 +4653,36 @@ async def run_agent(
     system_final = (
         _mode_declare(mode) + _language_directive(prompt) + base_prompt + workspace_note
     )
-    # LANGUAGE RULE (always follow): match the user's language for the entire
-    # conversation. If the user writes in Persian (فارسی), reply entirely in
-    # Persian — including the update_plan checklist/todo items, the plan
-    # content, summaries, ask_user questions and options, and any comments or
-    # text inside generated code/files. If the user writes in any other
-    # language, reply entirely in that same language. Never switch languages
-    # for todo lists, plans or summaries.
+    # Consolidated RULES block: search discipline, clarification and
+    # context-first behavior in one compact block (was three separate blocks —
+    # SEARCH RULE / CLARIFY RULE / CONTEXT-FIRST RULE — that overlapped and
+    # cost tokens on every request and every tool-loop step). The language
+    # rule is NOT duplicated here: _language_directive() above already injects
+    # it (HARD RULE for Persian / LANGUAGE RULE otherwise).
     system_final += (
-        "\n\nLANGUAGE RULE (always follow): Match the user's language for the "
-        "entire conversation. Persian (فارسی) → reply entirely in Persian — including "
-        "update_plan checklist/todo items, the plan content, summaries, ask_user "
-        "questions/options, and comments or text inside generated code/files. Any other "
-        "language → reply entirely in that same language. Never switch languages for "
-        "todo lists, plans or summaries."
-    )
-    system_final += (
-        "\n\nSEARCH RULE (strict, always follow): To search or look up anything "
-        "inside the project files, ONLY use the subagent search tools "
-        "(grep / glob / read / explore). "
-        "Never use any other method (e.g. python scripts or run_terminal tool) "
-        "to search or read project files. This applies in every mode."
+        "\n\nRULES (strict, always follow, in every mode):\n"
+        "1. SEARCH: to search or look up anything inside the project files, ONLY "
+        "use the file tools (grep / glob / read / explore). Never use any other "
+        "method (python scripts, run_terminal) to search or read project files.\n"
+        "2. CLARIFY: when the request is ambiguous, contains conflicting or "
+        "mutually-exclusive instructions, or has several reasonable "
+        "interpretations, call ask_user as your FIRST action — before any other "
+        "tool call — and wait for the answer. Never guess or silently pick one "
+        "interpretation. Keep the question to one short sentence with 2-5 short, "
+        "mutually-exclusive options in YOUR OWN order of preference (best first). "
+        "Only skip asking when the ambiguity is cosmetic or you can confidently "
+        "resolve it from context already in your hands. Follow the answer exactly.\n"
+        "3. CONTEXT-FIRST: before you call ANY search/discovery tool (grep / glob "
+        "/ read / explore / search_memory), check what is ALREADY in your context: "
+        "the RAG blocks auto-injected for this request (===== YOUR OWN MEMORY =====, "
+        "===== RELEVANT PROJECT FILES =====, ===== SAVED WEB PAGES =====) when "
+        "present, and the conversation itself — files you already read or searched, "
+        "code you already wrote or changed, and answers you already gave earlier in "
+        "this session. NEVER re-search for information you already have: it wastes "
+        "tokens and time. Only search for what is genuinely MISSING or not "
+        "sufficiently specific. When you need more detail than a snippet already in "
+        "context, read that file directly (read / grep with its exact path) instead "
+        "of running a fresh search."
     )
     # Task-scope routing: tell the model which discovery path this turn favors,
     # matching the code-enforced own-search quota wrapped over its tools below.
@@ -4706,23 +4716,6 @@ async def run_agent(
             "`explore`. Only fall back to explore if the thing genuinely can't be "
             "narrowed to a few files."
         )
-    system_final += (
-        "\n\nCLARIFY RULE (strict, always follow, in every mode): When the user's "
-        "request is ambiguous, contains conflicting or mutually-exclusive "
-        "instructions, has several reasonable interpretations, or needs a detail "
-        "you cannot infer from the project or their message, you MUST call "
-        "the ask_user tool as your FIRST action — before any other tool call — "
-        "and wait for the user's answer. Never guess, assume, or silently pick "
-        "one interpretation on their behalf, and never try to resolve a genuine "
-        "ambiguity by searching the code first. Keep the question to one short "
-        "sentence and pass 2-5 short, mutually-exclusive options when the choice "
-        "is naturally multiple-choice. Always list those options in YOUR OWN "
-        "order of preference — put the option you recommend and think is best "
-        "FIRST so the user sees it as option #1. Only skip asking when the "
-        "ambiguity is "
-        "cosmetic or you can confidently resolve it from context already in your "
-        "hands. When you do ask, follow the user's answer exactly."
-    )
     extra = (system_prompt or "").strip()
     if extra:
         system_final += (
@@ -4792,26 +4785,12 @@ async def run_agent(
 
     # Context-first pointer: whatever memory/file/web context was auto-injected
     # above, plus files already read and work already done earlier in THIS
-    # conversation, is ALREADY in the model's context. Tell it to check that
-    # FIRST before any search/explore call, so it doesn't re-search for content
-    # already sitting in front of it (the "YOUR OWN MEMORY" / "RELEVANT PROJECT
-    # FILES" / "SAVED WEB PAGES" blocks, and earlier tool results in this chat).
+    # conversation, is ALREADY in the model's context. The consolidated RULES
+    # block (appended near the top) tells the model to check that FIRST before
+    # any search/explore call, so it doesn't re-search for content already
+    # sitting in front of it (the "YOUR OWN MEMORY" / "RELEVANT PROJECT FILES"
+    # / "SAVED WEB PAGES" blocks, and earlier tool results in this chat).
     _rag_injected = bool(learned_memory or rag_block)
-    system_final += (
-        "\n\nCONTEXT-FIRST RULE (strict, always follow, in every mode): Before "
-        "you call ANY search/discovery tool (grep / glob / read / explore / "
-        "search_memory), CHECK what is ALREADY in your context: (1) the RAG "
-        "blocks auto-injected for this request (===== YOUR OWN MEMORY =====, "
-        "===== RELEVANT PROJECT FILES =====, ===== SAVED WEB PAGES =====) when "
-        "present, and (2) the conversation itself — files you already read or "
-        "searched, code you already wrote or changed, and answers you already "
-        "gave earlier in this session. NEVER re-search for information you "
-        "already have in context: re-searching wastes tokens and time. Only "
-        "search for information that is genuinely MISSING or not sufficiently "
-        "specific in what you already have. When you need more detail than the "
-        "snippet already in context, read that file directly (read / grep with "
-        "its exact path) instead of running a fresh search."
-    )
     if _rag_injected:
         # Pass a digest of what RAG already surfaced into explore's sub-agent
         # task text (via the shared cross-call seed dict), so a same-turn explore
@@ -5484,7 +5463,12 @@ async def run_agent(
                     fragment = _dangling_fragment(_reply)
                     if fragment:
                         continuation_retries += 1
-                        extra = await _continue_reply(model, _reply, fragment)
+                        # Route to the compact subagent (== model when none is
+                        # configured) so the main model isn't charged for
+                        # finishing a dangling fragment.
+                        extra = await _continue_reply(
+                            compact_model or model, _reply, fragment
+                        )
                         if extra:
                             reply_chunks.append(extra)
                             yield _event_delta(extra)
@@ -5494,7 +5478,15 @@ async def run_agent(
                     # Best-effort + never raises; runs only for substantive turns.
                     try:
                         await _maybe_auto_memory(
-                            model, root, prompt, _reply, tools_used, vector_store
+                            # Route to the compact subagent (== model when none
+                            # is configured) so the main model isn't charged for
+                            # memory distillation.
+                            compact_model or model,
+                            root,
+                            prompt,
+                            _reply,
+                            tools_used,
+                            vector_store,
                         )
                     except Exception as exc:  # noqa: BLE001 — best-effort, never raises
                         # Surface auto-memory failures instead of swallowing them

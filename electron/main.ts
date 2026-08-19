@@ -472,11 +472,15 @@ function registerIpc(): void {
       }).catch(() => null)
       if (!res) continue
       const data = (await res.json().catch(() => null)) as
-        | { status: string; message?: string; refresh_token?: string; access_token?: string; expires_in?: number }
+        | { status: string; message?: string; detail?: string; refresh_token?: string; access_token?: string; expires_in?: number }
         | null
-      if (!data || data.status === 'pending') continue
-      if (data.status === 'error') {
-        throw new Error(data.message || 'Google sign-in failed')
+      if (!data) continue
+      if (data.status === 'pending') continue
+      // The sidecar reports OAuth failures with a real HTTP error status (400)
+      // and a `detail` body — a non-OK response is a hard failure, never fall
+      // through to returning empty tokens.
+      if (!res.ok || data.status === 'error') {
+        throw new Error(data.detail || data.message || `Google sign-in failed (${res.status})`)
       }
       return {
         refreshToken: data.refresh_token ?? '',

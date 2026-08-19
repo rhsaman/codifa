@@ -554,7 +554,17 @@ def _blocked_terminal(command: str) -> str | None:
 
 
 def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
-    """Run ``command`` in ``root`` via the shell; returns (exit_code, output)."""
+    """Run ``command`` in ``root`` via the shell; returns (exit_code, output).
+
+    ``shell=True`` is INTENTIONAL here and not an injection risk: this is the
+    terminal tool — the whole ``command`` string IS the tool's input (the agent
+    builds it itself), so there is no trusted prefix being concatenated with
+    untrusted data and no injection boundary to cross. The command runs as the
+    same user, sandboxed to ``root`` by ``_blocked_terminal``/``_escapes_root``.
+    A list-based exec (no shell) would break pipes/redirects/``&&`` that
+    build/test/lint commands legitimately need. Every OTHER subprocess call in
+    this file (MCP probe, tsc, rg) passes an argument list with no shell.
+    """
     try:
         proc = subprocess.Popen(
             command,

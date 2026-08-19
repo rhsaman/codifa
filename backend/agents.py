@@ -2267,6 +2267,108 @@ def _needs_workspace(prompt: str) -> bool:
     return True
 
 
+# --- output-budget scope (narrow tasks get a tighter reply ceiling) -------- #
+# Classifies a task as "narrow" (targeted lookup/fix — the answer is short and
+# the code lands via tool results) vs "broad" (architecture/overview — the
+# reply can legitimately be long). Drives the proportional narrow cap in
+# _settings_for. Keyword-based on purpose — cheap and stable, not a classifier.
+# Broad is checked FIRST so "how does the whole architecture work end to end"
+# stays broad even though it contains "how does". Unclear prompts return ""
+# (full budget) — safer than cutting off a long answer.
+def _detect_scope(prompt: str) -> str:
+    if not prompt:
+        return ""
+    low = prompt.lower()
+    if any(
+        k in low
+        for k in (
+            "architecture",
+            "overview",
+            "end to end",
+            "whole",
+            "entire codebase",
+            "entire project",
+            "how does everything",
+            "how does the whole",
+            "how everything",
+            "understand the codebase",
+            "full picture",
+            "deep dive",
+            "comprehensive",
+            "explain the system",
+            "design",
+            "all the files",
+            "every file",
+            "all files",
+            "how do all",
+            "what are all",
+            "list all",
+            "compare",
+            "differences between",
+            "refactor",
+            "migrate",
+            "restructure",
+            "rewrite",
+            "plan",
+        )
+    ):
+        return "broad"
+    if any(
+        k in low
+        for k in (
+            "find",
+            "where is",
+            "where's",
+            "what is",
+            "what's",
+            "which file",
+            "which function",
+            "which class",
+            "locate",
+            "search",
+            "show me",
+            "how is",
+            "how does",
+            "why does",
+            "why is",
+            "is there",
+            "does it",
+            "fix",
+            "bug",
+            "error",
+            "typo",
+            "rename",
+            "delete",
+            "remove",
+            "add",
+            "change",
+            "update",
+            "parameter",
+            "argument",
+            "signature",
+            "definition",
+            "defined",
+            "implement",
+            "usage",
+            "call",
+            "function",
+            "class",
+            "variable",
+            "import",
+            "export",
+            "test",
+            "run",
+            "explain briefly",
+            "short",
+            "quick",
+            "what does",
+            "what happens",
+        )
+    ):
+        return "narrow"
+    return ""
+
+
 # --- test verification (never finish a test task with red tests) ---------- #
 # Prompt-level signal that a coder task is about writing/fixing/running tests.
 # English "test" is matched as a whole word so "latest"/"contest" never trip
@@ -4714,6 +4816,7 @@ async def run_agent(
         api_key,
         env_var,
         oauth_token=oauth_token,
+        scope=_detect_scope(prompt),
     )
     agent = Agent(
         model,

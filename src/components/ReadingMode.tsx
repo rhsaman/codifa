@@ -4,47 +4,11 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage } from '../types'
-import { splitSections, type Section } from '../lib/sections'
+import { splitSections } from '../lib/sections'
 import { useStore } from '../lib/store'
 import { prepareContent } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
 import 'highlight.js/styles/github-dark.min.css'
-
-/** Clean reply icon (corner-down-left) — no chat-bubble/Telegram look. */
-const AskIcon = () => (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M9 10 4 15l5 5" />
-    <path d="M20 4v7a4 4 0 0 1-4 4H4" />
-  </svg>
-)
-
-/** Book icon for the panel header. */
-const BookIcon = () => (
-  <svg
-    width="17"
-    height="17"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-  </svg>
-)
 
 /** Chevron-up for the previous-section nav button. */
 const ChevronUpIcon = () => (
@@ -84,10 +48,7 @@ const ChevronDownIcon = () => (
  * Reading mode — a right-side panel (like Claude Code's docs viewer) for a
  * long agent answer: section titles on the left, the selected section's full
  * content on the right. The chat stays visible behind it — a soft scrim
- * focuses the panel without fully blocking the conversation. Each section has
- * an "Ask about this section" button that forks the section into its own new
- * chat (see store.forkSection), so the user can ask follow-up questions
- * without scrolling the whole answer or mixing sections.
+ * focuses the panel without fully blocking the conversation.
  */
 export function ReadingMode({
   message,
@@ -98,9 +59,9 @@ export function ReadingMode({
 }) {
   // App-wide direction (RTL/LTR toggle). The panel mirrors like the main
   // messages do: in RTL the contents list moves to the right side and the
-  // header/footer flow right-to-left. The section content itself still renders
-  // with dir="auto", so an English answer inside an RTL app keeps its own LTR
-  // flow.
+  // header/footer flow right-to-left. The section content follows the app
+  // direction too (dir={dir}), so in RTL mode the text reads right-to-left
+  // like the main messages.
   const dir = useStore((s) => s.dir)
   const sections = useMemo(() => splitSections(message.content), [message.content])
   const [active, setActive] = useState(0)
@@ -140,11 +101,6 @@ export function ReadingMode({
   const section = sections[active]
   if (!section) return null
 
-  const askFor = (s: Section) => {
-    useStore.getState().forkSection(message.id, s.title, s.content)
-    onClose()
-  }
-
   const copy = async () => {
     try {
       await copyToClipboard(section.content)
@@ -167,24 +123,81 @@ export function ReadingMode({
       >
         <div className="reading-mode-head">
           <div className="reading-mode-title">
-            <span className="reading-mode-title-icon">
-              <BookIcon />
+            <h2>Reading Mode</h2>
+            <span className="reading-mode-tab">
+              Section {active + 1} of {sections.length}
             </span>
-            <div className="reading-mode-title-text">
-              <h2>Reading Mode</h2>
-              <span className="reading-mode-tab">
-                Section {active + 1} of {sections.length}
-              </span>
-            </div>
           </div>
-          <button
-            className="modal-close"
-            onClick={onClose}
-            title="Close (Esc)"
-            aria-label="Close"
-          >
-            ✕
-          </button>
+          <div className="reading-mode-head-actions">
+            <button
+              className="reading-mode-nav"
+              onClick={() => setActive((a) => Math.max(a - 1, 0))}
+              disabled={active === 0}
+              title="Previous section (↑)"
+              aria-label="Previous section"
+            >
+              <ChevronUpIcon />
+            </button>
+            <button
+              className="reading-mode-nav"
+              onClick={() => setActive((a) => Math.min(a + 1, sections.length - 1))}
+              disabled={active === sections.length - 1}
+              title="Next section (↓)"
+              aria-label="Next section"
+            >
+              <ChevronDownIcon />
+            </button>
+            <button
+              className={`reading-mode-copy${copied ? ' copied' : ''}`}
+              onClick={copy}
+              title="Copy section text"
+            >
+              {copied ? (
+                <>
+                  <svg
+                    width="13"
+                    height="13"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                  Copied
+                </>
+              ) : (
+                <>
+                  <svg
+                    width="13"
+                    height="13"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+                    <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+                  </svg>
+                  Copy
+                </>
+              )}
+            </button>
+            <button
+              className="modal-close"
+              onClick={onClose}
+              title="Close (Esc)"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         <div className="reading-mode-progress" aria-hidden="true">
@@ -209,7 +222,7 @@ export function ReadingMode({
                   className="reading-mode-item-title"
                   onClick={() => setActive(i)}
                   title={s.title}
-                  dir="auto"
+                  dir={dir}
                 >
                   <span
                     className="reading-mode-item-level"
@@ -218,15 +231,7 @@ export function ReadingMode({
                     {s.title}
                   </span>
                 </button>
-                <button
-                  className="reading-mode-ask"
-                  onClick={() => askFor(s)}
-                  title="Ask about this section — new chat"
-                  aria-label="Ask about this section"
-                >
-                  <AskIcon />
-                </button>
-              </div>
+                </div>
             ))}
           </div>
 
@@ -234,80 +239,11 @@ export function ReadingMode({
             <div className="reading-mode-content-head">
               <div className="reading-mode-content-title">
                 <span className="reading-mode-content-num">{active + 1}</span>
-                <h3 dir="auto">{section.title}</h3>
-              </div>
-              <div className="reading-mode-content-actions">
-                <button
-                  className="reading-mode-nav"
-                  onClick={() => setActive((a) => Math.max(a - 1, 0))}
-                  disabled={active === 0}
-                  title="Previous section (↑)"
-                  aria-label="Previous section"
-                >
-                  <ChevronUpIcon />
-                </button>
-                <button
-                  className="reading-mode-nav"
-                  onClick={() => setActive((a) => Math.min(a + 1, sections.length - 1))}
-                  disabled={active === sections.length - 1}
-                  title="Next section (↓)"
-                  aria-label="Next section"
-                >
-                  <ChevronDownIcon />
-                </button>
-                <button
-                  className={`reading-mode-copy${copied ? ' copied' : ''}`}
-                  onClick={copy}
-                  title="Copy section text"
-                >
-                  {copied ? (
-                    <>
-                      <svg
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.5"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                      Copied
-                    </>
-                  ) : (
-                    <>
-                      <svg
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-                      </svg>
-                      Copy
-                    </>
-                  )}
-                </button>
-                <button
-                  className="reading-mode-ask-btn"
-                  onClick={() => askFor(section)}
-                  title="New chat with this section's context"
-                >
-                  <AskIcon /> Ask about this section
-                </button>
+                <h3 dir={dir}>{section.title}</h3>
               </div>
             </div>
             <div className="reading-mode-content-inner" key={active}>
-              <div className="chat-message markdown-body" dir="auto">
+              <div className="chat-message markdown-body" dir={dir}>
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeHighlight]}

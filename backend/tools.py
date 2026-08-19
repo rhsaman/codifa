@@ -4846,7 +4846,7 @@ def make_tool_callbacks(
             # carry. For those, relax the report to allow verbatim blocks and
             # raise the sub-agent's max output so the parent gets the actual
             # code in ONE call instead of looping explore for more detail.
-            # Narrow fact-lookups keep the cheap concise-report style/1200 cap.
+            # Narrow fact-lookups keep the cheap concise-report style/2000 cap.
             if _is_content_gathering(task_text):
                 _sub_report_style = (
                     "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
@@ -4865,7 +4865,7 @@ def make_tool_callbacks(
                     "</next_steps>\n"
                     "</results>"
                 )
-                _sub_max_tokens = 3000
+                _sub_max_tokens = 4500
             else:
                 _sub_report_style = (
                     "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
@@ -4883,7 +4883,7 @@ def make_tool_callbacks(
                     "</next_steps>\n"
                     "</results>"
                 )
-                _sub_max_tokens = 1200
+                _sub_max_tokens = 2000
 
             # Cross-call dedup seed: earlier explore calls this turn already
             # read/searched these paths. Feed them into the sub-agent's SYSTEM

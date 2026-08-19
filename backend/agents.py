@@ -227,9 +227,6 @@ def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
     return wrapped
 
 
-
-
-
 _TERMIN_TOKENS = re.compile(r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|(\S+)')
 
 # Commands that never touch the filesystem (no file names leak through them);
@@ -638,9 +635,9 @@ _UNIVERSAL_RULES = (
 _SEARCH_RULE = (
     "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
     "Choose the search tool by the BREADTH of what you need:\n"
-    "1. TARGETED lookup — you know the file, pattern or keyword: search "
+    "1. TARGETED lookup,keyword: search "
     "directly with grep / glob / read.\n"
-    "2. WIDE or UNFAMILIAR search — a broad span, several areas, or you don't "
+    "2. WIDE search — a broad span, several areas "
     "know where something lives: delegate to the explore sub-agent — call the "
     "task tool with subagent_type='explore'. It searches the codebase for you "
     "in an isolated context and returns a report.\n"
@@ -2270,9 +2267,6 @@ def _needs_workspace(prompt: str) -> bool:
     return True
 
 
-
-
-
 # --- test verification (never finish a test task with red tests) ---------- #
 # Prompt-level signal that a coder task is about writing/fixing/running tests.
 # English "test" is matched as a whole word so "latest"/"contest" never trip
@@ -2310,9 +2304,6 @@ def _is_test_task(prompt: str, picked_skills: Sequence[dict] | None = None) -> b
             if "test" in slug or "تست" in slug:
                 return True
     return False
-
-
-
 
 
 def _trivial_prompt(prompt: str) -> bool:
@@ -3706,9 +3697,6 @@ def _append_app_log(line: str) -> None:
         pass
 
 
-
-
-
 def _build_subagent_model(
     entry: str,
     model: Any,
@@ -3756,8 +3744,7 @@ def _build_subagent_model(
         )
     except Exception as exc:  # noqa: BLE001 — surface the bad model instead of a silent fallback
         print(
-            f"[subagent build] {_kind}/{_model} failed: {exc!r} — "
-            "see Settings → Tools",
+            f"[subagent build] {_kind}/{_model} failed: {exc!r} — see Settings → Tools",
             flush=True,
         )
         return None
@@ -4269,7 +4256,6 @@ async def run_agent(
             tools["run_terminal"] = _wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
-    
 
     # Steer injection: every tool's result is a delivery point for user
     # messages typed while this run is active. The wrapper drains the per-chat
@@ -4535,7 +4521,7 @@ async def run_agent(
         "context, read that file directly (read / grep with its exact path) instead "
         "of running a fresh search."
     )
-    
+
     extra = (system_prompt or "").strip()
     if extra:
         system_final += (
@@ -4949,13 +4935,19 @@ async def run_agent(
     # it, or it might answer without ever looking at the images.
     if vision_model and image_uris:
         history_messages = [
-            ModelRequest(parts=[SystemPromptPart(content=(
-                "The user attached image(s) to this message, but you cannot see "
-                "them directly. Call the `vision` tool to analyze them, then "
-                "base your answer on its report. If you need a closer look at a "
-                "specific detail, call `vision` again with a more specific "
-                "prompt."
-            ))])
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(
+                        content=(
+                            "The user attached image(s) to this message, but you cannot see "
+                            "them directly. Call the `vision` tool to analyze them, then "
+                            "base your answer on its report. If you need a closer look at a "
+                            "specific detail, call `vision` again with a more specific "
+                            "prompt."
+                        )
+                    )
+                ]
+            )
         ] + history_messages
 
     if prompt:

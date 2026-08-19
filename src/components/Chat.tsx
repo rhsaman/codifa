@@ -1890,8 +1890,8 @@ export function ChatPanel() {
       "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
       "conversation is in another language (e.g. Persian/Farsi), under 150 words, no preamble.\n\n" +
       transcript;
-    // Route through the user's configured "compact" subagent model (Settings →
-    // Subagents) when set, instead of always the chat's active provider/model.
+    // Route through the user's configured "compact" tool model (Settings →
+    // Tools) when set, instead of always the chat's active provider/model.
     // An entry may be "providerId/model" to run on a DIFFERENT provider than
     // the parent (mirrors the backend's own _resolve_subagent parsing, and the
     // subagent_models handling above in handleEvent). A bare entry — or none —

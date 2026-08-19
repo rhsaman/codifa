@@ -134,12 +134,10 @@ def _is_content_gathering(text: str) -> bool:
     """Heuristic for whether a task needs substantial verbatim content from
     several files (styling / refactor / rewrite) rather than a narrow lookup.
 
-    Drives two behaviors: (1) ``task_tool`` gives content-heavy tasks a bigger
-    report budget and allows verbatim code blocks; (2) the plan/coder agent's
-    own-search quota is bumped so it can gather content from known files itself
-    instead of looping task/explore. Keyword-based on purpose — cheap and stable —
-    not a full classifier. ``path_hint``/``hints`` presence alone does NOT count:
-    a scoped question can still be a short fact-lookup.
+    Drives one behavior: ``task_tool`` gives content-heavy tasks a bigger
+    report budget and allows verbatim code blocks. Keyword-based on purpose —
+    cheap and stable — not a full classifier. ``path_hint``/``hints`` presence
+    alone does NOT count: a scoped question can still be a short fact-lookup.
     """
     if not text:
         return False
@@ -439,12 +437,12 @@ except Exception:  # noqa: BLE001, S110 — pydantic-ai is a hard dependency; de
 def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
     """A short, actionable note for when a subagent fails — names BOTH the
     subagent and the model it ran on so the user can change the right one in
-    Settings → Subagents. Returns '' when there's nothing useful to say."""
+    Settings → Tools. Returns '' when there's nothing useful to say."""
     text = str(exc).strip()
     if model:
         return (
             f"Note: the {agent} sub-agent model ({model}) failed — change it in "
-            f"Settings → Subagents. ({text})"
+            f"Settings → Tools. ({text})"
         )
     if text:
         return f"Note: the {agent} sub-agent failed. ({text})"
@@ -3765,7 +3763,7 @@ def make_tool_callbacks(
                     )
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 # Both the search subagent AND the main model failed. Say so with
-                # the model name so the user can fix it in Settings → Subagents,
+                # the model name so the user can fix it in Settings → Tools,
                 # THEN provide the raw output as fallback.
                 _ran_name = str(
                     getattr(

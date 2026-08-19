@@ -217,7 +217,7 @@ export interface ToolActivity {
   children?: ToolActivity[]
   /** Which model executed this specific tool call. Empty/absent = the main
    *  conversation model; set for calls issued by a sub-agent (e.g. explore's
-   *  own resolved model from Settings → Subagents). */
+   *  own resolved model from Settings → Tools). */
   model?: string
   /** Structured result rows (e.g. web_search hits) shown in the tool card. */
   items?: SearchResultItem[]

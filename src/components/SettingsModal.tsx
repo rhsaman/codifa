@@ -40,7 +40,7 @@ function providerSig(p: ProviderConfig): string {
   ].join('|')
 }
 
-function SubagentModelSelect({
+function ToolModelSelect({
   agent, label, desc, current, onSelect,
 }: {
   agent: string
@@ -504,7 +504,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'memory' | 'subagents' | 'models' | 'general'>('providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'memory' | 'tools' | 'models' | 'general'>('providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
     clientId: googleProvider?.oauthClientId ?? '',
@@ -1012,8 +1012,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       ),
     },
     {
-      id: 'subagents',
-      label: 'Subagents',
+      id: 'tools',
+      label: 'Tools',
       group: 'Agent',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1090,7 +1090,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Tabs 'providers' / 'modes' / / 'auth' edit LOCAL buffered state
   // (`cfg`, `promptDrafts`, `googleAuthDraft`) that is only committed to the
   // store when Save is pressed — every other tab (plugins, mcp, skills,
-  // memory, subagents, models) writes straight to the store as the user
+  // memory, tools, models) writes straight to the store as the user
   // types, so there is nothing to "save" or "cancel" there. The footer used
   // to render three different button combinations across tabs (Cancel+Save /
   // Save+Close / Close-only) with no visual explanation for the difference,
@@ -1102,7 +1102,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   // Auto-save tabs: Done force-flushes any pending state to disk before
   // closing (a change made while a reply is streaming could otherwise be
   // lost) — previously this required an extra, easy-to-miss "Save" click on
-  // just the subagents/memory/auth tabs; now it always happens automatically.
+  // just the tools/memory/auth tabs; now it always happens automatically.
   const handleDone = () => {
     flushStateNow()
     onClose()
@@ -1942,47 +1942,49 @@ Caps on total stored documents and chunks per workspace; the oldest are evicted 
         </>
         )}
 
-        {tab === 'subagents' && (
+        {tab === 'tools' && (
         <>
           <div className="field">
             <div className="field-head">
-              <label>Subagent Models</label>
+              <label>Tool Models</label>
             </div>
             <div className="hint">
-              Pick separate models for the built-in subagents. Leave a field empty to
-              use the main model (the one chosen in the composer). The explore subagent
-              runs read-only searches; using a small/fast model here saves time and tokens.
+              Pick separate models for the built-in tools (explore, search, web, vision,
+              compact). Leave a field empty to use the main model (the one chosen in the
+              composer), or type "main model" to pin a tool to the main model explicitly.
+              Tools only consume main-model tokens when you set them to the main model or
+              their own model is unavailable.
             </div>
 
-            <SubagentModelSelect
+            <ToolModelSelect
               agent="explore"
-              label="Explore subagent"
+              label="Explore tool"
               desc="Read-only file search and code investigation (explore tool)."
               current={subagentModels.explore || ''}
               onSelect={setSubagentModel}
             />
-            <SubagentModelSelect
+            <ToolModelSelect
               agent="search"
-              label="Search subagent"
-              desc="Model that runs the explore sub-agent's search tools (grep / glob / list_files). Falls back to the explore model."
+              label="Search tool"
+              desc="Model that runs the explore tool's search tools (grep / glob / list_files). Falls back to the explore model."
               current={subagentModels.search || ''}
               onSelect={setSubagentModel}
             />
-            <SubagentModelSelect
+            <ToolModelSelect
               agent="web"
-              label="Web subagent"
+              label="Web tool"
               desc="Model that distills web_search results and summarizes fetched pages. Falls back to the explore model."
               current={subagentModels.web || ''}
               onSelect={setSubagentModel}
             />
-            <SubagentModelSelect
+            <ToolModelSelect
               agent="vision"
               label="Vision model"
               desc="Image analysis model (handles screenshots, diagrams and photos)."
               current={subagentModels.vision || ''}
               onSelect={setSubagentModel}
             />
-            <SubagentModelSelect
+            <ToolModelSelect
               agent="compact"
               label="Compact model"
               desc="Conversation summariser — compacts chat history to stay under the context window."

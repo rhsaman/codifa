@@ -81,7 +81,6 @@ from tools import (
     _SCOUT_CTX,
     LOG_FILENAME,
     PathEscapeError,
-    _is_content_gathering,
     _is_text_path,
     _read_text,
     _tool_event,
@@ -228,97 +227,7 @@ def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
     return wrapped
 
 
-# Plan mode's OWN grep/glob calls are capped in CODE, not just prompt wording —
-# "TOOL-CALL DISCIPLINE" language alone is not reliably followed by weaker
-# models (prompt enforcement != model compliance). After the limit, further
-# calls are DENIED with a note pointing at `explore`; the model itself decides
-# whether to call it (opencode-style — no auto-delegation, no surprise
-# sub-agent spawns). An investigation-heavy plan turn can't quietly burn tokens
-# on many shallow searches of its own.
-_PLAN_OWN_SEARCH_LIMIT = 15
 
-
-def _wrap_limited_grep(
-    fn: Callable,
-    counter: dict,
-    limit: int = _PLAN_OWN_SEARCH_LIMIT,
-    emit: Callable[[dict], None] | None = None,
-    tool: str = "grep",
-):
-    async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
-        counter["n"] = counter.get("n", 0) + 1
-        if counter["n"] > limit:
-            # The cap is a safety backstop, not a router: an over-quota search is
-            # DENIED with a note, and the model decides whether to call `task`
-            # (subagent_type='explore', isolated sub-agent context) — exactly
-            # like opencode, no auto-delegation.
-            msg = (
-                "ERROR: your own grep/glob calls for this turn are used up. "
-                "Stop making more grep/glob calls — if you still need to "
-                "investigate, call the task tool ONCE with subagent_type='explore' "
-                "and the whole question (it runs in an isolated sub-agent)."
-            )
-            if emit is not None:
-                emit(
-                    {
-                        "kind": "tool",
-                        "tool": tool,
-                        "args": {"pattern": pattern, "path": path, "include": include},
-                    }
-                )
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": tool,
-                        "summary": msg,
-                        "status": "denied",
-                    }
-                )
-            return msg
-        return await fn(pattern, path, include)
-
-    return wrapped
-
-
-def _wrap_limited_glob(
-    fn: Callable,
-    counter: dict,
-    limit: int = _PLAN_OWN_SEARCH_LIMIT,
-    emit: Callable[[dict], None] | None = None,
-    tool: str = "glob",
-):
-    async def wrapped(pattern: str, path: str = "") -> str:
-        counter["n"] = counter.get("n", 0) + 1
-        if counter["n"] > limit:
-            # Same backstop as grep: DENIED with a note, model decides whether
-            # to call `task` (subagent_type='explore') — no auto-delegation
-            # (opencode-style).
-            msg = (
-                "ERROR: your own grep/glob calls for this turn are used up. "
-                "Stop making more grep/glob calls — if you still need to "
-                "investigate, call the task tool ONCE with subagent_type='explore' "
-                "and the whole question (it runs in an isolated sub-agent)."
-            )
-            if emit is not None:
-                emit(
-                    {
-                        "kind": "tool",
-                        "tool": tool,
-                        "args": {"pattern": pattern, "path": path},
-                    }
-                )
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": tool,
-                        "summary": msg,
-                        "status": "denied",
-                    }
-                )
-            return msg
-        return await fn(pattern, path)
-
-    return wrapped
 
 
 _TERMIN_TOKENS = re.compile(r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|(\S+)')
@@ -536,10 +445,9 @@ def _wrap_readonly_terminal(fn: Callable):
 
 # grep-family tools reachable via run_terminal — all fully replaced by
 # grep (single-file/dir) or explore (broad, isolated). Left
-# reachable through the terminal, a model that hit the grep/glob cap (see
-# _PLAN_OWN_SEARCH_LIMIT) could just shell out to `grep -r` instead and keep
-# searching with no cap and no isolation — a complete, silent bypass of both
-# the search cap AND the system prompt's own "use grep/explore" instruction.
+# reachable through the terminal, a model could just shell out to `grep -r`
+# instead and keep searching with no isolation — a complete, silent bypass of
+# the system prompt's own "use grep/explore" instruction.
 # This closes that specific hole; it intentionally does NOT touch find/cat/ls
 # (legitimate narrow uses: checking one file exists, reading a build log,
 # listing a directory).
@@ -692,9 +600,9 @@ def _subagent_target(
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. Use glob for filenames (patterns like `**/*.ts` or `src/*.py`), grep for content (regex, optionally with include to filter extensions), and read to read a file when you need its actual code. Combine related lookups into ONE search with alternation (foo|bar|baz), and FIRE the searches you already know you need in the SAME turn (parallel tool calls) instead of searching one at a time. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Scout directly with glob (patterns like `**/*.ts` or `src/*.py`), grep (regex content search, add include to filter extensions) and read (a file or directory — pass offset/limit to page large files) when you need verbatim code. Use the task tool (subagent_type='explore') only for genuinely broad or unfamiliar spans (isolated sub-agent context). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Scout with glob (patterns like `**/*.ts`), grep (regex content search) and read (a file or directory, paged with offset/limit) for verbatim code; combine related lookups into one regex and fire the searches you already know you need in the SAME turn (parallel tool calls); stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Use the task tool (subagent_type='explore') for broad spans or unfamiliar areas. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
+    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
+    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
 }
 
 # Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
@@ -720,6 +628,26 @@ _UNIVERSAL_RULES = (
     "serves the specific case in front of you. When a small generalization (a "
     "parameter, a lookup table/registry, a shared helper) makes the solution "
     "serve a whole class of similar tasks instead of one instance, prefer it."
+)
+
+# The search/explore strategy is a FIRST-CLASS rule: it sits at the very top of
+# every mode's prompt (right after the mode declaration + language rule) so the
+# agent always picks the right tool for the breadth of the search. It replaces
+# the per-mode scout guidance that used to be duplicated inside each
+# SYSTEM_PROMPTS entry and the SEARCH rule in the trailing RULES block.
+_SEARCH_RULE = (
+    "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
+    "Choose the search tool by the BREADTH of what you need:\n"
+    "1. TARGETED lookup — you know the file, pattern or keyword: search "
+    "directly with grep / glob / read.\n"
+    "2. WIDE or UNFAMILIAR search — a broad span, several areas, or you don't "
+    "know where something lives: delegate to the explore sub-agent — call the "
+    "task tool with subagent_type='explore'. It searches the codebase for you "
+    "in an isolated context and returns a report.\n"
+    "3. Fire the searches you already know you need in the SAME turn (parallel "
+    "tool calls) instead of one at a time.\n"
+    "NEVER search or read project files with run_terminal or scripts — only "
+    "the file tools (grep / glob / read / explore)."
 )
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -772,7 +700,7 @@ async def _settings_for(
     ``thinking_level`` overrides. Free-tier models never get AUTO-injected
     ``thinking`` (free routers commonly reject the parameter and return an
     empty response), but an explicit user choice is honored for them too.
-    ``scope`` (narrow/broad/content, see ``_task_scope``) tightens the
+    ``scope`` (narrow/broad/content) tightens the
     output budget for narrow/targeted tasks — the answer is short and the code
     lands via tool results, so a large reply ceiling just invites verbose filler.
     """
@@ -1279,7 +1207,7 @@ _MAX_OUTPUT_TOKENS = 128_000
 # larger values outright.
 _FALLBACK_OUTPUT_TOKENS = 8_192
 
-# Output-token ceiling for NARROW/targeted turns (see _task_scope + _settings_for).
+# Output-token ceiling for NARROW/targeted turns.
 # A targeted lookup/fix needs a short direct reply — the code itself is written
 # through write_file/edit_file tool results, not the model's text — so capping
 # its reply saves real (often expensive) output tokens while keeping full quality.
@@ -1401,9 +1329,9 @@ def _plan_reuse_note(history: list[dict]) -> str:
 
 
 # Path-like token scan for extracting file references from a Plan-mode message's
-# prose (mirrors `_task_has_explicit_file`'s pattern). The reliable source is the
-# plan's own trailing `Files:` line, but plans written before that contract don't
-# have one, so prose + checklist items are scanned as a fallback.
+# prose. The reliable source is the plan's own trailing `Files:` line, but plans
+# written before that contract don't have one, so prose + checklist items are
+# scanned as a fallback.
 _PLAN_PATH_RE = re.compile(
     r"(?:[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh))"
 )
@@ -2342,97 +2270,7 @@ def _needs_workspace(prompt: str) -> bool:
     return True
 
 
-# Per-turn own-search quota by task scope (see _task_scope). Narrow/targeted
-# turns get a generous direct allowance so a specific lookup (a symbol, a file,
-# a function) resolves with a few direct grep/glob/read calls — no explore
-# round-trip. Broad/exploratory turns get a small quota so
-# the model delegates to the task tool (subagent_type='explore', isolated
-# sub-agent context) instead of
-# chaining many cheap searches in the parent's resent transcript. Content-heavy
-# tasks keep the biggest budget: compressing verbatim JSX/CSS through the
-# explore agent's report summary is what loops it, so the parent reads the
-# known files itself.
-_TASK_SCOPE_NARROW_LIMIT = 15
-_TASK_SCOPE_BROAD_LIMIT = 3
-_TASK_SCOPE_CONTENT_LIMIT = 25
 
-# Broad/exploratory keywords: understanding a feature across many files, finding
-# all usages app-wide, or a result set that is large/unpredictable and would
-# pollute the parent's context if dumped in raw. These route to the explore
-# agent.
-_TASK_BROAD_KEYWORDS = (
-    "how does",
-    "how do",
-    "what is the flow",
-    "end to end",
-    "end-to-end",
-    "from scratch",
-    "understand",
-    "architecture",
-    "pipeline",
-    "data flow",
-    "every place",
-    "every usage",
-    "all usages",
-    "everywhere",
-    "all places",
-    "find all",
-    "list all",
-    "map out",
-    "trace",
-    "overview",
-    "across the",
-    "whole app",
-    "entire app",
-    "app-wide",
-    "app wide",
-    "across the codebase",
-    "whole codebase",
-    "entire codebase",
-    "restyl",
-    "restyle",
-    "refactor",
-    "migrat",
-    "redesign",
-    "restructure",
-    "rewrite",
-    "روند کار",
-    "چطور کار می‌کنه",
-    "سراسری",
-    "همه جای",
-    "همه جا",
-)
-# Narrow/targeted keywords: a concrete symbol/file/piece is being looked for.
-# These resolve via direct tools, never explore-by-default.
-_TASK_NARROW_KEYWORDS = (
-    "find where",
-    "where is",
-    "where's",
-    "where does",
-    "which file",
-    "what file",
-    "is it defined",
-    "is defined",
-    "defined in",
-    "define",
-    "function ",
-    "method ",
-    "class ",
-    "variable ",
-    "constant ",
-    "the definition",
-    "find the file",
-    "locate",
-    "symbol",
-    "api endpoint",
-    "in this file",
-    "in that file",
-    "مشخص کن",
-    "کجاست",
-    "کدام فایل",
-    "تعریف",
-    "پیدا کن",
-)
 
 
 # --- test verification (never finish a test task with red tests) ---------- #
@@ -2474,51 +2312,7 @@ def _is_test_task(prompt: str, picked_skills: Sequence[dict] | None = None) -> b
     return False
 
 
-def _task_scope(prompt: str) -> str:
-    """Classify a task's search scope: ``narrow`` | ``broad`` | ``content``.
 
-    Deterministic keyword heuristic (not a full classifier — keeps it cheap,
-    stable and language-agnostic for Persian/English). Drives the per-turn
-    ``own_search_limit``: narrow/targeted lookups resolve via the parent's own
-    direct tools, broad/exploratory sweeps delegate to ``explore`` early, and
-    content-heavy gather tasks keep the largest direct budget.
-
-    Precedence: content-gathering FIRST (highest priority) because restyle/
-    refactor/rewrite tasks need verbatim JSX/CSS from known files — pushing
-    those through explore's report-compressed summaries is what caused the
-    observed styling-task loop, so they get the big direct quota instead. This
-    intentionally supersedes the broad signal on an app-wide restyle: the
-    parent reads the already-identified files directly, using explore only for
-    pieces it genuinely hasn't located. Then broad (app-wide/end-to-end sweeps
-    that MUST delegate early), then narrow (a specific symbol/file/pattern).
-    """
-    text = (prompt or "").strip().lower()
-    if not text:
-        return "narrow"
-    # Content-gathering is the strongest signal (verbatim code needed from known
-    # files) — reuse the existing tools.py keyword classifier.
-    if _is_content_gathering(text):
-        return "content"
-    if any(k in text for k in _TASK_BROAD_KEYWORDS):
-        return "broad"
-    if any(k in text for k in _TASK_NARROW_KEYWORDS):
-        return "narrow"
-    # With a one-shot prompt, an explicit relative path / extension-bearing file
-    # name (src/main.ts) usually means a targeted lookup, not a broad sweep.
-    if _task_has_explicit_file(text):
-        return "narrow"
-    return "narrow"
-
-
-def _task_has_explicit_file(text: str) -> bool:
-    """True when the prompt names a concrete file (extension-bearing path or a
-    backtick-quoted / /-prefixed path), which usually pins the task to one spot."""
-    if re.search(
-        r"(?:[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp))",
-        text,
-    ):
-        return True
-    return bool(re.search(r"(?:^\s*[/`]|[/`]\s*[/\w.]+\.[a-z0-9]+)", text))
 
 
 def _trivial_prompt(prompt: str) -> bool:
@@ -3493,6 +3287,8 @@ _SKILL_WEAK_KEYWORDS: set[str] = {
     "know",
     "think",
     "say",
+    "skill",
+    "اسکیل",
 }
 
 
@@ -3924,7 +3720,7 @@ def _build_subagent_model(
     oauth_token: str,
     provider_lookup: Callable[[str], dict | None],
 ) -> tuple[Any, str] | None:
-    """Build the subagent model for a Settings → Subagents entry.
+    """Build the subagent model for a Settings → Tools entry.
 
     Returns ``(model, model_name)`` for the subagent, or ``None`` when the
     entry is empty / unresolvable / fails to build (the caller falls back to
@@ -3933,6 +3729,10 @@ def _build_subagent_model(
     — instead of silently landing on another slot's default (e.g. the explore
     model for the search/web slots).
     """
+    # Explicit "main model" literal → the parent model itself (the user's way
+    # of pinning a tool to the main model without picking it from the list).
+    if entry.strip().lower() in ("main model", "main_model", "main"):
+        return (model, model_name)
     target = _subagent_target(
         entry,
         provider,
@@ -3957,7 +3757,7 @@ def _build_subagent_model(
     except Exception as exc:  # noqa: BLE001 — surface the bad model instead of a silent fallback
         print(
             f"[subagent build] {_kind}/{_model} failed: {exc!r} — "
-            "see Settings → Subagents",
+            "see Settings → Tools",
             flush=True,
         )
         return None
@@ -3975,7 +3775,7 @@ def _resolve_subagent_models(
     provider_lookup: Callable[[str], dict | None],
 ) -> dict[str, Any]:
     """Resolve the per-slot subagent models (explore / search / web / compact /
-    vision) from Settings → Subagents entries.
+    vision) from Settings → Tools entries.
 
     Slot defaults when the entry is empty or fails to build: explore/compact →
     parent model, search/web → explore model, vision → None. An entry equal to
@@ -4175,7 +3975,7 @@ async def run_agent(
     )
 
     # Build dedicated subagent models when the user picks one in Settings →
-    # Subagents. Falls back to the parent model (default) so existing setups
+    # Tools. Falls back to the parent model (default) so existing setups
     # keep working without any config change.
     subagent_models = subagent_models or {}
 
@@ -4236,7 +4036,7 @@ async def run_agent(
         )
 
     # Resolve every slot (explore / search / web / compact / vision) from the
-    # Settings → Subagents entries. Each slot falls back to its default when
+    # Settings → Tools entries. Each slot falls back to its default when
     # the entry is empty or fails to build; an entry equal to the parent model
     # resolves to the parent model itself (so search/web do NOT silently land
     # on the explore model when the user explicitly picked the main model).
@@ -4266,7 +4066,7 @@ async def run_agent(
     # the UI that a subagent used its own model rather than the parent's. When
     # a configured entry failed to build (invalid model id / bad key) and we
     # fell back to the parent, mark it so the user knows WHICH subagent model
-    # to fix in Settings → Subagents instead of a silent parent fallback.
+    # to fix in Settings → Tools instead of a silent parent fallback.
     def _routing_label(actual: Any, entry: str) -> str:
         name = str(getattr(actual, "model_name", "") or model_name)
         if entry and name == model_name:
@@ -4443,9 +4243,7 @@ async def run_agent(
     # the full registry — otherwise a `task` call from plan/ask mode spawns a
     # general sub-agent that still has write_file/edit_file/confirm_action and a
     # writable terminal, bypassing the read-only guarantee (the observed "agent
-    # edited files while in plan mode" bug). Set BEFORE the per-turn search-limit
-    # wraps (those cap the PARENT's own searches; a sub-agent's isolated
-    # transcript has its own usage limits) and before the steer/resume wraps (a
+    # edited files while in plan mode" bug). Set BEFORE the steer/resume wraps (a
     # sub-agent's transcript is discarded, so steers drained by its tools would
     # be lost). When the request is file-scoped, `task` is removed from the
     # parent's tools anyway, so this never leaks scope.
@@ -4471,51 +4269,7 @@ async def run_agent(
             tools["run_terminal"] = _wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
-    elif mode in ("plan", "ask", "coder"):
-        # Code-enforced cap on this mode's OWN grep/glob/read calls per turn
-        # (see _PLAN_OWN_SEARCH_LIMIT above) — the
-        # system prompt already asks for this, but prompt wording alone is not
-        # reliably followed. Originally only Plan (later also Ask) had this
-        # backstop; Coder was left uncapped on the assumption that real editing
-        # work needs more of its own searches — in practice it showed the same
-        # unfocused pattern as Ask: burn through many direct calls, hit some
-        # internal ceiling, then retry with a slightly different query instead
-        # of stopping. The cap keeps an investigation-heavy turn from burning
-        # the parent's own tool-call budget and tokens on many shallow searches.
-        #
-        # The limit is a safety backstop against unfocused shallow-search loops;
-        # it is high enough that direct investigation (and content gathering via
-        # read) is allowed. Task scope picks the per-turn quota: narrow/targeted
-        # lookups resolve directly with a generous allowance; broad/exploratory
-        # turns get a small quota so the model reaches for `explore` early
-        # instead of chaining cheap searches in its own costly transcript.
-        # Over-quota calls are DENIED with a note — the model itself decides
-        # whether to call explore (opencode-style, no auto-delegation).
-        _turn_task_scope = _task_scope(prompt or "")
-        if _turn_task_scope == "broad":
-            own_search_limit = _TASK_SCOPE_BROAD_LIMIT
-        elif _turn_task_scope == "content":
-            own_search_limit = _TASK_SCOPE_CONTENT_LIMIT
-        else:
-            own_search_limit = _TASK_SCOPE_NARROW_LIMIT
-        plan_search_counter: dict = {}
-        _deny_emit = lambda ev: queue.put_nowait(_tool_event(ev))
-        if "grep" in tools:
-            tools["grep"] = _wrap_limited_grep(
-                tools["grep"],
-                plan_search_counter,
-                limit=own_search_limit,
-                emit=_deny_emit,
-                tool="grep",
-            )
-        if "glob" in tools:
-            tools["glob"] = _wrap_limited_glob(
-                tools["glob"],
-                plan_search_counter,
-                limit=own_search_limit,
-                emit=_deny_emit,
-                tool="glob",
-            )
+    
 
     # Steer injection: every tool's result is a delivery point for user
     # messages typed while this run is active. The wrapper drains the per-chat
@@ -4746,20 +4500,22 @@ async def run_agent(
     # re-orients the agent immediately — buried at the end of a long prompt it
     # was easy to miss and the agent kept behaving as the previous mode.
     system_final = (
-        _mode_declare(mode) + _language_directive(prompt) + base_prompt + workspace_note
+        _mode_declare(mode)
+        + _language_directive(prompt)
+        + _SEARCH_RULE
+        + base_prompt
+        + workspace_note
     )
-    # Consolidated RULES block: search discipline, clarification and
-    # context-first behavior in one compact block (was three separate blocks —
-    # SEARCH RULE / CLARIFY RULE / CONTEXT-FIRST RULE — that overlapped and
-    # cost tokens on every request and every tool-loop step). The language
-    # rule is NOT duplicated here: _language_directive() above already injects
-    # it (HARD RULE for Persian / LANGUAGE RULE otherwise).
+    # Consolidated RULES block: clarification and context-first behavior in one
+    # compact block (was three separate blocks — SEARCH RULE / CLARIFY RULE /
+    # CONTEXT-FIRST RULE — that overlapped and cost tokens on every request and
+    # every tool-loop step). The SEARCH discipline now lives ONCE at the top in
+    # _SEARCH_RULE; the language rule is NOT duplicated here either:
+    # _language_directive() above already injects it (HARD RULE for Persian /
+    # LANGUAGE RULE otherwise).
     system_final += (
         "\n\nRULES (strict, always follow, in every mode):\n"
-        "1. SEARCH: to search or look up anything inside the project files, ONLY "
-        "use the file tools (grep / glob / read / explore). Never use any other "
-        "method (python scripts, run_terminal) to search or read project files.\n"
-        "2. CLARIFY: when the request is ambiguous, contains conflicting or "
+        "1. CLARIFY: when the request is ambiguous, contains conflicting or "
         "mutually-exclusive instructions, or has several reasonable "
         "interpretations, call ask_user as your FIRST action — before any other "
         "tool call — and wait for the answer. Never guess or silently pick one "
@@ -4767,7 +4523,7 @@ async def run_agent(
         "mutually-exclusive options in YOUR OWN order of preference (best first). "
         "Only skip asking when the ambiguity is cosmetic or you can confidently "
         "resolve it from context already in your hands. Follow the answer exactly.\n"
-        "3. CONTEXT-FIRST: before you call ANY search/discovery tool (grep / glob "
+        "2. CONTEXT-FIRST: before you call ANY search/discovery tool (grep / glob "
         "/ read / explore / search_memory), check what is ALREADY in your context: "
         "the RAG blocks auto-injected for this request (===== YOUR OWN MEMORY =====, "
         "===== RELEVANT PROJECT FILES =====, ===== SAVED WEB PAGES =====) when "
@@ -4779,38 +4535,7 @@ async def run_agent(
         "context, read that file directly (read / grep with its exact path) instead "
         "of running a fresh search."
     )
-    # Task-scope routing: tell the model which discovery path this turn favors,
-    # matching the code-enforced own-search quota wrapped over its tools below.
-    _turn_scope = _task_scope(prompt or "")
-    if _turn_scope == "broad":
-        system_final += (
-            "\n\nSCOPE ROUTING (this request): This is a BROAD/exploratory task "
-            "(spans many files, unfamiliar area, or an app-wide sweep). Delegate the "
-            "investigation to the `explore` tool FIRST and let its isolated "
-            "sub-agent do the searching — your own direct search budget this turn "
-            "is intentionally small so you don't chain many cheap searches into "
-            "your costly transcript. Use your own grep/glob "
-            "only to pin down a specific location the explore report "
-            "points to; then read for verbatim code you already located."
-        )
-    elif _turn_scope == "content":
-        system_final += (
-            "\n\nSCOPE ROUTING (this request): This task needs verbatim code from "
-            "several already-known files (styling/refactor/rewrite). Read and search "
-            "those files DIRECTLY with read / grep — you have a "
-            "generous own-search budget for this turn. Use `explore` only for the "
-            "parts you genuinely haven't located yet, not to re-read files you "
-            "already identified."
-        )
-    else:
-        system_final += (
-            "\n\nSCOPE ROUTING (this request): This is a NARROW/targeted task "
-            "(a specific file, function, symbol or bounded pattern). Resolve it "
-            "DIRECTLY with grep / glob / read "
-            "from your own context — do not delegate a single-lookup question to "
-            "`explore`. Only fall back to explore if the thing genuinely can't be "
-            "narrowed to a few files."
-        )
+    
     extra = (system_prompt or "").strip()
     if extra:
         system_final += (
@@ -5003,7 +4728,6 @@ async def run_agent(
         api_key,
         env_var,
         oauth_token=oauth_token,
-        scope=_turn_scope,
     )
     agent = Agent(
         model,

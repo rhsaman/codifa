@@ -6,7 +6,7 @@ import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage } from '../types'
 import { splitSections, type Section } from '../lib/sections'
 import { useStore } from '../lib/store'
-import { detectDir, prepareContent } from '../lib/bidi'
+import { prepareContent } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
 import 'highlight.js/styles/github-dark.min.css'
 
@@ -96,11 +96,12 @@ export function ReadingMode({
   message: ChatMessage
   onClose: () => void
 }) {
+  // App-wide direction (RTL/LTR toggle). The panel mirrors like the main
+  // messages do: in RTL the contents list moves to the right side and the
+  // header/footer flow right-to-left. The section content itself still renders
+  // with dir="auto", so an English answer inside an RTL app keeps its own LTR
+  // flow.
   const dir = useStore((s) => s.dir)
-  // Direction of the message itself — the panel's texts must line up with the
-  // content, not just the app-wide toggle (a Persian app can hold an English
-  // answer, and vice versa).
-  const contentDir = useMemo(() => detectDir(message.content), [message.content])
   const sections = useMemo(() => splitSections(message.content), [message.content])
   const [active, setActive] = useState(0)
   const [copied, setCopied] = useState(false)
@@ -155,7 +156,7 @@ export function ReadingMode({
   }
 
   const panel = (
-    <div className="reading-mode" onClick={(e) => e.stopPropagation()}>
+    <div className="reading-mode" dir={dir} onClick={(e) => e.stopPropagation()}>
       {/* Soft scrim — click anywhere outside the panel to close. */}
       <div className="reading-mode-scrim" aria-hidden="true" onClick={onClose} />
       <div
@@ -191,7 +192,7 @@ export function ReadingMode({
         </div>
 
         <div className="reading-mode-body">
-          <div className="reading-mode-list" dir={contentDir}>
+          <div className="reading-mode-list">
             <div className="reading-mode-list-label">
               Contents
               <span className="reading-mode-list-count">{sections.length}</span>
@@ -231,7 +232,10 @@ export function ReadingMode({
 
           <div className="reading-mode-content" ref={contentRef}>
             <div className="reading-mode-content-head">
-              <h3 dir="auto">{section.title}</h3>
+              <div className="reading-mode-content-title">
+                <span className="reading-mode-content-num">{active + 1}</span>
+                <h3 dir="auto">{section.title}</h3>
+              </div>
               <div className="reading-mode-content-actions">
                 <button
                   className="reading-mode-nav"

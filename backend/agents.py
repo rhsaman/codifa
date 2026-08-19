@@ -3913,6 +3913,129 @@ def _append_app_log(line: str) -> None:
 
 
 
+def _build_subagent_model(
+    entry: str,
+    model: Any,
+    model_name: str,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    env_var: str,
+    oauth_token: str,
+    provider_lookup: Callable[[str], dict | None],
+) -> tuple[Any, str] | None:
+    """Build the subagent model for a Settings → Subagents entry.
+
+    Returns ``(model, model_name)`` for the subagent, or ``None`` when the
+    entry is empty / unresolvable / fails to build (the caller falls back to
+    its slot default). When the entry resolves to the PARENT model itself, the
+    parent model is returned so the subagent explicitly runs on the main model
+    — instead of silently landing on another slot's default (e.g. the explore
+    model for the search/web slots).
+    """
+    target = _subagent_target(
+        entry,
+        provider,
+        base_url,
+        api_key,
+        env_var,
+        oauth_token,
+        provider_lookup,
+    )
+    if target is None:
+        return None
+    _kind, _model, _base, _key, _env, _oauth = target
+    if not _model:
+        return None
+    if _model == model_name:
+        return (model, model_name)
+    try:
+        return (
+            build_model(_kind, _model, _base, _key, _env, oauth_token=_oauth),
+            _model,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface the bad model instead of a silent fallback
+        print(
+            f"[subagent build] {_kind}/{_model} failed: {exc!r} — "
+            "see Settings → Subagents",
+            flush=True,
+        )
+        return None
+
+
+def _resolve_subagent_models(
+    subagent_models: dict,
+    model: Any,
+    model_name: str,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    env_var: str,
+    oauth_token: str,
+    provider_lookup: Callable[[str], dict | None],
+) -> dict[str, Any]:
+    """Resolve the per-slot subagent models (explore / search / web / compact /
+    vision) from Settings → Subagents entries.
+
+    Slot defaults when the entry is empty or fails to build: explore/compact →
+    parent model, search/web → explore model, vision → None. An entry equal to
+    the parent model resolves to the parent model itself (explicit "use the
+    main model"), so search/web do NOT silently land on the explore model in
+    that case.
+    """
+
+    def _build(entry: str) -> tuple[Any, str] | None:
+        return _build_subagent_model(
+            entry,
+            model,
+            model_name,
+            provider,
+            base_url,
+            api_key,
+            env_var,
+            oauth_token,
+            provider_lookup,
+        )
+
+    explore_model = model
+    explore_built = subagent_models.get("explore", "") or ""
+    _sub = _build(explore_built)
+    if _sub is not None:
+        explore_model, _ = _sub
+
+    search_model = explore_model
+    search_built = subagent_models.get("search", "") or ""
+    _sub = _build(search_built)
+    if _sub is not None:
+        search_model, _ = _sub
+
+    web_model = explore_model
+    web_built = subagent_models.get("web", "") or ""
+    _sub = _build(web_built)
+    if _sub is not None:
+        web_model, _ = _sub
+
+    compact_model = model
+    compact_built = subagent_models.get("compact", "") or ""
+    _sub = _build(compact_built)
+    if _sub is not None:
+        compact_model, _ = _sub
+
+    vision_model: Any = None
+    vision_built = subagent_models.get("vision", "") or ""
+    _sub = _build(vision_built)
+    if _sub is not None:
+        vision_model, _ = _sub
+
+    return {
+        "explore": explore_model,
+        "search": search_model,
+        "web": web_model,
+        "compact": compact_model,
+        "vision": vision_model,
+    }
+
+
 async def run_agent(
     provider: str,
     model_name: str,
@@ -4112,65 +4235,32 @@ async def run_agent(
             _subagent_provider,
         )
 
-    def _build_subagent(entry: str) -> tuple[Any, str] | None:
-        """Build the subagent model for an entry; returns (model, model_name)
-        or None when the entry is empty / equals the parent model / fails to
-        build (fall back to parent)."""
-        target = _resolve_subagent(entry)
-        if target is None:
-            return None
-        _kind, _model, _base, _key, _env, _oauth = target
-        if not _model or _model == model_name:
-            return None
-        try:
-            return (
-                build_model(_kind, _model, _base, _key, _env, oauth_token=_oauth),
-                _model,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface the bad model instead of a silent fallback
-            print(
-                f"[subagent build] {_kind}/{_model} failed: {exc!r} — "
-                "see Settings → Subagents",
-                flush=True,
-            )
-            return None
-
-    explore_model = model
+    # Resolve every slot (explore / search / web / compact / vision) from the
+    # Settings → Subagents entries. Each slot falls back to its default when
+    # the entry is empty or fails to build; an entry equal to the parent model
+    # resolves to the parent model itself (so search/web do NOT silently land
+    # on the explore model when the user explicitly picked the main model).
+    _resolved = _resolve_subagent_models(
+        subagent_models,
+        model,
+        model_name,
+        provider,
+        base_url,
+        api_key,
+        env_var,
+        oauth_token,
+        _subagent_provider,
+    )
+    explore_model = _resolved["explore"]
+    search_model = _resolved["search"]
+    web_model = _resolved["web"]
+    compact_model = _resolved["compact"]
+    vision_model = _resolved["vision"]
     explore_built = subagent_models.get("explore", "") or ""
-    _sub = _build_subagent(explore_built)
-    if _sub is not None:
-        explore_model, _ = _sub
-    # No manual explore config in Settings → Subagents: explore runs on the
-    # parent model (default). Manual config always wins.
-
-    # "search" subagent: the explore sub-agent (which runs the existing
-    # grep / glob / read tools) uses this model when
-    # configured, falling back to the "explore" model, then the parent model.
-    search_model = explore_model
     search_built = subagent_models.get("search", "") or ""
-    _sub = _build_subagent(search_built)
-    if _sub is not None:
-        search_model, _ = _sub
-
-    # "web" subagent: web_search / fetch_url result distillation uses this
-    # model when configured, falling back to the explore model, then parent.
-    web_model = explore_model
     web_built = subagent_models.get("web", "") or ""
-    _sub = _build_subagent(web_built)
-    if _sub is not None:
-        web_model, _ = _sub
-
-    compact_model = model
     compact_built = subagent_models.get("compact", "") or ""
-    _sub = _build_subagent(compact_built)
-    if _sub is not None:
-        compact_model, _ = _sub
-
-    vision_model: Any = None
     vision_built = subagent_models.get("vision", "") or ""
-    _sub = _build_subagent(vision_built)
-    if _sub is not None:
-        vision_model, _ = _sub
 
     # Log which model ACTUALLY runs for each subagent, so it's verifiable in
     # the UI that a subagent used its own model rather than the parent's. When
@@ -4180,7 +4270,12 @@ async def run_agent(
     def _routing_label(actual: Any, entry: str) -> str:
         name = str(getattr(actual, "model_name", "") or model_name)
         if entry and name == model_name:
-            return f"{entry} ⚠ build failed → parent"
+            # Only flag a build failure when the entry was a DIFFERENT model
+            # that failed to build. An entry equal to the parent model is an
+            # intentional "use the main model" choice, not a failure.
+            target = _resolve_subagent(entry)
+            if target is not None and target[1] != model_name:
+                return f"{entry} ⚠ build failed → parent"
         return name
 
     _routing = {

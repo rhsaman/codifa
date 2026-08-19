@@ -1,6 +1,6 @@
 {
   "name": "codifa",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Multi-provider AI coding assistant with a Pydantic AI agent sidecar, Monaco editor and file explorer.",
   "author": {
     "name": "coder",

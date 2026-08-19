@@ -57,8 +57,8 @@ SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 # blip on the gateway retries the sub-agent instead of failing the whole turn
 # and re-burning parent tokens. Flat 30s cadence, up to 10 attempts, then the
 # caller's existing fallback path runs (raw output / error message).
-_SUBAGENT_RETRY_SECONDS = 30
-_SUBAGENT_MAX_ATTEMPTS = 10
+_SUBAGENT_RETRY_SECONDS = 5
+_SUBAGENT_MAX_ATTEMPTS = 3
 
 # Set by agents.py before each agent run: the AUTO-SCOUTED WORKSPACE OVERVIEW
 # text (root listing — _AUTO_SCOUT_KEY_FILES is empty, so it's just the tiny
@@ -144,12 +144,36 @@ def _is_content_gathering(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
-    return any(k in low for k in ("restyle", "redesign", "restructure", "rewrite",
-                               "styling", "styles", "css", "jsx", "tsx", "scss",
-                               "border", "borders", "read the full", "full content",
-                               "verbatim", "entire component", "entire file",
-                               "get the css", "get the jsx", "get the code",
-                               "refactor", "migrate", "extract", "inline", "reflow"))
+    return any(
+        k in low
+        for k in (
+            "restyle",
+            "redesign",
+            "restructure",
+            "rewrite",
+            "styling",
+            "styles",
+            "css",
+            "jsx",
+            "tsx",
+            "scss",
+            "border",
+            "borders",
+            "read the full",
+            "full content",
+            "verbatim",
+            "entire component",
+            "entire file",
+            "get the css",
+            "get the jsx",
+            "get the code",
+            "refactor",
+            "migrate",
+            "extract",
+            "inline",
+            "reflow",
+        )
+    )
 
 
 def _parse_json_list(text: str) -> list[str]:
@@ -212,9 +236,7 @@ def _thoroughness_prompt(thoroughness: str) -> str:
     )
 
 
-def _explore_usage_limits(
-    thoroughness: str, content_gathering: bool = False
-) -> dict:
+def _explore_usage_limits(thoroughness: str, content_gathering: bool = False) -> dict:
     """Per-thoroughness explore sub-agent budgets (request/tool-call caps and
     widen caps).
 
@@ -465,9 +487,6 @@ def _ddg_search(query: str, max_results: int, cfg: dict) -> list[dict]:
     return out
 
 
-
-
-
 def _tavily_search(query: str, max_results: int, cfg: dict) -> list[dict]:
     """Tavily search API. Needs the plugin's ``apiKey`` set in Settings → Plugins."""
     import httpx
@@ -487,7 +506,9 @@ def _tavily_search(query: str, max_results: int, cfg: dict) -> list[dict]:
         {
             "title": str(item.get("title", "")).strip(),
             "url": str(item.get("url", "")).strip(),
-            "snippet": str(item.get("content", "") or item.get("snippet", "") or "").strip(),
+            "snippet": str(
+                item.get("content", "") or item.get("snippet", "") or ""
+            ).strip(),
         }
         for item in results
         if isinstance(item, dict)
@@ -500,26 +521,118 @@ SEARCH_BACKENDS: dict[str, Callable[[str, int, dict], list[dict]]] = {
 }
 
 _TEXT_EXTENSIONS = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".jsonc", ".yaml", ".yml",
-    ".toml", ".md", ".mdx", ".txt", ".html", ".css", ".scss", ".less", ".vue",
-    ".svelte", ".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".go", ".java",
-    ".kt", ".swift", ".rb", ".php", ".sh", ".bash", ".zsh", ".fish", ".sql",
-    ".xml", ".ini", ".cfg", ".conf", ".env", ".csv", ".tsv", ".ipynb",
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".md",
+    ".mdx",
+    ".txt",
+    ".html",
+    ".css",
+    ".scss",
+    ".less",
+    ".vue",
+    ".svelte",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".rs",
+    ".go",
+    ".java",
+    ".kt",
+    ".swift",
+    ".rb",
+    ".php",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".sql",
+    ".xml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".csv",
+    ".tsv",
+    ".ipynb",
 }
 
 _BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg",
-    ".pdf", ".zip", ".gz", ".tar", ".rar", ".7z", ".exe", ".dmg", ".dll",
-    ".so", ".dylib", ".o", ".a", ".bin", ".woff", ".woff2", ".ttf", ".otf",
-    ".mp4", ".mp3", ".wav", ".mov", ".avi", ".db", ".sqlite", ".pyc", ".pyo",
-    ".class", ".jar", ".wasm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".bmp",
+    ".svg",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".rar",
+    ".7z",
+    ".exe",
+    ".dmg",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".o",
+    ".a",
+    ".bin",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".mov",
+    ".avi",
+    ".db",
+    ".sqlite",
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".jar",
+    ".wasm",
 }
 
 _SKIP_DIRS = {
-    "node_modules", ".git", ".venv", "venv", "__pycache__", ".next",
-    ".nuxt", "dist", "dist-electron", "release", "build", "coverage",
-    ".cache", ".idea", ".vscode", ".DS_Store", "target", "vendor",
-    ".tox", ".mypy_cache", ".pytest_cache", "out", "bin", "obj",
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    "dist",
+    "dist-electron",
+    "release",
+    "build",
+    "coverage",
+    ".cache",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    "target",
+    "vendor",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "out",
+    "bin",
+    "obj",
 }
 
 # ripgrep globs that exclude the deny-list dirs even when `--hidden` is passed
@@ -530,11 +643,17 @@ _RG_EXCLUDE_GLOBS = ["!{" + ",".join(sorted(_SKIP_DIRS)) + "}/**", "!.DS_Store"]
 _TERMINAL_BLOCK = [
     (r"^\s*sudo\b", "sudo (privilege escalation) is blocked"),
     (r"^\s*su\b", "su (user switch) is blocked"),
-    (r"\b(mkfs|fdisk|parted|mkpart|gparted)\b", "disk partitioning commands are blocked"),
+    (
+        r"\b(mkfs|fdisk|parted|mkpart|gparted)\b",
+        "disk partitioning commands are blocked",
+    ),
     (r"\b(shutdown|reboot|poweroff|halt)\b", "system control commands are blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\*", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\s", "destructive rm is blocked"),
-    (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+~", "destructive rm on the home directory is blocked"),
+    (
+        r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+~",
+        "destructive rm on the home directory is blocked",
+    ),
     (r"(^\s*|[;&|]\s*|\$\s*\(\s*)open\b", "the macOS `open` launcher is blocked"),
     (r"dd\s+if=", "dd is blocked"),
     (r"(>|>>)\s*/dev/(sd|disk)", "raw disk access is blocked"),
@@ -542,7 +661,9 @@ _TERMINAL_BLOCK = [
     (r"\|\s*(sh|bash|zsh)\b", "piping into a shell is blocked"),
 ]
 
-_TERMINAL_BLOCK_RE = [(re.compile(pat, re.IGNORECASE), msg) for pat, msg in _TERMINAL_BLOCK]
+_TERMINAL_BLOCK_RE = [
+    (re.compile(pat, re.IGNORECASE), msg) for pat, msg in _TERMINAL_BLOCK
+]
 
 
 def _blocked_terminal(command: str) -> str | None:
@@ -585,7 +706,11 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             stdout, stderr = proc.communicate()
-            output = f"[command timed out after {timeout}s]\n" + (stdout or "") + (stderr or "")
+            output = (
+                f"[command timed out after {timeout}s]\n"
+                + (stdout or "")
+                + (stderr or "")
+            )
             return -1, output
         code = proc.returncode
         output = (stdout or "") + (stderr or "")
@@ -728,10 +853,7 @@ def _walk_files(root: str) -> Sequence[str]:
         # workspace content the agent must see) but skip the deny-list
         # (`.git`, `.cache`, `node_modules`, …) — mirrors the renderer's
         # quick-open walk so Ctrl+P and the agent agree on what is visible.
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _SKIP_DIRS
-        ]
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
         for name in filenames:
             if name == ".DS_Store":
                 continue
@@ -788,7 +910,9 @@ def list_files(root: str, path: str = "") -> dict:
                 kind = "file"
         except OSError:
             kind = "file"
-        entries.append({"name": name, "kind": kind, "path": f"{path}/{name}".strip("/")})
+        entries.append(
+            {"name": name, "kind": kind, "path": f"{path}/{name}".strip("/")}
+        )
 
     return {"path": path, "entries": entries}
 
@@ -836,7 +960,10 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                     continue
                 text = raw.rstrip("\n")
                 if len(text) > MAX_LINE_LENGTH:
-                    text = text[:MAX_LINE_LENGTH] + f"… (line truncated to {MAX_LINE_LENGTH} chars)"
+                    text = (
+                        text[:MAX_LINE_LENGTH]
+                        + f"… (line truncated to {MAX_LINE_LENGTH} chars)"
+                    )
                 lines.append({"line": lineno, "text": text})
                 if len(lines) >= cap:
                     truncated = True
@@ -845,8 +972,21 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                         total += 1
                     break
     except (OSError, UnicodeError) as exc:
-        return {"path": path, "error": str(exc), "lines": [], "start": start, "total": 0, "truncated": False}
-    return {"path": path, "lines": lines, "start": start, "total": total, "truncated": truncated}
+        return {
+            "path": path,
+            "error": str(exc),
+            "lines": [],
+            "start": start,
+            "total": 0,
+            "truncated": False,
+        }
+    return {
+        "path": path,
+        "lines": lines,
+        "start": start,
+        "total": total,
+        "truncated": truncated,
+    }
 
 
 def write_file(root: str, path: str, content: str) -> dict:
@@ -943,7 +1083,8 @@ def open_vector_store(
     try:
         os.makedirs(base_dir, exist_ok=True)
         slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+            or "workspace"
         )
         db_path = db_path_for(base_dir, slug)
         return VectorStore(db_path, StoreConfig.from_dict(config))
@@ -990,7 +1131,7 @@ def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
     m = re.match(r"^---\n([\s\S]*?)\n---\n?", raw)
     if m:
         fm = m.group(1)
-        body = raw[m.end():]
+        body = raw[m.end() :]
     name = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
     description = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
     return (
@@ -1041,7 +1182,9 @@ def persist_skill(
             # description of what the skill IS, and embedding it inflates
             # semantic scores with irrelevant content.
             store.upsert_doc(
-                path, KIND_SKILL, name,
+                path,
+                KIND_SKILL,
+                name,
                 [f"{name}. {description}"],
             )
             if previous_name and previous_name != name:
@@ -1178,7 +1321,9 @@ def _project_slug(root: str) -> str:
 def _memory_manager(root: str, store: VectorStore | None = None) -> MemoryManager:
     """Shared memory manager bound to the workspace vector store (if any)."""
     try:
-        mm = MemoryManager(data_root=user_coder_dir(), config=MemoryConfig.from_settings(None))
+        mm = MemoryManager(
+            data_root=user_coder_dir(), config=MemoryConfig.from_settings(None)
+        )
         if store is not None:
             mm.bind_store(store)
         return mm
@@ -1306,7 +1451,11 @@ def remove_memory(root: str, subject: str, store: VectorStore | None = None) -> 
     res = mm.remove(subject, project_id=_project_slug(root))
     if "error" in res:
         return {"path": KIND_MEMORY, "error": res["error"]}
-    return {"path": KIND_MEMORY, "ok": True, "skip": "not found" if not res.get("removed") else False}
+    return {
+        "path": KIND_MEMORY,
+        "ok": True,
+        "skip": "not found" if not res.get("removed") else False,
+    }
 
 
 def search_memory(
@@ -1323,7 +1472,12 @@ def search_memory(
     """
     query = (query or "").strip()
     if store is None:
-        return {"query": query, "notes": [], "total": 0, "error": "memory store not available"}
+        return {
+            "query": query,
+            "notes": [],
+            "total": 0,
+            "error": "memory store not available",
+        }
     mm = _memory_manager(root, store)
     project = _project_slug(root)
     total = len(mm.list(project_id=project))
@@ -1372,7 +1526,10 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
     )
     result = persist_skill(markdown, fallback_name=name)
     if not result.get("ok"):
-        return {"path": f"db://skills/{slugify(name)}", "error": result.get("note", "save failed")}
+        return {
+            "path": f"db://skills/{slugify(name)}",
+            "error": result.get("note", "save failed"),
+        }
     return {
         "path": f"db://skills/{slugify(name)}",
         "name": result["name"],
@@ -1419,7 +1576,11 @@ def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
             _, err = proc.communicate(timeout=timeout)
             if proc.returncode not in (0, None):
                 msg = (err or b"").decode("utf-8", errors="replace").strip()
-                return f"exit {proc.returncode}: {msg[:200]}" if msg else f"exit {proc.returncode}"
+                return (
+                    f"exit {proc.returncode}: {msg[:200]}"
+                    if msg
+                    else f"exit {proc.returncode}"
+                )
             return None
         except subprocess.TimeoutExpired:
             # Still running — looks healthy. Kill the probe.
@@ -1651,7 +1812,9 @@ def _verify_typescript(root: str) -> str | None:
     out = (proc.stdout or proc.stderr or "").strip()
     error_lines = [ln for ln in out.splitlines() if ": error TS" in ln]
     if not error_lines:
-        return None  # tsc failed for some other reason (config issue etc.) — stay silent
+        return (
+            None  # tsc failed for some other reason (config issue etc.) — stay silent
+        )
     count = len(error_lines)
     preview = "\n".join(error_lines[:8])
     more = f"\n…({count - 8} more)" if count > 8 else ""
@@ -1722,9 +1885,7 @@ _PLAN_NEW_FILE_MARKERS = ("new file", "create", "new:", "add a new", "to be crea
 # `path:line` citations in a sub-agent explore report. Deliberately narrow
 # (a dot-extension path followed by a colon + digits) so prose like "it was
 # fixed in v1.2: done" and `scheme://` URLs aren't caught.
-_CITATION_RE = re.compile(
-    r"(?<![\w/.])([\w][\w./\-]+\.[A-Za-z0-9]{1,8}):(\d+)"
-)
+_CITATION_RE = re.compile(r"(?<![\w/.])([\w][\w./\-]+\.[A-Za-z0-9]{1,8}):(\d+)")
 
 
 def _self_check_plan_paths(root: str, content: str) -> str:
@@ -1768,7 +1929,9 @@ def _self_check_plan_paths(root: str, content: str) -> str:
     )
 
 
-def _search_python(root: str, query: str, path: str, ctx: int, include: str = "") -> dict:
+def _search_python(
+    root: str, query: str, path: str, ctx: int, include: str = ""
+) -> dict:
     """Python fallback for ``search_in_files`` when ripgrep is unavailable.
 
     Walks the tree and matches line-by-line with the same semantics as rg:
@@ -1777,7 +1940,12 @@ def _search_python(root: str, query: str, path: str, ctx: int, include: str = ""
     """
     target = resolve_safe(root, path, allow_coder=True)
     if not os.path.isdir(target) and not os.path.isfile(target):
-        return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
+        return {
+            "query": query,
+            "matches": [],
+            "truncated": False,
+            "error": f"path not found: {path}",
+        }
 
     try:
         pattern = re.compile(query, re.IGNORECASE)
@@ -1813,8 +1981,7 @@ def _search_python(root: str, query: str, path: str, ctx: int, include: str = ""
                     lo = max(0, index - ctx)
                     hi = min(total, index + ctx + 1)
                     entry["context_lines"] = [
-                        {"line": i + 1, "text": lines[i][:500]}
-                        for i in range(lo, hi)
+                        {"line": i + 1, "text": lines[i][:500]} for i in range(lo, hi)
                     ]
                 matches.append(entry)
                 if len(matches) >= MAX_SEARCH_RESULTS:
@@ -1829,7 +1996,9 @@ def _include_glob_to_re(include: str) -> re.Pattern | None:
     inc = (include or "").strip()
     if not inc:
         return None
-    parts = [i.strip() for i in inc.replace("{", "").replace("}", "").split(",") if i.strip()]
+    parts = [
+        i.strip() for i in inc.replace("{", "").replace("}", "").split(",") if i.strip()
+    ]
     chunks: list[str] = []
     for part in parts:
         esc = ""
@@ -1847,7 +2016,9 @@ def _include_glob_to_re(include: str) -> re.Pattern | None:
     return re.compile(r"(?:^|/)(" + "|".join(chunks) + r")$")
 
 
-def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") -> dict | None:
+def _rg_search(
+    root: str, query: str, path: str, ctx: int, include: str = ""
+) -> dict | None:
     """Claude-Code-style ripgrep search; returns None when rg is unusable."""
     rg = shutil.which("rg")
     if not rg:
@@ -1865,7 +2036,12 @@ def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") ->
     # actually in. A path that resolves to neither a file nor a directory (a
     # typo) is now reported as a clean error instead of guessing.
     if not os.path.isdir(target) and not os.path.isfile(target):
-        return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
+        return {
+            "query": query,
+            "matches": [],
+            "truncated": False,
+            "error": f"path not found: {path}",
+        }
 
     cwd = coder if in_coder else root_real
     search_arg = os.path.relpath(target, cwd).replace(os.sep, "/")
@@ -1876,7 +2052,15 @@ def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") ->
     # unless --hidden is passed; exit codes: 0 = matches, 1 = none, 2 = error.
     # --hidden makes config files (`.config`, `.github`, …) searchable; the
     # deny-list globs keep `.git`/`node_modules`/… out even when hidden.
-    cmd = [rg, "--json", "--line-number", "--smart-case", "--color", "never", "--hidden"]
+    cmd = [
+        rg,
+        "--json",
+        "--line-number",
+        "--smart-case",
+        "--color",
+        "never",
+        "--hidden",
+    ]
     cmd += _RG_EXCLUDE_GLOBS
     if ctx > 0:
         cmd += ["--context", str(ctx)]
@@ -1917,7 +2101,9 @@ def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") ->
             entry = {
                 "file": file,
                 "line": data.get("line_number"),
-                "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[:500],
+                "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[
+                    :500
+                ],
             }
             if ctx > 0:
                 entry["context_lines"] = []
@@ -1925,14 +2111,20 @@ def _rg_search(root: str, query: str, path: str, ctx: int, include: str = "") ->
             if len(matches) >= MAX_SEARCH_RESULTS:
                 return {"query": query, "matches": matches, "truncated": True}
         elif obj.get("type") == "context" and ctx > 0 and matches:
-            matches[-1]["context_lines"].append({
-                "line": data.get("line_number"),
-                "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[:500],
-            })
+            matches[-1]["context_lines"].append(
+                {
+                    "line": data.get("line_number"),
+                    "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[
+                        :500
+                    ],
+                }
+            )
     return {"query": query, "matches": matches, "truncated": False}
 
 
-def search_in_files(root: str, query: str, path: str = "", context: int = 0, include: str = "") -> dict:
+def search_in_files(
+    root: str, query: str, path: str = "", context: int = 0, include: str = ""
+) -> dict:
     """Search for ``query`` (case-insensitive regex) under ``path``.
 
     Uses ripgrep when available (respecting ``.gitignore``, skipping hidden and
@@ -1971,7 +2163,11 @@ def _glob_python(root: str, pattern: str, target: str, path: str) -> dict:
         if len(files) >= MAX_SEARCH_RESULTS:
             break
     files = _clip_glob_results(files)
-    return {"pattern": pattern, "matches": files, "truncated": len(matches) > len(files)}
+    return {
+        "pattern": pattern,
+        "matches": files,
+        "truncated": len(matches) > len(files),
+    }
 
 
 def _clip_glob_results(paths: list[str]) -> list[str]:
@@ -2021,7 +2217,11 @@ def _rg_glob(root: str, pattern: str, target: str, path: str) -> dict | None:
             files.append(rel)
         if len(files) >= MAX_SEARCH_RESULTS:
             break
-    return {"pattern": pattern, "matches": _clip_glob_results(files), "truncated": len(files) >= MAX_SEARCH_RESULTS}
+    return {
+        "pattern": pattern,
+        "matches": _clip_glob_results(files),
+        "truncated": len(files) >= MAX_SEARCH_RESULTS,
+    }
 
 
 def glob_files(root: str, pattern: str, path: str = "") -> dict:
@@ -2259,6 +2459,7 @@ def _html_to_text(html: str) -> tuple[str, str]:
 # Pydantic AI tool registrations
 # --------------------------------------------------------------------------- #
 
+
 def _validate_mcp_url(url: str, timeout: int = 15) -> dict:
     """Verify that ``url`` is a working MCP endpoint before saving it.
 
@@ -2307,9 +2508,7 @@ def _validate_mcp_url(url: str, timeout: int = 15) -> dict:
                 }
             if resp.status_code in (404, 405):
                 # Possibly an SSE transport: GET should open an event stream.
-                sse = client.get(
-                    url, headers={"Accept": "text/event-stream"}
-                )
+                sse = client.get(url, headers={"Accept": "text/event-stream"})
                 ct = sse.headers.get("content-type", "")
                 if sse.status_code == 200 and "text/event-stream" in ct:
                     return {"ok": True}
@@ -2349,11 +2548,46 @@ def _is_terminal_search(command: str) -> bool:
     # actual operation, so they don't decide the classification.
     _SKIP = {"cd", "echo", "pwd", "export", "env", "set", "source", "clear", "time"}
     _SEARCH = {
-        "grep", "egrep", "fgrep", "rg", "ripgrep", "find", "sed", "awk",
-        "cat", "ls", "head", "tail", "wc", "sort", "uniq", "type", "which",
-        "nl", "tree", "file", "stat", "cut", "tr", "diff", "strings",
-        "xxd", "od", "less", "more", "fold", "fmt", "paste", "join",
-        "tac", "rev", "shuf", "seq", "xargs", "jq", "sqlite3",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ripgrep",
+        "find",
+        "sed",
+        "awk",
+        "cat",
+        "ls",
+        "head",
+        "tail",
+        "wc",
+        "sort",
+        "uniq",
+        "type",
+        "which",
+        "nl",
+        "tree",
+        "file",
+        "stat",
+        "cut",
+        "tr",
+        "diff",
+        "strings",
+        "xxd",
+        "od",
+        "less",
+        "more",
+        "fold",
+        "fmt",
+        "paste",
+        "join",
+        "tac",
+        "rev",
+        "shuf",
+        "seq",
+        "xargs",
+        "jq",
+        "sqlite3",
     }
     _GIT_PREFIXES = ("git grep", "git log", "git diff", "git show", "git blame")
     for seg in re.split(r"&&|;|\||\n", cmd):
@@ -2774,16 +3008,32 @@ def make_tool_callbacks(
                     tofile=path,
                 )
             )
-            adds = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
-            dels = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
-            emit({
-                "kind": "diff",
+            adds = sum(
+                1
+                for l in diff.splitlines()
+                if l.startswith("+") and not l.startswith("+++")
+            )
+            dels = sum(
+                1
+                for l in diff.splitlines()
+                if l.startswith("-") and not l.startswith("---")
+            )
+            emit(
+                {
+                    "kind": "diff",
+                    "tool": "write_file",
+                    "path": path,
+                    "diff": diff,
+                    "summary": f"{len(content)} chars · +{adds}/-{dels}",
+                }
+            )
+        emit(
+            {
+                "kind": "tool_result",
                 "tool": "write_file",
-                "path": path,
-                "diff": diff,
-                "summary": f"{len(content)} chars · +{adds}/-{dels}",
-            })
-        emit({"kind": "tool_result", "tool": "write_file", "summary": f"{len(content)} chars"})
+                "summary": f"{len(content)} chars",
+            }
+        )
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -2794,7 +3044,10 @@ def make_tool_callbacks(
     async def save_plan_tool(title: str, content: str) -> str:
         """PLAN MODE ONLY. Save the implementation plan you just wrote as markdown in the user data folder (per-chat, never inside the workspace), so the user or Coder mode can pick it up. Each call OVERWRITES this chat's plan — call ONCE after your '## Plan' text is final, with `title` (short) and `content` (the full plan markdown). The ONE write capability plan mode has; never writes workspace files."""
         emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
-        workspace_slug = slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+        workspace_slug = (
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+            or "workspace"
+        )
         try:
             _state_db.save_plan(workspace_slug, title, content, chat_id=chat_id)
         except Exception as exc:  # noqa: BLE001
@@ -2802,11 +3055,14 @@ def make_tool_callbacks(
             emit(_error_result("save_plan", msg))
             return f"ERROR saving plan: {msg}"
         check_note = _self_check_plan_paths(root, content)
-        emit({
-            "kind": "tool_result",
-            "tool": "save_plan",
-            "summary": "saved" + (" (self-check flagged paths)" if check_note else ""),
-        })
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "save_plan",
+                "summary": "saved"
+                + (" (self-check flagged paths)" if check_note else ""),
+            }
+        )
         return (
             "Saved the plan to the app database for this workspace. "
             "It will be offered again automatically on the next run in this workspace."
@@ -2815,7 +3071,13 @@ def make_tool_callbacks(
 
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
         """Curate the project's durable memory (RAG notes, loaded every future session). If the user asks to remember/keep something (any language), call with action='add' THIS SAME turn — the tool call IS the save; saying "I'll remember" saves nothing. action: 'add' (text), 'replace' (subject= find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself (conventions, gotchas, build quirks, stated preferences). ENGLISH. No secrets, personal data, one-offs, or AGENTS.md content. Near cap prefer replace/remove."""
-        emit({"kind": "tool", "tool": "memory", "args": {"action": action, "subject": subject, "text": text}})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "memory",
+                "args": {"action": action, "subject": subject, "text": text},
+            }
+        )
         action = (action or "").strip().lower()
         try:
             if action == "replace":
@@ -2845,7 +3107,9 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "memory", "summary": f"ok ({action})"})
         return f"Memory updated ({action}). It will be loaded automatically in future sessions for this project."
 
-    async def search_memory_tool(query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> str:
+    async def search_memory_tool(
+        query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS
+    ) -> str:
         """Search this project's durable memory (RAG notes) for notes relevant to `query`. The most relevant notes to the current message are auto-injected every run, so you usually don't need this. Call when you need MORE: a different angle, older notes, or a mid-task check (e.g. a recurring error). Pass a few keywords (e.g. "port config", "auth flow"); leave query empty for the most recently added notes."""
         emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
         try:
@@ -2861,12 +3125,30 @@ def make_tool_callbacks(
         notes = result.get("notes", [])
         total = result.get("total", 0)
         if total == 0:
-            emit({"kind": "tool_result", "tool": "search_memory", "summary": "no notes yet"})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "search_memory",
+                    "summary": "no notes yet",
+                }
+            )
             return "No memory notes saved yet for this project."
         if not notes:
-            emit({"kind": "tool_result", "tool": "search_memory", "summary": "no matches"})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "search_memory",
+                    "summary": "no matches",
+                }
+            )
             return f"No saved notes matched {query!r} (out of {total} total notes). Proceed without them."
-        emit({"kind": "tool_result", "tool": "search_memory", "summary": f"{len(notes)}/{total} notes"})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "search_memory",
+                "summary": f"{len(notes)}/{total} notes",
+            }
+        )
         body = "\n".join(notes)
         label = f"matching {query!r}" if query else "most recent"
         return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
@@ -2900,7 +3182,9 @@ def make_tool_callbacks(
                 )
         if not normalized:
             emit(_error_result("update_plan", "empty plan"))
-            return "ERROR: plan must contain at least one item with non-empty 'content'."
+            return (
+                "ERROR: plan must contain at least one item with non-empty 'content'."
+            )
         # Enforce the single-active-step invariant. The model sometimes marks more
         # than one item 'in_progress' in the same call (e.g. forgets to flip the
         # previous step to 'completed' when starting the next one) — the frontend
@@ -2908,21 +3192,27 @@ def make_tool_callbacks(
         # blink together'). Only the LAST in_progress item (by list order — the
         # step actually being worked on now) stays in_progress; any earlier one is
         # treated as already finished and normalized to 'completed'.
-        in_progress_idx = [i for i, it in enumerate(normalized) if it["status"] == "in_progress"]
+        in_progress_idx = [
+            i for i, it in enumerate(normalized) if it["status"] == "in_progress"
+        ]
         for i in in_progress_idx[:-1]:
             normalized[i]["status"] = "completed"
         # Feed the plan-nudge backstop (see _format_plan_nudge_suffix): reset the
         # since-last-update counter now that the plan was just touched, and record
         # whether a step is still open so mutating tools know whether to nudge.
         _plan_nudge_state["since_update"] = 0
-        _plan_nudge_state["has_in_progress"] = any(i["status"] == "in_progress" for i in normalized)
+        _plan_nudge_state["has_in_progress"] = any(
+            i["status"] == "in_progress" for i in normalized
+        )
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
-        emit({
-            "kind": "tool_result",
-            "tool": "update_plan",
-            "summary": f"{done}/{len(normalized)} done",
-        })
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "update_plan",
+                "summary": f"{done}/{len(normalized)} done",
+            }
+        )
         return f"Plan updated: {len(normalized)} steps, {done} completed."
 
     async def create_skill_tool(
@@ -2933,11 +3223,13 @@ def make_tool_callbacks(
         source_query: str = "",
     ) -> str:
         """Create or update a reusable skill in the app database (global). `name` display name; `description` one-line when-to-use; `content` full markdown body. Skills live ONLY in the app DB + vector store — never write skill files to disk; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
-        emit({
-            "kind": "tool",
-            "tool": "create_skill",
-            "args": {"name": name, "description": description},
-        })
+        emit(
+            {
+                "kind": "tool",
+                "tool": "create_skill",
+                "args": {"name": name, "description": description},
+            }
+        )
         body = (content or "").strip()
         source_note = ""
         src_url = (source_url or "").strip()
@@ -2946,19 +3238,49 @@ def make_tool_callbacks(
             if src_url:
                 if not src_url.startswith(("http://", "https://")):
                     src_url = "https://" + src_url.lstrip("/")
-                emit({"kind": "tool", "tool": "create_skill", "args": {"source_fetch": src_url}})
-                fetched = await asyncio.to_thread(fetch_url, src_url, FETCH_EXCERPT_CHARS)
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "create_skill",
+                        "args": {"source_fetch": src_url},
+                    }
+                )
+                fetched = await asyncio.to_thread(
+                    fetch_url, src_url, FETCH_EXCERPT_CHARS
+                )
             else:
-                emit({"kind": "tool", "tool": "create_skill", "args": {"source_search": src_query}})
-                search = await asyncio.to_thread(web_search, src_query, MAX_WEB_SEARCH_RESULTS)
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "create_skill",
+                        "args": {"source_search": src_query},
+                    }
+                )
+                search = await asyncio.to_thread(
+                    web_search, src_query, MAX_WEB_SEARCH_RESULTS
+                )
                 if "error" in search:
                     msg = f"web search failed: {search['error']}"
-                    emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "create_skill",
+                            "summary": msg,
+                            "status": "error",
+                        }
+                    )
                     return f"ERROR creating skill {name!r}: {msg}"
                 results = search.get("results", [])
                 if not results:
                     msg = f"web search for {src_query!r} returned no results"
-                    emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "create_skill",
+                            "summary": msg,
+                            "status": "error",
+                        }
+                    )
                     return f"ERROR creating skill {name!r}: {msg}"
                 # Prefer a result that looks like an actual skill/markdown source
                 # (github / raw / SKILL.md / .md) over generic pages; otherwise
@@ -2975,19 +3297,43 @@ def make_tool_callbacks(
                         picked = r
                         break
                 src_url = picked.get("url", "")
-                emit({"kind": "tool", "tool": "create_skill", "args": {"source_fetch": src_url}})
-                fetched = await asyncio.to_thread(fetch_url, src_url, FETCH_EXCERPT_CHARS)
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "create_skill",
+                        "args": {"source_fetch": src_url},
+                    }
+                )
+                fetched = await asyncio.to_thread(
+                    fetch_url, src_url, FETCH_EXCERPT_CHARS
+                )
             if "error" in fetched:
                 msg = f"could not fetch source {src_url!r}: {fetched['error']}"
-                emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "create_skill",
+                        "summary": msg,
+                        "status": "error",
+                    }
+                )
                 return f"ERROR creating skill {name!r}: {msg}"
             real = (fetched.get("content") or "").strip()
             if len(real) < 50:
                 msg = f"source {src_url!r} contained almost no readable text"
-                emit({"kind": "tool_result", "tool": "create_skill", "summary": msg, "status": "error"})
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "create_skill",
+                        "summary": msg,
+                        "status": "error",
+                    }
+                )
                 return f"ERROR creating skill {name!r}: {msg}"
             body = real
-            source_note = f"built from real content fetched from {src_url} ({len(body)} chars)"
+            source_note = (
+                f"built from real content fetched from {src_url} ({len(body)} chars)"
+            )
             if not (description or "").strip():
                 # Derive a one-line description from the fetched file so the
                 # skill stays searchable even when the model omits it.
@@ -2998,8 +3344,22 @@ def make_tool_callbacks(
                     if _d:
                         _desc = _d.group(1).strip()
                 if not _desc:
-                    _first_line = next((l.strip() for l in body.splitlines() if l.strip() and not l.lstrip().startswith("#")), "")
-                    _title = next((l.lstrip("#").strip() for l in body.splitlines() if l.lstrip().startswith("#")), "")
+                    _first_line = next(
+                        (
+                            l.strip()
+                            for l in body.splitlines()
+                            if l.strip() and not l.lstrip().startswith("#")
+                        ),
+                        "",
+                    )
+                    _title = next(
+                        (
+                            l.lstrip("#").strip()
+                            for l in body.splitlines()
+                            if l.lstrip().startswith("#")
+                        ),
+                        "",
+                    )
                     _desc = _first_line or _title or f"Skill about {name}."
                 description = _desc[:300]
         if not body:
@@ -3018,11 +3378,13 @@ def make_tool_callbacks(
         summary = f"saved to the app database as skill {name!r}"
         if indexed is False:
             summary += " (not indexed — no embedding model available)"
-        emit({
-            "kind": "tool_result",
-            "tool": "create_skill",
-            "summary": summary,
-        })
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "create_skill",
+                "summary": summary,
+            }
+        )
         note = result.get("note", "")
         extra = f" {source_note}." if source_note else "."
         return (
@@ -3052,11 +3414,13 @@ def make_tool_callbacks(
             check = await asyncio.to_thread(_validate_mcp_url, url)
             if not check.get("ok"):
                 msg = check.get("error", "endpoint validation failed")
-                emit({
-                    "kind": "tool_result",
-                    "tool": "create_mcp",
-                    "summary": msg,
-                })
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "create_mcp",
+                        "summary": msg,
+                    }
+                )
                 return (
                     f"ERROR: {msg}. The connector was NOT saved. Ask the user for "
                     "the correct MCP server URL, or for a local server provide the "
@@ -3081,11 +3445,13 @@ def make_tool_callbacks(
             msg = result["error"]
             emit(_error_result("create_mcp", msg))
             return f"ERROR creating MCP connector {name!r}: {msg}"
-        emit({
-            "kind": "tool_result",
-            "tool": "create_mcp",
-            "summary": f"updated {name} in the app database",
-        })
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "create_mcp",
+                "summary": f"updated {name} in the app database",
+            }
+        )
         return (
             f"MCP connector {name!r} saved to the app database (user-level, "
             "shared across all workspaces). It will be loaded on "
@@ -3097,11 +3463,13 @@ def make_tool_callbacks(
         path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> str:
         """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite."""
-        emit({
-            "kind": "tool",
-            "tool": "edit_file",
-            "args": {"path": path, "replace_all": replace_all},
-        })
+        emit(
+            {
+                "kind": "tool",
+                "tool": "edit_file",
+                "args": {"path": path, "replace_all": replace_all},
+            }
+        )
         try:
             result = edit_file(root, path, old_string, new_string, replace_all)
         except PathEscapeError as exc:
@@ -3121,17 +3489,29 @@ def make_tool_callbacks(
                 tofile=path,
             )
         )
-        adds = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
-        dels = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
-        emit({
-            "kind": "diff",
-            "tool": "edit_file",
-            "path": path,
-            "diff": diff,
-            "summary": f"+{adds}/-{dels}",
-        })
+        adds = sum(
+            1
+            for l in diff.splitlines()
+            if l.startswith("+") and not l.startswith("+++")
+        )
+        dels = sum(
+            1
+            for l in diff.splitlines()
+            if l.startswith("-") and not l.startswith("---")
+        )
+        emit(
+            {
+                "kind": "diff",
+                "tool": "edit_file",
+                "path": path,
+                "diff": diff,
+                "summary": f"+{adds}/-{dels}",
+            }
+        )
         occ = result.get("occurrences", 1)
-        emit({"kind": "tool_result", "tool": "edit_file", "summary": f"+{adds}/-{dels}"})
+        emit(
+            {"kind": "tool_result", "tool": "edit_file", "summary": f"+{adds}/-{dels}"}
+        )
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
@@ -3147,12 +3527,14 @@ def make_tool_callbacks(
         # slot has fallen back earlier in the turn.
         _search_runner = main_model if _fallback_state.get("search") else search_model
         _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
-        emit({
-            "kind": "tool",
-            "tool": "grep",
-            "args": {"pattern": pattern, "path": path, "include": include},
-            "model": _search_runner_name,
-        })
+        emit(
+            {
+                "kind": "tool",
+                "tool": "grep",
+                "args": {"pattern": pattern, "path": path, "include": include},
+                "model": _search_runner_name,
+            }
+        )
         try:
             result = search_in_files(root, pattern, path, 0, include)
         except PathEscapeError as exc:
@@ -3165,7 +3547,14 @@ def make_tool_callbacks(
             return f"ERROR searching {path}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "grep", "summary": "no matches", "model": _search_runner_name})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "grep",
+                    "summary": "no matches",
+                    "model": _search_runner_name,
+                }
+            )
             return f"No matches for {pattern!r} under {path or '/'}."
         # Hard cap on the total characters returned so a broad search can't
         # flood the context window.
@@ -3234,12 +3623,14 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "grep",
-                        "summary": f"{len(matches)} matches (distilled)",
-                        "model": str(getattr(ran_model, "model_name", "") or ""),
-                    })
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "grep",
+                            "summary": f"{len(matches)} matches (distilled)",
+                            "model": str(getattr(ran_model, "model_name", "") or ""),
+                        }
+                    )
                     return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 _ran_name = str(
@@ -3252,15 +3643,27 @@ def make_tool_callbacks(
                 )
                 _search_note = _subagent_fail_note("search", _ran_name, exc)
                 if _search_note:
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "grep",
-                        "summary": "search subagent failed — raw matches below",
-                        "status": "error",
-                        "model": _ran_name,
-                    })
-                    return f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n" + "\n".join(lines)
-        emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches", "model": _search_runner_name})
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "grep",
+                            "summary": "search subagent failed — raw matches below",
+                            "status": "error",
+                            "model": _ran_name,
+                        }
+                    )
+                    return (
+                        f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
+                        + "\n".join(lines)
+                    )
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "grep",
+                "summary": f"{len(matches)} matches",
+                "model": _search_runner_name,
+            }
+        )
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
@@ -3272,12 +3675,14 @@ def make_tool_callbacks(
             else ""
         )
         _is_search_cmd = _is_terminal_search(command)
-        emit({
-            "kind": "tool",
-            "tool": "run_terminal",
-            "args": {"command": command},
-            "model": _reader_model_name if _is_search_cmd else "",
-        })
+        emit(
+            {
+                "kind": "tool",
+                "tool": "run_terminal",
+                "args": {"command": command},
+                "model": _reader_model_name if _is_search_cmd else "",
+            }
+        )
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]
@@ -3310,7 +3715,11 @@ def make_tool_callbacks(
         # call falls back to the MAIN model (see _run_distill) — the raw output
         # is only returned when BOTH models fail.
         _reader_model = main_model if _fallback_state.get("search") else search_model
-        if _reader_model is not None and _is_terminal_search(command) and len(output) >= 600:
+        if (
+            _reader_model is not None
+            and _is_terminal_search(command)
+            and len(output) >= 600
+        ):
             try:
                 from pydantic_ai import Agent as _SA
                 from pydantic_ai.settings import ModelSettings as _SMS
@@ -3343,12 +3752,14 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "run_terminal",
-                        "summary": f"search distilled · {len(distilled)} chars",
-                        "model": str(getattr(ran_model, "model_name", "") or ""),
-                    })
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "run_terminal",
+                            "summary": f"search distilled · {len(distilled)} chars",
+                            "model": str(getattr(ran_model, "model_name", "") or ""),
+                        }
+                    )
                     return (
                         f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
                     )
@@ -3389,7 +3800,14 @@ def make_tool_callbacks(
         # main model once the slot has fallen back earlier in the turn.
         _search_runner = main_model if _fallback_state.get("search") else search_model
         _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
-        emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}, "model": _search_runner_name})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "glob",
+                "args": {"pattern": pattern, "path": path},
+                "model": _search_runner_name,
+            }
+        )
         try:
             result = glob_files(root, pattern, path)
         except PathEscapeError as exc:
@@ -3402,7 +3820,14 @@ def make_tool_callbacks(
             return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
         matches = result.get("matches", [])
         if not matches:
-            emit({"kind": "tool_result", "tool": "glob", "summary": "no matches", "model": _search_runner_name})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "glob",
+                    "summary": "no matches",
+                    "model": _search_runner_name,
+                }
+            )
             return f"No files match {pattern!r} under {path or '/'}."
         lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
@@ -3451,12 +3876,14 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "glob",
-                        "summary": f"{len(matches)} matches (distilled)",
-                        "model": str(getattr(ran_model, "model_name", "") or ""),
-                    })
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "glob",
+                            "summary": f"{len(matches)} matches (distilled)",
+                            "model": str(getattr(ran_model, "model_name", "") or ""),
+                        }
+                    )
                     return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 _ran_name = str(
@@ -3469,15 +3896,27 @@ def make_tool_callbacks(
                 )
                 _search_note = _subagent_fail_note("search", _ran_name, exc)
                 if _search_note:
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "glob",
-                        "summary": "search subagent failed — raw matches below",
-                        "status": "error",
-                        "model": _ran_name,
-                    })
-                    return f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n" + "\n".join(lines)
-        emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches", "model": _search_runner_name})
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "glob",
+                            "summary": "search subagent failed — raw matches below",
+                            "status": "error",
+                            "model": _ran_name,
+                        }
+                    )
+                    return (
+                        f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
+                        + "\n".join(lines)
+                    )
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "glob",
+                "summary": f"{len(matches)} matches",
+                "model": _search_runner_name,
+            }
+        )
         return raw
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
@@ -3486,7 +3925,14 @@ def make_tool_callbacks(
         # the main model once the slot has fallen back earlier in the turn.
         _search_runner = main_model if _fallback_state.get("search") else search_model
         _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
-        emit({"kind": "tool", "tool": "read", "args": {"filePath": filePath, "offset": offset, "limit": limit}, "model": _search_runner_name})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "read",
+                "args": {"filePath": filePath, "offset": offset, "limit": limit},
+                "model": _search_runner_name,
+            }
+        )
         try:
             target = resolve_safe(root, filePath, allow_coder=True)
         except PathEscapeError as exc:
@@ -3494,12 +3940,16 @@ def make_tool_callbacks(
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
-            raw = await _read_dir_tool(target, filePath, offset, limit, _search_runner_name)
+            raw = await _read_dir_tool(
+                target, filePath, offset, limit, _search_runner_name
+            )
             # When a dedicated "search" subagent model is configured, pass the raw
             # directory listing through the search subagent so it does the interpretation work
             # (and its tokens are accounted to the search model). On a hard sub-agent
             # failure the call falls back to the MAIN model (see _run_distill).
-            _search_runner = main_model if _fallback_state.get("search") else search_model
+            _search_runner = (
+                main_model if _fallback_state.get("search") else search_model
+            )
             # NOTE: no `not _fallback_state` guard here — _run_distill itself
             # picks the main model once the slot has fallen back (sticky), so a
             # later directory read in the same turn still gets distilled (by the
@@ -3524,7 +3974,12 @@ def make_tool_callbacks(
                             ),
                             model_settings=_SMS(temperature=0.2, max_tokens=400),
                         ),
-                        lambda: f"DIRECTORY: {filePath}\n\nENTRIES:\n" + raw.split("\n", 1)[1] if "\n" in raw else raw,
+                        lambda: (
+                            f"DIRECTORY: {filePath}\n\nENTRIES:\n"
+                            + raw.split("\n", 1)[1]
+                            if "\n" in raw
+                            else raw
+                        ),
                         timeout_total=60,
                     )
                     distilled = str(getattr(res, "output", "") or "").strip()
@@ -3537,17 +3992,25 @@ def make_tool_callbacks(
                         )
                         if _usage_ev:
                             emit(_usage_ev)
-                        emit({
-                            "kind": "tool_result",
-                            "tool": "read",
-                            "summary": f"directory distilled · {len(distilled)} chars",
-                            "model": str(getattr(ran_model, "model_name", "") or ""),
-                        })
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "read",
+                                "summary": f"directory distilled · {len(distilled)} chars",
+                                "model": str(
+                                    getattr(ran_model, "model_name", "") or ""
+                                ),
+                            }
+                        )
                         return f"DIRECTORY {filePath} (distilled)\n{distilled}"
                 except Exception as exc:  # noqa: BLE001 — fall back to raw output
                     _ran_name = str(
                         getattr(
-                            main_model if _fallback_state.get("search") else search_model,
+                            (
+                                main_model
+                                if _fallback_state.get("search")
+                                else search_model
+                            ),
                             "model_name",
                             "",
                         )
@@ -3555,14 +4018,21 @@ def make_tool_callbacks(
                     )
                     _search_note = _subagent_fail_note("search", _ran_name, exc)
                     if _search_note:
-                        emit({
-                            "kind": "tool_result",
-                            "tool": "read",
-                            "summary": "search subagent failed — raw listing below",
-                            "status": "error",
-                            "model": _ran_name,
-                        })
-                        return f"DIRECTORY {filePath}\n{_search_note}\n" + raw.split("\n", 1)[1] if "\n" in raw else raw
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "read",
+                                "summary": "search subagent failed — raw listing below",
+                                "status": "error",
+                                "model": _ran_name,
+                            }
+                        )
+                        return (
+                            f"DIRECTORY {filePath}\n{_search_note}\n"
+                            + raw.split("\n", 1)[1]
+                            if "\n" in raw
+                            else raw
+                        )
             return raw
         if not os.path.exists(target):
             msg = "file not found"
@@ -3591,10 +4061,19 @@ def make_tool_callbacks(
             body = f"{body}\n\n(Showing lines {start}-{lines[-1]['line']} of {total}. Use offset={next_line} to continue.)"
         else:
             body = f"{body}\n\n(End of file — total {total} lines)"
-        emit({"kind": "tool_result", "tool": "read", "summary": f"{len(lines)} lines", "model": _search_runner_name})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "read",
+                "summary": f"{len(lines)} lines",
+                "model": _search_runner_name,
+            }
+        )
         return f"{filePath}\n{body}"
 
-    async def _read_dir_tool(target: str, filePath: str, offset: int, limit: int, _model: str = "") -> str:
+    async def _read_dir_tool(
+        target: str, filePath: str, offset: int, limit: int, _model: str = ""
+    ) -> str:
         """Directory branch of the read tool (opencode-style listing)."""
         try:
             names = sorted(os.listdir(target), key=lambda n: (n.lower(),))
@@ -3611,29 +4090,65 @@ def make_tool_callbacks(
             entries.append(f"{name}{marker}")
         start = max(1, int(offset or 1))
         count = max(1, min(int(limit or 2000), 2000))
-        window = entries[start - 1: start - 1 + count]
+        window = entries[start - 1 : start - 1 + count]
         footer = (
             f"({len(entries)} entries, showing {start}-{start - 1 + len(window)})"
             if start - 1 + len(window) < len(entries)
             else f"({len(entries)} entries)"
         )
         body = "\n".join(window) if window else "(empty directory)"
-        emit({"kind": "tool_result", "tool": "read", "summary": f"directory · {len(entries)} entries", "model": _model})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "read",
+                "summary": f"directory · {len(entries)} entries",
+                "model": _model,
+            }
+        )
         return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
 
-    async def task_tool(description: str, prompt: str, subagent_type: str, task_id: str = "") -> str:
+    async def task_tool(
+        description: str, prompt: str, subagent_type: str, task_id: str = ""
+    ) -> str:
         """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description — for the 'explore' agent, specify the desired thoroughness level ('quick' | 'medium' | 'very thorough'). `subagent_type`: the specialized agent to use — 'explore' (fast codebase search: find files by pattern, search code, answer codebase questions) or 'general' (general-purpose research / multi-step tasks). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
         if subagent_type not in AGENTS:
-            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
-            emit(_error_result("task", f"Unknown agent type: {subagent_type} is not a valid agent type"))
-            return f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "task",
+                    "args": {
+                        "description": description,
+                        "subagent_type": subagent_type,
+                    },
+                    "model": "",
+                }
+            )
+            emit(
+                _error_result(
+                    "task",
+                    f"Unknown agent type: {subagent_type} is not a valid agent type",
+                )
+            )
+            return (
+                f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
+            )
         # Sub-agent depth limit (opencode's subagent_depth, default 1): a
         # sub-agent cannot spawn another sub-agent.
         if _TASK_DEPTH_CTX.get() >= _SUBAGENT_DEPTH_LIMIT:
-            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "task",
+                    "args": {
+                        "description": description,
+                        "subagent_type": subagent_type,
+                    },
+                    "model": "",
+                }
+            )
             emit(_error_result("task", "subagent depth limit reached"))
             return (
                 f"ERROR: subagent depth limit reached ({_SUBAGENT_DEPTH_LIMIT}) — "
@@ -3654,7 +4169,17 @@ def make_tool_callbacks(
         _run_model = explore_model
         _run_model_name = str(getattr(_run_model, "model_name", "") or "")
         if explore_model is None:
-            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": ""})
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "task",
+                    "args": {
+                        "description": description,
+                        "subagent_type": subagent_type,
+                    },
+                    "model": "",
+                }
+            )
             emit(_error_result("task", "unavailable"))
             return "ERROR: the explore agent is unavailable (no model configured for this session)."
 
@@ -3670,8 +4195,7 @@ def make_tool_callbacks(
             return (
                 "[NOTE: this task is nearly identical to an explore task already "
                 "run this turn — reusing its report instead of spawning another "
-                "sub-agent.]\n\n"
-                + str(prior.get("report") or "")
+                "sub-agent.]\n\n" + str(prior.get("report") or "")
             )
 
         def _explore_sig_matches(ent: dict) -> bool:
@@ -3703,7 +4227,7 @@ def make_tool_callbacks(
         # per _run_explore(model) so a fallback run on the main model labels its
         # read/grep/glob events with the main model, not the failed sub-agent's.
         _sub_emit_model_name = _run_model_name
- 
+
         # Per-branch emit state: with a PARALLEL fan-out each branch runs in its
         # own asyncio task, so a shared mutable model-name variable would race
         # (one branch fallback would mislabel another branch events). Each
@@ -3738,7 +4262,7 @@ def make_tool_callbacks(
             if searches is None:
                 searches = _sub_seen_searches
             return searches, _explore_seen_listings
- 
+
         def _sub_emit(event: dict) -> None:
             branch_emit = _sub_emit_ctx.get()
             if branch_emit is not None:
@@ -3764,11 +4288,8 @@ def make_tool_callbacks(
             if st is None:
                 return
             low = (out or "").strip().lower()
-            if (
-                not low
-                or low.startswith(
-                    ("error", "no matches", "no files match", "(no ")
-                )
+            if not low or low.startswith(
+                ("error", "no matches", "no files match", "(no ")
             ):
                 st["streak"] += 1
             else:
@@ -3880,7 +4401,11 @@ def make_tool_callbacks(
             for cache_key, body in items:
                 parts = cache_key.split("|", 2)
                 tool = parts[0]
-                label = parts[1] if len(parts) > 1 and parts[1] else (parts[2] if len(parts) > 2 else "/")
+                label = (
+                    parts[1]
+                    if len(parts) > 1 and parts[1]
+                    else (parts[2] if len(parts) > 2 else "/")
+                )
                 snippet = body[:300].replace("\n", " ")
                 if len(body) > 300:
                     snippet += "…"
@@ -3923,7 +4448,9 @@ def make_tool_callbacks(
                         break
             return bad
 
-        def _sub_check_seen(tool: str, key: tuple[str, str], query: str, path: str) -> str | None:
+        def _sub_check_seen(
+            tool: str, key: tuple[str, str], query: str, path: str
+        ) -> str | None:
             # LIVE cross-call check FIRST: a PARALLEL explore call (same turn)
             # may have already run this exact search — its result is in the
             # SHARED turn-level digest, but this branch's per-branch search-set
@@ -3991,13 +4518,20 @@ def make_tool_callbacks(
             return None
 
         @_sub_tracked
-        async def _sub_read(filePath: str = "", offset: int = 1, limit: int = 2000) -> str:
+        async def _sub_read(
+            filePath: str = "", offset: int = 1, limit: int = 2000
+        ) -> str:
             """Sub-agent read: one file (line-paged) or one directory (listing)."""
-            _sub_emit({
-                "kind": "tool", "tool": "read",
-                "args": {"filePath": filePath, "offset": offset, "limit": limit},
-            })
-            lkey = _sub_search_key(f"o{int(offset or 1)}l{int(limit or 2000)}", filePath) or (filePath, "")
+            _sub_emit(
+                {
+                    "kind": "tool",
+                    "tool": "read",
+                    "args": {"filePath": filePath, "offset": offset, "limit": limit},
+                }
+            )
+            lkey = _sub_search_key(
+                f"o{int(offset or 1)}l{int(limit or 2000)}", filePath
+            ) or (filePath, "")
             # Listing a directory is idempotent: re-listing the SAME directory
             # later in a run returns the same tree and only re-resends the whole
             # sub-agent transcript for nothing. Fold repeats (the sub-agent
@@ -4017,7 +4551,10 @@ def make_tool_callbacks(
                 _sub_cache_key("read", lkey), asyncio.Lock()
             )
             async with _lock:
-                if lkey in _sub_seen()[1] or _sub_cache_key("read", lkey) in _explore_turn_digest:
+                if (
+                    lkey in _sub_seen()[1]
+                    or _sub_cache_key("read", lkey) in _explore_turn_digest
+                ):
                     cached = _sub_cached("read", lkey)
                     body = cached or f"(no stored result for {filePath or '/'})"
                     _sub_emit(
@@ -4047,7 +4584,9 @@ def make_tool_callbacks(
                         marker = "/" if entry["kind"] == "dir" else "  "
                         lines.append(f"{marker}{entry['name']}")
                     if len(result["entries"]) > _sub_listing_count:
-                        lines.append(f"…({len(result['entries']) - _sub_listing_count} more entries)")
+                        lines.append(
+                            f"…({len(result['entries']) - _sub_listing_count} more entries)"
+                        )
                     body = "\n".join(lines) if lines else "(empty directory)"
                     out = f"DIRECTORY {filePath or '/'}\n{body}"
                 else:
@@ -4062,14 +4601,18 @@ def make_tool_callbacks(
                         elif not excerpt["lines"]:
                             out = f"ERROR reading {filePath}: line offset {offset} is past the end"
                         else:
-                            rows = [f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]]
+                            rows = [
+                                f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]
+                            ]
                             if excerpt["truncated"]:
                                 rows.append(
                                     f"\n(Showing lines {excerpt['start']}-{excerpt['lines'][-1]['line']}"
                                     f" of {excerpt['total']}. Use offset={excerpt['lines'][-1]['line'] + 1} to continue.)"
                                 )
                             else:
-                                rows.append(f"\n(End of file — total {excerpt['total']} lines)")
+                                rows.append(
+                                    f"\n(End of file — total {excerpt['total']} lines)"
+                                )
                             out = f"{filePath}\n" + "\n".join(rows)
                 _sub_seen()[1].add(lkey)
                 _sub_cache_put("read", lkey, out)
@@ -4078,7 +4621,13 @@ def make_tool_callbacks(
 
         @_sub_tracked
         async def _sub_grep(pattern: str, path: str = "", include: str = "") -> str:
-            _sub_emit({"kind": "tool", "tool": "grep", "args": {"pattern": pattern, "path": path, "include": include}})
+            _sub_emit(
+                {
+                    "kind": "tool",
+                    "tool": "grep",
+                    "args": {"pattern": pattern, "path": path, "include": include},
+                }
+            )
             key = _sub_search_key(pattern, path)
             # Per-key lock across CONCURRENT explore calls (see _sub_read): the
             # parent emits N explore calls in one response and they run at the
@@ -4109,7 +4658,9 @@ def make_tool_callbacks(
                     out = f"No matches for {pattern!r} under {path or '/'}."
                     if key[0]:
                         _sub_cache_put("grep", key, out)
-                    _sub_emit({"kind": "tool_result", "tool": "grep", "summary": "no matches"})
+                    _sub_emit(
+                        {"kind": "tool_result", "tool": "grep", "summary": "no matches"}
+                    )
                     return out
                 lines: list[str] = []
                 total = 0
@@ -4126,16 +4677,32 @@ def make_tool_callbacks(
                     total += block_size
                     if total >= _sub_tool_out_chars:
                         break
-                note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
+                note = (
+                    f"\n({len(matches)} matches found, {shown} shown)"
+                    if len(matches) > shown
+                    else ""
+                )
                 out = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
                 if key[0]:
                     _sub_cache_put("grep", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "grep", "summary": f"{len(matches)} matches"})
+                _sub_emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "grep",
+                        "summary": f"{len(matches)} matches",
+                    }
+                )
                 return out
 
         @_sub_tracked
         async def _sub_glob(pattern: str, path: str = "") -> str:
-            _sub_emit({"kind": "tool", "tool": "glob", "args": {"pattern": pattern, "path": path}})
+            _sub_emit(
+                {
+                    "kind": "tool",
+                    "tool": "glob",
+                    "args": {"pattern": pattern, "path": path},
+                }
+            )
             key = _sub_search_key(pattern, path)
             # Per-key lock across CONCURRENT explore calls (see _sub_read/_sub_grep).
             _lock = _explore_locks.setdefault(
@@ -4158,20 +4725,31 @@ def make_tool_callbacks(
                     out = f"No files match glob {pattern!r} under {path or '/'}."
                     if key[0]:
                         _sub_cache_put("glob", key, out)
-                    _sub_emit({"kind": "tool_result", "tool": "glob", "summary": "no matches"})
+                    _sub_emit(
+                        {"kind": "tool_result", "tool": "glob", "summary": "no matches"}
+                    )
                     return out
                 lines = list(matches[:50])
                 out = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines)
                 if key[0]:
                     _sub_cache_put("glob", key, out)
-                _sub_emit({"kind": "tool_result", "tool": "glob", "summary": f"{len(matches)} matches"})
+                _sub_emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "glob",
+                        "summary": f"{len(matches)} matches",
+                    }
+                )
                 return out
 
         from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
 
         async def _run_explore_inner(
-            model: Any, task_text: str, state: dict,
-            branch_index: int = 0, branch_total: int = 1,
+            model: Any,
+            task_text: str,
+            state: dict,
+            branch_index: int = 0,
+            branch_total: int = 1,
             thoroughness: str = "medium",
         ) -> str:
             """Run the isolated exploration sub-agent on ``model`` with the given
@@ -4184,7 +4762,8 @@ def make_tool_callbacks(
             caches so a resumed run continues from the failed attempt's findings
             instead of re-exploring from zero. Raises ``_UsageLimitExceeded``
             (step budget — NOT a model failure, so no fallback) or the underlying
-            exception when BOTH models fail a step. state["model"] is the per-branch model name stamped on this branch sub-agent events (set by the _run_explore wrapper, updated on per-sub-search fallback)."""
+            exception when BOTH models fail a step. state["model"] is the per-branch model name stamped on this branch sub-agent events (set by the _run_explore wrapper, updated on per-sub-search fallback).
+            """
             from pydantic_ai import Agent as _Agent
             from pydantic_ai import Tool as _Tool
             from pydantic_ai.messages import (
@@ -4245,7 +4824,11 @@ def make_tool_callbacks(
                 for ckey, body in items:
                     parts = ckey.split("|", 2)
                     tool = parts[0]
-                    label = parts[1] if len(parts) > 1 and parts[1] else (parts[2] if len(parts) > 2 else "/")
+                    label = (
+                        parts[1]
+                        if len(parts) > 1 and parts[1]
+                        else (parts[2] if len(parts) > 2 else "/")
+                    )
                     snippet = body[:200].replace("\n", " ")
                     if len(body) > 200:
                         snippet += "…"
@@ -4549,7 +5132,9 @@ def make_tool_callbacks(
                     _resume_note = _sub_resume_note()
                     if _resume_note:
                         resume_history = [
-                            _ModelRequest(parts=[_SystemPromptPart(content=_resume_note)])
+                            _ModelRequest(
+                                parts=[_SystemPromptPart(content=_resume_note)]
+                            )
                         ]
                     try:
                         fix_result = await _run_subagent_call(
@@ -4601,8 +5186,11 @@ def make_tool_callbacks(
             return report
 
         async def _run_explore(
-            model: Any, task_text: str, branch_id: int = 0,
-            branch_index: int = 0, branch_total: int = 1,
+            model: Any,
+            task_text: str,
+            branch_id: int = 0,
+            branch_index: int = 0,
+            branch_total: int = 1,
             thoroughness: str = "medium",
         ) -> str:
             """Per-branch wrapper: stamps every sub-agent event with this
@@ -4640,8 +5228,11 @@ def make_tool_callbacks(
             )
             try:
                 return await _run_explore_inner(
-                    model, task_text, state,
-                    branch_index=branch_index, branch_total=branch_total,
+                    model,
+                    task_text,
+                    state,
+                    branch_index=branch_index,
+                    branch_total=branch_total,
                     thoroughness=thoroughness,
                 )
             finally:
@@ -4666,7 +5257,15 @@ def make_tool_callbacks(
         _ecall = _task_call_seq + 1
         _task_call_seq = _ecall
         _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
-        emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": subagent_type}, "model": _run_model_name, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "task",
+                "args": {"description": description, "subagent_type": subagent_type},
+                "model": _run_model_name,
+                "branch": _ecall,
+            }
+        )
         # Register this call as IN-FLIGHT so a concurrent near-duplicate (parent
         # fires N task calls in one parallel-tool-calls response) awaits THIS
         # call's report instead of spawning its own sub-agent. Resolved in
@@ -4691,7 +5290,9 @@ def make_tool_callbacks(
 
         try:
             report = await _run_explore(
-                _run_model, prompt, branch_id=_ecall,
+                _run_model,
+                prompt,
+                branch_id=_ecall,
                 thoroughness=thoroughness,
             )
         except _UsageLimitExceeded:
@@ -4718,14 +5319,24 @@ def make_tool_callbacks(
                 f"The exploration sub-agent found nothing usable for {prompt!r}.\n</task_result>\n</task>"
             )
         _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
-        emit({"kind": "tool_result", "tool": "task", "summary": f"{len(report)} chars", "model": _ran_model_name, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "task",
+                "summary": f"{len(report)} chars",
+                "model": _ran_model_name,
+                "branch": _ecall,
+            }
+        )
         _final = f'<task id="{_tid}" state="completed">\n<task_result>\n{report}\n</task_result>\n</task>'
-        _explore_call_log.append({
-            "prompt": prompt,
-            "subagent_type": "explore",
-            "thoroughness": thoroughness,
-            "report": _final,
-        })
+        _explore_call_log.append(
+            {
+                "prompt": prompt,
+                "subagent_type": "explore",
+                "thoroughness": thoroughness,
+                "report": _final,
+            }
+        )
         return _finish(_final)
 
     async def _run_general_task(description: str, prompt: str, task_id: str) -> str:
@@ -4745,7 +5356,14 @@ def make_tool_callbacks(
 
         _general_model = main_model if main_model is not None else explore_model
         if _general_model is None:
-            emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": "general"}, "model": ""})
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "task",
+                    "args": {"description": description, "subagent_type": "general"},
+                    "model": "",
+                }
+            )
             emit(_error_result("task", "unavailable"))
             return "ERROR: the general agent is unavailable (no model configured for this session)."
         _general_name = str(getattr(_general_model, "model_name", "") or "")
@@ -4753,7 +5371,15 @@ def make_tool_callbacks(
         _ecall = _task_call_seq + 1
         _task_call_seq = _ecall
         _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
-        emit({"kind": "tool", "tool": "task", "args": {"description": description, "subagent_type": "general"}, "model": _general_name, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "task",
+                "args": {"description": description, "subagent_type": "general"},
+                "model": _general_name,
+                "branch": _ecall,
+            }
+        )
         # The general sub-agent inherits the parent's tools minus `task` (no
         # nested sub-agents) and minus the plan/checklist tools that would
         # pollute the parent's UI state (opencode's general denies todowrite).
@@ -4815,7 +5441,15 @@ def make_tool_callbacks(
         _usage_ev = _usage_event(getattr(_res, "usage", None), model=_general_name)
         if _usage_ev:
             emit(_usage_ev)
-        emit({"kind": "tool_result", "tool": "task", "summary": f"{len(_output)} chars", "model": _general_name, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "task",
+                "summary": f"{len(_output)} chars",
+                "model": _general_name,
+                "branch": _ecall,
+            }
+        )
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def vision_tool(prompt: str) -> str:
@@ -4837,13 +5471,19 @@ def make_tool_callbacks(
         _imgs = [u for u in (image_uris or []) if u]
         _vmodel = vision_model if vision_model is not None else main_model
         _vname = (
-            str(getattr(_vmodel, "model_name", "") or "")
-            if _vmodel is not None
-            else ""
+            str(getattr(_vmodel, "model_name", "") or "") if _vmodel is not None else ""
         )
         _ecall = _task_call_seq + 1
         _task_call_seq = _ecall
-        emit({"kind": "tool", "tool": "vision", "args": {"prompt": prompt}, "model": _vname, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "vision",
+                "args": {"prompt": prompt},
+                "model": _vname,
+                "branch": _ecall,
+            }
+        )
         if not _imgs:
             emit(_error_result("vision", "no images"))
             return "ERROR: no image is attached to this message — nothing to analyze."
@@ -4897,7 +5537,15 @@ def make_tool_callbacks(
         _usage_ev = _usage_event(getattr(_res, "usage", None), model=_vname)
         if _usage_ev:
             emit(_usage_ev)
-        emit({"kind": "tool_result", "tool": "vision", "summary": f"{len(_output)} chars", "model": _vname, "branch": _ecall})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "vision",
+                "summary": f"{len(_output)} chars",
+                "model": _vname,
+                "branch": _ecall,
+            }
+        )
         if not _output:
             emit(_error_result("vision", "no report"))
             return "ERROR: the vision sub-agent produced no usable analysis."
@@ -4912,11 +5560,25 @@ def make_tool_callbacks(
             if _web_runner is not None
             else ""
         )
-        emit({"kind": "tool", "tool": "web_search", "args": {"query": query}, "model": _web_runner_name})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "web_search",
+                "args": {"query": query},
+                "model": _web_runner_name,
+            }
+        )
         result = await asyncio.to_thread(web_search, query, max_results)
         if "error" in result:
             msg = result["error"]
-            emit({"kind": "tool_result", "tool": "web_search", "summary": msg, "status": "error"})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "web_search",
+                    "summary": msg,
+                    "status": "error",
+                }
+            )
             return f"WEB SEARCH ERROR for {query!r}: {msg}"
         results = result.get("results", [])
         if not results:
@@ -4986,14 +5648,16 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "web_search",
-                        "summary": f"{len(results)} results (distilled)",
-                        "engine": engine,
-                        "results": ui_items,
-                        "model": str(getattr(ran_model, "model_name", "") or ""),
-                    })
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "web_search",
+                            "summary": f"{len(results)} results (distilled)",
+                            "engine": engine,
+                            "results": ui_items,
+                            "model": str(getattr(ran_model, "model_name", "") or ""),
+                        }
+                    )
                     return f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
             except Exception as exc:  # noqa: BLE001 — fall back to raw results
                 # Both the web subagent AND the main model failed — tell the user
@@ -5009,16 +5673,27 @@ def make_tool_callbacks(
                 )
                 _web_note = _subagent_fail_note("web", _ran_name, exc)
                 if _web_note:
-                    emit({
-                        "kind": "tool_result",
-                        "tool": "web_search",
-                        "summary": summary,
-                        "engine": engine,
-                        "results": ui_items,
-                        "model": _ran_name,
-                    })
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "web_search",
+                            "summary": summary,
+                            "engine": engine,
+                            "results": ui_items,
+                            "model": _ran_name,
+                        }
+                    )
                     return raw_results + "\n\n" + _web_note
-        emit({"kind": "tool_result", "tool": "web_search", "summary": summary, "engine": engine, "results": ui_items, "model": _web_runner_name})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "web_search",
+                "summary": summary,
+                "engine": engine,
+                "results": ui_items,
+                "model": _web_runner_name,
+            }
+        )
         return raw_results
 
     async def fetch_url_tool(url: str, question: str = "", full: bool = False) -> str:
@@ -5033,7 +5708,14 @@ def make_tool_callbacks(
             if _sum_runner is not None
             else ""
         )
-        emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url, "full": effective_full}, "model": _sum_runner_name})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "fetch_url",
+                "args": {"url": url, "full": effective_full},
+                "model": _sum_runner_name,
+            }
+        )
         # full=True bypasses the default excerpt cap: return the whole page so
         # one call is enough for copying source files (SKILL.md / docs). The
         # extracted body is already bounded by fetch_url (FETCH_EXCERPT_CHARS).
@@ -5047,12 +5729,46 @@ def make_tool_callbacks(
         # skills), which is exactly the bug this fixes.
         _cap = tool_out_chars
         _probe = url.split("?", 1)[0].rstrip("/")
-        _ext = _probe.rsplit(".", 1)[-1].lower() if "." in _probe.rsplit("/", 1)[-1] else ""
-        _raw_hosts = ("raw.githubusercontent.com", "cdn.jsdelivr.net", "gist.github.com", "raw.fastgit.org")
+        _ext = (
+            _probe.rsplit(".", 1)[-1].lower()
+            if "." in _probe.rsplit("/", 1)[-1]
+            else ""
+        )
+        _raw_hosts = (
+            "raw.githubusercontent.com",
+            "cdn.jsdelivr.net",
+            "gist.github.com",
+            "raw.fastgit.org",
+        )
         _ext_full = {
-            "md", "markdown", "txt", "text", "json", "yaml", "yml", "toml",
-            "py", "ts", "tsx", "js", "jsx", "css", "html", "htm", "sh", "bash",
-            "pdf", "xml", "svg", "csv", "r", "sql", "env", "ini", "conf", "cfg",
+            "md",
+            "markdown",
+            "txt",
+            "text",
+            "json",
+            "yaml",
+            "yml",
+            "toml",
+            "py",
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "css",
+            "html",
+            "htm",
+            "sh",
+            "bash",
+            "pdf",
+            "xml",
+            "svg",
+            "csv",
+            "r",
+            "sql",
+            "env",
+            "ini",
+            "conf",
+            "cfg",
         }
         if effective_full or _ext in _ext_full or _probe.startswith(_raw_hosts):
             _cap = FETCH_EXCERPT_CHARS
@@ -5072,12 +5788,14 @@ def make_tool_callbacks(
                 pass
             if body:
                 if len(body) > _cap:
-                    body = body[: _cap] + "\n…(output truncated to fit context)"
-                emit({
-                    "kind": "tool_result",
-                    "tool": "fetch_url",
-                    "summary": f"{len(body)} chars (cached)",
-                })
+                    body = body[:_cap] + "\n…(output truncated to fit context)"
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "fetch_url",
+                        "summary": f"{len(body)} chars (cached)",
+                    }
+                )
                 return f"FETCHED {url} (cached)\nTitle: {title or 'unknown'}\n\n{body}"
         result = await asyncio.to_thread(fetch_url, url)
         if "error" in result:
@@ -5089,7 +5807,11 @@ def make_tool_callbacks(
         # Cache the fetch result (24h TTL)
         if body:
             try:
-                cache.set(cache_key, json.dumps({"content": body, "title": title}, ensure_ascii=False), 86400)
+                cache.set(
+                    cache_key,
+                    json.dumps({"content": body, "title": title}, ensure_ascii=False),
+                    86400,
+                )
             except Exception:  # noqa: BLE001, S110
                 pass
         # Persist the fetched page into the workspace vector store (KIND_WEB)
@@ -5100,7 +5822,7 @@ def make_tool_callbacks(
                     f"web:{url}",
                     KIND_WEB,
                     title or url,
-                    [body[:WEB_SEARCH_SNIPPET_MAX * 4]],
+                    [body[: WEB_SEARCH_SNIPPET_MAX * 4]],
                     {"source_url": url, "source_type": "web"},
                 )
             except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
@@ -5111,12 +5833,14 @@ def make_tool_callbacks(
         # the caller needs the complete source.
         if effective_full:
             if len(body) > _cap:
-                body = body[: _cap] + "\n…(output truncated to fit context)"
-            emit({
-                "kind": "tool_result",
-                "tool": "fetch_url",
-                "summary": f"{len(body)} chars",
-            })
+                body = body[:_cap] + "\n…(output truncated to fit context)"
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "fetch_url",
+                    "summary": f"{len(body)} chars",
+                }
+            )
             return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
 
         # Claude-Code-style: the main model receives only a distilled answer,
@@ -5183,33 +5907,41 @@ def make_tool_callbacks(
         head = f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "")
         if answer:
             if answer.startswith("Note: the"):
-                emit({
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "fetch_url",
+                        "summary": f"{len(body)} chars",
+                        "model": _ran_sum_name,
+                    }
+                )
+                return head + answer
+            emit(
+                {
                     "kind": "tool_result",
                     "tool": "fetch_url",
-                    "summary": f"{len(body)} chars",
+                    "summary": f"summarized · {len(answer)} chars",
                     "model": _ran_sum_name,
-                })
-                return head + answer
-            emit({
-                "kind": "tool_result",
-                "tool": "fetch_url",
-                "summary": f"summarized · {len(answer)} chars",
-                "model": _ran_sum_name,
-            })
+                }
+            )
             return head + "SUMMARY:\n" + answer
         # Fallback: no summarizer (or it failed) — return a bounded excerpt that
         # respects the shared context budget so it can never overflow the window.
         if len(body) > _cap:
-            body = body[: _cap] + "\n…(output truncated to fit context)"
-        emit({
-            "kind": "tool_result",
-            "tool": "fetch_url",
-            "summary": f"{len(body)} chars",
-            "model": _ran_sum_name,
-        })
+            body = body[:_cap] + "\n…(output truncated to fit context)"
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "fetch_url",
+                "summary": f"{len(body)} chars",
+                "model": _ran_sum_name,
+            }
+        )
         return head + body
 
-    async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:
+    async def request_permission_tool(
+        action: str, path: str = "", reason: str = ""
+    ) -> str:
         """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors live in the app DB and come inline — never read them from disk, never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
         # Paths under the always-readable user data folder never need a
         # permission prompt — grant silently with no UI card at all.
@@ -5224,7 +5956,13 @@ def make_tool_callbacks(
                     )
             except PathEscapeError:
                 pass
-        emit({"kind": "tool", "tool": "request_permission", "args": {"action": action, "path": path}})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "request_permission",
+                "args": {"action": action, "path": path},
+            }
+        )
         if permission_gates is None:
             emit(_error_result("request_permission", "permission system unavailable"))
             return "ERROR: permission system is not available."
@@ -5232,7 +5970,15 @@ def make_tool_callbacks(
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         permission_gates[pid] = fut
-        emit({"kind": "permission", "id": pid, "action": action, "path": path, "reason": reason})
+        emit(
+            {
+                "kind": "permission",
+                "id": pid,
+                "action": action,
+                "path": path,
+                "reason": reason,
+            }
+        )
         try:
             granted = await asyncio.wait_for(fut, timeout=300)
         except asyncio.TimeoutError:
@@ -5242,7 +5988,13 @@ def make_tool_callbacks(
         if granted:
             if permit is not None:
                 permit["outside"] = True
-            emit({"kind": "tool_result", "tool": "request_permission", "summary": "granted"})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "request_permission",
+                    "summary": "granted",
+                }
+            )
             return (
                 f"PERMISSION GRANTED for {path or action!r}. The user approved it — you may now "
                 f"complete this outside-workspace action (other outside actions still need a fresh "
@@ -5264,7 +6016,15 @@ def make_tool_callbacks(
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         permission_gates[pid] = fut
-        emit({"kind": "permission", "id": pid, "action": action, "reason": reason, "scope": "confirm"})
+        emit(
+            {
+                "kind": "permission",
+                "id": pid,
+                "action": action,
+                "reason": reason,
+                "scope": "confirm",
+            }
+        )
         try:
             granted = await asyncio.wait_for(fut, timeout=300)
         except asyncio.TimeoutError:
@@ -5272,7 +6032,13 @@ def make_tool_callbacks(
         finally:
             permission_gates.pop(pid, None)
         if granted:
-            emit({"kind": "tool_result", "tool": "confirm_action", "summary": "confirmed"})
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "confirm_action",
+                    "summary": "confirmed",
+                }
+            )
             return f"CONFIRMED by the user: {action!r}. Proceed with it now."
         emit({"kind": "tool_result", "tool": "confirm_action", "summary": "denied"})
         return (
@@ -5282,7 +6048,13 @@ def make_tool_callbacks(
 
     async def ask_user_tool(question: str, options: list[str] | None = None) -> str:
         """Ask the user a question mid-task and WAIT for the answer instead of guessing. Use when the request is ambiguous, has conflicting instructions, or misses a detail you can't infer — and it's your FIRST action when intent is genuinely unclear. Pass 2-5 short, mutually-exclusive `options` (few words) for multiple-choice; omit/empty for free text. Order the options by YOUR OWN preference: put the option you recommend and think is best FIRST (it becomes option #1 the user sees), then the rest in decreasing preference. One clear `question`. Not for things you can find out yourself; one question per call. Returns the user's exact answer."""
-        emit({"kind": "tool", "tool": "ask_user", "args": {"question": question, "options": options or []}})
+        emit(
+            {
+                "kind": "tool",
+                "tool": "ask_user",
+                "args": {"question": question, "options": options or []},
+            }
+        )
         if ask_gates is None:
             emit(_error_result("ask_user", "ask system unavailable"))
             return "ERROR: the ask-the-user system is not available. Ask the question directly in your reply instead and wait for the user's next message."
@@ -5300,7 +6072,13 @@ def make_tool_callbacks(
         if not answer:
             emit(_error_result("ask_user", "no answer (timed out)"))
             return "The user did not answer in time. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
-        emit({"kind": "tool_result", "tool": "ask_user", "summary": f"answered: {answer[:80]}"})
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "ask_user",
+                "summary": f"answered: {answer[:80]}",
+            }
+        )
         return f"USER ANSWERED: {answer}"
 
     async def _search_console_impl(
@@ -5346,12 +6124,19 @@ def make_tool_callbacks(
                     pc_refresh = decrypt_secret(p.get("oauthRefreshToken") or "")
                     if pc_id and pc_secret and pc_refresh:
                         client_id, client_secret, refresh = pc_id, pc_secret, pc_refresh
-                        sc_cfg = {**sc_cfg, "clientId": client_id, "clientSecret": client_secret, "refreshToken": refresh}
+                        sc_cfg = {
+                            **sc_cfg,
+                            "clientId": client_id,
+                            "clientSecret": client_secret,
+                            "refreshToken": refresh,
+                        }
                     break
         if not (client_id and client_secret and refresh):
             return "Google Search Console is not signed in — connect your Google account in Settings → Auth."
         try:
-            token = await _providers.google_access_token(client_id, client_secret, refresh)
+            token = await _providers.google_access_token(
+                client_id, client_secret, refresh
+            )
         except Exception as exc:  # noqa: BLE001
             return f"Search Console auth failed: {exc} — reconnect the Google account in Settings → Auth."
         import httpx
@@ -5369,7 +6154,11 @@ def make_tool_callbacks(
                     return f"Search Console sites error {r.status_code}: {data.get('error', {}).get('message', r.text[:200])}"
                 rows = data.get("siteEntry") or []
                 lines = [f"- {s.get('siteUrl', '')}" for s in rows]
-                return (f"Search Console sites ({len(lines)}):\n" + "\n".join(lines)) if lines else "No sites accessible with this account."
+                return (
+                    (f"Search Console sites ({len(lines)}):\n" + "\n".join(lines))
+                    if lines
+                    else "No sites accessible with this account."
+                )
             if action == "query":
                 import datetime
                 import urllib.parse
@@ -5380,7 +6169,11 @@ def make_tool_callbacks(
                 except ValueError:
                     return "Invalid end_date — use YYYY-MM-DD."
                 try:
-                    s = datetime.date.fromisoformat(start_date) if start_date else e - datetime.timedelta(days=27)
+                    s = (
+                        datetime.date.fromisoformat(start_date)
+                        if start_date
+                        else e - datetime.timedelta(days=27)
+                    )
                 except ValueError:
                     return "Invalid start_date — use YYYY-MM-DD."
                 site_url = (sc_cfg.get("siteUrl") or "").strip()
@@ -5391,22 +6184,31 @@ def make_tool_callbacks(
                     # (https://…) before domain properties (sc-domain:…) and try
                     # them in order — skipping any the account can't query.
                     async with httpx.AsyncClient(timeout=20.0) as client:
-                        r = await client.get("https://www.googleapis.com/webmasters/v3/sites", headers=headers)
+                        r = await client.get(
+                            "https://www.googleapis.com/webmasters/v3/sites",
+                            headers=headers,
+                        )
                     if r.status_code >= 400:
                         data = r.json()
                         return (
                             f"Search Console sites error {r.status_code}: "
                             f"{data.get('error', {}).get('message', r.text[:200])}"
                         )
-                    rows = (r.json().get("siteEntry") or [])
+                    rows = r.json().get("siteEntry") or []
                     if not rows:
                         return "No sites accessible with this account — add a verified property in Google Search Console first."
                     candidates = sorted(
-                        (str(s.get("siteUrl", "")).strip() for s in rows if s.get("siteUrl")),
+                        (
+                            str(s.get("siteUrl", "")).strip()
+                            for s in rows
+                            if s.get("siteUrl")
+                        ),
                         key=lambda u: (not u.startswith("https://"), u),
                     )
                     if not candidates:
-                        return "Could not determine a site URL from the connected account."
+                        return (
+                            "Could not determine a site URL from the connected account."
+                        )
                 else:
                     candidates = [site_url]
                 body = {
@@ -5465,22 +6267,31 @@ def make_tool_callbacks(
                     # sites, preferring URL-prefix properties, and try them in
                     # order until one accepts the inspection.
                     async with httpx.AsyncClient(timeout=20.0) as client:
-                        r = await client.get("https://www.googleapis.com/webmasters/v3/sites", headers=headers)
+                        r = await client.get(
+                            "https://www.googleapis.com/webmasters/v3/sites",
+                            headers=headers,
+                        )
                     if r.status_code >= 400:
                         data = r.json()
                         return (
                             f"Search Console sites error {r.status_code}: "
                             f"{data.get('error', {}).get('message', r.text[:200])}"
                         )
-                    rows = (r.json().get("siteEntry") or [])
+                    rows = r.json().get("siteEntry") or []
                     if not rows:
                         return "No sites accessible with this account — add a verified property in Google Search Console first."
                     candidates = sorted(
-                        (str(s.get("siteUrl", "")).strip() for s in rows if s.get("siteUrl")),
+                        (
+                            str(s.get("siteUrl", "")).strip()
+                            for s in rows
+                            if s.get("siteUrl")
+                        ),
                         key=lambda u: (not u.startswith("https://"), u),
                     )
                     if not candidates:
-                        return "Could not determine a site URL from the connected account."
+                        return (
+                            "Could not determine a site URL from the connected account."
+                        )
                 else:
                     candidates = [site_url]
                 errors: list[str] = []
@@ -5532,7 +6343,10 @@ def make_tool_callbacks(
                     reasons: list[str] = []
                     if "noindex" in robots.lower():
                         reasons.append("blocked by noindex")
-                    if robots.lower() == "bloqueado" or "not crawled" in page_fetch.lower():
+                    if (
+                        robots.lower() == "bloqueado"
+                        or "not crawled" in page_fetch.lower()
+                    ):
                         reasons.append("robots.txt block / not crawled")
                     if "soft404" in low_cov or "soft 404" in low_verdict:
                         reasons.append("soft-404")

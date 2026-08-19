@@ -31,7 +31,7 @@ const LIVE_CACHE = new Map<string, string[]>();
 /** Compact provider + model picker shown in the composer. Models are fetched
  *  live from each provider's /models endpoint (never hardcoded) and persisted
  *  to the DB per provider; custom models added in Settings are shown from the
- *  DB. The last 5 used models appear in a "Recent" section on top. */
+ *  DB. The last 10 used models appear in a "Recent" section on top. */
 export function ProviderModelSelect() {
   const providers = useStore((s) => s.settings.providers);
   const activeId = useStore((s) => s.settings.activeProviderId);
@@ -134,10 +134,11 @@ export function ProviderModelSelect() {
   const searching = q.length > 0;
   const terms = q.split(/\s+/).filter(Boolean);
 
-  // Last 5 used models, resolved to a provider (legacy bare entries are
+  // Last 10 used models, resolved to a provider (legacy bare entries are
   // attributed to the unique provider that owns the model).
   const recentList = useMemo(() => {
     const items: Array<{ p: ProviderConfig; model: string }> = [];
+    const seen = new Set<string>();
     for (const r of recents) {
       if (!r.model) continue;
       let p = providers.find((x) => x.id === r.providerId);
@@ -151,8 +152,12 @@ export function ProviderModelSelect() {
       }
       if (!p) continue;
       if ((p.removedModels ?? []).includes(r.model)) continue;
-      items.push({ p, model: bareModel(p, r.model) });
-      if (items.length >= 5) break;
+      const model = bareModel(p, r.model);
+      const key = `${p.id}/${model}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ p, model });
+      if (items.length >= 10) break;
     }
     return items;
   }, [recents, providers, live]);

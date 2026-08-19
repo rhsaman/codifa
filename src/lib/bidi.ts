@@ -67,6 +67,35 @@ export function fixZwsp(text: string): string {
   })
 }
 
+// The model's own Persian output frequently OMITS the half-space (ZWNJ,
+// U+200C) that correct Persian typography requires in two very common,
+// low-risk-to-detect constructions — producing text that visually reads as
+// one glued word even though the UI renders every character it was given
+// (this is a MODEL-output gap, not something fixZwsp's word-separator logic
+// touches — that only fixes existing invisible separators, it never inserts
+// missing ones):
+//   1) Ezafe "ه" + "ی" (بقیهی/همهی/ناحیهی → بقیه‌ی/همه‌ی/ناحیه‌ی). A Persian
+//      root ending in ه essentially never has a genuine (non-ezafe) "ی"
+//      glued straight onto it at a word boundary, so this is safe to always
+//      fix.
+//   2) The negation prefix "نمی" (نمیفرستد → نمی‌فرستد). No common Persian
+//      word begins with نمی other than this prefix, so this is also safe to
+//      always fix. The affirmative prefix "می" is deliberately NOT handled
+//      here — too many ordinary words start with آن (میز, میدان, میلیون, …)
+//      to fix without a false-positive list, which is more likely to
+//      mis-glue a real word than to help.
+const ZWNJ = "\u200C"
+const PERSIAN_LETTER = `[${PERSIAN_RANGE}]`
+const BOUND_AFTER = `(?:[\\s)\\]»«"'.,:;!?\u060C\u061B\u061F]|$)`
+const EZAFE_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u06CC)(?=${BOUND_AFTER})`, "gu")
+const NEGATION_PREFIX_RE = /(?<![\u0621-\u06FF])(\u0646\u0645\u06CC)(?=[\u0621-\u06FF])/gu
+
+export function fixMissingZwnj(text: string): string {
+  return text
+    .replace(EZAFE_RE, `$1${ZWNJ}$2`)
+    .replace(NEGATION_PREFIX_RE, `$1${ZWNJ}`)
+}
+
 // Direction for UI containers that must line up with the app's RTL/LTR toggle
 // (ask cards, steer/queue bubbles, composer). dir="auto" alone resolves from
 // the FIRST strong character, so a mostly-Persian message that opens with a
@@ -91,7 +120,7 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   const parts = cleaned.split(/```/g)
   const fixed = parts.map((p, i) => {
     if (i % 2 === 1) return p // inside code block, don't modify
-    return fixZwsp(p)
+    return fixMissingZwnj(fixZwsp(p))
   })
   return fixed.join('```')
 }

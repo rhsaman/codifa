@@ -852,13 +852,13 @@ export const ChatMessageView = memo(function ChatMessageView({
                 <button
                   className="msg-copy msg-read"
                   onClick={() => setReading(true)}
-                  title="حالت مطالعه — خواندن بخشها جداگانه و سوال از هر بخش"
+                  title="Reading mode — study each section separately and ask about it"
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
                     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
                   </svg>
-                  مطالعه
+                  Read
                 </button>
               )}
             </>

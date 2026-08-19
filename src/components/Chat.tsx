@@ -2194,14 +2194,48 @@ export function ChatPanel() {
   // recreated `onRetry` per render would defeat it. Route through a ref instead.
   const retryMessageRef = useRef(retryMessage);
   retryMessageRef.current = retryMessage;
-  // EVERY Retry action resumes: when the user's turn left a failed assistant
-  // message behind (partial content + preserved tool activity + plan), re-run
-  // the SAME user message so the model continues from where it was cut off
-  // instead of redoing the completed work (the backend feeds the partial reply
-  // and completed tools back as a resume note). Only when there is no failed
-  // turn to resume does retryMessage fall back to truncate-and-restart.
+
+  // Restart-from-scratch retry for the USER message's retry icon: ALWAYS delete
+  // this user message and everything below it, then re-send from scratch. This
+  // is deliberately NOT the resume path — the failed assistant turn (partial
+  // content + preserved tools + plan) is discarded so the chat continues fresh
+  // from this message onward. The error banner's Retry keeps its own resume
+  // behavior via retryMessageRef.
+  const restartFromMessage = useCallback(
+    (id: string) => {
+      // Cancel any active stream first — otherwise the `busy` guard in send()
+      // would swallow the re-send.
+      const active = useStore.getState().chatAborts[chatIdRef.current];
+      if (active && !active.signal.aborted) {
+        active.abort();
+      }
+      const s = useStore.getState();
+      const ch = s.chats.find((c) => c.id === s.activeChatId);
+      if (!ch) return;
+      const msg = ch.messages.find((m) => m.id === id);
+      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
+      // ALWAYS truncate-and-restart: remove this user message and everything
+      // below it, then re-send from scratch (send() creates a fresh user bubble).
+      if (!s.truncateTo(id)) return;
+      const text = msg.content;
+      // Give the abort's finally block a tick to reset busy/streaming state
+      // before re-sending (send() re-sets busy=true itself, but the abort's
+      // finally would otherwise clear it mid-run).
+      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
+    },
+    [send],
+  );
+
+  // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
+  // recreated `onRetry` per render would defeat it. Route through a ref instead.
+  const restartFromMessageRef = useRef(restartFromMessage);
+  restartFromMessageRef.current = restartFromMessage;
+
+  // The USER message's retry icon restarts from that message (deletes everything
+  // below it and re-sends fresh). The error banner's Retry keeps its own resume
+  // path via retryMessageRef.
   const onRetry = useMemo(
-    () => (id: string) => retryMessageRef.current(id),
+    () => (id: string) => restartFromMessageRef.current(id),
     [],
   );
 

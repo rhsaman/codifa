@@ -140,6 +140,18 @@ console.log('4) updateMessage هنگام streaming → heartbeat (maybePersistMi
   check('updateMessage بعد از ۲ ثانیه heartbeat نوشت', chatsCalls().length === 2, chatsCalls().length)
 }
 
+// Cleanup: end the fake stream so the pending 500ms debounce timer (scheduled by
+// updateMessage → maybePersistMidStream → persistSoon) doesn't keep re-arming
+// forever — the fake clock never advances on its own, so the throttle would
+// never allow a write and node would never exit.
+{
+  const s = useStore.getState()
+  const chatId = s.chats[0].id
+  const streaming = s.chats[0].messages.find((m) => m.streaming)
+  if (streaming) s.updateMessage(streaming.id, { streaming: false })
+  s.persist() // not streaming → full write, no re-arm → event loop drains
+}
+
 if (failed) {
   console.error(`\n❌ ${failed} تست ناموفق`)
   process.exit(1)

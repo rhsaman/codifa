@@ -598,7 +598,7 @@ def _subagent_target(
 
 SYSTEM_PROMPTS: dict[str, str] = {
     "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
+    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. TEST DISCIPLINE (strict, every step): after implementing or fixing any feature, function, component or bug, write or update the corresponding tests (backend: pytest in backend/tests; frontend: vitest in test/) and run them before finishing — never finish a step with untested code. Trivial changes (docs, config, typo, rename, styling) don't need new tests, but still run the relevant suite if it's fast. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
     "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
 }
 
@@ -2411,6 +2411,64 @@ def _is_test_task(prompt: str, picked_skills: Sequence[dict] | None = None) -> b
             if "test" in slug or "تست" in slug:
                 return True
     return False
+
+
+# Implementation-task detection: a coder task that CHANGES code (feature, fix,
+# refactor, implement, add, ...) must write/update tests and run them before
+# finishing. Broader than `_is_test_task` (which only fires when the prompt
+# explicitly mentions tests) so the agent doesn't "forget" tests on ordinary
+# feature/bugfix work — the exact gap the user reported. Trivial/doc-only
+# prompts (README, typo, rename, config, styling, "explain") are excluded:
+# they don't need tests.
+_IMPL_TASK_RE = re.compile(
+    r"(?:\b(feature|fix|bug|implement|implementation|refactor|add|create|"
+    r"build|write|update|change|modify|improve|extend|support|handle|migrate|"
+    r"upgrade|optimize|rewrite|rework|repair|resolve|correct)\b|"
+    r"بساز|بنویس|درست|رفع|اضافه|ساخت|اصلاح|بهبود|تغییر)",
+    re.IGNORECASE,
+)
+
+# Prompts that are clearly NOT implementation work — no tests needed.
+_TRIVIAL_TASK_RE = re.compile(
+    r"(?:\b(readme|docs?|documentation|comment|typo|rename|"
+    r"style|styling|css|color|font|explain|what|why|how|list|show|"
+    r"summar|translate|format)\b|مستند|توضیح|چیست|چطور|خلاصه|ترجمه)",
+    re.IGNORECASE,
+)
+
+
+def _is_impl_task(prompt: str) -> bool:
+    """True when the prompt asks for code changes that need tests.
+
+    Complements ``_is_test_task``: catches ordinary feature/bugfix/refactor
+    requests so the TEST VERIFICATION RULE and the loop-level follow-up also
+    apply to them, while skipping trivial/doc-only prompts.
+    """
+    p = (prompt or "").strip().lower()
+    if not p or len(p) <= 8:
+        return False
+    if _TRIVIAL_TASK_RE.search(p):
+        return False
+    return bool(_IMPL_TASK_RE.search(p))
+
+
+def _is_code_task(prompt: str) -> bool:
+    """True when the prompt plausibly involves code changes that need tests.
+
+    Broader than ``_is_impl_task``: fires on ANY non-trivial, non-doc-only
+    prompt (no keyword required), so a coder turn that ends up editing code
+    is always covered — the user should never have to explicitly ask for
+    tests. Trivial/doc-only prompts (README, typo, explain, ...) are
+    excluded: they don't need tests. The loop-level guarantee is enforced
+    at runtime via ``code_changed`` (see ``run_agent``); this predicate only
+    decides whether the prompt-level TEST VERIFICATION RULE is injected.
+    """
+    p = (prompt or "").strip().lower()
+    if not p or len(p) <= 8:
+        return False
+    if _TRIVIAL_TASK_RE.search(p):
+        return False
+    return True
 
 
 def _trivial_prompt(prompt: str) -> bool:
@@ -4951,20 +5009,24 @@ async def run_agent(
             )
         system_final += section
 
-    # TEST VERIFICATION RULE: a coder task about tests must run the project's
-    # real test command and see it pass before the agent may declare done. This
-    # is the prompt-level half of the guarantee; the loop-level half (a bounded
-    # forced follow-up when the turn finished without running any test command)
-    # lives in the retry loop below (see `_TestVerifyNeeded`).
-    if mode == "coder" and _is_test_task(prompt, picked):
+    # TEST VERIFICATION RULE: a coder task that changes code (or is about
+    # tests) must write/update the tests for its changes and run the project's
+    # real test command, seeing it pass, before the agent may declare done.
+    # This is the prompt-level half of the guarantee; the loop-level half (a
+    # bounded forced follow-up when the turn finished without running any test
+    # command) lives in the retry loop below (see `_TestVerifyNeeded`).
+    if mode == "coder" and (_is_test_task(prompt, picked) or _is_code_task(prompt)):
         system_final += (
             "\n\nTEST VERIFICATION RULE (strict, always follow): This task "
-            "involves tests. Before your final message you MUST run the "
-            "project's real test command (pytest, vitest/node:test, cargo test, "
-            "go test, JUnit, ...) and observe it PASS (exit 0). If the tests "
-            "fail, fix the code and re-run until they pass. NEVER declare the "
-            "task done with failing tests. In your final message, state the "
-            "exact command you ran and its result."
+            "involves code changes or tests. Before your final message you MUST "
+            "(1) write or update the tests covering the code you changed "
+            "(backend: pytest in backend/tests; frontend: vitest in test/), and "
+            "(2) run the project's real test command (pytest, vitest/node:test, "
+            "cargo test, go test, JUnit, ...) and observe it PASS (exit 0). If "
+            "the tests fail, fix the code and re-run until they pass. NEVER "
+            "declare the task done with failing tests or with changed code that "
+            "has no tests. In your final message, state the exact command you "
+            "ran and its result."
         )
 
     # A plan saved by an earlier plan-mode run in this workspace is injected so
@@ -5294,12 +5356,18 @@ async def run_agent(
     # the final `_reply` handed to auto-memory/plan-save is the whole reply,
     # not just the last attempt's continuation.
     reply_chunks: list[str] = []
-    # Test verification: a test-related coder task must run the project's test
-    # command and see it pass before the agent may finish. `test_cmd_ran` is
-    # sticky across attempts (a throttle retry must not forget a test run);
-    # `test_verify_retries` bounds the forced follow-up to ONE.
-    test_verify_needed = mode == "coder" and _is_test_task(prompt, picked)
+    # Test verification: in coder mode, ANY turn that actually changes code
+    # (write/edit/non-readonly terminal) must run the project's test command
+    # and see it pass before the agent may finish — the user should never
+    # have to ask for tests. Explicit test tasks force it too. `test_cmd_ran`
+    # and `code_changed` are sticky across attempts (a throttle retry must
+    # not forget a test run or an edit); `test_verify_retries` bounds the
+    # forced follow-up to ONE.
+    test_verify_needed = mode == "coder" and (
+        _is_test_task(prompt, picked) or _is_code_task(prompt)
+    )
     test_cmd_ran = False
+    code_changed = False
     test_verify_retries = 0
     while True:
         attempt += 1
@@ -5453,6 +5521,10 @@ async def run_agent(
                             )
                         ):
                             mutating_ran = True
+                            # Sticky across attempts: an edit that landed before a
+                            # throttle/compact retry must still count as "code was
+                            # changed" for test verification (see `_TestVerifyNeeded`).
+                            code_changed = True
                         if item.get("kind") == "tool" and item.get("tool"):
                             tools_used.append(str(item["tool"]))
                             # Steps inside an `explore` sub-agent run (tagged
@@ -5609,6 +5681,7 @@ async def run_agent(
             # The except chain below turns this into a resume note + re-run.
             if (
                 test_verify_needed
+                and (code_changed or _is_test_task(prompt, picked))
                 and not test_cmd_ran
                 and _reply.strip()
                 and test_verify_retries < 1
@@ -5719,12 +5792,15 @@ async def run_agent(
                 resume_note = _build_resume_note(turn_tool_log)
                 note = (
                     "TEST VERIFICATION REQUIRED: You finished this task WITHOUT "
-                    "running the project's tests. Before your final message, run "
-                    "the project's real test command (pytest / vitest / cargo "
-                    "test / go test / JUnit / ...) and confirm it PASSES (exit 0). "
-                    "If tests fail, fix the code and re-run until green. Do NOT "
-                    "repeat completed work — only run the tests and report the "
-                    "exact command and its result."
+                    "running the project's tests. Before your final message: "
+                    "(1) if you changed or added code, write or update the tests "
+                    "covering it (backend: pytest in backend/tests; frontend: "
+                    "vitest in test/); (2) run the project's real test command "
+                    "(pytest / vitest / cargo test / go test / JUnit / ...) and "
+                    "confirm it PASSES (exit 0). If tests fail, fix the code and "
+                    "re-run until green. Do NOT repeat completed work — only add "
+                    "missing tests, run the suite, and report the exact command "
+                    "and its result."
                 )
                 if resume_note:
                     note += "\n\nWork already completed this turn:\n" + resume_note

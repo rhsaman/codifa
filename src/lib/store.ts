@@ -16,6 +16,7 @@ import type {
   Settings,
   ThinkingLevel,
   TokenUsage,
+  ToolActivity,
   Workspace,
 } from '../types'
 import { api } from './fs'
@@ -40,12 +41,66 @@ function sanitizeChats(chats: Chat[]): Chat[] {
       messages: c.messages.map((m) => {
         const msg = { ...m } as Record<string, unknown>
         delete msg.retry
+        // A message persisted mid-stream (heartbeat snapshot) is marked so the
+        // UI can show it as "interrupted" after a crash/power cut instead of
+        // looking like a complete reply. The final write once the turn ends
+        // (streaming=false) clears the flag naturally.
+        if (msg.streaming) msg.interrupted = true
         delete msg.streaming
         delete msg.thinking
-        delete msg.toolActivity
+        // Keep toolActivity (trimmed) so tool cards survive a restart — it was
+        // previously stripped as transient, which is why tool calls vanished
+        // after any reload, not just after a power cut.
+        if (Array.isArray(msg.toolActivity)) {
+          msg.toolActivity = trimToolActivity(msg.toolActivity as ToolActivity[])
+        }
         return msg as unknown as ChatMessage
       }),
     }
+  })
+}
+
+// ── Mid-stream persistence (heartbeat) ────────────────────────────────────────
+// While a reply is streaming, the store defers full writes (see persist()) so
+// per-token updates don't hammer the DB. But that alone means a power cut loses
+// the ENTIRE in-flight turn — it never reached disk. The heartbeat below writes
+// a throttled chats-only snapshot at most once every MID_STREAM_MS while a run
+// is active, so a crash loses at most the last ~2s instead of the whole turn.
+const MID_STREAM_MS = 2000
+let lastMidStreamPersist = 0
+
+// Bounds on persisted toolActivity so the chat JSON (and every heartbeat IPC
+// payload) stays small even for tool calls with huge args/diffs/results.
+const MAX_TOOL_TEXT = 4000 // summary / diff
+const MAX_TOOL_ITEMS = 50 // web_search etc. result rows
+const MAX_TOOL_SNIPPET = 500 // per result snippet
+const MAX_TOOL_ARG = 2000 // per string value inside args
+
+function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
+  return acts.map((a) => {
+    const out: ToolActivity = { ...a }
+    if (typeof out.summary === 'string' && out.summary.length > MAX_TOOL_TEXT) {
+      out.summary = out.summary.slice(0, MAX_TOOL_TEXT) + '…'
+    }
+    if (typeof out.diff === 'string' && out.diff.length > MAX_TOOL_TEXT) {
+      out.diff = out.diff.slice(0, MAX_TOOL_TEXT) + '…'
+    }
+    if (out.args && typeof out.args === 'object') {
+      const args: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(out.args)) {
+        args[k] = typeof v === 'string' && v.length > MAX_TOOL_ARG ? v.slice(0, MAX_TOOL_ARG) + '…' : v
+      }
+      out.args = args
+    }
+    if (Array.isArray(out.items)) {
+      out.items = out.items.slice(0, MAX_TOOL_ITEMS).map((it) =>
+        typeof it.snippet === 'string' && it.snippet.length > MAX_TOOL_SNIPPET
+          ? { ...it, snippet: it.snippet.slice(0, MAX_TOOL_SNIPPET) + '…' }
+          : it,
+      )
+    }
+    if (Array.isArray(out.children)) out.children = trimToolActivity(out.children)
+    return out
   })
 }
 
@@ -92,6 +147,27 @@ let persistTimer: ReturnType<typeof setTimeout> | undefined
 function persistSoon(): void {
   clearTimeout(persistTimer)
   persistTimer = setTimeout(() => useStore.getState().persist(), 500)
+}
+
+// Chats-only snapshot for the mid-stream heartbeat: skips settings entirely so
+// the (async, AES) settings encryption is never re-run every 2s during a run.
+function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
+  void api.storeSet('chats', sanitizeChats(s.chats))
+}
+
+// Called from updateMessage on every SSE token. While streaming, only a cheap
+// Date.now() check runs per token; the actual write happens at most once per
+// MID_STREAM_MS. When not streaming, falls back to the normal debounced persist.
+function maybePersistMidStream(): void {
+  if (useStore.getState().anyStreaming()) {
+    const now = Date.now()
+    if (now - lastMidStreamPersist >= MID_STREAM_MS) {
+      lastMidStreamPersist = now
+      writeChatsNow(useStore.getState())
+    }
+  } else {
+    persistSoon()
+  }
 }
 
 // Flush any deferred (mid-stream) persist immediately — used on app close so
@@ -798,15 +874,24 @@ export const useStore = create<State>((set, get) => ({
   },
 
   persist: () => {
-    // Never rewrite the whole DB while a reply is streaming: each SSE token
-    // fires store updates, and persisting every one hammers coder.db / the
-    // cache file. The final state is persisted once streaming ends.
-    // BUT never DROP user-initiated saves (mode prompts, subagent models,
-    // provider config) made mid-stream: defer until streaming ends instead.
+    // Never rewrite the whole DB per SSE token while a reply is streaming.
+    // Instead of deferring EVERYTHING until the stream ends (which lost the
+    // whole in-flight turn on a power cut), write a throttled chats-only
+    // snapshot at most once every MID_STREAM_MS — a crash then loses at most
+    // the last ~2s. User-initiated saves (mode prompts, subagent models,
+    // provider config) made mid-stream are still deferred, never dropped: the
+    // final writeStateNow once streaming ends includes them.
     if (get().anyStreaming()) {
-      persistSoon()
+      const now = Date.now()
+      if (now - lastMidStreamPersist >= MID_STREAM_MS) {
+        lastMidStreamPersist = now
+        writeChatsNow(get())
+      } else {
+        persistSoon()
+      }
       return
     }
+    lastMidStreamPersist = 0
     writeStateNow(get())
   },
 
@@ -1487,9 +1572,11 @@ export const useStore = create<State>((set, get) => ({
     })
     // updateMessage fires on every SSE token while streaming — persisting the
     // whole chats array each time is what hammers coder.db / app-state-cache.json.
-    // Skip it during streaming; the final state is persisted once the stream ends
-    // (setStreaming(false) → the trailing updateMessage({streaming:false})).
-    if (!get().anyStreaming()) persistSoon()
+    // While streaming, maybePersistMidStream() throttles to one chats-only
+    // snapshot per MID_STREAM_MS (heartbeat); once the stream ends
+    // (setStreaming(false) → the trailing updateMessage({streaming:false})) it
+    // falls back to the normal debounced full persist.
+    maybePersistMidStream()
   },
 
   accrueChatUsage: (chatId, modelId, delta) => {

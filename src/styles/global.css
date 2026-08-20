@@ -2133,6 +2133,17 @@ textarea {
   padding: 0 4px;
 }
 
+.msg-interrupted {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px dashed color-mix(in srgb, var(--warning, #d9a514) 55%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning, #d9a514) 8%, transparent);
+  color: color-mix(in srgb, var(--warning, #d9a514) 80%, var(--text-dim));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .chat-messages[data-dir="rtl"] .msg-actions {
   justify-content: flex-start;
 }

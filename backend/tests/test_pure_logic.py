@@ -9,6 +9,9 @@ from agents import (
     _SKILL_GAP_MIN,
     _auto_select_skills,
     _fts_keywords,
+    _is_code_task,
+    _is_impl_task,
+    _is_test_task,
     _skill_keyword_matches,
     _skills_section,
     _subagent_target,
@@ -439,3 +442,44 @@ def test_subagent_target_openrouter_parent_keeps_parent_creds():
         "openrouter/free", **_parent(parent_provider="openrouter"), provider_lookup=_no_row
     )
     assert t == ("openrouter", "free", "http://parent.example/v1", "parent-key", "", ""), t
+
+
+# ---------------------------------------------------------------------------
+# _is_code_task / _is_impl_task / _is_test_task (test-verification gating)
+# ---------------------------------------------------------------------------
+
+
+def test_is_code_task_catches_prompts_without_impl_keywords():
+    # The user's exact gap: "the login is broken" has no fix/implement/add
+    # keyword, so `_is_impl_task` misses it — but it IS code work and must be
+    # covered by test verification.
+    assert _is_code_task("the login button is broken")
+    assert _is_code_task("app crashes when I click submit")
+    assert _is_code_task("make the button green")
+    assert _is_code_task("لاگین خرابه")
+
+
+def test_is_code_task_excludes_trivial_and_doc_only_prompts():
+    assert not _is_code_task("explain this function")
+    assert not _is_code_task("fix the typo in README")
+    assert not _is_code_task("what does this do")
+    assert not _is_code_task("hi")
+    assert not _is_code_task("")
+    assert not _is_code_task("   ")
+
+
+def test_is_code_task_broader_than_is_impl_task():
+    # Every impl task is a code task, but code task also covers keyword-less
+    # bug reports that impl-task regex misses.
+    for p in ("fix the bug", "implement login", "add tests", "refactor auth"):
+        assert _is_impl_task(p), p
+        assert _is_code_task(p), p
+    assert _is_impl_task("the login button is broken") is False
+    assert _is_code_task("the login button is broken") is True
+
+
+def test_is_test_task_still_detects_test_prompts():
+    assert _is_test_task("run the tests")
+    assert _is_test_task("تست بنویس")
+    assert _is_test_task("add unit tests for the parser")
+    assert not _is_test_task("fix the login bug")

@@ -286,6 +286,11 @@ export interface ChatMessage {
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
+  /** True when this message was persisted mid-stream (heartbeat snapshot) and
+   *  the app died before the turn completed — shown as "interrupted" after a
+   *  crash/power cut instead of looking like a complete reply. Cleared by the
+   *  final write once the turn ends normally. */
+  interrupted?: boolean
   /** True for a user message steered into a RUNNING agent (typed mid-run). It
    *  is visible immediately; the backend confirms delivery with `steer_applied`
    *  (flag cleared) or, if the turn ends without injecting it, it is re-sent as

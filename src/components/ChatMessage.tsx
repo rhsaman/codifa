@@ -824,6 +824,12 @@ export const ChatMessageView = memo(function ChatMessageView({
         )
       )}
 
+      {!isUser && message.interrupted && (
+        <div className="msg-interrupted" dir="auto">
+          ⚠️ Interrupted — this reply was cut off (e.g. power loss). Send “continue” to resume.
+        </div>
+      )}
+
       {!isUser && (message.content || message.usage || message.streaming) && (
         <div className="msg-actions">
           {message.usage && (

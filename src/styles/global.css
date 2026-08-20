@@ -3403,15 +3403,15 @@ textarea {
 
 /* Sub-agent model badge: small tonal pill inside the sub-row, so the model
    that ACTUALLY ran each read/grep/glob is visible at a glance (the sub-agent
-   model, or the main model after a per-sub-search fallback). The generic
-   .tool-badge style is scoped to .tool-card-head, so sub-rows need their own. */
+   model, or the main model after a per-sub-search fallback). Takes the tool's
+   accent color (--tool-color) so it reads in both light and dark themes. */
 .tool-sub-row .tool-model-badge {
   font-family: var(--font-mono);
   font-size: 9.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
-  color: var(--text-dim);
-  background: color-mix(in srgb, var(--bg-raised) 80%, var(--tool-color, var(--accent)) 20%);
+  color: var(--tool-color, var(--accent));
+  background: color-mix(in srgb, var(--tool-color, var(--accent)) 14%, transparent);
   border: none;
   border-radius: 999px;
   padding: 1px 7px;

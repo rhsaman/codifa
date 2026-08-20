@@ -3,8 +3,8 @@
   --bg-alt: #181825;
   --bg-panel: #313244;
   /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs). */
-  --bg-raised: #3b3c4f;
-  --bg-input: #313244;
+  --bg-raised: #45475a;
+  --bg-input: #45475a;
   --bg-hover: #45475a;
   --border: #45475a;
   --text: #cdd6f4;
@@ -1473,7 +1473,7 @@ textarea {
 }
 
 .update-btn:hover {
-  background: linear-gradient(135deg, var(--accent), #74c7ec);
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 70%, var(--text)));
   color: var(--on-accent);
   border-color: transparent;
   transform: translateY(-1px);
@@ -1821,14 +1821,13 @@ textarea {
   width: 100%;
   min-width: 0;
   height: 100%;
-  /* Clean, subtle vertical depth — mirrors the sidebar's gradient so the chat
-     surface reads as one continuous surface instead of a flat slab. No radial
-     smudges: just a faint accent tint at the top that fades out within the
-     first ~260px. */
+  position: relative;
+  /* Same surface as the sidebar: --bg-alt with a faint accent tint at the
+     top, so the chat and sidebar read as one continuous surface. */
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--accent) 5%, var(--bg-panel)),
-    var(--bg-panel) 260px
+    color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+    var(--bg-alt)
   );
 }
 
@@ -1867,6 +1866,11 @@ textarea {
      internally). */
   overflow-x: hidden;
   padding: 14px;
+  /* Keep the last messages, notices and error banners fully above the
+     floating composer — the padding must exceed the composer's total height
+     (input + toolbar + padding ≈ 142px) with comfortable clearance so
+     nothing tucks under it when scrolled to the bottom. */
+  padding-bottom: 210px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -2091,17 +2095,61 @@ textarea {
   margin-top: 2px;
 }
 
+/* Room for the bubble tail: .msg has content-visibility:auto → contain:paint
+   clips at the border box, so the tail (which pokes 7px past the bubble) must
+   sit inside this padding to stay fully visible in both LTR and RTL. */
+.msg.user {
+  padding-inline: 10px;
+}
+
+/* Align the WHOLE user block (label + bubble + copy/retry buttons) to the
+   user's side — right in RTL, left in LTR. align-items on the .msg wrapper
+   is the most robust lever: the .msg wrapper is always LTR (the app never
+   sets direction on it), so flex-end/flex-start are physical and can't be
+   defeated by the bubble's own dir. It also keeps the buttons matched to
+   the bubble in both modes. */
+.chat-messages[data-dir="rtl"] .msg.user {
+  align-items: flex-end;
+}
+
+.chat-messages[data-dir="ltr"] .msg.user {
+  align-items: flex-start;
+}
+
 .msg.user .msg-bubble {
+  /* Compact bubble that hugs its content — NOT a full-width strip. This is
+     what makes it read as a real chat bubble instead of a tool card. */
+  width: fit-content;
+  max-width: min(72ch, 100%);
+  position: relative;
+  /* Solid theme-accent fill (iMessage-style) so the user bubble is instantly
+     distinct from the dark tinted tool cards. Text flips to --on-accent for
+     guaranteed contrast on the bright surface. */
   background: linear-gradient(
     180deg,
-    color-mix(in srgb, var(--accent) 9%, var(--bg-input)),
-    color-mix(in srgb, var(--accent) 3%, var(--bg-input))
+    color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
+    color-mix(in srgb, var(--accent) 74%, var(--bg-panel))
   );
-  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border));
-  border-radius: 14px 14px 14px 6px;
+  border: none;
+  border-radius: 18px 18px 18px 6px;
+  color: var(--on-accent);
+  /* Flat and clean — just a hairline inner top highlight, no outer shadow. */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--on-accent) 14%, transparent);
   /* The base .msg-bubble only pads 4px horizontally — that's what glued the
      text to the corner. User bubbles get real breathing room. */
   padding: 10px 14px;
+}
+
+/* Real speech-bubble tail — a small triangle on the user's side (LTR: left). */
+.msg.user .msg-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: -7px;
+  width: 14px;
+  height: 14px;
+  background: color-mix(in srgb, var(--accent) 74%, var(--bg-panel));
+  clip-path: polygon(100% 0, 0 50%, 100% 100%);
 }
 
 .chat-messages[data-dir="rtl"] .msg.user .msg-bubble {
@@ -2112,13 +2160,41 @@ textarea {
      RTL mode. */
   direction: rtl;
   text-align: right;
-  /* RTL tail on the bottom-RIGHT (the user's side); the base rule's
-     bottom-left 6px is the LTR tail. */
-  border-radius: 14px 14px 6px 14px;
+  /* RTL: the user's side is the RIGHT — pin the compact bubble there.
+     align-self is physical (the .msg wrapper is always LTR), so it can't be
+     defeated by the bubble's own direction. IMPORTANT: do NOT add an auto
+     margin here — an auto margin on an item whose own direction is rtl makes
+     the browser resolve the position to flex-start (LEFT) and defeats
+     align-self (verified in a real Electron render test). */
+  align-self: flex-end;
+  /* RTL tail on the bottom-RIGHT (the user's side). */
+  border-radius: 18px 18px 6px 18px;
+}
+
+/* RTL: the tail points right, toward the user. */
+.chat-messages[data-dir="rtl"] .msg.user .msg-bubble::after {
+  left: auto;
+  right: -7px;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
 }
 
 .chat-messages[data-dir="ltr"] .msg.user .msg-bubble {
-  border-radius: 14px 6px 14px 14px;
+  /* LTR: the user's side is the LEFT — pin the compact bubble there.
+     Same rule as RTL: no auto margin (it would defeat align-self). */
+  align-self: flex-start;
+  /* LTR tail on the bottom-LEFT (the user's side). */
+  border-radius: 18px 18px 18px 6px;
+}
+
+/* Keep the "You" label aligned with the bubble: right in RTL, left in LTR. */
+.chat-messages[data-dir="rtl"] .msg.user .msg-role {
+  width: fit-content;
+  margin-left: auto;
+}
+
+.chat-messages[data-dir="ltr"] .msg.user .msg-role {
+  width: fit-content;
+  margin-right: auto;
 }
 
 .msg.error .msg-bubble {
@@ -2128,7 +2204,7 @@ textarea {
 .msg-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 8px;
   padding: 0 4px;
 }
@@ -2145,21 +2221,18 @@ textarea {
 }
 
 .chat-messages[data-dir="rtl"] .msg-actions {
+  /* RTL: flip the row so each button reads icon-on-the-right (RTL order),
+     and pin the buttons to the RIGHT (the user's side in RTL). */
+  direction: rtl;
   justify-content: flex-start;
 }
 
 .msg-usage {
-  margin-right: auto;
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: color-mix(in srgb, var(--accent) 78%, var(--text-dim));
   opacity: 0.85;
   white-space: nowrap;
-}
-
-.chat-messages[data-dir="rtl"] .msg-usage {
-  margin-right: 0;
-  margin-left: auto;
 }
 
 .msg-usage.live {
@@ -2398,10 +2471,21 @@ textarea {
 }
 
 .composer {
-  position: relative;
-  flex: 0 0 auto;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
   padding: 10px 16px 16px;
-  background: linear-gradient(to bottom, transparent, var(--bg-panel) 45%);
+  /* The composer floats over the conversation: a translucent wash lets the
+     messages scroll behind the input and stay visible through it, fading
+     from a subtle tint at the bottom edge to fully transparent at the top. */
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--bg-panel) 45%, transparent) 0%,
+    color-mix(in srgb, var(--bg-panel) 18%, transparent) 55%,
+    transparent 100%
+  );
   transition: box-shadow 0.15s;
 }
 
@@ -2478,7 +2562,7 @@ textarea {
 
 .composer-input::placeholder {
   color: var(--text-dim);
-  opacity: 0.75;
+  opacity: 1;
 }
 
 /* Keep the textarea's scrollbar out of sight until the user interacts with
@@ -2509,7 +2593,6 @@ textarea {
   gap: 10px;
   margin-top: 6px;
   padding-top: 8px;
-  border-top: 1px solid var(--hairline);
 }
 
 .composer-left {
@@ -4635,7 +4718,7 @@ textarea {
 
 .model-select-combo-input::placeholder {
   color: var(--text-dim);
-  opacity: 0.85;
+  opacity: 1;
 }
 
 .model-select-combo-input:hover {
@@ -4907,6 +4990,11 @@ textarea {
   margin-left: auto;
   font-size: 11px;
   color: var(--text-dim);
+  flex-shrink: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- dir toggle ---- */
@@ -5096,11 +5184,6 @@ textarea {
   background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
 }
 
-.mention-icon-badge.skill {
-  background: color-mix(in srgb, var(--thinking) 16%, var(--bg-input));
-  color: var(--thinking);
-}
-
 .mention-icon-badge.mcp {
   background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
   color: var(--link);
@@ -5113,6 +5196,14 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 500;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Skill names in the @mention popup stand out from their description so the
+   title stays readable even when the hint is long. */
+.mention-item.skill .mention-rel {
+  color: var(--link);
 }
 
 /* MCP connector row rendered as a persistent on/off switch. */
@@ -5784,57 +5875,35 @@ textarea {
   --tool-color: var(--accent);
   border: none;
   border-left: 3px solid color-mix(in srgb, var(--tool-color) 55%, transparent);
-  border-radius: 12px;
+  border-radius: 18px;
   background: linear-gradient(
     to bottom,
     color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
     color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
   );
-  box-shadow:
-    var(--shadow-card),
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  /* Flat — no outer shadow; just a hairline top highlight. */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
   overflow: hidden;
 }
 
 /* Status glow replaces the old outline: a soft accent ring + halo that
-   reads as "live" without any hard border. While running, the halo gently
-   breathes so the card feels alive. */
+   reads as "live" without any hard border. Static — no pulsing. */
 .tool-card.running {
   box-shadow:
-    var(--shadow-card),
-    0 0 0 1px color-mix(in srgb, var(--tool-color) 24%, transparent),
-    0 0 20px -6px color-mix(in srgb, var(--tool-color) 45%, transparent);
-  animation: tool-running-pulse 2.2s ease-in-out infinite;
-}
-
-@keyframes tool-running-pulse {
-  0%,
-  100% {
-    box-shadow:
-      var(--shadow-card),
-      0 0 0 1px color-mix(in srgb, var(--tool-color) 24%, transparent),
-      0 0 20px -6px color-mix(in srgb, var(--tool-color) 45%, transparent);
-  }
-  50% {
-    box-shadow:
-      var(--shadow-card),
-      0 0 0 1px color-mix(in srgb, var(--tool-color) 40%, transparent),
-      0 0 28px -4px color-mix(in srgb, var(--tool-color) 62%, transparent);
-  }
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--tool-color) 22%, transparent);
 }
 
 .tool-card.error {
   box-shadow:
-    var(--shadow-card),
-    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--danger) 40%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent);
 }
 
 .tool-card.denied {
   box-shadow:
-    var(--shadow-card),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--thinking) 40%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent);
 }
 
 /* Explore uses a dimmer mix of the theme accent than single/group calls —
@@ -6099,46 +6168,33 @@ textarea {
 .tool-group {
   --tool-color: color-mix(in srgb, var(--accent) 70%, var(--bg));
   border: none;
-  border-radius: 12px;
+  border-radius: 18px;
   background: linear-gradient(
     to bottom,
     color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
     color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
   );
-  /* Two offset shadows below = a "stack of pages", so a group reads as a
-     bundle of calls, not a single tool card. */
-  box-shadow:
-    var(--shadow-card),
-    0 3px 0 -1px color-mix(in srgb, var(--tool-color) 14%, transparent),
-    0 6px 0 -2px color-mix(in srgb, var(--tool-color) 8%, transparent);
+  /* Flat — no outer shadow; just a hairline top highlight. */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
   overflow: hidden;
 }
 
 .tool-group.running {
   box-shadow:
-    var(--shadow-card),
-    0 3px 0 -1px color-mix(in srgb, var(--tool-color) 14%, transparent),
-    0 6px 0 -2px color-mix(in srgb, var(--tool-color) 8%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--tool-color) 22%, transparent),
-    0 0 18px -6px color-mix(in srgb, var(--tool-color) 40%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--tool-color) 22%, transparent);
 }
 
 .tool-group.denied {
   box-shadow:
-    var(--shadow-card),
-    0 3px 0 -1px color-mix(in srgb, var(--tool-color) 14%, transparent),
-    0 6px 0 -2px color-mix(in srgb, var(--tool-color) 8%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--thinking) 40%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent);
 }
 
 .tool-group.error {
   box-shadow:
-    var(--shadow-card),
-    0 3px 0 -1px color-mix(in srgb, var(--tool-color) 14%, transparent),
-    0 6px 0 -2px color-mix(in srgb, var(--tool-color) 8%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent),
-    0 0 16px -6px color-mix(in srgb, var(--danger) 40%, transparent);
+    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent);
 }
 
 .tool-group-head {
@@ -6682,7 +6738,7 @@ textarea {
 
 .search-input::placeholder {
   color: var(--text-dim);
-  opacity: 0.7;
+  opacity: 1;
 }
 
 .search-mode-badge {
@@ -8029,6 +8085,9 @@ textarea {
   inset: 0;
   z-index: 90;
   pointer-events: none;
+  /* Panel width — opens at half the viewport; the React component overrides
+     this inline while the user drags the resize handle. */
+  --reading-w: min(calc(50vw - 12px), calc(100vw - 24px));
 }
 
 /* Soft scrim — focuses the panel while keeping the chat visible.
@@ -8064,7 +8123,10 @@ textarea {
   top: 12px;
   right: 12px;
   bottom: 12px;
-  width: min(720px, calc(100vw - 24px));
+  width: var(--reading-w);
+  /* Hard safety net: never let the panel overflow the viewport, even if the
+     saved width is larger than the current window. */
+  max-width: calc(100vw - 24px);
   display: flex;
   flex-direction: column;
   border-radius: 18px;
@@ -8112,9 +8174,40 @@ textarea {
     90deg,
     color-mix(in srgb, var(--accent) 55%, transparent),
     var(--accent) 50%,
-    color-mix(in srgb, var(--accent) 55%, #cba6f7)
+    color-mix(in srgb, var(--accent) 55%, var(--text))
   );
   pointer-events: none;
+}
+
+/* Drag handle on the panel's left edge (VSCode-style width resize, like the
+   sidebar). The panel is anchored to the right edge, so the handle sits at
+   right: calc(var(--reading-w) + 9px) — the 12px panel offset minus the 3px
+   overlap — straddling the panel's left edge. */
+.reading-mode-resize-handle {
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: calc(var(--reading-w) + 9px);
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.reading-mode-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 2px;
+  height: 100%;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.reading-mode-resize-handle:hover::after,
+.reading-mode-resize-handle:active::after {
+  background: var(--accent);
 }
 
 /* ---- Header ---- */
@@ -8230,7 +8323,7 @@ textarea {
   background: linear-gradient(
     90deg,
     var(--accent),
-    color-mix(in srgb, var(--accent) 60%, #cba6f7)
+    color-mix(in srgb, var(--accent) 60%, var(--text))
   );
   transition: width 0.15s ease;
 }
@@ -8437,7 +8530,7 @@ textarea {
   background: linear-gradient(
     135deg,
     var(--accent),
-    color-mix(in srgb, var(--accent) 70%, #cba6f7)
+    color-mix(in srgb, var(--accent) 70%, var(--text))
   );
   color: var(--on-accent);
   font-size: 12px;
@@ -8867,11 +8960,16 @@ textarea {
 
 /* 5) Chat bubbles keep their surface + shadow, errors get a danger ring. */
 .msg.user .msg-bubble {
+  /* Solid theme-accent fill (iMessage-style) — clearly distinct from the dark
+     tinted tool cards. Text flips to --on-accent for guaranteed contrast. */
   background: linear-gradient(
     180deg,
-    color-mix(in srgb, var(--accent) 8%, var(--bg-input)),
-    var(--bg-input)
+    color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
+    color-mix(in srgb, var(--accent) 74%, var(--bg-panel))
   );
+  color: var(--on-accent);
+  /* Flat and clean — just a hairline inner top highlight, no outer shadow. */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--on-accent) 14%, transparent);
 }
 
 .msg.error .msg-bubble {
@@ -9475,7 +9573,7 @@ textarea {
 .mcp-fields input::placeholder,
 .data-path-row input::placeholder,
 .system-prompt::placeholder {
-  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
+  color: var(--text-dim);
   opacity: 1;
 }
 

@@ -42,6 +42,7 @@ import {
   PREFIX_SHORTCUTS,
   formatGlobalShortcut,
   formatShortcut,
+  physicalKey,
 } from "../lib/shortcuts";
 import type {
   AgentMode,
@@ -709,14 +710,18 @@ export function ChatPanel() {
     });
   }, [wroot, attachments]);
 
+  /** Distance from the bottom still treated as "at bottom". Kept small (8px) so
+   *  a slight scroll-up is saved exactly instead of snapping back to the bottom
+   *  on return; the ResizeObserver reconcile re-pins while streaming anyway. */
+  const AT_BOTTOM_EPS = 8;
   /** Snapshot the current viewport as a message-anchored scroll position. */
   const computeScrollPos = (el: HTMLDivElement): { id: string; offset: number; atBottom: boolean } | null => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+    // At the bottom (the common case while streaming) there is nothing to scan:
+    // the id is unused for atBottom restores, so return without touching the DOM.
+    if (atBottom) return { id: "", offset: 0, atBottom: true };
     const msgs = el.querySelectorAll<HTMLElement>("[data-msg-id]");
     if (msgs.length === 0) return null;
-    if (atBottom) {
-      return { id: msgs[msgs.length - 1].dataset.msgId ?? "", offset: 0, atBottom: true };
-    }
     const containerRect = el.getBoundingClientRect();
     let anchor: HTMLElement | null = null;
     for (const m of msgs) {
@@ -733,6 +738,21 @@ export function ChatPanel() {
     };
   };
 
+  /** Coalesce the (DOM-scanning) position capture to at most once per frame —
+   *  scroll events can fire many times per frame, and querySelectorAll +
+   *  getBoundingClientRect on every event is the main CPU cost of scrolling. */
+  const scrollRafRef = useRef<number | null>(null);
+  const syncScrollPos = () => {
+    if (scrollRafRef.current != null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+    const el = scrollRef.current;
+    if (!el) return;
+    const pos = computeScrollPos(el);
+    if (pos) lastScrollPosRef.current = pos;
+  };
+
   const onChatScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -746,20 +766,23 @@ export function ChatPanel() {
       restoreTargetRef.current = null;
       restoreScrollRef.current = null;
     }
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
     stickToBottom.current = atBottom;
-    setShowJump(!atBottom);
+    // Bail out when unchanged so scrolling doesn't re-render the whole panel on
+    // every tick — the jump button only flips once per boundary crossing.
+    setShowJump((prev) => (prev === !atBottom ? prev : !atBottom));
     // Reached the top with older messages still unrendered → load the previous
     // page. Anchored via prependAnchorRef so the viewport doesn't jump.
     if (el.scrollTop < 40 && chat && chat.messages.length > msgLimit) {
       prependAnchorRef.current = el.scrollHeight;
       setMsgLimit((n) => Math.min(chat.messages.length, n + MSG_PAGE));
     }
-    // Remember where the user left this chat — in-memory only. No store write
-    // per scroll (that lagged the UI); the position is flushed to the store on
-    // chat switch (unmount) and on app close (pagehide/beforeunload) below.
-    const pos = computeScrollPos(el);
-    if (pos) lastScrollPosRef.current = pos;
+    // Remember where the user left this chat — in-memory only. The cheap parts
+    // run here; the DOM scan is deferred to the next frame (and flushed
+    // synchronously on chat switch / app close via syncScrollPos).
+    if (scrollRafRef.current == null) {
+      scrollRafRef.current = requestAnimationFrame(syncScrollPos);
+    }
   };
 
   /** Force the transcript to the bottom regardless of where the user scrolled
@@ -770,10 +793,9 @@ export function ChatPanel() {
     setScrollTick((t) => t + 1);
     // The user is pinned to the newest messages — record it so a later chat
     // switch / restart restores the bottom instead of a stale scrolled-up spot.
+    // The id is unused for atBottom restores, so no DOM scan is needed here.
     if (chat?.id) {
-      const el = scrollRef.current;
-      const msgs = el?.querySelectorAll<HTMLElement>("[data-msg-id]") ?? [];
-      const lastId = msgs.length ? (msgs[msgs.length - 1].dataset.msgId ?? "") : "";
+      const lastId = chat.messages.length ? (chat.messages[chat.messages.length - 1].id ?? "") : "";
       lastScrollPosRef.current = { id: lastId, offset: 0, atBottom: true };
       useStore.getState().setChatScrollPos(chat.id, lastScrollPosRef.current);
     }
@@ -819,7 +841,7 @@ export function ChatPanel() {
         }
         return;
       }
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
       if (stickToBottom.current) {
         el.scrollTop = el.scrollHeight;
       } else if (!atBottom) {
@@ -830,9 +852,11 @@ export function ChatPanel() {
     if (content) ro.observe(content);
     ro.observe(el);
     return () => ro.disconnect();
-    // Re-subscribe per transcript page so the current list node is observed
-    // (the panel also remounts per chat, so this is cheap).
-  }, [chat?.messages, msgLimit]);
+    // The observed nodes (.chat-scroll and its .chat-messages child) are stable
+    // across renders, so subscribe once on mount — re-subscribing on every
+    // message append (streaming) only churned the observer for no benefit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Keep the viewport pinned when older messages are prepended above it
   // (lazy paging on scroll-to-top / "load older"): the browser grows the
@@ -854,9 +878,35 @@ export function ChatPanel() {
     if (!pos || pos.atBottom) return;
     const el = scrollRef.current;
     if (!el) return;
-    const anchor = el.querySelector<HTMLElement>(`[data-msg-id="${pos.id}"]`);
+    let anchor = el.querySelector<HTMLElement>(`[data-msg-id="${pos.id}"]`);
+    let anchorId = pos.id;
     if (!anchor) {
-      // Anchor gone (e.g. compacted away) → fall back to the newest messages.
+      // Anchor gone (compacted away, truncated by /undo or retry, or a message
+      // that no longer renders) → land on the nearest surviving message instead
+      // of jumping to the bottom, so the user returns as close as possible to
+      // where they left off.
+      const rendered = new Set(
+        Array.from(el.querySelectorAll<HTMLElement>("[data-msg-id]")).map((n) => n.dataset.msgId ?? ""),
+      );
+      const msgs = chat?.messages ?? [];
+      const idx = msgs.findIndex((m) => m.id === pos.id);
+      if (idx >= 0) {
+        // The anchor still exists but isn't rendered → nearest rendered message above it.
+        for (let i = idx - 1; i >= 0; i--) {
+          if (rendered.has(msgs[i].id)) {
+            anchorId = msgs[i].id;
+            break;
+          }
+        }
+      } else {
+        // The anchor was removed entirely → oldest surviving rendered message
+        // (closest to where the compacted/truncated range used to be).
+        anchorId = rendered.values().next().value ?? "";
+      }
+      anchor = anchorId ? el.querySelector<HTMLElement>(`[data-msg-id="${anchorId}"]`) : null;
+    }
+    if (!anchor) {
+      // Nothing left to anchor to → fall back to the newest messages.
       restoredRef.current = true;
       stickToBottom.current = true;
       el.scrollTop = el.scrollHeight;
@@ -873,9 +923,9 @@ export function ChatPanel() {
     // real heights. Keep re-anchoring (via the ResizeObserver reconcile above)
     // as the browser actually renders the content around the anchor, until the
     // position stabilizes or the user scrolls away.
-    restoreTargetRef.current = { id: pos.id, offset: pos.offset };
+    restoreTargetRef.current = { id: anchorId, offset: pos.offset };
     restoreScrollRef.current = el.scrollTop;
-  }, [initialScrollPos, msgLimit]);
+  }, [initialScrollPos, msgLimit, chat]);
 
   // Flush the saved scroll position on unmount (chat switch) and on app close
   // (pagehide/beforeunload) so the last viewport is never lost. The store write
@@ -888,6 +938,10 @@ export function ChatPanel() {
     // this component's beforeunload handler) so the snapshot always includes it.
     const pushToStore = () => {
       if (!cid) return;
+      // If a scroll happened in the last frame, its rAF capture may not have
+      // fired yet — compute synchronously so the position saved is exactly the
+      // viewport at flush time (cheap: no-op unless a capture is pending).
+      syncScrollPos();
       if (lastScrollPosRef.current) {
         useStore.getState().setChatScrollPosMem(cid, lastScrollPosRef.current);
       }
@@ -2656,13 +2710,52 @@ export function ChatPanel() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Persian/Arabic keyboard layouts often map Shift+2 to a different
+    // character (e.g. `"`), so the user can't type `@` for skill mentions.
+    // When the physical Shift+Digit2 was pressed but produced something other
+    // than `@`, insert `@` manually at the caret (mirrors the insert-at-cursor
+    // pattern of startSkillMention/acceptSkillMention).
+    if (
+      e.code === "Digit2" &&
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      e.key !== "@"
+    ) {
+      e.preventDefault();
+      const el = textareaRef.current;
+      if (el) {
+        const start = el.selectionStart ?? input.length;
+        const end = el.selectionEnd ?? input.length;
+        const next = input.slice(0, start) + "@" + input.slice(end);
+        setInput(next);
+        // Mirror onInputChange's "@ at a word boundary" check so the skill
+        // mention picker opens exactly as if the char had been typed normally.
+        if (!cmdOpen && !skillMention) {
+          const prevChar = start > 0 ? input[start - 1] : "";
+          if (!prevChar || /\s/.test(prevChar)) startSkillMention(start);
+        }
+        requestAnimationFrame(() => {
+          el.focus();
+          el.setSelectionRange(start + 1, start + 1);
+        });
+      }
+      return;
+    }
     if (cmdOpen && filteredCmds.length > 0) {
-      if (e.key === "ArrowDown") {
+      if (
+        e.key === "ArrowDown" ||
+        ((e.ctrlKey || e.metaKey) && physicalKey(e) === "j")
+      ) {
         e.preventDefault();
         setCmdIndex((i) => (i + 1) % filteredCmds.length);
         return;
       }
-      if (e.key === "ArrowUp") {
+      if (
+        e.key === "ArrowUp" ||
+        ((e.ctrlKey || e.metaKey) && physicalKey(e) === "k")
+      ) {
         e.preventDefault();
         setCmdIndex((i) => (i - 1 + filteredCmds.length) % filteredCmds.length);
         return;
@@ -2686,7 +2779,8 @@ export function ChatPanel() {
     if (skillMention && filteredSkills.length > 0) {
       if (
         e.key === "ArrowDown" ||
-        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n")
+        ((e.ctrlKey || e.metaKey) &&
+          (physicalKey(e) === "j" || physicalKey(e) === "n"))
       ) {
         e.preventDefault();
         setSkillMentionIdx((i) => (i + 1) % filteredSkills.length);
@@ -2694,7 +2788,8 @@ export function ChatPanel() {
       }
       if (
         e.key === "ArrowUp" ||
-        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p")
+        ((e.ctrlKey || e.metaKey) &&
+          (physicalKey(e) === "k" || physicalKey(e) === "p"))
       ) {
         e.preventDefault();
         setSkillMentionIdx(
@@ -3421,14 +3516,13 @@ export function ChatPanel() {
                 {filteredSkills.map((s, i) => (
                   <div
                     key={s.name}
-                    className={`mention-item${i === skillMentionIdx ? " kbd" : ""}`}
+                    className={`mention-item skill${i === skillMentionIdx ? " kbd" : ""}`}
                     onMouseEnter={() => setSkillMentionIdx(i)}
                     onMouseDown={(e) => {
                       e.preventDefault();
                       acceptSkillMention(s);
                     }}
                   >
-                    <span className="mention-icon-badge skill">⚡</span>
                     <span className="mention-rel">@{s.name}</span>
                     <span className="mention-hint">{s.description}</span>
                   </div>
@@ -3463,7 +3557,7 @@ export function ChatPanel() {
                     };
                     if (
                       (e.ctrlKey || e.metaKey) &&
-                      e.key.toLowerCase() === "n"
+                      (physicalKey(e) === "j" || physicalKey(e) === "n")
                     ) {
                       e.preventDefault();
                       e.stopPropagation();
@@ -3472,7 +3566,7 @@ export function ChatPanel() {
                     }
                     if (
                       (e.ctrlKey || e.metaKey) &&
-                      e.key.toLowerCase() === "p"
+                      (physicalKey(e) === "k" || physicalKey(e) === "p")
                     ) {
                       e.preventDefault();
                       e.stopPropagation();

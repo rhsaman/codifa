@@ -54,6 +54,12 @@ npx esbuild test/persistHeartbeat.test.ts --bundle --platform=node --format=esm 
   --packages=external --outfile=test/.tmp-hb.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-hb.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs
+echo ""
+echo "── تست ۱۰: scrollPos (ذخیرهٔ دقیق موقعیت اسکرول + بدون reorder + ماندن در snapshot) ──"
+npx esbuild test/scrollPos.test.ts --bundle --platform=node --format=esm \
+  --packages=external --outfile=test/.tmp-scroll.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-scroll.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

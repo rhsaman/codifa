@@ -103,15 +103,25 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
       if (d > 0) setIdx((i) => (max === 0 ? 0 : (i + 1) % (max + 1)))
       else setIdx((i) => (max === 0 ? 0 : (i - 1 + max + 1) % (max + 1)))
     }
-    if (e.key === 'ArrowDown' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'n')) {
+    // Navigate with ArrowUp/ArrowDown, neovim-style Ctrl+K (up) / Ctrl+J
+    // (down), or Ctrl+P (up) / Ctrl+N (down). stopPropagation keeps the
+    // global Ctrl+P "open file picker" shortcut from re-firing while the
+    // overlay is open.
+    if (
+      e.key === 'ArrowDown' ||
+      ((e.ctrlKey || e.metaKey) && (physicalKey(e) === 'j' || physicalKey(e) === 'n'))
+    ) {
       e.preventDefault()
-      if ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'n') e.stopPropagation()
+      if ((e.ctrlKey || e.metaKey) && (physicalKey(e) === 'j' || physicalKey(e) === 'n')) e.stopPropagation()
       move(1)
       return
     }
-    if (e.key === 'ArrowUp' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'p')) {
+    if (
+      e.key === 'ArrowUp' ||
+      ((e.ctrlKey || e.metaKey) && (physicalKey(e) === 'k' || physicalKey(e) === 'p'))
+    ) {
       e.preventDefault()
-      if ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'p') e.stopPropagation()
+      if ((e.ctrlKey || e.metaKey) && (physicalKey(e) === 'k' || physicalKey(e) === 'p')) e.stopPropagation()
       move(-1)
       return
     }

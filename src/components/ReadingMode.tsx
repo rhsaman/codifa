@@ -8,6 +8,7 @@ import { splitSections } from '../lib/sections'
 import { useStore } from '../lib/store'
 import { prepareContent } from '../lib/bidi'
 import { copyToClipboard } from '../lib/clipboard'
+import { physicalKey } from '../lib/shortcuts'
 import 'highlight.js/styles/github-dark.min.css'
 
 /** Chevron-up for the previous-section nav button. */
@@ -67,14 +68,43 @@ export function ReadingMode({
   const [active, setActive] = useState(0)
   const [copied, setCopied] = useState(false)
   const [progress, setProgress] = useState(0)
+  // Panel width — opens at half the viewport, then user-resizable by dragging
+  // the left edge (VSCode-style, like the sidebar). The dragged width is
+  // persisted locally (same pattern as coder:sidebarWidth) so the panel
+  // reopens at the last used size.
+  const [width, setWidth] = useState(() => {
+    if (typeof window === 'undefined' || typeof window.innerWidth !== 'number') return 720
+    const max = window.innerWidth - 24
+    const saved = (() => {
+      try {
+        return parseInt(localStorage.getItem('coder:readingWidth') ?? '', 10)
+      } catch {
+        return NaN
+      }
+    })()
+    const n = Number.isFinite(saved) ? saved : Math.round(window.innerWidth / 2) - 12
+    return Math.max(320, Math.min(max, n))
+  })
+  // Keep the panel inside the viewport when the window is resized (e.g. the
+  // app is moved from a large monitor to a small one while the panel is open).
+  // The saved width is left untouched — it only clamps for the current window.
+  useEffect(() => {
+    const onResize = () => {
+      setWidth((w) => Math.max(320, Math.min(window.innerWidth - 24, w)))
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
   const contentRef = useRef<HTMLDivElement>(null)
 
   // Esc closes the panel; ↑/↓ jump between sections.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose()
-      else if (e.key === 'ArrowDown') setActive((a) => Math.min(a + 1, sections.length - 1))
-      else if (e.key === 'ArrowUp') setActive((a) => Math.max(a - 1, 0))
+      else if (e.key === 'ArrowDown' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'j'))
+        setActive((a) => Math.min(a + 1, sections.length - 1))
+      else if (e.key === 'ArrowUp' || ((e.ctrlKey || e.metaKey) && physicalKey(e) === 'k'))
+        setActive((a) => Math.max(a - 1, 0))
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -111,10 +141,45 @@ export function ReadingMode({
     }
   }
 
+  // Drag the panel's left edge to resize (right-anchored, so dragging left
+  // grows the panel and dragging right shrinks it — the inverse of the
+  // left-anchored sidebar).
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = width
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.max(320, Math.min(window.innerWidth - 24, startW - (ev.clientX - startX)))
+      setWidth(w)
+      try {
+        localStorage.setItem('coder:readingWidth', String(w))
+      } catch {
+        /* storage unavailable — the width just won't persist */
+      }
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   const panel = (
-    <div className="reading-mode" dir={dir} onClick={(e) => e.stopPropagation()}>
+    <div
+      className="reading-mode"
+      dir={dir}
+      style={{ '--reading-w': `${width}px` } as React.CSSProperties}
+      onClick={(e) => e.stopPropagation()}
+    >
       {/* Soft scrim — click anywhere outside the panel to close. */}
       <div className="reading-mode-scrim" aria-hidden="true" onClick={onClose} />
+      {/* Drag handle on the panel's left edge — resize like the sidebar. */}
+      <div
+        className="reading-mode-resize-handle"
+        title="Drag to resize"
+        onMouseDown={startResize}
+      />
       <div
         className="reading-mode-panel"
         role="dialog"

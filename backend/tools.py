@@ -3021,6 +3021,13 @@ def make_tool_callbacks(
     # instead of spawning its own sub-agent.
     _explore_call_log: list[dict] = []
     _explore_inflight: list[dict] = []
+    # Turn-level read_skill dedup: small/free models (e.g. DEEPSEEK-V4-FLASH-FREE)
+    # often re-read the SAME skill several times in one turn — each call re-sends
+    # the full body (Code-Expert is ~16k chars), so 12+ repeats waste hundreds of
+    # thousands of tokens. After the first full read, later calls return a short
+    # "already loaded" note instead of the body again; the content is already in
+    # the conversation history from the first read.
+    _read_skill_cache: set[str] = set()
     # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
     # update_plan (the common case for small tasks) never hit the threshold, so
     # the model could write its final reply with a step still stuck 'in_progress'
@@ -3486,6 +3493,26 @@ def make_tool_callbacks(
                 }
             )
             return msg
+        skill_name = str(found.get("name") or name)
+        if skill_name in _read_skill_cache:
+            # Already loaded in full earlier this turn — the body is in the
+            # conversation history. Return a short note instead of re-sending
+            # the whole skill (observed: 12+ identical read_skill calls in one
+            # turn from small/free models, each re-sending ~16k chars).
+            msg = (
+                f"Skill {skill_name!r} was already loaded in full earlier in "
+                "this conversation — follow its instructions exactly. No need "
+                "to re-read it."
+            )
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read_skill",
+                    "summary": msg,
+                }
+            )
+            return msg
+        _read_skill_cache.add(skill_name)
         out = _format_skill_body(found)
         emit(
             {

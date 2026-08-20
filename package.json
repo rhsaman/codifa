@@ -2,7 +2,10 @@
   "name": "codifa",
   "version": "1.4.3",
   "description": "Offline-first AI coding assistant for your own machine — a real agent (Ask/Plan/Coder), voice input and RAG memory. Bring your own model: OpenRouter, OpenAI-compatible APIs or local LLMs.",
-  "author": "rhsaman",
+  "author": {
+    "name": "rhsaman",
+    "email": "rhsaman@users.noreply.github.com"
+  },
   "license": "MIT",
   "keywords": [
     "ai",

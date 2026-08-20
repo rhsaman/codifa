@@ -1537,6 +1537,38 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
     }
 
 
+def _find_skill_row(rows: list[dict], name: str) -> dict | None:
+    """Locate a skill row by display name (case-insensitive), then by slug or
+    path suffix. Returns None when nothing matches."""
+    target = (name or "").strip().lower()
+    for row in rows:
+        if str(row.get("name") or "").strip().lower() == target:
+            return row
+    if target:
+        for row in rows:
+            slug = str(row.get("slug") or "").lower()
+            path = str(row.get("path") or "").lower()
+            if target == slug or path.endswith("/" + target) or target in path:
+                return row
+    return None
+
+
+def _format_skill_body(row: dict) -> str:
+    """Format a skill DB row as the full body ``read_skill`` returns: name,
+    description, and the markdown body with frontmatter stripped."""
+    body = str(row.get("content") or "").strip()
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        if end != -1:
+            body = body[end + 4 :].lstrip("\n").strip()
+    desc = str(row.get("description") or "").strip()
+    out = f"# {row.get('name')}\n"
+    if desc:
+        out += f"\n{desc}\n"
+    out += f"\n{body}\n"
+    return out
+
+
 def upsert_mcp_server(root: str, name: str, cfg: dict) -> dict:
     """Add or replace one MCP server entry in the app database (shared globally).
 
@@ -3389,6 +3421,38 @@ def make_tool_callbacks(
             f"Skill {name!r} saved. {note}{extra} It will be offered on future runs. "
             "Tell the user the skill was created."
         )
+
+    async def read_skill_tool(name: str) -> str:
+        """Read a skill's FULL instructions from the app database (global). `name` = the skill's display name (or its slug/path suffix). Returns the complete markdown body so you can follow the skill's instructions exactly. Skills live ONLY in the app DB — never read skill files from disk. Use this when the user's request matches a skill listed in AVAILABLE SKILLS and you need its full instructions."""
+        emit({"kind": "tool", "tool": "read_skill", "args": {"name": name}})
+        try:
+            rows = _state_db.list_skills()
+        except Exception as exc:  # noqa: BLE001
+            msg = f"skill store unavailable: {exc}"
+            emit(_error_result("read_skill", msg))
+            return f"ERROR reading skill {name!r}: {msg}"
+        found = _find_skill_row(rows, name)
+        if found is None:
+            names = ", ".join(str(r.get("name") or "") for r in rows) or "(none installed)"
+            msg = f"No skill named {name!r}. Available skills: {names}"
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read_skill",
+                    "summary": msg,
+                    "status": "error",
+                }
+            )
+            return msg
+        out = _format_skill_body(found)
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "read_skill",
+                "summary": f"loaded skill {found.get('name')} ({len(out)} chars)",
+            }
+        )
+        return out
 
     async def create_mcp_tool(
         name: str,
@@ -6420,6 +6484,7 @@ def make_tool_callbacks(
         "search_memory": search_memory_tool,
         "update_plan": update_plan,
         "create_skill": create_skill_tool,
+        "read_skill": read_skill_tool,
         "create_mcp": create_mcp_tool,
         "grep": grep_tool,
         "glob": glob_tool,

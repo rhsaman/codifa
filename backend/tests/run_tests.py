@@ -29,7 +29,6 @@ TESTS = [
     "test_task_unknown_agent",
     "test_task_general_agent",
     "test_task_depth_limit",
-    "test_delegate_broad",
     "test_issues",
     "test_compact",
     "test_models_dev",

@@ -2,6 +2,8 @@
   --bg: #1e1e2e;
   --bg-alt: #181825;
   --bg-panel: #313244;
+  /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs). */
+  --bg-raised: #3b3c4f;
   --bg-input: #313244;
   --bg-hover: #45475a;
   --border: #45475a;
@@ -3344,7 +3346,7 @@ textarea {
   border: none;
   border-radius: 10px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 55%, transparent);
+  background: var(--bg-raised);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.1);
@@ -3365,7 +3367,7 @@ textarea {
 }
 
 .tool-sub-row.running {
-  background: color-mix(in srgb, var(--tool-color, var(--accent)) 6%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 88%, var(--tool-color, var(--accent)) 12%);
 }
 
 .tool-sub-row .tool-sub-name {
@@ -3409,7 +3411,7 @@ textarea {
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--text-dim);
-  background: color-mix(in srgb, var(--tool-color, var(--accent)) 12%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 80%, var(--tool-color, var(--accent)) 20%);
   border: none;
   border-radius: 999px;
   padding: 1px 7px;
@@ -3422,7 +3424,11 @@ textarea {
 }
 
 .tool-sub-list .tool-card {
-  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 60%, transparent);
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
+    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
+  );
 }
 
 .tool-sub-list .tool-card-head {
@@ -5773,8 +5779,8 @@ textarea {
   border-radius: 12px;
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--bg-panel) 96%, var(--tool-color) 6%),
-    var(--bg-panel)
+    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
+    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
   );
   box-shadow: var(--shadow-card);
   overflow: hidden;
@@ -5809,14 +5815,15 @@ textarea {
   --tool-color: var(--tool-explore);
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--bg-panel) 96%, var(--tool-explore) 7%),
-    var(--bg-panel)
+    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-explore) 20%),
+    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-explore) 8%)
   );
 }
 
 .tool-card.explore .tool-sub-list {
   position: relative;
   padding-left: 18px;
+  background: color-mix(in srgb, var(--bg-hover) 85%, var(--tool-explore) 15%);
 }
 
 .tool-card.explore .tool-sub-list::before {
@@ -5848,6 +5855,10 @@ textarea {
 
 .tool-card.explore .tool-sub-row + .tool-sub-row {
   border-top: none;
+}
+
+.tool-card.explore .tool-sub-row.running {
+  background: color-mix(in srgb, var(--bg-hover) 78%, var(--tool-explore) 22%);
 }
 
 .tool-card-head {
@@ -5890,14 +5901,16 @@ textarea {
   white-space: nowrap;
 }
 
-/* Engine / sub-count badge: tonal pill, no outline. */
+/* Engine / sub-count badge: tonal pill, no outline. Text takes the tool's
+   accent color (single=blue, group=violet, explore=teal) so the badge reads
+   as part of the card's identity, not a neutral chip. */
 .tool-card-head .tool-badge {
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.03em;
-  color: var(--text);
+  color: var(--tool-color);
   background: color-mix(in srgb, var(--tool-color) 14%, transparent);
   border: none;
   border-radius: 999px;
@@ -5997,8 +6010,8 @@ textarea {
   border-radius: 12px;
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--bg-panel) 94%, var(--tool-color) 7%),
-    var(--bg-panel)
+    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
+    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
   );
   /* Two offset shadows below = a "stack of pages", so a group reads as a
      bundle of calls, not a single tool card. */
@@ -6143,10 +6156,95 @@ textarea {
    dominant shape and the calls read as rows inside it. */
 .tool-group-body .tool-card {
   border-left: none;
-  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 55%, transparent);
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
+    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
+  );
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+/* Collapsed preview: the newest 3 calls as a cascading stack of mini-cards.
+   Newest sits at the bottom; older calls sit above it, so the preview reads
+   top-to-bottom in chronological order. New arrivals slide in at the bottom. */
+.tool-cascade {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.tool-cascade-item {
+  position: relative;
+  margin-top: -3px;
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg-hover) 86%, var(--tool-color, var(--accent)) 14%),
+    color-mix(in srgb, var(--bg-hover) 94%, var(--tool-color, var(--accent)) 6%)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 2px 5px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  transition:
+    opacity 0.25s ease,
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
+  will-change: transform;
+}
+
+/* oldest card sits flush at the top of the cascade */
+.tool-cascade-item:first-child {
+  margin-top: 0;
+}
+
+/* newest card pops: stronger edge + shadow */
+.tool-cascade-item:last-child {
+  border-color: color-mix(in srgb, var(--text) 12%, var(--hairline));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 3px 8px rgba(0, 0, 0, 0.14);
+}
+
+/* depth: older calls sit further back, slightly dimmed */
+.tool-cascade-item:nth-child(2) {
+  opacity: 1;
+}
+
+.tool-cascade-item:nth-child(3) {
+  opacity: 1;
+}
+
+.tool-cascade-item:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 4px 10px rgba(0, 0, 0, 0.16);
+}
+
+/* Explorer preview keeps its teal identity: tinted border + left accent. */
+.tool-card.explore .tool-cascade-item {
+  border-color: color-mix(in srgb, var(--tool-explore) 30%, transparent);
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg-hover) 86%, var(--tool-explore) 14%),
+    color-mix(in srgb, var(--bg-hover) 94%, var(--tool-explore) 6%)
+  );
+}
+
+.tool-card.explore .tool-cascade-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: color-mix(in srgb, var(--tool-explore) 50%, transparent);
 }
 
 /* Remaining tool args rendered as inline key:value chips in the card head —
@@ -6241,7 +6339,7 @@ textarea {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.5;
-  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 60%, transparent);
+  background: var(--bg-raised);
   border: none;
   border-radius: 8px;
   max-height: 360px;
@@ -6253,7 +6351,7 @@ textarea {
 }
 
 .diff-view .diff-add {
-  background: color-mix(in srgb, var(--success) 14%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 86%, var(--success) 14%);
   color: var(--success);
   padding: 0 10px;
   white-space: pre;
@@ -6261,7 +6359,7 @@ textarea {
 }
 
 .diff-view .diff-del {
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 86%, var(--danger) 14%);
   color: var(--danger);
   padding: 0 10px;
   white-space: pre;
@@ -6278,7 +6376,7 @@ textarea {
 .diff-view .diff-hunk {
   color: var(--link);
   padding: 0 10px;
-  background: color-mix(in srgb, var(--link) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 90%, var(--link) 10%);
   font-weight: 600;
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--link) 55%, transparent);
 }
@@ -6288,7 +6386,7 @@ textarea {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.5;
-  background: color-mix(in srgb, var(--bg-raised, var(--bg)) 60%, transparent);
+  background: var(--bg-raised);
   border: none;
   border-radius: 8px;
   max-height: 360px;
@@ -6376,23 +6474,23 @@ textarea {
 .diff-side-row.del > .diff-side-num:first-child,
 .diff-side-row.mod > .diff-side-num:first-child {
   color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 82%, var(--danger) 18%);
 }
 
 .diff-side-row.add > .diff-side-num:nth-child(3),
 .diff-side-row.mod > .diff-side-num:nth-child(3) {
   color: var(--success);
-  background: color-mix(in srgb, var(--success) 18%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 82%, var(--success) 18%);
 }
 
 .diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 86%, var(--danger) 14%);
   color: var(--danger);
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 65%, transparent);
 }
 
 .diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--success) 14%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 86%, var(--success) 14%);
   color: var(--success);
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--success) 65%, transparent);
 }
@@ -6403,11 +6501,11 @@ textarea {
 }
 
 .diff-side-row.mod > .diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 92%, var(--danger) 8%);
 }
 
 .diff-side-row.mod > .diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--success) 8%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 92%, var(--success) 8%);
 }
 
 .diff-side-meta {
@@ -6418,7 +6516,7 @@ textarea {
 
 .diff-side-meta.hunk {
   color: var(--link);
-  background: color-mix(in srgb, var(--link) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 90%, var(--link) 10%);
   font-weight: 600;
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--link) 55%, transparent);
 }
@@ -8673,10 +8771,6 @@ textarea {
     color-mix(in srgb, var(--accent) 8%, var(--bg-input)),
     var(--bg-input)
   );
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.08),
-    0 8px 20px -10px rgba(0, 0, 0, 0.3);
 }
 
 .msg.error .msg-bubble {
@@ -8686,7 +8780,6 @@ textarea {
 }
 
 .seg-steer {
-  background: var(--bg-input);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.05);

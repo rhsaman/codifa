@@ -1,4 +1,4 @@
-import { memo, useEffect, useState, type KeyboardEvent } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import type { ToolActivity } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
@@ -20,7 +20,7 @@ const TOOL_LABEL: Record<string, string> = {
 }
 
 /** A task card running the explore agent (opencode-style subagent). */
-const isExploreCard = (a: ToolActivity) =>
+export const isExploreCard = (a: ToolActivity) =>
   a.tool === 'task' && a.args?.subagent_type === 'explore'
 
 function fmtTime(ms?: number): string {
@@ -315,6 +315,7 @@ export const ToolGroupView = memo(function ToolGroupView({
         <span className="tool-ms">{fmtTime(totalMs)}</span>
         <span className={`chev ${open ? 'open' : ''}`}>▾</span>
       </button>
+      {!open && <ToolCascade activities={activities.map((a) => a.activity)} />}
       {open && (
         <div className="tool-group-body">
           {activities.map(({ activity, index }) => (
@@ -381,6 +382,76 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
       </span>
       {activity.summary && <span className="tool-sub-summary">{activity.summary}</span>}
       <span className="tool-ms">{fmtTime(ms)}</span>
+    </div>
+  )
+})
+
+/** How many of the newest calls the collapsed preview shows. */
+const PREVIEW_COUNT = 3
+
+/** Collapsed preview: the newest PREVIEW_COUNT calls as a cascading stack of
+ *  mini-cards (each newer card overlaps the one above it). Always shows the
+ *  last 3, so as new calls stream in the preview live-updates to the newest. */
+const ToolCascade = memo(function ToolCascade({ activities }: { activities: ToolActivity[] }) {
+  // Chronological order: oldest on top, newest at the bottom (reads like a log).
+  const last = activities.slice(-PREVIEW_COUNT)
+  const listRef = useRef<HTMLDivElement>(null)
+  const prevTops = useRef<Map<string, number>>(new Map())
+  const firstRun = useRef(true)
+
+  // FLIP: when the list changes, glide every card from its previous spot to its
+  // new one (brand-new cards rise in from below) instead of letting the layout
+  // jump — that jump is what made the preview feel like it was shaking.
+  useLayoutEffect(() => {
+    const el = listRef.current
+    if (!el) return
+    const items = Array.from(el.children) as HTMLElement[]
+    const nextTops = new Map<string, number>()
+    const glide =
+      'transform 0.32s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease'
+    for (const item of items) {
+      const key = item.dataset.key ?? ''
+      const next = item.offsetTop
+      const prev = prevTops.current.get(key)
+      if (firstRun.current) {
+        nextTops.set(key, next)
+        continue
+      }
+      if (prev === undefined) {
+        // brand-new card: rise in from below
+        item.style.transition = 'none'
+        item.style.transform = 'translateY(14px)'
+        item.style.opacity = '0'
+        void item.offsetHeight
+        item.style.transition = glide
+        item.style.transform = ''
+        item.style.opacity = ''
+      } else if (prev !== next) {
+        // moved card: invert the jump, then glide to the new spot
+        item.style.transition = 'none'
+        item.style.transform = `translateY(${prev - next}px)`
+        void item.offsetHeight
+        item.style.transition = glide
+        item.style.transform = ''
+      }
+      nextTops.set(key, next)
+    }
+    prevTops.current = nextTops
+    firstRun.current = false
+  }, [last])
+
+  return (
+    <div className="tool-cascade" ref={listRef}>
+      {last.map((a, i) => (
+        <div
+          key={a.callId ?? `${a.tool}-${i}`}
+          data-key={a.callId ?? `${a.tool}-${i}`}
+          className="tool-cascade-item"
+          style={{ zIndex: i + 1 }}
+        >
+          <ToolSubRow activity={a} />
+        </div>
+      ))}
     </div>
   )
 })
@@ -460,7 +531,7 @@ export const ToolCallView = memo(function ToolCallView({
             ? 'explore'
             : TOOL_LABEL[activity.tool] ?? activity.tool}
         </span>
-        {activity.model && (
+        {!isExploreCard(activity) && activity.model && (
           <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
             {activity.model}
           </span>
@@ -539,6 +610,9 @@ export const ToolCallView = memo(function ToolCallView({
         {collapsible && <span className={`chev${collapsed ? '' : ' open'}`}>▾</span>}
       </div>
 
+      {collapsed && activity.tool === 'task' && activity.children && activity.children.length > 0 && (
+        <ToolCascade activities={activity.children} />
+      )}
       {!collapsed && (
       <div className="tool-card-body">
           {activity.summary && <div className="tool-summary">{fixZwsp(activity.summary)}</div>}

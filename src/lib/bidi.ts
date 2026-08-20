@@ -68,31 +68,40 @@ export function fixZwsp(text: string): string {
 }
 
 // The model's own Persian output frequently OMITS the half-space (ZWNJ,
-// U+200C) that correct Persian typography requires in two very common,
-// low-risk-to-detect constructions — producing text that visually reads as
-// one glued word even though the UI renders every character it was given
-// (this is a MODEL-output gap, not something fixZwsp's word-separator logic
-// touches — that only fixes existing invisible separators, it never inserts
-// missing ones):
-//   1) Ezafe "ه" + "ی" (بقیهی/همهی/ناحیهی → بقیه‌ی/همه‌ی/ناحیه‌ی). A Persian
-//      root ending in ه essentially never has a genuine (non-ezafe) "ی"
-//      glued straight onto it at a word boundary, so this is safe to always
-//      fix.
-//   2) The negation prefix "نمی" (نمیفرستد → نمی‌فرستد). No common Persian
-//      word begins with نمی other than this prefix, so this is also safe to
-//      always fix. The affirmative prefix "می" is deliberately NOT handled
-//      here — too many ordinary words start with آن (میز, میدان, میلیون, …)
-//      to fix without a false-positive list, which is more likely to
-//      mis-glue a real word than to help.
+// U+200C) that correct Persian typography requires — producing text that
+// visually reads as one glued word (کتابخانههای → کتابخانه‌های,
+// منسوخشدهاند → منسوخ‌شدهاند). We tried @persian-tools/persian-tools'
+// halfSpace() here, but it only converts EXISTING spaces for می/نمی/بی
+// prefixes, ها/تر/ترین suffixes and ~26 word pairs — it never inserts a
+// missing ZWNJ into already-glued words, and it doesn't know the های suffix
+// at all. So we hand-roll the safe, high-signal patterns instead:
+//   1) Ezafe "ه" + "ی" (بقیهی → بقیه‌ی) — a Persian root ending in ه
+//      essentially never has a genuine (non-ezafe) "ی" glued onto it at a
+//      word boundary.
+//   2) The negation prefix "نمی" (نمیفرستد → نمی‌فرستد) — no common word
+//      begins with نمی other than this prefix. ("می" is deliberately NOT
+//      handled: میز/میدان/میلیون make it false-positive-prone.)
+//   3) The plural suffix "های/هایی" (کتابخانههای → کتابخانه‌های) — after a
+//      2+-letter word ending in ه, a glued های/هایی is almost always the
+//      plural suffix (هایلایت etc. are excluded by the boundary check).
+//   4) Compound past forms "Xشده" (منسوخشده → منسوخ‌شده) and "Xاند"
+//      (شدهاند → شده‌اند) — a glued شده/اند after a 2+-letter word is a
+//      verb compound, not a standalone word.
 const ZWNJ = "\u200C"
 const PERSIAN_LETTER = `[${PERSIAN_RANGE}]`
 const BOUND_AFTER = `(?:[\\s)\\]»«"'.,:;!?\u060C\u061B\u061F]|$)`
 const EZAFE_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u06CC)(?=${BOUND_AFTER})`, "gu")
 const NEGATION_PREFIX_RE = /(?<![\u0621-\u06FF])(\u0646\u0645\u06CC)(?=[\u0621-\u06FF])/gu
+const HAYES_SUFFIX_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u0647\u0627\u06CC\u06CC|\u0647\u0627\u06CC)(?=${BOUND_AFTER})`, "gu")
+const SHODE_RE = new RegExp(`(${PERSIAN_LETTER}{2,})(\u0634\u062F\u0647)(?=\u0627\u0646\u062F|${BOUND_AFTER})`, "gu")
+const AND_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u0627\u0646\u062F)(?=${BOUND_AFTER})`, "gu")
 
 export function fixMissingZwnj(text: string): string {
   return text
     .replace(EZAFE_RE, `$1${ZWNJ}$2`)
+    .replace(HAYES_SUFFIX_RE, `$1${ZWNJ}$2`)
+    .replace(SHODE_RE, `$1${ZWNJ}$2`)
+    .replace(AND_RE, `$1${ZWNJ}$2`)
     .replace(NEGATION_PREFIX_RE, `$1${ZWNJ}`)
 }
 
@@ -112,8 +121,9 @@ export function detectDir(text: string): 'rtl' | 'ltr' {
 // browser (dir="auto" / unicode-bidi: plaintext on the message containers), so
 // we no longer inject LRI/PDI/RLI isolates by hand — that manual injection was
 // the source of the reversed-paren / flipped-arrow / glued-word bugs. All that
-// remains is stripping model-injected bidi control chars and normalizing the
-// invisible word separators, both of which are safe and direction-agnostic.
+// remains is stripping model-injected bidi control chars, normalizing the
+// invisible word separators, and restoring missing half-spaces (ZWNJ) — all
+// safe and direction-agnostic.
 export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   if (!text) return text
   const cleaned = stripBidiMarks(text)

@@ -3089,35 +3089,34 @@ def _load_skills(root: str) -> list[dict]:
     return skills
 
 
-def _skills_section(skills: list[dict], picked: list[dict] | None = None) -> str:
-    """Progressive-disclosure skill index for the system prompt.
+def _skills_section(skills: list[dict]) -> str:
+    """Compact skill index for the system prompt (discovery only).
 
     Skills come from the app database and cannot be reached through the
-    project-sandboxed read tool, so a used skill's body must be inlined. But
-    only the picked/selected skills get their full body — every other skill
-    stays as a compact name + description line, so the agent always knows what
-    exists without paying the token cost of every body on every turn (the
-    opencode/codex discovery → activation model).
+    project-sandboxed read tool, so the agent loads a skill's full body on
+    demand with the ``read_skill`` tool. This section is the discovery half of
+    the opencode/codex discovery → activation model: every skill stays as a
+    compact name + description line so the agent always knows what exists
+    without paying the token cost of every body on every turn. Full bodies are
+    never inlined here — the model calls ``read_skill`` only when a request
+    actually matches a skill.
     """
     if not skills:
         return ""
-    picked_paths = {s["path"] for s in (picked or [])}
     lines = [
         "\n\n=== AVAILABLE SKILLS ===",
         (
-            "These skills are available. If the user's request matches one, follow its "
-            "instructions exactly. Full instructions are given inline for the skills "
-            "that match this request; the rest are listed by name + description."
+            "These skills are available. If the user's request matches one, call "
+            "the read_skill tool with its exact name to load its full instructions, "
+            "then follow them exactly. The rest are listed by name + description."
         ),
     ]
     for s in skills:
         name = s["name"]
-        desc = f" — {s['description']}" if s["description"] else ""
-        if s["path"] in picked_paths:
-            body = s["content"]
-            lines.append(f"- {name}{desc} (skill):\n{body}")
-        else:
-            lines.append(f"- {name}{desc}")
+        desc = s["description"] or ""
+        if len(desc) > 100:
+            desc = desc[:97].rstrip() + "…"
+        lines.append(f"- {name} — {desc}" if desc else f"- {name}")
     return "\n".join(lines)
 
 
@@ -3382,10 +3381,24 @@ _SKILL_WEAK_KEYWORDS: set[str] = {
     "say",
     "skill",
     "اسکیل",
+    "مهارت",
 }
 
 
-def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, dict]]:
+def _skill_forms(t: str) -> list[str]:
+    """Lowercased token plus its English alias expansion (if any)."""
+    tl = t.lower()
+    alias = _SKILL_ALIASES.get(tl)
+    return [tl, alias.lower()] if alias else [tl]
+
+
+def _skill_kw_in(tl: str, hay: str) -> bool:
+    # Exact substring, plus a light English-plural fallback ("tests" ->
+    # "test" matches a description that says "testing").
+    return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
+
+
+def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, dict, bool]]:
     """Skills whose NAME or DESCRIPTION literally contains a significant prompt
     keyword (see ``_fts_keywords``).
 
@@ -3407,8 +3420,9 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
     only name-hit skills are returned; description-only matches are used only
     when nothing matched by name.
 
-    Returns ``(weight, skill)`` pairs ordered by weight (name hits double, then
-    name, for stability); ``[]`` when no keyword matches. Never raises.
+    Returns ``(weight, skill, name_hit)`` triples ordered by weight (name hits
+    double, then name, for stability); ``[]`` when no keyword matches. Never
+    raises.
     """
     tokens = _fts_keywords(prompt, max_terms=8)
     if not tokens:
@@ -3417,43 +3431,67 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
     if not tokens:
         return []
 
-    def _forms(t: str) -> list[str]:
-        tl = t.lower()
-        alias = _SKILL_ALIASES.get(tl)
-        return [tl, alias.lower()] if alias else [tl]
-
-    def _kw_in(tl: str, hay: str) -> bool:
-        # Exact substring, plus a light English-plural fallback ("tests" ->
-        # "test" matches a description that says "testing").
-        return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
-
-    name_hit: list[tuple[int, dict]] = []
-    desc_only: list[tuple[int, dict]] = []
+    name_hit: list[tuple[int, dict, bool]] = []
+    desc_only: list[tuple[int, dict, bool]] = []
     for s in skills:
         name = str(s.get("name") or "").lower()
         desc = str(s.get("description") or "").lower()
         name_hits = 0
         desc_hits = 0
         for t in tokens:
-            for form in _forms(t):
-                if _kw_in(form, name):
+            for form in _skill_forms(t):
+                if _skill_kw_in(form, name):
                     name_hits += 1
                     break
-                if _kw_in(form, desc):
+                if _skill_kw_in(form, desc):
                     desc_hits += 1
                     break
         if name_hits:
-            name_hit.append((name_hits * 2 + desc_hits, s))
+            name_hit.append((name_hits * 2 + desc_hits, s, True))
         elif desc_hits:
-            desc_only.append((desc_hits, s))
+            desc_only.append((desc_hits, s, False))
 
-    def _sort(pool: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
+    def _sort(pool: list[tuple[int, dict, bool]]) -> list[tuple[int, dict, bool]]:
         pool.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
         return list(reversed(pool))
 
     # Name hits win outright; description-only matches fill in only when no
     # skill is named after a prompt keyword.
     return _sort(name_hit) if name_hit else _sort(desc_only)
+
+
+def _skill_match_tokens(tokens: list[str], skill: dict) -> list[str]:
+    """Tokens (from ``tokens``) whose alias-expanded form appears in the
+    skill's NAME or DESCRIPTION. Used by the distinctiveness gate."""
+    name = str(skill.get("name") or "").lower()
+    desc = str(skill.get("description") or "").lower()
+    out: list[str] = []
+    for t in tokens:
+        for form in _skill_forms(t):
+            if _skill_kw_in(form, name) or _skill_kw_in(form, desc):
+                out.append(t)
+                break
+    return out
+
+
+def _skill_token_df(tokens: list[str], skills: list[dict]) -> dict[str, int]:
+    """Document frequency: for each token, how many skills' NAME or
+    DESCRIPTION contain any of its forms. Computed from the live skill list at
+    runtime, so it adapts automatically to skills added later — a token that
+    appears in many descriptions is not a distinctive signal."""
+    df: dict[str, int] = {}
+    for t in tokens:
+        count = 0
+        for s in skills:
+            name = str(s.get("name") or "").lower()
+            desc = str(s.get("description") or "").lower()
+            if any(
+                _skill_kw_in(f, name) or _skill_kw_in(f, desc)
+                for f in _skill_forms(t)
+            ):
+                count += 1
+        df[t] = count
+    return df
 
 
 # Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
@@ -3466,12 +3504,20 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
 # and the gap are deliberately strict.
 _SKILL_GAP_MIN = 0.008
 
+# Absolute semantic floor for DESCRIPTION-ONLY keyword hits (the keyword tier's
+# own gate). A name hit is unambiguous and needs no floor; a description-only
+# hit is accepted when its semantic score clears this floor OR its token is
+# distinctive across the live skill set (see _auto_select_skills). This is a
+# general absolute — not tuned to any specific skill — so it keeps working for
+# skills added later.
+_SKILL_DESC_FLOOR = 0.78
+
 
 def _auto_select_skills(
     store: VectorStore | None,
     skills: list[dict],
     prompt: str,
-    top_k: int = 3,
+    top_k: int = 2,
     rel_gap: float = 0.02,
     min_abs: float = 0.84,
 ) -> list[dict]:
@@ -3489,6 +3535,10 @@ def _auto_select_skills(
        contains a distinctive prompt word is found exactly — this is what makes
        a skill reliably findable even when the embedding band can't tell it
        apart. Ranked by hit weight (name hits double) then semantic score.
+       Description-only hits are gated: accepted only when the matched token
+       is distinctive across the live skill set (df <= 1) or the semantic
+       score clears ``_SKILL_DESC_FLOOR`` — a generic word in a description
+       can no longer attach a skill that isn't needed.
 
     2. SEMANTIC tier (high-confidence fallback): only when no keyword matches.
        The absolute floor (``min_abs``) and the top-vs-runner-up gap gate
@@ -3525,15 +3575,39 @@ def _auto_select_skills(
     # Tier 1: exact keyword match on name/description — precise, wins outright.
     kw = _skill_keyword_matches(prompt, skills)
     if kw:
-        # _skill_keyword_matches already puts name-hit skills first; within
-        # that ordering break weight ties by semantic score so a name-hit
-        # skill is never outranked by a description-only match that happens
-        # to embed closer to the prompt.
-        ranked = sorted(
-            kw,
-            key=lambda ws: (-ws[0], -sem.get(ws[1]["path"], 0.0)),
-        )
-        return [s for _, s in ranked[:top_k]]
+        # Gate description-only hits: a name hit is unambiguous and passes
+        # outright, but a description mention is only accepted when the matched
+        # token is distinctive across the live skill set (df <= 1) or the
+        # semantic score clears _SKILL_DESC_FLOOR. This is what stops a generic
+        # word in a description from attaching a skill that isn't needed — and
+        # because distinctiveness is computed from the actual installed skills
+        # at runtime, it keeps working for skills added later.
+        tokens = [
+            t
+            for t in _fts_keywords(prompt, max_terms=8)
+            if t.lower() not in _SKILL_WEAK_KEYWORDS
+        ]
+        df = _skill_token_df(tokens, skills)
+        kept: list[tuple[int, dict]] = []
+        for weight, s, name_hit in kw:
+            if name_hit:
+                kept.append((weight, s))
+                continue
+            if sem.get(s["path"], 0.0) >= _SKILL_DESC_FLOOR:
+                kept.append((weight, s))
+                continue
+            if any(df.get(t, 0) <= 1 for t in _skill_match_tokens(tokens, s)):
+                kept.append((weight, s))
+        if kept:
+            # _skill_keyword_matches already puts name-hit skills first; within
+            # that ordering break weight ties by semantic score so a name-hit
+            # skill is never outranked by a description-only match that happens
+            # to embed closer to the prompt.
+            ranked = sorted(
+                kept,
+                key=lambda ws: (-ws[0], -sem.get(ws[1]["path"], 0.0)),
+            )
+            return [s for _, s in ranked[:top_k]]
 
     # Tier 2: semantic-only fallback.
     scores = sorted(sem.items(), key=lambda x: x[1], reverse=True)
@@ -4761,11 +4835,11 @@ async def run_agent(
             # I have?" and knows what exists for future requests.
             yield {"kind": "skill", "skills": []}
 
-    # Progressive disclosure: names + descriptions of every skill are always
-    # injected so the agent knows what exists; full bodies only for the
-    # picked/selected skills (see _skills_section).
+    # Discovery: names + descriptions of every skill are always injected so the
+    # agent knows what exists; full bodies are loaded on demand via read_skill
+    # (see _skills_section).
     if skills:
-        section = _skills_section(skills, picked)
+        section = _skills_section(skills)
         # In Ask mode an explicitly attached skill turns the agent INTO the
         # role that skill defines (mentor/seo/translator/...). Make that role
         # header prominent so it is not buried below the mentor framing.

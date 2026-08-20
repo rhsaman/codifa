@@ -17,7 +17,7 @@ import { cancelSteer } from '../lib/api'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { splitSections } from '../lib/sections'
-import { ToolCallView, ToolGroupView } from './ToolCallView'
+import { ToolCallView, ToolGroupView, isExploreCard } from './ToolCallView'
 import { ReadingMode } from './ReadingMode'
 import 'highlight.js/styles/github-dark.min.css'
 
@@ -400,14 +400,14 @@ function UsageBadge({
 // card — never swept into the collapsed read-only group. Grouping a write
 // silently is worse than grouping a search: the user has no way to tell it
 // happened, which is exactly the "did this actually save?" confusion this set
-// exists to prevent.
+// exists to prevent. Explore sub-agents are also always-visible (isExploreCard
+// below) so the explorer never hides inside the collapsed group.
 const ALWAYS_VISIBLE_TOOLS = new Set([
   'write_file',
   'edit_file',
   'memory',
   'create_skill',
   'create_mcp',
-  'explore',
 ])
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
@@ -573,7 +573,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
     }
     const activity = message.toolActivity?.[seg.index]
     if (!activity) return
-    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool)) {
+    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush(`grp-${i}`)
       nodes.push(
         <ToolCallView

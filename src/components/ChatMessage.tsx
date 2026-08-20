@@ -228,6 +228,7 @@ export function RetryBanner({
   model,
   agent,
   fallback,
+  stalled,
   onCancel,
   onRetry,
 }: {
@@ -240,6 +241,7 @@ export function RetryBanner({
   model?: string
   agent?: string
   fallback?: boolean
+  stalled?: boolean
   onCancel?: () => void
   onRetry?: () => void
 }) {
@@ -316,6 +318,9 @@ export function RetryBanner({
         {suffix}
         {who ? <span className="retry-who">{who}</span> : null}
         {reason ? <span className="retry-reason"> — {reason}</span> : null}
+        {stalled && !gaveUp ? (
+          <span className="retry-stalled"> — still waiting for the provider</span>
+        ) : null}
       </span>
       {onRetry && (
         <button className="retry-btn" onClick={onRetry} title="Retry — resumes where it stopped without redoing completed work">

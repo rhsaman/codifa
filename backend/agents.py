@@ -31,7 +31,7 @@ warnings.filterwarnings(
 
 from fastmcp.client.transports import StdioTransport
 from pydantic_ai import Agent, AgentRunResultEvent, RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import (
@@ -1635,6 +1635,71 @@ def _usage_event(usage, model: str = "") -> dict | None:
 def _preemptive_compact_fraction(ctx: int) -> float:
     """Fraction of the context window at which to compact pre-emptively."""
     return 0.60
+
+
+# ProcessHistory sliding-window guard. pydantic-ai re-sends the ENTIRE
+# accumulated message history on every model request, so even with the reactive
+# _UsageCapability (which compacts at 60% of the window) a long tool-loop turn
+# re-sends a growing context on every step — the dominant token cost. This
+# processor proactively trims the history BEFORE each request once the run's
+# accumulated usage crosses a threshold, keeping the first message (system
+# prompt + current user prompt), any existing "[Compacted earlier context]"
+# summary, and a recent tail (opencode-style sliding window).
+#
+# The trigger sits ABOVE the reactive 60% compact so the stop-and-retry compact
+# (which builds the summary) fires first; after that, every subsequent request
+# stays bounded to the summary + tail instead of re-sending the whole turn.
+# A message-count fallback covers providers that report 0 usage (the same gap
+# the deterministic tool-step budget covers) so a long turn still gets bounded.
+_HISTORY_TRIGGER_FRACTION = 0.70
+_HISTORY_KEEP_TAIL = 15
+_HISTORY_MAX_MESSAGES = 40
+
+
+def _is_compact_summary(msg: ModelMessage) -> bool:
+    """True if `msg` is the "[Compacted earlier context]" summary from _compact_history."""
+    if not isinstance(msg, ModelRequest):
+        return False
+    return any(
+        isinstance(p, SystemPromptPart)
+        and str(getattr(p, "content", "")).startswith("[Compacted earlier context]")
+        for p in msg.parts
+    )
+
+
+def _make_history_processor(window: int):
+    """Build a ProcessHistory processor that bounds the per-request context.
+
+    Returns a sync processor (first arg annotated ``RunContext`` so pydantic-ai
+    passes the run context). Once the run's accumulated usage crosses
+    ``_HISTORY_TRIGGER_FRACTION`` of the window — or the message list grows past
+    ``_HISTORY_MAX_MESSAGES`` (providers that report 0 usage) — every subsequent
+    request is trimmed to: the first message (system prompt + current user
+    prompt), any existing compact summary, and the last ``_HISTORY_KEEP_TAIL``
+    messages. pydantic-ai repairs dangling tool-call edges left by the slice.
+    """
+
+    def _processor(ctx: RunContext, messages: list[ModelMessage]) -> list[ModelMessage]:
+        if not messages:
+            return messages
+        if len(messages) <= _HISTORY_MAX_MESSAGES and ctx.usage.total_tokens < int(
+            window * _HISTORY_TRIGGER_FRACTION
+        ):
+            return messages
+        keep: list[ModelMessage] = [messages[0]]
+        keep_ids = {id(messages[0])}
+        for m in messages[1:]:
+            if _is_compact_summary(m) and id(m) not in keep_ids:
+                keep.append(m)
+                keep_ids.add(id(m))
+        tail_start = max(0, len(messages) - _HISTORY_KEEP_TAIL)
+        for m in messages[tail_start:]:
+            if id(m) not in keep_ids:
+                keep.append(m)
+                keep_ids.add(id(m))
+        return keep
+
+    return _processor
 
 
 # Deterministic tool-loop budget. pydantic-ai re-sends the ENTIRE accumulated
@@ -4501,7 +4566,7 @@ async def run_agent(
         model_settings=agent_settings,
         tools=registered,
         toolsets=toolsets,
-        capabilities=[_usage_cap],
+        capabilities=[_usage_cap, ProcessHistory(_make_history_processor(ctx))],
         # Cheap models (free tiers) occasionally return an EMPTY response (no
         # text, no tool call) which pydantic-ai counts against its output-retry
         # budget. The default budget is 1, so a single blip instantly dies with
@@ -5642,7 +5707,7 @@ async def run_agent(
                     model,
                     system_prompt=system_final,
                     model_settings=agent_settings,
-                    capabilities=[_usage_cap],
+                    capabilities=[_usage_cap, ProcessHistory(_make_history_processor(ctx))],
                     retries={"tools": 3, "output": 3},
                 )
                 yield _retry_ev(

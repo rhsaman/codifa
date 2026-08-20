@@ -2333,22 +2333,26 @@ def web_search(query: str, max_results: int = 5) -> dict:
 
 
 MAX_FETCH_BYTES = 1_000_000
-FETCH_TIMEOUT = 15
-# Intermediate cap applied to a fetched page BEFORE it is handed to the
-# summarizer model. It is not the context budget (that comes from the model's
-# reported window via `tool_out_chars`) — it only bounds the summarizer input.
-FETCH_EXCERPT_CHARS = 24_000
+FETCH_TIMEOUT = 30
+# Cap applied to a fetched page before it is handed to the model. Matches
+# codex's web_fetch (100k chars); opencode returns even more (5MB) and lets the
+# model's context window decide. It is not the context budget (that comes from
+# the model's reported window via `tool_out_chars`) — it only bounds a single
+# page so one fetch can never flood the window.
+FETCH_EXCERPT_CHARS = 100_000
 
 
 def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
     """Fetch a web page and return its extracted text.
 
     Returns ``{"url", "title", "content"}`` on success or ``{"url", "error"}``
-    with a friendly reason otherwise. HTML is stripped to plain text; binary /
+    with a friendly reason otherwise. HTML is converted to Markdown (like
+    opencode's webfetch) so headings/links/code/tables survive; binary /
     non-text responses are rejected; content is capped at ``max_chars`` so a
     single page can never flood the context window. The response is streamed
     and reads at most ``MAX_FETCH_BYTES``, so oversized pages are truncated
-    rather than rejected wholesale. Never raises.
+    rather than rejected wholesale. On a Cloudflare 403 the request is retried
+    once with an honest User-Agent. Never raises.
     """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
@@ -2357,17 +2361,21 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
     try:
         import httpx
 
-        with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=True) as client:
-            with client.stream(
-                "GET",
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-                    )
-                },
-            ) as resp:
+        browser_ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        )
+        honest_ua = "curl/8.7.1"
+        body = b""
+        ct = ""
+        for ua in (browser_ua, honest_ua):
+            with (
+                httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=True) as client,
+                client.stream("GET", url, headers={"User-Agent": ua}) as resp,
+            ):
+                if resp.status_code == 403 and ua != honest_ua:
+                    # Cloudflare challenge — retry once with an honest UA.
+                    continue
                 if resp.status_code >= 400:
                     return {
                         "url": url,
@@ -2389,11 +2397,13 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
                     size += len(chunk)
                     if size >= MAX_FETCH_BYTES:
                         break
-            body = b"".join(chunks).decode("utf-8", errors="replace")
-            title = ""
-            text = body
-            if "text/html" in ct or ct == "":
-                title, text = _html_to_text(body)
+                body = b"".join(chunks)
+                break
+        body = body.decode("utf-8", errors="replace")
+        title = ""
+        text = body
+        if "text/html" in ct or ct == "":
+            title, text = _html_to_markdown(body)
     except Exception as exc:  # noqa: BLE001
         return {"url": url, "error": f"fetch failed: {exc}"}
 
@@ -2482,6 +2492,29 @@ def _html_to_text(html: str) -> tuple[str, str]:
     if m:
         title = re.sub(r"\s+", " ", m.group(1)).strip()
     return title, text
+
+
+def _html_to_markdown(html: str) -> tuple[str, str]:
+    """HTML → Markdown conversion (title + body), like opencode's webfetch.
+
+    Uses ``markdownify`` (with BeautifulSoup to drop script/style/nav chrome
+    first, matching opencode's jsdom pre-clean) when installed; falls back to
+    the plain-text parser otherwise.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        from markdownify import markdownify as _md
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(
+            ["script", "style", "noscript", "nav", "aside", "footer", "header"]
+        ):
+            tag.decompose()
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        text = _md(str(soup), heading_style="ATX")
+        return title, text
+    except Exception:  # noqa: BLE001 — fall back to the plain-text parser
+        return _html_to_text(html)
 
 
 # --------------------------------------------------------------------------- #
@@ -5794,30 +5827,16 @@ def make_tool_callbacks(
         )
         return raw_results
 
-    async def fetch_url_tool(url: str, question: str = "", full: bool = False) -> str:
-        """Fetch a web page / raw file and return its extracted text. Default returns a bounded excerpt (or a sub-agent summary when `question` is set). For copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs) the backend auto-returns full text (up to 24k chars) — one call per file is enough; don't pass `full=True` and don't re-fetch the same file via other hosts. Every call re-sends the whole conversation, so it costs real tokens."""
+    async def fetch_url_tool(url: str, full: bool = False) -> str:
+        """Fetch a web page / raw file and return its extracted text (Markdown). Returns the FULL page content — no summarization, exactly like opencode's `webfetch` and codex's `web_fetch`. Pages are capped at 100k chars (codex's cap) so one fetch can never flood the context window; pass `full=True` to lift the cap for copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs). Every call re-sends the whole conversation, so it costs real tokens."""
         effective_full = bool(full)
-        # The model that will summarize the page: the web/explore sub-agent, or
-        # the MAIN model once this slot has fallen back earlier in the turn.
-        _sum_model = web_model or explore_model
-        _sum_runner = main_model if _fallback_state.get("web") else _sum_model
-        _sum_runner_name = (
-            str(getattr(_sum_runner, "model_name", "") or "")
-            if _sum_runner is not None
-            else ""
-        )
         emit(
             {
                 "kind": "tool",
                 "tool": "fetch_url",
                 "args": {"url": url, "full": effective_full},
-                "model": _sum_runner_name,
             }
         )
-        # full=True bypasses the default excerpt cap: return the whole page so
-        # one call is enough for copying source files (SKILL.md / docs). The
-        # extracted body is already bounded by fetch_url (FETCH_EXCERPT_CHARS).
-        #
         # AUTO-DETECT source files regardless of the model's `full` flag: a URL
         # that points at a raw file (markdown / text / source-code extension, or
         # a raw.githubusercontent / jsdelivr / gist host) is ALWAYS returned in
@@ -5825,7 +5844,6 @@ def make_tool_callbacks(
         # this, a skill-install fetch would silently come back as a tiny excerpt
         # and the agent would re-fetch the same file (token blow-up, truncated
         # skills), which is exactly the bug this fixes.
-        _cap = tool_out_chars
         _probe = url.split("?", 1)[0].rstrip("/")
         _ext = (
             _probe.rsplit(".", 1)[-1].lower()
@@ -5869,7 +5887,6 @@ def make_tool_callbacks(
             "cfg",
         }
         if effective_full or _ext in _ext_full or _probe.startswith(_raw_hosts):
-            _cap = FETCH_EXCERPT_CHARS
             effective_full = True
         cache = _get_result_cache()
         cache_key = f"fetch:{url}"
@@ -5885,8 +5902,6 @@ def make_tool_callbacks(
             except (ValueError, TypeError):
                 pass
             if body:
-                if len(body) > _cap:
-                    body = body[:_cap] + "\n…(output truncated to fit context)"
                 emit(
                     {
                         "kind": "tool_result",
@@ -5895,7 +5910,11 @@ def make_tool_callbacks(
                     }
                 )
                 return f"FETCHED {url} (cached)\nTitle: {title or 'unknown'}\n\n{body}"
-        result = await asyncio.to_thread(fetch_url, url)
+        # full=True (or auto-detected source file) lifts the cap so one call is
+        # enough for copying source files (SKILL.md / docs).
+        result = await asyncio.to_thread(
+            fetch_url, url, MAX_FETCH_BYTES if effective_full else FETCH_EXCERPT_CHARS
+        )
         if "error" in result:
             msg = result["error"]
             emit(_error_result("fetch_url", msg))
@@ -5926,116 +5945,18 @@ def make_tool_callbacks(
             except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
                 pass
 
-        # full=True (or auto-detected source file) returns the whole page
-        # verbatim — no summarizer, no excerpt. This is the skill-install path:
-        # the caller needs the complete source.
-        if effective_full:
-            if len(body) > _cap:
-                body = body[:_cap] + "\n…(output truncated to fit context)"
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "fetch_url",
-                    "summary": f"{len(body)} chars",
-                }
-            )
-            return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
-
-        # Claude-Code-style: the main model receives only a distilled answer,
-        # not the raw page. A summarizer model (the same configured model, run
-        # with a tiny token budget) answers the `question` from the extracted
-        # text, keeping the main context lean. On a hard sub-agent failure the
-        # call falls back to the MAIN model (see _run_distill) — the bounded
-        # excerpt is only returned when BOTH models fail.
-        answer = ""
-        _ran_sum_name = _sum_runner_name
-        if _sum_runner is not None:
-            try:
-                from pydantic_ai import Agent
-                from pydantic_ai.settings import ModelSettings
-
-                _prompt = question.strip() or "Summarize the key content of this page."
-                res, ran_model = await _run_distill(
-                    "web",
-                    _sum_runner,
-                    "web-page summarizer",
-                    lambda m: Agent(
-                        m,
-                        system_prompt=(
-                            "You are a web-page reader. Read the quoted page text and "
-                            "answer the user's question with a CONCISE summary (under "
-                            "120 words). If the page cannot answer the question, say "
-                            "so. Ignore navigation menus, sidebars, footers and "
-                            "ads."
-                        ),
-                        model_settings=ModelSettings(temperature=0.2, max_tokens=400),
-                    ),
-                    lambda: f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
-                    timeout_total=90,
-                )
-                _ran_sum_name = str(getattr(ran_model, "model_name", "") or "")
-                answer = str(getattr(res, "output", "") or "").strip()
-                # Surface the summarizer's token usage so it shows in MODEL USAGE
-                # (same normalizer the explore sub-agent uses).
-                from agents import _usage_event  # local import (circular-safe)
-
-                _usage_ev = _usage_event(
-                    getattr(res, "usage", None),
-                    model=_ran_sum_name,
-                )
-                if _usage_ev:
-                    emit(_usage_ev)
-            except Exception as exc:  # noqa: BLE001
-                # Both the web/explore subagent AND the main model failed — note
-                # it with the model name so the user can fix Settings →
-                # Subagents, then excerpt-fall.
-                answer = ""
-                _ran_name = str(
-                    getattr(
-                        main_model if _fallback_state.get("web") else _sum_model,
-                        "model_name",
-                        "",
-                    )
-                    or ""
-                )
-                _web_note = _subagent_fail_note("web", _ran_name, exc)
-                if _web_note:
-                    answer = _web_note  # becomes the "summary" replaced below
-
-        head = f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "")
-        if answer:
-            if answer.startswith("Note: the"):
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "fetch_url",
-                        "summary": f"{len(body)} chars",
-                        "model": _ran_sum_name,
-                    }
-                )
-                return head + answer
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "fetch_url",
-                    "summary": f"summarized · {len(answer)} chars",
-                    "model": _ran_sum_name,
-                }
-            )
-            return head + "SUMMARY:\n" + answer
-        # Fallback: no summarizer (or it failed) — return a bounded excerpt that
-        # respects the shared context budget so it can never overflow the window.
-        if len(body) > _cap:
-            body = body[:_cap] + "\n…(output truncated to fit context)"
+        # Return the FULL page verbatim — no summarizer, no excerpt. This is the
+        # opencode/codex behavior: the tool returns raw content and the model
+        # decides what to do with it. The body is already bounded by fetch_url
+        # (FETCH_EXCERPT_CHARS, or MAX_FETCH_BYTES when full=True).
         emit(
             {
                 "kind": "tool_result",
                 "tool": "fetch_url",
                 "summary": f"{len(body)} chars",
-                "model": _ran_sum_name,
             }
         )
-        return head + body
+        return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
 
     async def request_permission_tool(
         action: str, path: str = "", reason: str = ""

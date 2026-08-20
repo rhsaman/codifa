@@ -36,6 +36,7 @@ import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
 import { detectDir, prepareContent } from "../lib/bidi";
 import { registerChatSend, sendPendingSteerNext, sendQueuedNext, uid2 } from "../lib/chatSends";
+import { composerScrollPadding } from "../lib/scrollPadding";
 import {
   GLOBAL_SHORTCUTS,
   PREFIX_LABEL,
@@ -426,6 +427,7 @@ export function ChatPanel() {
       s.description.toLowerCase().includes(atQuery),
   );
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
   // Per-chat scroll restoration: captured once per mount (the panel remounts on
   // every chat switch via key={activeChatId}). If the user last left this chat
   // scrolled up, don't auto-pin to the bottom on return.
@@ -857,6 +859,33 @@ export function ChatPanel() {
     // message append (streaming) only churned the observer for no benefit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The composer floats over the conversation (position: absolute; bottom: 0)
+  // and the ask/perm cards anchor above it (bottom: calc(100% + 10px)), so the
+  // fixed 210px padding-bottom on .chat-scroll only clears the idle composer.
+  // When a card is open (up to 46vh) or the textarea grows (up to 200px), the
+  // floating UI extends higher and would cover the last messages. Measure the
+  // real floating height and grow the scroll padding to match.
+  useEffect(() => {
+    const el = scrollRef.current;
+    const composer = composerRef.current;
+    if (!el || !composer) return;
+    const update = () => {
+      const card = composer.querySelector<HTMLElement>(".ask-card, .perm-card");
+      const composerH = composer.getBoundingClientRect().height;
+      const cardH = card ? card.getBoundingClientRect().height : null;
+      el.style.paddingBottom = `${composerScrollPadding(composerH, cardH)}px`;
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(composer);
+    const card = composer.querySelector<HTMLElement>(".ask-card, .perm-card");
+    if (card) ro.observe(card);
+    return () => {
+      ro.disconnect();
+      el.style.paddingBottom = "";
+    };
+  }, [askReq, permissionReq]);
 
   // Keep the viewport pinned when older messages are prepended above it
   // (lazy paging on scroll-to-top / "load older"): the browser grows the
@@ -1413,27 +1442,14 @@ export function ChatPanel() {
           retry: null,
         });
       } else if (event.kind === "skill") {
-        const names = Array.isArray(event.skills) ? event.skills : [];
-        if (names.length > 0) {
-          // Skills are only ever attached manually (via @mention) — there is
-          // no auto-selection anymore.
-          const note = `> ✦ **Attached skills:** ${names.join(", ")}\n\n`;
-          store.updateMessage(assistantMsg.id, {
-            content: note + (findMsg()?.content ?? ""),
-          });
-        } else if (event.note) {
-          store.updateMessage(assistantMsg.id, {
-            content: `> ${event.note}\n\n` + (findMsg()?.content ?? ""),
-          });
-        }
+        // Deliberately NOT rendered into the chat — the user asked for the
+        // "Attached skills" / MCP notes to stay out of the transcript. The
+        // attached skills are still inlined in the system prompt, so the
+        // model follows them; only the visible note is dropped.
       } else if (event.kind === "mcp") {
-        const servers = Array.isArray(event.servers) ? event.servers : [];
-        if (servers.length > 0) {
-          const note = `> 🔌 **MCP: ${servers.join(", ")}**\n\n`;
-          store.updateMessage(assistantMsg.id, {
-            content: note + (findMsg()?.content ?? ""),
-          });
-        }
+        // Deliberately NOT rendered into the chat (same reason as "skill"
+        // above): the active MCP servers are already listed in the prompt's
+        // USER-SELECTED SKILLS/TOOLS section, so the note is redundant UI.
       } else if (event.kind === "subagent_models") {
         // Debug-only routing info. Deliberately NOT rendered into the chat —
         // the user asked for subagent model lists to stay out of the message.
@@ -3124,6 +3140,7 @@ export function ChatPanel() {
               model={retryingMsg.retry.model}
               agent={retryingMsg.retry.agent}
               fallback={retryingMsg.retry.fallback}
+              stalled={stalled}
               onRetry={() => {
                 const msgs = chat?.messages ?? [];
                 const idx = msgs.findIndex((m) => m.id === retryingMsg.id);
@@ -3135,7 +3152,7 @@ export function ChatPanel() {
               onCancel={stop}
             />
           )}
-          {(cmdError || compactError || compactNotice || prefixNotice || compacting || (busy && stalled)) && (
+          {(cmdError || compactError || compactNotice || prefixNotice || compacting || (busy && stalled && !retryingMsg?.retry)) && (
             <div className="chat-notices">
               {compacting && (
                 <div className="notice-banner notice-loading" dir="ltr">
@@ -3268,6 +3285,7 @@ export function ChatPanel() {
       </div>
 
       <div
+        ref={composerRef}
         className={`composer${dragOver ? " dragover" : ""}`}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}

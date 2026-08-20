@@ -2653,7 +2653,7 @@ textarea {
 .composer-actions {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 8px;
 }
 
 .icon-btn {
@@ -2711,8 +2711,8 @@ textarea {
 
 .attach-count {
   position: absolute;
-  top: -3px;
-  right: -3px;
+  top: -2px;
+  right: -2px;
   min-width: 15px;
   height: 15px;
   padding: 0 4px;
@@ -3680,10 +3680,269 @@ textarea {
   margin-bottom: 18px;
 }
 
-.data-path-row {
+/* ---- memory tab: grouped settings rows ---- */
+.settings-group {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  margin-bottom: 20px;
+  overflow: hidden;
+  background: var(--bg);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.settings-group:hover {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.04);
+  border-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
+}
+
+.settings-group-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px 14px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  position: relative;
+}
+
+.settings-group-head::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 20%, transparent), transparent);
+}
+
+.settings-group-icon {
+  font-size: 18px;
+  line-height: 1.4;
+  flex-shrink: 0;
+  margin-top: 1px;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.1));
+}
+
+.settings-group-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.settings-group-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  line-height: 1.55;
+  max-width: 600px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s ease;
+}
+
+.settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, var(--accent) 3%);
+}
+
+.settings-row:last-child {
+  border-bottom: none;
+}
+
+.settings-row-stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.settings-row-label {
+  flex: 1;
+  min-width: 0;
+  padding-right: 8px;
+}
+
+.settings-row-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.settings-row-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-top: 5px;
+  line-height: 1.55;
+}
+
+.settings-row-desc b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-row-desc code {
+  font-size: 11.5px;
+  background: color-mix(in srgb, var(--bg-input) 80%, var(--accent) 10%);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--border) 60%, var(--accent) 20%);
+}
+
+.settings-row-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.settings-row-control input[type='number'] {
+  width: 90px;
+  padding: 8px 10px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.settings-row-control input[type='number']:hover {
+  border-color: color-mix(in srgb, var(--border) 60%, var(--accent) 40%);
+}
+
+.settings-row-control input[type='number']:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  background: var(--bg);
+}
+
+.settings-row-control .btn {
+  white-space: nowrap;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  border-radius: 8px;
+}
+
+.settings-row-stack .data-path-row input {
+  flex: 1;
+}
+
+.field-unit {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  padding-top: 1px;
+}
+
+/* toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 999px;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.switch-slider::before {
+  content: '';
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 3px;
+  top: 3px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94), background 0.2s ease;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05);
+}
+
+.switch input:checked + .switch-slider {
+  background: var(--accent);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.1), 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.switch input:checked + .switch-slider::before {
+  transform: translateX(20px);
+  background: #fff;
+}
+
+.switch input:focus-visible + .switch-slider {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.switch:hover .switch-slider::before {
+  transform: scale(1.1);
+}
+
+.switch input:checked:hover + .switch-slider::before {
+  transform: translateX(20px) scale(1.1);
+}
+
+.settings-saved {
   display: flex;
   align-items: center;
   gap: 8px;
+  font-size: 12.5px;
+  color: var(--accent);
+  padding: 10px 14px;
+  margin: 8px 12px 4px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-radius: 8px;
+  animation: settings-saved-in 0.3s ease;
+}
+
+@keyframes settings-saved-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.settings-saved::before {
+  content: '✓';
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.data-path-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .migrate-progress {
@@ -3708,6 +3967,173 @@ textarea {
 .data-path-row input {
   flex: 1;
   min-width: 0;
+  padding: 9px 12px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.data-path-row input:hover {
+  border-color: color-mix(in srgb, var(--border) 60%, var(--accent) 40%);
+}
+
+.data-path-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  background: var(--bg);
+}
+
+.data-path-row input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.data-path-row .btn {
+  white-space: nowrap;
+  padding: 8px 16px;
+  font-size: 12.5px;
+  border-radius: 8px;
+}
+
+/* Danger zone group — distinct red accent for destructive actions */
+.settings-group:has(.btn.danger) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--danger) 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--danger) 30%);
+}
+
+.settings-group:has(.btn.danger) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(229, 72, 77, 0.3));
+}
+
+.settings-group:has(.btn.danger) .settings-group-title {
+  color: var(--danger);
+}
+
+.settings-group:has(.btn.danger):hover {
+  border-color: color-mix(in srgb, var(--border) 50%, var(--danger) 50%);
+  box-shadow: 0 2px 8px rgba(229, 72, 77, 0.08), 0 0 0 1px rgba(229, 72, 77, 0.1);
+}
+
+.settings-group:has(.btn.danger) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, var(--danger) 3%);
+}
+
+/* Current usage group — subtle blue accent for info */
+.settings-group:has(.settings-group-icon:contains("📊")) .settings-group-head,
+.settings-group:has(.settings-group-title:contains("Current usage")) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
+}
+
+.settings-group:has(.settings-group-icon:contains("📊")) .settings-group-icon,
+.settings-group:has(.settings-group-title:contains("Current usage")) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(99, 102, 241, 0.3));
+}
+
+.settings-group:has(.settings-group-icon:contains("📊")) .settings-group-title,
+.settings-group:has(.settings-group-title:contains("Current usage")) .settings-group-title {
+  color: var(--accent);
+}
+
+/* Result cache group — subtle purple accent for performance */
+.settings-group:has(.settings-group-icon:contains("⚡")) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #a855f7 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, #a855f7 30%);
+}
+
+.settings-group:has(.settings-group-icon:contains("⚡")) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(168, 85, 247, 0.3));
+}
+
+.settings-group:has(.settings-group-icon:contains("⚡")) .settings-group-title {
+  color: #a855f7;
+}
+
+.settings-group:has(.settings-group-icon:contains("⚡")):hover {
+  border-color: color-mix(in srgb, var(--border) 50%, #a855f7 50%);
+  box-shadow: 0 2px 8px rgba(168, 85, 247, 0.08), 0 0 0 1px rgba(168, 85, 247, 0.1);
+}
+
+.settings-group:has(.settings-group-icon:contains("⚡")) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, #a855f7 3%);
+}
+
+/* Agent memory notes group — subtle green accent for memory */
+.settings-group:has(.settings-group-icon:contains("📝")) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #22c55e 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, #22c55e 30%);
+}
+
+.settings-group:has(.settings-group-icon:contains("📝")) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(34, 197, 94, 0.3));
+}
+
+.settings-group:has(.settings-group-icon:contains("📝")) .settings-group-title {
+  color: #22c55e;
+}
+
+.settings-group:has(.settings-group-icon:contains("📝")):hover {
+  border-color: color-mix(in srgb, var(--border) 50%, #22c55e 50%);
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.08), 0 0 0 1px rgba(34, 197, 94, 0.1);
+}
+
+.settings-group:has(.settings-group-icon:contains("📝")) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, #22c55e 3%);
+}
+
+/* RAG memory group — subtle blue accent */
+.settings-group:has(.settings-group-icon:contains("🧠")) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
+}
+
+.settings-group:has(.settings-group-icon:contains("🧠")) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(99, 102, 241, 0.3));
+}
+
+.settings-group:has(.settings-group-icon:contains("🧠")) .settings-group-title {
+  color: var(--accent);
+}
+
+.settings-group:has(.settings-group-icon:contains("🧠")):hover {
+  border-color: color-mix(in srgb, var(--border) 50%, var(--accent) 50%);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.08), 0 0 0 1px rgba(99, 102, 241, 0.1);
+}
+
+.settings-group:has(.settings-group-icon:contains("🧠")) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, var(--accent) 3%);
+}
+
+/* Data & maintenance group — subtle orange accent */
+.settings-group:has(.settings-group-icon:contains("🗂")) .settings-group-head,
+.settings-group:has(.settings-group-icon:contains("🗂️")) .settings-group-head {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #f97316 4%), var(--bg));
+  border-bottom-color: color-mix(in srgb, var(--border) 70%, #f97316 30%);
+}
+
+.settings-group:has(.settings-group-icon:contains("🗂")) .settings-group-icon,
+.settings-group:has(.settings-group-icon:contains("🗂️")) .settings-group-icon {
+  filter: drop-shadow(0 1px 1px rgba(249, 115, 22, 0.3));
+}
+
+.settings-group:has(.settings-group-icon:contains("🗂")) .settings-group-title,
+.settings-group:has(.settings-group-icon:contains("🗂️")) .settings-group-title {
+  color: #f97316;
+}
+
+.settings-group:has(.settings-group-icon:contains("🗂")):hover,
+.settings-group:has(.settings-group-icon:contains("🗂️")):hover {
+  border-color: color-mix(in srgb, var(--border) 50%, #f97316 50%);
+  box-shadow: 0 2px 8px rgba(249, 115, 22, 0.08), 0 0 0 1px rgba(249, 115, 22, 0.1);
+}
+
+.settings-group:has(.settings-group-icon:contains("🗂")) .settings-row:hover,
+.settings-group:has(.settings-group-icon:contains("🗂️")) .settings-row:hover {
+  background: color-mix(in srgb, var(--bg) 97%, #f97316 3%);
 }
 
 .field label {
@@ -5615,6 +6041,11 @@ textarea {
 
 .retry-banner .retry-reason {
   opacity: 0.75;
+}
+
+.retry-banner .retry-stalled {
+  opacity: 0.75;
+  color: var(--warn, #d9a441);
 }
 
 .retry-banner .retry-who {

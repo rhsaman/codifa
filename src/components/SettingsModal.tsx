@@ -1797,9 +1797,247 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
         {tab === 'memory' && (
         <>
-            <div className="field">
-              <div className="field-head">
-                <label>Data path</label>
+          {/* ===== RAG memory (vector store) ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">🧠</span>
+              <div>
+                <div className="settings-group-title">RAG memory</div>
+                <div className="settings-group-desc">
+                  Long-term recall: memory notes and saved web pages are embedded into a local
+                  vector store and auto-injected into future sessions.
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Retention (TTL)</div>
+                <div className="settings-row-desc">
+                  How long <b>memory notes</b> and <b>saved web pages (from fetch tool)</b> stay in
+                  the vector store before expiring. Set high (e.g. <code>3650</code> = 10 years) to
+                  keep everything indefinitely. <b>Unit: days</b> (unlike short-term notes which use hours).
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={1}
+                  value={ttlInput}
+                  onChange={(e) => setTtlInput(e.target.value)}
+                  dir="ltr"
+                  aria-label="RAG memory retention TTL in days"
+                />
+                <span className="field-unit">days</span>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Max documents / Max chunks</div>
+                <div className="settings-row-desc">
+                  Hard caps on total stored documents and chunks per workspace. When limits are
+                  reached, the oldest entries are evicted first (FIFO).
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={10}
+                  value={maxDocsInput}
+                  onChange={(e) => setMaxDocsInput(e.target.value)}
+                  placeholder="500"
+                  dir="ltr"
+                  aria-label="Max documents"
+                />
+                <span className="field-unit" style={{opacity: 0.5}}>/</span>
+                <input
+                  type="number"
+                  min={50}
+                  value={maxChunksInput}
+                  onChange={(e) => setMaxChunksInput(e.target.value)}
+                  placeholder="4000"
+                  dir="ltr"
+                  aria-label="Max chunks"
+                />
+                <button className="btn tiny" onClick={applyMemoryConfig}>Save</button>
+              </div>
+            </div>
+          </div>
+
+          {/* ===== Agent memory notes ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">📝</span>
+              <div>
+                <div className="settings-group-title">Agent memory notes</div>
+                <div className="settings-group-desc">
+                  Short notes the agent saves about your project while working. Each note type has
+                  its own lifetime; expired notes are purged automatically. <b>Sliding TTL</b> (below)
+                  extends the lifetime on every read/use so active notes don't vanish mid-task.
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Task notes TTL</div>
+                <div className="settings-row-desc">
+                  <b>For: In-flight work notes</b> — e.g. "currently refactoring X", "fixing bug in Y",
+                  "next step is Z". Temporary scratchpad for active tasks.
+                  Expires after this many hours of inactivity. Default: <code>6h</code>.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={1}
+                  value={taskTtlInput}
+                  onChange={(e) => setTaskTtlInput(e.target.value)}
+                  dir="ltr"
+                  aria-label="Task notes TTL in hours"
+                />
+                <span className="field-unit">hours</span>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Short-term notes TTL</div>
+                <div className="settings-row-desc">
+                  <b>For: Transient observations & session context</b> — e.g. "user prefers tabs",
+                  "API key is in .env.local", "project uses pnpm". Longer-lived than task notes.
+                  Expires after this many hours of inactivity. Default: <code>24h</code>.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={1}
+                  value={shortTermTtlInput}
+                  onChange={(e) => setShortTermTtlInput(e.target.value)}
+                  dir="ltr"
+                  aria-label="Short-term notes TTL in hours"
+                />
+                <span className="field-unit">hours</span>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Sliding TTL</div>
+                <div className="settings-row-desc">
+                  When <b>enabled</b>, every read or use of a note <b>resets its expiry timer</b>.
+                  Active notes stay alive indefinitely; only truly unused notes expire. Applies to
+                  both Task and Short-term notes. Default: <code>on</code>.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <label className="switch" title="Enable sliding TTL (reset expiry on read/use)">
+                  <input type="checkbox" checked={slidingInput} onChange={(e) => setSlidingInput(e.target.checked)} />
+                  <span className="switch-slider" />
+                </label>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Save TTL config</div>
+                <div className="settings-row-desc">
+                  Persists Task, Short-term, Cache TTLs and Sliding TTL to settings. Changes take
+                  effect immediately for <b>new notes</b>; existing notes keep their original expiry.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <button className="btn tiny" onClick={() => {
+                  const t = parseInt(taskTtlInput, 10)
+                  const s = parseInt(shortTermTtlInput, 10)
+                  const c = parseInt(cacheTtlInput, 10)
+                  setMemoryTtlConfig({
+                    task: Number.isFinite(t) ? t : 6,
+                    shortTerm: Number.isFinite(s) ? s : 24,
+                    cache: Number.isFinite(c) ? c : 60,
+                    sliding: slidingInput,
+                  })
+                  setMemMsg('Memory TTL config saved.')
+                }}>Save TTL config</button>
+              </div>
+            </div>
+          </div>
+
+          {/* ===== Result cache ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">⚡</span>
+              <div>
+                <div className="settings-group-title">Result cache</div>
+                <div className="settings-group-desc">
+                  Speeds up repeated work by caching tool outputs. Cached results are reused
+                  within the TTL window, avoiding redundant fetches/searches.
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Cache TTL</div>
+                <div className="settings-row-desc">
+                  How long <b>fetched web pages (fetch tool)</b>, <b>search results</b>, and
+                  <b>tool outputs</b> stay cached before being re-fetched. Default: <code>60min</code>.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={1}
+                  value={cacheTtlInput}
+                  onChange={(e) => setCacheTtlInput(e.target.value)}
+                  dir="ltr"
+                  aria-label="Cache TTL in minutes"
+                />
+                <span className="field-unit">minutes</span>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Save cache config</div>
+                <div className="settings-row-desc">
+                  Persists the Cache TTL to settings. Takes effect immediately for new cache entries.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <button className="btn tiny" onClick={() => {
+                  const c = parseInt(cacheTtlInput, 10)
+                  setMemoryTtlConfig({ cache: Number.isFinite(c) ? c : 60 })
+                  setMemMsg('Cache TTL saved.')
+                }}>Save cache TTL</button>
+              </div>
+            </div>
+          </div>
+
+          {/* ===== Data & maintenance ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">🗂️</span>
+              <div>
+                <div className="settings-group-title">Data & maintenance</div>
+                <div className="settings-group-desc">
+                  Where your data lives and how to reset it.
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row settings-row-stack">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Data path</div>
+                <div className="settings-row-desc">
+                  All app data lives under this path: settings (<code>settings.json</code>), chats,
+                  vector stores, models, memory, skills, MCP connectors, and plans. Moving the path
+                  copies every file to the new location and empties the old one. The default{' '}
+                  <code>~/.codifa</code> works the same on macOS, Linux, and Windows
+                  (<code>~/</code> = your home directory).
+                </div>
               </div>
               <div className="data-path-row">
                 <input
@@ -1821,124 +2059,68 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <div className="hint">{migrateLabel} — {migratePct}%</div>
                 </div>
               )}
-              <div className="hint">
-                All app data lives under this path: settings (<code>settings.json</code>), chats,
-                vector stores, models, memory, skills, MCP connectors, and plans. Moving the path
-                copies every file to the new location and empties the old one. The default{' '}
-                <code>~/.codifa</code> works the same on macOS, Linux, and Windows
-                (<code>~/</code> = your home directory).
-              </div>
               {dataMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{dataMsg}</div>}
             </div>
-            <div className="field">
-              <label>Memory TTL (days)</label>
-              <input
-                type="number"
-                min={1}
-                value={ttlInput}
-                onChange={(e) => setTtlInput(e.target.value)}
-                dir="ltr"
-              />
-              <div className="hint">
-                Notes and saved web pages expire <code>ttl_days</code> after their last update. Set a
-                high value (e.g. <code>3650</code>) to keep everything.
-              </div>
-            </div>
-            <div className="field">
-              <div className="field-head">
-                <label>Max documents / Max chunks</label>
-              </div>
-              <div className="data-path-row">
-                <input
-                  type="number"
-                  min={10}
-                  value={maxDocsInput}
-                  onChange={(e) => setMaxDocsInput(e.target.value)}
-                  placeholder="500"
-                  dir="ltr"
-                />
-                <input
-                  type="number"
-                  min={50}
-                  value={maxChunksInput}
-                  onChange={(e) => setMaxChunksInput(e.target.value)}
-                  placeholder="4000"
-                  dir="ltr"
-                />
-                <button className="btn tiny" onClick={applyMemoryConfig}>Save</button>
-              </div>
-              <div className="hint">
-Caps on total stored documents and chunks per workspace; the oldest are evicted first.
+          </div>
+
+          {memStats && memStats.available && (
+            <div className="settings-group">
+              <div className="settings-group-head">
+                <span className="settings-group-icon">📊</span>
+                <div>
+                  <div className="settings-group-title">Current usage</div>
+                  <div className="settings-group-desc">
+                    Live stats for this workspace's vector store.
+                  </div>
                 </div>
-                {memMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{memMsg}</div>}
-            </div>
-            <div className="field">
-              <label>Cache TTL (minutes)</label>
-              <input
-                type="number"
-                min={1}
-                value={cacheTtlInput}
-                onChange={(e) => setCacheTtlInput(e.target.value)}
-                dir="ltr"
-              />
-              <div className="hint">Search results, web pages and tool results expire after this many minutes.</div>
-            </div>
-            <div className="field">
-              <label>Task memory TTL (hours)</label>
-              <input
-                type="number"
-                min={1}
-                value={taskTtlInput}
-                onChange={(e) => setTaskTtlInput(e.target.value)}
-                dir="ltr"
-              />
-              <div className="hint">In-flight work notes expire after this many hours since last access.</div>
-            </div>
-            <div className="field">
-              <label>Short-term memory TTL (hours)</label>
-              <input
-                type="number"
-                min={1}
-                value={shortTermTtlInput}
-                onChange={(e) => setShortTermTtlInput(e.target.value)}
-                dir="ltr"
-              />
-              <div className="hint">Transient observations and session context expire after this many hours.</div>
-            </div>
-            <div className="field">
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input type="checkbox" checked={slidingInput} onChange={(e) => setSlidingInput(e.target.checked)} />
-                Sliding TTL (extend expiry when memory is used)
-              </label>
-            </div>
-            <div className="field">
-              <button className="btn tiny" onClick={() => {
-                const t = parseInt(taskTtlInput, 10)
-                const s = parseInt(shortTermTtlInput, 10)
-                const c = parseInt(cacheTtlInput, 10)
-                setMemoryTtlConfig({
-                  task: Number.isFinite(t) ? t : 6,
-                  shortTerm: Number.isFinite(s) ? s : 24,
-                  cache: Number.isFinite(c) ? c : 60,
-                  sliding: slidingInput,
-                })
-                setMemMsg('Memory TTL config saved.')
-              }}>Save TTL config</button>
-            </div>
-              {memStats && memStats.available && (
-                <div className="hint">
-                  Current usage: {memStats.docs} docs / {memStats.chunks} chunks in {memStats.db || 'workspace store'}.
-                  Active TTL {memStats.ttl_days}d, max {memStats.max_docs} docs / {memStats.max_chunks} chunks.
+              </div>
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <div className="settings-row-title">Documents / Chunks</div>
+                  <div className="settings-row-desc">
+                    <code>{memStats.docs}</code> docs / <code>{memStats.chunks}</code> chunks in
+                    <code>{memStats.db || 'workspace store'}</code>.
+                  </div>
                 </div>
-              )}
-            <div className="field">
-              <button className="btn tiny danger" onClick={doClearMemory} disabled={clearing}>
-                {clearing ? 'Clearing…' : 'Clear RAG memory'}
-              </button>
-              <div className="hint">
-                Permanently deletes all memory notes and saved web pages for this workspace.
+              </div>
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <div className="settings-row-title">Active limits</div>
+                  <div className="settings-row-desc">
+                    TTL: <code>{memStats.ttl_days}d</code> · Max docs: <code>{memStats.max_docs}</code> · Max chunks: <code>{memStats.max_chunks}</code>
+                  </div>
+                </div>
               </div>
             </div>
+          )}
+
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">🗑️</span>
+              <div>
+                <div className="settings-group-title">Danger zone</div>
+                <div className="settings-group-desc">
+                  Irreversible actions. Use with caution.
+                </div>
+              </div>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Clear RAG memory</div>
+                <div className="settings-row-desc">
+                  Permanently deletes <b>all memory notes</b> and <b>saved web pages</b> for this
+                  workspace. This cannot be undone.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <button className="btn tiny danger" onClick={doClearMemory} disabled={clearing}>
+                  {clearing ? 'Clearing…' : 'Clear RAG memory'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {memMsg && <div className="settings-saved">{memMsg}</div>}
         </>
         )}
 

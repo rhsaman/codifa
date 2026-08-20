@@ -60,6 +60,12 @@ npx esbuild test/scrollPos.test.ts --bundle --platform=node --format=esm \
   --packages=external --outfile=test/.tmp-scroll.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-scroll.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs
+echo ""
+echo "── تست ۱۱: scrollPadding (فاصلهٔ پایین اسکرول برای کامپوزر شناور + کارت‌های ask/perm) ──"
+npx esbuild test/scrollPadding.test.ts --bundle --platform=node --format=esm \
+  --packages=external --outfile=test/.tmp-sp.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-sp.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

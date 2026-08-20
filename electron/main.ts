@@ -534,7 +534,7 @@ function registerIpc(): void {
   ipcMain.handle('fs:delete', (_e, root: string, rel: string) => {
     return deleteSafe(root, rel)
   })
-  ipcMain.handle('fs:search', (_e, root: string, query: string) => {
+  ipcMain.handle('fs:search', async (_e, root: string, query: string) => {
     return searchContent(root, query)
   })
   ipcMain.handle('fs:read-image', (_e, absPath: string) => {

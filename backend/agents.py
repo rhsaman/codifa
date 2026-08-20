@@ -642,9 +642,9 @@ _SEARCH_RULE = (
     "Choose the search tool by the BREADTH of what you need:\n"
     "1. TARGETED lookup,keyword: search "
     "directly with grep / glob / read.\n"
-    "2. WIDE search — a broad span, several areas "
-    "know where something lives: delegate to the explore sub-agent — call the "
-    "task tool with subagent_type='explore'. It searches the codebase for you "
+    "2. Wide search: use task with subagent_type='explore'. Split independent "
+    "search areas across multiple explore agents and launch them IN PARALLEL. "
+    "Use as many as meaningfully reduce search time; avoid redundant agents.\n"
     "in an isolated context and returns a report.\n"
     "3. Fire the searches you already know you need in the SAME turn (parallel "
     "tool calls) instead of one at a time.\n"
@@ -3254,6 +3254,55 @@ _SKILL_ALIASES: dict[str, str] = {
     "ایپیآی": "api",
     "دیتا": "data",
     "تحلیل": "analysis",
+    # mentor / teaching
+    "منتور": "mentor",
+    "مربی": "mentor",
+    "آموزش": "teach",
+    "درس": "teach",
+    "یادگیری": "learn",
+    # debugging / quality
+    "دیباگ": "debug",
+    "باگ": "bug",
+    "خطا": "error",
+    "امنیت": "security",
+    "پرفورمنس": "performance",
+    "بهینه": "optimize",
+    # auth / payments
+    "ورود": "login",
+    "ثبتنام": "signup",
+    "پرداخت": "payment",
+    "درگاه": "payment",
+    # chat / ai
+    "چت": "chat",
+    "ربات": "bot",
+    "مدل": "model",
+    "اسکرپت": "script",
+    "اتوماسیون": "automation",
+    # browser / extension
+    "مرورگر": "browser",
+    "اکستنشن": "extension",
+    "پلاگین": "plugin",
+    # ui / ux
+    "قالب": "template",
+    "تم": "theme",
+    "فونت": "font",
+    "آیکون": "icon",
+    "انیمیشن": "animation",
+    "فرم": "form",
+    "جدول": "table",
+    "چارت": "chart",
+    "نمودار": "chart",
+    "نقشه": "map",
+    # media
+    "ویدیو": "video",
+    "صدا": "audio",
+    "تصویر": "image",
+    "آپلود": "upload",
+    "دانلود": "download",
+    "میانبر": "shortcut",
+    "کامپایل": "compile",
+    "بیلد": "build",
+    "شبکه": "network",
 }
 
 # Generic / ambiguous words that are NOT distinctive skill signals. A word like
@@ -3403,9 +3452,11 @@ def _skill_kw_in(tl: str, hay: str) -> bool:
     return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
 
 
-def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, dict, bool]]:
-    """Skills whose NAME or DESCRIPTION literally contains a significant prompt
-    keyword (see ``_fts_keywords``).
+def _skill_keyword_matches(
+    prompt: str, skills: list[dict]
+) -> list[tuple[int, dict, bool]]:
+    """Skills whose NAME, DESCRIPTION or BODY literally contains a significant
+    prompt keyword (see ``_fts_keywords``).
 
     This is the precise, language-exact tier of skill selection: e5 cosine sits
     in a compressed band (~0.78-0.83) where the top-1 is often noise, but a
@@ -3438,11 +3489,14 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
 
     name_hit: list[tuple[int, dict, bool]] = []
     desc_only: list[tuple[int, dict, bool]] = []
+    body_only: list[tuple[int, dict, bool]] = []
     for s in skills:
         name = str(s.get("name") or "").lower()
         desc = str(s.get("description") or "").lower()
+        body = str(s.get("content") or "").lower()
         name_hits = 0
         desc_hits = 0
+        body_hits = 0
         for t in tokens:
             for form in _skill_forms(t):
                 if _skill_kw_in(form, name):
@@ -3451,18 +3505,34 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
                 if _skill_kw_in(form, desc):
                     desc_hits += 1
                     break
+                if _skill_kw_in(form, body):
+                    body_hits += 1
+                    break
         if name_hits:
             name_hit.append((name_hits * 2 + desc_hits, s, True))
         elif desc_hits:
             desc_only.append((desc_hits, s, False))
+        elif body_hits:
+            # A token found only in the skill BODY is the weakest keyword
+            # signal: bodies are long and full of generic words, so a body hit
+            # alone never passes outright — it still needs the semantic floor
+            # (same gate as description-only) to confirm the skill is actually
+            # relevant to the prompt. This catches skills whose distinctive
+            # terms live in the instructions rather than the name/description.
+            body_only.append((body_hits, s, False))
 
     def _sort(pool: list[tuple[int, dict, bool]]) -> list[tuple[int, dict, bool]]:
         pool.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
         return list(reversed(pool))
 
     # Name hits win outright; description-only matches fill in only when no
-    # skill is named after a prompt keyword.
-    return _sort(name_hit) if name_hit else _sort(desc_only)
+    # skill is named after a prompt keyword; body-only matches are the last
+    # resort (and still need the semantic floor to be accepted).
+    if name_hit:
+        return _sort(name_hit)
+    if desc_only:
+        return _sort(desc_only)
+    return _sort(body_only)
 
 
 # Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
@@ -3484,7 +3554,12 @@ _SKILL_GAP_MIN = 0.008
 # semantic 0.77). The embedding is the only signal that confirms relevance, so
 # it is required. This is a general absolute — not tuned to any specific skill —
 # so it keeps working for skills added later.
-_SKILL_DESC_FLOOR = 0.78
+#
+# Raised to 0.84 (same as the semantic tier's absolute floor): since picked
+# skills now have their FULL body inlined, a false positive costs real tokens,
+# so description-only hits must clear the same high-confidence bar as pure
+# semantic matches. Measured irrelevant prompts top out at ~0.83.
+_SKILL_DESC_FLOOR = 0.84
 
 
 def _auto_select_skills(
@@ -3990,6 +4065,9 @@ async def run_agent(
     env_var: str = "",
     oauth_token: str = "",
     mcp_servers: dict | None = None,
+    # Names of skills the user explicitly attached this turn (via @mention).
+    # When non-empty, ONLY these are loaded and auto-selection is skipped.
+    skills: list[str] | None = None,
     allow_create: bool = False,
     cap: dict | None = None,
     permission_gates: dict | None = None,
@@ -4771,10 +4849,30 @@ async def run_agent(
         except Exception:  # noqa: BLE001, S110 — best-effort seed, never raises
             pass
 
-    skills = _load_skills(root)
+    all_skills = _load_skills(root)
     picked: list[dict] = []
     skill_note = ""
-    if prompt:
+    # Explicit @mention attachment: the user named the skills they want this
+    # turn. ONLY those are loaded — auto-selection is skipped entirely so a
+    # manually-attached skill never gets overridden by (or mixed with) an
+    # auto-picked one.
+    manual_names = [n.strip() for n in (skills or []) if n and n.strip()]
+    if manual_names:
+        by_name = {s["name"].lower(): s for s in all_skills}
+        picked = [by_name[n.lower()] for n in manual_names if n.lower() in by_name]
+        if picked:
+            yield {
+                "kind": "skill",
+                "skills": [s["name"] for s in picked],
+                "manual": True,
+            }
+        else:
+            yield {
+                "kind": "skill",
+                "skills": [],
+                "note": f"attached skill(s) not found: {', '.join(manual_names)}",
+            }
+    elif prompt:
         # RAG auto-selection: index the skills, retrieve the ones closest to the
         # user's message, and feed only those to the agent. Always on — there is
         # no toggle (matches opencode/codex, where selection is automatic and
@@ -4785,14 +4883,14 @@ async def run_agent(
             skill_store = open_skill_store()
         except Exception:  # noqa: BLE001
             skill_store = None
-        if not skills:
+        if not all_skills:
             skill_note = "no skills installed — create one with /skill <description> or in Settings → Skills"
         elif skill_store is None:
             skill_note = "skills installed but the skill index is unavailable"
         else:
             try:
-                _sync_skills_to_store(skill_store, skills)
-                picked = _auto_select_skills(skill_store, skills, prompt)
+                _sync_skills_to_store(skill_store, all_skills)
+                picked = _auto_select_skills(skill_store, all_skills, prompt)
             except Exception as exc:  # noqa: BLE001 — never let indexing break the run
                 picked = []
                 skill_note = f"skills not indexed: {exc}"
@@ -4812,8 +4910,33 @@ async def run_agent(
     # Discovery: names + descriptions of every skill are always injected so the
     # agent knows what exists; full bodies are loaded on demand via read_skill
     # (see _skills_section).
-    if skills:
-        section = _skills_section(skills)
+    if all_skills:
+        # Auto-selected (or manually attached) skills are inlined in FULL —
+        # their whole body — so the agent actually follows them without a
+        # read_skill round-trip. The "needed" determination was already made
+        # (auto-selection or an explicit @mention). The rest stay as a compact
+        # name+description catalog so token cost stays bounded: only the picked
+        # skill(s) pay the full-body price, never the whole library.
+        picked_names = {s["name"] for s in picked}
+        section = _skills_section(
+            [s for s in all_skills if s["name"] not in picked_names]
+        )
+        if picked:
+            bodies = []
+            for s in picked:
+                bodies.append(
+                    f"===== SKILL: {s['name']} =====\n"
+                    f"Description: {s['description'] or '(none)'}\n\n"
+                    f"{s['content']}\n"
+                    f"===== END SKILL: {s['name']} ====="
+                )
+            section = (
+                "\n\n=== ATTACHED SKILLS (selected for this request) ===\n"
+                "The following skill(s) were selected as relevant to this "
+                "request. Follow their instructions exactly.\n\n"
+                + "\n\n".join(bodies)
+                + section
+            )
         # In Ask mode an explicitly attached skill turns the agent INTO the
         # role that skill defines (mentor/seo/translator/...). Make that role
         # header prominent so it is not buried below the mentor framing.

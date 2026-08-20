@@ -30,9 +30,6 @@ export const THEMES: Theme[] = [
       '--danger': '#ea6c70',
       '--success': '#46a758',
       '--link': '#e88d67',
-      '--tool-single': '#e08e73',
-      '--tool-group': '#e8a33d',
-      '--tool-explore': '#6bb8a8',
       '--thinking': '#e8c468',
     },
     workspaceColors: [
@@ -65,9 +62,6 @@ export const THEMES: Theme[] = [
       '--danger': '#f7768e',
       '--success': '#9ece6a',
       '--link': '#7aa2f7',
-      '--tool-single': '#7aa2f7',
-      '--tool-group': '#bb9af7',
-      '--tool-explore': '#73daca',
       '--thinking': '#e0af68',
     },
     workspaceColors: [
@@ -100,9 +94,6 @@ export const THEMES: Theme[] = [
       '--danger': '#f38ba8',
       '--success': '#a6e3a1',
       '--link': '#89b4fa',
-      '--tool-single': '#8fb8fa',
-      '--tool-group': '#cca8f7',
-      '--tool-explore': '#94e2d5',
       '--thinking': '#f9e2af',
     },
     workspaceColors: [
@@ -135,9 +126,6 @@ export const THEMES: Theme[] = [
       '--danger': '#ed8796',
       '--success': '#a6da95',
       '--link': '#8aadf4',
-      '--tool-single': '#a6c1f7',
-      '--tool-group': '#d1b3f8',
-      '--tool-explore': '#8bd5ca',
       '--thinking': '#eed49f',
     },
     workspaceColors: [
@@ -170,9 +158,6 @@ export const THEMES: Theme[] = [
       '--danger': '#ed9fa1',
       '--success': '#a6d189',
       '--link': '#98b3f0',
-      '--tool-single': '#bdcff5',
-      '--tool-group': '#e0c5f0',
-      '--tool-explore': '#a5d7d0',
       '--thinking': '#e5c890',
     },
     workspaceColors: [
@@ -205,9 +190,6 @@ export const THEMES: Theme[] = [
       '--danger': '#b20d30',
       '--success': '#29661b',
       '--link': '#094dd3',
-      '--tool-single': '#0844bc',
-      '--tool-group': '#6411d2',
-      '--tool-explore': '#0e575b',
       '--thinking': '#7c4f10',
     },
     workspaceColors: [
@@ -240,9 +222,6 @@ export const THEMES: Theme[] = [
       '--danger': '#fc6756',
       '--success': '#b8bb26',
       '--link': '#83a598',
-      '--tool-single': '#a6bfb5',
-      '--tool-group': '#e1abba',
-      '--tool-explore': '#99c688',
       '--thinking': '#fabd2f',
     },
     workspaceColors: [
@@ -275,9 +254,6 @@ export const THEMES: Theme[] = [
       '--danger': '#ff5555',
       '--success': '#50fa7b',
       '--link': '#8be9fd',
-      '--tool-single': '#8be9fd',
-      '--tool-group': '#caa8fa',
-      '--tool-explore': '#50fa7b',
       '--thinking': '#f1fa8c',
     },
     workspaceColors: [
@@ -310,9 +286,6 @@ export const THEMES: Theme[] = [
       '--danger': '#d89fa5',
       '--success': '#a3be8c',
       '--link': '#97b1cc',
-      '--tool-single': '#97b1cc',
-      '--tool-group': '#c3a5be',
-      '--tool-explore': '#88c0d0',
       '--thinking': '#ebcb8b',
     },
     workspaceColors: [
@@ -345,9 +318,6 @@ export const THEMES: Theme[] = [
       '--danger': '#eb6f92',
       '--success': '#9ccfd8',
       '--link': '#3c8fb0',
-      '--tool-single': '#9ccfd8',
-      '--tool-group': '#c4a7e7',
-      '--tool-explore': '#f6c177',
       '--thinking': '#f6c177',
     },
     workspaceColors: [
@@ -380,9 +350,6 @@ export const THEMES: Theme[] = [
       '--danger': '#e37982',
       '--success': '#98c379',
       '--link': '#61afef',
-      '--tool-single': '#70b7f1',
-      '--tool-group': '#d59ce6',
-      '--tool-explore': '#66bdc8',
       '--thinking': '#e5c07b',
     },
     workspaceColors: [
@@ -415,9 +382,6 @@ export const THEMES: Theme[] = [
       '--danger': '#fa4a89',
       '--success': '#a6e22e',
       '--link': '#66d9ef',
-      '--tool-single': '#66d9ef',
-      '--tool-group': '#c6a6ff',
-      '--tool-explore': '#a6e22e',
       '--thinking': '#e6db74',
     },
     workspaceColors: [
@@ -450,9 +414,6 @@ export const THEMES: Theme[] = [
       '--danger': '#d5787a',
       '--success': '#7e9a72',
       '--link': '#7fb4ca',
-      '--tool-single': '#83a0d9',
-      '--tool-group': '#aa98c6',
-      '--tool-explore': '#83a79d',
       '--thinking': '#dca561',
     },
     workspaceColors: [
@@ -485,9 +446,6 @@ export const THEMES: Theme[] = [
       '--danger': '#e98f91',
       '--success': '#a7c080',
       '--link': '#7fbbb3',
-      '--tool-single': '#9eceaa',
-      '--tool-group': '#e2b6cb',
-      '--tool-explore': '#9ecbc5',
       '--thinking': '#dbbc7f',
     },
     workspaceColors: [

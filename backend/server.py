@@ -128,6 +128,10 @@ class ChatRequest(BaseModel):
     system_prompt: str = ""
     thinking_level: str = "medium"
     mcp_servers: dict = {}
+    # Names of skills the user explicitly attached this turn (via @mention).
+    # When non-empty, ONLY these skills are loaded and auto-selection is
+    # skipped for this turn. Empty = normal auto-selection.
+    skills: list[str] = []
     context_window: int = 0
     allow_create: bool = False
     # Mode capabilities: tool access per mode, so the backend can gate tools
@@ -866,6 +870,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 system_prompt=req.system_prompt,
                 thinking_level=req.thinking_level,
                 mcp_servers=req.mcp_servers,
+                skills=req.skills,
                 context_window=req.context_window,
                 allow_create=req.allow_create,
                 cap=req.cap,

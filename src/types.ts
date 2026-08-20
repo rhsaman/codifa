@@ -398,6 +398,9 @@ export interface SidecarEvent {
   path?: string
   /** Auto-selected skill names (the 'skill' event kind). */
   skills?: string[]
+  /** True when the skills were attached manually by the user (@mention)
+   *  instead of auto-selected — the note is labeled differently. */
+  manual?: boolean
   /** Informational note on a 'skill' event with an empty skills list (why no skill was auto-applied). */
   note?: string
   /** MCP connector names active for this turn (the 'mcp' event kind). */

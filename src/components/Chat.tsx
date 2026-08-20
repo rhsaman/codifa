@@ -29,7 +29,9 @@ import {
   transcribeAudio,
   respondPermission,
   respondAsk,
+  listSkills,
 } from "../lib/api";
+import type { SkillRow } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
 import { detectDir, prepareContent } from "../lib/bidi";
@@ -55,6 +57,12 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
+
+// Skill list cache for the @mention picker. Lives at module scope so it
+// survives chat switches (the ChatPanel remounts per chat via key=activeChatId
+// and would otherwise refetch on every switch). Refreshed on every @open so a
+// newly created skill shows up without an app restart.
+let skillsListCache: SkillRow[] | null = null;
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -369,6 +377,15 @@ export function ChatPanel() {
   const [skillOpen, setSkillOpen] = useState(false);
   const [skillQuery, setSkillQuery] = useState("");
   const [skillIdx, setSkillIdx] = useState(0);
+  // Manual @skill mention: position of the "@" that opened the picker, the
+  // partial query after it, the highlighted row, and the loaded skill list.
+  const [skillMention, setSkillMention] = useState<{ at: number } | null>(null);
+  const [skillMentionQuery, setSkillMentionQuery] = useState("");
+  const [skillMentionIdx, setSkillMentionIdx] = useState(0);
+  const [skillsList, setSkillsList] = useState<SkillRow[]>(
+    skillsListCache ?? [],
+  );
+  const [skillsLoading, setSkillsLoading] = useState(skillsListCache === null);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
@@ -400,6 +417,13 @@ export function ChatPanel() {
     kind: "mcp" as const,
     name,
   }));
+  const atQuery = skillMentionQuery.trim().toLowerCase();
+  const filteredSkills = skillsList.filter(
+    (s) =>
+      !atQuery ||
+      s.name.toLowerCase().includes(atQuery) ||
+      s.description.toLowerCase().includes(atQuery),
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   // Per-chat scroll restoration: captured once per mount (the panel remounts on
   // every chat switch via key={activeChatId}). If the user last left this chat
@@ -1085,12 +1109,31 @@ export function ChatPanel() {
         );
       }
     }
+    // Manual @skill mentions: extract the skill names the user attached with
+    // @, pass them to the backend (only those are loaded, auto-selection is
+    // skipped for this turn) and strip the @mentions from the prompt so the
+    // model doesn't see raw @tokens. The stored transcript keeps the original
+    // text with the @mentions.
+    const mentionSkills = new Set<string>();
+    const cleanedText = text.replace(
+      /@([\w\u0600-\u06FF-]+)/g,
+      (m, name: string) => {
+        const hit = skillsList.find(
+          (s) => s.name.toLowerCase() === name.toLowerCase(),
+        );
+        if (hit) {
+          mentionSkills.add(hit.name);
+          return "";
+        }
+        return m;
+      },
+    );
     const finalPrompt =
       skillNotes.length > 0
-        ? `${text}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
+        ? `${cleanedText}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
           "\n",
         )}`
-        : text;
+        : cleanedText;
 
     // If a previous run was interrupted mid-task (its checklist isn't fully
     // completed), remind the model of the current plan state so it continues
@@ -1309,7 +1352,8 @@ export function ChatPanel() {
       } else if (event.kind === "skill") {
         const names = Array.isArray(event.skills) ? event.skills : [];
         if (names.length > 0) {
-          const note = `> ✦ **Auto-selected skills:** ${names.join(", ")}\n\n`;
+          const label = event.manual ? "Attached skills" : "Auto-selected skills";
+          const note = `> ✦ **${label}:** ${names.join(", ")}\n\n`;
           store.updateMessage(assistantMsg.id, {
             content: note + (findMsg()?.content ?? ""),
           });
@@ -1718,6 +1762,7 @@ export function ChatPanel() {
               if (all[n]) sel[n] = all[n];
             return sel;
           })(),
+          skills: Array.from(mentionSkills),
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
@@ -2493,6 +2538,7 @@ export function ChatPanel() {
     const prevChar = pos > 0 ? input[pos - 1] : "";
     if (prevChar && !/\s/.test(prevChar)) return;
     setCmdOpen({ at: pos });
+    setSkillMention(null);
     setCmdQuery("");
     setCmdIndex(0);
   };
@@ -2509,6 +2555,42 @@ export function ChatPanel() {
       if (el) {
         el.focus();
         const pos = before.length + name.length + 2;
+        el.setSelectionRange(pos, pos);
+      }
+    });
+  };
+
+  const ensureSkills = useCallback(async () => {
+    const list = await listSkills();
+    skillsListCache = list;
+    setSkillsList(list);
+    setSkillsLoading(false);
+  }, []);
+
+  const startSkillMention = (at: number) => {
+    setCmdOpen(null);
+    setSkillMention({ at });
+    setSkillMentionQuery("");
+    setSkillMentionIdx(0);
+    void ensureSkills();
+  };
+
+  const acceptSkillMention = (skill: SkillRow) => {
+    if (!skillMention) return;
+    const before = input.slice(0, skillMention.at);
+    const after = input.slice(skillMention.at + 1);
+    // Replace the partial token after "@" (e.g. "ski") with the skill name.
+    const rest = after.replace(/^\S*/, "");
+    const next = `${before}@${skill.name} ${rest}`;
+    setInput(next);
+    setSkillMention(null);
+    setSkillMentionQuery("");
+    setSkillMentionIdx(0);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (el) {
+        el.focus();
+        const pos = before.length + skill.name.length + 2;
         el.setSelectionRange(pos, pos);
       }
     });
@@ -2536,6 +2618,12 @@ export function ChatPanel() {
     if (v.length === prev.length + 1) {
       const ch = v[v.length - 1];
       if (ch === "/" && !cmdOpen) startCmd(v.length - 1);
+      // "@" opens the skill mention picker only at a word boundary (start of
+      // the line or after whitespace) so emails / @handles don't trigger it.
+      if (ch === "@" && !cmdOpen && !skillMention) {
+        const prevChar = v.length > 1 ? v[v.length - 2] : "";
+        if (!prevChar || /\s/.test(prevChar)) startSkillMention(v.length - 1);
+      }
     }
 
     if (cmdOpen) {
@@ -2548,6 +2636,20 @@ export function ChatPanel() {
         } else {
           setCmdQuery(after);
           setCmdIndex(0);
+        }
+      }
+    }
+
+    if (skillMention) {
+      if (v[skillMention.at] !== "@") {
+        setSkillMention(null);
+      } else {
+        const after = v.slice(skillMention.at + 1);
+        if (after.search(/\s/) !== -1) {
+          setSkillMention(null);
+        } else {
+          setSkillMentionQuery(after);
+          setSkillMentionIdx(0);
         }
       }
     }
@@ -2581,13 +2683,43 @@ export function ChatPanel() {
       setCmdOpen(null);
       return;
     }
+    if (skillMention && filteredSkills.length > 0) {
+      if (
+        e.key === "ArrowDown" ||
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n")
+      ) {
+        e.preventDefault();
+        setSkillMentionIdx((i) => (i + 1) % filteredSkills.length);
+        return;
+      }
+      if (
+        e.key === "ArrowUp" ||
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p")
+      ) {
+        e.preventDefault();
+        setSkillMentionIdx(
+          (i) => (i - 1 + filteredSkills.length) % filteredSkills.length,
+        );
+        return;
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        acceptSkillMention(filteredSkills[skillMentionIdx]);
+        return;
+      }
+    }
+    if (skillMention && e.key === "Escape") {
+      e.preventDefault();
+      setSkillMention(null);
+      return;
+    }
     if (skillOpen && e.key === "Escape") {
       e.preventDefault();
       setSkillOpen(false);
       return;
     }
 
-    if (!cmdOpen && e.key === "Tab") {
+    if (!cmdOpen && !skillMention && e.key === "Tab") {
       e.preventDefault();
       cycleMode(e.shiftKey ? -1 : 1);
       return;
@@ -3262,6 +3394,43 @@ export function ChatPanel() {
                     <span className="mention-icon-badge cmd">/</span>
                     <span className="mention-rel">/{c.name}</span>
                     <span className="mention-hint">{c.hint}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {skillMention && (
+              <div className="mention-popup" dir="ltr">
+                <div className="mention-head">
+                  <span className="mention-head-icon">@</span>
+                  <span>Skills</span>
+                  <span className="mention-head-count">
+                    {filteredSkills.length}
+                  </span>
+                </div>
+                {skillsLoading && skillsList.length === 0 && (
+                  <div className="mention-empty">Loading skills…</div>
+                )}
+                {!skillsLoading && skillsList.length === 0 && (
+                  <div className="mention-empty">
+                    No skills — create one with /skill or in Settings → Skills
+                  </div>
+                )}
+                {skillsList.length > 0 && filteredSkills.length === 0 && (
+                  <div className="mention-empty">No matching skills</div>
+                )}
+                {filteredSkills.map((s, i) => (
+                  <div
+                    key={s.name}
+                    className={`mention-item${i === skillMentionIdx ? " kbd" : ""}`}
+                    onMouseEnter={() => setSkillMentionIdx(i)}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      acceptSkillMention(s);
+                    }}
+                  >
+                    <span className="mention-icon-badge skill">⚡</span>
+                    <span className="mention-rel">@{s.name}</span>
+                    <span className="mention-hint">{s.description}</span>
                   </div>
                 ))}
               </div>

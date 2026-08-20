@@ -331,28 +331,74 @@ export const ToolGroupView = memo(function ToolGroupView({
   )
 })
 
+/** Compact one-line detail for a collapsed tool row. Mirrors the chips the
+ *  full card head shows (command/path/pattern/description/memory text/url…),
+ *  so a collapsed preview never shows an empty row for tools whose args the
+ *  old path-only summary missed (run_terminal, memory, fetch_url, task…). */
 function subArgSummary(activity: ToolActivity): string {
   const args = activity.args
   if (!args) return ''
-  const path = String(args.filePath ?? args.path ?? '')
-  const pattern = String(args.pattern ?? args.query ?? '')
-  const startRaw = args.offset ?? args.start
-  const limitRaw = args.limit
-  let s = path
-  const st = Number(startRaw)
-  const lm = Number(limitRaw)
-  if (startRaw !== undefined && startRaw !== '' && Number.isFinite(st) && st >= 0) {
-    // Show the real range (mirrors the main tool card) instead of a fake "…".
-    if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
-      s += `:${st}–${st + lm - 1}`
-    } else {
-      s += `:${st}`
-    }
-  } else if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
-    s += `:1–${lm}`
+  const parts: string[] = []
+
+  // run_terminal: the shell command
+  if (args.command !== undefined && args.command !== '') {
+    parts.push(String(args.command))
   }
-  if (pattern) s += s ? ' · ' + pattern : pattern
-  return s
+
+  // read/write/edit/list_files: path + real line range (mirrors the card head)
+  const path = String(args.filePath ?? args.path ?? '')
+  if (path) {
+    let p = path
+    const startRaw = args.offset ?? args.start
+    const limitRaw = args.limit
+    const st = Number(startRaw)
+    const lm = Number(limitRaw)
+    if (startRaw !== undefined && startRaw !== '' && Number.isFinite(st) && st >= 0) {
+      // Show the real range (mirrors the main tool card) instead of a fake "…".
+      if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
+        p += `:${st}–${st + lm - 1}`
+      } else {
+        p += `:${st}`
+      }
+    } else if (limitRaw !== undefined && limitRaw !== '' && Number.isFinite(lm) && lm > 0) {
+      p += `:1–${lm}`
+    }
+    parts.push(p)
+  }
+
+  // grep/glob/web_search: pattern or query
+  const pattern = String(args.pattern ?? args.query ?? '')
+  if (pattern) parts.push(pattern)
+
+  // task: the short description (the full card shows it as the task chip)
+  const description = String(args.description ?? '')
+  if (description) parts.push(description)
+
+  // memory: the remembered text / subject
+  const memText = String(args.text ?? args.subject ?? '')
+  if (memText) parts.push(memText)
+
+  // fetch_url: the URL
+  const url = String(args.url ?? '')
+  if (url) parts.push(url)
+
+  // web_search: engine badge
+  const engine = String(args.engine ?? '')
+  if (engine) parts.push(engine)
+
+  // Fallback: any remaining args as `key:value` chips (same as ToolArgs in the
+  // card head) so no tool ever collapses to an empty row.
+  const covered = new Set([
+    'command', 'path', 'filePath', 'offset', 'limit', 'start', 'end',
+    'query', 'pattern', 'description', 'text', 'subject', 'url', 'engine',
+    'content', 'old_string', 'new_string', 'prompt', 'subagent_type', 'task_id',
+  ])
+  const rest = Object.entries(args)
+    .filter(([k]) => !covered.has(k))
+    .map(([k, v]) => `${k}:${fmtArgValue(v)}`)
+  if (rest.length > 0) parts.push(rest.join(' '))
+
+  return parts.join(' · ')
 }
 
 /** Non-collapsable row for ONE sub-agent tool call (explore's internal
@@ -368,6 +414,7 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
     return () => clearInterval(t)
   }, [running])
   const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  const subSummary = subArgSummary(activity)
   return (
     <div className={`tool-sub-row ${activity.status}${running ? ' running' : ''}`}>
       <StatusIcon status={activity.status} />
@@ -377,8 +424,8 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
           {activity.model}
         </span>
       )}
-      <span className="tool-sub-args" title={subArgSummary(activity)}>
-        {subArgSummary(activity)}
+      <span className="tool-sub-args" title={subSummary}>
+        {subSummary}
       </span>
       {activity.summary && <span className="tool-sub-summary">{activity.summary}</span>}
       <span className="tool-ms">{fmtTime(ms)}</span>
@@ -531,7 +578,7 @@ export const ToolCallView = memo(function ToolCallView({
             ? 'explore'
             : TOOL_LABEL[activity.tool] ?? activity.tool}
         </span>
-        {!isExploreCard(activity) && activity.model && (
+        {activity.model && (
           <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
             {activity.model}
           </span>

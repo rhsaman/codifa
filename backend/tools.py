@@ -120,14 +120,18 @@ def _thoroughness_from_prompt(text: str) -> str:
     opencode passes thoroughness in the task prompt TEXT (the explore agent
     description tells the model to "specify the desired thoroughness level:
     quick / medium / very thorough"), not as a structured param. Parse it back
-    out so the sub-agent prompt adapts (quick/medium/very thorough).
+    out so the sub-agent prompt adapts (quick/medium/very thorough). Default is
+    QUICK (not medium): explore is latency-bound — every sub-agent round-trip
+    re-sends the whole transcript — so an unspecified task should finish in a
+    couple of targeted searches; the parent can always ask for more depth
+    explicitly.
     """
     low = (text or "").lower()
     if "very thorough" in low or "comprehensive" in low or "exhaustive" in low:
         return "very thorough"
     if "quick" in low or "fast" in low or "brief" in low or "minimal" in low:
         return "quick"
-    return "medium"
+    return "quick"
 
 
 def _is_content_gathering(text: str) -> bool:
@@ -319,6 +323,36 @@ def _sub_stop_report(streak: int) -> str:
     )
 
 
+class _SubagentTokenLimitError(Exception):
+    """The sub-agent model hit its max_tokens ceiling while producing a
+    response (e.g. the explore report needs ~2000-4500 output tokens but the
+    model's configured limit is smaller). This is a CONFIG problem, not a
+    transient model failure — falling back to the main model would just double
+    the latency and hide the cause, so it is raised instead and surfaced as an
+    actionable message (raise max_tokens / pick a model with a bigger output
+    limit in Settings → Tools)."""
+
+
+def _is_token_limit_error(exc: Exception) -> bool:
+    """True when an exception is a max-output-token ceiling hit (pydantic-ai /
+    provider wording varies: 'Model token limit (...) exceeded', 'max_tokens',
+    'maximum context length', ...)."""
+    text = str(exc).lower()
+    return any(
+        k in text
+        for k in (
+            "token limit",
+            "max_tokens",
+            "maximum context length",
+            "context length exceeded",
+            "output token",
+            "token budget",
+            "tokens exceeded",
+            "completion_tokens",
+        )
+    )
+
+
 class _PerStepFallbackModel:
     """A pydantic-ai model wrapper that gives the EXPLORE sub-agent PER-SUB-SEARCH
     fallback: EVERY model request first tries the primary (sub-agent) model; if
@@ -400,6 +434,14 @@ class _PerStepFallbackModel:
                     pass
             return response
         except Exception as exc:  # noqa: BLE001 — any primary failure → try the fallback model
+            # A max-output-token ceiling hit is a CONFIG problem (the sub-agent
+            # model's max_tokens is too small for the report), not a transient
+            # failure — silently re-running the request on the main model just
+            # doubles the latency and hides the cause. Raise it so the explore
+            # tool surfaces an actionable message (raise max_tokens in Settings
+            # → Tools) instead of a slow, unexplained fallback.
+            if _is_token_limit_error(exc):
+                raise _SubagentTokenLimitError(str(exc)) from exc
             if self._on_fallback is not None:
                 try:
                     self._on_fallback(exc)
@@ -4812,7 +4854,7 @@ def make_tool_callbacks(
             state: dict,
             branch_index: int = 0,
             branch_total: int = 1,
-            thoroughness: str = "medium",
+            thoroughness: str = "quick",
         ) -> str:
             """Run the isolated exploration sub-agent on ``model`` with the given
             task text (the task tool's ``prompt``) and return
@@ -5253,7 +5295,7 @@ def make_tool_callbacks(
             branch_id: int = 0,
             branch_index: int = 0,
             branch_total: int = 1,
-            thoroughness: str = "medium",
+            thoroughness: str = "quick",
         ) -> str:
             """Per-branch wrapper: stamps every sub-agent event with this
             branch id and the model that ACTUALLY ran it (the sub-agent model,
@@ -5364,6 +5406,19 @@ def make_tool_callbacks(
                 "The explore agent did not finish within its step budget — the task was likely too "
                 "broad. Split it into smaller, more specific task calls, or investigate the remaining "
                 "part yourself with grep/read.\n</task_result>\n</task>"
+            )
+        except _SubagentTokenLimitError as exc:
+            # The sub-agent model's max_tokens is too small for the report —
+            # a CONFIG problem, not a transient failure. Surface an actionable
+            # message instead of the generic failure text.
+            emit(_error_result("task", f"sub-agent token limit: {exc}"))
+            return _finish(
+                f'<task id="{_tid}" state="error">\n<task_result>\n'
+                f"ERROR: the explore sub-agent model ({_run_model_name}) hit its "
+                f"max_tokens limit while producing the report. The explore report "
+                f"needs ~2000-4500 output tokens — raise the model's max_tokens in "
+                f"Settings → Tools, or pick a model with a larger output limit.\n"
+                f"</task_result>\n</task>"
             )
         except Exception as exc:  # noqa: BLE001
             # Both the sub-agent model AND the main-model fallback failed a

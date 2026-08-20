@@ -76,12 +76,30 @@ export interface WorkspaceFile {
   name: string
 }
 
+/** Per-root quick-open cache (TTL like the Electron walk cache): Ctrl+P re-opens
+ *  re-walk the same tree every time; caching the file list per root for a few
+ *  seconds turns repeated opens into a map hit instead of a full IPC walk. */
+const WORKSPACE_CACHE_TTL_MS = 10_000
+const workspaceCache = new Map<string, { at: number; files: WorkspaceFile[] }>()
+
 export async function workspaceFiles(root: string): Promise<WorkspaceFile[]> {
+  const hit = workspaceCache.get(root)
+  if (hit && Date.now() - hit.at < WORKSPACE_CACHE_TTL_MS) return hit.files
   // Single-pass walk in the main process: fast, no per-directory IPC, and no
   // 800-file cap that used to silently drop whole subfolders (e.g. the second
   // of two project folders). Falls back to the old per-dir walk if unavailable.
   const walked = await api.fsWalk(root).catch(() => null)
-  if (walked) return walked
+  const files = walked ?? (await fallbackWalk(root))
+  workspaceCache.set(root, { at: Date.now(), files })
+  // Keep the cache bounded: drop the oldest entry when it grows past 20 roots.
+  if (workspaceCache.size > 20) {
+    const oldest = workspaceCache.keys().next().value
+    if (oldest !== undefined) workspaceCache.delete(oldest)
+  }
+  return files
+}
+
+async function fallbackWalk(root: string): Promise<WorkspaceFile[]> {
   const out: WorkspaceFile[] = []
   const stack: string[] = ['']
   while (stack.length > 0 && out.length < MAX_INDEXED) {

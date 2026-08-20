@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import { spawn } from 'child_process'
 import { getDataRoot } from '../store-db'
 
 /**
@@ -45,6 +46,46 @@ const SKIP_DIRS = new Set([
 
 const MAX_WALK_FILES = 50_000
 
+/** Per-root walk cache (TTL like backend/tools.py `_walk_cache`): Ctrl+P and
+ *  content search re-walk the same tree on every open/keystroke; caching the
+ *  file list per root for a few seconds turns repeated walks into a map hit. */
+const WALK_CACHE_TTL_MS = 10_000
+const walkCache = new Map<string, { at: number; files: string[] }>()
+
+function cachedWalk(root: string): string[] {
+  const hit = walkCache.get(root)
+  if (hit && Date.now() - hit.at < WALK_CACHE_TTL_MS) return hit.files
+  const files: string[] = []
+  const stack: string[] = [root]
+  while (stack.length > 0 && files.length < MAX_WALK_FILES) {
+    const dir = stack.pop()!
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const e of entries) {
+      if (files.length >= MAX_WALK_FILES) break
+      const full = path.join(dir, e.name)
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name)) continue
+        stack.push(full)
+      } else if (e.isFile()) {
+        if (e.name === '.DS_Store') continue
+        files.push(full)
+      }
+    }
+  }
+  walkCache.set(root, { at: Date.now(), files })
+  // Keep the cache bounded: drop the oldest entry when it grows past 50 roots.
+  if (walkCache.size > 50) {
+    const oldest = walkCache.keys().next().value
+    if (oldest !== undefined) walkCache.delete(oldest)
+  }
+  return files
+}
+
 /** Walk the whole workspace tree in ONE pass and return every file quick-open
  *  should index (relative path + name). Skips dependency/build dirs and
  *  dot-dirs like `.git`/`.cache`, but keeps other dotfiles (`.config`, `.env`,
@@ -54,29 +95,11 @@ const MAX_WALK_FILES = 50_000
 export function walkWorkspace(root: string): { rel: string; name: string }[] {
   if (!root || !fs.existsSync(root)) return []
   const out: { rel: string; name: string }[] = []
-  const stack: string[] = [root]
-  while (stack.length > 0 && out.length < MAX_WALK_FILES) {
-    const dir = stack.pop()!
-    let entries: fs.Dirent[]
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch {
-      continue
-    }
-    for (const e of entries) {
-      if (out.length >= MAX_WALK_FILES) break
-      const full = path.join(dir, e.name)
-      if (e.isDirectory()) {
-        if (SKIP_DIRS.has(e.name)) continue
-        stack.push(full)
-      } else if (e.isFile()) {
-        if (e.name === '.DS_Store') continue
-        out.push({
-          rel: path.relative(root, full).split(path.sep).join('/'),
-          name: e.name,
-        })
-      }
-    }
+  for (const full of cachedWalk(root)) {
+    out.push({
+      rel: path.relative(root, full).split(path.sep).join('/'),
+      name: path.basename(full),
+    })
   }
   out.sort((a, b) => a.rel.localeCompare(b.rel))
   return out
@@ -156,43 +179,121 @@ const TEXT_EXTENSIONS = new Set([
 ])
 
 const MAX_SEARCH_MATCHES = 200
-const MAX_SEARCH_FILES = 4000
 const MAX_SEARCH_BYTES = 2_000_000
 
 function walkFiles(root: string): string[] {
-  const out: string[] = []
-  const stack = [root]
-  while (stack.length > 0) {
-    const dir = stack.pop()!
-    let entries: fs.Dirent[]
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch {
-      continue
-    }
-    for (const e of entries) {
-      const full = path.join(dir, e.name)
-      if (e.isDirectory()) {
-        if (SKIP_DIRS.has(e.name)) continue
-        stack.push(full)
-      } else if (e.isFile()) {
-        if (e.name === '.DS_Store') continue
-        out.push(full)
-        if (out.length >= MAX_SEARCH_FILES) return out
-      }
-    }
-  }
-  return out
+  return cachedWalk(root)
 }
 
-export function searchContent(root: string, query: string): SearchMatch[] {
-  const q = query.toLowerCase().trim()
+/** ripgrep is the fast path for content search (the backend already uses it).
+ *  Build include/exclude globs from the SAME sets the JS walk uses so both
+ *  paths agree on what is searchable. */
+const RG_INCLUDE_GLOBS = [...TEXT_EXTENSIONS].map((ext) => `**/*${ext}`)
+const RG_EXCLUDE_GLOBS: string[] = []
+for (const d of SKIP_DIRS) {
+  RG_EXCLUDE_GLOBS.push(`!**/${d}/**`, `!**/${d}`)
+}
+
+/** Content search via ripgrep, spawned with cwd=root so match paths come back
+ *  relative to the root. Returns null when rg is unavailable so the caller
+ *  falls back to the JS scan. Non-blocking: the main process is never held up
+ *  on a big repo (the old sync read-every-file scan froze the whole app). */
+function rgSearch(root: string, query: string): Promise<SearchMatch[] | null> {
+  return new Promise((resolve) => {
+    const args = [
+      '--json', '-i', '-F', '--no-ignore', '--hidden', '--color', 'never',
+      '--max-filesize', String(MAX_SEARCH_BYTES),
+    ]
+    // Each glob MUST be its own `-g` flag — passing them bare makes rg treat
+    // them as positional paths (it then searches the WHOLE tree, e.g. a 4GB
+    // release/ dir, instead of pruning it).
+    for (const g of RG_INCLUDE_GLOBS) args.push('-g', g)
+    for (const g of RG_EXCLUDE_GLOBS) args.push('-g', g)
+    args.push('-e', query, '.')
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn('rg', args, { cwd: root, windowsHide: true })
+    } catch {
+      resolve(null)
+      return
+    }
+    let settled = false
+    const finish = (result: SearchMatch[] | null) => {
+      if (settled) return
+      settled = true
+      try {
+        child.kill()
+      } catch {
+        /* already exited */
+      }
+      resolve(result)
+    }
+    child.on('error', () => finish(null)) // ENOENT → rg not installed
+    const matches: SearchMatch[] = []
+    let buf = ''
+    if (child.stdout) {
+      child.stdout.on('data', (chunk: Buffer) => {
+        buf += chunk.toString('utf8')
+        let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl)
+          buf = buf.slice(nl + 1)
+          if (!line.trim()) continue
+          try {
+            const obj = JSON.parse(line) as {
+              type?: string
+              data?: {
+                path?: { text?: string }
+                line_number?: number
+                lines?: { text?: string }
+              }
+            }
+            if (obj.type === 'match' && obj.data) {
+              matches.push({
+                file: (obj.data.path?.text ?? '').replace(/\\/g, '/').replace(/^\.\//, ''),
+                line: obj.data.line_number ?? 0,
+                text: (obj.data.lines?.text ?? '').replace(/\n$/, '').slice(0, 300),
+              })
+              if (matches.length >= MAX_SEARCH_MATCHES) {
+                finish(matches)
+                return
+              }
+            }
+          } catch {
+            /* skip malformed line */
+          }
+        }
+      })
+      child.stdout.on('end', () => finish(matches))
+    }
+    child.on('close', () => finish(matches))
+    if (child.stderr) {
+      child.stderr.on('data', () => {
+        /* ignore */
+      })
+    }
+  })
+}
+
+export async function searchContent(root: string, query: string): Promise<SearchMatch[]> {
+  const q = query.trim()
   if (!q) return []
+  if (!root || !fs.existsSync(root)) return []
+  const fast = await rgSearch(root, q)
+  if (fast) return fast
+  return searchContentFallback(root, q)
+}
+
+/** Slow-path JS scan (used only when ripgrep is not installed): walks the tree
+ *  and reads every file. Kept as the fallback so content search still works
+ *  everywhere, but rg is ~100x faster on a real repo. */
+function searchContentFallback(root: string, query: string): SearchMatch[] {
+  const q = query.toLowerCase()
   const matches: SearchMatch[] = []
   for (const file of walkFiles(root)) {
     if (matches.length >= MAX_SEARCH_MATCHES) break
     const ext = path.extname(file).toLowerCase()
-    if (!TEXT_EXTENSIONS.has(ext) && !['.md', '.txt'].includes(ext)) continue
+    if (!TEXT_EXTENSIONS.has(ext)) continue
     let content: string
     try {
       const stat = fs.statSync(file)

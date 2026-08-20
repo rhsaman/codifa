@@ -74,8 +74,8 @@ export function DownloadModelGate({ onReady }: Props) {
         <div className="download-gate-icon">⬇</div>
         <div className="download-gate-title">Download the essential model</div>
         <div className="download-gate-sub">
-          Coder needs a local embedding model for RAG memory and automatic skill
-          selection. Download it once and it stays installed.
+          Coder needs a local embedding model for RAG memory. Download it once
+          and it stays installed.
         </div>
 
         <label className="download-gate-label">Model (HF repo id)</label>

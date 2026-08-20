@@ -35,13 +35,12 @@ logger = logging.getLogger(__name__)
 from vector_store import (
     KIND_FILE,
     KIND_MEMORY,
-    KIND_SKILL,
     KIND_WEB,
     VectorStore,
 )
 
 # All known kinds, in the order the context builder likes to see them.
-ALL_KINDS = (KIND_FILE, KIND_SKILL, KIND_WEB, KIND_MEMORY)
+ALL_KINDS = (KIND_FILE, KIND_WEB, KIND_MEMORY)
 
 # Score floors per backend (0..1). Exact is always accepted; FTS and semantic
 # need to clear a bar so weak matches don't pollute the context.
@@ -65,7 +64,6 @@ class RetrievalSettings:
     min_score: float = _SEMANTIC_MIN
     include_files: bool = True
     include_memory: bool = True
-    include_skills: bool = True
     include_web: bool = True
     auto_index: bool = True  # index workspace files on workspace open
     auto_recall: bool = True  # inject retrieved context into every prompt
@@ -90,7 +88,6 @@ class RetrievalSettings:
             min_score=float(_int("min_score", 25) / 100),
             include_files=_bool("include_files", True),
             include_memory=_bool("include_memory", True),
-            include_skills=_bool("include_skills", True),
             include_web=_bool("include_web", True),
             auto_index=_bool("auto_index", True),
             auto_recall=_bool("auto_recall", True),
@@ -102,8 +99,6 @@ class RetrievalSettings:
             kinds.append(KIND_FILE)
         if self.include_memory:
             kinds.append(KIND_MEMORY)
-        if self.include_skills:
-            kinds.append(KIND_SKILL)
         if self.include_web:
             kinds.append(KIND_WEB)
         return tuple(kinds) or ()

@@ -96,6 +96,14 @@ jobs:
       - name: Build renderer + electron
         run: npm run build
 
+      - name: Exclude workspace from Windows Defender
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # electron-builder runs the freshly-built (unsigned) Setup.exe to
+          # generate the uninstaller; Defender kills it with "Exit code: null".
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+
       - name: Package (${{ matrix.os }})
         run: npx electron-builder ${{ matrix.flags }} --publish never
 

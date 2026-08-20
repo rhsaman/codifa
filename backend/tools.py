@@ -34,7 +34,6 @@ from memory_manager import MEM_SHORT_TERM, MemoryConfig, MemoryManager
 from secret_utils import decrypt_secret
 from vector_store import (
     KIND_MEMORY,
-    KIND_SKILL,
     KIND_WEB,
     StoreConfig,
     VectorStore,
@@ -977,6 +976,7 @@ def read_file(root: str, path: str) -> dict:
 
 
 MAX_LINE_LENGTH = 2000  # chars; lines longer are truncated like opencode's read tool
+MAX_READ_EXCERPT_BYTES = 50_000  # total read-tool output cap, like opencode's read tool (50 KB)
 
 
 def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
@@ -992,6 +992,7 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
     lines: list[dict] = []
     total = 0
     truncated = False
+    bytes_used = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, raw in enumerate(fh, 1):
@@ -1004,7 +1005,18 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                         text[:MAX_LINE_LENGTH]
                         + f"… (line truncated to {MAX_LINE_LENGTH} chars)"
                     )
+                # opencode-style byte cap: stop once the accumulated output
+                # reaches MAX_READ_EXCERPT_BYTES so a huge file can't flood the
+                # context even when `limit` is large.
+                size = len(text.encode("utf-8", errors="replace")) + 1
+                if bytes_used + size > MAX_READ_EXCERPT_BYTES:
+                    truncated = True
+                    # keep scanning to count total lines (cheap) so the footer is right
+                    for _extra in fh:
+                        total += 1
+                    break
                 lines.append({"line": lineno, "text": text})
+                bytes_used += size
                 if len(lines) >= cap:
                     truncated = True
                     # keep scanning to count total lines (cheap) so the footer is right
@@ -1144,20 +1156,6 @@ def open_vector_store(
         return None
 
 
-def open_skill_store(base_dir: str = "") -> VectorStore | None:
-    """Open (or create) the global skill vector store (``skills.vectors.sqlite``).
-
-    Skills are indexed globally (not per workspace), so they live in one
-    sqlite file under ``base_dir`` (default ``~/.codifa/vector-db``). Returns
-    ``None`` when it can't be opened so callers degrade gracefully.
-    """
-    base_dir = base_dir or _state_db.vector_db_dir()
-    try:
-        os.makedirs(base_dir, exist_ok=True)
-        return VectorStore(os.path.join(base_dir, "skills.vectors.sqlite"))
-    except Exception:  # noqa: BLE001
-        return None
-
 
 def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
     """Pull ``name`` and ``description`` from a skill's markdown frontmatter.
@@ -1185,15 +1183,12 @@ def persist_skill(
     raw: str,
     fallback_name: str = "",
     previous_name: str = "",
-    store: VectorStore | None = None,
 ) -> dict:
-    """Persist a skill to the app database and re-embed it in the vector store.
+    """Persist a skill to the app database.
 
     ``raw`` is the full skill markdown (frontmatter + body). The name and
-    description are parsed from the frontmatter; the whole skill is embedded
-    (name/description + body) under the synthetic id ``db://skills/<slug>`` so
-    auto-selection keeps working. The id is a virtual key — skills live in the
-    app database and the vector store, never as files on disk.
+    description are parsed from the frontmatter. The id is a virtual key —
+    skills live in the app database, never as files on disk.
     """
     name, description, body = _parse_skill_markdown(raw)
     if not name:
@@ -1210,59 +1205,22 @@ def persist_skill(
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
         _state_db.delete_skill(previous_name)
-
-    indexed = False
-    note = f"skill '{name}' saved to the app database"
-    if store is None:
-        store = open_skill_store()
-    if store is not None:
-        try:
-            # Index only the name+description passage (same as
-            # _sync_skills_to_store): the body is instructions, not a
-            # description of what the skill IS, and embedding it inflates
-            # semantic scores with irrelevant content.
-            store.upsert_doc(
-                path,
-                KIND_SKILL,
-                name,
-                [f"{name}. {description}"],
-            )
-            if previous_name and previous_name != name:
-                prev_slug = slugify(previous_name)
-                # Drop any legacy ~/.coder/... vector ids for the old name.
-                store.remove(f"~/.coder/skills/{prev_slug}/SKILL.md")
-                store.remove(f"db://skills/{prev_slug}")
-            indexed = True
-        except EmbedderUnavailableError as exc:
-            note = f"{note} (not indexed yet: {exc})"
-        except Exception as exc:  # noqa: BLE001
-            note = f"{note} (vector update failed: {exc})"
-    return {"ok": True, "name": name, "slug": slug, "indexed": indexed, "note": note}
+    return {
+        "ok": True,
+        "name": name,
+        "slug": slug,
+        "note": f"skill '{name}' saved to the app database",
+    }
 
 
-def remove_skill(name: str, store: VectorStore | None = None) -> dict:
-    """Delete a skill from the app database and its vectors."""
+def remove_skill(name: str) -> dict:
+    """Delete a skill from the app database."""
     try:
         removed = _state_db.delete_skill(name)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "note": f"could not remove skill: {exc}"}
-    if store is None:
-        store = open_skill_store()
-    if store is not None:
-        try:
-            store.remove(f"db://skills/{slugify(name)}")
-            store.remove(f"~/.coder/skills/{slugify(name)}/SKILL.md")
-        except Exception:  # noqa: BLE001, S110 — vector removal is best-effort
-            pass
     return {"ok": True, "removed": removed, "note": f"skill '{name}' removed"}
 
-
-def skill_store_status() -> tuple[VectorStore | None, str]:
-    """Open the global skill store, returning it plus a status note."""
-    store = open_skill_store()
-    if store is None:
-        return None, "skill index unavailable"
-    return store, ""
 
 
 def _builtin_skills_dir() -> str:
@@ -1550,9 +1508,9 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
 
     ``name`` is the display name, ``description`` is indexed for the system
     prompt, and ``content`` is the full markdown body (step-by-step
-    instructions). The skill is stored in the state DB and embedded into the
-    global skill vector store; an existing skill of the same name is replaced.
-    The ``root`` argument is kept for API compatibility and is not used.
+    instructions). The skill is stored in the state DB; an existing skill of
+    the same name is replaced. The ``root`` argument is kept for API
+    compatibility and is not used.
     """
     body = content.strip()
     if not body:
@@ -1574,7 +1532,6 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
         "path": f"db://skills/{slugify(name)}",
         "name": result["name"],
         "ok": True,
-        "indexed": result["indexed"],
         "note": result["note"],
     }
 
@@ -3301,7 +3258,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
     ) -> str:
-        """Create or update a reusable skill in the app database (global). `name` display name; `description` one-line when-to-use; `content` full markdown body. Skills live ONLY in the app DB + vector store — never write skill files to disk; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or update a reusable skill in the app database (global). `name` display name; `description` one-line when-to-use; `content` full markdown body. Skills live ONLY in the app DB — never write skill files to disk; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",
@@ -3453,10 +3410,7 @@ def make_tool_callbacks(
             msg = result["error"]
             emit(_error_result("create_skill", msg))
             return f"ERROR creating skill {name!r}: {msg}"
-        indexed = result.get("indexed")
         summary = f"saved to the app database as skill {name!r}"
-        if indexed is False:
-            summary += " (not indexed — no embedding model available)"
         emit(
             {
                 "kind": "tool_result",
@@ -6124,9 +6078,7 @@ def make_tool_callbacks(
             }
         )
         try:
-            granted = await asyncio.wait_for(fut, timeout=300)
-        except asyncio.TimeoutError:
-            granted = False
+            granted = await fut
         finally:
             permission_gates.pop(pid, None)
         if granted:
@@ -6170,9 +6122,7 @@ def make_tool_callbacks(
             }
         )
         try:
-            granted = await asyncio.wait_for(fut, timeout=300)
-        except asyncio.TimeoutError:
-            granted = False
+            granted = await fut
         finally:
             permission_gates.pop(pid, None)
         if granted:
@@ -6208,14 +6158,12 @@ def make_tool_callbacks(
         ask_gates[aid] = fut
         emit({"kind": "ask", "id": aid, "question": question, "options": options or []})
         try:
-            answer = await asyncio.wait_for(fut, timeout=600)
-        except asyncio.TimeoutError:
-            answer = ""
+            answer = await fut
         finally:
             ask_gates.pop(aid, None)
         if not answer:
-            emit(_error_result("ask_user", "no answer (timed out)"))
-            return "The user did not answer in time. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
+            emit(_error_result("ask_user", "no answer"))
+            return "The user submitted an empty answer. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
         emit(
             {
                 "kind": "tool_result",

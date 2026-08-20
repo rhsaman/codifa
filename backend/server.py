@@ -448,7 +448,7 @@ async def system_prompts() -> dict:
     return {"chat": SYSTEM_PROMPTS["chat"], "codewriter": SYSTEM_PROMPTS["codewriter"]}
 
 
-# --- skills (stored in the app database, embedded in the skill vector store) - #
+# --- skills (stored in the app database) ---------------------------------- #
 
 
 class SkillSyncRequest(BaseModel):

@@ -490,7 +490,7 @@ export async function listSkills(): Promise<SkillRow[]> {
   }
 }
 
-/** Create/update/delete a skill in the app database (+ vector store). */
+/** Create/update/delete a skill in the app database. */
 export async function syncSkill(params: {
   name: string
   previousName?: string

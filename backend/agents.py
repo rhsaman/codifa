@@ -86,7 +86,6 @@ from tools import (
     _tool_event,
     list_files,
     make_tool_callbacks,
-    open_skill_store,
     open_vector_store,
     read_file,
     remember,
@@ -94,7 +93,7 @@ from tools import (
     slugify,
     user_coder_dir,
 )
-from vector_store import KIND_MEMORY, KIND_SKILL, VectorStore
+from vector_store import KIND_MEMORY, VectorStore
 
 # Steer messages injected into a RUNNING agent without interrupting it. Keyed
 # by chat_id; each entry is {"id", "prompt"}. The frontend POSTs here while the
@@ -648,6 +647,11 @@ _SEARCH_RULE = (
     "in an isolated context and returns a report.\n"
     "3. Fire the searches you already know you need in the SAME turn (parallel "
     "tool calls) instead of one at a time.\n"
+    "4. CONTEXT BUDGET: the explore subagent runs in an isolated context and "
+    "only its compact report enters your context — so for multi-file research "
+    "DELEGATE to explore instead of reading many files yourself. When you do "
+    "read a large file, page it with read offset/limit (e.g. limit=300) instead "
+    "of dumping the whole file into context.\n"
     "NEVER search or read project files with run_terminal or scripts — only "
     "the file tools (grep / glob / read / explore)."
 )
@@ -1624,11 +1628,13 @@ def _usage_event(usage, model: str = "") -> dict | None:
 # keeps small-context models (8k) from dying with
 # `request (N tokens) exceeds the available context size (M tokens)`.
 #
-# Fixed at 80% of the window for every model size — compact only once real
-# usage pressure shows up, not pre-emptively on small windows.
+# Fixed at 60% of the window for every model size — compact before real usage
+# pressure shows up, so the in-flight turn stays small (opencode compacts when
+# total tokens approach the window; 60% is a safe pre-emptive point that keeps
+# small-context models (8k) well clear of the hard limit).
 def _preemptive_compact_fraction(ctx: int) -> float:
     """Fraction of the context window at which to compact pre-emptively."""
-    return 0.80
+    return 0.60
 
 
 # Deterministic tool-loop budget. pydantic-ai re-sends the ENTIRE accumulated
@@ -1641,18 +1647,17 @@ def _preemptive_compact_fraction(ctx: int) -> float:
 # aggressive for a 1M-context model: a real Coder turn routinely runs 30+ tool
 # calls at a few hundred tokens each, so a flat cap would stop and "compact" a
 # turn whose actual usage is ~20k of 1M tokens. Scale the cap with the window —
-# ~24 steps for small models, capped at 80 even for huge windows. 500-at-1M
-# let a turn balloon to reality-check pressure (each tool loop step re-sends the
-# whole accumulated transcript, so 500 steps on a big window is far more than a
-# browser window worth of tokens). 80 is the observed practical bound for a
-# broad-but-legitimate turn; a step-budget hit still widens-and-resumes (with
-# the tool log) rather than hard-failing, so the cap only bounds how fast the
-# widening happens, not whether the work can finish.
+# ~12 steps for small models, capped at 30 even for huge windows. Each tool
+# loop step re-sends the whole accumulated transcript, so a tighter cap keeps
+# the per-turn context small (opencode's default is ~10 steps). A step-budget
+# hit still widens-and-resumes (with the tool log) rather than hard-failing, so
+# the cap only bounds how fast the widening happens, not whether the work can
+# finish.
 def _tool_steps_compact_at(ctx: int) -> int:
     """Max tool-loop steps before the deterministic compact safety net fires."""
     if ctx <= 0:
-        return 24
-    return max(24, min(ctx // 2_000, 80))
+        return 12
+    return max(12, min(ctx // 4_000, 30))
 
 
 class _HighWatermark(Exception):
@@ -3169,9 +3174,11 @@ def _skills_section(skills: list[dict]) -> str:
     lines = [
         "\n\n=== AVAILABLE SKILLS ===",
         (
-            "These skills are available. If the user's request matches one, call "
-            "the read_skill tool with its exact name to load its full instructions, "
-            "then follow them exactly. The rest are listed by name + description."
+            "These skills are available. They are used ONLY when the user "
+            "explicitly attaches one with @mention in the message (the attached "
+            "skill's full instructions are inlined). You may also call read_skill "
+            "to inspect one when the user asks about it. The rest are listed by "
+            "name + description."
         ),
     ]
     for s in skills:
@@ -3211,532 +3218,6 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
         "If this message continues that task, follow this plan. If it is a new, "
         "unrelated task, ignore it."
     )
-
-
-# In-memory fingerprint of the last skill set indexed per store, so repeated
-# auto-select turns don't re-embed unchanged skills on every single run.
-_skill_sync_cache: dict[str, str] = {}
-
-
-def _sync_skills_to_store(store: VectorStore | None, skills: list[dict]) -> None:
-    """Index loaded skills into the global skill vector store (kind ``skill``).
-
-    Each skill is stored under its path so retrieval maps straight back to the
-    full skill dict. Passages are embedded in one batched call, and re-indexing
-    is skipped entirely while the skill set is unchanged (tracked per store).
-    Never raises; indexing failure just means auto-selection falls back to no
-    skills.
-    """
-    if store is None:
-        return
-    fp = hashlib.sha256(
-        (
-            "\x00".join(f"{s['path']}\x01{s.get('content') or ''}" for s in skills)
-        ).encode()
-    ).hexdigest()
-    if _skill_sync_cache.get(store.db_path) == fp:
-        return
-    entries: list[tuple[str, str, str, Sequence[str]]] = []
-    for s in skills:
-        name = s["name"]
-        desc = s.get("description") or ""
-        # Index ONLY the name+description passage. The body is instructions for
-        # the model, not a description of what the skill IS — embedding it
-        # inflates semantic scores with irrelevant content (measured: the
-        # Testing skill's body made it top-scorer for "یه کد پایتون بنویس").
-        # Selection should match the skill's purpose, so the body stays out of
-        # the vector index.
-        prefix = f"{name}. {desc}".strip()
-        if prefix:
-            entries.append((s["path"], KIND_SKILL, name, [prefix]))
-        # Drop any legacy ~/.coder/skills/<slug>/SKILL.md vector id from before
-        # skills moved to the db://skills/<slug> scheme, so they don't linger.
-        try:
-            store.remove(f"~/.coder/skills/{slugify(name)}/SKILL.md")
-        except Exception:  # noqa: BLE001, S110 — cleanup is best-effort
-            pass
-    try:
-        store.upsert_many(entries)
-        _skill_sync_cache[store.db_path] = fp
-    except Exception:  # noqa: BLE001 — one bad skill must not stop the batch
-        _skill_sync_cache.pop(store.db_path, None)
-
-
-# Persian → English tech-term aliases so a Persian prompt can match an
-# English-named skill ("گیت" -> git-workflow, "سئو" -> seo-optimization).
-# Both the prompt token and its alias are matched against skill names and
-# descriptions. This is what makes skills reliably findable across languages
-# when the embedding band can't tell them apart.
-_SKILL_ALIASES: dict[str, str] = {
-    # git / version control
-    "گیت": "git",
-    "پوش": "push",
-    "کامیت": "commit",
-    "برنچ": "branch",
-    "مرج": "merge",
-    "ریپو": "repo",
-    # testing
-    "تست": "test",
-    # web / design
-    "طراحی": "design",
-    "داشبورد": "dashboard",
-    "وبسایت": "website",
-    "سایت": "site",
-    "لندینگ": "landing",
-    "پیج": "page",
-    "فرانتاند": "frontend",
-    "بکاند": "backend",
-    "ریاکت": "react",
-    "نود": "node",
-    "وب": "web",
-    "ادمین": "admin",
-    "موبایل": "mobile",
-    "دسکتاپ": "desktop",
-    "اپ": "app",
-    # content / writing
-    "ایمیل": "email",
-    "مقاله": "article",
-    "خلاصه": "summar",
-    "ترجمه": "translate",
-    "سئو": "seo",
-    "قیمت": "pricing",
-    "فروش": "pricing",
-    "گزارش": "report",
-    # infra / data
-    "پایتون": "python",
-    "دیتابیس": "database",
-    "سرور": "server",
-    "داکر": "docker",
-    "دیپلوی": "deploy",
-    "کلاد": "cloud",
-    "ایپیآی": "api",
-    "دیتا": "data",
-    "تحلیل": "analysis",
-    # mentor / teaching
-    "منتور": "mentor",
-    "مربی": "mentor",
-    "آموزش": "teach",
-    "درس": "teach",
-    "یادگیری": "learn",
-    # debugging / quality
-    "دیباگ": "debug",
-    "باگ": "bug",
-    "خطا": "error",
-    "امنیت": "security",
-    "پرفورمنس": "performance",
-    "بهینه": "optimize",
-    # auth / payments
-    "ورود": "login",
-    "ثبتنام": "signup",
-    "پرداخت": "payment",
-    "درگاه": "payment",
-    # chat / ai
-    "چت": "chat",
-    "ربات": "bot",
-    "مدل": "model",
-    "اسکرپت": "script",
-    "اتوماسیون": "automation",
-    # browser / extension
-    "مرورگر": "browser",
-    "اکستنشن": "extension",
-    "پلاگین": "plugin",
-    # ui / ux
-    "قالب": "template",
-    "تم": "theme",
-    "فونت": "font",
-    "آیکون": "icon",
-    "انیمیشن": "animation",
-    "فرم": "form",
-    "جدول": "table",
-    "چارت": "chart",
-    "نمودار": "chart",
-    "نقشه": "map",
-    # media
-    "ویدیو": "video",
-    "صدا": "audio",
-    "تصویر": "image",
-    "آپلود": "upload",
-    "دانلود": "download",
-    "میانبر": "shortcut",
-    "کامپایل": "compile",
-    "بیلد": "build",
-    "شبکه": "network",
-}
-
-# Generic / ambiguous words that are NOT distinctive skill signals. A word like
-# "پروژه" (project) appears in too many descriptions, and "رسمی" is a homonym
-# ("formal email" vs "راهنمای رسمی" = official guide in a design skill) — a
-# literal match on these produces false positives, so they are dropped before
-# keyword matching. Keep this list small and focused on words that measurably
-# misfire; distinctive terms must stay out of it.
-_SKILL_WEAK_KEYWORDS: set[str] = {
-    # Persian
-    "پروژه",
-    "کار",
-    "بنویس",
-    "بساز",
-    "ساخت",
-    "ساختن",
-    "رسمی",
-    "کمک",
-    "بهتر",
-    "درست",
-    "کن",
-    "کردن",
-    "میخوام",
-    "لطفا",
-    "باید",
-    "میشه",
-    "برام",
-    "بده",
-    "ادامه",
-    "ببین",
-    "چرا",
-    "چطوری",
-    "سلام",
-    "خوبی",
-    "مرسی",
-    "ممنون",
-    "یه",
-    "یک",
-    "رو",
-    "تو",
-    "که",
-    "این",
-    "اون",
-    "بعد",
-    "الان",
-    "فقط",
-    "خیلی",
-    "جدید",
-    "بزرگ",
-    "کوچک",
-    "هوش",
-    "متن",
-    "کاربر",
-    "سیستم",
-    "برنامه",
-    "فایل",
-    "پوشه",
-    "داخل",
-    "خارج",
-    # English
-    "project",
-    "write",
-    "build",
-    "make",
-    "help",
-    "better",
-    "fix",
-    "work",
-    "want",
-    "please",
-    "need",
-    "create",
-    "do",
-    "get",
-    "use",
-    "can",
-    "will",
-    "would",
-    "should",
-    "about",
-    "with",
-    "from",
-    "into",
-    "your",
-    "this",
-    "that",
-    "some",
-    "new",
-    "good",
-    "great",
-    "hello",
-    "hi",
-    "thanks",
-    "thank",
-    "code",
-    "run",
-    "show",
-    "tell",
-    "give",
-    "add",
-    "change",
-    "update",
-    "set",
-    "find",
-    "search",
-    "open",
-    "close",
-    "start",
-    "stop",
-    "check",
-    "see",
-    "look",
-    "read",
-    "send",
-    "call",
-    "go",
-    "back",
-    "just",
-    "only",
-    "very",
-    "really",
-    "also",
-    "still",
-    "even",
-    "let",
-    "put",
-    "take",
-    "know",
-    "think",
-    "say",
-    "skill",
-    "اسکیل",
-    "مهارت",
-}
-
-
-def _skill_forms(t: str) -> list[str]:
-    """Lowercased token plus its English alias expansion (if any)."""
-    tl = t.lower()
-    alias = _SKILL_ALIASES.get(tl)
-    return [tl, alias.lower()] if alias else [tl]
-
-
-def _skill_kw_in(tl: str, hay: str) -> bool:
-    # Exact substring, plus a light English-plural fallback ("tests" ->
-    # "test" matches a description that says "testing").
-    return tl in hay or (tl.endswith("s") and tl[:-1] in hay)
-
-
-def _skill_keyword_matches(
-    prompt: str, skills: list[dict]
-) -> list[tuple[int, dict, bool]]:
-    """Skills whose NAME, DESCRIPTION or BODY literally contains a significant
-    prompt keyword (see ``_fts_keywords``).
-
-    This is the precise, language-exact tier of skill selection: e5 cosine sits
-    in a compressed band (~0.78-0.83) where the top-1 is often noise, but a
-    skill whose name/description literally contains the prompt's keyword (e.g.
-    "تست" -> a testing skill, "git" -> git-workflow) is a strong signal the
-    embedding can't reliably reproduce. Two guards keep it precise:
-
-    * ``_SKILL_WEAK_KEYWORDS`` — generic/ambiguous words (پروژه، بنویس، رسمی،
-      project, write, ...) are dropped first, so a "formal email" request can't
-      match a design skill whose description says "راهنمای رسمی" (official).
-    * ``_SKILL_ALIASES`` — a Persian token is also matched by its English alias
-      ("گیت" -> "git"), so Persian prompts reach English-named skills.
-
-    A NAME hit is categorically stronger than a description mention — a skill
-    NAMED "Testing" is unambiguous, while "test" in decision-making's
-    "test assumptions" is a false positive. So when any skill has a name hit,
-    only name-hit skills are returned; description-only matches are used only
-    when nothing matched by name.
-
-    Returns ``(weight, skill, name_hit)`` triples ordered by weight (name hits
-    double, then name, for stability); ``[]`` when no keyword matches. Never
-    raises.
-    """
-    tokens = _fts_keywords(prompt, max_terms=8)
-    if not tokens:
-        return []
-    tokens = [t for t in tokens if t.lower() not in _SKILL_WEAK_KEYWORDS]
-    if not tokens:
-        return []
-
-    name_hit: list[tuple[int, dict, bool]] = []
-    desc_only: list[tuple[int, dict, bool]] = []
-    body_only: list[tuple[int, dict, bool]] = []
-    for s in skills:
-        name = str(s.get("name") or "").lower()
-        desc = str(s.get("description") or "").lower()
-        body = str(s.get("content") or "").lower()
-        name_hits = 0
-        desc_hits = 0
-        body_hits = 0
-        for t in tokens:
-            for form in _skill_forms(t):
-                if _skill_kw_in(form, name):
-                    name_hits += 1
-                    break
-                if _skill_kw_in(form, desc):
-                    desc_hits += 1
-                    break
-                if _skill_kw_in(form, body):
-                    body_hits += 1
-                    break
-        if name_hits:
-            name_hit.append((name_hits * 2 + desc_hits, s, True))
-        elif desc_hits:
-            desc_only.append((desc_hits, s, False))
-        elif body_hits:
-            # A token found only in the skill BODY is the weakest keyword
-            # signal: bodies are long and full of generic words, so a body hit
-            # alone never passes outright — it still needs the semantic floor
-            # (same gate as description-only) to confirm the skill is actually
-            # relevant to the prompt. This catches skills whose distinctive
-            # terms live in the instructions rather than the name/description.
-            body_only.append((body_hits, s, False))
-
-    def _sort(pool: list[tuple[int, dict, bool]]) -> list[tuple[int, dict, bool]]:
-        pool.sort(key=lambda x: (x[0], str(x[1].get("name") or "").lower()))
-        return list(reversed(pool))
-
-    # Name hits win outright; description-only matches fill in only when no
-    # skill is named after a prompt keyword; body-only matches are the last
-    # resort (and still need the semantic floor to be accepted).
-    if name_hit:
-        return _sort(name_hit)
-    if desc_only:
-        return _sort(desc_only)
-    return _sort(body_only)
-
-
-# Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
-# selection. Measured on the real skill set: irrelevant prompts ("یه کد پایتون
-# بنویس", "پروژه رو پوش کن تو گیت") score a compressed band (~0.78-0.83) where
-# the top-1 is often noise, while genuine matches ("تست بنویس برای پروژه",
-# "طراحی UI برای داشبورد") clear ~0.84. The keyword tier (with Persian→English
-# aliases) is the primary selector; the semantic tier is a high-confidence
-# safety net that only fires on unambiguous matches, so both the absolute floor
-# and the gap are deliberately strict.
-_SKILL_GAP_MIN = 0.008
-
-# Absolute semantic floor for DESCRIPTION-ONLY keyword hits. A name hit is
-# unambiguous and needs no floor; a description-only hit is accepted only when
-# its semantic score clears this floor. Distinctiveness (how many skills share
-# the token) is deliberately NOT a gate: a token can be unique to one skill yet
-# irrelevant to the prompt (measured: "چجوری این ریپو رو کاری کنم دیده بشه و
-# ادم ها بهش استار بدن؟" matched a design skill via "ادم" with df==1 but
-# semantic 0.77). The embedding is the only signal that confirms relevance, so
-# it is required. This is a general absolute — not tuned to any specific skill —
-# so it keeps working for skills added later.
-#
-# Raised to 0.84 (same as the semantic tier's absolute floor): since picked
-# skills now have their FULL body inlined, a false positive costs real tokens,
-# so description-only hits must clear the same high-confidence bar as pure
-# semantic matches. Measured irrelevant prompts top out at ~0.83.
-_SKILL_DESC_FLOOR = 0.84
-
-
-def _auto_select_skills(
-    store: VectorStore | None,
-    skills: list[dict],
-    prompt: str,
-    top_k: int = 2,
-    rel_gap: float = 0.02,
-    min_abs: float = 0.84,
-) -> list[dict]:
-    """Pick the most relevant skills for ``prompt``.
-
-    Two tiers, because mean-pooled e5 cosine alone sits in a compressed band
-    (~0.78-0.83) where the top-1 is often noise (measured: "پروژه رو پوش کن تو
-    گیت" scored Testing 0.788 / design skills 0.775 — irrelevant winners over
-    the real git-workflow skill, and "یه کد پایتون بنویس" scored Testing 0.831):
-
-    1. KEYWORD tier (precise): significant prompt words matched against each
-       skill's NAME + DESCRIPTION (``_skill_keyword_matches``). Generic words
-       (پروژه/بنویس/رسمی/...) are dropped and Persian tokens are expanded by
-       their English alias ("گیت" -> git), so a skill whose name/description
-       contains a distinctive prompt word is found exactly — this is what makes
-       a skill reliably findable even when the embedding band can't tell it
-       apart. Ranked by hit weight (name hits double) then semantic score.
-       A NAME hit is unambiguous and passes outright (the embedding can't be
-       trusted for Persian — "پروژه رو پوش کن تو گیت" scores git-workflow below
-       0.77, yet the alias "گیت"->git in the name is a certain match). A
-       DESCRIPTION-only hit is accepted only when its semantic score clears
-       ``_SKILL_DESC_FLOOR``: the embedding is the only signal that confirms the
-       token is relevant to the prompt, not merely present in the description.
-       Distinctiveness (df) is deliberately NOT used — a token unique to one
-       skill can still be irrelevant (measured: "چجوری این ریپو رو کاری کنم
-       دیده بشه و ادم ها بهش استار بدن؟" matched a design skill via "ادم" with
-       df==1 but semantic 0.77). Because the floor is a general absolute
-       computed from the live skill set, it keeps working for skills added
-       later.
-
-    2. SEMANTIC tier (high-confidence fallback): only when no keyword matches.
-       The absolute floor (``min_abs``) and the top-vs-runner-up gap gate
-       (``_SKILL_GAP_MIN``) are deliberately strict because the compressed band
-       makes low scores indistinguishable from noise — measured irrelevant
-       prompts top out at ~0.83 while genuine matches clear ~0.84. A single
-       installed skill needs no gap — it clears the absolute floor or it
-       doesn't. Near-ties within ``rel_gap`` of the best are all returned (not
-       just the top-1): with a compressed band the model is better placed to
-       pick among them.
-
-    Returns up to ``top_k`` skills. Candidates are mapped back to the loaded
-    skill dicts by their ``path`` key. Falls back to ``[]`` when the store is
-    unavailable or nothing clears the gate — never raises.
-    """
-    if not prompt or not skills or store is None:
-        return []
-    by_path = {s["path"]: s for s in skills}
-    try:
-        # Ask for several chunks per skill: each skill is stored as multiple
-        # passages, so a top_k equal to the skill count can collapse to a single
-        # skill after dedup.
-        hits = store.search(
-            prompt, kind=KIND_SKILL, top_k=max(len(skills) * 4, 8), min_score=0.0
-        )
-    except Exception:  # noqa: BLE001
-        hits = []
-    sem: dict[str, float] = {}
-    for hit in hits:
-        key = hit.get("key")
-        if key and key not in sem and key in by_path:
-            sem[key] = float(hit.get("score", 0.0))
-
-    # Tier 1: exact keyword match on name/description. A NAME hit is
-    # unambiguous and passes outright (the embedding can't be trusted for
-    # Persian — "پروژه رو پوش کن تو گیت" scores git-workflow below 0.77, yet
-    # the alias "گیت"->git in the name is a certain match). A DESCRIPTION-only
-    # hit is accepted only when its semantic score clears _SKILL_DESC_FLOOR:
-    # the embedding is the only signal that confirms the token is relevant to
-    # the prompt, not just present in the description. Distinctiveness (df) is
-    # deliberately NOT used — a token unique to one skill can still be
-    # irrelevant (measured: "چجوری این ریپو رو کاری کنم دیده بشه و ادم ها بهش
-    # استار بدن؟" matched a design skill via "ادم" with df==1 but semantic
-    # 0.77). Because the floor is a general absolute computed from the live
-    # skill set, it keeps working for skills added later.
-    kw = _skill_keyword_matches(prompt, skills)
-    if kw:
-        kept: list[tuple[int, dict]] = []
-        for weight, s, name_hit in kw:
-            if name_hit or sem.get(s["path"], 0.0) >= _SKILL_DESC_FLOOR:
-                kept.append((weight, s))
-        if kept:
-            # _skill_keyword_matches already puts name-hit skills first; within
-            # that ordering break weight ties by semantic score so a name-hit
-            # skill is never outranked by a description-only match that happens
-            # to embed closer to the prompt.
-            ranked = sorted(
-                kept,
-                key=lambda ws: (-ws[0], -sem.get(ws[1]["path"], 0.0)),
-            )
-            return [s for _, s in ranked[:top_k]]
-
-    # Tier 2: semantic-only fallback.
-    scores = sorted(sem.items(), key=lambda x: x[1], reverse=True)
-    if not scores:
-        return []
-    best_score = scores[0][1]
-    # Absolute gate: a compressed-band top score means the prompt didn't
-    # genuinely match anything (greetings, small talk) — do not attach a skill.
-    if best_score < min_abs:
-        return []
-    # Relative gate: the top candidate must stand out from the runner-up, or
-    # the band is just noise. A single skill needs no gap.
-    if len(scores) > 1 and best_score - scores[1][1] < _SKILL_GAP_MIN:
-        return []
-    picked: list[dict] = []
-    for key, score in scores[:top_k]:
-        if score < best_score - rel_gap:  # drop the long tail of near-ties
-            break
-        skill = by_path[key]
-        if skill not in picked:
-            picked.append(skill)
-    return picked[:top_k]
 
 
 def _run_mcp_config(servers: dict) -> str | None:
@@ -4486,7 +3967,7 @@ async def run_agent(
         # drop their schemas too — the agent only needs the read tools to
         # answer "سلام". This is a pure token win (smaller tool schema sent
         # every round), with zero quality cost: RAG context injection and
-        # auto-selected skills are unaffected (they're not tools).
+        # manually attached skills are unaffected (they're not tools).
         for name in (
             "web_search",
             "fetch_url",
@@ -4674,7 +4155,7 @@ async def run_agent(
             toolsets = None
         if toolsets:
             # Surface which MCP connectors were active for this turn, mirroring
-            # the "Auto-selected skills" note. MCP tool calls run through
+            # the "Attached skills" note. MCP tool calls run through
             # pydantic-ai's toolset machinery and never emit `tool` events, so
             # without this the user has no way to see MCP was in play.
             yield {"kind": "mcp", "servers": list((mcp_servers or {}).keys())}
@@ -4909,11 +4390,9 @@ async def run_agent(
 
     all_skills = _load_skills(root)
     picked: list[dict] = []
-    skill_note = ""
     # Explicit @mention attachment: the user named the skills they want this
-    # turn. ONLY those are loaded — auto-selection is skipped entirely so a
-    # manually-attached skill never gets overridden by (or mixed with) an
-    # auto-picked one.
+    # turn. ONLY those are loaded — there is no auto-selection, so a skill is
+    # never attached unless the user picks it.
     manual_names = [n.strip() for n in (skills or []) if n and n.strip()]
     if manual_names:
         by_name = {s["name"].lower(): s for s in all_skills}
@@ -4930,51 +4409,16 @@ async def run_agent(
                 "skills": [],
                 "note": f"attached skill(s) not found: {', '.join(manual_names)}",
             }
-    elif prompt:
-        # RAG auto-selection: index the skills, retrieve the ones closest to the
-        # user's message, and feed only those to the agent. Always on — there is
-        # no toggle (matches opencode/codex, where selection is automatic and
-        # quiet). Runs in all three modes (ask / coder / plan) — a vectorized
-        # skill is useful context regardless of which mode is asking.
-        skill_store = None
-        try:
-            skill_store = open_skill_store()
-        except Exception:  # noqa: BLE001
-            skill_store = None
-        if not all_skills:
-            skill_note = "no skills installed — create one with /skill <description> or in Settings → Skills"
-        elif skill_store is None:
-            skill_note = "skills installed but the skill index is unavailable"
-        else:
-            try:
-                _sync_skills_to_store(skill_store, all_skills)
-                picked = _auto_select_skills(skill_store, all_skills, prompt)
-            except Exception as exc:  # noqa: BLE001 — never let indexing break the run
-                picked = []
-                skill_note = f"skills not indexed: {exc}"
-        if picked:
-            yield {"kind": "skill", "skills": [s["name"] for s in picked]}
-        elif skill_note:
-            # Surface only the notable cases (nothing installed, index
-            # unavailable, indexing failed). "No match" is the routine outcome
-            # and stays quiet so it doesn't spam every message.
-            yield {"kind": "skill", "skills": [], "note": skill_note}
-        else:
-            # No skill specifically matched this prompt. Keep the compact
-            # catalog available so the agent can still answer "what skills do
-            # I have?" and knows what exists for future requests.
-            yield {"kind": "skill", "skills": []}
 
     # Discovery: names + descriptions of every skill are always injected so the
     # agent knows what exists; full bodies are loaded on demand via read_skill
     # (see _skills_section).
     if all_skills:
-        # Auto-selected (or manually attached) skills are inlined in FULL —
-        # their whole body — so the agent actually follows them without a
-        # read_skill round-trip. The "needed" determination was already made
-        # (auto-selection or an explicit @mention). The rest stay as a compact
-        # name+description catalog so token cost stays bounded: only the picked
-        # skill(s) pay the full-body price, never the whole library.
+        # Manually attached skills are inlined in FULL — their whole body — so
+        # the agent actually follows them without a read_skill round-trip. The
+        # rest stay as a compact name+description catalog so token cost stays
+        # bounded: only the attached skill(s) pay the full-body price, never
+        # the whole library.
         picked_names = {s["name"] for s in picked}
         section = _skills_section(
             [s for s in all_skills if s["name"] not in picked_names]
@@ -4989,9 +4433,9 @@ async def run_agent(
                     f"===== END SKILL: {s['name']} ====="
                 )
             section = (
-                "\n\n=== ATTACHED SKILLS (selected for this request) ===\n"
-                "The following skill(s) were selected as relevant to this "
-                "request. Follow their instructions exactly.\n\n"
+                "\n\n=== ATTACHED SKILLS (attached by the user) ===\n"
+                "The following skill(s) were attached to this request by the "
+                "user. Follow their instructions exactly.\n\n"
                 + "\n\n".join(bodies)
                 + section
             )
@@ -5348,6 +4792,10 @@ async def run_agent(
     # from scratch. Reset per turn — a fresh prompt must not inherit stale
     # tool results from a previous turn.
     turn_tool_log: list[str] = []
+    # Whether this run's completed tools have been replayed into `history` as
+    # REAL `resume_tool` records (see the except-block injection below). Set
+    # once so multiple retries don't duplicate the same tool messages.
+    _resume_injected = False
     # The reply text accumulated across ALL attempts of this turn. Deliberately
     # NOT reset per attempt: a retry (throttle, dropped connection, compact)
     # continues from the partial text a previous attempt already streamed, and
@@ -5717,6 +5165,46 @@ async def run_agent(
             # overwritten as the run progresses and removed on a clean finish,
             # so a stale snapshot can never leak into a successful turn.
             _save_partial_resume()
+            # Replay this run's completed tools as REAL tool-call/return pairs
+            # into `history` so ANY retry (throttle, dropped connection, widen,
+            # auto-compact) resumes with the actual results instead of re-running
+            # the tools. The text resume note (`_build_resume_note`) alone is
+            # often ignored by the model — it carries no real output. Injected
+            # ONCE (flag) to avoid duplication across retries; the records live
+            # in `history`, so every retry path that rebuilds `history_messages`
+            # from `history` picks them up automatically.
+            if not _resume_injected and resume_buffer:
+                history = history + [
+                    {
+                        "role": "resume_tool",
+                        "tool": str(t["tool"]),
+                        "args": _json_safe(t.get("args")) or {},
+                        "result": str(t.get("result") or ""),
+                        "call_id": f"resume-{i}",
+                    }
+                    for i, t in enumerate(resume_buffer)
+                ] + [
+                    {
+                        "role": "system",
+                        "content": (
+                            "The tool calls above were completed in the PREVIOUS "
+                            "(interrupted) attempt of this turn, with their actual "
+                            "results. Treat them as already done — do NOT re-run the "
+                            "same tools. Continue the task from where it was cut off."
+                            + (
+                                "\n\nA skill is already attached and active for this "
+                                "turn — do NOT re-run its setup/opening/installation "
+                                "procedure or re-read its instructions as if new; "
+                                "simply continue acting in its role from where the "
+                                "interrupted turn stopped."
+                                if skills
+                                else ""
+                            )
+                        ),
+                    }
+                ]
+                history_messages = _to_model_messages(history)
+                _resume_injected = True
             # A short-lived free-tier throttle (e.g. `429 FreeUsageLimitError:
             # Rate limit exceeded. Please try again later.`) is NOT a hard quota
             # and NOT a fatal failure — the gateway just wants us to wait. Retry

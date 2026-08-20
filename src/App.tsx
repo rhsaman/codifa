@@ -62,13 +62,13 @@ export default function App() {
     runLoad()
   }, [load, runLoad])
 
-  // First-run "download essential model" gate: RAG memory and skill
-  // auto-selection need the on-device embedding model. Until a ready
-  // embedding build exists, the app is fully blocked behind a download
-  // page. Re-checks every few seconds so it clears automatically the
-  // moment a download finishes (and never appears once one is installed).
-  // A transient fetch failure stays 'unknown' and retries; after a few
-  // failures it falls through to the app so a sidecar hiccup never traps
+  // First-run "download essential model" gate: RAG memory needs the on-device
+  // embedding model. Until a ready embedding build exists, the app is fully
+  // blocked behind a download page. Re-checks every few seconds so it clears
+  // automatically the moment a download finishes (and never appears once one
+  // is installed). A transient fetch failure stays 'unknown' and retries;
+  // after a few failures it falls through to the app so a sidecar hiccup
+  // never traps
   // the user (the gate reappears on the next launch).
   useEffect(() => {
     if (!loaded || embeddingGate === 'ready') return

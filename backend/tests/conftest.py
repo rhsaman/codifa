@@ -61,6 +61,8 @@ def _reset_mock():
     mock.script = []
     mock.captured = []
     mock.reject_parallel = False
+    mock.error_at = {}
+    mock.statuses = []
     yield
 
 

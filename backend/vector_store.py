@@ -42,7 +42,6 @@ from embeddings import embed_dim, embed_passages, embed_queries
 
 KIND_MEMORY = "memory"
 KIND_WEB = "web"
-KIND_SKILL = "skill"
 KIND_FILE = "file"
 
 # Bump when the embedding pipeline itself changes (prompt format, pooling, ...)

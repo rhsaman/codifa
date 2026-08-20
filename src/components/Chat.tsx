@@ -1164,10 +1164,10 @@ export function ChatPanel() {
       }
     }
     // Manual @skill mentions: extract the skill names the user attached with
-    // @, pass them to the backend (only those are loaded, auto-selection is
-    // skipped for this turn) and strip the @mentions from the prompt so the
-    // model doesn't see raw @tokens. The stored transcript keeps the original
-    // text with the @mentions.
+    // @, pass them to the backend (only those are loaded — there is no
+    // auto-selection) and strip the @mentions from the prompt so the model
+    // doesn't see raw @tokens. The stored transcript keeps the original text
+    // with the @mentions.
     const mentionSkills = new Set<string>();
     const cleanedText = text.replace(
       /@([\w\u0600-\u06FF-]+)/g,
@@ -1317,6 +1317,15 @@ export function ChatPanel() {
     // icon forever, with no visible error at all.
     const HARD_STALL_GRACE_MS = 120_000;
     const stallTimer = setInterval(() => {
+      // While the agent is waiting for the user to answer a permission /
+      // confirm / ask request, it is legitimately paused — never treat that
+      // as a stall and never force-abort, no matter how long the user takes.
+      const chatState = useStore.getState().chats.find((c) => c.id === chat.id);
+      if (chatState?.pendingPermission || chatState?.pendingAsk) {
+        stalledSinceRef.current = null;
+        useStore.getState().setChatStalled(chat.id, false);
+        return;
+      }
       const limit = toolRunningRef.current ? 900_000 : 180_000;
       const elapsed = Date.now() - lastEventAt.current;
       if (elapsed <= limit) {
@@ -1406,8 +1415,9 @@ export function ChatPanel() {
       } else if (event.kind === "skill") {
         const names = Array.isArray(event.skills) ? event.skills : [];
         if (names.length > 0) {
-          const label = event.manual ? "Attached skills" : "Auto-selected skills";
-          const note = `> ✦ **${label}:** ${names.join(", ")}\n\n`;
+          // Skills are only ever attached manually (via @mention) — there is
+          // no auto-selection anymore.
+          const note = `> ✦ **Attached skills:** ${names.join(", ")}\n\n`;
           store.updateMessage(assistantMsg.id, {
             content: note + (findMsg()?.content ?? ""),
           });

@@ -71,6 +71,50 @@ console.log('3) گاردها:')
   check('لیست خالی → null', planRetry([], 'u1', 'message') === null)
 }
 
+console.log('4) ریترای پیام با attachment/image → محتوا حفظ میشود:')
+{
+  const withAttach: ChatMessage = {
+    id: 'u4',
+    role: 'user',
+    content: 'این فایل را بخوان',
+    createdAt: Date.now(),
+    attachments: ['a.txt', 'b.txt'],
+    images: [{ path: '/tmp/x.png', name: 'x.png' }],
+  }
+  const plan = planRetry([withAttach], 'u4', 'message')
+  check('action = restart', plan?.action === 'restart', plan)
+  check(
+    'attachments حفظ شدند',
+    plan?.action === 'restart' &&
+      plan.target.attachments.length === 2 &&
+      plan.target.attachments[0] === 'a.txt',
+    plan,
+  )
+  check(
+    'images حفظ شدند',
+    plan?.action === 'restart' &&
+      plan.target.images.length === 1 &&
+      plan.target.images[0].name === 'x.png',
+    plan,
+  )
+}
+
+console.log('5) بنر retry → resume: پیام کاربر همان است (partial + tool call ها در store میمانند):')
+{
+  const plan = planRetry(messages, 'u2', 'banner')
+  check('action = resume', plan?.action === 'resume', plan)
+  check(
+    'userMsgId همان پیام کاربر است',
+    plan?.action === 'resume' && plan.target.userMsgId === 'u2',
+    plan,
+  )
+  check(
+    'محتوا حفظ میشود',
+    plan?.action === 'resume' && plan.target.content === 'برنامه بساز',
+    plan,
+  )
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

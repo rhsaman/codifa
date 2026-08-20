@@ -2477,6 +2477,12 @@ textarea {
   right: 0;
   z-index: 10;
   padding: 10px 16px 16px;
+  /* The composer floats over the conversation and would otherwise cover the
+     bottom of the chat scrollbar. Let clicks on its empty padding (right edge
+     where the scrollbar runs, bottom edge) pass through to the scroll
+     container below; only the inner card and the anchored ask/perm cards
+     capture pointer events. */
+  pointer-events: none;
   /* The composer floats over the conversation: a translucent wash lets the
      messages scroll behind the input and stay visible through it, fading
      from a subtle tint at the bottom edge to fully transparent at the top. */
@@ -2487,6 +2493,12 @@ textarea {
     transparent 100%
   );
   transition: box-shadow 0.15s;
+}
+
+.composer-inner,
+.ask-card,
+.perm-card {
+  pointer-events: auto;
 }
 
 .composer.dragover .composer-inner {

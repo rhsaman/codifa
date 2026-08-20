@@ -30,6 +30,14 @@ class MockState:
         # When True, a request carrying `parallel_tool_calls` gets a hard 400 —
         # simulates a gateway that rejects the field.
         self.reject_parallel = False
+        # Queue of (status_code, message) error responses keyed by REQUEST INDEX
+        # (0-based, in arrival order). A request whose index is present gets that
+        # error instead of popping from `script`, so a transient provider error
+        # (429 throttle, 500) can be injected at a precise point mid-turn (e.g.
+        # the request right AFTER a tool call).
+        self.error_at: dict[int, tuple[int, str]] = {}
+        # HTTP status returned for every request, in order, for assertions.
+        self.statuses: list[int] = []
 
 
 mock = MockState()
@@ -94,18 +102,31 @@ async def chat_handler(request: Request):
     body = await request.json()
     mock.captured.append(body)
     if mock.reject_parallel and body.get("parallel_tool_calls"):
+        mock.statuses.append(400)
         return JSONResponse(
             {"error": {"message": "parallel_tool_calls unsupported", "type": "unsupported"}},
             media_type="application/json",
             status_code=400,
         )
+    if mock.error_at:
+        idx = len(mock.captured) - 1
+        if idx in mock.error_at:
+            status, message = mock.error_at.pop(idx)
+            mock.statuses.append(status)
+            return JSONResponse(
+                {"error": {"message": message, "type": "server_error"}},
+                media_type="application/json",
+                status_code=status,
+            )
     spec = mock.script.pop(0) if mock.script else text_reply("default")
     if spec is None:
+        mock.statuses.append(400)
         return JSONResponse(
             {"error": {"message": "bad request", "type": "invalid_request"}},
             media_type="application/json",
             status_code=400,
         )
+    mock.statuses.append(200)
     if body.get("stream"):
         return StreamingResponse(sse(*spec)(), media_type="text/event-stream")
     finish = "stop"

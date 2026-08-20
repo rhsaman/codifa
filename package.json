@@ -1,12 +1,30 @@
 {
   "name": "codifa",
-  "version": "1.4.2",
-  "description": "Multi-provider AI coding assistant with a Pydantic AI agent sidecar, Monaco editor and file explorer.",
-  "author": {
-    "name": "coder",
-    "email": "coder@users.noreply.github.com"
-  },
+  "version": "1.4.3",
+  "description": "Offline-first AI coding assistant for your own machine — a real agent (Ask/Plan/Coder), voice input and RAG memory. Bring your own model: OpenRouter, OpenAI-compatible APIs or local LLMs.",
+  "author": "rhsaman",
   "license": "MIT",
+  "keywords": [
+    "ai",
+    "coding-assistant",
+    "electron",
+    "offline-first",
+    "local-llm",
+    "rag",
+    "pydantic-ai",
+    "whisper",
+    "openrouter",
+    "ollama",
+    "monaco-editor",
+    "desktop-app",
+    "typescript",
+    "python"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rhsaman/codifa.git"
+  },
+  "homepage": "https://github.com/rhsaman/codifa",
   "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {

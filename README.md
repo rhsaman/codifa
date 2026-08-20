@@ -25,8 +25,21 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![Pydantic AI](https://img.shields.io/badge/Pydantic%20AI-v2-8A2BE2)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+![GitHub stars](https://img.shields.io/github/stars/rhsaman/codifa?style=social)
+![GitHub downloads](https://img.shields.io/github/downloads/rhsaman/codifa/total)
+
+[⬇️ **Download**](https://github.com/rhsaman/codifa/releases/latest) · [⭐ **Star**](https://github.com/rhsaman/codifa) · [🐛 **Report a bug**](https://github.com/rhsaman/codifa/issues/new/choose)
 
 </div>
+
+<!--
+📸 Screenshots — add your images here so visitors see the app instantly.
+Drop files into docs/screenshots/ and reference them, e.g.:
+
+![Coder mode](docs/screenshots/coder-mode.png)
+![Voice input](docs/screenshots/voice-input.png)
+![Plan mode](docs/screenshots/plan-mode.png)
+-->
 
 ---
 
@@ -308,7 +321,23 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 
 ---
 
+## 🤝 Contributing / مشارکت
+
+Contributions of all kinds are welcome — bug reports, feature ideas, docs and
+code. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or
+pull request.
+
+مشارکت‌های همه‌جانبه خوش‌آمد است — گزارش باگ، ایدهٔ ویژگی، مستندات و کد. پیش از
+ثبت issue یا pull request لطفاً [CONTRIBUTING.md](CONTRIBUTING.md) را بخوانید.
+
+---
+
 ## 📄 License / مجوز
 
 MIT — do whatever you like, just keep the license. / هر طور که می‌خواهید
 استفاده کنید؛ فقط مجوز را نگه دارید.
+
+---
+
+⭐ If Codifa helps you, please star the repo — it helps others find it. /
+اگر کدیفا به کارتان آمد، با یک ⭐ به دیده‌شدن آن کمک کنید.

@@ -1,6 +1,6 @@
 {
   "name": "codifa",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Offline-first AI coding assistant for your own machine — a real agent (Ask/Plan/Coder), voice input and RAG memory. Bring your own model: OpenRouter, OpenAI-compatible APIs or local LLMs.",
   "author": {
     "name": "rhsaman",

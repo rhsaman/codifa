@@ -1,0 +1,59 @@
+"""Live test: the `task` tool enforces the sub-agent depth limit.
+
+opencode's subagent_depth (default 1): the parent can spawn a sub-agent, but a
+sub-agent cannot spawn another. The general sub-agent's tools exclude `task`
+so nesting is impossible in practice — this is a belt-and-suspenders guard on
+the contextvar.
+
+Guards:
+1. With _TASK_DEPTH_CTX at the limit, task(...) returns the depth error.
+2. The depth error is an ERROR, not a silent fallback.
+"""
+import asyncio
+import os
+import sys
+import tempfile
+
+_TMP = tempfile.mkdtemp(prefix="coder-test-task-depth-data-")
+os.environ["CODER_DATA_DIR"] = _TMP
+
+_THIS = os.path.dirname(os.path.abspath(__file__))
+for _p in (_THIS, os.path.dirname(_THIS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from pydantic_ai.models.test import TestModel  # noqa: E402
+
+from tools import _SUBAGENT_DEPTH_LIMIT, _TASK_DEPTH_CTX, make_tool_callbacks  # noqa: E402
+
+
+async def main():
+    ws = tempfile.mkdtemp(prefix="coder-test-task-depth-ws-")
+    emitted: list[dict] = []
+    tools = make_tool_callbacks(
+        ws,
+        lambda ev: emitted.append(ev),
+        explore_model=TestModel(custom_output_text="explore"),
+        main_model=TestModel(custom_output_text="done"),
+    )
+    task = tools["task"]
+
+    # Simulate being inside a sub-agent: depth already at the limit.
+    token = _TASK_DEPTH_CTX.set(_SUBAGENT_DEPTH_LIMIT)
+    try:
+        out = await task(description="x", prompt="find foo", subagent_type="explore")
+    finally:
+        _TASK_DEPTH_CTX.reset(token)
+
+    assert "subagent depth limit reached" in out, out
+    assert "cannot spawn another sub-agent" in out, out
+
+    cards = [e for e in emitted if e.get("kind") == "tool" and e.get("tool") == "task"]
+    assert len(cards) == 1, f"expected 1 task card (the error), got {len(cards)}"
+
+    print(f"  depth limit ({_SUBAGENT_DEPTH_LIMIT}) enforced: nested task denied")
+    print("TASK-DEPTH-LIMIT TEST PASSED")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

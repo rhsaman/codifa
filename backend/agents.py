@@ -607,6 +607,8 @@ SYSTEM_PROMPTS: dict[str, str] = {
 # that existed BEFORE the agent's work are reported as notes, not silently fixed.
 # 3) Replies stay short but precise and complete. 4) Code is written to stay
 # extensible for future needs — never a one-off hack for only the current case.
+# 5) Persian replies use the half-space (ZWNJ) correctly — the app does NOT
+# post-process glued Persian words, so the model must emit ZWNJ itself.
 _UNIVERSAL_RULES = (
     "\n\nUNIVERSAL RULES (apply in every mode):\n"
     "1. DEAD CODE: never leave dead code behind in code you write or modify — "
@@ -624,7 +626,10 @@ _UNIVERSAL_RULES = (
     "following the project's existing patterns — never a one-off hack that only "
     "serves the specific case in front of you. When a small generalization (a "
     "parameter, a lookup table/registry, a shared helper) makes the solution "
-    "serve a whole class of similar tasks instead of one instance, prefer it."
+    "serve a whole class of similar tasks instead of one instance, prefer it.\n"
+    "5. PERSIAN TYPOGRAPHY: when replying in Persian, always use the half-space "
+    "(ZWNJ, U+200C) between word components — e.g. کتابخانه‌ها, منسوخ‌شده‌اند, "
+    "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it."
 )
 
 # The search/explore strategy is a FIRST-CLASS rule: it sits at the very top of
@@ -3460,40 +3465,6 @@ def _skill_keyword_matches(prompt: str, skills: list[dict]) -> list[tuple[int, d
     return _sort(name_hit) if name_hit else _sort(desc_only)
 
 
-def _skill_match_tokens(tokens: list[str], skill: dict) -> list[str]:
-    """Tokens (from ``tokens``) whose alias-expanded form appears in the
-    skill's NAME or DESCRIPTION. Used by the distinctiveness gate."""
-    name = str(skill.get("name") or "").lower()
-    desc = str(skill.get("description") or "").lower()
-    out: list[str] = []
-    for t in tokens:
-        for form in _skill_forms(t):
-            if _skill_kw_in(form, name) or _skill_kw_in(form, desc):
-                out.append(t)
-                break
-    return out
-
-
-def _skill_token_df(tokens: list[str], skills: list[dict]) -> dict[str, int]:
-    """Document frequency: for each token, how many skills' NAME or
-    DESCRIPTION contain any of its forms. Computed from the live skill list at
-    runtime, so it adapts automatically to skills added later — a token that
-    appears in many descriptions is not a distinctive signal."""
-    df: dict[str, int] = {}
-    for t in tokens:
-        count = 0
-        for s in skills:
-            name = str(s.get("name") or "").lower()
-            desc = str(s.get("description") or "").lower()
-            if any(
-                _skill_kw_in(f, name) or _skill_kw_in(f, desc)
-                for f in _skill_forms(t)
-            ):
-                count += 1
-        df[t] = count
-    return df
-
-
 # Minimum top-vs-runner-up cosine gap for the semantic-only tier of skill
 # selection. Measured on the real skill set: irrelevant prompts ("یه کد پایتون
 # بنویس", "پروژه رو پوش کن تو گیت") score a compressed band (~0.78-0.83) where
@@ -3504,12 +3475,15 @@ def _skill_token_df(tokens: list[str], skills: list[dict]) -> dict[str, int]:
 # and the gap are deliberately strict.
 _SKILL_GAP_MIN = 0.008
 
-# Absolute semantic floor for DESCRIPTION-ONLY keyword hits (the keyword tier's
-# own gate). A name hit is unambiguous and needs no floor; a description-only
-# hit is accepted when its semantic score clears this floor OR its token is
-# distinctive across the live skill set (see _auto_select_skills). This is a
-# general absolute — not tuned to any specific skill — so it keeps working for
-# skills added later.
+# Absolute semantic floor for DESCRIPTION-ONLY keyword hits. A name hit is
+# unambiguous and needs no floor; a description-only hit is accepted only when
+# its semantic score clears this floor. Distinctiveness (how many skills share
+# the token) is deliberately NOT a gate: a token can be unique to one skill yet
+# irrelevant to the prompt (measured: "چجوری این ریپو رو کاری کنم دیده بشه و
+# ادم ها بهش استار بدن؟" matched a design skill via "ادم" with df==1 but
+# semantic 0.77). The embedding is the only signal that confirms relevance, so
+# it is required. This is a general absolute — not tuned to any specific skill —
+# so it keeps working for skills added later.
 _SKILL_DESC_FLOOR = 0.78
 
 
@@ -3535,10 +3509,18 @@ def _auto_select_skills(
        contains a distinctive prompt word is found exactly — this is what makes
        a skill reliably findable even when the embedding band can't tell it
        apart. Ranked by hit weight (name hits double) then semantic score.
-       Description-only hits are gated: accepted only when the matched token
-       is distinctive across the live skill set (df <= 1) or the semantic
-       score clears ``_SKILL_DESC_FLOOR`` — a generic word in a description
-       can no longer attach a skill that isn't needed.
+       A NAME hit is unambiguous and passes outright (the embedding can't be
+       trusted for Persian — "پروژه رو پوش کن تو گیت" scores git-workflow below
+       0.77, yet the alias "گیت"->git in the name is a certain match). A
+       DESCRIPTION-only hit is accepted only when its semantic score clears
+       ``_SKILL_DESC_FLOOR``: the embedding is the only signal that confirms the
+       token is relevant to the prompt, not merely present in the description.
+       Distinctiveness (df) is deliberately NOT used — a token unique to one
+       skill can still be irrelevant (measured: "چجوری این ریپو رو کاری کنم
+       دیده بشه و ادم ها بهش استار بدن؟" matched a design skill via "ادم" with
+       df==1 but semantic 0.77). Because the floor is a general absolute
+       computed from the live skill set, it keeps working for skills added
+       later.
 
     2. SEMANTIC tier (high-confidence fallback): only when no keyword matches.
        The absolute floor (``min_abs``) and the top-vs-runner-up gap gate
@@ -3572,31 +3554,23 @@ def _auto_select_skills(
         if key and key not in sem and key in by_path:
             sem[key] = float(hit.get("score", 0.0))
 
-    # Tier 1: exact keyword match on name/description — precise, wins outright.
+    # Tier 1: exact keyword match on name/description. A NAME hit is
+    # unambiguous and passes outright (the embedding can't be trusted for
+    # Persian — "پروژه رو پوش کن تو گیت" scores git-workflow below 0.77, yet
+    # the alias "گیت"->git in the name is a certain match). A DESCRIPTION-only
+    # hit is accepted only when its semantic score clears _SKILL_DESC_FLOOR:
+    # the embedding is the only signal that confirms the token is relevant to
+    # the prompt, not just present in the description. Distinctiveness (df) is
+    # deliberately NOT used — a token unique to one skill can still be
+    # irrelevant (measured: "چجوری این ریپو رو کاری کنم دیده بشه و ادم ها بهش
+    # استار بدن؟" matched a design skill via "ادم" with df==1 but semantic
+    # 0.77). Because the floor is a general absolute computed from the live
+    # skill set, it keeps working for skills added later.
     kw = _skill_keyword_matches(prompt, skills)
     if kw:
-        # Gate description-only hits: a name hit is unambiguous and passes
-        # outright, but a description mention is only accepted when the matched
-        # token is distinctive across the live skill set (df <= 1) or the
-        # semantic score clears _SKILL_DESC_FLOOR. This is what stops a generic
-        # word in a description from attaching a skill that isn't needed — and
-        # because distinctiveness is computed from the actual installed skills
-        # at runtime, it keeps working for skills added later.
-        tokens = [
-            t
-            for t in _fts_keywords(prompt, max_terms=8)
-            if t.lower() not in _SKILL_WEAK_KEYWORDS
-        ]
-        df = _skill_token_df(tokens, skills)
         kept: list[tuple[int, dict]] = []
         for weight, s, name_hit in kw:
-            if name_hit:
-                kept.append((weight, s))
-                continue
-            if sem.get(s["path"], 0.0) >= _SKILL_DESC_FLOOR:
-                kept.append((weight, s))
-                continue
-            if any(df.get(t, 0) <= 1 for t in _skill_match_tokens(tokens, s)):
+            if name_hit or sem.get(s["path"], 0.0) >= _SKILL_DESC_FLOOR:
                 kept.append((weight, s))
         if kept:
             # _skill_keyword_matches already puts name-hit skills first; within

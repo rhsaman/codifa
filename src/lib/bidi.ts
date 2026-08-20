@@ -67,43 +67,13 @@ export function fixZwsp(text: string): string {
   })
 }
 
-// The model's own Persian output frequently OMITS the half-space (ZWNJ,
-// U+200C) that correct Persian typography requires — producing text that
-// visually reads as one glued word (کتابخانههای → کتابخانه‌های,
-// منسوخشدهاند → منسوخ‌شدهاند). We tried @persian-tools/persian-tools'
-// halfSpace() here, but it only converts EXISTING spaces for می/نمی/بی
-// prefixes, ها/تر/ترین suffixes and ~26 word pairs — it never inserts a
-// missing ZWNJ into already-glued words, and it doesn't know the های suffix
-// at all. So we hand-roll the safe, high-signal patterns instead:
-//   1) Ezafe "ه" + "ی" (بقیهی → بقیه‌ی) — a Persian root ending in ه
-//      essentially never has a genuine (non-ezafe) "ی" glued onto it at a
-//      word boundary.
-//   2) The negation prefix "نمی" (نمیفرستد → نمی‌فرستد) — no common word
-//      begins with نمی other than this prefix. ("می" is deliberately NOT
-//      handled: میز/میدان/میلیون make it false-positive-prone.)
-//   3) The plural suffix "های/هایی" (کتابخانههای → کتابخانه‌های) — after a
-//      2+-letter word ending in ه, a glued های/هایی is almost always the
-//      plural suffix (هایلایت etc. are excluded by the boundary check).
-//   4) Compound past forms "Xشده" (منسوخشده → منسوخ‌شده) and "Xاند"
-//      (شدهاند → شده‌اند) — a glued شده/اند after a 2+-letter word is a
-//      verb compound, not a standalone word.
-const ZWNJ = "\u200C"
-const PERSIAN_LETTER = `[${PERSIAN_RANGE}]`
-const BOUND_AFTER = `(?:[\\s)\\]»«"'.,:;!?\u060C\u061B\u061F]|$)`
-const EZAFE_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u06CC)(?=${BOUND_AFTER})`, "gu")
-const NEGATION_PREFIX_RE = /(?<![\u0621-\u06FF])(\u0646\u0645\u06CC)(?=[\u0621-\u06FF])/gu
-const HAYES_SUFFIX_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u0647\u0627\u06CC\u06CC|\u0647\u0627\u06CC)(?=${BOUND_AFTER})`, "gu")
-const SHODE_RE = new RegExp(`(${PERSIAN_LETTER}{2,})(\u0634\u062F\u0647)(?=\u0627\u0646\u062F|${BOUND_AFTER})`, "gu")
-const AND_RE = new RegExp(`(${PERSIAN_LETTER}{2,}\u0647)(\u0627\u0646\u062F)(?=${BOUND_AFTER})`, "gu")
-
-export function fixMissingZwnj(text: string): string {
-  return text
-    .replace(EZAFE_RE, `$1${ZWNJ}$2`)
-    .replace(HAYES_SUFFIX_RE, `$1${ZWNJ}$2`)
-    .replace(SHODE_RE, `$1${ZWNJ}$2`)
-    .replace(AND_RE, `$1${ZWNJ}$2`)
-    .replace(NEGATION_PREFIX_RE, `$1${ZWNJ}`)
-}
+// NOTE: We deliberately do NOT try to restore missing half-spaces (ZWNJ) in
+// the model's Persian output here. Glued words like کتابخانههای are a MODEL
+// OUTPUT problem, and no regex can reliably reconstruct the ZWNJ position
+// without a dictionary (persian-tools' halfSpace only converts EXISTING
+// spaces and doesn't know های at all). The fix lives at the source: the
+// system prompt (backend/agents.py, _UNIVERSAL_RULES) instructs the model to
+// emit ZWNJ correctly. Do not re-add per-pattern regexes here.
 
 // Direction for UI containers that must line up with the app's RTL/LTR toggle
 // (ask cards, steer/queue bubbles, composer). dir="auto" alone resolves from
@@ -121,16 +91,17 @@ export function detectDir(text: string): 'rtl' | 'ltr' {
 // browser (dir="auto" / unicode-bidi: plaintext on the message containers), so
 // we no longer inject LRI/PDI/RLI isolates by hand — that manual injection was
 // the source of the reversed-paren / flipped-arrow / glued-word bugs. All that
-// remains is stripping model-injected bidi control chars, normalizing the
-// invisible word separators, and restoring missing half-spaces (ZWNJ) — all
-// safe and direction-agnostic.
+// remains is stripping model-injected bidi control chars and normalizing the
+// invisible word separators — both safe and direction-agnostic. (Missing
+// half-spaces in Persian are a model-output issue fixed via the system prompt,
+// not here — see the note above.)
 export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   if (!text) return text
   const cleaned = stripBidiMarks(text)
   const parts = cleaned.split(/```/g)
   const fixed = parts.map((p, i) => {
     if (i % 2 === 1) return p // inside code block, don't modify
-    return fixMissingZwnj(fixZwsp(p))
+    return fixZwsp(p)
   })
   return fixed.join('```')
 }

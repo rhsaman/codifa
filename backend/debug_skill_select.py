@@ -24,6 +24,7 @@ PROMPTS = [
     "یه کد پایتون بنویس",
     "تست بنویس برای پروژه",
     "طراحی UI برای داشبورد",
+    "چجوری این ریپو رو کاری کنم دیده بشه و ادم ها بهش استار بدن؟",
 ]
 
 
@@ -45,15 +46,6 @@ def main() -> None:
         print(f"  keyword tier matches ({len(kw)}):")
         for _w, s, name_hit in kw:
             print(f"    - {s['name']!r} (name_hit={name_hit})")
-
-        # distinctiveness gate info (df per surviving token)
-        tokens = [
-            t
-            for t in agents._fts_keywords(prompt, max_terms=8)
-            if t.lower() not in agents._SKILL_WEAK_KEYWORDS
-        ]
-        df = agents._skill_token_df(tokens, skills)
-        print(f"  token df: { {t: df.get(t, 0) for t in tokens} }")
 
         # semantic scores for every skill
         hits = store.search(prompt, kind=agents.KIND_SKILL, top_k=max(len(skills) * 4, 8), min_score=0.0)

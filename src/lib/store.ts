@@ -353,15 +353,17 @@ function normalizeRecentModels(raw: unknown): RecentModel[] {
   const out: RecentModel[] = []
   for (const entry of raw) {
     if (typeof entry === 'string' && entry.trim()) {
-      out.push({ providerId: '', model: entry.trim() })
+      out.push({ providerId: '', model: entry.trim(), lastUsed: Date.now() })
     } else if (entry && typeof entry === 'object') {
-      const e = entry as { providerId?: unknown; model?: unknown }
+      const e = entry as { providerId?: unknown; model?: unknown; lastUsed?: unknown }
       const model = typeof e.model === 'string' ? e.model.trim() : ''
       const pid = typeof e.providerId === 'string' ? e.providerId : ''
-      if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model })
+      const lastUsed = typeof e.lastUsed === 'number' ? e.lastUsed : Date.now()
+      if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model, lastUsed })
     }
   }
-  return out.slice(0, 20)
+  // Sort by lastUsed descending (most recent first) and limit to 20
+  return out.sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0)).slice(0, 20)
 }
 
 interface State {
@@ -1218,9 +1220,10 @@ export const useStore = create<State>((set, get) => ({
     const m = (model || '').trim()
     if (!m) return
     const pid = providerId || ''
+    const now = Date.now()
     set((s) => {
       const recentModels = [
-        { providerId: pid, model: m },
+        { providerId: pid, model: m, lastUsed: now },
         ...s.recentModels.filter((x) => x.model !== m || x.providerId !== pid),
       ].slice(0, 20)
       return { recentModels }

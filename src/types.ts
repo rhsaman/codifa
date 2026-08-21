@@ -7,6 +7,8 @@ export type AgentMode = string
 export interface RecentModel {
   providerId: string
   model: string
+  /** Epoch ms when this model was last used — used to sort recents by usage time. */
+  lastUsed?: number
 }
 
 /** Per-mode tool access. Sent to the backend so tool gating is data-driven

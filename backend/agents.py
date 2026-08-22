@@ -1625,16 +1625,123 @@ def _usage_event(usage, model: str = "") -> dict | None:
 # overflow: once a request's true input tokens (reported by the provider) pass
 # this share of the window, the in-flight tool loop is stopped and the turn is
 # re-sent from compacted history instead of waiting to hit the hard limit. This
-# keeps small-context models (8k) from dying with
-# `request (N tokens) exceeds the available context size (M tokens)`.
-#
-# Fixed at 60% of the window for every model size — compact before real usage
-# pressure shows up, so the in-flight turn stays small (opencode compacts when
-# total tokens approach the window; 60% is a safe pre-emptive point that keeps
-# small-context models (8k) well clear of the hard limit).
-def _preemptive_compact_fraction(ctx: int) -> float:
-    """Fraction of the context window at which to compact pre-emptively."""
-    return 0.60
+# --- opencode-compat compaction ------------------------------------------------
+# Mirrored from anomalyco/opencode (dev): packages/opencode/src/session/{compaction,overflow}.ts,
+# packages/core/src/session/compaction.ts, packages/opencode/src/agent/prompt/compaction.txt.
+# The auto-compact trigger is opencode's `isOverflow`: compaction fires when accumulated tokens
+# >= `usable`, where `usable = ctx - min(COMPACTION_BUFFER, maxOutputTokens)`. For an 8k model
+# (max output ~2k) that's 8192 - 2048 = 6144 (~75% of the window); for a 200k model it is ~96% —
+# exactly opencode's behaviour. Recent turns are kept VERBATIM up to a token budget
+# (`preserveRecentBudget`) instead of collapsing the whole conversation into one note.
+_COMPACTION_BUFFER = 20_000
+_TOOL_OUTPUT_MAX_CHARS = 2_000
+_SUMMARY_OUTPUT_TOKENS = 4_096
+_MIN_PRESERVE_RECENT_TOKENS = 2_000
+_MAX_PRESERVE_RECENT_TOKENS = 15_000
+
+
+def _estimate_tokens(text: str) -> int:
+    """Heuristic token count (~4 chars/token), matching opencode's Token.estimate."""
+    return max(1, len(text or "") // 4)
+
+
+def _model_max_output(model: Any) -> int:
+    """opencode's maxOutputTokens for the model (0 when unknown)."""
+    info = getattr(model, "model_info", None)
+    val = getattr(info, "max_output_tokens", 0) if info is not None else 0
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usable_tokens(ctx: int, max_output: int = 0) -> int:
+    """opencode `usable`: context window minus the compaction/output reservation."""
+    if ctx <= 0:
+        return 0
+    reserved = min(_COMPACTION_BUFFER, max_output if max_output > 0 else max(ctx // 4, 0))
+    return max(0, ctx - reserved)
+
+
+def _recent_tail_budget(ctx: int, max_output: int = 0) -> int:
+    """opencode `preserveRecentBudget`: recent turns kept verbatim, in tokens."""
+    usable = _usable_tokens(ctx, max_output)
+    return min(_MAX_PRESERVE_RECENT_TOKENS, max(_MIN_PRESERVE_RECENT_TOKENS, int(usable * 0.25)))
+
+
+def _preemptive_compact_fraction(ctx: int, max_output: int = 0) -> float:
+    """Fraction of the window at which to compact — opencode's `usable / ctx`."""
+    if ctx <= 0:
+        return 0.60  # historical default when the window is unknown
+    return _usable_tokens(ctx, max_output) / ctx
+
+
+# opencode's compaction agent system prompt (verbatim — keeps the source language).
+_COMPACTION_SYSTEM_PROMPT = (
+    "You are a context summarization agent. You are given a conversation between a user and an agent. "
+    "Your goal is to produce a structured summary matching the format specified so another coding agent "
+    "can continue the work.\n\n"
+    "Always follow the exact output structure requested by the user prompt. Keep every section, preserve "
+    "exact file paths and identifiers when known, and prefer terse bullets over paragraphs.\n\n"
+    "Do not continue the conversation. Do not respond to any questions in the conversation. Only output the "
+    "structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation."
+)
+
+
+# opencode's SUMMARY_TEMPLATE (verbatim structure + rules).
+_SUMMARY_TEMPLATE = (
+    "Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. "
+    "Do not include the <template> tags in your response.\n"
+    "<template>\n"
+    "## Objective\n"
+    "- [one or two brief sentences describing what the user is trying to accomplish]\n\n"
+    "## Important Details\n"
+    "- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to "
+    "continue, or \"(none)\"]\n\n"
+    "## Work State\n"
+    "### Completed\n"
+    "- [finished work, verified facts, or changes made; otherwise \"(none)\"]\n\n"
+    "### Active\n"
+    "- [current work, partial changes, or investigation state; otherwise \"(none)\"]\n\n"
+    "### Blocked\n"
+    "- [blockers, failing commands, or unknowns; otherwise \"(none)\"]\n\n"
+    "## Next Move\n"
+    "1. [immediate concrete action, or \"(none)\"]\n"
+    "2. [next action if known, or \"(none)\"]\n\n"
+    "## Relevant Files\n"
+    "- [file or directory path: why it matters, or \"(none)\"]\n"
+    "</template>\n\n"
+    "Rules:\n"
+    "- Keep every section, even when empty.\n"
+    "- Use terse bullets, not prose paragraphs.\n"
+    "- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.\n"
+    "- Do not mention the summary process or that context was compacted."
+)
+
+
+# opencode's SUMMARY_UPDATE_INSTRUCTIONS (used when merging a prior summary).
+_SUMMARY_UPDATE_INSTRUCTIONS = (
+    "The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new "
+    "summary that combines both. The <prior-summary> is discarded after this: anything you do not carry "
+    "into the new summary is lost.\n\n"
+    "When combining:\n"
+    "- Carry forward objectives, constraints, user directives, decisions, and parallel workstreams from the "
+    "<prior-summary> even when the <conversation> does not mention them. Drop only what is finished and no "
+    "longer needed.\n"
+    "- The <conversation> is more recent than the <prior-summary>. Where they conflict, the conversation "
+    "wins: state the corrected fact and drop the old claim.\n"
+    "- Add new progress, decisions, constraints, and context from the conversation.\n"
+    "- Move completed work from \"Active\" to \"Completed\".\n"
+    "- If a blocker has been resolved, update the summary to reflect that while keeping any details still "
+    "needed to continue the work.\n"
+    "- Update \"Objective\" and \"Next Move\" to reflect the current work state."
+)
+
+
+def _summary_output_budget(ctx: int, max_output: int = 0) -> int:
+    """opencode's 4096-token summary ceiling, scaled so it fits small windows."""
+    usable = _usable_tokens(ctx, max_output)
+    return max(1024, min(_SUMMARY_OUTPUT_TOKENS, usable - 1024))
 
 
 # ProcessHistory sliding-window guard. pydantic-ai re-sends the ENTIRE
@@ -1652,7 +1759,6 @@ def _preemptive_compact_fraction(ctx: int) -> float:
 # A message-count fallback covers providers that report 0 usage (the same gap
 # the deterministic tool-step budget covers) so a long turn still gets bounded.
 _HISTORY_TRIGGER_FRACTION = 0.70
-_HISTORY_KEEP_TAIL = 15
 _HISTORY_MAX_MESSAGES = 40
 
 
@@ -1667,6 +1773,19 @@ def _is_compact_summary(msg: ModelMessage) -> bool:
     )
 
 
+def _model_message_tokens(m: Any) -> int:
+    """Estimate tokens for a pydantic-ai ModelMessage (sum of part text)."""
+    try:
+        text = "".join(
+            str(getattr(p, "content", ""))
+            for p in (getattr(m, "parts", []) or [])
+            if getattr(p, "content", None) is not None
+        )
+    except Exception:  # noqa: BLE001
+        text = str(m)
+    return _estimate_tokens(text)
+
+
 def _make_history_processor(window: int):
     """Build a ProcessHistory processor that bounds the per-request context.
 
@@ -1675,9 +1794,11 @@ def _make_history_processor(window: int):
     ``_HISTORY_TRIGGER_FRACTION`` of the window — or the message list grows past
     ``_HISTORY_MAX_MESSAGES`` (providers that report 0 usage) — every subsequent
     request is trimmed to: the first message (system prompt + current user
-    prompt), any existing compact summary, and the last ``_HISTORY_KEEP_TAIL``
-    messages. pydantic-ai repairs dangling tool-call edges left by the slice.
+    prompt), any existing compact summary, and a recent tail bounded by the SAME
+    token budget opencode keeps verbatim on compaction (``_recent_tail_budget``).
+    pydantic-ai repairs dangling tool-call edges left by the slice.
     """
+    tail_budget = _recent_tail_budget(window, 0)
 
     def _processor(ctx: RunContext, messages: list[ModelMessage]) -> list[ModelMessage]:
         if not messages:
@@ -1692,8 +1813,19 @@ def _make_history_processor(window: int):
             if _is_compact_summary(m) and id(m) not in keep_ids:
                 keep.append(m)
                 keep_ids.add(id(m))
-        tail_start = max(0, len(messages) - _HISTORY_KEEP_TAIL)
-        for m in messages[tail_start:]:
+        # Recent tail from the end, bounded by the opencode token budget.
+        tail: list[ModelMessage] = []
+        tail_tokens = 0
+        for m in reversed(messages[1:]):
+            if id(m) in keep_ids:
+                continue
+            est = _model_message_tokens(m)
+            if tail and tail_tokens + est > tail_budget:
+                break
+            tail.append(m)
+            tail_tokens += est
+        tail.reverse()
+        for m in tail:
             if id(m) not in keep_ids:
                 keep.append(m)
                 keep_ids.add(id(m))
@@ -1769,6 +1901,7 @@ class _UsageCapability(AbstractCapability[Any]):
         context_limit: int,
         state: dict,
         compact_threshold: float | None = None,
+        max_output: int = 0,
     ) -> None:
         self._on_usage = on_usage
         self._context_limit = context_limit
@@ -1776,7 +1909,7 @@ class _UsageCapability(AbstractCapability[Any]):
         self._compact_threshold = (
             compact_threshold
             if compact_threshold is not None
-            else _preemptive_compact_fraction(context_limit)
+            else _preemptive_compact_fraction(context_limit, max_output)
         )
 
     async def after_model_request(
@@ -2932,14 +3065,18 @@ async def _compact_history(
     max_chars: int = 30_000,
     usage_cap=None,
     fallback_model: Any = None,
+    ctx: int = 0,
+    max_output: int = 0,
 ) -> list[dict] | None:
-    """Collapse older turns into one short summary note, keeping the most recent
-    turns verbatim, so a full window can continue instead of being cut off.
+    """Collapse older turns into one structured summary, keeping a recent tail
+    verbatim, so a full window can continue instead of being cut off.
 
-    Only the LAST message is kept verbatim (opencode-style) — everything older
-    is folded into the summary, so a compact always frees the maximum space.
-    The summary + last message is what the model receives next, which is enough
-    for the current task to continue seamlessly.
+    Mirrors opencode's compaction (anomalyco/opencode): only the OLDER portion
+    of the conversation — everything beyond a recent token-budgeted tail — is
+    summarized; the most recent turns are kept VERBATIM after the summary. The
+    summary uses opencode's exact template and merge behaviour, and its output
+    is bounded only by opencode's 4096-token ceiling (scaled for small windows),
+    not a 250-word straitjacket — so detail is preserved instead of discarded.
 
     Returns a tuple ``(new_history, recent_kept)`` — ``recent_kept`` is the exact
     number of recent turns preserved verbatim after the summary, so the caller
@@ -2956,20 +3093,31 @@ async def _compact_history(
     /compact path, so a flaky compact subagent degrades to the working model
     instead of surfacing ``compact_failed``.
     """
-    # opencode-style: keep ONLY the last message verbatim; everything older is
-    # folded into the summary. The summary + last message is what the model
-    # receives next, so the compact frees the maximum space.
-    recent_n = 1
-    recent = history[-1:]
-    older = history[:-1]
+    if ctx <= 0:
+        ctx = 8192  # opencode assumes a window is always known; fall back sensibly
+    tail_budget = _recent_tail_budget(ctx, max_output)
+
+    # --- select the recent tail (kept verbatim) -------------------------------
+    # Walk backward keeping whole messages until the token budget is hit
+    # (opencode's `select`/`preserveRecentBudget`).
+    tail: list[dict] = []
+    tail_tokens = 0
+    for m in reversed(history):
+        est = _estimate_tokens(str(m.get("content", "")))
+        if tail and tail_tokens + est > tail_budget:
+            break
+        tail.append(m)
+        tail_tokens += est
+    tail.reverse()
+    recent = tail
+    older = history[: len(history) - len(tail)]
     if not older:
         return None
 
-    # A previous compact already left a "[Compacted earlier context]" summary at
-    # the head of the history. Re-summarizing it on every compact would cascade:
-    # each pass re-compresses the old summary (250 words -> 250 words) and
-    # squeezes out older details. Keep it verbatim and only summarize the turns
-    # that came after it.
+    # --- separate any existing "[Compacted earlier context]" summary ----------
+    # A previous compact left a summary at the head. On a 2nd+ compact opencode
+    # MERGES it (carries forward details) rather than re-compressing it, so we
+    # pass it to the model as the <prior-summary> instead of concatenating.
     existing_summary = ""
     older_turns: list[dict] = []
     for t in older:
@@ -2985,45 +3133,56 @@ async def _compact_history(
         # compress — don't re-compress the old summary, report nothing to do.
         return None
 
-    text = "\n\n".join(str(t.get("content", "")) for t in older_turns)
-    if len(text) > max_chars:
-        text = text[-max_chars:] + "\n...(older part omitted)"
+    # --- serialize the head (older turns) for the summarizer, truncating -------
+    # tool outputs to opencode's TOOL_OUTPUT_MAX_CHARS so one huge result can't
+    # dominate the summary budget.
+    def _serialize(msg: dict) -> str:
+        content = str(msg.get("content", ""))
+        if len(content) > _TOOL_OUTPUT_MAX_CHARS:
+            content = content[:_TOOL_OUTPUT_MAX_CHARS] + "\n[truncated]"
+        return content
+
+    older_turns_text = [_serialize(t) for t in older_turns]
+    head_text = "\n\n".join(older_turns_text)
+
+    # Bound the head so the summarize call itself fits the window (opencode
+    # refuses to compact when the prompt wouldn't fit; we trim oldest instead).
+    max_head_tokens = max(1024, _usable_tokens(ctx, max_output) - tail_budget - 512)
+    while _estimate_tokens(head_text) > max_head_tokens and len(older_turns_text) > 1:
+        older_turns_text.pop(0)
+        head_text = "\n\n".join(older_turns_text)
 
     async def _summarize(m: Any) -> str:
+        if existing_summary:
+            user_prompt = (
+                "Here is the conversation so far:\n\n"
+                f"<conversation>\n{head_text}\n</conversation>\n\n"
+                "Here is the summary of the conversation before the <conversation> above:\n\n"
+                f"<prior-summary>\n{existing_summary}\n</prior-summary>\n\n"
+                + _SUMMARY_UPDATE_INSTRUCTIONS
+                + "\n\n"
+                + _SUMMARY_TEMPLATE
+            )
+        else:
+            user_prompt = (
+                "Here is the conversation so far:\n\n"
+                f"<conversation>\n{head_text}\n</conversation>\n\n"
+                "Create a new anchored summary from the conversation history in the "
+                "<conversation> tags above so another coding agent can continue the work.\n\n"
+                + _SUMMARY_TEMPLATE
+            )
         kwargs = {
-            "system_prompt": (
-                "You are a code-session context compressor. Read the earlier conversation "
-                "(user requests, your prior replies, and tool-call results) and rewrite it as a "
-                "compact structured note so work can continue seamlessly — a fresh reader with no "
-                "other memory of this session must be able to pick up exactly where it left off. "
-                "Write the ENTIRE note in ENGLISH even if the conversation is in another language "
-                "(e.g. Persian/Farsi) — translate the user's requests and your findings to English. "
-                "Use EXACTLY these headers, each with terse bullet lines (short phrases, file paths "
-                "and facts — not prose); omit a header's body only if truly nothing applies to it, "
-                "but keep the header:\n"
-                "## Objective\nWhat the user is ultimately trying to accomplish, in their own terms.\n"
-                "## Important Details\nNon-obvious facts learned about the codebase relevant to the objective — "
-                "where things live, how they work, gotchas hit. This is exactly what a fresh search "
-                "would otherwise have to re-derive, so keep anything not obvious from the file path "
-                "alone.\n"
-                "## Work State\nSplit into three sub-sections:\n"
-                "**Completed** — what has ACTUALLY been done so far (files changed, commands run, "
-                "decisions made) — not what was merely discussed or planned.\n"
-                "**Active** — what is currently in progress or being investigated.\n"
-                "**Blocked** — anything stuck, waiting, or not yet possible.\n"
-                "## Next Move\nWhat remains to be done or decided, in priority order.\n"
-                "## Relevant Files\nExact paths touched or referenced, one per line, no commentary.\n"
-                "Keep the whole note under 250 words — density matters more than coverage."
-            ),
+            "system_prompt": _COMPACTION_SYSTEM_PROMPT,
             "model_settings": ModelSettings(temperature=0.2),
         }
         if usage_cap is not None:
             kwargs["capabilities"] = [usage_cap]
         summarizer = Agent(m, **kwargs)
         result = await summarizer.run(
-            text,
+            user_prompt,
             model_settings=ModelSettings(
-                timeout=model_timeout(model=m, total=60, connect=15, read=60)
+                max_tokens=_summary_output_budget(ctx, max_output),
+                timeout=model_timeout(model=m, total=60, connect=15, read=60),
             ),
         )
         return str(getattr(result, "output", "") or "").strip()
@@ -3049,13 +3208,12 @@ async def _compact_history(
     if not summary:
         return None  # compact failed — do NOT drop messages; caller surfaces a retry
 
-    if existing_summary:
-        summary = existing_summary.rstrip() + "\n\n" + summary
-
+    # opencode stores a single merged summary; we keep our "[Compacted earlier
+    # context]" system-note convention so the frontend fold logic still works.
     return (
         [{"role": "system", "content": "[Compacted earlier context]\n" + summary}]
         + recent,
-        recent_n,
+        len(recent),
     )
 
 
@@ -3772,6 +3930,7 @@ async def run_agent(
         context_limit=ctx,
         state=early_usage_state,
         compact_threshold=compact_threshold,
+        max_output=_model_max_output(model),
     )
 
     # Build dedicated subagent models when the user picks one in Settings →
@@ -5030,9 +5189,9 @@ async def run_agent(
                             real = early_usage_state.get("last") or 0
                             raise _HighWatermark(
                                 (
-                                    real
-                                    if real > 0
-                                    else int(ctx * _preemptive_compact_fraction(ctx))
+                                real
+                                if real > 0
+                                else int(ctx * _preemptive_compact_fraction(ctx, _model_max_output(model)))
                                 ),
                                 ctx,
                                 note=(
@@ -5457,6 +5616,7 @@ async def run_agent(
                             _q.put_nowait(dict(usage)),
                         )[1],
                         context_limit=0,  # summarizer bushy enough; never auto-compacts itself
+                        max_output=_model_max_output(compact_model or model),
                         state={
                             "model_name": compact_model_name,
                             "hit": False,
@@ -5480,6 +5640,8 @@ async def run_agent(
                         if compact_model is None or compact_model is model
                         else model
                     ),
+                    ctx=ctx,
+                    max_output=_model_max_output(compact_model or model),
                 )
                 compact_keep: int = 0
                 if compacted is not None and isinstance(compacted, tuple):
@@ -5753,6 +5915,8 @@ async def run_agent(
                         if compact_model is None or compact_model is model
                         else model
                     ),
+                    ctx=ctx,
+                    max_output=_model_max_output(compact_model or model),
                 )
                 if compacted is not None:
                     compact_keep = 0

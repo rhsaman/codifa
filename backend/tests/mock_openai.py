@@ -77,6 +77,18 @@ def tool_call(tool, args_json, call_id="call_x", finish="tool_calls"):
     ]
 
 
+def length_reply(finish="length"):
+    """Emulate a small local model whose context window was exceeded: an empty
+    response with ``finish_reason: 'length'``. pydantic-ai raises
+    ``UnexpectedModelBehavior`` on this — exactly the crash the sub-agents now
+    degrade from instead of killing the turn."""
+    return [
+        {"id": "c-1", "object": "chat.completion.chunk", "created": 0,
+         "model": MODEL,
+         "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
+    ]
+
+
 async def models_handler(request: Request):
     return JSONResponse({"object": "list", "data": [
         {"id": MODEL, "context_length": 32000},
@@ -127,13 +139,38 @@ async def chat_handler(request: Request):
             status_code=400,
         )
     mock.statuses.append(200)
+    # Derive usage from the REAL request/response sizes so token counts are
+    # internally logical (input tokens scale with the context actually sent),
+    # instead of the hard-coded 100/10 placeholders.
+    prompt_tokens = max(1, len(json.dumps(body, ensure_ascii=False)) // 4)
+    resp_text = ""
     if body.get("stream"):
+        for c in spec:
+            resp_text += (c.get("choices", [{}])[0].get("delta", {}).get("content") or "")
+    else:
+        if spec and any(c.get("choices", [{}])[0].get("finish_reason") for c in spec):
+            finish = next((c["choices"][0]["finish_reason"] for c in spec
+                           if c.get("choices", [{}])[0].get("finish_reason")), "stop")
+        else:
+            finish = "stop"
+        resp_text = _to_completion(spec, finish=finish)["choices"][0]["message"].get("content") or ""
+    completion_tokens = max(0, len(resp_text) // 4)
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if body.get("stream"):
+        if spec:
+            spec[-1]["usage"] = usage
         return StreamingResponse(sse(*spec)(), media_type="text/event-stream")
     finish = "stop"
     if spec and any(c.get("choices", [{}])[0].get("finish_reason") for c in spec):
         finish = next((c["choices"][0]["finish_reason"] for c in spec
                        if c.get("choices", [{}])[0].get("finish_reason")), "stop")
-    return JSONResponse(_to_completion(spec, finish=finish))
+    comp = _to_completion(spec, finish=finish)
+    comp["usage"] = usage
+    return JSONResponse(comp)
 
 
 app = Starlette(routes=[

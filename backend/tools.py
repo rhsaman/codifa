@@ -12,6 +12,7 @@ import asyncio
 import contextvars
 import difflib
 import functools
+import traceback
 import glob as _pyglob
 import json
 import os
@@ -50,14 +51,10 @@ MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
 WEB_SEARCH_TIMEOUT = 15
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
+SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
+SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
 
-# Skip distillation when raw output is below this threshold (chars).
-# Small results are fast for the parent to read directly; distillation adds
-# a full LLM round-trip (~several seconds) and is only worthwhile for
-# large/broad searches where it saves parent context tokens.
-_SEARCH_DISTILL_THRESHOLD = 600
-
-# Sub-agent model calls (terminal-search reader / web distiller)
+# Sub-agent model calls (web distiller)
 # share the parent turn's retry policy so a free-tier rate limit or connection
 # blip on the gateway retries the sub-agent instead of failing the whole turn
 # and re-burning parent tokens. Flat 30s cadence, up to 10 attempts, then the
@@ -192,6 +189,78 @@ async def _run_subagent_call(
     # The old 30s x 10 backoff (up to 5 minutes of silent stalling per call) is
     # what made a sub-agent run feel like it searched for half an hour.
     return await factory()
+
+
+# --- Adaptive sub-agent output cap ---------------------------------------
+# We want a hard upper bound on how many tokens a sub-agent may generate even
+# when there is no external timeout (a slow local model otherwise produces
+# unbounded output and the turn stalls indefinitely).  But we must never set a
+# cap larger than the model's real context window — that is exactly what caused
+# the old "Model token limit (400) exceeded" crash on small-window local
+# models.  So the cap is derived as a fraction of the window, with a safe
+# headroom, and falls back to "no cap" (None) when we cannot learn the window.
+_SUBAGENT_MT_CACHE: dict[int, object] = {}
+_MISSING = object()
+
+
+async def _subagent_max_tokens(model, *, narrow: bool = True):
+    """Bounded-but-safe max_tokens for a sub-agent run.
+
+    `narrow=True` for cheap sub-agents (distillers) that only need a short
+    answer; `narrow=False` for general/vision sub-agents whose prompt is larger.
+    Returns None when the model's window is unknown (caller then sends no cap).
+    """
+    key = id(model)
+    cached = _SUBAGENT_MT_CACHE.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    val = await _resolve_subagent_max_tokens(model, narrow=narrow)
+    _SUBAGENT_MT_CACHE[key] = val
+    return val
+
+
+async def _resolve_subagent_max_tokens(model, *, narrow: bool) -> int | None:
+    ctx = await _model_context_window(model)
+    if not ctx or ctx <= 0:
+        return None
+    headroom = 512  # room for the (often large) sub-agent prompt + history
+    raw = (ctx // 4) if narrow else (ctx // 8)
+    # Cap at a value that is safely under any model's *output* limit (most
+    # providers reject max_tokens above their max output, often ~8K) while still
+    # bounding runaway generation when no external timeout is in force.
+    cap = min(raw, 8000, max(64, ctx - headroom))
+    return cap if cap >= 64 else 64
+
+
+async def _model_context_window(model) -> int:
+    """Best-effort context-window lookup. 0 when unknown."""
+    info = getattr(model, "model_info", None)
+    cw = int(getattr(info, "context_window", 0) or 0)
+    if cw:
+        return cw
+    m = getattr(model, "_model", model)
+    name = getattr(m, "model_name", "") or getattr(model, "model_name", "") or ""
+    if not name:
+        return 0
+    base_url = ""
+    prov_obj = getattr(m, "provider", None) or getattr(model, "provider", None)
+    if prov_obj is not None:
+        bu = getattr(prov_obj, "base_url", None)
+        if bu is not None:
+            base_url = str(bu)
+    low = base_url.lower()
+    if "ollama" in low:
+        prov = "ollama"
+    elif "openrouter" in low:
+        prov = "openrouter"
+    else:
+        prov = "openai"
+    try:
+        from providers import model_context as _mc
+
+        return await _mc(prov, name, base_url)
+    except Exception:
+        return 0
 
 
 
@@ -2423,7 +2492,6 @@ def make_tool_callbacks(
     emit: Callable[[dict], None],
     context_window: int = 0,
     web_model: Any = None,
-    search_model: Any = None,
     main_model: Any = None,
     vision_model: Any = None,
     image_uris: list[str] | None = None,
@@ -2604,19 +2672,23 @@ def make_tool_callbacks(
         while True:
             try:
                 agent = make_agent(model)
+                mt = await _subagent_max_tokens(model, narrow=True)
+                _ms = {
+                    "timeout": _providers.model_timeout(
+                        model=model,
+                        total=timeout_total,
+                        connect=15,
+                        read=timeout_total,
+                    )
+                }
+                if mt is not None:
+                    _ms["max_tokens"] = mt
                 res = await _run_subagent_call(
                     # Bind loop vars as defaults so the closure stays correct
                     # even if the callable is invoked after the loop advances.
-                    lambda agent=agent, model=model: agent.run(
+                    lambda agent=agent, model=model, _ms=_ms: agent.run(
                         make_prompt(),
-                        model_settings=_MS(
-                            timeout=_providers.model_timeout(
-                                model=model,
-                                total=timeout_total,
-                                connect=15,
-                                read=timeout_total,
-                            )
-                        ),
+                        model_settings=_MS(**_ms),
                     ),
                     label,
                     emit=emit,
@@ -3231,19 +3303,20 @@ def make_tool_callbacks(
         )
 
     async def grep_tool(pattern: str, path: str = "", include: str = "") -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files.
+
+Returns each match as a `file:line:` header followed by a few surrounding code lines (the matching line is marked with `>`), so you normally do NOT need a separate `read` to see the relevant code. Use this instead of grep+read. Runs on the MAIN model — grep output is returned directly (capped to `tool_out_chars`) so the agent can read the matches itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
-            _search_runner = main_model if _fallback_state.get("search") else search_model
-            _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
             emit(
                 {
                     "kind": "tool",
                     "tool": "grep",
                     "args": {"pattern": pattern, "path": path, "include": include},
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
             emit(
@@ -3251,27 +3324,21 @@ def make_tool_callbacks(
                     "kind": "tool_result",
                     "tool": "grep",
                     "summary": "cached",
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
             return cached
 
-        # The search sub-agent model is the one configured for search tools
-        # (grep / glob / list_files). Label the event with it so the UI badge
-        # shows which model this search slot runs on — the main model once the
-        # slot has fallen back earlier in the turn.
-        _search_runner = main_model if _fallback_state.get("search") else search_model
-        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
         emit(
             {
                 "kind": "tool",
                 "tool": "grep",
                 "args": {"pattern": pattern, "path": path, "include": include},
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         try:
-            result = search_in_files(root, pattern, path, 0, include)
+            result = search_in_files(root, pattern, path, SNIPPET_CONTEXT, include)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("grep", msg))
@@ -3287,19 +3354,31 @@ def make_tool_callbacks(
                     "kind": "tool_result",
                     "tool": "grep",
                     "summary": "no matches",
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
-            return f"No matches for {pattern!r} under {path or '/'}."
+            return f"No matches for {pattern!r} under {path or '/'}"
         # Hard cap on the total characters returned so a broad search can't
         # flood the context window.
+        def _snippet(m: dict) -> list[str]:
+            rows: dict[int, str] = {}
+            for c in m.get("context_lines") or []:
+                if c.get("line") is not None:
+                    rows[c["line"]] = (c.get("text") or "")[:SNIPPET_LINE_WIDTH]
+            rows[m["line"]] = (m.get("text") or "")[:SNIPPET_LINE_WIDTH]
+            out = [f"{m['file']}:{m['line']}:"]
+            for ln in sorted(rows):
+                mark = ">" if ln == m["line"] else " "
+                out.append(f"   {mark} {ln}: {rows[ln]}")
+            return out
+
         lines: list[str] = []
         total = 0
         shown = 0
         for m in matches:
             if shown >= search_count:
                 break
-            block = [f"{m['file']}:{m['line']}: {m['text']}"]
+            block = _snippet(m)
             block_size = sum(len(b) + 1 for b in block)
             if lines and total + block_size > tool_out_chars:
                 break
@@ -3314,109 +3393,31 @@ def make_tool_callbacks(
             else ""
         )
         raw = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-
-        # Skip distillation for small results — parent reads them directly.
-        # Distillation adds a full LLM round-trip; only worthwhile for large
-        # outputs where it saves parent context tokens.
-        _search_runner = main_model if _fallback_state.get("search") else search_model
-        if _search_runner is not None and len(raw) >= _SEARCH_DISTILL_THRESHOLD:
-            try:
-                from pydantic_ai import Agent as _SA
-                from pydantic_ai.settings import ModelSettings as _SMS
-
-                res, ran_model = await _run_distill(
-                    "search",
-                    _search_runner,
-                    "search distiller",
-                    lambda m: _SA(
-                        m,
-                        system_prompt=(
-                            "You are a code-search reader. A regex search of the "
-                            "codebase produced the raw matches below. Distill them "
-                            "into a CONCISE answer (under ~150 words): what was found, "
-                            "exact file paths and line numbers, and a one-line note on "
-                            "the most relevant match. Do not restate the whole raw output."
-                        ),
-                        model_settings=_SMS(temperature=0.2, max_tokens=400),
-                    ),
-                    lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
-                    timeout_total=25,
-                )
-                distilled = str(getattr(res, "output", "") or "").strip()
-                if distilled:
-                    from agents import _usage_event  # local import (circular-safe)
-
-                    _usage_ev = _usage_event(
-                        getattr(res, "usage", None),
-                        model=str(getattr(ran_model, "model_name", "") or ""),
-                    )
-                    if _usage_ev:
-                        emit(_usage_ev)
-                    result_text = f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
-                    _parent_search_cache[cache_key] = result_text
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "grep",
-                            "summary": f"{len(matches)} matches (distilled)",
-                            "model": str(getattr(ran_model, "model_name", "") or ""),
-                        }
-                    )
-                    return result_text
-            except Exception as exc:  # noqa: BLE001 — fall back to raw output
-                _ran_name = str(
-                    getattr(
-                        main_model if _fallback_state.get("search") else search_model,
-                        "model_name",
-                        "",
-                    )
-                    or ""
-                )
-                _search_note = _subagent_fail_note("search", _ran_name, exc)
-                if _search_note:
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "grep",
-                            "summary": "search subagent failed — raw matches below",
-                            "status": "error",
-                            "model": _ran_name,
-                        }
-                    )
-                    return (
-                        f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
-                        + "\n".join(lines)
-                    )
         _parent_search_cache[cache_key] = raw
         emit(
             {
                 "kind": "tool_result",
                 "tool": "grep",
                 "summary": f"{len(matches)} matches",
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
-        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes)."""
+        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache for terminal search commands
         if _is_terminal_search(command):
             cache_key = ("terminal", command, "", "")
             cached = _parent_search_cache.get(cache_key)
             if cached is not None:
-                _reader_model = main_model if _fallback_state.get("search") else search_model
-                _reader_model_name = (
-                    str(getattr(_reader_model, "model_name", "") or "")
-                    if _reader_model is not None
-                    else ""
-                )
                 emit(
                     {
                         "kind": "tool",
                         "tool": "run_terminal",
                         "args": {"command": command},
-                        "model": _reader_model_name,
+                        "model": _main_name,
                     }
                 )
                 emit(
@@ -3424,24 +3425,18 @@ def make_tool_callbacks(
                         "kind": "tool_result",
                         "tool": "run_terminal",
                         "summary": "cached",
-                        "model": _reader_model_name,
+                        "model": _main_name,
                     }
                 )
                 return cached
 
-        _reader_model = main_model if _fallback_state.get("search") else search_model
-        _reader_model_name = (
-            str(getattr(_reader_model, "model_name", "") or "")
-            if _reader_model is not None
-            else ""
-        )
         _is_search_cmd = _is_terminal_search(command)
         emit(
             {
                 "kind": "tool",
                 "tool": "run_terminal",
                 "args": {"command": command},
-                "model": _reader_model_name if _is_search_cmd else "",
+                "model": _main_name if _is_search_cmd else "",
             }
         )
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
@@ -3468,87 +3463,6 @@ def make_tool_callbacks(
         if not output:
             emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
             return f"$ {command}\n(no output, exit code {result['exit_code']})" + nudge
-        # When a dedicated "search" subagent model is configured and this is a
-        # codebase search (grep/rg/find/sed...), pass the raw output through the
-        # search subagent so it does the interpretation work (and its tokens are
-        # accounted to the search model in MODEL USAGE), instead of the parent
-        # model reading the raw output directly. On a hard sub-agent failure the
-        # call falls back to the MAIN model (see _run_distill) — the raw output
-        # is only returned when BOTH models fail.
-        _reader_model = main_model if _fallback_state.get("search") else search_model
-        if (
-            _reader_model is not None
-            and _is_terminal_search(command)
-            and len(output) >= _SEARCH_DISTILL_THRESHOLD
-        ):
-            try:
-                from pydantic_ai import Agent as _SA
-                from pydantic_ai.settings import ModelSettings as _SMS
-
-                res, ran_model = await _run_distill(
-                    "search",
-                    _reader_model,
-                    "terminal-search reader",
-                    lambda m: _SA(
-                        m,
-                        system_prompt=(
-                            "You are a code-search reader. A shell command searched the "
-                            "codebase and produced the raw output below. Distill it into a "
-                            "CONCISE answer (under ~150 words): what was found, exact file "
-                            "paths and line numbers, and a one-line note on the most "
-                            "relevant match. Do not restate the whole raw output."
-                        ),
-                        model_settings=_SMS(temperature=0.2, max_tokens=400),
-                    ),
-                    lambda: f"COMMAND: {command}\n\nOUTPUT:\n{output}",
-                    timeout_total=25,
-                )
-                distilled = str(getattr(res, "output", "") or "").strip()
-                if distilled:
-                    from agents import _usage_event  # local import (circular-safe)
-
-                    _usage_ev = _usage_event(
-                        getattr(res, "usage", None),
-                        model=str(getattr(ran_model, "model_name", "") or ""),
-                    )
-                    if _usage_ev:
-                        emit(_usage_ev)
-                    result_text = f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
-                    if _is_terminal_search(command):
-                        _parent_search_cache[("terminal", command, "", "")] = result_text
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "run_terminal",
-                            "summary": f"search distilled · {len(distilled)} chars",
-                            "model": str(getattr(ran_model, "model_name", "") or ""),
-                        }
-                    )
-                    return result_text
-            except Exception as exc:  # noqa: BLE001 — fall back to raw output
-                # Both the search subagent AND the main model failed. Say so with
-                # the model name so the user can fix it in Settings → Tools,
-                # THEN provide the raw output as fallback.
-                _ran_name = str(
-                    getattr(
-                        main_model if _fallback_state.get("search") else search_model,
-                        "model_name",
-                        "",
-                    )
-                    or ""
-                )
-                _search_note = _subagent_fail_note("search", _ran_name, exc)
-                if _search_note:
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "run_terminal",
-                            "summary": "search subagent failed — raw output below",
-                            "status": "error",
-                            "model": _ran_name,
-                        }
-                    )
-                    return f"$ {command}\n{_search_note}\n{output}" + nudge
         emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
         # Exit code used to live ONLY in the emit() summary (UI-only) — the
         # model never saw it in the text it actually reads, so it had to guess
@@ -3557,19 +3471,18 @@ def make_tool_callbacks(
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "") -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
-            _search_runner = main_model if _fallback_state.get("search") else search_model
-            _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
             emit(
                 {
                     "kind": "tool",
                     "tool": "glob",
                     "args": {"pattern": pattern, "path": path},
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
             emit(
@@ -3577,21 +3490,17 @@ def make_tool_callbacks(
                     "kind": "tool_result",
                     "tool": "glob",
                     "summary": "cached",
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
             return cached
 
-        # Search-slot model label (same as grep): the search sub-agent, or the
-        # main model once the slot has fallen back earlier in the turn.
-        _search_runner = main_model if _fallback_state.get("search") else search_model
-        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
         emit(
             {
                 "kind": "tool",
                 "tool": "glob",
                 "args": {"pattern": pattern, "path": path},
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         try:
@@ -3611,107 +3520,33 @@ def make_tool_callbacks(
                     "kind": "tool_result",
                     "tool": "glob",
                     "summary": "no matches",
-                    "model": _search_runner_name,
+                    "model": _main_name,
                 }
             )
             return f"No files match {pattern!r} under {path or '/'}."
         lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
         raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-
-        # Skip distillation for small results — parent reads them directly.
-        _search_runner = main_model if _fallback_state.get("search") else search_model
-        if _search_runner is not None and len(raw) >= _SEARCH_DISTILL_THRESHOLD:
-            try:
-                from pydantic_ai import Agent as _SA
-                from pydantic_ai.settings import ModelSettings as _SMS
-
-                res, ran_model = await _run_distill(
-                    "search",
-                    _search_runner,
-                    "search distiller",
-                    lambda m: _SA(
-                        m,
-                        system_prompt=(
-                            "You are a code-search reader. A glob search of the "
-                            "codebase produced the raw file matches below. Distill them "
-                            "into a CONCISE answer (under ~150 words): what files were found, "
-                            "exact file paths, and a one-line note on the most relevant match. "
-                            "Do not restate the whole raw output."
-                        ),
-                        model_settings=_SMS(temperature=0.2, max_tokens=400),
-                    ),
-                    lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
-                    timeout_total=25,
-                )
-                distilled = str(getattr(res, "output", "") or "").strip()
-                if distilled:
-                    from agents import _usage_event  # local import (circular-safe)
-
-                    _usage_ev = _usage_event(
-                        getattr(res, "usage", None),
-                        model=str(getattr(ran_model, "model_name", "") or ""),
-                    )
-                    if _usage_ev:
-                        emit(_usage_ev)
-                    result_text = f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
-                    _parent_search_cache[cache_key] = result_text
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "glob",
-                            "summary": f"{len(matches)} matches (distilled)",
-                            "model": str(getattr(ran_model, "model_name", "") or ""),
-                        }
-                    )
-                    return result_text
-            except Exception as exc:  # noqa: BLE001 — fall back to raw output
-                _ran_name = str(
-                    getattr(
-                        main_model if _fallback_state.get("search") else search_model,
-                        "model_name",
-                        "",
-                    )
-                    or ""
-                )
-                _search_note = _subagent_fail_note("search", _ran_name, exc)
-                if _search_note:
-                    emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "glob",
-                            "summary": "search subagent failed — raw matches below",
-                            "status": "error",
-                            "model": _ran_name,
-                        }
-                    )
-                    return (
-                        f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
-                        + "\n".join(lines)
-                    )
         _parent_search_cache[cache_key] = raw
         emit(
             {
                 "kind": "tool_result",
                 "tool": "glob",
                 "summary": f"{len(matches)} matches",
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         return raw
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery."""
-        # Search-slot model label (same as grep/glob): the search sub-agent, or
-        # the main model once the slot has fallen back earlier in the turn.
-        _search_runner = main_model if _fallback_state.get("search") else search_model
-        _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {
                 "kind": "tool",
                 "tool": "read",
                 "args": {"filePath": filePath, "offset": offset, "limit": limit},
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         try:
@@ -3721,99 +3556,7 @@ def make_tool_callbacks(
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
-            raw = await _read_dir_tool(
-                target, filePath, offset, limit, _search_runner_name
-            )
-            # When a dedicated "search" subagent model is configured, pass the raw
-            # directory listing through the search subagent so it does the interpretation work
-            # (and its tokens are accounted to the search model). On a hard sub-agent
-            # failure the call falls back to the MAIN model (see _run_distill).
-            _search_runner = (
-                main_model if _fallback_state.get("search") else search_model
-            )
-            # NOTE: no `not _fallback_state` guard here — _run_distill itself
-            # picks the main model once the slot has fallen back (sticky), so a
-            # later directory read in the same turn still gets distilled (by the
-            # main model) instead of dumping raw entries into the parent context.
-            if _search_runner is not None:
-                try:
-                    from pydantic_ai import Agent as _SA
-                    from pydantic_ai.settings import ModelSettings as _SMS
-
-                    res, ran_model = await _run_distill(
-                        "search",
-                        _search_runner,
-                        "search distiller",
-                        lambda m: _SA(
-                            m,
-                            system_prompt=(
-                                "You are a code-search reader. A directory listing of the "
-                                "codebase produced the raw entries below. Distill them "
-                                "into a CONCISE answer (under ~150 words): what files/directories "
-                                "were found, and a one-line note on the most relevant entries. "
-                                "Do not restate the whole raw output."
-                            ),
-                            model_settings=_SMS(temperature=0.2, max_tokens=400),
-                        ),
-                        lambda: (
-                            f"DIRECTORY: {filePath}\n\nENTRIES:\n"
-                            + raw.split("\n", 1)[1]
-                            if "\n" in raw
-                            else raw
-                        ),
-                        timeout_total=60,
-                    )
-                    distilled = str(getattr(res, "output", "") or "").strip()
-                    if distilled:
-                        from agents import _usage_event  # local import (circular-safe)
-
-                        _usage_ev = _usage_event(
-                            getattr(res, "usage", None),
-                            model=str(getattr(ran_model, "model_name", "") or ""),
-                        )
-                        if _usage_ev:
-                            emit(_usage_ev)
-                        emit(
-                            {
-                                "kind": "tool_result",
-                                "tool": "read",
-                                "summary": f"directory distilled · {len(distilled)} chars",
-                                "model": str(
-                                    getattr(ran_model, "model_name", "") or ""
-                                ),
-                            }
-                        )
-                        return f"DIRECTORY {filePath} (distilled)\n{distilled}"
-                except Exception as exc:  # noqa: BLE001 — fall back to raw output
-                    _ran_name = str(
-                        getattr(
-                            (
-                                main_model
-                                if _fallback_state.get("search")
-                                else search_model
-                            ),
-                            "model_name",
-                            "",
-                        )
-                        or ""
-                    )
-                    _search_note = _subagent_fail_note("search", _ran_name, exc)
-                    if _search_note:
-                        emit(
-                            {
-                                "kind": "tool_result",
-                                "tool": "read",
-                                "summary": "search subagent failed — raw listing below",
-                                "status": "error",
-                                "model": _ran_name,
-                            }
-                        )
-                        return (
-                            f"DIRECTORY {filePath}\n{_search_note}\n"
-                            + raw.split("\n", 1)[1]
-                            if "\n" in raw
-                            else raw
-                        )
+            raw = await _read_dir_tool(target, filePath, offset, limit, _main_name)
             return raw
         if not os.path.exists(target):
             msg = "file not found"
@@ -3847,7 +3590,7 @@ def make_tool_callbacks(
                 "kind": "tool_result",
                 "tool": "read",
                 "summary": f"{len(lines)} lines",
-                "model": _search_runner_name,
+                "model": _main_name,
             }
         )
         return f"{filePath}\n{body}"
@@ -4029,7 +3772,6 @@ def make_tool_callbacks(
             tools=_general_tools,
             model_settings=_ModelSettings(
                 temperature=0.2,
-                max_tokens=2000,
                 parallel_tool_calls=True,
             ),
         )
@@ -4037,20 +3779,30 @@ def make_tool_callbacks(
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         try:
+            _gmt = await _subagent_max_tokens(_general_model, narrow=False)
+            _gms = {
+                "timeout": _providers.model_timeout(
+                    model=_general_model, total=120, connect=10, read=120
+                ),
+                "parallel_tool_calls": True,
+            }
+            if _gmt is not None:
+                _gms["max_tokens"] = _gmt
             _res = await _run_subagent_call(
-                lambda: _sub_agent.run(
+                lambda _gms=_gms: _sub_agent.run(
                     prompt,
                     usage_limits=_UsageLimits(request_limit=12, tool_calls_limit=24),
-                    model_settings=_ModelSettings(
-                        timeout=_providers.model_timeout(
-                            model=_general_model, total=120, connect=10, read=120
-                        ),
-                        parallel_tool_calls=True,
-                    ),
+                    model_settings=_ModelSettings(**_gms),
                 ),
                 "general sub-agent",
                 emit=emit,
                 model_name=_general_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
+            emit(_error_result("task", f"sub-agent failed: {exc}"))
+            return (
+                f"ERROR: the general sub-agent failed"
+                f" ({_general_name} model, change it in Settings → Subagents): {exc}"
             )
         finally:
             _SUB_AGENT_CTX.reset(_token)
@@ -4122,21 +3874,25 @@ def make_tool_callbacks(
                 "numbers, layout, colors, UI elements, errors) the main agent "
                 "needs — it cannot see the image, your report is its only view."
             ),
-            model_settings=_ModelSettings(temperature=0.2, max_tokens=2000),
+            model_settings=_ModelSettings(temperature=0.2),
         )
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         try:
+            _vmt = await _subagent_max_tokens(_vmodel, narrow=False)
+            _vms = {
+                "timeout": _providers.model_timeout(
+                    model=_vmodel, total=120, connect=10, read=120
+                ),
+            }
+            if _vmt is not None:
+                _vms["max_tokens"] = _vmt
             _res = await _run_subagent_call(
-                lambda: _sub_agent.run(
+                lambda _vms=_vms: _sub_agent.run(
                     [prompt, *[_ImgUrl(url=u) for u in _imgs]],
                     usage_limits=_UsageLimits(request_limit=3),
-                    model_settings=_ModelSettings(
-                        timeout=_providers.model_timeout(
-                            model=_vmodel, total=120, connect=10, read=120
-                        ),
-                    ),
+                    model_settings=_ModelSettings(**_vms),
                 ),
                 "vision sub-agent",
                 emit=emit,
@@ -4254,7 +4010,7 @@ def make_tool_callbacks(
                             "150 words) that cites the most relevant result URLs inline. "
                             "If the results cannot answer the query, say so."
                         ),
-                        model_settings=ModelSettings(temperature=0.2, max_tokens=400),
+                        model_settings=ModelSettings(temperature=0.2),
                     ),
                     lambda: f"QUERY: {query}\n\nSEARCH RESULTS:\n" + "\n".join(lines),
                     timeout_total=60,

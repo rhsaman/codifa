@@ -470,6 +470,61 @@ class _ReasoningBackfillChatModel(OpenAIChatModel):
         return mapped
 
 
+class _LocalChatModel(_ReasoningBackfillChatModel):
+    """OpenAIChatModel for local / bring-your-own OpenAI-compatible servers
+    (the "ollama" and "custom" provider kinds: llama.cpp, LM Studio, vLLM, Ollama).
+
+    These servers apply the model's Jinja chat template at request time, and
+    several popular templates (Qwen2.5, DeepSeek, many Llama-3.x finetunes)
+    assert that EVERY system message sits at the very BEGINNING of the
+    conversation — ``{% if messages[0]['role'] != 'system' %}{{
+    raise_exception('System message must be at the beginning') }}{% endif %}``
+    (or the per-message ``loop.first`` variant). Our agent legitimately emits a
+    system message in the MIDDLE of the conversation on interrupted-turn resume
+    (a "these tool calls were already done" note appended after the tool
+    results). That trips the assertion and the whole request 400s with
+    "Unable to generate parser for this template. Automatic parser generation
+    failed".
+
+    This override relocates any non-leading ``system``/``developer`` message to
+    the front and collapses the system block into ONE message, so the server
+    always sees a single contiguous system block at index 0. user/assistant/tool
+    messages are left untouched, so tool-call pairing is unaffected. It still
+    inherits the DeepSeek reasoning backfill (via ``_ReasoningBackfillChatModel``)
+    when a profile is set.
+    """
+
+    async def _map_messages(
+        self,
+        messages: Sequence[ModelMessage],
+        model_request_parameters: ModelRequestParameters,
+        *,
+        model_settings: ModelSettings | None = None,
+    ) -> list[chat.ChatCompletionMessageParam]:
+        mapped = await super()._map_messages(
+            messages, model_request_parameters, model_settings=model_settings
+        )
+        role = (self.profile or {}).get("openai_system_prompt_role", None) or "system"
+        if role not in ("system", "developer"):
+            return mapped
+        sys_msgs = [m for m in mapped if m.get("role") == role]
+        rest = [m for m in mapped if m.get("role") != role]
+        # Qwen3.5's chat template raises `System message must be at the beginning`
+        # for ANY system/developer message that is not the very first message —
+        # i.e. it requires EXACTLY ONE system message at index 0, even a second
+        # leading system (e.g. our prepended tool-reuse note + the main
+        # instructions) trips it. Collapse all system messages into a single
+        # block at the front whenever they aren't already a lone leading one.
+        if not sys_msgs or not rest:
+            return mapped
+        needs_fix = (len(sys_msgs) > 1) or (mapped[0].get("role") != role)
+        if not needs_fix:
+            return mapped
+        merged: dict = dict(sys_msgs[0])
+        merged["content"] = "\n\n".join((m.get("content") or "") for m in sys_msgs)
+        return [merged] + rest
+
+
 def build_model(
     provider: str,
     model: str,
@@ -575,6 +630,15 @@ def build_model(
             # (verified live: `""` → 400, `" "` → 200). Backfill with a
             # non-empty placeholder so the field survives the gateway.
             profile["openai_chat_thinking_backfill"] = " "
+    # Local / bring-your-own OpenAI-compatible servers (the "ollama" and "custom"
+    # provider kinds: llama.cpp, LM Studio, vLLM, Ollama) apply the model's Jinja
+    # chat template at request time, and several popular templates assert every
+    # system message is at the very beginning of the conversation. _LocalChatModel
+    # guarantees a single contiguous system block up front (and still inherits the
+    # DeepSeek reasoning backfill above when profile is set).
+    if provider in ("ollama", "custom"):
+        return _LocalChatModel(model, provider=provider_obj, profile=profile)
+    if profile:
         return _ReasoningBackfillChatModel(model, provider=provider_obj, profile=profile)
     return OpenAIChatModel(model, provider=provider_obj, profile=profile)
 
@@ -589,6 +653,17 @@ def _models_endpoint(provider: str, base_url: str) -> tuple[str, str]:
     if meta.get("models_url"):
         return _expand_base(meta["models_url"], provider), meta.get("models") or "openai"
     if meta.get("models") == "tags":
+        # The "ollama" provider in the UI is the generic LOCAL endpoint
+        # (llama.cpp / LM Studio / vLLM / Ollama). A custom base URL means a
+        # non-Ollama OpenAI-compatible server, which lists via /v1/models, not
+        # Ollama's /api/tags — otherwise llama.cpp/LM Studio return nothing and
+        # the UI can't show the model's real context window.
+        if provider == "ollama" and base_url and base_url.strip().rstrip("/") not in (
+            "",
+            OLLAMA_BASE.rstrip("/"),
+        ):
+            base = normalize_base_url(provider, base_url)
+            return base + "/models", "openai"
         base = (base_url or OLLAMA_BASE).rstrip("/")
         return base + "/api/tags", "tags"
     base = normalize_base_url(provider, base_url)
@@ -711,6 +786,72 @@ async def _llamacpp_default_ctx(base_url: str) -> int | None:
             return int(n) if n else None
     except Exception:  # noqa: BLE001
         return None
+
+
+async def _lmstudio_context(root: str, model_id: str = "") -> int | None:
+    """Real context window for a local LM Studio model via its native API."""
+    def _extract(obj):
+        if not isinstance(obj, dict):
+            return None
+        if isinstance(obj.get("data"), dict):
+            obj = obj["data"]
+        for key in ("context_length", "max_seq_len", "n_ctx"):
+            v = obj.get(key)
+            if v:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
+        info = obj.get("model_info") or {}
+        if isinstance(info, dict):
+            for key in ("context_length", "max_seq_len", "n_ctx"):
+                v = info.get(key)
+                if v:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if model_id:
+                try:
+                    r = await client.get(root + "/api/v1/model")
+                    if r.status_code == 200:
+                        n = _extract(r.json())
+                        if n:
+                            return n
+                except Exception:  # noqa: BLE001
+                    pass
+            r = await client.get(root + "/api/v1/models")
+            if r.status_code == 200:
+                data = r.json()
+                models = data.get("data") or []
+                if not isinstance(models, list):
+                    models = [models]
+                for m in models:
+                    if model_id and m.get("id") != model_id and m.get("model_key") != model_id:
+                        continue
+                    n = _extract(m)
+                    if n:
+                        return n
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+async def _local_model_ctx(base_url: str, model_id: str = "") -> int | None:
+    """Resolve the real context window from a local model server.
+
+    Tries llama.cpp's /props n_ctx, then LM Studio's native /api/v1/model and
+    /api/v1/models context_length. Returns None when neither advertises it.
+    """
+    root = _server_root(base_url)
+    n = await _llamacpp_default_ctx(root)
+    if n:
+        return n
+    return await _lmstudio_context(root, model_id)
 
 
 async def _models_dev_catalog() -> dict:
@@ -1103,6 +1244,7 @@ async def _ollama_info(
                 pass
     except Exception:  # noqa: BLE001
         return ctx, out
+    return ctx, out
 
 
 async def fetch_credits(
@@ -1262,16 +1404,29 @@ async def list_models(
                         if not m["max_output"] and pair[1]:
                             m["max_output"] = pair[1]
                 if _provider_meta(provider).get("editable_base_url") and any(not m["context"] for m in models):
-                    default_ctx = await _llamacpp_default_ctx(base_url)
                     for m in models:
-                        if default_ctx and not m["context"]:
-                            m["context"] = default_ctx
+                        if not m["context"]:
+                            local_ctx = await _local_model_ctx(base_url, m["id"])
+                            if local_ctx:
+                                m["context"] = local_ctx
                 models.sort(key=lambda m: m["id"])
     except Exception as exc:
         raise ProviderError(f"failed to fetch models from {url}: {exc}") from exc
 
     _model_cache[cache_key] = (time.monotonic(), models)
     return models
+
+
+def _looks_local(provider: str, base_url: str) -> bool:
+    """True when the base URL points at a locally-served model server.
+
+    Includes "ollama" because the UI's "ollama" provider is the generic local
+    endpoint (llama.cpp / LM Studio / vLLM), not Ollama specifically.
+    """
+    if provider in ("local", "custom", "ollama"):
+        return True
+    host = (base_url or "").split("://", 1)[-1].split("/", 1)[0].split(":")[0]
+    return host in ("localhost", "127.0.0.1")
 
 
 async def model_context(
@@ -1316,6 +1471,12 @@ async def model_context(
                 return int(entry["context"])
     except Exception:  # noqa: BLE001, S110 — provider lookup is best-effort
         pass
+    # Local model servers (ollama / llama.cpp / LM Studio) expose their REAL
+    # context window directly — resolve it from the server, not a hard-coded floor.
+    if _looks_local(provider, base_url):
+        local_ctx = await _local_model_ctx(base_url, model)
+        if local_ctx:
+            return local_ctx
     return 0
 
 

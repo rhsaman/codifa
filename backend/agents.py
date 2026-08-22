@@ -596,9 +596,9 @@ def _subagent_target(
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets.",
-    "coder": "You are Coder, an autonomous code-writing agent inside a desktop IDE. For a feature, task or fix: scout the relevant files, then implement end-to-end with your tools. For multi-step tasks call update_plan with a checklist and keep each item's status updated as you go; for trivial single-step changes skip it. Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through run_terminal (no sed -i, patch, tee, redirects, python heredocs that write files) — file changes go through edit_file/write_file only. Use glob to find files by name pattern; run_terminal to build/test/lint. SANDBOX RULE (very important): the sandbox folder is the OS temp dir — /tmp on macOS/Linux, %TEMP% on Windows. Write ALL scratch/throwaway test scripts there via run_terminal with absolute paths, NEVER into the workspace; /tmp is pre-approved and needs no permission. Permanent regression tests belong in the tests folder of the project they test — backend tests in backend/tests, frontend tests in frontend/tests, etc. (version-controlled, run in CI) — never scatter ad-hoc test files in source dirs. TEST DISCIPLINE (strict, every step): after implementing or fixing any feature, function, component or bug, write or update the corresponding tests (backend: pytest in backend/tests; frontend: vitest in test/) and run them before finishing — never finish a step with untested code. Trivial changes (docs, config, typo, rename, styling) don't need new tests, but still run the relevant suite if it's fast. For current or external info, use web_search and fetch_url. If the user @mentions files, their content is already in your context - do not re-search them. When the user asks to remember something, call memory (action='add') right away; also call memory (add/replace/remove) when you learn durable project knowledge; memory is auto-loaded each run - use search_memory only for more. For create/install skills or MCP connectors, call create_skill/create_mcp directly (stored in the app DB), no workspace search first. Match the user's language (Persian -> Persian, English -> English) and keep it. After finishing, summarize in the user's language what you changed and what to do next. TOOL-CALL DISCIPLINE (the whole transcript is resent every step, so wasted calls cost real tokens): combine related lookups into one regex, fire the searches you already know you need in the SAME turn (parallel tool calls), don't re-search the same spot with minor keyword variation, stop scouting once you have what you need, batch related edits, and re-run typecheck/lint/build after a logically-complete change, not after every edit. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file, force-push, destructive shell, dropping a DB) call confirm_action and WAIT; at a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; don't overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it and don't re-run tsc/py_compile for an auto-verified edit; still run the project's tests/build yourself. Only mark a checklist step 'completed' after its change is verified (auto-verify passed or the relevant test/lint/build ran once). CODE QUALITY (every language/project): write maintainable, readable code — small focused files, meaningful names, follow the project's existing structure and conventions. Put each concern in its own file/folder (logic vs UI vs data vs config); never dump unrelated code into one file or create a parallel layout when a home for it already exists. DRY: define shared logic ONCE and reuse it everywhere — never copy-paste. No hardcoded values, no dead/commented-out code, minimal diffs; fix any error you introduce and leave the codebase clean. Code comments must ALWAYS be in English, even when you chat in another language. REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact — never paste full file contents or large code blocks into your visible reply, and do not echo code you just wrote via a tool call back into your text. After writing/editing code, summarize concisely what changed (file, function, and a short diff-level description), not the code itself. PERFORMANCE OPTIMIZATION: When optimization is relevant, before optimizing code: (1) identify the current time and space complexity; (2) estimate the expected input size and workload; (3) identify the actual bottleneck, including CPU, memory, I/O, database, and network costs; (4) determine whether the algorithm, data structure, or data access pattern can be improved; (5) prefer a simpler solution when performance is already sufficient; (6) only apply optimizations that provide a meaningful real-world benefit; (7) preserve correctness, behavior, readability, and maintainability; (8) do not make micro-optimizations based on assumptions — use benchmarks or profiling when performance is critical. Choose idiomatic algorithms, data structures, iteration patterns, concurrency models, and language-specific techniques appropriate for the target language and runtime. Only then modify the code.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths).",
+    "ask": "You are a mentor inside a desktop IDE. For any project-related question (behavior, styling, logic, bugs, file structure, dependencies, etc.), inspect the relevant files with your file tools BEFORE answering - never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you (the auto-injected memory/project-file/web blocks, attached files, earlier tool results, or this conversation), answer directly - do NOT call a tool. Never repeat a search or re-request information already available. Keep replies concise.",
+    "coder": "You are Coder, an implementation-only code-writing agent inside a desktop IDE. You receive the plan and the exact implementation context (file paths, symbols, line targets, and the current code snippets to match) from Plan mode - use it directly; you do NOT explore the repository. You have NO discovery or execution tools: you cannot grep, glob, read, browse files, run commands, or run tests. Implement strictly from the provided context. If the provided context is insufficient to make an exact edit, call ask_user ONCE with the specific missing detail - do not search. For multi-step work call update_plan with a checklist and keep each item's status updated; skip it for trivial single-step changes. Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command - file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Do not make unnecessary intermediate calls. Batch related edits into a single change where one suffices; do not repeatedly edit the same code when one edit accomplishes the task. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it; do not re-run verification yourself. If the plan specifies creating or updating test files, do so, but running tests is Plan mode's job (it has the read-only terminal) - do not attempt to run them. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions - small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. If the user @mentions files, their content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact - never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: inspect files and run only safe read-only terminal commands (git status/diff/log/show, pwd, node/python --version, build/test/lint); never modify/create/delete files; never read files through the terminal (cat/sed/grep/awk/head/tail/find - blocked). Stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). MINIMIZE EXPLORATION — SEARCH FIRST, THEN READ: do ALL your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Never alternate search and read (search→read→search→read) — that multiplies tool calls and burns tokens for no gain. Read enough context in a SINGLE call (read with offset/limit, or grep with its exact path) instead of repeatedly reading small sections; never reread a file or location you already have. STOP scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Include in the plan the EXACT current code snippets (with enough surrounding context) at each edit site so Coder can match and edit them without reading the files itself; do NOT paste full file contents.",
 }
 
 # Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
@@ -3015,7 +3015,7 @@ async def _compact_history(
                 "## Relevant Files\nExact paths touched or referenced, one per line, no commentary.\n"
                 "Keep the whole note under 250 words — density matters more than coverage."
             ),
-            "model_settings": ModelSettings(temperature=0.2, max_tokens=700),
+            "model_settings": ModelSettings(temperature=0.2),
         }
         if usage_cap is not None:
             kwargs["capabilities"] = [usage_cap]
@@ -3094,7 +3094,7 @@ async def _continue_reply(model: Any, reply: str, fragment: str) -> str:
                 "anything that comes before the fragment, do NOT add "
                 "greetings, explanations, markdown fences, or commentary."
             ),
-            model_settings=ModelSettings(temperature=0.3, max_tokens=400),
+            model_settings=ModelSettings(temperature=0.3),
         )
         body = f"ASSISTANT REPLY (cut off):\n{reply[-2000:]}"
         res = await finisher.run(
@@ -3152,7 +3152,7 @@ async def _maybe_auto_memory(
                 "90 words, in ENGLISH, starting with '- '. If nothing is durable "
                 "enough, output exactly the single word NONE."
             ),
-            model_settings=ModelSettings(temperature=0.2, max_tokens=300),
+            model_settings=ModelSettings(temperature=0.2),
         )
         body = (
             f"USER REQUEST:\n{work}\n\n"
@@ -3449,7 +3449,7 @@ _MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder"}
 _MODE_CAPS = {
     "ask": "You are a read-only MENTOR: you guide and teach the user, and you NEVER write, edit or delete files or run commands.",
     "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files; your terminal is read-only.",
-    "coder": "You have full write access: you can create/edit files and run commands.",
+    "coder": "You are an implementation-only agent: you create/edit files strictly from the plan's context. You have NO discovery or execution tools — you cannot search, read, browse, or run commands/tests.",
 }
 
 # Per-mode output contract appended to the CURRENT-MODE note every turn, so a
@@ -3608,12 +3608,6 @@ def _resolve_subagent_models(
             provider_lookup,
         )
 
-    search_model = model
-    search_built = subagent_models.get("search", "") or ""
-    _sub = _build(search_built)
-    if _sub is not None:
-        search_model, _ = _sub
-
     web_model = model
     web_built = subagent_models.get("web", "") or ""
     _sub = _build(web_built)
@@ -3633,7 +3627,6 @@ def _resolve_subagent_models(
         vision_model, _ = _sub
 
     return {
-        "search": search_model,
         "web": web_model,
         "compact": compact_model,
         "vision": vision_model,
@@ -3857,11 +3850,9 @@ async def run_agent(
         oauth_token,
         _subagent_provider,
     )
-    search_model = _resolved["search"]
     web_model = _resolved["web"]
     compact_model = _resolved["compact"]
     vision_model = _resolved["vision"]
-    search_built = subagent_models.get("search", "") or ""
     web_built = subagent_models.get("web", "") or ""
     compact_built = subagent_models.get("compact", "") or ""
     vision_built = subagent_models.get("vision", "") or ""
@@ -3883,7 +3874,6 @@ async def run_agent(
         return name
 
     _routing = {
-        "search": _routing_label(search_model, search_built),
         "web": _routing_label(web_model, web_built),
         "compact": _routing_label(compact_model, compact_built),
         "vision": _routing_label(vision_model, vision_built),
@@ -3916,7 +3906,6 @@ async def run_agent(
         lambda ev: queue.put_nowait(_tool_event(ev)),
         context_window=ctx,
         web_model=web_model,
-        search_model=search_model,
         main_model=model,
         vision_model=vision_model,
         image_uris=image_uris,
@@ -3969,6 +3958,19 @@ async def run_agent(
             }
         if "run_terminal" in tools:
             tools["run_terminal"] = _wrap_no_search_bypass(tools["run_terminal"])
+    # Coder is implementation-only: it relies entirely on the context/plan supplied
+    # by Plan mode, so it must not explore the repo or run commands. Strip every
+    # discovery/execution tool, keeping only the file-write tools plus the
+    # confirm/ask/update helpers it needs. This enforces the "Coder MUST NOT
+    # search/grep/glob/read/run shell" rule at the tool layer, not just in text,
+    # and shrinks Coder's tool schema (~19 -> 5) for a large token win.
+    if mode == "coder":
+        tools = {
+            name: fn
+            for name, fn in tools.items()
+            if name
+            in ("write_file", "edit_file", "confirm_action", "update_plan", "ask_user")
+        }
     # `save_plan` is the ONE write capability plan mode gets despite otherwise
     # being fully read-only (writeFiles=False / mode != "coder") — it writes to
     # the app database, never into the workspace, so it doesn't need the general
@@ -4284,7 +4286,7 @@ async def run_agent(
     system_final = (
         _mode_declare(mode)
         + _language_directive(prompt)
-        + _SEARCH_RULE
+        + ("" if mode == "coder" else _SEARCH_RULE)
         + base_prompt
         + workspace_note
     )
@@ -4457,25 +4459,12 @@ async def run_agent(
             )
         system_final += section
 
-    # TEST VERIFICATION RULE: a coder task that changes code (or is about
-    # tests) must write/update the tests for its changes and run the project's
-    # real test command, seeing it pass, before the agent may declare done.
-    # This is the prompt-level half of the guarantee; the loop-level half (a
-    # bounded forced follow-up when the turn finished without running any test
-    # command) lives in the retry loop below (see `_TestVerifyNeeded`).
-    if mode == "coder" and (_is_test_task(prompt, picked) or _is_code_task(prompt)):
-        system_final += (
-            "\n\nTEST VERIFICATION RULE (strict, always follow): This task "
-            "involves code changes or tests. Before your final message you MUST "
-            "(1) write or update the tests covering the code you changed "
-            "(backend: pytest in backend/tests; frontend: vitest in test/), and "
-            "(2) run the project's real test command (pytest, vitest/node:test, "
-            "cargo test, go test, JUnit, ...) and observe it PASS (exit 0). If "
-            "the tests fail, fix the code and re-run until they pass. NEVER "
-            "declare the task done with failing tests or with changed code that "
-            "has no tests. In your final message, state the exact command you "
-            "ran and its result."
-        )
+    # TEST VERIFICATION: previously a Coder-only rule forced the agent to write
+    # tests and run the project's test command before finishing. Coder is now
+    # implementation-only and has NO terminal (it MUST NOT run shell/test
+    # commands), so that rule no longer applies here — verification is Plan
+    # mode's job (it keeps a read-only terminal that may run build/test/lint).
+    # The corresponding loop-level forced follow-up is disabled for Coder below.
 
     # A plan saved by an earlier plan-mode run in this workspace is injected so
     # Coder (or a plan retry) can continue it without the user retyping it.
@@ -4630,10 +4619,10 @@ async def run_agent(
                         {
                             "role": "system",
                             "content": (
-                                "The tool calls above were completed in the PREVIOUS (interrupted) "
-                                "run of this turn, with their actual results. Treat them as already "
-                                "done — do NOT re-run the same tools. Continue the task from where "
-                                "it was cut off."
+                                "The tool calls already present in this conversation were completed "
+                                "in the PREVIOUS (interrupted) run of this turn, with their actual "
+                                "results. Treat them as already done — do NOT re-run the same tools. "
+                                "Continue the task from where it was cut off."
                                 + (
                                     "\n\nA skill is already attached and active for this turn — do "
                                     "NOT re-run its setup/opening/installation procedure or re-read "
@@ -4667,11 +4656,11 @@ async def run_agent(
                     {
                         "role": "system",
                         "content": (
-                            "The assistant reply above was cut off mid-generation in a "
-                            "PREVIOUS (interrupted) run of this turn. Continue the reply "
-                            "from exactly where it stopped — do NOT restart the answer, "
-                            "do NOT repeat text already written, and do NOT re-run tools "
-                            "whose work is already reflected in it."
+                            "The assistant reply already present in this conversation was "
+                            "cut off mid-generation in a PREVIOUS (interrupted) run of this "
+                            "turn. Continue the reply from exactly where it stopped — do NOT "
+                            "restart the answer, do NOT repeat text already written, and do "
+                            "NOT re-run tools whose work is already reflected in it."
                         ),
                     }
                 ]
@@ -4811,8 +4800,14 @@ async def run_agent(
     # and `code_changed` are sticky across attempts (a throttle retry must
     # not forget a test run or an edit); `test_verify_retries` bounds the
     # forced follow-up to ONE.
-    test_verify_needed = mode == "coder" and (
-        _is_test_task(prompt, picked) or _is_code_task(prompt)
+    # Coder has no terminal (implementation-only), so it can't run the project's
+    # test command — the forced test-verify follow-up only makes sense where a
+    # terminal exists. Guard on "run_terminal" in the (already mode-filtered)
+    # tool set so it stays a no-op for Coder.
+    test_verify_needed = (
+        mode == "coder"
+        and "run_terminal" in tools
+        and (_is_test_task(prompt, picked) or _is_code_task(prompt))
     )
     test_cmd_ran = False
     code_changed = False
@@ -4863,6 +4858,9 @@ async def run_agent(
                 usage_limits=UsageLimits(
                     request_limit=max(200, tool_steps_cap * 4),
                     tool_calls_limit=max(400, tool_steps_cap * 8),
+                    per_request_input_tokens_limit=(
+                        max(1024, int(ctx) - 256) if ctx else None
+                    ),
                 ),
             ) as events:
                 # Producer task: forwards the model's streaming text/thinking
@@ -5446,7 +5444,16 @@ async def run_agent(
                 if compact_model_name:
                     compact_cap = _UsageCapability(
                         on_usage=lambda usage, _q=queue: (
-                            usage.update({"kind": "usage"}),
+                            # The compaction summarizer is a SEPARATE, smaller
+                            # model call — its own token usage must never replace
+                            # the parent turn's context-meter badge (that caused
+                            # the meter to visibly drop to the summarizer's tiny
+                            # usage, then jump back up on the next real step).
+                            # Tag it `sub=True`, same as every other sub-agent
+                            # usage event (see tools.py's `_emit`), so the
+                            # frontend still accrues it into session totals but
+                            # keeps it out of the message badge / context meter.
+                            usage.update({"kind": "usage", "sub": True}),
                             _q.put_nowait(dict(usage)),
                         )[1],
                         context_limit=0,  # summarizer bushy enough; never auto-compacts itself

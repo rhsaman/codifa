@@ -2,8 +2,11 @@
 
 Covers the fix: when a Settings → Tools entry equals the parent (main)
 model — either by name or via the "main model" literal — the subagent must
-run on the main model — NOT silently fall back to another slot's default
-(e.g. the explore model for the search/web slots).
+run on the main model — NOT silently fall back to another slot's default.
+
+Slots: web / compact / vision. vision defaults to None; the others
+default to the parent (main) model. (The former "search" slot was removed:
+grep/glob/read/terminal-search now run on the main model directly.)
 
 Run: cd backend && .venv/bin/python -m pytest tests/test_subagent_models.py -q
 """
@@ -67,18 +70,13 @@ def test_main_model_literal_returns_parent(monkeypatch):
 
 
 def test_main_model_literal_in_resolve(monkeypatch):
-    # "main model" literal in a slot → that slot runs on the parent model,
-    # and search/web do NOT silently land on the explore model.
+    # "main model" literal in a slot → that slot runs on the parent model.
     resolved = _resolve(
         {
-            "explore": "explore-model",
-            "search": "main model",
             "web": "main_model",
         },
         monkeypatch=monkeypatch,
     )
-    assert resolved["explore"].model_name == "explore-model"
-    assert resolved["search"].model_name == "main-model"
     assert resolved["web"].model_name == "main-model"
 
 
@@ -128,22 +126,17 @@ def _resolve(subagent_models: dict, parent_name: str = "main-model", monkeypatch
 
 
 def test_slots_use_parent_when_entry_equals_parent(monkeypatch):
-    # THE regression: search/web/compact/vision explicitly set to the main
-    # model must resolve to the parent — search/web must NOT land on the
-    # explore model.
+    # web/compact/vision explicitly set to the main model must resolve
+    # to the parent.
     resolved = _resolve(
         {
-            "explore": "explore-model",
-            "search": "main-model",
             "web": "main-model",
             "compact": "main-model",
             "vision": "main-model",
         },
         monkeypatch=monkeypatch,
     )
-    assert resolved["explore"].model_name == "explore-model"
-    # search/web/compact/vision all explicitly = main model → parent
-    assert resolved["search"].model_name == "main-model"
+    # web/compact/vision all explicitly = main model → parent
     assert resolved["web"].model_name == "main-model"
     assert resolved["compact"].model_name == "main-model"
     assert resolved["vision"].model_name == "main-model"
@@ -151,18 +144,15 @@ def test_slots_use_parent_when_entry_equals_parent(monkeypatch):
 
 def test_slots_defaults_without_entries(monkeypatch):
     resolved = _resolve({}, monkeypatch=monkeypatch)
-    assert resolved["explore"].model_name == "main-model"
-    assert resolved["search"].model_name == "main-model"  # explore default == parent
     assert resolved["web"].model_name == "main-model"
     assert resolved["compact"].model_name == "main-model"
     assert resolved["vision"] is None
 
 
-def test_search_falls_back_to_explore_when_unset(monkeypatch):
-    # search/web fall back to the EXPLORE model when unset (documented chain)
-    resolved = _resolve({"explore": "explore-model"}, monkeypatch=monkeypatch)
-    assert resolved["explore"].model_name == "explore-model"
-    assert resolved["search"] is resolved["explore"]
-    assert resolved["web"] is resolved["explore"]
+def test_web_compact_default_to_parent_when_unset(monkeypatch):
+    # web/compact fall back to the PARENT model when unset (the explore slot no
+    # longer exists, so there is no separate explore model to inherit).
+    resolved = _resolve({}, monkeypatch=monkeypatch)
+    assert resolved["web"].model_name == "main-model"
     assert resolved["compact"].model_name == "main-model"
     assert resolved["vision"] is None

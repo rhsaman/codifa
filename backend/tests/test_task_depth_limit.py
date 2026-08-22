@@ -33,7 +33,6 @@ async def main():
     tools = make_tool_callbacks(
         ws,
         lambda ev: emitted.append(ev),
-        explore_model=TestModel(custom_output_text="explore"),
         main_model=TestModel(custom_output_text="done"),
     )
     task = tools["task"]
@@ -41,7 +40,7 @@ async def main():
     # Simulate being inside a sub-agent: depth already at the limit.
     token = _TASK_DEPTH_CTX.set(_SUBAGENT_DEPTH_LIMIT)
     try:
-        out = await task(description="x", prompt="find foo", subagent_type="explore")
+        out = await task(description="x", prompt="find foo", subagent_type="general")
     finally:
         _TASK_DEPTH_CTX.reset(token)
 

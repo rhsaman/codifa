@@ -2131,27 +2131,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <label>Tool Models</label>
             </div>
             <div className="hint">
-              Pick separate models for the built-in tools (explore, read, web, vision,
+              Pick separate models for the built-in tools (web, vision,
               compact). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
             </div>
 
-            <ToolModelSelect
-              agent="explore"
-              label="Explore tool"
-              desc="Read-only file search and code investigation (explore tool)."
-              current={subagentModels.explore || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
-              agent="search"
-              label="Read tool"
-              desc="Model that runs the read / grep / glob search tools. Falls back to the explore model."
-              current={subagentModels.search || ''}
-              onSelect={setSubagentModel}
-            />
             <ToolModelSelect
               agent="web"
               label="Web tool"

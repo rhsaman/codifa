@@ -41,7 +41,6 @@ async def main():
     tools = make_tool_callbacks(
         ws,
         lambda ev: emitted.append(ev),
-        explore_model=TestModel(custom_output_text="explore"),
         main_model=main_model,
     )
     task = tools["task"]

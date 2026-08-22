@@ -98,7 +98,7 @@ async def test_auto_retry_500_resumes_with_real_tool_results(run_events):
     # Request 1 (the main model's request AFTER the read tool ran) gets a 500.
     mock.error_at = {1: (500, "server error")}
 
-    events = await run_events("read app.py and summarize it")
+    events = await run_events("read app.py and summarize it", mode="plan")
 
     retries = _retry_events(events)
     assert retries, "expected an auto-retry event after the 500"
@@ -131,7 +131,7 @@ async def test_auto_retry_throttle_resumes_with_real_tool_results(
     # Request 1 (after the read tool ran) gets a 429 throttle.
     mock.error_at = {1: (429, "Rate limit exceeded. Please try again later.")}
 
-    events = await run_events("read app.py and summarize it")
+    events = await run_events("read app.py and summarize it", mode="plan")
 
     retries = _retry_events(events)
     assert retries, "expected an auto-retry event after the throttle"
@@ -152,7 +152,7 @@ async def test_auto_retry_before_any_tool_has_no_injection(run_events):
     # Request 0 (the very first request, before any tool) gets a 500.
     mock.error_at = {0: (500, "server error")}
 
-    events = await run_events("read app.py and summarize it")
+    events = await run_events("read app.py and summarize it", mode="plan")
 
     assert _retry_events(events), "expected an auto-retry event"
     last = mock.captured[-1]
@@ -171,7 +171,7 @@ async def test_auto_retry_injects_resume_tools_only_once(run_events):
     # Requests 1 and 2 (both after the read tool ran) get a 500 each.
     mock.error_at = {1: (500, "server error"), 2: (500, "server error")}
 
-    events = await run_events("read app.py and summarize it")
+    events = await run_events("read app.py and summarize it", mode="plan")
 
     retries = _retry_events(events)
     assert len(retries) == 2, f"expected 2 auto-retries, got {len(retries)}"
@@ -198,7 +198,7 @@ async def test_manual_retry_resumes_from_durable_file(run_events, workspace):
         None,  # hard 400 on the main model's next request
     ]
     with pytest.raises(Exception):
-        await run_events("read app.py and summarize it")
+        await run_events("read app.py and summarize it", mode="plan")
 
     # The durable resume file must hold the completed read.
     resume = state_db.load_turn_resume(str(workspace), "pytest-chat")
@@ -219,7 +219,7 @@ async def test_manual_retry_resumes_from_durable_file(run_events, workspace):
             ),
         },
     ]
-    await run_events("read app.py and summarize it", history=history)
+    await run_events("read app.py and summarize it", mode="plan", history=history)
 
     last = mock.captured[-1]
     calls = _resume_calls(last)

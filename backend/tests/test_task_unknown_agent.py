@@ -1,8 +1,8 @@
 """Live test: the `task` tool rejects unknown subagent types (opencode-style).
 
 opencode's task tool: "Unknown agent type: X is not a valid agent type". The
-agent registry (backend/agent_registry.py) defines the valid types — explore
-and general. Anything else is an ERROR, not a silent fallback.
+agent registry (backend/agent_registry.py) defines the valid types — currently
+only `general`. Anything else is an ERROR, not a silent fallback.
 
 Guards:
 1. task(subagent_type='bogus') -> "Unknown agent type: bogus is not a valid agent type".
@@ -32,7 +32,6 @@ async def main():
     tools = make_tool_callbacks(
         ws,
         lambda ev: emitted.append(ev),
-        explore_model=TestModel(custom_output_text="explore"),
         main_model=TestModel(custom_output_text="done"),
     )
     task = tools["task"]

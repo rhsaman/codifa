@@ -458,7 +458,7 @@ export async function removeModel(
   })
 }
 
-// ---- Skills & MCP connectors (stored in the sidecar's app database) ------- //
+// ---- Skills & MCP connectors (skills are file-based; MCP in app db) -------- //
 
 export interface SkillRow {
   name: string
@@ -476,7 +476,7 @@ export interface SkillSyncResult {
   removed?: boolean
 }
 
-/** List all skills from the app database. */
+/** List all skills (file-based storage in the sidecar's skill dir). */
 export async function listSkills(): Promise<SkillRow[]> {
   const url = await ensureSidecar()
   if (!url) return []
@@ -490,7 +490,7 @@ export async function listSkills(): Promise<SkillRow[]> {
   }
 }
 
-/** Create/update/delete a skill in the app database. */
+/** Create/update/delete a skill (file-based storage in the sidecar's skill dir). */
 export async function syncSkill(params: {
   name: string
   previousName?: string

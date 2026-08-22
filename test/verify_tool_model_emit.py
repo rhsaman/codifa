@@ -1,49 +1,58 @@
-"""Verify grep/glob/read tool events now carry the search-subagent model name
-end-to-end through make_tool_callbacks (the same path the app uses)."""
+"""
+Verify that parent search-slot tool events carry the search-subagent model name
+(so the frontend can attribute search usage to the correct model).
+
+grep/glob are NO LONGER parent tools — searching is delegated to the explore
+sub-agent. `read` is the remaining parent tool that runs on the search-subagent
+model (or the main model once the slot falls back), so it must stamp its `tool`
+event with that model name.
+"""
 import asyncio
-import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+sys.path.insert(0, "backend")
 
-from tools import make_tool_callbacks  # noqa: E402
+from tools import make_tool_callbacks
 
 
-class FakeModel:
-    def __init__(self, name: str):
+class _FakeModel:
+    def __init__(self, name):
         self.model_name = name
 
 
-async def main() -> None:
-    events: list[dict] = []
+async def main():
+    events = []
+
     tools = make_tool_callbacks(
-        root=os.path.join(os.path.dirname(__file__), ".."),
+        root="/tmp",
         emit=events.append,
-        explore_model=FakeModel("nvidia/nemotron-3-super-120b-a12b"),
-        web_model=FakeModel("openrouter/free"),
-        search_model=FakeModel("openrouter/free"),
-        main_model=FakeModel("deepseek-v4-flash-free"),
+        search_model=_FakeModel("search-subagent-model"),
+        main_model=_FakeModel("main-model"),
     )
 
-    # grep
-    await tools["grep"]("def main", "test", "*.py")
-    # glob
-    await tools["glob"]("*.py", "test")
-    # read (file)
-    await tools["read"]("test/verify_tool_model_emit.py", 1, 5)
+    # grep/glob are delegated to the explore sub-agent — they must NOT be
+    # parent tools anymore.
+    assert "grep" not in tools, "grep should be delegated to explore, not a parent tool"
+    assert "glob" not in tools, "glob should be delegated to explore, not a parent tool"
 
-    print("=== emitted events (tool / tool_result) ===")
-    for ev in events:
-        if ev.get("kind") in ("tool", "tool_result"):
-            print(f"  {ev['kind']:12} {ev['tool']:12} model={ev.get('model')!r}")
+    # `read` is the remaining parent search-slot tool: its `tool` event must
+    # carry the search-subagent model name. (A missing file is fine — the `tool`
+    # event is emitted before any file access.)
+    await tools["read"]("nonexistent-file-for-test.py")
 
-    tool_evs = [e for e in events if e.get("kind") == "tool"]
-    missing = [e["tool"] for e in tool_evs if not e.get("model")]
-    print()
-    if missing:
-        print(f"❌ MISSING model on: {missing}")
+    tool_events = [ev for ev in events if ev.get("kind") == "tool"]
+    if not tool_events:
+        print("FAIL: no `tool` events were emitted by read")
         sys.exit(1)
-    print("✅ ALL tool events carry the search-subagent model name")
+
+    bad = [ev for ev in tool_events if not ev.get("model")]
+    if bad:
+        print("FAIL: tool events missing model:")
+        for ev in bad:
+            print("  ", ev)
+        sys.exit(1)
+
+    print("✅ parent search-slot tool events carry the search-subagent model name")
 
 
 if __name__ == "__main__":

@@ -10,17 +10,6 @@ model reads them from the ``task`` tool schema and decides which agent to
 delegate to.
 """
 
-# opencode's explore agent description (agent.ts) — verbatim.
-EXPLORE_DESCRIPTION = (
-    'Fast agent specialized for exploring codebases. Use this when you need to '
-    'quickly find files by patterns (eg. "src/components/**/*.tsx"), search code '
-    'for keywords (eg. "API endpoints"), or answer questions about the codebase '
-    '(eg. "how do API endpoints work?"). When calling this agent, specify the '
-    'desired thoroughness level: "quick" for basic searches, "medium" for '
-    'moderate exploration, or "very thorough" for comprehensive analysis across '
-    'multiple locations and naming conventions.'
-)
-
 # opencode's general agent description (agent.ts) — verbatim.
 GENERAL_DESCRIPTION = (
     "General-purpose agent for researching complex questions and executing "
@@ -33,13 +22,6 @@ GENERAL_DESCRIPTION = (
 #   - None -> the sub-agent inherits the parent's tools minus ``task``
 #     (no nested sub-agents — opencode's subagent_depth=1 default).
 AGENTS: dict[str, dict] = {
-    "explore": {
-        "name": "explore",
-        "description": EXPLORE_DESCRIPTION,
-        "mode": "subagent",
-        # read-only file-search tools; the sub-agent does the searching itself
-        "tools": ["read", "grep", "glob"],
-    },
     "general": {
         "name": "general",
         "description": GENERAL_DESCRIPTION,

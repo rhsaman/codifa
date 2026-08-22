@@ -139,7 +139,9 @@ export function ProviderModelSelect() {
   const recentList = useMemo(() => {
     const items: Array<{ p: ProviderConfig; model: string }> = [];
     const seen = new Set<string>();
-    for (const r of recents) {
+    // Sort by lastUsed descending so the most recently used model is first.
+    const ordered = [...recents].sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0));
+    for (const r of ordered) {
       if (!r.model) continue;
       let p = providers.find((x) => x.id === r.providerId);
       if (!p && !r.providerId) {

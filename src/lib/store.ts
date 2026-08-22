@@ -585,13 +585,25 @@ function makeChat(mode: AgentMode = 'ask'): Chat {
   const activeProvider =
     s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
     s.settings.providers[0]
+  // Default a new chat to the most recently used model so it continues where the
+  // user left off, instead of always falling back to the provider's default model.
+  // Sort by lastUsed desc to mirror the recent-models list in the model selector
+  // (its top entry is exactly the provider+model we want to inherit here).
+  const recent = [...s.recentModels].sort(
+    (a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0),
+  )[0]
+  const recentProvider = recent
+    ? s.settings.providers.find((p) => p.id === recent.providerId)
+    : undefined
+  const providerId = recentProvider?.id ?? activeProvider?.id
+  const model = recentProvider && recent ? recent.model : activeProvider?.model
   return {
     id: uid(),
     title: 'New chat',
     mode,
     thinkingLevel: 'medium',
-    providerId: activeProvider?.id,
-    model: activeProvider?.model,
+    providerId,
+    model,
     messages: [],
     createdAt: now,
     updatedAt: now,

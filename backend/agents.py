@@ -440,18 +440,18 @@ def _wrap_readonly_terminal(fn: Callable):
 
 
 # grep-family tools reachable via run_terminal — all fully replaced by
-# grep (single-file/dir) or explore (broad, isolated). Left
+# grep (single-file/dir). Left
 # reachable through the terminal, a model could just shell out to `grep -r`
 # instead and keep searching with no isolation — a complete, silent bypass of
-# the system prompt's own "use grep/explore" instruction.
+# the system prompt's own "use grep" instruction.
 # This closes that specific hole; it intentionally does NOT touch find/cat/ls
 # (legitimate narrow uses: checking one file exists, reading a build log,
 # listing a directory).
 _SEARCH_BYPASS_PROGS = {"rg", "grep", "egrep", "fgrep", "ag", "ack", "ack-grep"}
 _SEARCH_BYPASS_MSG = (
     "ERROR: {prog} via run_terminal is not allowed — it bypasses the search-call "
-    "cap and isolation that grep/task give you. Use grep "
-    "for a targeted look, or the task tool (subagent_type='explore') for anything "
+    "cap and isolation that grep gives you. Use grep "
+    "for a targeted look, or the task tool (subagent_type='general') for anything "
     "broader."
 )
 # A python one-liner doing its own file-walk-and-match is the same bypass in
@@ -631,7 +631,7 @@ _UNIVERSAL_RULES = (
     "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it."
 )
 
-# The search/explore strategy is a FIRST-CLASS rule: it sits at the very top of
+# The search strategy is a FIRST-CLASS rule: it sits at the very top of
 # every mode's prompt (right after the mode declaration + language rule) so the
 # agent always picks the right tool for the breadth of the search. It replaces
 # the per-mode scout guidance that used to be duplicated inside each
@@ -641,19 +641,19 @@ _SEARCH_RULE = (
     "Choose the search tool by the BREADTH of what you need:\n"
     "1. TARGETED lookup,keyword: search "
     "directly with grep / glob / read.\n"
-    "2. Wide search: use task with subagent_type='explore'. Split independent "
-    "search areas across multiple explore agents and launch them IN PARALLEL. "
+    "2. Wide search: use task with subagent_type='general'. Split independent "
+    "search areas across multiple general agents and launch them IN PARALLEL. "
     "Use as many as meaningfully reduce search time; avoid redundant agents.\n"
     "in an isolated context and returns a report.\n"
     "3. Fire the searches you already know you need in the SAME turn (parallel "
     "tool calls) instead of one at a time.\n"
-    "4. CONTEXT BUDGET: the explore subagent runs in an isolated context and "
+    "4. CONTEXT BUDGET: a subagent runs in an isolated context and "
     "only its compact report enters your context — so for multi-file research "
-    "DELEGATE to explore instead of reading many files yourself. When you do "
+    "DELEGATE to a subagent instead of reading many files yourself. When you do "
     "read a large file, page it with read offset/limit (e.g. limit=300) instead "
     "of dumping the whole file into context.\n"
     "NEVER search or read project files with run_terminal or scripts — only "
-    "the file tools (grep / glob / read / explore)."
+    "the file tools (grep / glob / read)."
 )
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -3226,13 +3226,12 @@ def _skills_section(skills: list[dict]) -> str:
     """Compact skill index for the system prompt (discovery only).
 
     Skills come from the app database and cannot be reached through the
-    project-sandboxed read tool, so the agent loads a skill's full body on
-    demand with the ``read_skill`` tool. This section is the discovery half of
-    the opencode/codex discovery → activation model: every skill stays as a
-    compact name + description line so the agent always knows what exists
-    without paying the token cost of every body on every turn. Full bodies are
-    never inlined here — the model calls ``read_skill`` only when a request
-    actually matches a skill.
+    project-sandboxed read tool. This section is the discovery half of the
+    opencode/codex discovery → activation model: every skill stays as a compact
+    name + description line so the agent always knows what exists without paying
+    the token cost of every body on every turn. Full bodies are never inlined
+    here — skills are used only via @mention, which inlines their full
+    instructions.
     """
     if not skills:
         return ""
@@ -3241,8 +3240,7 @@ def _skills_section(skills: list[dict]) -> str:
         (
             "These skills are available. They are used ONLY when the user "
             "explicitly attaches one with @mention in the message (the attached "
-            "skill's full instructions are inlined). You may also call read_skill "
-            "to inspect one when the user asks about it. The rest are listed by "
+            "skill's full instructions are inlined). The rest are listed by "
             "name + description."
         ),
     ]
@@ -3543,8 +3541,7 @@ def _build_subagent_model(
     entry is empty / unresolvable / fails to build (the caller falls back to
     its slot default). When the entry resolves to the PARENT model itself, the
     parent model is returned so the subagent explicitly runs on the main model
-    — instead of silently landing on another slot's default (e.g. the explore
-    model for the search/web slots).
+    — instead of silently landing on another slot's default.
     """
     # Explicit "main model" literal → the parent model itself (the user's way
     # of pinning a tool to the main model without picking it from the list).
@@ -3590,14 +3587,12 @@ def _resolve_subagent_models(
     oauth_token: str,
     provider_lookup: Callable[[str], dict | None],
 ) -> dict[str, Any]:
-    """Resolve the per-slot subagent models (explore / search / web / compact /
+    """Resolve the per-slot subagent models (search / web / compact /
     vision) from Settings → Tools entries.
 
-    Slot defaults when the entry is empty or fails to build: explore/compact →
-    parent model, search/web → explore model, vision → None. An entry equal to
-    the parent model resolves to the parent model itself (explicit "use the
-    main model"), so search/web do NOT silently land on the explore model in
-    that case.
+    Slot defaults when the entry is empty or fails to build: all slots →
+    parent model, vision → None. An entry equal to the parent model resolves
+    to the parent model itself (explicit "use the main model").
     """
 
     def _build(entry: str) -> tuple[Any, str] | None:
@@ -3613,19 +3608,13 @@ def _resolve_subagent_models(
             provider_lookup,
         )
 
-    explore_model = model
-    explore_built = subagent_models.get("explore", "") or ""
-    _sub = _build(explore_built)
-    if _sub is not None:
-        explore_model, _ = _sub
-
-    search_model = explore_model
+    search_model = model
     search_built = subagent_models.get("search", "") or ""
     _sub = _build(search_built)
     if _sub is not None:
         search_model, _ = _sub
 
-    web_model = explore_model
+    web_model = model
     web_built = subagent_models.get("web", "") or ""
     _sub = _build(web_built)
     if _sub is not None:
@@ -3644,7 +3633,6 @@ def _resolve_subagent_models(
         vision_model, _ = _sub
 
     return {
-        "explore": explore_model,
         "search": search_model,
         "web": web_model,
         "compact": compact_model,
@@ -3854,11 +3842,10 @@ async def run_agent(
             _subagent_provider,
         )
 
-    # Resolve every slot (explore / search / web / compact / vision) from the
+    # Resolve every slot (search / web / compact / vision) from the
     # Settings → Tools entries. Each slot falls back to its default when
     # the entry is empty or fails to build; an entry equal to the parent model
-    # resolves to the parent model itself (so search/web do NOT silently land
-    # on the explore model when the user explicitly picked the main model).
+    # resolves to the parent model itself.
     _resolved = _resolve_subagent_models(
         subagent_models,
         model,
@@ -3870,12 +3857,10 @@ async def run_agent(
         oauth_token,
         _subagent_provider,
     )
-    explore_model = _resolved["explore"]
     search_model = _resolved["search"]
     web_model = _resolved["web"]
     compact_model = _resolved["compact"]
     vision_model = _resolved["vision"]
-    explore_built = subagent_models.get("explore", "") or ""
     search_built = subagent_models.get("search", "") or ""
     web_built = subagent_models.get("web", "") or ""
     compact_built = subagent_models.get("compact", "") or ""
@@ -3898,7 +3883,6 @@ async def run_agent(
         return name
 
     _routing = {
-        "explore": _routing_label(explore_model, explore_built),
         "search": _routing_label(search_model, search_built),
         "web": _routing_label(web_model, web_built),
         "compact": _routing_label(compact_model, compact_built),
@@ -3927,29 +3911,10 @@ async def run_agent(
         getattr(model, "model_name", "") or model_name
     )
 
-    # Explorer seed: RAG-injected context (memory notes + file/web chunks for
-    # THIS turn) is already visible to the parent's system prompt. When explore
-    # is called in the same turn, seed its sub-agent task text with what RAG
-    # already surfaced (file paths / topics covered), so explore doesn't
-    # independently re-discover content the parent already has in context. It's
-    # a mutable dict: make_tool_callbacks copies it at build time, and we fill
-    # it below once the RAG blocks are composed.
-    _explore_rag_seed: dict[str, str] = {}
-    # Persisted explore digest from a PREVIOUS (interrupted) run of this chat:
-    # seed the explore sub-agent with what was already explored on disk, so a
-    # reconnect / "ادامه بده" does not re-discover the same files from zero.
-    try:
-        _saved_resume = state_db.load_turn_resume(root, chat_id) or {}
-        _saved_digest = _saved_resume.get("explore_digest")
-        if isinstance(_saved_digest, dict):
-            _explore_rag_seed.update({str(k): str(v) for k, v in _saved_digest.items()})
-    except Exception:  # noqa: BLE001, S110 — best-effort seed, never raises
-        pass
     tools = make_tool_callbacks(
         root,
         lambda ev: queue.put_nowait(_tool_event(ev)),
         context_window=ctx,
-        explore_model=explore_model,
         web_model=web_model,
         search_model=search_model,
         main_model=model,
@@ -3960,7 +3925,6 @@ async def run_agent(
         permit={"outside": allow_outside},
         store=vector_store,
         chat_id=chat_id,
-        explore_seed=_explore_rag_seed,
     )
     # Tool access is data-driven by per-mode capabilities (cap), so custom modes
     # added in the UI work without backend changes. Missing/flat cap falls back to
@@ -4342,7 +4306,7 @@ async def run_agent(
         "Only skip asking when the ambiguity is cosmetic or you can confidently "
         "resolve it from context already in your hands. Follow the answer exactly.\n"
         "2. CONTEXT-FIRST: before you call ANY search/discovery tool (grep / glob "
-        "/ read / explore / search_memory), check what is ALREADY in your context: "
+        "/ read / search_memory), check what is ALREADY in your context: "
         "the RAG blocks auto-injected for this request (===== YOUR OWN MEMORY =====, "
         "===== RELEVANT PROJECT FILES =====, ===== SAVED WEB PAGES =====) when "
         "present, and the conversation itself — files you already read or searched, "
@@ -4425,34 +4389,10 @@ async def run_agent(
     # above, plus files already read and work already done earlier in THIS
     # conversation, is ALREADY in the model's context. The consolidated RULES
     # block (appended near the top) tells the model to check that FIRST before
-    # any search/explore call, so it doesn't re-search for content already
+    # any search call, so it doesn't re-search for content already
     # sitting in front of it (the "YOUR OWN MEMORY" / "RELEVANT PROJECT FILES"
     # / "SAVED WEB PAGES" blocks, and earlier tool results in this chat).
     _rag_injected = bool(learned_memory or rag_block)
-    if _rag_injected:
-        # Pass a digest of what RAG already surfaced into explore's sub-agent
-        # task text (via the shared cross-call seed dict), so a same-turn explore
-        # call builds on it instead of independently re-discovering the same files.
-        try:
-            covered = set()
-            for line in (rag_block or "").splitlines():
-                m = re.search(
-                    r"\(([^()]+\.(?:tsx?|jsx?|py|css|scss|html|json|go|rs|rb|c|h|cpp|md))\)",
-                    line,
-                )
-                if m:
-                    covered.add(m.group(1).strip())
-            if learned_memory:
-                covered.add("memory notes (===== YOUR OWN MEMORY =====)")
-            if covered:
-                _explore_rag_seed["rag|covered|"] = (
-                    "RAG already surfaced for this turn — do NOT re-discover; "
-                    "only dig deeper where needed. Covered: "
-                    + ", ".join(sorted(covered))
-                )
-        except Exception:  # noqa: BLE001, S110 — best-effort seed, never raises
-            pass
-
     all_skills = _load_skills(root)
     picked: list[dict] = []
     # Explicit @mention attachment: the user named the skills they want this
@@ -4476,14 +4416,13 @@ async def run_agent(
             }
 
     # Discovery: names + descriptions of every skill are always injected so the
-    # agent knows what exists; full bodies are loaded on demand via read_skill
+    # agent knows what exists; full bodies are loaded via @mention inline only
     # (see _skills_section).
     if all_skills:
         # Manually attached skills are inlined in FULL — their whole body — so
-        # the agent actually follows them without a read_skill round-trip. The
-        # rest stay as a compact name+description catalog so token cost stays
-        # bounded: only the attached skill(s) pay the full-body price, never
-        # the whole library.
+        # the agent follows them directly. The rest stay as a compact
+        # name+description catalog so token cost stays bounded: only the attached
+        # skill(s) pay the full-body price, never the whole library.
         picked_names = {s["name"] for s in picked}
         section = _skills_section(
             [s for s in all_skills if s["name"] not in picked_names]
@@ -4607,12 +4546,8 @@ async def run_agent(
             scouted = ""
     if scouted:
         user_content.append(scouted)
-        # Hand the scout to the explore sub-agent too (via contextvar): the
-        # sub-agent runs in an isolated context that never sees the main
-        # prompt, so without this it re-globs the root to orient itself — a
-        # duplicate of the auto-scout. The contextvar propagates into the
-        # explore tool call (same task tree), which folds the root listing
-        # into the sub-agent's system prompt.
+        # Surface the auto-scout listing so the agent can orient itself from
+        # context it already has, instead of re-scouting the workspace.
         try:
             _SCOUT_CTX.set(scouted)
         except Exception:  # noqa: BLE001, S110 — cosmetic only, never fails the turn
@@ -5040,7 +4975,7 @@ async def run_agent(
                             code_changed = True
                         if item.get("kind") == "tool" and item.get("tool"):
                             tools_used.append(str(item["tool"]))
-                            # Steps inside an `explore` sub-agent run (tagged
+                            # Steps inside a sub-agent run (tagged
                             # `sub=True`, see tools.py) do NOT count against this
                             # turn's deterministic step budget: they never enter
                             # OUR resent transcript, only the sub-agent's own
@@ -5621,7 +5556,7 @@ async def run_agent(
             # CRITICAL: each retry restarts `run_stream_events` from the CURRENT
             # `history_messages` — which do NOT include the tool calls just made
             # (they only live in `turn_tool_log`, capped separately). A blind retry
-            # would re-explore the whole workspace from scratch and re-blow the
+            # would re-scout the whole workspace from scratch and re-blow the
             # budget, doubling waste until the cap is exhausted. To fix that, feed
             # the work done so far back in as a system note so the model continues
             # where it left off. Retries are also bounded tighter (3 instead of 6)

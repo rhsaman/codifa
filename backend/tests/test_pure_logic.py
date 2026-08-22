@@ -53,8 +53,8 @@ def test_skills_section_empty_for_no_skills():
 
 
 def test_skills_section_compact_when_nothing_picked():
-    a = _skill("db://skills/a", "Alpha", "توضیح آلفا", "BODY-A")
-    b = _skill("db://skills/b", "Beta", "توضیح بتا", "BODY-B")
+    a = _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A")
+    b = _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B")
     section = _skills_section([a, b])
     assert "Alpha — توضیح آلفا" in section
     assert "Beta — توضیح بتا" in section
@@ -63,19 +63,20 @@ def test_skills_section_compact_when_nothing_picked():
 
 
 def test_skills_section_never_inlines_bodies():
-    # Option B: full bodies are NEVER inlined — the model loads them on demand
-    # via read_skill. The section is discovery-only (name + description).
-    a = _skill("db://skills/a", "Alpha", "توضیح آلفا", "BODY-A")
-    b = _skill("db://skills/b", "Beta", "توضیح بتا", "BODY-B")
+    # Full bodies are NEVER inlined — they're only attached when the user
+    # @mentions a skill. The section is discovery-only (name + description).
+    a = _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A")
+    b = _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B")
     section = _skills_section([a, b])
     assert "BODY-A" not in section and "BODY-B" not in section, \
         "no skill body may ever be inlined"
-    assert "read_skill" in section, "section must point the agent at read_skill"
+    assert "@mention" in section, "section must tell the agent skills use @mention"
+    assert "read_skill" not in section, "read_skill tool was removed"
 
 
 def test_skills_section_truncates_long_descriptions():
     long_desc = "این یک توضیح خیلی طولانی است که باید کوتاه شود " * 6
-    a = _skill("db://skills/a", "Alpha", long_desc, "BODY-A")
+    a = _skill("file://skills/a/skill.md", "Alpha", long_desc, "BODY-A")
     section = _skills_section([a])
     assert "BODY-A" not in section
     line = next(l for l in section.splitlines() if l.startswith("- Alpha"))

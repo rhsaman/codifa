@@ -51,7 +51,13 @@ WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context le
 WEB_SEARCH_TIMEOUT = 15
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 
-# Sub-agent model calls (explore / terminal-search reader / web distiller)
+# Skip distillation when raw output is below this threshold (chars).
+# Small results are fast for the parent to read directly; distillation adds
+# a full LLM round-trip (~several seconds) and is only worthwhile for
+# large/broad searches where it saves parent context tokens.
+_SEARCH_DISTILL_THRESHOLD = 600
+
+# Sub-agent model calls (terminal-search reader / web distiller)
 # share the parent turn's retry policy so a free-tier rate limit or connection
 # blip on the gateway retries the sub-agent instead of failing the whole turn
 # and re-burning parent tokens. Flat 30s cadence, up to 10 attempts, then the
@@ -61,9 +67,9 @@ _SUBAGENT_MAX_ATTEMPTS = 3
 
 # Set by agents.py before each agent run: the AUTO-SCOUTED WORKSPACE OVERVIEW
 # text (root listing — _AUTO_SCOUT_KEY_FILES is empty, so it's just the tiny
-# root-entries line). task_tool reads it to tell the explore sub-agent the root
-# is already listed, so it doesn't re-glob the root to orient itself (a
-# duplicate of the main agent's auto-scout).
+# root-entries line). The agent reads it to know the root is already listed,
+# so it doesn't re-glob the root to orient itself (a duplicate of the main
+# agent's auto-scout).
 _SCOUT_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
     "coder_scout_ctx", default=""
 )
@@ -99,39 +105,6 @@ _SUB_AGENT_BRANCH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
 _PARENT_TOOLS_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "coder_parent_tools", default=None
 )
-
-# Per-branch early-stop state for the EXPLORE sub-agent (set by _run_explore):
-# {"streak": consecutive empty tool results, "found_any": any non-empty result
-# so far, "threshold": empty_stop_after for this thoroughness}. The sub-tools
-# update it via _sub_track_result; _PerStepFallbackModel.request() reads it to
-# stop a fruitless search early (no more model round-trips = no more token
-# burn) instead of letting it run the whole budget. `found_any` guards quality:
-# a search that HAS found useful info is never hard-stopped with "not found" —
-# it raises _SubEarlyStop so the findings-so-far are returned as the report.
-_sub_empty_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "explore_sub_empty", default=None
-)
-
-
-def _thoroughness_from_prompt(text: str) -> str:
-    """Parse the thoroughness level out of a task prompt.
-
-    opencode passes thoroughness in the task prompt TEXT (the explore agent
-    description tells the model to "specify the desired thoroughness level:
-    quick / medium / very thorough"), not as a structured param. Parse it back
-    out so the sub-agent prompt adapts (quick/medium/very thorough). Default is
-    QUICK (not medium): explore is latency-bound — every sub-agent round-trip
-    re-sends the whole transcript — so an unspecified task should finish in a
-    couple of targeted searches; the parent can always ask for more depth
-    explicitly.
-    """
-    low = (text or "").lower()
-    if "very thorough" in low or "comprehensive" in low or "exhaustive" in low:
-        return "very thorough"
-    if "quick" in low or "fast" in low or "brief" in low or "minimal" in low:
-        return "quick"
-    return "quick"
-
 
 def _is_content_gathering(text: str) -> bool:
     """Heuristic for whether a task needs substantial verbatim content from
@@ -199,86 +172,6 @@ def _parse_json_list(text: str) -> list[str]:
     ]
 
 
-def _thoroughness_prompt(thoroughness: str) -> str:
-    """Return the explore sub-agent THOROUGHNESS instruction for the given
-    level ('quick' | 'medium' | 'very thorough'; anything else -> medium).
-    Ported from opencode's explore subagent thoroughness control: the caller
-    picks how deep to sweep, and the sub-agent prompt adapts — quick = minimal
-    targeted searches, very thorough = exhaustive multi-convention sweep."""
-    return {
-        "quick": (
-            "THOROUGHNESS: quick — do the MINIMUM searches needed for a "
-            "confident answer (1-2 targeted searches), then report "
-            "immediately. Do not exhaustively enumerate files or chase "
-            "every naming convention."
-        ),
-        "medium": (
-            "THOROUGHNESS: medium — search the obvious locations and "
-            "naming conventions, confirm what you find, then report. "
-            "Don't over-explore, but don't stop at the very first match "
-            "either."
-        ),
-        "very thorough": (
-            "THOROUGHNESS: very thorough — this is a COMPREHENSIVE sweep. "
-            "Search MULTIPLE naming conventions, locations and file types "
-            "(src, tests, docs, configs); try substrings, word fragments "
-            "and adjacent terms; verify absence before reporting 'not "
-            "found'; enumerate ALL relevant files with exact file:line "
-            "references. Be exhaustive — do not stop early."
-        ),
-    }.get(
-        (thoroughness or "medium").strip().lower(),
-        (
-            "THOROUGHNESS: medium — search the obvious locations and "
-            "naming conventions, confirm what you find, then report. "
-            "Don't over-explore, but don't stop at the very first match "
-            "either."
-        ),
-    )
-
-
-def _explore_usage_limits(thoroughness: str, content_gathering: bool = False) -> dict:
-    """Per-thoroughness explore sub-agent budgets (request/tool-call caps and
-    widen caps).
-
-    Every sub-agent model request re-sends the whole transcript to the model,
-    so the REQUEST count is the dominant search-TIME cost — bounding it is what
-    keeps an explore search fast. ``quick`` must finish in a couple of
-    round-trips; ``medium`` gets the standard sweep; ``very thorough`` the
-    widest. Content-gathering tasks (refactor / restyle / verbatim-code
-    lookups) keep a high floor so a broad investigation finishes in ONE run
-    instead of hitting the budget and forcing the parent to split it up (each
-    split re-pays the discovery overhead). The widen-and-resume loop in
-    _run_explore_inner still lets a legitimately broad search continue past
-    the base cap (up to ``*_cap``, at most ``widen_max`` extra runs), so these
-    caps bound search TIME, not search QUALITY — a progressing search is never
-    cut off mid-investigation, only a runaway loop is.
-    """
-    base = {
-        "quick": (3, 6),
-        "medium": (6, 12),
-        "very thorough": (12, 24),
-    }
-    req, calls = base.get((thoroughness or "medium").strip().lower(), (6, 12))
-    if content_gathering:
-        req = max(req, 12)
-        calls = max(calls, 24)
-    return {
-        "request_limit": req,
-        "tool_calls_limit": calls,
-        "request_cap": min(req * 2, 24),
-        "tool_calls_cap": min(calls * 2, 36),
-        "widen_max": 1 if (thoroughness or "").strip().lower() == "quick" else 2,
-        # Consecutive EMPTY sub-search results allowed before the explore stops
-        # early (no more model round-trips). Scales with thoroughness so a
-        # "very thorough" sweep can still try multiple phrasings (persistence)
-        # before concluding not-found; quick stops almost immediately.
-        "empty_stop_after": {"quick": 2, "medium": 3, "very thorough": 4}.get(
-            (thoroughness or "medium").strip().lower(), 3
-        ),
-    }
-
-
 async def _run_subagent_call(
     factory: Callable[[], Any],
     label: str,
@@ -290,189 +183,17 @@ async def _run_subagent_call(
     NO retry backoff: a transient throttle, retryable, or empty-output error
     propagates immediately so the caller's per-call fallback handles it FAST.
     The old 30s x 10 retry policy (up to 5 minutes of silent backoff per call)
-    is what made an explore run feel like it searched for half an hour.
-    Resilience is instead provided per-call by the callers: the explore
-    sub-agent's _PerStepFallbackModel (per-sub-search fallback to the main
-    model) and _run_distill's main-model fallback. Returns the coroutine's
-    result.
+    is what made a sub-agent run feel like it searched for half an hour.
+    Resilience is instead provided per-call by the callers: _run_distill's
+    main-model fallback. Returns the coroutine's result.
     """
     # NO RETRY: a transient throttle, retryable, or empty-output error
     # propagates immediately so the caller's per-call fallback handles it fast.
     # The old 30s x 10 backoff (up to 5 minutes of silent stalling per call) is
-    # what made an explore run feel like it searched for half an hour.
+    # what made a sub-agent run feel like it searched for half an hour.
     return await factory()
 
 
-class _SubEarlyStop(Exception):
-    """Raised by the explore model wrapper when the sub-agent's last searches
-    were ALL empty but it HAD found useful information earlier (diminishing
-    returns — the prompt's hard-stop condition #3). The run is stopped so the
-    findings-so-far are returned as the report instead of burning more tokens
-    on fruitless searches."""
-
-
-def _sub_stop_report(streak: int) -> str:
-    """Report text returned when a fruitless explore is stopped early (nothing
-    useful was found at all — `found_any` is False, so "not found" is honest)."""
-    return (
-        "SEARCH STOPPED EARLY — the last "
-        f"{streak} searches returned no results, so the explore stopped to "
-        "avoid wasting tokens. Report: the requested information was not "
-        "found in the workspace with the searches performed."
-    )
-
-
-class _SubagentTokenLimitError(Exception):
-    """The sub-agent model hit its max_tokens ceiling while producing a
-    response (e.g. the explore report needs ~2000-4500 output tokens but the
-    model's configured limit is smaller). This is a CONFIG problem, not a
-    transient model failure — falling back to the main model would just double
-    the latency and hide the cause, so it is raised instead and surfaced as an
-    actionable message (raise max_tokens / pick a model with a bigger output
-    limit in Settings → Tools)."""
-
-
-def _is_token_limit_error(exc: Exception) -> bool:
-    """True when an exception is a max-output-token ceiling hit (pydantic-ai /
-    provider wording varies: 'Model token limit (...) exceeded', 'max_tokens',
-    'maximum context length', ...)."""
-    text = str(exc).lower()
-    return any(
-        k in text
-        for k in (
-            "token limit",
-            "max_tokens",
-            "maximum context length",
-            "context length exceeded",
-            "output token",
-            "token budget",
-            "tokens exceeded",
-            "completion_tokens",
-        )
-    )
-
-
-class _PerStepFallbackModel:
-    """A pydantic-ai model wrapper that gives the EXPLORE sub-agent PER-SUB-SEARCH
-    fallback: EVERY model request first tries the primary (sub-agent) model; if
-    that request fails, the SAME request re-runs on the fallback (main) model.
-    Non-sticky — the NEXT request goes back to the primary, so a failing
-    grep/read/glob step falls back individually instead of flipping the whole
-    explore run (or the whole turn) onto the main model.
-
-    ``on_fallback(exc)`` fires when a request moves to the fallback model;
-    ``on_primary()`` fires when a request succeeds on the primary model — the
-    explore tool uses these to label each sub-search's events with the model
-    that ACTUALLY ran. Every other attribute delegates to the primary model so
-    pydantic-ai treats the wrapper like the real model it wraps.
-    """
-
-    def __init__(
-        self,
-        primary: Any,
-        fallback: Any,
-        on_fallback: Callable[[Exception], None] | None = None,
-        on_primary: Callable[[], None] | None = None,
-    ) -> None:
-        self._primary = primary
-        self._fallback = fallback
-        self._on_fallback = on_fallback
-        self._on_primary = on_primary
-
-    @property
-    def model_name(self) -> str:
-        return str(getattr(self._primary, "model_name", "") or "")
-
-    def __getattr__(self, name: str) -> Any:
-        # Delegate every other attribute (part types, provider, client, ...)
-        # to the primary model so pydantic-ai treats the wrapper like the real
-        # model it wraps. object.__getattribute__ avoids recursion if the
-        # attribute is looked up before __init__ finished assigning _primary.
-        return getattr(object.__getattribute__(self, "_primary"), name)
-
-    async def request(
-        self,
-        messages: list[Any],
-        model_settings: Any = None,
-        model_request_parameters: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        # EARLY STOP (token waste guard): if this branch's last searches were
-        # all empty (streak >= threshold), do NOT call the model again — every
-        # request re-sends the whole transcript, so a fruitless search burning
-        # the full budget is pure token waste. If the sub-agent HAD found
-        # something earlier (found_any), raise _SubEarlyStop so the findings
-        # so far are returned as the report (never discard partial findings);
-        # otherwise return a "not found" report directly.
-        _est = _sub_empty_ctx.get()
-        if _est is not None and _est["streak"] >= _est["threshold"]:
-            if _est["found_any"]:
-                raise _SubEarlyStop()
-            from pydantic_ai.messages import (
-                ModelResponse as _MR,
-            )
-            from pydantic_ai.messages import (
-                TextPart as _TP,
-            )
-
-            return _MR(
-                parts=[_TP(content=_sub_stop_report(_est["streak"]))],
-                model_name=self.model_name,
-            )
-        try:
-            response = await self._primary.request(
-                messages,
-                model_settings=model_settings,
-                model_request_parameters=model_request_parameters,
-                **kwargs,
-            )
-            if self._on_primary is not None:
-                try:
-                    self._on_primary()
-                except Exception:  # noqa: BLE001, S110 — cosmetic only
-                    pass
-            return response
-        except Exception as exc:  # noqa: BLE001 — any primary failure → try the fallback model
-            # A max-output-token ceiling hit is a CONFIG problem (the sub-agent
-            # model's max_tokens is too small for the report), not a transient
-            # failure — silently re-running the request on the main model just
-            # doubles the latency and hides the cause. Raise it so the explore
-            # tool surfaces an actionable message (raise max_tokens in Settings
-            # → Tools) instead of a slow, unexplained fallback.
-            if _is_token_limit_error(exc):
-                raise _SubagentTokenLimitError(str(exc)) from exc
-            if self._on_fallback is not None:
-                try:
-                    self._on_fallback(exc)
-                except Exception:  # noqa: BLE001, S110 — cosmetic only
-                    pass
-            return await self._fallback.request(
-                messages,
-                model_settings=model_settings,
-                model_request_parameters=model_request_parameters,
-                **kwargs,
-            )
-
-    # request_stream is intentionally NOT defined here: the sub-agents run
-    # non-streaming, so __getattr__ delegates it to the primary model as-is
-    # (a streaming fallback would need an async-context-manager dance that
-    # the sub-agents never exercise).
-
-
-# pydantic-ai's Agent(...) resolves its model through `models.infer_model`,
-# which returns the model unchanged only when `isinstance(model, Model)`.
-# Register the wrapper as a VIRTUAL subclass of the Model ABC so Agent(...)
-# accepts it instead of parsing it as a model-id string — which crashed with
-# "argument of type '_PerStepFallbackModel' is not iterable" (the `in` check
-# in parse_model_id iterates a non-string). Virtual subclassing keeps the
-# wrapper a plain class, so __getattr__ still delegates every attribute
-# (provider, settings, request_stream, ...) to the primary model.
-try:
-    from pydantic_ai.models import Model as _PAIModel
-
-    _PAIModel.register(_PerStepFallbackModel)
-except Exception:  # noqa: BLE001, S110 — pydantic-ai is a hard dependency; degrade gracefully
-    pass
 
 
 def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
@@ -1534,22 +1255,6 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
         "ok": True,
         "note": result["note"],
     }
-
-
-def _find_skill_row(rows: list[dict], name: str) -> dict | None:
-    """Locate a skill row by display name (case-insensitive), then by slug or
-    path suffix. Returns None when nothing matches."""
-    target = (name or "").strip().lower()
-    for row in rows:
-        if str(row.get("name") or "").strip().lower() == target:
-            return row
-    if target:
-        for row in rows:
-            slug = str(row.get("slug") or "").lower()
-            path = str(row.get("path") or "").lower()
-            if target == slug or path.endswith("/" + target) or target in path:
-                return row
-    return None
 
 
 def _format_skill_body(row: dict) -> str:
@@ -2666,33 +2371,6 @@ def _is_terminal_search(command: str) -> bool:
     return False
 
 
-def _explore_task_similar(a: str, b: str) -> float:
-    """Similarity of two explore task strings: containment of the SMALLER token
-    set in the larger one (inter / min). Unlike Dice, this separates "show me
-    a.go" vs "show me b.go" (0.75 — different files, NOT deduped) from "find app
-    logic" vs "find app logic in detail" (1.0 — same area rephrased, deduped).
-    Tokens cover Latin + Persian words."""
-    ta = set(re.findall(r"[\w\u0600-\u06FF]+", (a or "").lower()))
-    tb = set(re.findall(r"[\w\u0600-\u06FF]+", (b or "").lower()))
-    if not ta or not tb:
-        return 0.0
-    inter = len(ta & tb)
-    return inter / min(len(ta), len(tb))
-
-
-def _explore_paths_compat(a: str, b: str) -> bool:
-    """True when two explore path_hints constrain the same area: equal, one empty
-    (unconstrained), or one is a sub-path of the other.
-
-    Retained for compatibility with older callers; the task tool no longer takes
-    a structured path_hint (the model puts the scope in the prompt text)."""
-    a = (a or "").strip().strip("/")
-    b = (b or "").strip().strip("/")
-    if not a or not b:
-        return True
-    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
-
-
 def _tool_event(ev: dict) -> dict:
     """Shape a tool event for the SSE stream: whitelist the fields the UI can
     render. LIVES HERE (not in agents.py) so the backend tests can import it
@@ -2744,7 +2422,6 @@ def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
     context_window: int = 0,
-    explore_model: Any = None,
     web_model: Any = None,
     search_model: Any = None,
     main_model: Any = None,
@@ -2755,7 +2432,6 @@ def make_tool_callbacks(
     permit: dict | None = None,
     store: VectorStore | None = None,
     chat_id: str = "",
-    explore_seed: dict | None = None,
 ) -> dict[str, Callable]:
     """Build the agent tools bound to ``root`` with an emit callback.
 
@@ -2873,6 +2549,10 @@ def make_tool_callbacks(
     # broken model).
     _fallback_state: dict[str, bool] = {}
 
+    # Parent search cache: avoids re-running ripgrep + re-distilling identical
+    # searches within the same turn. Keyed by (tool, pattern, path, include).
+    _parent_search_cache: dict[tuple[str, str, str, str], str] = {}
+
     def _emit_fallback(
         slot: str,
         agent_label: str,
@@ -2983,41 +2663,6 @@ def make_tool_callbacks(
     # Shared state for the update_plan nudge backstop (see _format_plan_nudge_suffix
     # above) — lives for this run only, reset each time make_tool_callbacks is called.
     _plan_nudge_state = {"since_update": 0, "has_in_progress": False}
-    # Cross-call explore memory: dict cache_key -> body of every tool result the
-    # explore sub-agent(s) produced SO FAR this turn. Each new explore call seeds
-    # its own _sub_result_cache from this and prepends an "already explored"
-    # digest to its task_text, so repeated explore calls in one turn build on
-    # earlier findings instead of each starting from zero (the observed 10-15
-    # round re-discovery loop for broad styling tasks).
-    _explore_turn_digest: dict[str, str] = dict(explore_seed or {})
-    # Turn-level SHARED dedup state for CONCURRENT explore calls. The parent
-    # model emits N explore tool calls in ONE response and pydantic-ai runs
-    # them CONCURRENTLY (agents.py parallel_tool_calls=True) — so each call
-    # used to seed its own per-call seen-sets from the digest at start, which
-    # is EMPTY for all of them (none has finished yet), and every parallel call
-    # re-discovered the same files/searches from zero (the "5 explores with
-    # identical sub-searches" symptom). These sets/locks live at TURN level so
-    # the first call to touch a file/search does the work and the others reuse
-    # the cached result instead of re-running it.
-    _explore_seen_listings: set[tuple[str, str]] = set()
-    _explore_locks: dict[str, asyncio.Lock] = {}
-    # Turn-level dedup of explore CALLS (the "چند تا اکسپلور با ساب ایجنت های
-    # مثل هم" symptom): the parent model often fires SEVERAL explore calls in one
-    # parallel-tool-calls response with near-identical tasks (same area
-    # rephrased, or the same task with a different thoroughness). Each used to
-    # spawn its own sub-agent card. `_explore_call_log` holds COMPLETED calls
-    # (sequential dedup); `_explore_inflight` holds calls still running — a
-    # concurrent near-duplicate awaits the matching in-flight call's report
-    # instead of spawning its own sub-agent.
-    _explore_call_log: list[dict] = []
-    _explore_inflight: list[dict] = []
-    # Turn-level read_skill dedup: small/free models (e.g. DEEPSEEK-V4-FLASH-FREE)
-    # often re-read the SAME skill several times in one turn — each call re-sends
-    # the full body (Code-Expert is ~16k chars), so 12+ repeats waste hundreds of
-    # thousands of tokens. After the first full read, later calls return a short
-    # "already loaded" note instead of the body again; the content is already in
-    # the conversation history from the first read.
-    _read_skill_cache: set[str] = set()
     # Was 5: a task that finishes in only 1-4 mutating tool calls after the last
     # update_plan (the common case for small tasks) never hit the threshold, so
     # the model could write its final reply with a step still stuck 'in_progress'
@@ -3458,58 +3103,6 @@ def make_tool_callbacks(
             "Tell the user the skill was created."
         )
 
-    async def read_skill_tool(name: str) -> str:
-        """Read a skill's FULL instructions from the app database (global). `name` = the skill's display name (or its slug/path suffix). Returns the complete markdown body so you can follow the skill's instructions exactly. Skills live ONLY in the app DB — never read skill files from disk. Use this when the user's request matches a skill listed in AVAILABLE SKILLS and you need its full instructions."""
-        emit({"kind": "tool", "tool": "read_skill", "args": {"name": name}})
-        try:
-            rows = _state_db.list_skills()
-        except Exception as exc:  # noqa: BLE001
-            msg = f"skill store unavailable: {exc}"
-            emit(_error_result("read_skill", msg))
-            return f"ERROR reading skill {name!r}: {msg}"
-        found = _find_skill_row(rows, name)
-        if found is None:
-            names = ", ".join(str(r.get("name") or "") for r in rows) or "(none installed)"
-            msg = f"No skill named {name!r}. Available skills: {names}"
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "read_skill",
-                    "summary": msg,
-                    "status": "error",
-                }
-            )
-            return msg
-        skill_name = str(found.get("name") or name)
-        if skill_name in _read_skill_cache:
-            # Already loaded in full earlier this turn — the body is in the
-            # conversation history. Return a short note instead of re-sending
-            # the whole skill (observed: 12+ identical read_skill calls in one
-            # turn from small/free models, each re-sending ~16k chars).
-            msg = (
-                f"Skill {skill_name!r} was already loaded in full earlier in "
-                "this conversation — follow its instructions exactly. No need "
-                "to re-read it."
-            )
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "read_skill",
-                    "summary": msg,
-                }
-            )
-            return msg
-        _read_skill_cache.add(skill_name)
-        out = _format_skill_body(found)
-        emit(
-            {
-                "kind": "tool_result",
-                "tool": "read_skill",
-                "summary": f"loaded skill {found.get('name')} ({len(out)} chars)",
-            }
-        )
-        return out
-
     async def create_mcp_tool(
         name: str,
         command: str = "",
@@ -3639,6 +3232,30 @@ def make_tool_callbacks(
 
     async def grep_tool(pattern: str, path: str = "", include: str = "") -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files. Returns `file:line: text` blocks, truncated to fit context."""
+        # Parent search cache key
+        cache_key = ("grep", pattern, path, include)
+        cached = _parent_search_cache.get(cache_key)
+        if cached is not None:
+            _search_runner = main_model if _fallback_state.get("search") else search_model
+            _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "grep",
+                    "args": {"pattern": pattern, "path": path, "include": include},
+                    "model": _search_runner_name,
+                }
+            )
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "grep",
+                    "summary": "cached",
+                    "model": _search_runner_name,
+                }
+            )
+            return cached
+
         # The search sub-agent model is the one configured for search tools
         # (grep / glob / list_files). Label the event with it so the UI badge
         # shows which model this search slot runs on — the main model once the
@@ -3697,18 +3314,12 @@ def make_tool_callbacks(
             else ""
         )
         raw = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-        # When a dedicated "search" subagent model is configured, pass the raw
-        # matches through the search subagent so it does the interpretation work
-        # (and its tokens are accounted to the search model), instead of the
-        # parent model reading the raw matches directly. On a hard sub-agent
-        # failure the call falls back to the MAIN model (see _run_distill) —
-        # the raw matches are only returned when BOTH models fail.
+
+        # Skip distillation for small results — parent reads them directly.
+        # Distillation adds a full LLM round-trip; only worthwhile for large
+        # outputs where it saves parent context tokens.
         _search_runner = main_model if _fallback_state.get("search") else search_model
-        # NOTE: no `not _fallback_state` guard here — _run_distill itself picks
-        # the main model once the slot has fallen back (sticky), so a later
-        # grep in the same turn still gets distilled (by the main model) instead
-        # of dumping raw matches into the parent context.
-        if _search_runner is not None:
+        if _search_runner is not None and len(raw) >= _SEARCH_DISTILL_THRESHOLD:
             try:
                 from pydantic_ai import Agent as _SA
                 from pydantic_ai.settings import ModelSettings as _SMS
@@ -3729,7 +3340,7 @@ def make_tool_callbacks(
                         model_settings=_SMS(temperature=0.2, max_tokens=400),
                     ),
                     lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
-                    timeout_total=60,
+                    timeout_total=25,
                 )
                 distilled = str(getattr(res, "output", "") or "").strip()
                 if distilled:
@@ -3741,6 +3352,8 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
+                    result_text = f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+                    _parent_search_cache[cache_key] = result_text
                     emit(
                         {
                             "kind": "tool_result",
@@ -3749,7 +3362,7 @@ def make_tool_callbacks(
                             "model": str(getattr(ran_model, "model_name", "") or ""),
                         }
                     )
-                    return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+                    return result_text
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 _ran_name = str(
                     getattr(
@@ -3774,6 +3387,7 @@ def make_tool_callbacks(
                         f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
                         + "\n".join(lines)
                     )
+        _parent_search_cache[cache_key] = raw
         emit(
             {
                 "kind": "tool_result",
@@ -3786,6 +3400,35 @@ def make_tool_callbacks(
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes)."""
+        # Parent search cache for terminal search commands
+        if _is_terminal_search(command):
+            cache_key = ("terminal", command, "", "")
+            cached = _parent_search_cache.get(cache_key)
+            if cached is not None:
+                _reader_model = main_model if _fallback_state.get("search") else search_model
+                _reader_model_name = (
+                    str(getattr(_reader_model, "model_name", "") or "")
+                    if _reader_model is not None
+                    else ""
+                )
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "run_terminal",
+                        "args": {"command": command},
+                        "model": _reader_model_name,
+                    }
+                )
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "run_terminal",
+                        "summary": "cached",
+                        "model": _reader_model_name,
+                    }
+                )
+                return cached
+
         _reader_model = main_model if _fallback_state.get("search") else search_model
         _reader_model_name = (
             str(getattr(_reader_model, "model_name", "") or "")
@@ -3836,7 +3479,7 @@ def make_tool_callbacks(
         if (
             _reader_model is not None
             and _is_terminal_search(command)
-            and len(output) >= 600
+            and len(output) >= _SEARCH_DISTILL_THRESHOLD
         ):
             try:
                 from pydantic_ai import Agent as _SA
@@ -3858,7 +3501,7 @@ def make_tool_callbacks(
                         model_settings=_SMS(temperature=0.2, max_tokens=400),
                     ),
                     lambda: f"COMMAND: {command}\n\nOUTPUT:\n{output}",
-                    timeout_total=60,
+                    timeout_total=25,
                 )
                 distilled = str(getattr(res, "output", "") or "").strip()
                 if distilled:
@@ -3870,6 +3513,9 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
+                    result_text = f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
+                    if _is_terminal_search(command):
+                        _parent_search_cache[("terminal", command, "", "")] = result_text
                     emit(
                         {
                             "kind": "tool_result",
@@ -3878,9 +3524,7 @@ def make_tool_callbacks(
                             "model": str(getattr(ran_model, "model_name", "") or ""),
                         }
                     )
-                    return (
-                        f"$ {command}\n\nSEARCH SUBAGENT SUMMARY:\n{distilled}" + nudge
-                    )
+                    return result_text
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 # Both the search subagent AND the main model failed. Say so with
                 # the model name so the user can fix it in Settings → Tools,
@@ -3914,6 +3558,30 @@ def make_tool_callbacks(
 
     async def glob_tool(pattern: str, path: str = "") -> str:
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files."""
+        # Parent search cache key
+        cache_key = ("glob", pattern, path, "")
+        cached = _parent_search_cache.get(cache_key)
+        if cached is not None:
+            _search_runner = main_model if _fallback_state.get("search") else search_model
+            _search_runner_name = str(getattr(_search_runner, "model_name", "") or "")
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "glob",
+                    "args": {"pattern": pattern, "path": path},
+                    "model": _search_runner_name,
+                }
+            )
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "glob",
+                    "summary": "cached",
+                    "model": _search_runner_name,
+                }
+            )
+            return cached
+
         # Search-slot model label (same as grep): the search sub-agent, or the
         # main model once the slot has fallen back earlier in the turn.
         _search_runner = main_model if _fallback_state.get("search") else search_model
@@ -3950,18 +3618,10 @@ def make_tool_callbacks(
         lines = list(matches[:50])
         note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
         raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-        # When a dedicated "search" subagent model is configured, pass the raw
-        # matches through the search subagent so it does the interpretation work
-        # (and its tokens are accounted to the search model), instead of the
-        # parent model reading the raw matches directly. On a hard sub-agent
-        # failure the call falls back to the MAIN model (see _run_distill) —
-        # the raw matches are only returned when BOTH models fail.
+
+        # Skip distillation for small results — parent reads them directly.
         _search_runner = main_model if _fallback_state.get("search") else search_model
-        # NOTE: no `not _fallback_state` guard here — _run_distill itself picks
-        # the main model once the slot has fallen back (sticky), so a later
-        # glob in the same turn still gets distilled (by the main model) instead
-        # of dumping raw matches into the parent context.
-        if _search_runner is not None:
+        if _search_runner is not None and len(raw) >= _SEARCH_DISTILL_THRESHOLD:
             try:
                 from pydantic_ai import Agent as _SA
                 from pydantic_ai.settings import ModelSettings as _SMS
@@ -3982,7 +3642,7 @@ def make_tool_callbacks(
                         model_settings=_SMS(temperature=0.2, max_tokens=400),
                     ),
                     lambda: f"PATTERN: {pattern}\n\nMATCHES:\n" + "\n".join(lines),
-                    timeout_total=60,
+                    timeout_total=25,
                 )
                 distilled = str(getattr(res, "output", "") or "").strip()
                 if distilled:
@@ -3994,6 +3654,8 @@ def make_tool_callbacks(
                     )
                     if _usage_ev:
                         emit(_usage_ev)
+                    result_text = f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+                    _parent_search_cache[cache_key] = result_text
                     emit(
                         {
                             "kind": "tool_result",
@@ -4002,7 +3664,7 @@ def make_tool_callbacks(
                             "model": str(getattr(ran_model, "model_name", "") or ""),
                         }
                     )
-                    return f"SEARCH RESULTS for {pattern!r} (distilled)\n{distilled}"
+                    return result_text
             except Exception as exc:  # noqa: BLE001 — fall back to raw output
                 _ran_name = str(
                     getattr(
@@ -4027,6 +3689,7 @@ def make_tool_callbacks(
                         f"SEARCH RESULTS for {pattern!r}\n{_search_note}\n"
                         + "\n".join(lines)
                     )
+        _parent_search_cache[cache_key] = raw
         emit(
             {
                 "kind": "tool_result",
@@ -4228,7 +3891,7 @@ def make_tool_callbacks(
     async def task_tool(
         description: str, prompt: str, subagent_type: str, task_id: str = ""
     ) -> str:
-        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description — for the 'explore' agent, specify the desired thoroughness level ('quick' | 'medium' | 'very thorough'). `subagent_type`: the specialized agent to use — 'explore' (fast codebase search: find files by pattern, search code, answer codebase questions) or 'general' (general-purpose research / multi-step tasks). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
@@ -4275,1200 +3938,27 @@ def make_tool_callbacks(
         # General-purpose sub-agent: inherits the parent's tools minus `task`.
         if subagent_type == "general":
             return await _run_general_task(description, prompt, task_id)
-        # --- explore agent (the file-search specialist) ---
-        # opencode passes thoroughness in the task prompt text, not a structured
-        # param — parse it back out so the sub-agent prompt adapts.
-        thoroughness = _thoroughness_from_prompt(prompt)
-        # The model that will run this explore call: ALWAYS the explore
-        # sub-agent. Per-sub-search fallback to the MAIN model happens INSIDE
-        # _run_explore (the _PerStepFallbackModel wrapper), so a failed search
-        # never flips the whole explore — or the rest of the turn — onto the
-        # main model (non-sticky).
-        _run_model = explore_model
-        _run_model_name = str(getattr(_run_model, "model_name", "") or "")
-        if explore_model is None:
-            emit(
-                {
-                    "kind": "tool",
-                    "tool": "task",
-                    "args": {
-                        "description": description,
-                        "subagent_type": subagent_type,
-                    },
-                    "model": "",
-                }
-            )
-            emit(_error_result("task", "unavailable"))
-            return "ERROR: the explore agent is unavailable (no model configured for this session)."
-
-        # CODE-LEVEL DEDUP of explore task calls: the parent model often fires several
-        # task calls in ONE parallel-tool-calls response with near-identical
-        # prompts (same area rephrased, or the same task with a different
-        # thoroughness). Each used to spawn its own sub-agent card — the
-        # "چند تا اکسپلور با ساب ایجنت های مثل هم" symptom. A near-duplicate
-        # (containment >= 0.8 on the prompt text) reuses the
-        # earlier report instead of spawning another sub-agent — unless the NEW
-        # call explicitly asks for deeper thoroughness than the earlier one ran.
-        def _explore_reuse(prior: dict) -> str:
-            return (
-                "[NOTE: this task is nearly identical to an explore task already "
-                "run this turn — reusing its report instead of spawning another "
-                "sub-agent.]\n\n" + str(prior.get("report") or "")
-            )
-
-        def _explore_sig_matches(ent: dict) -> bool:
-            if ent.get("subagent_type") != "explore":
-                return False
-            if _explore_task_similar(ent.get("prompt", ""), prompt) < 0.8:
-                return False
-            prior_thorough = str(ent.get("thoroughness") or "medium")
-            # the new call explicitly wants a deeper sweep
-            return not (
-                thoroughness == "very thorough" and prior_thorough != "very thorough"
-            )
-
-        for _prior in reversed(_explore_call_log):
-            if _explore_sig_matches(_prior):
-                return _explore_reuse(_prior)
-        for _ent in _explore_inflight:
-            if _explore_sig_matches(_ent):
-                _report = await asyncio.shield(_ent["future"])
-                return _explore_reuse({"report": _report})
-
-        # Sub-agent-specific tighter limits — keeps tool output compact
-        # so the sub-agent model sees only relevant data, never megabytes.
-        _sub_listing_count = min(listing_count, 15)
-        _sub_search_count = min(search_count, 15)
-        _sub_tool_out_chars = max(400, min(tool_out_chars, 5_000))
-
-        # The model name stamped on the sub-agent's internal tool events. Updated
-        # per _run_explore(model) so a fallback run on the main model labels its
-        # read/grep/glob events with the main model, not the failed sub-agent's.
-        _sub_emit_model_name = _run_model_name
-
-        # Per-branch emit state: with a PARALLEL fan-out each branch runs in its
-        # own asyncio task, so a shared mutable model-name variable would race
-        # (one branch fallback would mislabel another branch events). Each
-        # _run_explore branch sets its OWN emit closure into this contextvar —
-        # contextvars are per-task, so the shared sub-tools pick up the right
-        # branch closure (and branch id) automatically.
-        _sub_emit_ctx: contextvars.ContextVar = contextvars.ContextVar(
-            "explore_sub_emit", default=None
-        )
-
-        # Per-branch dedup for SEARCHES only. READS dedup against the SHARED
-        # turn-level _explore_seen_listings (defined in make_tool_callbacks): a
-        # read is idempotent — same
-        # path+offset+limit always yields the same bytes — so sharing is safe
-        # and lets every parallel branch reuse the first branch's reads instead
-        # of each re-reading the same files (the "all parallel explores show
-        # the same sub-searches" symptom). SEARCHES stay per-branch: a SHARED
-        # search seen-set would fold branch B's broader query into branch A's
-        # more-specific one ("fastapi" folded into "fastapiroutes"), making
-        # every branch reuse the first branch's cached findings and converge on
-        # the same searches. Each _run_explore branch sets its OWN search-set
-        # copy (seeded from the turn-level digest = prior work) into this
-        # contextvar; the shared sub-tools read per-branch searches + the
-        # SHARED listings, so branches stay independent on searches while
-        # never re-reading files another branch already read this call.
-        _sub_seen_searches_ctx: contextvars.ContextVar = contextvars.ContextVar(
-            "explore_sub_seen_searches", default=None
-        )
-
-        def _sub_seen() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-            searches = _sub_seen_searches_ctx.get()
-            if searches is None:
-                searches = _sub_seen_searches
-            return searches, _explore_seen_listings
-
-        def _sub_emit(event: dict) -> None:
-            branch_emit = _sub_emit_ctx.get()
-            if branch_emit is not None:
-                branch_emit(event)
-                return
-            # Forward to the same UI stream (so the user sees live sub-agent
-            # activity) but tagged `sub=True` so the PARENT's deterministic
-            # tool-step budget (see agents.py) does not count these steps —
-            # they never enter the parent model's own resent transcript, only
-            # the sub-agent's, which is discarded once the task tool returns.
-            event = dict(event)
-            event["sub"] = True
-            event.setdefault("model", _sub_emit_model_name)
-            emit(event)
-
-        # Early-stop tracking: consecutive EMPTY tool results (grep/glob with no
-        # matches, read errors) increment the branch streak; any real content
-        # resets it and marks the branch as having found something. The model
-        # wrapper (_PerStepFallbackModel.request) reads this to stop a fruitless
-        # explore before it burns the whole budget on re-sent transcripts.
-        def _sub_track_result(out: str) -> None:
-            st = _sub_empty_ctx.get()
-            if st is None:
-                return
-            low = (out or "").strip().lower()
-            if not low or low.startswith(
-                ("error", "no matches", "no files match", "(no ")
-            ):
-                st["streak"] += 1
-            else:
-                st["streak"] = 0
-                st["found_any"] = True
-
-        def _sub_tracked(fn):
-            # functools.wraps is REQUIRED: pydantic-ai builds each tool's JSON
-            # schema from inspect.signature, and without it the wrapper's
-            # (*args, **kwargs) signature produced a garbage schema
-            # ({"additionalProperties": true, "properties": {"args": ...}}) —
-            # models then called read/grep/glob with an `args` list plus an
-            # `additionalProperty` key, and every sub-search crashed with
-            # "unexpected keyword argument". wraps exposes __wrapped__ so the
-            # real signature drives the schema.
-            @functools.wraps(fn)
-            async def _wrapped(*args, **kwargs):
-                out = await fn(*args, **kwargs)
-                _sub_track_result(out)
-                return out
-
-            return _wrapped
-
-        # Code-enforced dedup for the sub-agent's search tools. The sub-agent
-        # model repeatedly re-searches the same area with only minor keyword
-        # variation ("FastAPI" then "FastAPI" again, "@app" then "@app." then
-        # "@app.get") — each is a fresh model request that re-resends its whole
-        # isolated transcript, the single biggest token burn in an explore run.
-        # A prompt instruction to "not repeat" is not enough; this makes an
-        # exact repeat return a short stop-signal instead of burning another
-        # round-trip, and near-duplicate prefixes are folded in too.
-        #
-        # Each tool's ACTUAL result is also cached (keyed the same way). That
-        # serves two purposes: (1) a dedup hit returns the real findings — with
-        # an "ALREADY" prefix — instead of a memory-based stop-signal, and (2)
-        # when the run is retried after a step-budget / context overflow (see
-        # the widen loop below), a FRESH sub-agent model has no memory of the
-        # prior attempt, so its re-issued queries get the cached results back
-        # instead of a dead-end "use the result you already have" it never got.
-        _sub_seen_searches: set[tuple[str, str]] = set()
-        _sub_result_cache: dict[str, str] = dict(_explore_turn_digest)
-
-        def _sub_search_key(query: str, path: str) -> tuple[str, str]:
-            q = re.sub(r"[^a-z0-9_.@]+", "", (query or "").lower())
-            p = re.sub(r"[^a-z0-9_.@/]+", "", (path or "").lower())
-            return (q, p)
-
-        # Seed the seen-sets from the turn-level digest so a NEW explore call
-        # (fresh sub-agent, no memory) treats earlier calls' searches/listings as
-        # already done: a re-issued query gets the cached result back instead of
-        # burning a real search. Digest keys are "tool|query|path" — rebuild the
-        # (query, path) tuples for grep/glob/read entries.
-        for _ckey in list(_explore_turn_digest.keys()):
-            _parts = _ckey.split("|", 2)
-            if len(_parts) != 3:
-                continue
-            _ctool, _cq, _cp = _parts
-            if _ctool in ("grep", "glob") and _cq:
-                _sub_seen_searches.add((_cq, _cp))
-            elif _ctool == "read":
-                _explore_seen_listings.add((_cq or _cp, _cp))
-
-        def _sub_cache_key(tool: str, key: tuple[str, str]) -> str:
-            return f"{tool}|{key[0]}|{key[1]}"
-
-        def _sub_cached(tool: str, key: tuple[str, str]) -> str | None:
-            ckey = _sub_cache_key(tool, key)
-            body = _sub_result_cache.get(ckey)
-            if body is None:
-                # Live cross-call check: parallel explore calls each snapshot
-                # the digest at start, so a read another call completed AFTER
-                # this call's seed is not in _sub_result_cache yet — check the
-                # shared turn-level digest directly.
-                body = _explore_turn_digest.get(ckey)
-            return body
-
-        def _sub_cache_put(tool: str, key: tuple[str, str], body: str) -> None:
-            """Store a tool result in BOTH the per-call cache and the turn-level
-            digest, so a later explore call in the same turn can reuse it."""
-            ckey = _sub_cache_key(tool, key)
-            _sub_result_cache[ckey] = body
-            _explore_turn_digest[ckey] = body
-            _persist_explore_digest()
-
-        def _persist_explore_digest() -> None:
-            """Persist the turn-level explore digest to disk (same resume file
-            the agent's tool-resume uses), so an explore call AFTER a disconnect /
-            app restart still dedups against what was already explored instead of
-            re-discovering from zero. Best-effort + throttled: never raises, and
-            never clobbers the agent's own `tools` resume records — it merges."""
-            if not chat_id:
-                return
-            try:
-                _prev = _state_db.load_turn_resume(root, chat_id) or {}
-                _prev["explore_digest"] = dict(_explore_turn_digest)
-                _state_db.save_turn_resume(root, chat_id, _prev)
-            except Exception:  # noqa: BLE001, S110 — best-effort, never fails the tool
-                pass
-
-        def _sub_resume_note() -> str:
-            """Distilled summary of the sub-agent's completed tool work, fed back
-            on a widen/overflow retry so a fresh model continues from the cached
-            findings instead of re-exploring from zero. Stays small (tail only)."""
-            if not _sub_result_cache:
-                return ""
-            items = list(_sub_result_cache.items())[-30:]
-            omitted = len(_sub_result_cache) - len(items)
-            lines = []
-            for cache_key, body in items:
-                parts = cache_key.split("|", 2)
-                tool = parts[0]
-                label = (
-                    parts[1]
-                    if len(parts) > 1 and parts[1]
-                    else (parts[2] if len(parts) > 2 else "/")
-                )
-                snippet = body[:300].replace("\n", " ")
-                if len(body) > 300:
-                    snippet += "…"
-                lines.append(f"- {tool}({label}): {snippet}")
-            note = "\n".join(lines)
-            if omitted:
-                note += f"\n({omitted} earlier results omitted)"
-            return (
-                "Exploration work already completed in earlier attempts — do NOT redo it. "
-                "Use these cached results and continue where the investigation stopped:\n"
-                f"{note}"
-            )
-
-        def _sub_verify_report_paths(report: str) -> list[str]:
-            """Find `path:line` references in a sub-agent report that point at
-            files that do not exist under `root`. Returns a short list of bad
-            refs (capped) or [] when everything cited exists. Purely disk-based —
-            no model calls, so accuracy is verified without burning tokens."""
-            if not report:
-                return []
-            root_real = os.path.realpath(os.path.abspath(root))
-            bad: list[str] = []
-            seen: set[tuple[str, str]] = set()
-            for m in _CITATION_RE.finditer(report):
-                rel = m.group(1)
-                line = m.group(2)
-                key = (rel, line)
-                if key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    cand = os.path.realpath(os.path.join(root, rel.lstrip("/")))
-                except Exception:  # noqa: BLE001, S112 — unreadable entry just isn't flagged
-                    continue
-                if cand == root_real or not cand.startswith(root_real + os.sep):
-                    continue
-                if not os.path.isfile(cand):
-                    bad.append(f"{rel}:{line}")
-                    if len(bad) >= 15:
-                        break
-            return bad
-
-        def _sub_check_seen(
-            tool: str, key: tuple[str, str], query: str, path: str
-        ) -> str | None:
-            # LIVE cross-call check FIRST: a PARALLEL explore call (same turn)
-            # may have already run this exact search — its result is in the
-            # SHARED turn-level digest, but this branch's per-branch search-set
-            # was seeded at START (when the digest was still empty for all
-            # concurrent calls), so it's not in _seen_searches yet. Checking the
-            # shared digest here is what makes the 2nd..Nth concurrent explore
-            # call reuse the first call's findings instead of re-searching the
-            # same area from scratch. Exact-key only — no broader/narrower
-            # folding across calls (that stays per-branch below, so branches
-            # don't converge on the first branch's queries).
-            cached = _sub_cached(tool, key)
-            if cached is not None:
-                _sub_emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": tool,
-                        "summary": "already searched",
-                    }
-                )
-                return (
-                    f"ALREADY SEARCHED: you ran this exact search "
-                    f"({query!r} under {path or '/'}) earlier. Result from earlier:\n"
-                    f"{cached}"
-                )
-            _seen_searches, _ = _sub_seen()
-            for seen_key in _seen_searches:
-                # Exact repeat: return the cached result (real data, even for a
-                # fresh model on retry), not a dead-end "use your memory".
-                if key == seen_key:
-                    cached = _sub_cached(tool, key)
-                    body = (
-                        cached
-                        if cached
-                        else f"(no stored result for {query!r} under {path or '/'})"
-                    )
-                    _sub_emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "grep",
-                            "summary": "already searched",
-                        }
-                    )
-                    return (
-                        f"ALREADY SEARCHED: you ran this exact search "
-                        f"({query!r} under {path or '/'}) earlier. Result from earlier:\n"
-                        f"{body}"
-                    )
-                # Broader re-search of a more-specific earlier one: the specific
-                # result already contains the useful signal — return it.
-                if path == seen_key[1] and key[0] and seen_key[0].startswith(key[0]):
-                    cached = _sub_cached(tool, seen_key)
-                    body = cached or "(no stored result)"
-                    _sub_emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "grep",
-                            "summary": "already searched",
-                        }
-                    )
-                    return (
-                        f"ALREADY SEARCHED: you previously searched a more specific term "
-                        f"({seen_key[0]!r}) under {path or '/'}. Result from earlier:\n"
-                        f"{body}"
-                    )
-            return None
-
-        @_sub_tracked
-        async def _sub_read(
-            filePath: str = "", offset: int = 1, limit: int = 2000
-        ) -> str:
-            """Sub-agent read: one file (line-paged) or one directory (listing)."""
-            _sub_emit(
-                {
-                    "kind": "tool",
-                    "tool": "read",
-                    "args": {"filePath": filePath, "offset": offset, "limit": limit},
-                }
-            )
-            lkey = _sub_search_key(
-                f"o{int(offset or 1)}l{int(limit or 2000)}", filePath
-            ) or (filePath, "")
-            # Listing a directory is idempotent: re-listing the SAME directory
-            # later in a run returns the same tree and only re-resends the whole
-            # sub-agent transcript for nothing. Fold repeats (the sub-agent
-            # re-listed backend/, the root and scripts/ three times during a
-            # retry). The key includes offset/limit so a DIFFERENT line range of
-            # the same file is NOT folded into an earlier read — otherwise the
-            # sub-agent asking for agents.py:3250-3269 after agents.py:3240-3339
-            # gets the old range back forever and loops re-requesting it.
-            #
-            # Per-key lock across CONCURRENT explore calls: the parent emits N
-            # explore calls in one response and pydantic-ai runs them at the
-            # same time, so two calls can reach this read before EITHER has
-            # cached it — without the lock both re-read the file from scratch.
-            # The lock serializes them: first does the work + caches, the rest
-            # re-check the digest and get "already read/listed".
-            _lock = _explore_locks.setdefault(
-                _sub_cache_key("read", lkey), asyncio.Lock()
-            )
-            async with _lock:
-                if (
-                    lkey in _sub_seen()[1]
-                    or _sub_cache_key("read", lkey) in _explore_turn_digest
-                ):
-                    cached = _sub_cached("read", lkey)
-                    body = cached or f"(no stored result for {filePath or '/'})"
-                    _sub_emit(
-                        {
-                            "kind": "tool_result",
-                            "tool": "read",
-                            "summary": "already read/listed",
-                        }
-                    )
-                    return (
-                        f"ALREADY READ: you read {filePath or '/'} earlier. Result from earlier:\n"
-                        f"{body}"
-                    )
-                try:
-                    target = resolve_safe(root, filePath, allow_coder=True)
-                except PathEscapeError as exc:
-                    msg = f"invalid path: {exc}"
-                    _sub_emit(_error_result("read", msg))
-                    return f"ERROR reading {filePath}: {msg}"
-                if os.path.isdir(target):
-                    result = list_files(root, filePath)
-                    if "error" in result:
-                        _sub_emit(_error_result("read", result["error"]))
-                        return f"ERROR reading {filePath}: {result['error']}"
-                    lines = []
-                    for entry in result["entries"][:_sub_listing_count]:
-                        marker = "/" if entry["kind"] == "dir" else "  "
-                        lines.append(f"{marker}{entry['name']}")
-                    if len(result["entries"]) > _sub_listing_count:
-                        lines.append(
-                            f"…({len(result['entries']) - _sub_listing_count} more entries)"
-                        )
-                    body = "\n".join(lines) if lines else "(empty directory)"
-                    out = f"DIRECTORY {filePath or '/'}\n{body}"
-                else:
-                    if not os.path.exists(target):
-                        out = f"ERROR reading {filePath}: file not found"
-                    elif not _is_text_path(target):
-                        out = f"ERROR reading {filePath}: binary file (read skipped)"
-                    else:
-                        excerpt = _read_lines_excerpt(target, offset, limit)
-                        if excerpt.get("error"):
-                            out = f"ERROR reading {filePath}: {excerpt['error']}"
-                        elif not excerpt["lines"]:
-                            out = f"ERROR reading {filePath}: line offset {offset} is past the end"
-                        else:
-                            rows = [
-                                f"{ln['line']}: {ln['text']}" for ln in excerpt["lines"]
-                            ]
-                            if excerpt["truncated"]:
-                                rows.append(
-                                    f"\n(Showing lines {excerpt['start']}-{excerpt['lines'][-1]['line']}"
-                                    f" of {excerpt['total']}. Use offset={excerpt['lines'][-1]['line'] + 1} to continue.)"
-                                )
-                            else:
-                                rows.append(
-                                    f"\n(End of file — total {excerpt['total']} lines)"
-                                )
-                            out = f"{filePath}\n" + "\n".join(rows)
-                _sub_seen()[1].add(lkey)
-                _sub_cache_put("read", lkey, out)
-                _sub_emit({"kind": "tool_result", "tool": "read", "summary": "read"})
-                return out
-
-        @_sub_tracked
-        async def _sub_grep(pattern: str, path: str = "", include: str = "") -> str:
-            _sub_emit(
-                {
-                    "kind": "tool",
-                    "tool": "grep",
-                    "args": {"pattern": pattern, "path": path, "include": include},
-                }
-            )
-            key = _sub_search_key(pattern, path)
-            # Per-key lock across CONCURRENT explore calls (see _sub_read): the
-            # parent emits N explore calls in one response and they run at the
-            # same time, so two calls can issue the SAME grep before either has
-            # cached it. Serialize them: first searches + caches, the rest
-            # re-check the digest via _sub_check_seen and get the cached result.
-            _lock = _explore_locks.setdefault(
-                _sub_cache_key("grep", key), asyncio.Lock()
-            )
-            async with _lock:
-                if key[0]:
-                    stop = _sub_check_seen("grep", key, pattern, path)
-                    if stop is not None:
-                        return stop
-                    _sub_seen()[0].add(key)
-                try:
-                    result = search_in_files(root, pattern, path, 0, include)
-                except PathEscapeError as exc:
-                    msg = f"invalid path: {exc}"
-                    _sub_emit(_error_result("grep", msg))
-                    return f"ERROR searching {path}: {msg}"
-                if result.get("error"):
-                    msg = result["error"]
-                    _sub_emit(_error_result("grep", msg))
-                    return f"ERROR searching {path}: {msg}"
-                matches = result.get("matches", [])
-                if not matches:
-                    out = f"No matches for {pattern!r} under {path or '/'}."
-                    if key[0]:
-                        _sub_cache_put("grep", key, out)
-                    _sub_emit(
-                        {"kind": "tool_result", "tool": "grep", "summary": "no matches"}
-                    )
-                    return out
-                lines: list[str] = []
-                total = 0
-                shown = 0
-                for m in matches:
-                    if shown >= _sub_search_count:
-                        break
-                    block = [f"{m['file']}:{m['line']}: {m['text']}"]
-                    block_size = sum(len(b) + 1 for b in block)
-                    if lines and total + block_size > _sub_tool_out_chars:
-                        break
-                    lines.extend(block)
-                    shown += 1
-                    total += block_size
-                    if total >= _sub_tool_out_chars:
-                        break
-                note = (
-                    f"\n({len(matches)} matches found, {shown} shown)"
-                    if len(matches) > shown
-                    else ""
-                )
-                out = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-                if key[0]:
-                    _sub_cache_put("grep", key, out)
-                _sub_emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "grep",
-                        "summary": f"{len(matches)} matches",
-                    }
-                )
-                return out
-
-        @_sub_tracked
-        async def _sub_glob(pattern: str, path: str = "") -> str:
-            _sub_emit(
-                {
-                    "kind": "tool",
-                    "tool": "glob",
-                    "args": {"pattern": pattern, "path": path},
-                }
-            )
-            key = _sub_search_key(pattern, path)
-            # Per-key lock across CONCURRENT explore calls (see _sub_read/_sub_grep).
-            _lock = _explore_locks.setdefault(
-                _sub_cache_key("glob", key), asyncio.Lock()
-            )
-            async with _lock:
-                if key[0]:
-                    stop = _sub_check_seen("glob", key, pattern, path)
-                    if stop is not None:
-                        return stop
-                    _sub_seen()[0].add(key)
-                try:
-                    result = glob_files(root, pattern, path)
-                except PathEscapeError as exc:
-                    msg = f"invalid path: {exc}"
-                    _sub_emit(_error_result("glob", msg))
-                    return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
-                matches = result.get("matches", [])
-                if not matches:
-                    out = f"No files match glob {pattern!r} under {path or '/'}."
-                    if key[0]:
-                        _sub_cache_put("glob", key, out)
-                    _sub_emit(
-                        {"kind": "tool_result", "tool": "glob", "summary": "no matches"}
-                    )
-                    return out
-                lines = list(matches[:50])
-                out = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines)
-                if key[0]:
-                    _sub_cache_put("glob", key, out)
-                _sub_emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "glob",
-                        "summary": f"{len(matches)} matches",
-                    }
-                )
-                return out
-
-        from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
-
-        async def _run_explore_inner(
-            model: Any,
-            task_text: str,
-            state: dict,
-            branch_index: int = 0,
-            branch_total: int = 1,
-            thoroughness: str = "quick",
-        ) -> str:
-            """Run the isolated exploration sub-agent on ``model`` with the given
-            task text (the task tool's ``prompt``) and return
-            its report. The model is wrapped in a _PerStepFallbackModel, so every
-            individual grep/read/glob request first tries the sub-agent model and,
-            on a failure, re-runs THAT request on the MAIN model — the next
-            sub-search goes back to the sub-agent model (non-sticky per-sub-search
-            fallback instead of flipping the whole explore). Reuses the dedup
-            caches so a resumed run continues from the failed attempt's findings
-            instead of re-exploring from zero. Raises ``_UsageLimitExceeded``
-            (step budget — NOT a model failure, so no fallback) or the underlying
-            exception when BOTH models fail a step. state["model"] is the per-branch model name stamped on this branch sub-agent events (set by the _run_explore wrapper, updated on per-sub-search fallback).
-            """
-            from pydantic_ai import Agent as _Agent
-            from pydantic_ai import Tool as _Tool
-            from pydantic_ai.messages import (
-                ModelRequest as _ModelRequest,
-            )
-            from pydantic_ai.messages import (
-                SystemPromptPart as _SystemPromptPart,
-            )
-            from pydantic_ai.settings import ModelSettings as _ModelSettings
-            from pydantic_ai.usage import UsageLimits as _UsageLimits
-
-            # PER-SUB-SEARCH FALLBACK (non-sticky): wrap the model so every
-            # individual grep/read/glob request first tries the sub-agent model
-            # and, on a failure, re-runs THAT request on the MAIN model — the
-            # next sub-search goes back to the sub-agent model. The events for
-            # each sub-search are labeled with the model that ACTUALLY ran it.
-            _primary_name = str(getattr(model, "model_name", "") or "")
-            _fallback_model = main_model if main_model is not None else model
-            _fallback_name = str(getattr(_fallback_model, "model_name", "") or "")
-
-            def _on_step_fallback(exc: Exception) -> None:
-                state["model"] = _fallback_name
-                try:
-                    emit(
-                        {
-                            "kind": "retry",
-                            "attempt": 1,
-                            "max_attempts": 1,
-                            "delay": 0,
-                            "reason": (
-                                f"explore sub-search failed on the {_primary_name} model — "
-                                f"using the main model ({_fallback_name}) for THIS search only"
-                            ),
-                            "model": _fallback_name,
-                            "agent": "explore sub-agent",
-                            "fallback": True,
-                        }
-                    )
-                except Exception:  # noqa: BLE001, S110 — cosmetic only
-                    pass
-
-            def _on_step_primary() -> None:
-                state["model"] = _primary_name
-
-            _run_model_wrapped = _PerStepFallbackModel(
-                model,
-                _fallback_model,
-                on_fallback=_on_step_fallback,
-                on_primary=_on_step_primary,
-            )
-            # Cross-call memory: if earlier explore calls this turn already
-            # discovered files/areas, feed them to this fresh sub-agent so it
-            # builds on that work instead of re-listing/re-searching from zero.
-            if _explore_turn_digest:
-                items = list(_explore_turn_digest.items())[-20:]
-                omitted = len(_explore_turn_digest) - len(items)
-                digest_lines = []
-                for ckey, body in items:
-                    parts = ckey.split("|", 2)
-                    tool = parts[0]
-                    label = (
-                        parts[1]
-                        if len(parts) > 1 and parts[1]
-                        else (parts[2] if len(parts) > 2 else "/")
-                    )
-                    snippet = body[:200].replace("\n", " ")
-                    if len(body) > 200:
-                        snippet += "…"
-                    digest_lines.append(f"- {tool}({label}): {snippet}")
-                digest_note = "\n".join(digest_lines)
-                if omitted:
-                    digest_note += f"\n({omitted} earlier results omitted)"
-                task_text = (
-                    "Another explore call this turn already searched these — read "
-                    "them BEFORE re-searching, and only dig deeper where needed:\n"
-                    f"{digest_note}\n\nNOW answer this:\n{task_text}"
-                )
-
-            # Content-heavy tasks (restyle/refactor/rewrite, style-relevant
-            # keywords) genuinely need verbatim JSX/CSS/function bodies from
-            # several files, which a compressed ≤3-line-excerpt report can't
-            # carry. For those, relax the report to allow verbatim blocks and
-            # raise the sub-agent's max output so the parent gets the actual
-            # code in ONE call instead of looping explore for more detail.
-            # Narrow fact-lookups keep the cheap concise-report style/2000 cap.
-            if _is_content_gathering(task_text):
-                _sub_report_style = (
-                    "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
-                    "<results>\n"
-                    "<files>\n"
-                    "One line per relevant file: `path:line` — the verbatim code "
-                    "blocks the task needs (full JSX/CSS/function bodies relevant to "
-                    "the question, each prefixed by its exact file:line).\n"
-                    "</files>\n"
-                    "<answer>\n"
-                    "One short paragraph on how the code fits together (under ~150 "
-                    "words — the code blocks are the deliverable, not padding).\n"
-                    "</answer>\n"
-                    "<next_steps>\n"
-                    "Optional: 1-2 follow-up paths the parent could take.\n"
-                    "</next_steps>\n"
-                    "</results>"
-                )
-                _sub_max_tokens = 4500
-            else:
-                _sub_report_style = (
-                    "REPORT FORMAT: reply with a single COMPACT STRUCTURED block.\n"
-                    "<results>\n"
-                    "<files>\n"
-                    "One line per relevant file: `path:line` (use the exact paths "
-                    "from your tool results).\n"
-                    "</files>\n"
-                    "<answer>\n"
-                    "The direct answer to the task in 1-3 sentences (under ~100 "
-                    "words).\n"
-                    "</answer>\n"
-                    "<next_steps>\n"
-                    "Optional: 1-2 suggested follow-ups, or leave empty.\n"
-                    "</next_steps>\n"
-                    "</results>"
-                )
-                _sub_max_tokens = 2000
-
-            # Cross-call dedup seed: earlier explore calls this turn already
-            # read/searched these paths. Feed them into the sub-agent's SYSTEM
-            # PROMPT (not just the task text) so the model KNOWS not to re-issue
-            # those calls — a dedup hit after the fact still costs a full model
-            # round-trip (the whole transcript re-sends), so preventing the call
-            # up front is what actually saves tokens.
-            _sub_prior_note = _sub_resume_note()
-            # Thoroughness control (ported from opencode's explore subagent):
-            # the caller picks how deep to sweep, and the sub-agent prompt
-            # adapts — quick = minimal targeted searches, very thorough =
-            # exhaustive multi-convention sweep.
-            _thoroughness_note = _thoroughness_prompt(thoroughness)
-            sub_agent = _Agent(
-                _run_model_wrapped,
-                system_prompt=(
-                    # opencode's explore agent framing
-                    # (packages/opencode/src/agent/prompt/explore.txt): a single
-                    # read-only "file search specialist" sub-agent that searches
-                    # with glob/grep/read itself — no sibling branches.
-                    "You are a file search specialist. You excel at thoroughly navigating "
-                    "and exploring codebases: rapidly finding files with glob patterns, "
-                    "searching code and text with powerful regex, and reading file "
-                    "contents. Adapt your search approach to the thoroughness level "
-                    "specified by the caller. Return file paths as absolute paths in "
-                    "your final response; avoid emojis; do not create or modify any files.\n"
-                    "You are also a read-only exploration sub-agent — find the answer "
-                    "FAST and CHEAPLY and hand back a compact structured report. TIME IS "
-                    "PRECIOUS — every search round-trip re-sends your whole transcript, "
-                    "so do not over-explore.\n"
-                    + _thoroughness_note
-                    + "\n"
-                    + (
-                        "WORKSPACE ROOT ALREADY LISTED — do NOT glob the root "
-                        "again; the top-level entries are already known:\n"
-                        f"{_SCOUT_CTX.get()}\n"
-                        if _SCOUT_CTX.get()
-                        else ""
-                    )
-                    + (
-                        "ALREADY EXPLORED THIS TURN — do NOT re-read or re-search these; "
-                        "the results are already known. Only dig deeper where the task "
-                        "genuinely needs more than what is listed:\n"
-                        f"{_sub_prior_note}\n"
-                        if _sub_prior_note
-                        else ""
-                    )
-                    + "INTENT (do this before your first search): state in one sentence "
-                    "what you are actually looking for (the literal request vs. the real "
-                    "underlying need) so your searches are targeted, not scattershot.\n"
-                    "PARALLEL-FIRST ACTION: on your very first turn launch 3+ tool calls "
-                    "SIMULTANEOUSLY — fire the glob / grep / read "
-                    "calls you already know you need in ONE response (batch related terms "
-                    "with regex alternation foo|bar|baz). Do NOT do a serial "
-                    "search→read→decide-next loop.\n"
-                    "TOOL CHOICE: use glob to locate FILES by name pattern like '**/*.py' "
-                    "or 'src/**/*.ts', use read on a directory to see its contents, "
-                    "and use grep only to find CONTENT INSIDE already-identified files "
-                    "or to confirm a symbol/string exists. Do NOT grep to discover which "
-                    "files exist — that returns hundreds of noisy matches. Never repeat a search "
-                    "with only a minor keyword variation. Do NOT search for overly generic terms "
-                    "like 'class', 'function', 'def', 'import' or punctuation — use specific, "
-                    "project-relevant keywords.\n"
-                    "HARD STOP CONDITIONS — stop as soon as ANY applies: "
-                    "(1) you have enough context to answer the task confidently; "
-                    "(2) the same information keeps appearing across searches (diminishing returns); "
-                    "(3) the last 2 search iterations yielded no new useful information; "
-                    "(4) you found a direct answer. Then report immediately. "
-                    "When done, report your findings "
-                    + _sub_report_style
-                    + "\nACCURACY RULES: copy file paths EXACTLY as they appear in tool results — never "
-                    "invent, guess or abbreviate a path. If a search returns no matches, say so "
-                    "explicitly instead of assuming it exists. If you are unsure a file exists, "
-                    "confirm it with glob before citing it. Only cite facts that appear in "
-                    "your tool results; never rely on memory of files you did not actually see. "
-                    "PERSISTENCE: before concluding something 'does not exist' or 'is not handled "
-                    "anywhere', try MULTIPLE search phrasings and several likely locations — the "
-                    "exact literal string often differs from natural phrasing (try substrings, word "
-                    "fragments, adjacent terms), and a single search returning no matches is NOT "
-                    "proof of absence. When the task asks for exact file:line references and your "
-                    "first searches come up empty, keep investigating rather than reporting "
-                    "'not found' immediately."
-                ),
-                tools=[
-                    _Tool(_sub_read, name="read"),
-                    _Tool(_sub_grep, name="grep"),
-                    _Tool(_sub_glob, name="glob"),
-                ],
-                model_settings=_ModelSettings(
-                    temperature=0.2,
-                    max_tokens=_sub_max_tokens,
-                    parallel_tool_calls=True,
-                ),
-            )
-
-            # Widen-and-resume retry loop (mirrors the PARENT agent's handling in
-            # agents.py: a pydantic-ai UsageLimitExceeded or a provider context
-            # overflow is NOT a hard failure — raise the budget / resume from the
-            # cached tool results so a broad-but-legitimate investigation finishes
-            # in this isolated run instead of telling the PARENT to split the task
-            # (which then re-pays full discovery overhead in its OWN context).
-            # Each retry keeps the result cache (built above), so the fresh model
-            # gets its earlier findings back via the dedup instead of re-exploring.
-            _sub_model_name = str(getattr(model, "model_name", "") or "")
-            # Start content-gathering tasks (broad/verbatim-code investigations,
-            # same classifier that already drives _sub_max_tokens above) with a
-            # BIGGER initial budget instead of the narrow-lookup default. The
-            # narrow default routinely wasn't enough for a genuinely broad task,
-            # forcing a UsageLimitExceeded → widen → resume round trip: a full
-            # extra sequential sub-agent request purely to discover "the budget
-            # was too small", before the actual widened run even starts. Sizing
-            # the STARTING budget correctly for the task kind skips that wasted
-            # round trip for the common broad-task case; narrow lookups keep the
-            # tight default since they rarely need more.
-            # Per-thoroughness budgets (search TIME bound): quick = 2-3 model
-            # round-trips / 6 sub-searches max, medium = standard sweep, very
-            # thorough = widest. Content-gathering keeps a high floor (12 req /
-            # 24 calls) so a broad refactor/restyle investigation finishes in
-            # ONE run (see _explore_usage_limits).
-            _expl_limits = _explore_usage_limits(
-                thoroughness, _is_content_gathering(task_text)
-            )
-            _sub_request_limit = _expl_limits["request_limit"]
-            _sub_tool_calls_limit = _expl_limits["tool_calls_limit"]
-            _sub_request_cap = _expl_limits["request_cap"]
-            _sub_tool_calls_cap = _expl_limits["tool_calls_cap"]
-            _sub_widen_max = _expl_limits["widen_max"]
-            _sub_widen_retries = 0
-            _sub_overflow_retries = 0
-            _sub_run_prompt = task_text
-            _sub_res = None
-            while True:
-                try:
-                    # Direct run, NO _run_subagent_call retry: per-sub-search
-                    # fallback to the main model happens inside the wrapped model
-                    # (_run_model_wrapped), so a failing grep/read/glob step
-                    # re-runs on the main model immediately instead of stalling
-                    # on a 30s x 10 backoff.
-                    _sub_res = await sub_agent.run(
-                        _sub_run_prompt,
-                        # Was request_limit=10/tool_calls_limit=20 — too tight for a
-                        # genuinely broad investigation in a large codebase, so it hit
-                        # UsageLimitExceeded routinely and told the PARENT to split the
-                        # task into more explore calls. Each new explore call spins up a
-                        # FRESH sub-agent with no memory of what the previous attempt
-                        # already found, so that "split it up and retry" pattern was
-                        # paying the full discovery overhead (re-listing/re-searching
-                        # the same areas) two or three times over for one investigation
-                        # — exactly the repeated-tool-call token burn being reported.
-                        # Doubling the budget lets most broad-but-reasonable tasks
-                        # finish in ONE isolated sub-agent run instead. Still bounded,
-                        # so a truly runaway task fails loudly rather than looping
-                        # forever — it just needs a materially bigger task to get there.
-                        usage_limits=_UsageLimits(
-                            request_limit=_sub_request_limit,
-                            tool_calls_limit=_sub_tool_calls_limit,
-                        ),
-                        model_settings=_ModelSettings(
-                            timeout=_providers.model_timeout(
-                                model=model, total=90, connect=10, read=90
-                            ),
-                            parallel_tool_calls=True,
-                        ),
-                    )
-                    break
-                except _UsageLimitExceeded:
-                    # Step/request budget hit, no mutating side effects possible
-                    # (read-only sub-agent). Widen the budget and resume with the
-                    # cached tool results, mirroring the parent's widen branch.
-                    if _sub_widen_retries >= 2:
-                        raise
-                    _sub_widen_retries += 1
-                    _sub_request_limit = min(_sub_request_limit * 2, 24)
-                    _sub_tool_calls_limit = min(_sub_tool_calls_limit * 2, 36)
-                    resume_note = _sub_resume_note()
-                    if resume_note:
-                        _sub_run_prompt = f"{task_text}\n\n{resume_note}"
-                    emit(
-                        {
-                            "kind": "retry",
-                            "attempt": _sub_widen_retries,
-                            "max_attempts": 3,
-                            "delay": 0,
-                            "reason": (
-                                f"explore step budget raised to {_sub_request_limit} requests / "
-                                f"{_sub_tool_calls_limit} tool calls, resuming from previous tool results"
-                            ),
-                            "model": _sub_model_name,
-                            "agent": "explore sub-agent",
-                        }
-                    )
-                    continue
-                except _SubEarlyStop:
-                    # The sub-agent HAD found useful info earlier but its last
-                    # searches were ALL empty (diminishing returns — the prompt's
-                    # hard-stop condition #3). Never discard partial findings and
-                    # never burn more tokens: return the cached findings so far
-                    # as the report.
-                    _resume_note = _sub_resume_note()
-                    return (
-                        "EXPLORATION STOPPED EARLY — the last searches returned "
-                        "no new information (diminishing returns), so the explore "
-                        "stopped to avoid wasting tokens. Findings so far:\n"
-                        f"{_resume_note or '(none captured)'}"
-                    )
-                except Exception as exc:
-                    # A provider context overflow inside the sub-agent's own
-                    # isolated window: its transcript got too big. Resume ONCE
-                    # from the cached findings (the prompt + cached results are
-                    # far smaller than the raw transcript, so it fits again).
-                    # UsageLimitExceeded is handled above; `_is_context_overflow`
-                    # matches only real overflow wording.
-                    from agents import _is_context_overflow
-
-                    if _is_context_overflow(exc) and _sub_overflow_retries < 1:
-                        _sub_overflow_retries += 1
-                        resume_note = _sub_resume_note()
-                        if resume_note:
-                            _sub_run_prompt = f"{task_text}\n\n{resume_note}"
-                        emit(
-                            {
-                                "kind": "retry",
-                                "attempt": 1,
-                                "max_attempts": 2,
-                                "delay": 0,
-                                "reason": "explore sub-agent context was full — resuming from previous tool results",
-                                "model": _sub_model_name,
-                                "agent": "explore sub-agent",
-                            }
-                        )
-                        continue
-                    raise
-            res = _sub_res
-            report = str(getattr(res, "output", "") or "").strip()
-
-            # Citation verification: extract `path:line` references from the
-            # report and check each file exists on disk. Sub-agents occasionally
-            # fabricate paths/line numbers; if any are bogus, run ONE bounded
-            # correction round (sub-agent tokens only) pointing out the bad refs.
-            if report:
-                bad_refs = _sub_verify_report_paths(report)
-                if bad_refs:
-                    resume_history: list[_ModelRequest] = []
-                    _resume_note = _sub_resume_note()
-                    if _resume_note:
-                        resume_history = [
-                            _ModelRequest(
-                                parts=[_SystemPromptPart(content=_resume_note)]
-                            )
-                        ]
-                    try:
-                        fix_result = await _run_subagent_call(
-                            lambda: sub_agent.run(
-                                (
-                                    "Your exploration report cites file paths that do not exist in "
-                                    "the workspace:\n"
-                                    + "\n".join(f"- {b}" for b in bad_refs[:15])
-                                    + "\n\nCorrect the report: for each, either fix the path to the "
-                                    "REAL file (confirm it with glob/grep first) or "
-                                    "remove the fabricated reference entirely. Keep the rest of the "
-                                    "report unchanged. Reply with ONLY the corrected report."
-                                ),
-                                message_history=resume_history,
-                                usage_limits=_UsageLimits(
-                                    request_limit=max(4, _sub_request_limit),
-                                    tool_calls_limit=max(8, _sub_tool_calls_limit),
-                                ),
-                                model_settings=_ModelSettings(
-                                    timeout=_providers.model_timeout(
-                                        model=model, total=60, connect=10, read=60
-                                    ),
-                                    parallel_tool_calls=True,
-                                ),
-                            ),
-                            "explore sub-agent",
-                            emit=emit,
-                            model_name=_sub_model_name,
-                        )
-                        fixed = str(getattr(fix_result, "output", "") or "").strip()
-                        if fixed:
-                            report = fixed
-                    except Exception:  # noqa: BLE001, S110 — a failed fix is not fatal
-                        pass
-            # The sub-agent's model requests are billed real tokens, but they ran
-            # through a SEPARATE pydantic_ai Agent instance that never passed
-            # through _UsageCapability (that's only wired up for the PARENT
-            # agent's own model in agents.py) — so this usage was silently
-            # missing from both the live context meter and the cost total.
-            # Surface it the same way a normal tool-loop step does, via the same
-            # _usage_event normalizer, labeled with the model that ACTUALLY ran.
-            from agents import _usage_event  # local import (circular-safe)
-
-            _usage_ev = _usage_event(
-                getattr(_sub_res, "usage", None), model=_sub_model_name
-            )
-            if _usage_ev:
-                emit(_usage_ev)
-            return report
-
-        async def _run_explore(
-            model: Any,
-            task_text: str,
-            branch_id: int = 0,
-            branch_index: int = 0,
-            branch_total: int = 1,
-            thoroughness: str = "quick",
-        ) -> str:
-            """Per-branch wrapper: stamps every sub-agent event with this
-            branch id and the model that ACTUALLY ran it (the sub-agent model,
-            or the main model after a per-sub-search fallback). Each branch runs
-            in its own asyncio task, so the contextvar keeps the shared sub-tools
-            pointed at THIS branch closure — no cross-branch races."""
-            state = {"model": str(getattr(model, "model_name", "") or "")}
-
-            def _branch_emit(event: dict) -> None:
-                event = dict(event)
-                event["sub"] = True
-                event["branch"] = branch_id
-                event.setdefault("model", state["model"])
-                emit(event)
-
-            _token = _sub_emit_ctx.set(_branch_emit)
-            # Per-branch dedup for SEARCHES only: copy the digest-seeded shared
-            # search set so this branch dedups against its OWN searches + prior
-            # explore calls, never against other branches' concurrent searches
-            # (a shared search seen-set folded branch B's broader search into
-            # branch A's more-specific one, making all branches converge on the
-            # same searches). READS are NOT copied: they share the turn-level
-            # _explore_seen_listings so parallel branches reuse each other's
-            # file reads instead of each reading the same files.
-            _seen_token = _sub_seen_searches_ctx.set(set(_sub_seen_searches))
-            _empty_token = _sub_empty_ctx.set(
-                {
-                    "streak": 0,
-                    "found_any": False,
-                    "threshold": _explore_usage_limits(thoroughness)[
-                        "empty_stop_after"
-                    ],
-                }
-            )
-            try:
-                return await _run_explore_inner(
-                    model,
-                    task_text,
-                    state,
-                    branch_index=branch_index,
-                    branch_total=branch_total,
-                    thoroughness=thoroughness,
-                )
-            finally:
-                _sub_empty_ctx.reset(_empty_token)
-                _sub_seen_searches_ctx.reset(_seen_token)
-                _sub_emit_ctx.reset(_token)
-
-        # Run the explore sub-agent. Per-sub-search fallback to the MAIN model
-        # happens INSIDE _run_explore (the _PerStepFallbackModel wrapper), so a
-        # failing grep/read/glob step never flips the whole explore — or the
-        # rest of the turn — onto the main model (non-sticky). Step-budget
-        # exhaustion (_UsageLimitExceeded) is deliberately NOT a fallback — it
-        # means the task is too broad, not that the model is broken.
-        #
-        # ONE sub-agent per task call, exactly like opencode's `explore` agent
-        # (mode: subagent, read-only, thoroughness quick|medium|very thorough).
-        # The sub-agent does the searching itself with parallel tool calls
-        # (glob/grep/read) — there is NO fan-out into multiple sibling
-        # sub-agents, which is what produced "چند تا اکسپلور با ساب ایجنت های
-        # مثل هم" (several explore cards with near-identical sub-searches).
-        nonlocal _task_call_seq
-        _ecall = _task_call_seq + 1
-        _task_call_seq = _ecall
-        _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        # No other subagent types supported
         emit(
             {
                 "kind": "tool",
                 "tool": "task",
-                "args": {"description": description, "subagent_type": subagent_type},
-                "model": _run_model_name,
-                "branch": _ecall,
+                "args": {
+                    "description": description,
+                    "subagent_type": subagent_type,
+                },
+                "model": "",
             }
         )
-        # Register this call as IN-FLIGHT so a concurrent near-duplicate (parent
-        # fires N task calls in one parallel-tool-calls response) awaits THIS
-        # call's report instead of spawning its own sub-agent. Resolved in
-        # `_finish` on every exit path so a waiting duplicate never hangs.
-        _loop = asyncio.get_running_loop()
-        _future: asyncio.Future = _loop.create_future()
-        _inflight_ent = {
-            "prompt": prompt,
-            "subagent_type": "explore",
-            "thoroughness": thoroughness,
-            "future": _future,
-        }
-        _explore_inflight.append(_inflight_ent)
-
-        def _finish(final: str) -> str:
-            if not _future.done():
-                _future.set_result(final)
-            _explore_inflight[:] = [
-                e for e in _explore_inflight if e is not _inflight_ent
-            ]
-            return final
-
-        try:
-            report = await _run_explore(
-                _run_model,
-                prompt,
-                branch_id=_ecall,
-                thoroughness=thoroughness,
-            )
-        except _UsageLimitExceeded:
-            emit(_error_result("task", "step budget exceeded"))
-            return _finish(
-                f'<task id="{_tid}" state="error">\n<task_result>\n'
-                "The explore agent did not finish within its step budget — the task was likely too "
-                "broad. Split it into smaller, more specific task calls, or investigate the remaining "
-                "part yourself with grep/read.\n</task_result>\n</task>"
-            )
-        except _SubagentTokenLimitError as exc:
-            # The sub-agent model's max_tokens is too small for the report —
-            # a CONFIG problem, not a transient failure. Surface an actionable
-            # message instead of the generic failure text.
-            emit(_error_result("task", f"sub-agent token limit: {exc}"))
-            return _finish(
-                f'<task id="{_tid}" state="error">\n<task_result>\n'
-                f"ERROR: the explore sub-agent model ({_run_model_name}) hit its "
-                f"max_tokens limit while producing the report. The explore report "
-                f"needs ~2000-4500 output tokens — raise the model's max_tokens in "
-                f"Settings → Tools, or pick a model with a larger output limit.\n"
-                f"</task_result>\n</task>"
-            )
-        except Exception as exc:  # noqa: BLE001
-            # Both the sub-agent model AND the main-model fallback failed a
-            # step, or the run failed outside a model request — surface it.
-            emit(_error_result("task", f"failed: {exc}"))
-            return _finish(
-                f'<task id="{_tid}" state="error">\n<task_result>\n'
-                f"ERROR: the explore sub-agent failed"
-                f" ({_run_model_name} model, change it in Settings → Subagents): {exc}\n</task_result>\n</task>"
-            )
-        if not report:
-            emit(_error_result("task", "no report"))
-            return _finish(
-                f'<task id="{_tid}" state="error">\n<task_result>\n'
-                f"The exploration sub-agent found nothing usable for {prompt!r}.\n</task_result>\n</task>"
-            )
-        _ran_model_name = str(getattr(_run_model, "model_name", "") or "")
         emit(
-            {
-                "kind": "tool_result",
-                "tool": "task",
-                "summary": f"{len(report)} chars",
-                "model": _ran_model_name,
-                "branch": _ecall,
-            }
+            _error_result(
+                "task",
+                f"Unknown agent type: {subagent_type} is not a valid agent type",
+            )
         )
-        _final = f'<task id="{_tid}" state="completed">\n<task_result>\n{report}\n</task_result>\n</task>'
-        _explore_call_log.append(
-            {
-                "prompt": prompt,
-                "subagent_type": "explore",
-                "thoroughness": thoroughness,
-                "report": _final,
-            }
+        return (
+            f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
         )
-        return _finish(_final)
 
     async def _run_general_task(description: str, prompt: str, task_id: str) -> str:
         """Run the `general` sub-agent (opencode's general agent).
@@ -5485,7 +3975,7 @@ def make_tool_callbacks(
         from pydantic_ai.settings import ModelSettings as _ModelSettings
         from pydantic_ai.usage import UsageLimits as _UsageLimits
 
-        _general_model = main_model if main_model is not None else explore_model
+        _general_model = main_model
         if _general_model is None:
             emit(
                 {
@@ -6435,7 +4925,6 @@ def make_tool_callbacks(
         "search_memory": search_memory_tool,
         "update_plan": update_plan,
         "create_skill": create_skill_tool,
-        "read_skill": read_skill_tool,
         "create_mcp": create_mcp_tool,
         "grep": grep_tool,
         "glob": glob_tool,

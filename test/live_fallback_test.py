@@ -1,11 +1,16 @@
 """LIVE test: subagent fallback → events must show the MAIN model name.
 
-Replicates the app's real tool path (make_tool_callbacks + grep_tool) with a
+Replicates the app's real tool path (make_tool_callbacks + read_tool) with a
 deliberately BROKEN search model, then asserts:
-  1. the first grep falls back to the main model (distilled, model=main),
-  2. a SECOND grep in the same turn ALSO distills via the main model
+  1. the first read (directory) falls back to the main model (distilled, model=main),
+  2. a SECOND read in the same turn ALSO distills via the main model
      (not raw output) — the sticky-fallback consistency fix,
   3. every emitted event carries the main model name after fallback.
+
+NOTE: grep/glob are no longer parent tools — searching is delegated to the
+explore sub-agent. `read` is the remaining parent search-slot tool that runs
+on the search-subagent model (or the main model once the slot falls back), so
+it exercises the same sticky-fallback path via its directory-distill branch.
 """
 import asyncio
 import os
@@ -83,12 +88,15 @@ async def main() -> None:
         main_model=main_model,
     )
 
-    print("\n--- grep #1 (search model broken → must fall back to main) ---")
-    r1 = await tools["grep"]("def main", path="backend", include="*.py")
+    # grep/glob are delegated to the explore sub-agent — they are no longer
+    # parent tools. Use `read` on a directory, which runs on the search-subagent
+    # model (broken here) and distills the listing through _run_distill.
+    print("\n--- read #1 (search model broken → must fall back to main) ---")
+    r1 = await tools["read"]("backend")  # directory → distilled via search model (broken → main)
     print(f"  result head: {r1[:90]!r}")
 
-    print("\n--- grep #2 (same turn → must STILL distill via main, not raw) ---")
-    r2 = await tools["grep"]("async def", path="backend", include="*.py")
+    print("\n--- read #2 (same turn → must STILL distill via main, not raw) ---")
+    r2 = await tools["read"]("backend")
     print(f"  result head: {r2[:90]!r}")
 
     # Assertions
@@ -99,26 +107,26 @@ async def main() -> None:
 
     main_name = str(getattr(main_model, "model_name", "") or "")
     broken_name = str(getattr(broken, "model_name", "") or "")
-    tool_evs = [e for e in events if e.get("kind") == "tool" and e.get("tool") == "grep"]
-    res_evs = [e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "grep"]
+    tool_evs = [e for e in events if e.get("kind") == "tool" and e.get("tool") == "read"]
+    res_evs = [e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "read"]
 
     ok = True
-    # grep#1 tool event starts on the (broken) search model — correct.
+    # read#1 tool event starts on the (broken) search model — correct.
     good = tool_evs[0].get("model") == broken_name
     ok &= good
-    print(f"  grep#1 tool event model={tool_evs[0].get('model')!r} == broken search {broken_name!r}: {good}")
-    # grep#2 tool event must already be the MAIN model (sticky fallback).
+    print(f"  read#1 tool event model={tool_evs[0].get('model')!r} == broken search {broken_name!r}: {good}")
+    # read#2 tool event must already be the MAIN model (sticky fallback).
     good = tool_evs[1].get("model") == main_name
     ok &= good
-    print(f"  grep#2 tool event model={tool_evs[1].get('model')!r} == main {main_name!r}: {good}")
+    print(f"  read#2 tool event model={tool_evs[1].get('model')!r} == main {main_name!r}: {good}")
     for i, e in enumerate(res_evs):
         good = e.get("model") == main_name
         ok &= good
-        print(f"  grep#{i+1} result event model={e.get('model')!r} == main {main_name!r}: {good}  summary={e.get('summary')!r}")
+        print(f"  read#{i+1} result event model={e.get('model')!r} == main {main_name!r}: {good}  summary={e.get('summary')!r}")
 
-    # grep #2 must be distilled (not raw "MATCHES for ...")
-    distilled2 = "distilled" in r2 or "SEARCH RESULTS" in r2
-    print(f"  grep#2 distilled (not raw): {distilled2}")
+    # read #2 must be distilled (not raw directory listing)
+    distilled2 = "distilled" in r2 or "DIRECTORY" in r2
+    print(f"  read#2 distilled (not raw): {distilled2}")
     ok &= distilled2
 
     print(f"\nRESULT: {'✅ ALL OK' if ok else '❌ FAILED'}")

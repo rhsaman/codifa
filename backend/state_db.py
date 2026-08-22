@@ -9,8 +9,7 @@ data root (default ``~/.codifa``, configurable by Electron via
       chats/<workspace-slug>/<chat-id>.json     # one file per chat
       plan/<workspace-slug>/<chat-id>/plan.md   # per-chat implementation plan
       plan/<workspace-slug>/<chat-id>/plan.meta.json  # title / updated_at
-      skills/<slug>/skill.md                    # skill body (source of truth)
-      skills/<slug>/metadata.json               # name / slug / description / updated_at
+      skills/<slug>/skill.md                    # skill body + frontmatter (source of truth)
       mcp/<safe-name>.json                      # one file per MCP connector
 
 Why files instead of SQLite for user data: the user asked for data to be plain
@@ -269,9 +268,58 @@ def save_settings(settings: dict | None) -> None:
     _backup_then_save_settings(settings)
 
 
+# Keys the renderer ships as cold-start defaults (see src/lib/store.ts
+# ``writeStateNow`` and the default ``settings`` object). A payload that carries
+# ONLY these keys — and no real-data marker — is the cold-start default
+# skeleton. Any key outside this set (e.g. a user-toggled ``theme``) marks the
+# write as a real, intentional update that must be persisted.
+_DEFAULT_SETTINGS_KEYS = frozenset(
+    {
+        "providers",
+        "activeProviderId",
+        "systemPrompts",
+        "mcpServers",
+        "mcpEnabled",
+        "modes",
+        "compactThreshold",
+        "root",
+        "dir",
+        "recentModels",
+        "sidebarOpen",
+        "fontSize",
+        "vectorDbPath",
+        "dataPath",
+        "whisperModel",
+        "whisperBaseUrl",
+        "embeddingModel",
+        "embeddingBaseUrl",
+        "subagentModels",
+        "memory",
+        "memoryTtlDays",
+        "memoryMaxDocs",
+        "memoryMaxChunks",
+        "workspaceColors",
+        "pinnedWorkspaces",
+        "workspaces",
+        "searchPlugins",
+        "searchConsole",
+        "pinnedChats",
+    }
+)
+
+
 def _looks_like_default_skeleton(settings: dict) -> bool:
-    """True when the payload has none of the markers of a real, configured
-    settings file. Fresh defaults pass; a persisted prior session does not."""
+    """True ONLY when the payload is the cold-start DEFAULT skeleton — i.e. it
+    carries no key outside the renderer's default set and no real-data marker.
+
+    A partial user update such as ``{"theme": "light"}`` is NOT a skeleton
+    (``theme`` is never a default key) and must be persisted; only the full
+    default object written before real settings are hydrated qualifies."""
+    if not isinstance(settings, dict) or not settings:
+        return False
+    # Any key the renderer never ships as a default => this is a real write.
+    if set(settings) - _DEFAULT_SETTINGS_KEYS:
+        return False
     if (
         settings.get("workspaces")
         or settings.get("recentModels")
@@ -396,12 +444,49 @@ def _skill_dir(slug: str) -> str:
     return os.path.join(skills_dir(), _safe_file(slug, "skill"))
 
 
-def _skill_meta_path(slug: str) -> str:
-    return os.path.join(_skill_dir(slug), "metadata.json")
-
-
 def _skill_md_path(slug: str) -> str:
     return os.path.join(_skill_dir(slug), "skill.md")
+
+
+def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
+    """Return ``(name, slug, description)`` parsed from a skill markdown file.
+
+    The first ``---`` fenced block is treated as YAML frontmatter. Falls back to
+    deriving the name from the first ``# Heading`` line or the first non-empty
+    line when frontmatter is absent.
+    """
+    name = ""
+    slug = ""
+    description = ""
+    if raw.startswith("---"):
+        end = raw.find("\n---", 3)
+        if end != -1:
+            block = raw[3:end].strip("\n")
+            for line in block.splitlines():
+                if ":" not in line:
+                    continue
+                key, _, val = line.partition(":")
+                key = key.strip().lower()
+                val = val.strip().strip('"').strip("'")
+                if key == "name":
+                    name = val
+                elif key == "slug":
+                    slug = val
+                elif key == "description":
+                    description = val
+    if not name:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                name = line.lstrip("#").strip()
+            else:
+                name = line
+            break
+    if not slug and name:
+        slug = slugify(name)
+    return name, slug, description
 
 
 def _find_skill_dir(name_or_slug: str) -> str | None:
@@ -412,53 +497,50 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
     slug = _slugify(name_or_slug)
     # Prefer exact slug dir.
     d = _skill_dir(slug)
-    if os.path.isdir(d):
+    if os.path.isdir(d) and os.path.isfile(os.path.join(d, "skill.md")):
         return d
-    # Fall back to matching the stored name inside metadata.
+    # Fall back to matching the stored name inside the skill.md frontmatter.
     base = skills_dir()
     if os.path.isdir(base):
         for entry in os.listdir(base):
             p = os.path.join(base, entry)
             if not os.path.isdir(p):
                 continue
-            meta = _read_json(os.path.join(p, "metadata.json"))
-            if isinstance(meta, dict) and str(meta.get("name") or "").strip() == name_or_slug:
+            md = os.path.join(p, "skill.md")
+            if not os.path.isfile(md):
+                continue
+            name, _, _ = _parse_skill_frontmatter(_read_text(md))
+            if name and name.strip() == name_or_slug:
                 return p
     return None
 
 
 def save_skill(name: str, slug: str, description: str, path: str, content: str) -> None:
-    """Persist a skill as ``skills/<slug>/skill.md`` + ``metadata.json``.
-    ``version`` auto-increments and ``content_hash`` is SHA-256 of the body."""
+    """Persist a skill as ``skills/<slug>/skill.md`` with YAML frontmatter.
+
+    The frontmatter carries ``name``/``slug``/``description``; the rest of the
+    file is the skill body. ``path`` is informational (the on-disk location).
+    """
     with _LOCK:
         _migrate_legacy_db()
         name = str(name or "").strip()
         slug = str(slug or "").strip() or _slugify(name) or "skill"
-        d = _skill_dir(slug)
         content = str(content or "")
-        # Compute hash BEFORE normalising (we store what the user wrote).
-        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-        # Read the old metadata to bump version.
-        old_meta = _read_json(os.path.join(d, "metadata.json"))
-        old_version = 0
-        if isinstance(old_meta, dict):
-            old_version = int(old_meta.get("version") or 0)
-        _atomic_write(
-            os.path.join(d, "skill.md"),
-            content,
+        d = _skill_dir(slug)
+        os.makedirs(d, exist_ok=True)
+        # Strip any pre-existing frontmatter so we don't duplicate it.
+        if content.startswith("---"):
+            end = content.find("\n---", 3)
+            if end != -1:
+                content = content[end + 4:].lstrip("\n")
+        front = (
+            "---\n"
+            f"name: {name}\n"
+            f"slug: {slug}\n"
+            f"description: {str(description or '').strip()}\n"
+            "---\n\n"
         )
-        _atomic_write_json(
-            os.path.join(d, "metadata.json"),
-            {
-                "name": name,
-                "slug": slug,
-                "description": str(description or ""),
-                "path": str(path or f"db://skills/{slug}"),
-                "version": old_version + 1,
-                "content_hash": content_hash,
-                "updated_at": _now(),
-            },
-        )
+        _atomic_write(os.path.join(d, "skill.md"), front + content)
 
 
 def list_skills() -> list[dict]:
@@ -472,18 +554,23 @@ def list_skills() -> list[dict]:
             d = os.path.join(base, entry)
             if not os.path.isdir(d):
                 continue
-            meta = _read_json(os.path.join(d, "metadata.json"))
-            if not isinstance(meta, dict):
+            md = os.path.join(d, "skill.md")
+            if not os.path.isfile(md):
                 continue
+            raw = _read_text(md)
+            name, slug, description = _parse_skill_frontmatter(raw)
+            body = raw
+            if body.startswith("---"):
+                end = body.find("\n---", 3)
+                if end != -1:
+                    body = body[end + 4:].lstrip("\n")
             out.append(
                 {
-                    "name": str(meta.get("name") or ""),
-                    "slug": str(meta.get("slug") or entry),
-                    "description": str(meta.get("description") or ""),
-                    "path": str(meta.get("path") or f"db://skills/{entry}"),
-                    "version": int(meta.get("version") or 0),
-                    "content_hash": str(meta.get("content_hash") or ""),
-                    "content": _read_text(os.path.join(d, "skill.md")),
+                    "name": name or entry,
+                    "slug": slug or entry,
+                    "description": description,
+                    "path": f"file://{md}",
+                    "content": body,
                 }
             )
     return out
@@ -763,17 +850,15 @@ def _migrate_legacy_db() -> None:
                 name = str(name or "").strip()
                 slug = str(slug or "").strip() or _slugify(name) or "skill"
                 d = _skill_dir(slug)
-                _atomic_write(os.path.join(d, "skill.md"), content or "")
-                _atomic_write_json(
-                    os.path.join(d, "metadata.json"),
-                    {
-                        "name": name,
-                        "slug": slug,
-                        "description": str(description or ""),
-                        "path": str(vpath or f"db://skills/{slug}"),
-                        "updated_at": _now(),
-                    },
+                os.makedirs(d, exist_ok=True)
+                front = (
+                    "---\n"
+                    f"name: {name}\n"
+                    f"slug: {slug}\n"
+                    f"description: {str(description or '').strip()}\n"
+                    "---\n\n"
                 )
+                _atomic_write(os.path.join(d, "skill.md"), front + (content or ""))
         except sqlite3.Error:
             pass
         # mcp (already writes files directly)

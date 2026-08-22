@@ -129,8 +129,8 @@ class ChatRequest(BaseModel):
     thinking_level: str = "medium"
     mcp_servers: dict = {}
     # Names of skills the user explicitly attached this turn (via @mention).
-    # When non-empty, ONLY these skills are loaded and auto-selection is
-    # skipped for this turn. Empty = normal auto-selection.
+    # These are the only skills inlined in full; when empty, no skill body is
+    # loaded (skills are never auto-selected).
     skills: list[str] = []
     context_window: int = 0
     allow_create: bool = False
@@ -163,7 +163,7 @@ class ChatRequest(BaseModel):
     # Retrieval knobs (auto_index, auto_recall, top_k, include_* toggles).
     # None = backend defaults.
     retrieval_config: dict | None = None
-    # Per-subagent model overrides: {"explore": "model-id", "vision": "...", "compact": "..."}.
+    # Per-subagent model overrides: {"search": "model-id", "web": "...", "vision": "...", "compact": "..."}.
     # Missing / empty dict = use the parent model for every subagent.
     subagent_models: dict = {}
     # Pre-emptive auto-compact threshold as a fraction of the context window

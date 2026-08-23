@@ -194,6 +194,9 @@ async def main():
             {"role": "assistant",
              "content": "grep ran...[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
         ]
+        # Seed a plan so coder skips the discovery pipeline and this scenario
+        # stays focused on checklist/resume preservation.
+        state_db.save_plan(ws, "plan", "## Plan\n\n1. implement X\n\nFiles: app.py", chat_id=chat4)
         await run_turn(prompt="ادامه بده", history=history4, mode="coder",
                        **{**{k: v for k, v in common.items() if k != "mode"}, "chat_id": chat4})
         _, call_msg4 = find_in_request(

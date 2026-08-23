@@ -28,7 +28,7 @@ from mock_openai import (
 )
 
 from agents import _compact_history
-from providers import build_model
+from llm import build_chat_model
 
 
 # Each message is large (~1.4k chars) so the opencode token-budgeted tail
@@ -48,8 +48,8 @@ async def main():
     try:
         # Two DISTINCT model objects pointing at the same mock server: the
         # "compact subagent" (primary) and the "main model" (fallback).
-        compact_model = build_model("custom", "mock-model", base, "test", "", "")
-        main_model = build_model("custom", "mock-model", base, "test", "", "")
+        compact_model = build_chat_model("custom", "mock-model", base, "test", "", "")
+        main_model = build_chat_model("custom", "mock-model", base, "test", "", "")
         history = make_history()
 
         # 1. Compact subagent FAILS (hard 400) -> fall back to the main model.

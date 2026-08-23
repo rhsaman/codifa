@@ -1578,6 +1578,39 @@ textarea {
   margin: 0.2em 0 1.4em;
 }
 
+/* Mermaid diagrams rendered from ```mermaid fenced blocks. Colors are driven by
+   the diagram's themeVariables (set from the app CSS vars in Mermaid.tsx); the
+   container chrome below uses the same theme tokens so it blends in. */
+.mermaid-block {
+  margin: 0.4em 0 1.4em;
+  padding: 14px 16px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-x: auto;
+  text-align: center;
+  cursor: zoom-in;
+}
+.mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+/* Fallback while the assistant is still streaming an incomplete diagram: show
+   the raw source as a code block instead of an error. */
+.mermaid-fallback {
+  margin: 0.4em 0 1.4em;
+  padding: 12px 14px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
 .markdown-body ul,
 .markdown-body ol {
   margin: 0 0 0.8em;
@@ -10070,4 +10103,108 @@ textarea {
     inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
     0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
     0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* ----- Full-screen modal (mermaid diagrams + file diffs) ----- */
+.fullscreen-modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: color-mix(in srgb, #000 55%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2vh 2vw;
+}
+.fullscreen-modal-panel {
+  width: 96vw;
+  height: 92vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
+}
+.fullscreen-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.fullscreen-modal-title {
+  font-weight: 600;
+  font-size: 13px;
+  opacity: 0.9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fullscreen-close {
+  flex: none;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 30px;
+  height: 30px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.fullscreen-close:hover {
+  background: var(--bg-hover);
+}
+.fullscreen-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
+.diff-fullscreen-body {
+  padding: 0;
+}
+.fullscreen-empty {
+  color: var(--text-dim);
+  padding: 24px;
+  font-size: 13px;
+}
+.mermaid-fullscreen {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+.mermaid-fullscreen .mermaid-block {
+  cursor: default;
+  width: 100%;
+  margin: 0;
+}
+
+/* Full-screen button on write/edit tool cards. */
+.tool-fullscreen-btn {
+  flex: none;
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 7px;
+  cursor: pointer;
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  margin-left: 6px;
+}
+.tool-fullscreen-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
 }

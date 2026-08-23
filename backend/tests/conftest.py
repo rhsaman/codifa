@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 import threading
+import uuid
 
 import pytest
 
@@ -78,7 +79,13 @@ def run_events(mock_server, workspace):
     """Factory: run the REAL agent against the mock and collect its events."""
     base, _mock = mock_server
 
-    async def _run(prompt, *, history=None, subagent_models=None, mode="coder", **kw):
+    async def _run(prompt, *, history=None, subagent_models=None, mode="coder",
+                   chat_id=None, **kw):
+        # Unique chat_id per call by default so state_db (saved plans, turn
+        # resume) cannot leak across tests. Tests that need a STABLE chat_id
+        # across calls pass it explicitly.
+        if chat_id is None:
+            chat_id = f"pytest-{uuid.uuid4().hex[:8]}"
         events = []
         async for ev in run_agent(
             provider="custom",
@@ -89,7 +96,7 @@ def run_events(mock_server, workspace):
             mode=mode,
             prompt=prompt,
             history=history or [],
-            chat_id="pytest-chat",
+            chat_id=chat_id,
             subagent_models=subagent_models,
             **kw,
         ):

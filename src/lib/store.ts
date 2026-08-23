@@ -1795,17 +1795,11 @@ export const useStore = create<State>((set, get) => ({
           compacted: false,
           createdAt: Date.now(),
         }
-        // Insert the summary at the COMPACTION BOUNDARY — right after the folded
-        // older messages and BEFORE the preserved recent ones — so it reads as a
-        // in-conversation checkpoint (like a steer note) with the kept verbatim
-        // turns and any follow-up tool calls AFTER it, instead of a bubble glued
-        // to the bottom of the scrollback. The model still receives it first on
-        // the next request (sliceToBudget sorts system-first).
-        // Insert the summary right before the first preserved (non-compacted)
-        // message so streamed replies + tool calls always render BELOW the
-        // checkpoint. Falls back to the end if everything was folded.
-        const boundary = messages.findIndex((m) => !m.compacted)
-        messages.splice(boundary === -1 ? messages.length : boundary, 0, summaryMsg)
+        // Append the summary at the END of the conversation so it renders AFTER
+        // the agent's message (the user wants the checkpoint below the reply, not
+        // above it). The model still receives it first on the next request because
+        // sliceToBudget sorts system messages first regardless of array order.
+        messages.push(summaryMsg)
         return {
           ...c,
           messages,

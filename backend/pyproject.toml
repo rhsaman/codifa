@@ -1,11 +1,10 @@
 [project]
 name = "codifa"
 version = "0.1.0"
-description = "Pydantic AI agent sidecar for the Codifa Electron app"
+description = "Codifa Coder Agent"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.13.4",
-    "pydantic-ai>=2.14.1",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "ddgs>=9.14.4",
@@ -16,6 +15,10 @@ dependencies = [
     "tokenizers>=0.19",
     "sqlite-vec>=0.1.9",
     "markdownify>=0.13.1",
+    "langgraph>=1.2.11",
+    "langchain-core>=1.6.0",
+    "langchain-openai>=1.6.0",
+    "langchain-google-genai>=4.3.5",
 ]
 
 [tool.ruff]

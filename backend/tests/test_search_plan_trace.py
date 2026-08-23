@@ -71,8 +71,8 @@ async def test_search_plan_trace(run_events, mock_server, workspace):
             provider="custom", model_name=model, base_url=real_base, api_key=api_key,
             root=str(workspace), mode="plan",
             prompt=(
-                "چرا بالای اپ ظرفیت کانتکست مدل لوکال رو نمایش نمیده؟ "
-                "برای پاسخ، حتماً از ابزار grep/search استفاده کن و در کد جستجو کن."
+                "where is the render_header function defined? "
+                "use grep to search the code."
             ),
             history=[], chat_id="pytest-chat", subagent_models={},
         ):
@@ -80,17 +80,18 @@ async def test_search_plan_trace(run_events, mock_server, workspace):
         captured = []
         dt = time.perf_counter() - t0
     else:
-        # Parent calls the search (grep) tool, distiller runs, then it answers.
+        # The deterministic workflow performs the search (grep) itself; the plan
+        # LLM then answers from the injected results (it has no grep tool).
         mock.script = [
-            tool_call("grep", json.dumps({"pattern": "context", "path": "."})),
             text_reply(
-                "The app surfaces context capacity from the model's reported window; "
-                "for local models the header may not show it if the window isn't reported."
+                "render_header is defined in ui.py and returns the model's reported "
+                "context capacity; for local models the header may not show it if the "
+                "window isn't reported."
             ),
         ]
         t0 = time.perf_counter()
         events = await run_events(
-            "چرا بالای اپ ظرفیت کانتکست مدل لوکال رو نمایش نمیده؟",
+            "where is the render_header function defined?",
             mode="plan",
             subagent_models={},
         )

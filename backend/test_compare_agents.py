@@ -23,7 +23,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(__file__))
 
 from agents import run_agent
-from providers import build_model, env_key, is_opencode
+from providers import env_key, is_opencode
 
 
 @dataclass

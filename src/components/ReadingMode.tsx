@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
+import { mdComponents } from './ChatMessage'
 import type { ChatMessage } from '../types'
 import { splitSections } from '../lib/sections'
 import { useStore } from '../lib/store'
@@ -312,6 +313,7 @@ export function ReadingMode({
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeHighlight]}
+                  components={mdComponents}
                 >
                   {prepareContent(section.content, dir)}
                 </ReactMarkdown>

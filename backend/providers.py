@@ -17,16 +17,6 @@ import time
 from collections.abc import Sequence
 
 import httpx
-from openai.types import chat
-from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models import ModelRequestParameters
-from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.models.openrouter import OpenRouterModel
-from pydantic_ai.providers.google import GoogleProvider
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.providers.openrouter import OpenRouterProvider
-from pydantic_ai.settings import ModelSettings
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OPENCODE_BASE = "https://opencode.ai/zen/v1"
@@ -84,7 +74,7 @@ def model_timeout(
     by model type, and return the scalar. All other providers accept the
     granular ``httpx.Timeout`` (connect vs read).
     """
-    is_google = _provider_meta(provider).get("model_class") == "google" or isinstance(model, GoogleModel)
+    is_google = _provider_meta(provider).get("model_class") == "google"
     if is_google:
         return total
     return httpx.Timeout(total, connect=connect, read=read)
@@ -110,7 +100,6 @@ _models_dev_cache: tuple[float, dict] | None = None
 
 _MODEL_CACHE_TTL = 120  # seconds
 _model_cache: dict[tuple, tuple[float, list[str]]] = {}
-
 
 class ProviderError(RuntimeError):
     pass
@@ -418,229 +407,6 @@ def _is_deepseek_reasoning_model(model: str) -> bool:
     if "deepseek" not in m:
         return False
     return any(token in m for token in ("reasoner", "r1", "v4", "v3.1", "thinking", "reason"))
-
-
-class _ReasoningBackfillChatModel(OpenAIChatModel):
-    """OpenAIChatModel that ALWAYS backfills the `reasoning_content` field on
-    assistant tool-call messages for DeepSeek reasoning models.
-
-    pydantic-ai's stock backfill (openai.py `_map_messages`) only adds the
-    empty field while SOME message in the conversation carries a ThinkingPart
-    (`thinking_active`). Gateways that strip `reasoning_content` from the
-    streamed response (TokenRouter) never produce a ThinkingPart, so the stock
-    backfill never fires and the upstream DeepSeek API rejects the request
-    with `messages[N].reasoning_content is required for thinking tool-call
-    history`. Forcing the field here satisfies the round-trip requirement even
-    when no thinking text was ever captured (fresh-chat tool loop, stripped
-    gateway stream, resume_tool replay).
-    """
-
-    async def _map_messages(
-        self,
-        messages: Sequence[ModelMessage],
-        model_request_parameters: ModelRequestParameters,
-        *,
-        model_settings: ModelSettings | None = None,
-    ) -> list[chat.ChatCompletionMessageParam]:
-        mapped = await super()._map_messages(
-            messages, model_request_parameters, model_settings=model_settings
-        )
-        profile = self.profile or {}
-        field = profile.get("openai_chat_thinking_field")
-        if field and profile.get("openai_chat_send_back_thinking_parts") == "field":
-            # Some gateways (TokenRouter) strip an EMPTY `reasoning_content`
-            # from the request before forwarding to DeepSeek, which then 400s
-            # with `reasoning_content is required for thinking tool-call
-            # history`. A non-empty placeholder survives the gateway; direct
-            # DeepSeek accepts the empty string, so the default stays "".
-            placeholder = profile.get("openai_chat_thinking_backfill", "")
-            for message in mapped:
-                if (
-                    message.get("role") == "assistant"
-                    and message.get("tool_calls")
-                    and not message.get(field)
-                ):
-                    # `not message.get(field)` covers BOTH a missing field AND
-                    # the empty `''` that pydantic-ai's stock backfill injects
-                    # while ANY message carries a ThinkingPart. Gateways that
-                    # strip an EMPTY `reasoning_content` (TokenRouter) then
-                    # drop it and DeepSeek 400s — replacing it with the
-                    # placeholder keeps the field alive through the gateway.
-                    message[field] = placeholder  # type: ignore[typeddict-item]
-        return mapped
-
-
-class _LocalChatModel(_ReasoningBackfillChatModel):
-    """OpenAIChatModel for local / bring-your-own OpenAI-compatible servers
-    (the "ollama" and "custom" provider kinds: llama.cpp, LM Studio, vLLM, Ollama).
-
-    These servers apply the model's Jinja chat template at request time, and
-    several popular templates (Qwen2.5, DeepSeek, many Llama-3.x finetunes)
-    assert that EVERY system message sits at the very BEGINNING of the
-    conversation — ``{% if messages[0]['role'] != 'system' %}{{
-    raise_exception('System message must be at the beginning') }}{% endif %}``
-    (or the per-message ``loop.first`` variant). Our agent legitimately emits a
-    system message in the MIDDLE of the conversation on interrupted-turn resume
-    (a "these tool calls were already done" note appended after the tool
-    results). That trips the assertion and the whole request 400s with
-    "Unable to generate parser for this template. Automatic parser generation
-    failed".
-
-    This override relocates any non-leading ``system``/``developer`` message to
-    the front and collapses the system block into ONE message, so the server
-    always sees a single contiguous system block at index 0. user/assistant/tool
-    messages are left untouched, so tool-call pairing is unaffected. It still
-    inherits the DeepSeek reasoning backfill (via ``_ReasoningBackfillChatModel``)
-    when a profile is set.
-    """
-
-    async def _map_messages(
-        self,
-        messages: Sequence[ModelMessage],
-        model_request_parameters: ModelRequestParameters,
-        *,
-        model_settings: ModelSettings | None = None,
-    ) -> list[chat.ChatCompletionMessageParam]:
-        mapped = await super()._map_messages(
-            messages, model_request_parameters, model_settings=model_settings
-        )
-        role = (self.profile or {}).get("openai_system_prompt_role", None) or "system"
-        if role not in ("system", "developer"):
-            return mapped
-        sys_msgs = [m for m in mapped if m.get("role") == role]
-        rest = [m for m in mapped if m.get("role") != role]
-        # Qwen3.5's chat template raises `System message must be at the beginning`
-        # for ANY system/developer message that is not the very first message —
-        # i.e. it requires EXACTLY ONE system message at index 0, even a second
-        # leading system (e.g. our prepended tool-reuse note + the main
-        # instructions) trips it. Collapse all system messages into a single
-        # block at the front whenever they aren't already a lone leading one.
-        if not sys_msgs or not rest:
-            return mapped
-        needs_fix = (len(sys_msgs) > 1) or (mapped[0].get("role") != role)
-        if not needs_fix:
-            return mapped
-        merged: dict = dict(sys_msgs[0])
-        merged["content"] = "\n\n".join((m.get("content") or "") for m in sys_msgs)
-        return [merged] + rest
-
-
-def build_model(
-    provider: str,
-    model: str,
-    base_url: str,
-    api_key: str,
-    env_var: str = "",
-    oauth_token: str = "",
-) -> OpenAIChatModel | GoogleModel | OpenRouterModel:
-    """Build a pydantic-ai model for the given provider configuration.
-
-    ``oauth_token`` (Google OAuth access token) has the HIGHEST precedence when
-    non-empty — it must win over both any stored api_key and the env chain, so
-    a signed-in google provider actually uses the account's credentials.
-    """
-    if not model:
-        raise ProviderError("no model selected")
-    meta = _provider_meta(provider)
-    model = qualify_model_id(provider, model)
-    # A key entered in Settings (stored encrypted) wins over the env chain so
-    # pasting a key directly works even when an env var is also set; the OAuth
-    # access token still has the highest precedence.
-    key = oauth_token or api_key or env_key(provider, env_var) or ""
-    if meta.get("requires_key") and not key:
-        raise ProviderError(
-            f"No {meta['name']} credential configured. Open Settings → Providers → "
-            f"{meta['name']} and either set a real environment variable "
-            f"({' / '.join(meta['env_vars'])}) in your environment, or paste your "
-            f"key in the 'Saved API key' option. A variable name alone is not a key."
-        )
-    if meta.get("account_var") and not _provider_account(provider):
-        raise ProviderError(
-            f"No {meta['name']} account id configured. Set the {meta['account_var']} "
-            f"environment variable in your environment (see Settings → Providers → "
-            f"{meta['name']})."
-        )
-
-    model_class = meta.get("model_class") or "openai"
-    if model_class == "google":
-        # Gemini models use pydantic-ai's native GoogleModel rather than the generic
-        # OpenAIChatModel. Gemini 3.x requires `thought_signature` to be echoed back
-        # on every tool call; the OpenAI-compat /v1beta/openai adapter drops that
-        # field, so any multi-turn tool loop / compact resend gets a 400
-        # `missing a thought_signature`. GoogleModel round-trips it natively.
-        # It authenticates the same way the app already does for model limits —
-        # `x-goog-api-key` — so the resolved OAuth access token / API key works.
-        return GoogleModel(
-            model.removeprefix("models/") or model,
-            provider=GoogleProvider(api_key=key),
-        )
-    if model_class == "openrouter":
-        # OpenRouter gets its own pydantic-ai model class (rather than the generic
-        # OpenAIChatModel every other provider uses) because ONLY OpenRouterModel
-        # knows how to translate `openrouter_cache_*` settings into `cache_control`
-        # breakpoints for downstream providers that support prompt caching
-        # (Anthropic, Gemini) — this is the single biggest lever for cutting both
-        # cost and latency on repeated tool-loop resends, and it needs zero extra
-        # profile hacking: OpenRouterProvider.model_profile() already resolves the
-        # right thinking field (e.g. DeepSeek's `reasoning`) per downstream model.
-        return OpenRouterModel(model, provider=OpenRouterProvider(api_key=key))
-
-    base = normalize_base_url(provider, base_url)
-    provider_obj = OpenAIProvider(base_url=base, api_key=key or None)
-    if meta.get("ua_spoof"):
-        # opencode's zen gateway misclassifies plain python/httpx clients as
-        # rate-limited: the default `python-httpx/...` / `pydantic-ai/...`
-        # User-Agent gets a bogus HTTP 429 `FreeUsageLimitError` even on a
-        # healthy free-tier account, while a UA that looks like the real
-        # opencode client streams normally. Two layers must be spoofed:
-        #   (1) the provider http client's own default headers, AND
-        #   (2) pydantic-ai's per-request `extra_headers`, which it
-        #       unconditionally populates with `User-Agent: pydantic-ai/x.y.z`
-        #       via `setdefault` unless a UA is already present. Patching the
-        #       module-level `get_user_agent()` (which that `setdefault` calls)
-        #       covers every OpenAI-compatible agent/subagent built from here,
-        #       while leaving OpenRouterModel (its own module) untouched.
-        provider_obj.client._client.headers["User-Agent"] = OPENCODE_UA
-        try:
-            import pydantic_ai.models.openai as _pai_openai
-
-            _pai_openai.get_user_agent = lambda: OPENCODE_UA  # type: ignore[method-assign]
-        except Exception as exc:  # noqa: BLE001 — best-effort; layer (1) alone usually suffices
-            print(f"[providers] opencode UA patch failed: {exc!r}", file=sys.stderr)
-    # DeepSeek reasoning models require every assistant message in a request to
-    # carry `reasoning_content` (even empty) while thinking is active — a
-    # tool-calling turn that omits it is rejected with
-    # `The reasoning_content in the thinking mode must be passed back to the API`,
-    # killing long tool-loop turns. Declare `reasoning_content` as the thinking
-    # field and send it back on every turn so pydantic-ai round-trips thinking
-    # and backfills the empty field on tool calls. The backfill is FORCED for
-    # these models (see `_ReasoningBackfillChatModel`) because pydantic-ai only
-    # backfills while SOME message carries a ThinkingPart — gateways that strip
-    # `reasoning_content` from the stream never produce one.
-    profile = None
-    if _is_deepseek_reasoning_model(model):
-        profile = {
-            "openai_chat_thinking_field": "reasoning_content",
-            "openai_chat_send_back_thinking_parts": "field",
-        }
-        if provider == "tokenrouter":
-            # TokenRouter strips an EMPTY `reasoning_content` from the request
-            # before forwarding to DeepSeek, which then 400s with
-            # `reasoning_content is required for thinking tool-call history`
-            # (verified live: `""` → 400, `" "` → 200). Backfill with a
-            # non-empty placeholder so the field survives the gateway.
-            profile["openai_chat_thinking_backfill"] = " "
-    # Local / bring-your-own OpenAI-compatible servers (the "ollama" and "custom"
-    # provider kinds: llama.cpp, LM Studio, vLLM, Ollama) apply the model's Jinja
-    # chat template at request time, and several popular templates assert every
-    # system message is at the very beginning of the conversation. _LocalChatModel
-    # guarantees a single contiguous system block up front (and still inherits the
-    # DeepSeek reasoning backfill above when profile is set).
-    if provider in ("ollama", "custom"):
-        return _LocalChatModel(model, provider=provider_obj, profile=profile)
-    if profile:
-        return _ReasoningBackfillChatModel(model, provider=provider_obj, profile=profile)
-    return OpenAIChatModel(model, provider=provider_obj, profile=profile)
 
 
 def _models_endpoint(provider: str, base_url: str) -> tuple[str, str]:
@@ -1127,10 +893,27 @@ def _models_dev_entry(catalog: dict, provider_keys: list[str], model_id: str) ->
     # model's context/reasoning still resolves against the upstream provider's
     # catalog entry.
     if not any((catalog or {}).get(key) for key in provider_keys):
-        bare_index = _models_dev_bare_index(catalog)
+        # Router gateways (tokenrouter) present upstream models bare, so the
+        # model id often carries its OWN provider prefix (e.g.
+        # "nvidia/deepseek-v4-flash"). Resolve against THAT upstream provider's
+        # section first — never a different provider's entry with the same bare
+        # id (which would return the wrong context window).
+        prefix = model_id.split("/", 1)[0] if "/" in model_id else None
         candidates = [model_id]
-        if "/" in model_id:
+        if prefix:
             candidates.append(model_id.split("/", 1)[-1])
+        if prefix:
+            for cand in candidates:
+                entry = (catalog.get(prefix) or {}).get("models", {}).get(cand)
+                if isinstance(entry, dict):
+                    return entry
+                norm = _normalize_catalog_id(cand)
+                if norm and norm != cand:
+                    entry = (catalog.get(prefix) or {}).get("models", {}).get(norm)
+                    if isinstance(entry, dict):
+                        return entry
+        # Last resort: the reverse index of bare ids (first provider wins).
+        bare_index = _models_dev_bare_index(catalog)
         for candidate in candidates:
             entry = bare_index.get(candidate)
             if isinstance(entry, dict):
@@ -1364,29 +1147,43 @@ async def list_models(
                         }
                     )
                 # Enrich model metadata from the live models.dev catalog
-                # (community-maintained, provider- and model-specific). The
-                # catalog is the PRIMARY source — provider /models payloads
-                # under-advertise limits (opencode reports 4096 for
-                # deepseek-v4-flash-free while the real limit is 128K) — so its
-                # values override the provider's; the provider's own numbers
-                # are only kept as a fallback when the catalog doesn't know
-                # the model.
+                # (community-maintained, provider- and model-specific).
+                #
+                # Context-window source precedence:
+                #  * opencode (and opencode-compatible gateways) UNDER-advertise
+                #    context in their /models payload (e.g. 4096 for
+                #    deepseek-v4-flash-free while the real limit is 128K), so
+                #    models.dev is authoritative there.
+                #  * every other provider reports a real ``context_length`` via
+                #    its /models payload, so TRUST that and only fall back to
+                #    models.dev when it's missing/zero. This avoids a
+                #    cross-provider bleed where models.dev's ``opencode/...``
+                #    entry (which may carry a different limit) was overriding
+                #    the provider's own correct number.
                 catalog = await _models_dev_catalog()
+                _is_oc = is_opencode(provider, base_url)
                 for m in models:
                     dev_id = _models_dev_id(provider, m["id"], base_url)
                     dev_keys = _models_dev_keys(provider, base_url, dev_id)
                     dev_ctx = _models_dev_context(catalog, dev_keys, dev_id)
-                    if dev_ctx:
-                        m["context"] = dev_ctx
-                    elif (
-                        not m["context"]
-                        and _provider_meta(provider).get("free_ctx_fallback")
-                        and m["id"].endswith("-free")
-                    ):
-                        m["context"] = 200_000
-                    dev_out = _models_dev_max_output(catalog, dev_keys, dev_id)
-                    if dev_out:
-                        m["max_output"] = dev_out
+                    if _is_oc:
+                        if dev_ctx:
+                            m["context"] = dev_ctx
+                        elif (
+                            not m["context"]
+                            and _provider_meta(provider).get("free_ctx_fallback")
+                            and m["id"].endswith("-free")
+                        ):
+                            m["context"] = 200_000
+                    else:
+                        # Provider /models context_length is primary; models.dev
+                        # only fills the gaps (and still supplies pricing /
+                        # reasoning / max_output below).
+                        if not m["context"] and dev_ctx:
+                            m["context"] = dev_ctx
+                    dev_out_val = _models_dev_max_output(catalog, dev_keys, dev_id)
+                    if dev_out_val:
+                        m["max_output"] = m["max_output"] or dev_out_val
                     if not m.get("pricing"):
                         m["pricing"] = _models_dev_pricing(catalog, dev_keys, dev_id)
                     if m.get("reasoning") is None:
@@ -1409,6 +1206,17 @@ async def list_models(
                             local_ctx = await _local_model_ctx(base_url, m["id"])
                             if local_ctx:
                                 m["context"] = local_ctx
+                # No hardcoded floor: the context window must come from the
+                # provider's /models payload or the models.dev catalog — never a
+                # baked-in constant. If both are silent the value stays null and
+                # the UI shows a dash rather than a wrong number. A provider may
+                # still advertise its OWN default via provider metadata
+                # (provider-sourced, not a code constant).
+                floor = _provider_meta(provider).get("context_window")
+                if floor:
+                    for m in models:
+                        if not m["context"]:
+                            m["context"] = floor
                 models.sort(key=lambda m: m["id"])
     except Exception as exc:
         raise ProviderError(f"failed to fetch models from {url}: {exc}") from exc

@@ -19,8 +19,8 @@ for _p in (_THIS, os.path.dirname(_THIS)):
         sys.path.insert(0, _p)
 
 from agents import _subagent_target  # noqa: E402
-from providers import build_model  # noqa: E402
-from pydantic_ai import Agent  # noqa: E402
+from llm import build_chat_model  # noqa: E402
+from llm import llm_complete  # noqa: E402
 
 PROVIDERS = {
     "opencode": {
@@ -66,12 +66,11 @@ async def main():
             continue
         kind, model, base, key, env, oauth = t
         try:
-            m = build_model(kind, model, base, key, env, oauth_token=oauth)
-            agent = Agent(m)
-            res = await asyncio.wait_for(
-                agent.run("Reply with exactly: OK"), timeout=90
+            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth)
+            out = await asyncio.wait_for(
+                llm_complete(m, user="Reply with exactly: OK"), timeout=90
             )
-            out = str(res.output).strip()
+            out = str(out).strip()
             print(f"  {slot:8s} {entry:45s} -> OK: {out[:60]!r}")
         except Exception as exc:  # noqa: BLE001
             ok = False

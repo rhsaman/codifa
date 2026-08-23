@@ -19,7 +19,17 @@ import { getMode } from '../lib/modes'
 import { splitSections } from '../lib/sections'
 import { ToolCallView, ToolGroupView, isExploreCard } from './ToolCallView'
 import { ReadingMode } from './ReadingMode'
+import { Mermaid } from './Mermaid'
 import 'highlight.js/styles/github-dark.min.css'
+
+// rehype-highlight throws by default on languages it doesn't know (e.g.
+// `mermaid`). `ignoreMissing` lets unknown fences pass through untouched so the
+// `language-mermaid` class survives and ChatMessage's CodeBlock can render them
+// as live diagrams instead of erroring the whole markdown block.
+const REHYPE_HIGHLIGHT = [
+  rehypeHighlight,
+  { ignoreMissing: true },
+] as [typeof rehypeHighlight, { ignoreMissing: boolean }]
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
 // (dir toggles, parent re-renders that don't recreate the message, memo
@@ -77,6 +87,11 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const code = textFromChildren(props.children)
   const lang = codeLang(props.children)
 
+  // A ```mermaid fenced block is rendered as a live diagram, not as code.
+  if (lang === 'mermaid') {
+    return <Mermaid chart={code} />
+  }
+
   const copy = async () => {
     try {
       await copyToClipboard(code)
@@ -105,7 +120,10 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // itself makes its anonymous inner table shrink-wrap to content width, so the
 // cells never stretch to the border. A bordered full-width wrapper fixes the
 // "table doesn't fill the width" gap and carries the horizontal scroll.
-const mdComponents = {
+//
+// Exported so ReadingMode.tsx can reuse the exact same overrides (including the
+// ```mermaid -> diagram rendering) without duplicating them.
+export const mdComponents = {
   a: (props: React.HTMLAttributes<HTMLAnchorElement>) => (
     <a {...props} target="_blank" rel="noreferrer" />
   ),
@@ -567,7 +585,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
         <div key={i} className="chat-message markdown-body" dir="auto">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeHighlight]}
+            rehypePlugins={[REHYPE_HIGHLIGHT]}
             components={mdComponents}
           >
             {cachedPrepare(`${message.id}:seg:${i}`, seg.text, useStore.getState().dir)}
@@ -761,7 +779,7 @@ export const ChatMessageView = memo(function ChatMessageView({
               <div className="summary-body chat-message markdown-body" dir="auto">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeHighlight]}
+                  rehypePlugins={[REHYPE_HIGHLIGHT]}
                   components={mdComponents}
                 >
                   {cachedPrepare(`${message.id}:summary`, message.content || "(empty summary)", dir)}
@@ -819,7 +837,7 @@ export const ChatMessageView = memo(function ChatMessageView({
           <div className="chat-message markdown-body" dir="auto">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
+              rehypePlugins={[REHYPE_HIGHLIGHT]}
               components={mdComponents}
             >
               {cachedPrepare(message.id, message.content, dir)}

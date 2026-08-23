@@ -3,7 +3,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from pydantic_ai import Agent
+from llm import build_chat_model, llm_complete
 
 import providers
 
@@ -21,12 +21,12 @@ async def m(kind: str) -> bool:
         print(f"  list_models: {len(ids)} models; sample {ids[:3]}")
         key = providers.env_key(kind)
         print(f"  base_url: {providers.normalize_base_url(kind, '')}")
-        for model in CANDIDATES.get(kind, []):
-            try:
-                mo = providers.build_model(kind, model, "", key)
-                agent = Agent(mo, model_settings={"temperature": 0})
-                r = await asyncio.wait_for(agent.run("Say OK"), timeout=40)
-                print(f"  completion OK [{model}] -> {r.output!r}")
+            for model in CANDIDATES.get(kind, []):
+                mo = build_chat_model(kind, model, "", key)
+                r = await asyncio.wait_for(
+                    llm_complete(mo, user="Say OK"), timeout=40
+                )
+                print(f"  completion OK [{model}] -> {r!r}")
                 return True
             except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
                 print(f"  model {model} failed: {type(e).__name__}: {str(e)[:100]}")

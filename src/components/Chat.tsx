@@ -1143,7 +1143,7 @@ export function ChatPanel() {
   const send = async (
     text: string,
     atts: string[] = [],
-    imgs: Array<{ path: string; name: string }> = [],
+    imgs: Array<{ path: string; name: string; dataUrl?: string }> = [],
     allowCreate = false,
     reuseMsgId?: string,
     forceScroll = false,
@@ -1655,7 +1655,7 @@ export function ChatPanel() {
           // switches away and comes back (no auto-dismiss — dismissed via ✕).
           useStore.getState().setChatCompactNotice(
             chat.id,
-            "Context compacted — older messages are summarized above.",
+            "Context compacted — older messages are summarized below (after the conversation).",
           );
         }
       } else if (event.kind === "compact_failed") {
@@ -1826,7 +1826,9 @@ export function ChatPanel() {
           history,
           maxHistory,
           attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
-          images: imgs.map((i) => i.path),
+          images: imgs.map((i) =>
+            i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
+          ),
           systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
           thinkingLevel: supportsReasoning(
             activeProvider.model,
@@ -1855,6 +1857,9 @@ export function ChatPanel() {
             max_chunks: s.memoryMaxChunks,
           },
           subagentModels: s.subagentModels,
+          providers: Object.fromEntries(
+            (s.settings.providers ?? []).map((p) => [p.id, p]),
+          ),
           compactThreshold: (s.settings.compactThreshold ?? 80) / 100,
           signal: abort.signal,
         },
@@ -2156,7 +2161,7 @@ export function ChatPanel() {
     );
     useStore.getState().setChatCompactNotice(
       ch.id,
-      "Context compacted — older messages are summarized above.",
+      "Context compacted — older messages are summarized below (after the conversation).",
     );
     // Stay where the user is (normally the bottom, where the live conversation
     // continues). The messages-change effect below keeps the view pinned to

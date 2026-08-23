@@ -193,7 +193,10 @@ export interface StreamParams {
   /** How many recent messages to send per turn / preserve verbatim on compact. */
   maxHistory?: number
   attachments?: string[]
-  images?: string[]
+  /** Each image is a path string OR an object {path, dataUrl}; the backend
+   *  prefers an inline dataUrl so it never depends on reading the frontend's
+   *  temp file (covers uploads and screenshots). */
+  images?: Array<string | { path: string; dataUrl?: string }>
   systemPrompt?: string
   thinkingLevel?: string
   mcpServers?: Record<string, McpServerConfig>
@@ -215,6 +218,9 @@ export interface StreamParams {
   vectorConfig?: { ttl_days: number; max_docs: number; max_chunks: number }
   /** Per-subagent model overrides (explore, vision, compact). */
   subagentModels?: Record<string, string>
+  /** Full provider configs keyed by provider id, so a "providerId/model"
+   *  subagent entry is routed to that provider's own base URL / key. */
+  providers?: Record<string, ProviderConfig>
   /** Pre-emptive auto-compact threshold as a FRACTION of the context window
    *  (0.5–0.95, default 0.8). */
   compactThreshold?: number
@@ -262,6 +268,7 @@ export async function streamChat(
       vector_db_path: params.vectorDbPath ?? "",
       vector_config: params.vectorConfig ?? null,
       subagent_models: params.subagentModels ?? {},
+      providers: params.providers ?? {},
       compact_threshold: params.compactThreshold ?? 0.8,
       context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
     }),

@@ -21,7 +21,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
         sys.path.insert(0, _p)
 
 from agents import _subagent_target  # noqa: E402
-from providers import build_model  # noqa: E402
+from llm import build_chat_model  # noqa: E402
 
 PROVIDERS = {
     "opencode": {
@@ -68,7 +68,7 @@ def main():
         kind, model, base, key, env, oauth = t
         print(f"  {slot:8s} {entry:45s} -> kind={kind} model={model!r} env={env!r}")
         try:
-            m = build_model(kind, model, base, key, env, oauth_token=oauth)
+            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth)
             name = str(getattr(m, "model_name", "") or "")
             print(f"           built OK, model_name={name!r}")
         except Exception as exc:  # noqa: BLE001

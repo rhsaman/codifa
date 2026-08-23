@@ -1,42 +1,34 @@
-"""Regression test: the general (task) sub-agent must degrade gracefully when
-the underlying model returns an empty ``finish_reason: 'length'`` response
-(the exact failure a small local model produces when its context window is
-exceeded) instead of crashing the whole turn.
+"""Regression test: plan mode must complete gracefully (no crash) when the
+deterministic repo-discovery runs. Repository exploration is now a deterministic
+workflow (not a general sub-agent), so there is no sub-agent 'length' failure --
+the turn simply finishes from the injected context.
 """
 
 import json
 
-from mock_openai import length_reply, text_reply, tool_call
+from mock_openai import mock, text_reply, tool_call
 
 
-async def test_general_subagent_degrades_on_local_length_error(run_events, mock_server):
-    base, mock = mock_server
-    mock.script = [
-        tool_call(
-            "task",
-            json.dumps({
-                "description": "find context display",
-                "prompt": "find where the app shows context capacity",
-                "subagent_type": "general",
-            }),
-        ),
-        length_reply(),  # sub-agent's request exceeds the small local window
-        text_reply("I delegated the search but the sub-agent couldn't run locally."),
-    ]
-
-    events = await run_events(
-        "چرا بالای اپ ظرفیت کانتکست مدل لوکال رو نمایش نمیده؟",
-        mode="plan",
+async def test_plan_completes_with_deterministic_discovery(run_events, mock_server, workspace):
+    base, _mock = mock_server
+    # A file whose symbol is discoverable deterministically.
+    (workspace / "ui.py").write_text(
+        "def render_header(model):\n    return f'{model} context capacity'\n",
+        encoding="utf-8",
     )
+    mock.script = [text_reply("render_header lives in ui.py.")]
+    events = await run_events("where is render_header defined?", mode="plan")
 
-    # The turn must complete (run_agent does not raise) — no hard crash.
-    task_errors = [
-        e for e in events
-        if e.get("kind") == "tool_result" and e.get("tool") == "task"
-        and e.get("status") == "error"
-    ]
-    assert task_errors, "expected a graceful task error, not a turn-killing crash"
-    assert "sub-agent failed" in task_errors[0].get("summary", ""), \
-        f"unexpected task failure: {task_errors[0]}"
-    # The parent model still finishes the turn after the sub-agent failure.
+    # The deterministic discovery ran and the turn finished (no crash).
+    assert any(
+        e.get("kind") == "tool" and e.get("tool") == "repo_search" for e in events
+    ), "deterministic repo discovery did not run"
     assert any(e.get("kind") == "text" for e in events), "turn did not finish"
+
+    # No exploration tools leaked to the LLM.
+    tool_names = set()
+    for body in mock.captured:
+        for t in body.get("tools") or []:
+            tool_names.add((t.get("function") or {}).get("name"))
+    assert not (tool_names & {"glob", "grep", "read", "task"}), \
+        f"plan LLM must not have exploration tools: {tool_names}"

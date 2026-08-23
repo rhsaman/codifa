@@ -1,8 +1,10 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import type { ToolActivity } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
 import { fixZwsp } from '../lib/bidi'
+import { FullscreenModal } from './FullscreenModal'
+import { useFullscreen } from '../lib/fullscreen'
 
 const TOOL_LABEL: Record<string, string> = {
   write_file: 'write_file',
@@ -325,7 +327,7 @@ export const ToolGroupView = memo(function ToolGroupView({
               onReverted={() => onReverted(index)}
             />
           ))}
-        </div>
+      </div>
       )}
     </div>
   )
@@ -511,6 +513,11 @@ export const ToolCallView = memo(function ToolCallView({
   onReverted?: () => void
 }) {
   const [reverting, setReverting] = useState(false)
+  const myKey = useId()
+  const activeKey = useFullscreen((s) => s.activeKey)
+  const openFs = useFullscreen((s) => s.open)
+  const closeFs = useFullscreen((s) => s.close)
+  const fsOpen = activeKey === myKey
   const root = useStore((s) => s.root)
   // Task cards (explore/general sub-agents) are collapsible and start
   // collapsed: the nested read/grep/glob sub-list is noisy, so it stays
@@ -654,6 +661,19 @@ export const ToolCallView = memo(function ToolCallView({
         {fetchSummary && <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>}
         {activity.args && <ToolArgs args={activity.args} />}
         <span className="tool-ms">{fmtTime(ms)}</span>
+        {isWrite && (
+          <button
+            className="tool-fullscreen-btn"
+            title="Open full screen"
+            aria-label="Open full screen"
+            onClick={(e) => {
+              e.stopPropagation()
+              openFs(myKey)
+            }}
+          >
+            ⤢
+          </button>
+        )}
         {collapsible && <span className={`chev${collapsed ? '' : ' open'}`}>▾</span>}
       </div>
 
@@ -698,6 +718,20 @@ export const ToolCallView = memo(function ToolCallView({
             <span className="reverted-tag">reverted</span>
           )}
       </div>
+      )}
+    {fsOpen && (
+      <FullscreenModal
+        open={fsOpen}
+        onClose={closeFs}
+        title={String(activity.args?.path ?? activity.args?.filePath ?? 'File')}
+        bodyClass="diff-fullscreen-body"
+      >
+          {activity.diff ? (
+            <DiffView diff={activity.diff} />
+          ) : (
+            <div className="fullscreen-empty">No diff available for this file yet.</div>
+          )}
+        </FullscreenModal>
       )}
     </div>
   )

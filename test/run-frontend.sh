@@ -66,6 +66,12 @@ npx esbuild test/scrollPadding.test.ts --bundle --platform=node --format=esm \
   --packages=external --outfile=test/.tmp-sp.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-sp.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs
+echo ""
+echo "── تست ۱۲: usageContext (مصرف واقعی هر مدل در ستون کناری + پنجره/درصد کانتکست در نوار بالا) ──"
+npx esbuild test/usageContext.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-uc.mjs >/dev/null 2>&1
+node test/.tmp-uc.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

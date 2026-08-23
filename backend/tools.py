@@ -24,6 +24,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable, Sequence
+from urllib.parse import urlparse
 from typing import Any
 
 import providers as _providers
@@ -2655,9 +2656,10 @@ def make_tool_callbacks(
         slot: str,
         sub_model: Any,
         label: str,
-        make_agent: Callable[[Any], Any],
+        system_prompt: str,
         make_prompt: Callable[[], str],
         timeout_total: int = 60,
+        main_model: Any = None,
     ) -> tuple[Any, Any]:
         """Run a one-shot sub-agent distillation call (web distiller / page
         summarizer / terminal-search reader) with the shared retry policy,
@@ -2665,36 +2667,20 @@ def make_tool_callbacks(
         model / quota exhaustion). Returns ``(result, model_that_ran)`` so the
         caller can label usage + tool_result with the model that ACTUALLY ran.
         Sticky per slot per turn: a slot that already fell back skips the
-        sub-agent model and goes straight to the main model."""
-        from pydantic_ai.settings import ModelSettings as _MS
+        sub-agent model and goes straight to the main model.
+
+        Uses a LangChain model (no pydantic-ai)."""
+        from llm import llm_generate
 
         model = main_model if _fallback_state.get(slot) else sub_model
         while True:
             try:
-                agent = make_agent(model)
-                mt = await _subagent_max_tokens(model, narrow=True)
-                _ms = {
-                    "timeout": _providers.model_timeout(
-                        model=model,
-                        total=timeout_total,
-                        connect=15,
-                        read=timeout_total,
-                    )
-                }
-                if mt is not None:
-                    _ms["max_tokens"] = mt
-                res = await _run_subagent_call(
-                    # Bind loop vars as defaults so the closure stays correct
-                    # even if the callable is invoked after the loop advances.
-                    lambda agent=agent, model=model, _ms=_ms: agent.run(
-                        make_prompt(),
-                        model_settings=_MS(**_ms),
-                    ),
-                    label,
-                    emit=emit,
-                    model_name=str(getattr(model, "model_name", "") or ""),
+                text, usage = await llm_generate(
+                    model, system=system_prompt, user=make_prompt(), sub=True
                 )
-                return res, model
+                if usage:
+                    emit(usage)
+                return text, model
             except Exception as exc:  # fall back to main model
                 if model is main_model or main_model is None:
                     raise
@@ -2896,7 +2882,7 @@ def make_tool_callbacks(
     async def search_memory_tool(
         query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS
     ) -> str:
-        """Search this project's durable memory (RAG notes) for notes relevant to `query`. The most relevant notes to the current message are auto-injected every run, so you usually don't need this. Call when you need MORE: a different angle, older notes, or a mid-task check (e.g. a recurring error). Pass a few keywords (e.g. "port config", "auth flow"); leave query empty for the most recently added notes."""
+        """Search this project's durable memory (RAG notes) for notes relevant to `query`. Saved notes are auto-recalled ONLY on the FIRST message of a chat, and when the user explicitly asks to look at memory (e.g. "از مموری ببین") — NOT on every run, to keep token cost down. So if the user asks about memory or you need MORE context (a different angle, older notes, or a mid-task check like a recurring error), call this. Pass a few keywords (e.g. "port config", "auth flow"); leave query empty for the most recently added notes."""
         emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
         try:
             result = search_memory(root, query, max_results, store)
@@ -3713,10 +3699,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         ``_SUB_AGENT_BRANCH_CTX``, so they never count against the parent's
         deterministic tool-step budget (they run in an isolated transcript).
         """
-        from pydantic_ai import Agent as _Agent
-        from pydantic_ai import Tool as _Tool
-        from pydantic_ai.settings import ModelSettings as _ModelSettings
-        from pydantic_ai.usage import UsageLimits as _UsageLimits
+        from llm import langchain_tool_loop
 
         _general_model = main_model
         if _general_model is None:
@@ -3753,50 +3736,28 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         # registry only when no parent toolset was recorded.
         _parent_tools = _PARENT_TOOLS_CTX.get()
         _tool_source = _parent_tools if _parent_tools is not None else _tools
-        _general_tools = [
-            _Tool(_invoke(fn), name=name)
+        _general_tools = {
+            name: _invoke(fn)
             for name, fn in _tool_source.items()
             if name not in ("task", "update_plan", "save_plan", "vision")
-        ]
-        _sub_agent = _Agent(
-            _general_model,
-            system_prompt=(
-                "You are a general-purpose sub-agent. The main agent delegated a "
-                "task to you. Work through it independently with your tools, then "
-                "reply with a concise final result (under ~300 words unless the "
-                "task needs more). You run in an isolated context — the main agent "
-                "only sees your final reply, so include the concrete findings, "
-                "exact paths and any numbers it needs. Do not ask the user "
-                "questions; do not call the task tool."
-            ),
-            tools=_general_tools,
-            model_settings=_ModelSettings(
-                temperature=0.2,
-                parallel_tool_calls=True,
-            ),
-        )
+        }
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         try:
-            _gmt = await _subagent_max_tokens(_general_model, narrow=False)
-            _gms = {
-                "timeout": _providers.model_timeout(
-                    model=_general_model, total=120, connect=10, read=120
+            _output = await langchain_tool_loop(
+                _general_model,
+                system=(
+                    "You are a general-purpose sub-agent. The main agent delegated a "
+                    "task to you. Work through it independently with your tools, then "
+                    "reply with a concise final result (under ~300 words unless the "
+                    "task needs more). You run in an isolated context — the main agent "
+                    "only sees your final reply, so include the concrete findings, "
+                    "exact paths and any numbers it needs. Do not ask the user "
+                    "questions; do not call the task tool."
                 ),
-                "parallel_tool_calls": True,
-            }
-            if _gmt is not None:
-                _gms["max_tokens"] = _gmt
-            _res = await _run_subagent_call(
-                lambda _gms=_gms: _sub_agent.run(
-                    prompt,
-                    usage_limits=_UsageLimits(request_limit=12, tool_calls_limit=24),
-                    model_settings=_ModelSettings(**_gms),
-                ),
-                "general sub-agent",
-                emit=emit,
-                model_name=_general_name,
+                user=prompt,
+                tools=_general_tools,
             )
         except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
             emit(_error_result("task", f"sub-agent failed: {exc}"))
@@ -3808,12 +3769,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
-        _output = str(getattr(_res, "output", "") or "").strip()
-        from agents import _usage_event  # local import (circular-safe)
-
-        _usage_ev = _usage_event(getattr(_res, "usage", None), model=_general_name)
-        if _usage_ev:
-            emit(_usage_ev)
+        _output = (_output or "").strip()
         emit(
             {
                 "kind": "tool_result",
@@ -3825,6 +3781,47 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         )
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
+    def _is_vision_image_rejection(exc: BaseException) -> bool:
+        """True when the provider rejected the image content parts (a text-only
+        "vision" model, or one that doesn't accept base64 image_url)."""
+        text = str(exc)
+        status_match = re.search(r"status[_ ]code[:=]?\s*(\d{3})", text, re.IGNORECASE)
+        if status_match:
+            try:
+                if int(status_match.group(1)) not in (400, 422):
+                    return False
+            except ValueError:
+                pass
+        low = text.lower()
+        return (
+            "unknown variant" in low
+            and "image_url" in low
+            and ("expected" in low or "forgot to set a default message" in low)
+        ) or (
+            "image_url" in low
+            and (
+                "field is required" in low
+                or "not supported" in low
+                or "does not support" in low
+                or "unexpected" in low
+                or "unrecognized" in low
+            )
+        )
+
+    def _log_vision_error(exc: BaseException) -> str:
+        """Write the full traceback to ~/coder_vision_error.log and return a
+        concise ``Type: message`` string so the real cause is inspectable."""
+        import traceback as _tb
+
+        summary = f"{type(exc).__name__}: {exc}"
+        try:
+            _path = os.path.expanduser("~/coder_vision_error.log")
+            with open(_path, "a", encoding="utf-8") as _f:
+                _f.write("\n=== vision sub-agent error ===\n" + _tb.format_exc() + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        return summary
+
     async def vision_tool(prompt: str) -> str:
         """Analyze the image(s) attached to the current message using the
         vision sub-agent (Settings → Subagents → Vision model).
@@ -3835,10 +3832,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         the images + this prompt, and its analysis is returned as the tool
         result. The main model then writes the final answer.
         """
-        from pydantic_ai import Agent as _Agent
-        from pydantic_ai.messages import ImageUrl as _ImgUrl
-        from pydantic_ai.settings import ModelSettings as _ModelSettings
-        from pydantic_ai.usage import UsageLimits as _UsageLimits
+        from llm import llm_generate
 
         nonlocal _task_call_seq
         _imgs = [u for u in (image_uris or []) if u]
@@ -3864,62 +3858,48 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             emit(_error_result("vision", "unavailable"))
             return "ERROR: the vision model is unavailable (no model configured for this session)."
         _tid = f"vision-{uuid.uuid4().hex[:8]}"
-        _sub_agent = _Agent(
-            _vmodel,
-            system_prompt=(
-                "You are a vision analysis sub-agent. The main agent delegated an "
-                "image analysis task to you. Look carefully at the attached "
-                "image(s) and reply with a precise, concise analysis (under ~300 "
-                "words) that answers the task. Include the exact details (text, "
-                "numbers, layout, colors, UI elements, errors) the main agent "
-                "needs — it cannot see the image, your report is its only view."
-            ),
-            model_settings=_ModelSettings(temperature=0.2),
-        )
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
+        _sys = (
+            "You are a vision analysis sub-agent. The main agent delegated an "
+            "image analysis task to you. Look carefully at the attached "
+            "image(s) and reply with a precise, concise analysis (under ~300 "
+            "words) that answers the task. Include the exact details (text, "
+            "numbers, layout, colors, UI elements, errors) the main agent "
+            "needs — it cannot see the image, your report is its only view."
+        )
+        _used_model = _vname
         try:
-            _vmt = await _subagent_max_tokens(_vmodel, narrow=False)
-            _vms = {
-                "timeout": _providers.model_timeout(
-                    model=_vmodel, total=120, connect=10, read=120
-                ),
-            }
-            if _vmt is not None:
-                _vms["max_tokens"] = _vmt
-            _res = await _run_subagent_call(
-                lambda _vms=_vms: _sub_agent.run(
-                    [prompt, *[_ImgUrl(url=u) for u in _imgs]],
-                    usage_limits=_UsageLimits(request_limit=3),
-                    model_settings=_ModelSettings(**_vms),
-                ),
-                "vision sub-agent",
-                emit=emit,
-                model_name=_vname,
+            _output, usage = await llm_generate(
+                _vmodel, system=_sys, user=prompt, images=_imgs, sub=True,
             )
+            if usage:
+                emit(usage)
         except Exception as exc:  # noqa: BLE001
-            emit(_error_result("vision", f"failed: {exc}"))
+            emit(_error_result("vision", f"failed: {_log_vision_error(exc)}"))
+            if _is_vision_image_rejection(exc):
+                return (
+                    f"ERROR: the configured vision model ('{_vname}') rejected the image "
+                    f"— it does not support image input. Set a vision-capable model in "
+                    f"Settings → Subagents → Vision. Detail: {_log_vision_error(exc)}"
+                )
             return (
-                f"ERROR: the vision sub-agent failed"
-                f" ({_vname} model, change it in Settings → Subagents): {exc}"
+                f"ERROR: the vision sub-agent failed ('{_vname}' model): "
+                f"{_log_vision_error(exc)}. "
+                f"Try a different vision model in Settings → Subagents → Vision."
             )
         finally:
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
-        _output = str(getattr(_res, "output", "") or "").strip()
-        from agents import _usage_event  # local import (circular-safe)
-
-        _usage_ev = _usage_event(getattr(_res, "usage", None), model=_vname)
-        if _usage_ev:
-            emit(_usage_ev)
+        _output = (_output or "").strip()
         emit(
             {
                 "kind": "tool_result",
                 "tool": "vision",
                 "summary": f"{len(_output)} chars",
-                "model": _vname,
+                "model": _used_model,
                 "branch": _ecall,
             }
         )
@@ -3995,36 +3975,21 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         # _run_distill) — raw results are only returned when BOTH models fail.
         if _web_runner is not None:
             try:
-                from pydantic_ai import Agent
-                from pydantic_ai.settings import ModelSettings
-
                 res, ran_model = await _run_distill(
                     "web",
                     _web_runner,
                     "web-search distiller",
-                    lambda m: Agent(
-                        m,
-                        system_prompt=(
-                            "You are a web-search reader. Read the quoted search results "
-                            "and answer the user's query with a CONCISE summary (under "
-                            "150 words) that cites the most relevant result URLs inline. "
-                            "If the results cannot answer the query, say so."
-                        ),
-                        model_settings=ModelSettings(temperature=0.2),
+                    (
+                        "You are a web-search reader. Read the quoted search results "
+                        "and answer the user's query with a CONCISE summary (under "
+                        "150 words) that cites the most relevant result URLs inline. "
+                        "If the results cannot answer the query, say so."
                     ),
                     lambda: f"QUERY: {query}\n\nSEARCH RESULTS:\n" + "\n".join(lines),
                     timeout_total=60,
                 )
-                distilled = str(getattr(res, "output", "") or "").strip()
+                distilled = (res or "").strip()
                 if distilled:
-                    from agents import _usage_event  # local import (circular-safe)
-
-                    _usage_ev = _usage_event(
-                        getattr(res, "usage", None),
-                        model=str(getattr(ran_model, "model_name", "") or ""),
-                    )
-                    if _usage_ev:
-                        emit(_usage_ev)
                     emit(
                         {
                             "kind": "tool_result",
@@ -4083,6 +4048,29 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 "args": {"url": url, "full": effective_full},
             }
         )
+        # fetch_url is for WEB pages / raw URLs only. The model sometimes hands
+        # it a local workspace path (e.g. /Users/.../package.json) instead of the
+        # `read` tool. Reject those early so it never wastes a token-expensive
+        # web fetch on a file it could read directly — and steer it to the right
+        # tool.
+        _u = (url or "").strip()
+        _parsed = urlparse(_u)
+        _is_local = (
+            _parsed.scheme in ("", "file")
+            and (
+                _u.startswith(("/", "./", "../", "~"))
+                or os.path.isabs(_u)
+                or _u.startswith("file:")
+            )
+        )
+        if _is_local:
+            msg = (
+                "fetch_url only fetches web pages/URLs. To read or search a LOCAL "
+                "workspace file use the `read` tool (or `grep`/`glob` to search). "
+                f"Received a local path instead: {_u!r}."
+            )
+            emit(_error_result("fetch_url", msg))
+            return f"ERROR: {msg}"
         # AUTO-DETECT source files regardless of the model's `full` flag: a URL
         # that points at a raw file (markdown / text / source-code extension, or
         # a raw.githubusercontent / jsdelivr / gist host) is ALWAYS returned in
@@ -4218,6 +4206,18 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                     return (
                         f"PERMISSION GRANTED for {path!r}. This is inside the always-readable "
                         f"user data folder (Data path in Settings) — no permission is needed, you may proceed."
+                    )
+                # A path INSIDE the workspace root does not need an
+                # outside-workspace permission prompt — the agent can read,
+                # search and act there freely. Auto-grant so the UI never pops
+                # a needless dialog for in-workspace work; only genuinely
+                # OUTSIDE paths should require the user's approval.
+                ws = os.path.realpath(root)
+                if target == ws or target.startswith(ws + os.sep):
+                    return (
+                        f"PERMISSION GRANTED for {path!r}. This path is inside the workspace root, so no "
+                        f"permission is needed — you may read/search/act on it directly without calling "
+                        f"request_permission."
                     )
             except PathEscapeError:
                 pass

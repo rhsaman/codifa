@@ -25,9 +25,21 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from pydantic_ai.models.test import TestModel  # noqa: E402
+from langchain_core.messages import AIMessage  # noqa: E402
 
 from tools import make_tool_callbacks  # noqa: E402
+
+
+class _FakeModel:
+    """Minimal LangChain-style model: returns a fixed reply (no tool calls)."""
+
+    model_name = "fake"
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, msgs):
+        return AIMessage(content="REPORT: found")
 
 
 def _general_cards(emitted: list[dict]) -> list[dict]:
@@ -48,7 +60,7 @@ async def main():
     tools = make_tool_callbacks(
         ws,
         lambda ev: emitted.append(ev),
-        main_model=TestModel(call_tools=["grep"], custom_output_text="REPORT: found"),
+        main_model=_FakeModel(),
     )
     task = tools["task"]
 

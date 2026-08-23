@@ -124,7 +124,10 @@ class ChatRequest(BaseModel):
     prompt: str = ""
     history: list[dict] = []
     attachments: list[str] = []
-    images: list[str] = []
+    # Each image may be a string path OR an object {path, dataUrl}; the backend
+    # prefers an inline dataUrl so it never depends on reading the frontend's temp
+    # file (uploaded images and screenshots both carry one).
+    images: list = []
     system_prompt: str = ""
     thinking_level: str = "medium"
     mcp_servers: dict = {}
@@ -166,6 +169,10 @@ class ChatRequest(BaseModel):
     # Per-subagent model overrides: {"search": "model-id", "web": "...", "vision": "...", "compact": "..."}.
     # Missing / empty dict = use the parent model for every subagent.
     subagent_models: dict = {}
+    # Cross-provider routing: full provider configs keyed by provider id, so a
+    # "providerId/model" subagent entry can be run on that provider's own base
+    # URL / key (not the parent provider's).
+    providers: dict = {}
     # Pre-emptive auto-compact threshold as a fraction of the context window
     # (0.5–0.95). When real usage (input + output) crosses this, the run
     # compacts before the window overflows. Default 0.80.
@@ -266,9 +273,7 @@ async def app_save(req: StateRequest) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    import pydantic_ai
-
-    return {"status": "ok", "version": pydantic_ai.__version__}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 class OAuthStartRequest(BaseModel):
@@ -886,6 +891,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 subagent_models=req.subagent_models,
                 chat_id=req.chat_id,
                 compact_threshold=req.compact_threshold,
+                providers=req.providers,
             ):
                 yield _sse(event)
 

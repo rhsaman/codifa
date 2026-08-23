@@ -1,8 +1,20 @@
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+
+const MIN_ZOOM = 1
+const MAX_ZOOM = 5
+const ZOOM_STEP = 0.02
+
+function clampZoom(z: number) {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 100) / 100))
+}
 
 /** A reusable full-window overlay used to enlarge read-only content (mermaid
  *  diagrams, file diffs) without leaving the app. Closes on Esc or scrim click.
+ *
+ *  Zoom: drag a marquee box over the region you want — it zooms so that region
+ *  fills the viewport and centers. Ctrl/⌘ + wheel also zooms. The ⟳ button
+ *  resets to 100%.
  *
  *  Rendered through a portal into `document.body` on purpose: the trigger
  *  (a chat message or a tool card) lives inside the scrollable/transformed chat
@@ -23,6 +35,22 @@ export function FullscreenModal({
   children: ReactNode
   bodyClass?: string
 }) {
+  const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState({ x: 0, y: 0 })
+  const [sel, setSel] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
+  const [cursor, setCursor] = useState<'grab' | 'crosshair' | 'grabbing'>('grab')
+  const dragRef = useRef<{
+    mode: 'pan' | 'marquee'
+    sx: number
+    sy: number
+    panX: number
+    panY: number
+  } | null>(null)
+  const selRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null)
+  const viewportRef = useRef<HTMLDivElement | null>(null)
+  const zoomRef = useRef(zoom)
+  const panRef = useRef(pan)
+
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
@@ -32,7 +60,126 @@ export function FullscreenModal({
     return () => window.removeEventListener('keydown', onKey)
   }, [open, onClose])
 
+  // Reset zoom/pan whenever the modal (re)opens.
+  useEffect(() => {
+    if (open) {
+      setZoom(1)
+      setPan({ x: 0, y: 0 })
+      setSel(null)
+    }
+  }, [open])
+
+  // Keep refs in sync so the wheel handler reads fresh values.
+  useEffect(() => {
+    zoomRef.current = zoom
+    panRef.current = pan
+  }, [zoom, pan])
+
+  // Ctrl/⌘ + wheel zoom. A native non-passive listener is required so the
+  // browser's own page-zoom can be prevented.
+  useEffect(() => {
+    const el = viewportRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const el = viewportRef.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const vx = e.clientX - rect.left
+      const vy = e.clientY - rect.top
+      const z = zoomRef.current
+      const nz = clampZoom(z + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP))
+      if (nz === z) return
+      // Keep the content point under the cursor fixed while zooming.
+      const p = panRef.current
+      const cx = (vx - p.x) / z
+      const cy = (vy - p.y) / z
+      setZoom(nz)
+      setPan({ x: vx - cx * nz, y: vy - cy * nz })
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [open])
+
   if (!open) return null
+
+  const reset = () => {
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+  }
+
+  // Zoom so the marquee box (viewport px, relative to the viewport top-left)
+  // fills the viewport and centers.
+  const zoomTo = (sx: number, sy: number, sw: number, sh: number) => {
+    const el = viewportRef.current
+    if (!el || sw < 6 || sh < 6) return
+    const rect = el.getBoundingClientRect()
+    const W = rect.width
+    const H = rect.height
+    const nz = clampZoom(zoom * Math.min(W / sw, H / sh))
+    // Content coordinates of the marquee center under the CURRENT transform.
+    const ccx = (sx + sw / 2 - pan.x) / zoom
+    const ccy = (sy + sh / 2 - pan.y) / zoom
+    const nx = W / 2 - ccx * nz
+    const ny = H / 2 - ccy * nz
+    setZoom(nz)
+    setPan({ x: nx, y: ny })
+  }
+
+  const onMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const el = viewportRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    const marquee = e.metaKey || e.ctrlKey
+    dragRef.current = {
+      mode: marquee ? 'marquee' : 'pan',
+      sx: x,
+      sy: y,
+      panX: panRef.current.x,
+      panY: panRef.current.y,
+    }
+    if (marquee) {
+      selRef.current = { x, y, w: 0, h: 0 }
+      setSel({ x, y, w: 0, h: 0 })
+      setCursor('crosshair')
+    } else {
+      setCursor('grabbing')
+    }
+  }
+  const onMouseMove = (e: React.MouseEvent) => {
+    const d = dragRef.current
+    const el = viewportRef.current
+    if (!d || !el) return
+    const rect = el.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    if (d.mode === 'marquee') {
+      const next = {
+        x: Math.min(d.sx, x),
+        y: Math.min(d.sy, y),
+        w: Math.abs(x - d.sx),
+        h: Math.abs(y - d.sy),
+      }
+      selRef.current = next
+      setSel(next)
+    } else {
+      setPan({ x: d.panX + (x - d.sx), y: d.panY + (y - d.sy) })
+    }
+  }
+  const onMouseUp = () => {
+    const d = dragRef.current
+    const s = selRef.current
+    dragRef.current = null
+    selRef.current = null
+    if (d?.mode === 'marquee' && s && s.w >= 6 && s.h >= 6) {
+      zoomTo(s.x, s.y, s.w, s.h)
+    }
+    setSel(null)
+    setCursor('grab')
+  }
 
   return createPortal(
     <div className="fullscreen-modal-scrim" onClick={onClose} role="presentation">
@@ -54,7 +201,40 @@ export function FullscreenModal({
             ✕
           </button>
         </div>
-        <div className={`fullscreen-modal-body ${bodyClass ?? ''}`}>{children}</div>
+        <div className={`fullscreen-modal-body ${bodyClass ?? ''}`}>
+          <div
+            className="fullscreen-pan-viewport"
+            ref={viewportRef}
+            style={{ cursor }}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={onMouseUp}
+          >
+            <div
+              className="fullscreen-pan-content"
+              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+            >
+              {children}
+            </div>
+            {sel && (
+              <div
+                className="fullscreen-marquee"
+                style={{
+                  left: sel.x,
+                  top: sel.y,
+                  width: sel.w,
+                  height: sel.h,
+                }}
+              />
+            )}
+          </div>
+          <div className="fullscreen-zoom-bar">
+            <button onClick={reset} aria-label="Reset zoom" title="Reset zoom (100%)">
+              ⟳
+            </button>
+          </div>
+        </div>
       </div>
     </div>,
     document.body,

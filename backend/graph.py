@@ -1215,6 +1215,35 @@ _EXTS = {
     "groovy", "gradle", "xml", "ini", "cfg", "conf", "env",
 }
 
+# Files that are useless to read for comprehension: lockfiles, minified /
+# bundled output, source maps, binaries, archives, build artifacts. They can
+# still match glob/grep, so we skip them at read time -- unless the user named
+# the file explicitly (then it stays in `named` and is always read).
+_SKIP_READ_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "gemfile.lock", "composer.lock", "cargo.lock", "go.sum", "pip.lock",
+    ".ds_store", "thumbs.db",
+}
+_SKIP_READ_EXTS = {
+    "lock", "min.js", "min.css", "map", "min", "png", "jpg", "jpeg", "gif",
+    "ico", "webp", "svg", "woff", "woff2", "ttf", "eot", "otf", "pdf", "zip",
+    "gz", "tar", "tgz", "rar", "7z", "bin", "exe", "dll", "so", "dylib",
+    "wasm", "mp4", "mp3", "wav", "avi", "mov", "log", "cache", "pyc", "class",
+    "o", "obj", "jar", "war",
+}
+
+
+def _should_skip_read(rel: str) -> bool:
+    import os
+
+    name = os.path.basename(rel).lower()
+    if name in _SKIP_READ_NAMES:
+        return True
+    if ".min." in name:
+        return True
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    return ext in _SKIP_READ_EXTS
+
 _STOPWORDS = set(
     """
     what where which when how does the and for with that this from into your you
@@ -1607,7 +1636,7 @@ def _build_explore_context(state: AgentState) -> str:
         parts.append("PROJECT TREE:\n" + state["explore_tree"])
     greps = state.get("grep_results") or []
     if greps:
-        parts.append("GREP MATCHES:\n" + "\n\n".join(greps)[:40000])
+        parts.append("GREP MATCHES:\n" + "\n\n".join(greps)[:12000])
     rc = state.get("read_context", "")
     if rc:
         parts.append("FILE CONTENTS READ:\n" + rc)
@@ -1751,7 +1780,7 @@ async def repo_grep(state: AgentState) -> dict:
     # structural "keywords" (the grep field).
     patterns = list(
         dict.fromkeys((spec.get("grep", []) or []) + (spec.get("queries", []) or []))
-    )
+    )[:10]
     files: list[str] = []
     raw: list[str] = []
     for pat in patterns:
@@ -1804,8 +1833,8 @@ async def repo_collect(state: AgentState) -> dict:
     return {"candidate_files": top}
 
 
-MAX_EXPLORE_READ_FILES = 30
-MAX_EXPLORE_READ_CHARS = 60_000
+MAX_EXPLORE_READ_FILES = 15
+MAX_EXPLORE_READ_CHARS = 24_000
 
 
 async def repo_read(state: AgentState) -> dict:
@@ -1833,6 +1862,8 @@ async def repo_read(state: AgentState) -> dict:
         )
     if named:
         files = list(dict.fromkeys(list(named) + files))
+    named_set = set(named or [])
+    files = [f for f in files if f in named_set or not _should_skip_read(f)]
     MIN_CANDIDATES = 18
     if len(files) < MIN_CANDIDATES:
         ranked = _rank_files_by_prompt(_repo_source_files(state["root"]), rank_text)
@@ -1850,7 +1881,7 @@ async def repo_read(state: AgentState) -> dict:
     total = 0
     for f in top:
         queue.put_nowait({"kind": "tool", "tool": "read", "args": {"filePath": f}})
-        res = await _run_repo_tool(tools, "read", filePath=f, limit=400)
+        res = await _run_repo_tool(tools, "read", filePath=f, limit=200)
         snippet = f"=== {f} ===\n{res}"
         parts.append(snippet)
         total += len(snippet)
@@ -1866,11 +1897,12 @@ async def repo_read(state: AgentState) -> dict:
 
 
 _ASK_REPO_CUES = re.compile(
-    r"what files|which file|which files|where is|where are|locate|"
-    r"search the repo|how does .* work|trace|investigate|implementation of|"
-    r"explain .* code|which module|which function|which class|codebase|"
-    r"repository|repo\b|this project|the project|source code|what does .* do|"
-    r"کجا(ست)?|پیدا کن|تابع|فایل|کد|پروژه|مخزن|پیاده|چطور کار|ماژول|کلاس",
+    r"where is|where are|find|locate|trace|investigate|"
+    r"which function|which class|which module|which file|which files|"
+    r"implementation of|how does .* work|explain .* code|what does .* do|"
+    r"codebase|source code|"
+    r"کجا|پیدا کن|کدوم تابع|کدوم فانکشن|کدوم کلاس|کدوم ماژول|"
+    r"پیاده سازی|چطور کار",
     re.I,
 )
 
@@ -1884,6 +1916,20 @@ _MEMORY_RECALL_CUES = re.compile(
     r"recall|remember",
     re.I,
 )
+
+
+_REFERENCE_CUES = re.compile(
+    r"ببین|نشون بده|نمایش بده|اون فایل|همون فایل|آن فایل|"
+    r"look at it|that file|this file|show me|show it|open it",
+    re.I,
+)
+
+
+def _has_reference_cue(text: str) -> bool:
+    """True when the message refers to a file mentioned EARLIER in the
+    conversation (e.g. "ببینش", "look at that file") rather than naming it
+    directly."""
+    return bool(_REFERENCE_CUES.search(text or ""))
 
 
 def _ask_needs_repo(text: str) -> bool:
@@ -1905,14 +1951,19 @@ async def ask_entry(state: AgentState) -> dict:
 
 def _route_ask_entry(state: AgentState) -> str:
     request = state.get("request", "")
-    # Explore when a real file is referenced (this turn OR earlier in the
-    # conversation) -- e.g. the user says "ببینش" about a file named turns ago.
-    if _resolve_file_refs(
+    # Explore only when THIS message references a real file or uses a strong
+    # repo cue. We deliberately do NOT scan the whole history here: the agent's
+    # own prior replies cite file paths, so a history scan would re-trigger
+    # exploration on every subsequent message. The "ببینش about an earlier
+    # file" case is handled by the narrow reference-cue + history check below.
+    if _resolve_file_refs([request], state["root"]):
+        return "repo_derive"
+    if _ask_needs_repo(request):
+        return "repo_derive"
+    if _has_reference_cue(request) and _resolve_file_refs(
         [request] + [m.get("content", "") for m in (state.get("history") or [])],
         state["root"],
     ):
-        return "repo_derive"
-    if _ask_needs_repo(request):
         return "repo_derive"
     return "ask_answer"
 

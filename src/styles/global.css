@@ -10117,6 +10117,7 @@ textarea {
   padding: 2vh 2vw;
 }
 .fullscreen-modal-panel {
+  position: relative;
   width: 96vw;
   height: 92vh;
   display: flex;
@@ -10162,8 +10163,63 @@ textarea {
 .fullscreen-modal-body {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.fullscreen-pan-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.fullscreen-pan-content {
+  transform-origin: 0 0;
+  will-change: transform;
+  min-height: 100%;
+  min-width: 100%;
+}
+.fullscreen-marquee {
+  position: absolute;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+.fullscreen-zoom-bar {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 10px;
+  z-index: 2;
+  color: var(--text);
+  box-shadow: var(--shadow-pop);
+}
+.fullscreen-zoom-bar button {
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 30px;
+  height: 28px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.fullscreen-zoom-bar button:hover {
+  background: var(--bg-hover);
 }
 .diff-fullscreen-body {
   padding: 0;

@@ -396,8 +396,11 @@ export function ChatPanel() {
   // thinking text. Deliberately independent of `isThinking`: text chunks toggle
   // that flag on/off mid-turn, which used to flicker the pin on and off as the
   // model alternated between emitting text and reasoning.
-  const streamingMsg = chat?.messages.find((m) => m.streaming) ?? null;
-  const liveThinking = streamingMsg?.thinking ?? "";
+  // Live thinking is kept in LOCAL state (not message/store state) so each
+  // streamed token doesn't trigger a full store re-map — that was the source of
+  // the lag. It's only shown pinned at the top while reasoning, then cleared on
+  // done so it never lingers in the transcript.
+  const [liveThinking, setLiveThinking] = useState<string | null>(null);
   /** The assistant message currently being rate-limited/retried by the provider,
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
@@ -1218,9 +1221,15 @@ export function ChatPanel() {
     // doesn't see raw @tokens. The stored transcript keeps the original text
     // with the @mentions. Skill names may contain spaces, so we match the
     // longest known skill name that is a prefix of the @run.
+    // Guard: ensure the skill list is loaded before matching, so a mention
+    // typed/pasted before the picker opened (or before the async fetch
+    // resolved) is never missed.
+    if (skillsListCache === null || skillsListCache.length === 0) {
+      await ensureSkills();
+    }
     const { skills: mentionSkills, cleaned: cleanedText } = extractMentionSkills(
       text,
-      skillsList,
+      skillsListCache ?? skillsList,
     );
     const finalPrompt =
       skillNotes.length > 0
@@ -1446,12 +1455,8 @@ export function ChatPanel() {
         });
       } else if (event.kind === "thinking") {
         useStore.getState().setStreaming(true, true);
-        const prevT = findMsg()?.thinking ?? "";
         const chunkT = event.content ?? "";
-        store.updateMessage(assistantMsg.id, {
-          thinking: prevT + chunkT,
-          retry: null,
-        });
+        setLiveThinking((prev) => (prev ?? "") + chunkT);
       } else if (event.kind === "skill") {
         // Deliberately NOT rendered into the chat — the user asked for the
         // "Attached skills" / MCP notes to stay out of the transcript. The
@@ -1823,6 +1828,7 @@ export function ChatPanel() {
         useStore.getState().setChatStalled(chat.id, false);
         lastEventAt.current = Date.now();
         resolveStuckCards();
+        setLiveThinking(null);
       }
     };
 
@@ -1925,6 +1931,7 @@ export function ChatPanel() {
       abortRef.current = null;
       useStore.getState().setChatAbort(chat.id, null);
       useStore.getState().setStreaming(false, false);
+      setLiveThinking(null);
       // Keep the retry banner when this turn ended in a failure the user can
       // act on (retry_giveup / watchdog / backend error). Clearing `retry`
       // here would make the banner vanish the instant the stream closes, and
@@ -2663,6 +2670,14 @@ export function ChatPanel() {
     setSkillsLoading(false);
   }, []);
 
+  // Load the skill list up-front (once) so manual @mentions typed/pasted
+  // before the picker ever opens — or sent before the async fetch resolves —
+  // are still matched. skillsListCache is module-level, so this runs at most
+  // once across remounts.
+  useEffect(() => {
+    if (skillsListCache === null) void ensureSkills();
+  }, [ensureSkills]);
+
   const startSkillMention = (at: number) => {
     setCmdOpen(null);
     setSkillMention({ at });
@@ -2995,7 +3010,7 @@ export function ChatPanel() {
           titlebarEl,
         )}
 
-      {streamingMsg && (
+      {liveThinking !== null && (
         <div className="thinking-pin">
           <ThinkingBlock text={liveThinking} />
         </div>

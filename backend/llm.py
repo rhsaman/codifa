@@ -462,8 +462,19 @@ def usage_event(metadata: Any, model: str = "", sub: bool = False) -> dict | Non
         if isinstance(metadata, dict):
             input_tokens = int(metadata.get("input_tokens", 0) or 0)
             output_tokens = int(metadata.get("output_tokens", 0) or 0)
-            cache_read = int(metadata.get("cache_read_input_tokens", 0) or 0)
-            cache_write = int(metadata.get("cache_creation_input_tokens", 0) or 0)
+            details = metadata.get("input_token_details") or {}
+            cache_read = int(
+                metadata.get("cache_read_input_tokens")
+                or (details.get("cached_tokens") if isinstance(details, dict) else 0)
+                or (details.get("cache_read_tokens") if isinstance(details, dict) else 0)
+                or 0
+            )
+            cache_write = int(
+                metadata.get("cache_creation_input_tokens")
+                or (details.get("cache_creation_tokens") if isinstance(details, dict) else 0)
+                or (details.get("cache_write_tokens") if isinstance(details, dict) else 0)
+                or 0
+            )
         else:
             input_tokens = int(getattr(metadata, "input_tokens", 0) or 0)
             output_tokens = int(getattr(metadata, "output_tokens", 0) or 0)

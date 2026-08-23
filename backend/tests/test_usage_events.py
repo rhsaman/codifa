@@ -51,6 +51,45 @@ def test_usage_event_surfaces_cache_read_tokens():
     assert ev["cache_read_tokens"] == 400
 
 
+def test_usage_event_surfaces_cache_write_tokens():
+    # Prompt-cache creation (cache_write) is billed at its own rate; the sidebar
+    # needs it split out so cost math is correct across providers.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 40,
+            "total_tokens": 540,
+            "input_token_details": {
+                "cached_tokens": 300,
+                "cache_creation_tokens": 150,
+            },
+        },
+    )
+    ev = _usage_event_from_ai(ai, "m")
+    assert ev["input_tokens"] == 500
+    assert ev["output_tokens"] == 40
+    assert ev["cache_read_tokens"] == 300
+    assert ev["cache_write_tokens"] == 150
+
+
+def test_usage_event_surfaces_anthropic_cache_write():
+    # Anthropic surfaces cache creation under cache_creation_input_tokens.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 40,
+            "total_tokens": 540,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 150,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "m")
+    assert ev["cache_read_tokens"] == 300
+    assert ev["cache_write_tokens"] == 150
+
+
 def test_usage_event_returns_none_when_no_usage():
     ai = AIMessage(content="hi")
     assert _usage_event_from_ai(ai, "m") is None

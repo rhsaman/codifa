@@ -17,7 +17,7 @@ import { cancelSteer } from '../lib/api'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { splitSections } from '../lib/sections'
-import { ToolCallView, ToolGroupView, isExploreCard } from './ToolCallView'
+import { ToolCallView, ToolGroupView, ToolNarratedRow, isExploreCard } from './ToolCallView'
 import { ReadingMode } from './ReadingMode'
 import { Mermaid } from './Mermaid'
 import 'highlight.js/styles/github-dark.min.css'
@@ -530,21 +530,66 @@ function SegSteerBubble({
   )
 }
 
+/** A text segment counts as a "caption" (narration the model wrote right
+ *  before a tool call, e.g. "بذار ببینم X رو...") rather than a real prose
+ *  answer if it's short, single-paragraph, and has no rich formatting the
+ *  final answer would typically use. Longer/formatted text always renders as
+ *  its own markdown block. */
+function isCaptionCandidate(text: string): boolean {
+  const t = text.trim()
+  if (!t || t.length > 260) return false
+  if (t.includes('```')) return false
+  if (/^#{1,6}\s/m.test(t)) return false
+  if ((t.match(/\n/g) || []).length > 2) return false
+  return true
+}
+
 function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): ReactNode[] {
   const nodes: ReactNode[] = []
   let pending: { activity: ToolActivity; index: number }[] = []
+  // The narration line held back to attach to the tool call(s) that follow it
+  // (see isCaptionCandidate). Cleared once used or once it turns out nothing
+  // groupable followed it.
+  let pendingCaption: string | null = null
 
   const flush = (key: string) => {
     if (pending.length === 0) return
-    // Always a collapsible trace group (even for a single call) so grouping
-    // behavior stays uniform and predictable, matching Claude.ai's own trace.
-    nodes.push(<ToolGroupView key={key} activities={pending} />)
+    if (pending.length === 1) {
+      // یک فراخوانی تکی: با caption مدل (اگر بود) در یک بلوکِ واحد رندر می‌شود —
+      // به‌جای یک پاراگراف جدا بالای یک ردیف ابزارِ بی‌ربط.
+      const { activity } = pending[0]
+      nodes.push(<ToolNarratedRow key={key} caption={pendingCaption ?? undefined} activity={activity} />)
+    } else {
+      // 2+ consecutive read-only calls collapse into one trace group, headed
+      // by the same caption instead of only the generic count summary.
+      nodes.push(<ToolGroupView key={key} activities={pending} caption={pendingCaption ?? undefined} />)
+    }
     pending = []
+    pendingCaption = null
   }
 
-  message.segments?.forEach((seg, i) => {
+  const renderProse = (key: string, text: string) => {
+    nodes.push(
+      <div key={key} className="chat-message markdown-body" dir="auto">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[REHYPE_HIGHLIGHT]}
+          components={mdComponents}
+        >
+          {cachedPrepare(`${message.id}:seg:${key}`, text, useStore.getState().dir)}
+        </ReactMarkdown>
+      </div>,
+    )
+  }
+
+  const segs = message.segments ?? []
+  segs.forEach((seg, i) => {
     if (seg.kind === 'user') {
       flush(`grp-${i}`)
+      if (pendingCaption) {
+        renderProse(`cap-${i}`, pendingCaption)
+        pendingCaption = null
+      }
       const steerMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -557,24 +602,33 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
       return
     }
     if (seg.kind === 'text') {
+      // A text segment always ends whatever tool run was accumulating.
       flush(`grp-${i}`)
-      nodes.push(
-        <div key={i} className="chat-message markdown-body" dir="auto">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[REHYPE_HIGHLIGHT]}
-            components={mdComponents}
-          >
-            {cachedPrepare(`${message.id}:seg:${i}`, seg.text, useStore.getState().dir)}
-          </ReactMarkdown>
-        </div>,
-      )
+
+      // Does this text immediately precede a groupable (non-always-visible)
+      // tool call? If so, hold it back as that call's caption instead of
+      // rendering it as its own paragraph.
+      const next = segs[i + 1]
+      const nextActivity = next && next.kind === 'tool' ? message.toolActivity?.[next.index] : undefined
+      const nextIsGroupable =
+        nextActivity && !ALWAYS_VISIBLE_TOOLS.has(nextActivity.tool) && !isExploreCard(nextActivity)
+
+      if (nextIsGroupable && isCaptionCandidate(seg.text)) {
+        pendingCaption = seg.text
+        return
+      }
+
+      renderProse(String(i), seg.text)
       return
     }
     const activity = message.toolActivity?.[seg.index]
     if (!activity) return
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush(`grp-${i}`)
+      if (pendingCaption) {
+        renderProse(`cap-${i}`, pendingCaption)
+        pendingCaption = null
+      }
       nodes.push(
         <ToolCallView
           key={i}
@@ -587,6 +641,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
     }
   })
   flush('grp-end')
+  if (pendingCaption) renderProse('cap-end', pendingCaption)
   return nodes
 }
 
@@ -685,8 +740,6 @@ export const ChatMessageView = memo(function ChatMessageView({
       {!isUser && message.streaming && !message.retry && (
         <LiveWorkingStatus message={message} />
       )}
-
-      {!isUser && !message.streaming && message.thinking && <ThinkingBlock text={message.thinking} />}
 
       {!isUser && message.plan && message.plan.length > 0 && (
         <div className="plan-block" dir={dir}>

@@ -183,10 +183,17 @@ export function contextPercent(used: number, windowSize: number | null): number 
  * Resolve the context-meter token count shown in the sidebar.
  *
  * We take the LARGER of:
- *  - `realTotal`: the provider's reported `input + cache` tokens from the last
- *    assistant turn's `usage` event (opencode's precise count), and
+ *  - `realTotal`: the provider's reported `input + cache` tokens, taken as the
+ *    MAX across EVERY assistant turn's `usage` event, and
  *  - `estimate`: our full-conversation estimate (system + settled history +
  *    live turn).
+ *
+ * Each model call re-sends the ENTIRE history, so the largest per-turn
+ * input+cache is the true CURRENT context size — NOT the sum. We therefore
+ * scan every assistant message and keep the max (no `break`). `chat.usage` is
+ * a per-model SESSION total (the sum of every call's input tokens — it only
+ * ever grows) and would massively over-count the context, so it is
+ * intentionally NOT used here.
  *
  * opencode's proxy may window its reported `input_tokens` to a small slice, so
  * `realTotal` can UNDER-count the real conversation. Using the max keeps the
@@ -206,14 +213,21 @@ export function computeContextUsed(
 ): number {
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
+
+  // Scan EVERY assistant message and take the LARGEST input+cache across the
+  // whole conversation. Each model call re-sends the entire history, so the
+  // largest per-turn input+cache is the true (current) context size — NOT the
+  // sum. No `break`: we must scan every message. (chat.usage is a per-model
+  // SESSION total — the sum of every call's input tokens — so it is NOT the
+  // context size and must not be used here; it only ever grows and would
+  // massively over-count.)
   let realTotal = 0
   for (let i = active.length - 1; i >= 0; i--) {
     const m = active[i]
     const u = m.usage
     if (m.role === 'assistant' && u && u.outputTokens > 0) {
       const cached = (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
-      realTotal = (u.inputTokens || 0) + cached
-      break
+      realTotal = Math.max(realTotal, (u.inputTokens || 0) + cached)
     }
   }
   const estimate = estimateContextTokens(chat, systemPrompt, maxHistory, contextWindow, mode)

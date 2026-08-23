@@ -2131,6 +2131,14 @@ textarea {
   margin: 4px 4px;
 }
 
+.msg-bubble.segmented > .tool-narrated {
+  margin: 4px 4px;
+}
+
+.msg-bubble.segmented > .tool-single {
+  margin: 4px 4px;
+}
+
 /* A steer message (typed mid-run) injected inline between tool calls: renders
    right after the tool card that carried it, with the agent's later text and
    tool cards stacking below. Full-width, mirroring a normal user message
@@ -6617,6 +6625,114 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* A standalone single read-only call: ONE cohesive row, not a header welded
+   onto an empty body. Quiet surface, status + name + args + time in a single
+   line — restrained chrome, clear hierarchy (Anthropic-frontend style). */
+.tool-single {
+  --tool-color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: left;
+  user-select: none;
+  overflow: hidden;
+}
+
+.tool-single.running {
+  border-color: color-mix(in srgb, var(--tool-color) 45%, var(--border));
+}
+
+.tool-single.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.tool-single.denied {
+  border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
+}
+
+.tool-single .tool-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.tool-single-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tool-single-summary {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* ---- narrated tool call (caption + call as one unit) ---- */
+/* A single card that pairs the model's short narration line with the tool
+   call it introduces, so a run of "caption → call → caption → call" reads as
+   a sequence of quiet connected units instead of alternating full-width text
+   paragraphs and separate tool rows (see renderSegments in ChatMessage.tsx). */
+.tool-narrated {
+  --tool-color: var(--accent);
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.tool-narrated.running {
+  border-color: color-mix(in srgb, var(--tool-color) 45%, var(--border));
+}
+
+.tool-narrated.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.tool-narrated.denied {
+  border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
+}
+
+/* The narration line itself: quieter and smaller than a normal reply
+   paragraph (it's commentary, not the answer), right-to-left aware. */
+.tool-narrated-caption {
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.tool-narrated-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 12px 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
 }
 
 /* ---- grouped read-only tool calls (see ToolGroupView) ---- */

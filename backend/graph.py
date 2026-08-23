@@ -196,8 +196,11 @@ def classify_mode(prompt: str, fallback: str = "ask") -> str:
 
     Explicit ``/plan``, ``/code`` and ``/ask`` prefixes in the prompt always win
     (so chat commands can override the toolbar mode); otherwise we trust the
-    mode the UI selected. Invalid fallbacks collapse to ``ask``.
+    mode the UI selected. The fallback is normalized via ``normalize_mode`` so
+    legacy/UI names (e.g. "chat", "codewriter") resolve to the right mode
+    instead of silently collapsing to "ask".
     """
+    fallback = _agents.normalize_mode(fallback)
     text = (prompt or "").strip().lower()
     if text.startswith("/plan") and (len(text) == 5 or text[5] in " \n\t"):
         return "plan"
@@ -804,6 +807,36 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         disc = _agents._plan_discovery_note(history)
         if disc:
             lc_history.insert(0, SystemMessage(content=disc))
+        # Feed the previous test failure back to Coder so the retry loop is not
+        # blind: without this, coder->test->debug->coder repeats without knowing
+        # what broke, and the user can end up with buggy code after MAX attempts.
+        dbg = state.get("debug_info")
+        if dbg:
+            lc_history.insert(
+                0,
+                SystemMessage(
+                    content=f"PREVIOUS TEST FAILURE — fix this before finishing:\n{dbg[:3000]}"
+                ),
+            )
+        # Enforce the test-verification rule at runtime for any code-changing
+        # coder task (feature/bugfix/refactor), not only when the prompt
+        # literally says "test". This closes the gap the user reported: coder
+        # must write/update and run tests before finishing, even on ordinary
+        # code work. The pure-logic predicates live in agents.py.
+        if _agents._is_code_task(prompt):
+            lc_history.insert(
+                0,
+                SystemMessage(
+                    content=(
+                        "TEST VERIFICATION RULE: this is code-changing work. "
+                        "Write/update the relevant test(s) for the language(s) you "
+                        "touched and run them (uv run pytest / npm test / cargo test / "
+                        "go test / mvn test / dotnet test / ...). Do NOT finish with "
+                        "red tests — the system re-runs you on failure and feeds the "
+                        "error back, so keep fixing until all tests pass."
+                    )
+                ),
+            )
     reuse_tool = _agents._tool_reuse_note(history)
     if reuse_tool:
         lc_history.insert(0, SystemMessage(content=reuse_tool))
@@ -938,7 +971,16 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
     details = um.get("input_token_details") or {}
     if isinstance(details, dict):
         cache_read = int(
-            details.get("cached_tokens") or details.get("cache_read_tokens") or 0
+            details.get("cached_tokens")
+            or details.get("cache_read_tokens")
+            or um.get("cache_read_input_tokens")
+            or 0
+        )
+        cache_write = int(
+            details.get("cache_creation_tokens")
+            or details.get("cache_write_tokens")
+            or um.get("cache_creation_input_tokens")
+            or 0
         )
     return {
         "kind": "usage",
@@ -949,6 +991,60 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
         "cache_write_tokens": cache_write,
         "model": model or "",
     }
+
+
+def _thinking_from_chunk(chunk: Any) -> str | None:
+    """Extract reasoning/thinking text from a streamed LangChain chunk.
+
+    Reasoning-capable gateways (OpenAI o-series, DeepSeek reasoner, Gemini
+    thinking, …) surface their chain-of-thought in different places: a
+    ``reasoning_content`` field on the chunk, a ``thinking`` part inside a
+    list-typed ``content``, or under ``additional_kwargs`` /
+    ``response_metadata``. Returns the text when present, else ``None`` so the
+    caller can skip emitting a frontend ``thinking`` event; never raises on
+    unexpected shapes.
+    """
+    if chunk is None:
+        return None
+
+    def _coerce(val: Any) -> str | None:
+        # A nested mapping like response_metadata={"reasoning": {"text": ...}}
+        # is flattened to its inner string value.
+        if isinstance(val, dict):
+            for k in ("text", "thinking", "reasoning", "content"):
+                inner = val.get(k)
+                if isinstance(inner, str) and inner:
+                    return inner
+            return None
+        if isinstance(val, str) and val:
+            return val
+        return None
+
+    # 1) Direct attribute (OpenAI o-series / DeepSeek via langchain-openai).
+    rc = getattr(chunk, "reasoning_content", None)
+    out = _coerce(rc)
+    if out:
+        return out
+    # 2) List-typed content with a "thinking"/"reasoning" part.
+    content = getattr(chunk, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("thinking", "reasoning"):
+                txt = _coerce(part.get("text") or part.get("thinking") or part.get("reasoning"))
+                if txt:
+                    return txt
+    # 3) additional_kwargs / response_metadata fallbacks.
+    for bag in (
+        getattr(chunk, "additional_kwargs", None) or {},
+        getattr(chunk, "response_metadata", None) or {},
+    ):
+        if not isinstance(bag, dict):
+            continue
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            out = _coerce(bag.get(key))
+            if out:
+                return out
+    return None
 
 
 async def _compact_tool_history(
@@ -1115,6 +1211,13 @@ async def _run_mode_turn(
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "text":
                                 queue.put_nowait({"kind": "text", "content": part["text"]})
+                    # Reasoning/thinking tokens (separate from the visible
+                    # answer) — streamed so the frontend can pin a live
+                    # "thinking" card at the top of the chat while the model
+                    # reasons. Models that don't emit thinking yield "" here.
+                    thinking = _thinking_from_chunk(chunk)
+                    if thinking:
+                        queue.put_nowait({"kind": "thinking", "content": thinking})
                 if ai is None:
                     break
                 _astream_count_local_val = _astream_count_local
@@ -1224,10 +1327,28 @@ async def _run_mode_turn(
 # ---------------------------------------------------------------------------
 
 
-def detect_test_command(root: str) -> str | None:
-    """Find the project's existing test/build/type-check command."""
+def detect_test_commands(root: str) -> list[str]:
+    """Return every test/build/type-check command for languages present in root.
+
+    Multi-language aware: a workspace may contain a Python backend, a JS/TS
+    frontend, a Rust crate, etc. Each detected language contributes its own
+    command so the test gate covers the whole project, not just one stack.
+    """
     import os
 
+    cmds: list[str] = []
+
+    # --- Python (uv is preferred per AGENTS.md) ---
+    if os.path.isfile(os.path.join(root, "uv.lock")) or os.path.isfile(
+        os.path.join(root, "pyproject.toml")
+    ):
+        cmds.append("uv run pytest")
+    elif os.path.isfile(os.path.join(root, "pytest.ini")) or os.path.isfile(
+        os.path.join(root, "setup.py")
+    ):
+        cmds.append("python -m pytest")
+
+    # --- Node / JS / TS ---
     pkg = os.path.join(root, "package.json")
     if os.path.isfile(pkg):
         try:
@@ -1235,22 +1356,74 @@ def detect_test_command(root: str) -> str | None:
         except Exception:  # noqa: BLE001
             data = {}
         scripts = (data.get("scripts") or {}) if isinstance(data, dict) else {}
-        if "test" in scripts:
-            test = str(scripts["test"])
-            if "vitest" in test or "jest" in test:
-                return "npm test"
-            return "npm test"
-    if os.path.isfile(os.path.join(root, "pyproject.toml")):
-        return "uv run pytest"
-    if os.path.isfile(os.path.join(root, "pytest.ini")) or os.path.isfile(
-        os.path.join(root, "setup.py")
-    ):
-        return "pytest"
+        test = str(scripts.get("test", ""))
+        if test:
+            if "vitest" in test:
+                cmds.append("npx vitest run")
+            elif "jest" in test:
+                cmds.append("npx jest")
+            else:
+                cmds.append("npm test")
+
+    # --- Rust ---
     if os.path.isfile(os.path.join(root, "Cargo.toml")):
-        return "cargo test"
+        cmds.append("cargo test")
+
+    # --- Go ---
     if os.path.isfile(os.path.join(root, "go.mod")):
-        return "go test ./..."
-    return None
+        cmds.append("go test ./...")
+
+    # --- Java (Maven / Gradle) ---
+    if os.path.isfile(os.path.join(root, "pom.xml")):
+        cmds.append("mvn -q test")
+    if os.path.isfile(os.path.join(root, "build.gradle")) or os.path.isfile(
+        os.path.join(root, "build.gradle.kts")
+    ):
+        cmds.append("./gradlew test")
+
+    # --- .NET ---
+    try:
+        if any(f.endswith(".csproj") or f.endswith(".sln") for f in os.listdir(root)):
+            cmds.append("dotnet test")
+    except OSError:
+        pass
+
+    # --- Ruby ---
+    if os.path.isfile(os.path.join(root, "Gemfile")):
+        cmds.append("bundle exec rspec")
+    if os.path.isfile(os.path.join(root, "Rakefile")):
+        cmds.append("rake test")
+
+    # --- PHP ---
+    if os.path.isfile(os.path.join(root, "composer.json")):
+        cmds.append("vendor/bin/phpunit")
+
+    # --- Elixir ---
+    if os.path.isfile(os.path.join(root, "mix.exs")):
+        cmds.append("mix test")
+
+    # --- Dart / Flutter ---
+    if os.path.isfile(os.path.join(root, "pubspec.yaml")):
+        try:
+            with open(os.path.join(root, "pubspec.yaml"), encoding="utf-8") as _f:
+                _pub = _f.read()
+            if "flutter:" in _pub or "sdk: flutter" in _pub:
+                cmds.append("flutter test")
+            else:
+                cmds.append("dart test")
+        except OSError:
+            cmds.append("dart test")
+
+    # --- C / C++ ---
+    if os.path.isfile(os.path.join(root, "CMakeLists.txt")):
+        cmds.append("ctest --output-on-failure")
+    elif os.path.isfile(os.path.join(root, "Makefile")):
+        cmds.append("make test")
+    elif any(f.endswith((".c", ".cpp", ".cc", ".cxx")) for f in os.listdir(root)):
+        # no standard test runner; leave a no-op marker so test_node reports it
+        cmds.append("echo 'C/C++ project: no standard test runner detected'")
+
+    return cmds
 
 
 # ---------------------------------------------------------------------------
@@ -1307,43 +1480,52 @@ async def coder_node(state: AgentState) -> dict:
 
 
 def test_node(state: AgentState) -> dict:
-    """Run the project's existing test/build/type-check tooling.
+    """Run every language's test/build/type-check tooling in the workspace.
 
-    Uses ``tools.run_terminal`` (the same tool the agent uses) so the command is
-    sandboxed to the workspace root. Produces structured results.
+    Uses ``tools.run_terminal`` (the same tool the agent uses) so each command
+    is sandboxed to the workspace root. All detected commands are run; if any
+    fails the whole gate fails and the coder->debug->coder loop retries.
     """
     queue = state["_queue"]
     root = state["root"]
-    cmd = detect_test_command(root)
-    if not cmd:
+    cmds = detect_test_commands(root)
+    if not cmds:
         # Nothing to run — don't emit a misleading error event. The turn simply
         # proceeds to review with no test gate.
         return {
             "test_results": {"passed": True, "errors": [], "output": "no tests configured"},
             "test_status": "pass",
         }
-    queue.put_nowait({"kind": "tool", "tool": "run_terminal", "args": {"command": cmd}})
     from tools import run_terminal
 
-    result = run_terminal(root, cmd, timeout=300)
-    exit_code = result.get("exit_code", 1)
-    output = str(result.get("output", ""))
-    passed = exit_code == 0
-    queue.put_nowait(
-        {
-            "kind": "tool_result", "tool": "run_terminal",
-            "summary": f"exit={exit_code} ({'pass' if passed else 'fail'})",
-            "status": "ok" if passed else "error",
-        }
-    )
+    all_ok = True
+    errors: list[str] = []
+    out_parts: list[str] = []
+    for cmd in cmds:
+        queue.put_nowait({"kind": "tool", "tool": "run_terminal", "args": {"command": cmd}})
+        result = run_terminal(root, cmd, timeout=300)
+        exit_code = result.get("exit_code", 1)
+        output = str(result.get("output", ""))
+        ok = exit_code == 0
+        all_ok = all_ok and ok
+        if not ok:
+            errors.append(f"[{cmd}] {output[-2000:]}")
+        out_parts.append(f"$ {cmd}\n{output[-2000:]}")
+        queue.put_nowait(
+            {
+                "kind": "tool_result", "tool": "run_terminal",
+                "summary": f"{cmd} exit={exit_code} ({'pass' if ok else 'fail'})",
+                "status": "ok" if ok else "error",
+            }
+        )
     return {
         "test_results": {
-            "passed": passed,
-            "failed": not passed,
-            "errors": [] if passed else [output[-2000:]],
-            "output": output[-4000:],
+            "passed": all_ok,
+            "failed": not all_ok,
+            "errors": errors,
+            "output": "\n".join(out_parts)[-4000:],
         },
-        "test_status": "pass" if passed else "fail",
+        "test_status": "pass" if all_ok else "fail",
     }
 
 

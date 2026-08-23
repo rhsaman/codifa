@@ -44,7 +44,7 @@ OAUTH_RESULTS: dict[str, dict] = {}
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 import providers
 from agents import (
@@ -52,6 +52,7 @@ from agents import (
     _enqueue_steer,
     _is_read_timeout,
     _remove_steer,
+    normalize_mode,
     run_agent,
 )
 
@@ -108,6 +109,14 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     provider: str = "custom"
+
+    @model_validator(mode="after")
+    def _normalize_mode(self) -> "ChatRequest":
+        # Normalize legacy/UI mode names (e.g. "chat", "codewriter") to the
+        # canonical workflow modes at the API boundary, so downstream code only
+        # ever sees keys that exist in SYSTEM_PROMPTS.
+        self.mode = normalize_mode(self.mode)
+        return self
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
@@ -448,9 +457,12 @@ async def models_remove(req: ModelRemoveRequest) -> dict:
 
 @app.get("/system-prompts")
 async def system_prompts() -> dict:
-    from agents import SYSTEM_PROMPTS
+    from agents import SYSTEM_PROMPTS, MODE_ALIASES
 
-    return {"chat": SYSTEM_PROMPTS["chat"], "codewriter": SYSTEM_PROMPTS["codewriter"]}
+    # The frontend requests legacy keys ("chat", "codewriter"); map them back to
+    # the canonical prompts via MODE_ALIASES so this endpoint never raises
+    # KeyError and stays in sync with the single source of truth.
+    return {key: SYSTEM_PROMPTS[canonical] for key, canonical in MODE_ALIASES.items()}
 
 
 # --- skills (stored in the app database) ---------------------------------- #

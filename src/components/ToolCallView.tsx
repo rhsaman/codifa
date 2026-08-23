@@ -332,8 +332,14 @@ function applyReverseDiff(diff: string, current: string): string {
  *  full cards, matching Claude.ai's own tool-trace UI. */
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
+  caption,
 }: {
   activities: { activity: ToolActivity; index: number }[]
+  /** The short narration line the model wrote right before this run of calls
+   *  (see renderSegments in ChatMessage.tsx). Shown as a caption above the
+   *  collapsible head so the group reads as "here's what I'm doing, here's
+   *  the calls" instead of a bare count summary. */
+  caption?: string
   onReverted?: (index: number) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -345,6 +351,11 @@ export const ToolGroupView = memo(function ToolGroupView({
 
   return (
     <div className={`tool-group ${errored ? 'error' : running ? 'running' : denied ? 'denied' : 'done'}`}>
+      {caption && (
+        <div className="tool-narrated-caption" dir="auto">
+          {fixZwsp(caption)}
+        </div>
+      )}
       <button className={`tool-group-head ${open ? 'open' : ''}`} onClick={() => setOpen((o) => !o)}>
         <span className={`chev ${open ? 'open' : ''}`}>▾</span>
         {running ? (
@@ -575,6 +586,117 @@ const ToolCascade = memo(function ToolCascade({ activities }: { activities: Tool
           <ToolSubRow activity={a} />
         </div>
       ))}
+    </div>
+  )
+})
+
+/**
+ * A SINGLE read-only tool call rendered as ONE cohesive row — not a header
+ * bolted onto an empty body (which is what a lone ToolCallView looks like for
+ * grep/read/glob/search). Anthropic-frontend principles: one clear unit,
+ * restrained chrome, status + name + args + time in a single quiet line. Used
+ * for standalone single calls; multi-call runs still collapse into a group.
+ */
+export const ToolSingleRow = memo(function ToolSingleRow({
+  activity,
+}: {
+  activity: ToolActivity
+}) {
+  const [now, setNow] = useState(() => Date.now())
+  const running = activity.status === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 500)
+    return () => clearInterval(t)
+  }, [running])
+  const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  const detail = subArgSummary(activity)
+  const hasBody =
+    Boolean(activity.summary) ||
+    Boolean(activity.items?.length) ||
+    Boolean(activity.children?.length)
+  return (
+    <div className={`tool-single ${activity.status}${running ? ' running' : ''}`}>
+      <StatusIcon status={activity.status} />
+      <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+      {activity.model && (
+        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
+          {activity.model}
+        </span>
+      )}
+      {activity.tool === 'web_search' && activity.engine && (
+        <span className="tool-badge">{activity.engine}</span>
+      )}
+      {detail && (
+        <span className="tool-single-detail" title={detail}>
+          {detail}
+        </span>
+      )}
+      {hasBody && activity.summary && (
+        <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
+      )}
+      <span className="tool-ms">{fmtTime(ms)}</span>
+    </div>
+  )
+})
+
+/**
+ * A read-only tool call paired with the short narration line the model wrote
+ * right before calling it (e.g. "بذار ببینم X رو..."). Instead of stacking a
+ * full paragraph text block above a separate, unrelated tool row — which is
+ * what made multi-step tool runs feel noisy (every call got its own two-part
+ * block) — the caption and the call render as ONE quiet unit: caption line on
+ * top, compact tool line below, sharing a single card. See renderSegments in
+ * ChatMessage.tsx for how captions get attached to the call(s) that follow
+ * them. Falls back to the plain ToolSingleRow when there's no caption.
+ */
+export const ToolNarratedRow = memo(function ToolNarratedRow({
+  caption,
+  activity,
+}: {
+  caption?: string
+  activity: ToolActivity
+}) {
+  const [now, setNow] = useState(() => Date.now())
+  const running = activity.status === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 500)
+    return () => clearInterval(t)
+  }, [running])
+  const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  const detail = subArgSummary(activity)
+  const hasBody =
+    Boolean(activity.summary) || Boolean(activity.items?.length) || Boolean(activity.children?.length)
+
+  if (!caption) return <ToolSingleRow activity={activity} />
+
+  return (
+    <div className={`tool-narrated ${activity.status}${running ? ' running' : ''}`}>
+      <div className="tool-narrated-caption" dir="auto">
+        {fixZwsp(caption)}
+      </div>
+      <div className="tool-narrated-row">
+        <StatusIcon status={activity.status} />
+        <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+        {activity.model && (
+          <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
+            {activity.model}
+          </span>
+        )}
+        {activity.tool === 'web_search' && activity.engine && (
+          <span className="tool-badge">{activity.engine}</span>
+        )}
+        {detail && (
+          <span className="tool-single-detail" title={detail}>
+            {detail}
+          </span>
+        )}
+        {hasBody && activity.summary && (
+          <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
+        )}
+        <span className="tool-ms">{fmtTime(ms)}</span>
+      </div>
     </div>
   )
 })

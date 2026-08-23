@@ -78,6 +78,22 @@ npx esbuild test/contextUsed.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-cu.mjs >/dev/null 2>&1
 node test/.tmp-cu.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs
+echo ""
+echo "── تست ۱۴: link (هدایت لینک‌های خارجی به مرورگر سیستم) ──"
+node test/link.test.ts
+
+echo ""
+echo "── تست ۱۵: skills (استخراج منشن @slug اسکیل + سازگاری نام نمایشی) ──"
+npx esbuild test/skills.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-skills.mjs >/dev/null 2>&1
+node test/.tmp-skills.mjs
+
+echo ""
+echo "── تست ۱۶: skills cache (رفرش لیست پس از ذخیره/حذف اسکیل) ──"
+npx esbuild test/skillsCache.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-skillsCache.mjs >/dev/null 2>&1
+node test/.tmp-skillsCache.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

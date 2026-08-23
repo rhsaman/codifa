@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
 import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
+import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
@@ -694,6 +695,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [skillFilter, setSkillFilter] = useState('')
   const [mcpFilter, setMcpFilter] = useState('')
   const [addingMcp, setAddingMcp] = useState(false)
+  const skillListRef = useRef<HTMLDivElement | null>(null)
 
   const reloadSkills = useCallback(async (preferName?: string) => {
     const rows = await listSkills()
@@ -762,6 +764,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         return next
       })
       void reloadSkills(savedName)
+      invalidateSkillsList()
     }
   }
 
@@ -781,6 +784,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         return next
       })
       void reloadSkills()
+      invalidateSkillsList()
     }
   }
 
@@ -792,6 +796,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         '---\nname: new-skill\n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
     }))
     setSkillsMsg('Editing a new skill — fill in the details, then press Save skill.')
+    // The "New skill" editor renders at the TOP of the list; if the user had
+    // scrolled down, scroll the list back to the top so it's immediately visible.
+    requestAnimationFrame(() => skillListRef.current?.scrollTo({ top: 0, behavior: 'smooth' }))
   }
 
   // Keep the local editor in sync when the edited provider changes.
@@ -1709,9 +1716,37 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   dir="ltr"
                 />
               </div>
-              <div className="skill-list">
+              <div className="skill-list" ref={skillListRef}>
                 {skills.length === 0 && (
                   <div className="hint">No skills yet. Create one with <code>/skill &lt;description&gt;</code> in the chat.</div>
+                )}
+                {expandedSkills.has(NEW_SKILL_KEY) && (
+                  <div className="skill-card open">
+                    <div className="skill-card-head">
+                      <span className="skill-chevron open">▶</span>
+                      <span className="skill-card-name">New skill</span>
+                    </div>
+                    <div className="skill-card-body">
+                      <textarea
+                        className="system-prompt skill-raw"
+                        value={skillDrafts[NEW_SKILL_KEY] ?? ''}
+                        onChange={(e) =>
+                          setSkillDrafts((prev) => ({ ...prev, [NEW_SKILL_KEY]: e.target.value }))
+                        }
+                        rows={12}
+                        dir="ltr"
+                        spellCheck={false}
+                      />
+                      <div className="prompt-actions">
+                        <span className="hint">{skillsMsg}</span>
+                        <div className="skill-actions">
+                          <button className="btn tiny" onClick={() => saveSkill(NEW_SKILL_KEY)}>
+                            Save skill
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 )}
                 {skills
                   .filter((s) => {
@@ -1762,34 +1797,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       </div>
                     )
                   })}
-                {expandedSkills.has(NEW_SKILL_KEY) && (
-                  <div className="skill-card open">
-                    <div className="skill-card-head">
-                      <span className="skill-chevron open">▶</span>
-                      <span className="skill-card-name">New skill</span>
-                    </div>
-                    <div className="skill-card-body">
-                      <textarea
-                        className="system-prompt skill-raw"
-                        value={skillDrafts[NEW_SKILL_KEY] ?? ''}
-                        onChange={(e) =>
-                          setSkillDrafts((prev) => ({ ...prev, [NEW_SKILL_KEY]: e.target.value }))
-                        }
-                        rows={12}
-                        dir="ltr"
-                        spellCheck={false}
-                      />
-                      <div className="prompt-actions">
-                        <span className="hint">{skillsMsg}</span>
-                        <div className="skill-actions">
-                          <button className="btn tiny" onClick={() => saveSkill(NEW_SKILL_KEY)}>
-                            Save skill
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
         </>

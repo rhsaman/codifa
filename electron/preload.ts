@@ -62,6 +62,7 @@ const api = {
   storeSet: (key: string, value: unknown): Promise<boolean> => ipcRenderer.invoke('store:set', key, value),
   getDataPath: () => ipcRenderer.invoke('data:path'),
   hasSettingsFile: (): Promise<boolean> => ipcRenderer.invoke('data:has-settings'),
+  openExternal: (url: string): Promise<void> => ipcRenderer.invoke('open:external', url),
   moveDataPath: (p: string): Promise<string> => ipcRenderer.invoke('data:move', p),
   onSidecarChanged: (cb: () => void): (() => void) => {
     const listener = (): void => cb()

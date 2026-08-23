@@ -17,6 +17,7 @@ import { cancelSteer } from '../lib/api'
 import { useStore } from '../lib/store'
 import { getMode } from '../lib/modes'
 import { splitSections } from '../lib/sections'
+import { handleLinkClick } from '../lib/link'
 import { ToolCallView, ToolGroupView, ToolNarratedRow, isExploreCard } from './ToolCallView'
 import { ReadingMode } from './ReadingMode'
 import { Mermaid } from './Mermaid'
@@ -124,8 +125,17 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // Exported so ReadingMode.tsx can reuse the exact same overrides (including the
 // ```mermaid -> diagram rendering) without duplicating them.
 export const mdComponents = {
-  a: (props: React.HTMLAttributes<HTMLAnchorElement>) => (
-    <a {...props} target="_blank" rel="noreferrer" />
+  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    <a
+      {...props}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(e) => {
+        // Forward http(s) links to the OS browser; internal anchors keep
+        // their default behaviour inside the app.
+        handleLinkClick(e, props.href, (url) => void window.coder.openExternal(url))
+      }}
+    />
   ),
   pre: (props: React.HTMLAttributes<HTMLPreElement>) => <CodeBlock {...props} />,
   table: ({

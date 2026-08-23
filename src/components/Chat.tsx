@@ -34,6 +34,7 @@ import {
 import type { SkillRow } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
+import { extractMentionSkills, getSkillsList, ensureSkillsList, invalidateSkillsList, setSkillsFetcher } from "../lib/skills";
 import { detectDir, prepareContent } from "../lib/bidi";
 import { registerChatSend, sendPendingSteerNext, sendQueuedNext, uid2 } from "../lib/chatSends";
 import { composerScrollPadding } from "../lib/scrollPadding";
@@ -59,12 +60,6 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
-
-// Skill list cache for the @mention picker. Lives at module scope so it
-// survives chat switches (the ChatPanel remounts per chat via key=activeChatId
-// and would otherwise refetch on every switch). Refreshed on every @open so a
-// newly created skill shows up without an app restart.
-let skillsListCache: SkillRow[] | null = null;
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -126,46 +121,13 @@ function wantsSkillOrMcp(text: string): boolean {
  * the prompt with those @mentions stripped (the model must not see raw @tokens;
  * the stored transcript keeps the original text with the @mentions).
  *
- * Skill names may contain spaces (e.g. "Anthropic Frontend Design"), so a naive
- * `@(\w+)` capture would only grab "Anthropic" and miss the skill. Instead we
- * capture an `@` followed by a run of word / Persian letters and internal
- * spaces, then keep the LONGEST known skill name that is a prefix of that run
- * (case-insensitive). This makes "@Anthropic Frontend Design" match the skill.
- * Any trailing words after the name are preserved (e.g. "...Design please" ->
- * " please").
+ * The canonical mention token is the skill's slug (e.g.
+ * "@anthropic-frontend-design") — space-free and unambiguous. A legacy fallback
+ * also matches display names that contain spaces (e.g. "@Anthropic Frontend
+ * Design") for text pasted from before the slug-based flow. The actual
+ * extraction logic lives in ../lib/skills (extractMentionSkills) so it can be
+ * unit-tested independently of the React component.
  */
-function extractMentionSkills(
-  text: string,
-  skills: { name: string }[],
-): { skills: Set<string>; cleaned: string } {
-  const found = new Set<string>();
-  const names = skills.map((s) => s.name);
-  const re = /(^|\s)@([\w\u0600-\u06FF]+(?:\s[\w\u0600-\u06FF]+)*)/g;
-  let out = "";
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const lead = m[1];
-    const raw = m[2];
-    let best: string | null = null;
-    for (const n of names) {
-      if (raw.toLowerCase().startsWith(n.toLowerCase())) {
-        if (!best || n.length > best.length) best = n;
-      }
-    }
-    out += text.slice(last, m.index) + lead;
-    if (best) {
-      found.add(best);
-      out += raw.slice(best.length); // keep any trailing words after the name
-    } else {
-      out += "@" + raw; // leave unmatched @token as-is
-    }
-    last = m.index + m[0].length;
-  }
-  out += text.slice(last);
-  return { skills: found, cleaned: out };
-}
-
 const IMAGE_EXTS = new Set([
   "png",
   "jpg",
@@ -432,10 +394,8 @@ export function ChatPanel() {
   const [skillMention, setSkillMention] = useState<{ at: number } | null>(null);
   const [skillMentionQuery, setSkillMentionQuery] = useState("");
   const [skillMentionIdx, setSkillMentionIdx] = useState(0);
-  const [skillsList, setSkillsList] = useState<SkillRow[]>(
-    skillsListCache ?? [],
-  );
-  const [skillsLoading, setSkillsLoading] = useState(skillsListCache === null);
+  const [skillsList, setSkillsList] = useState<SkillRow[]>(getSkillsList());
+  const [skillsLoading, setSkillsLoading] = useState(getSkillsList().length === 0);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
@@ -472,6 +432,7 @@ export function ChatPanel() {
     (s) =>
       !atQuery ||
       s.name.toLowerCase().includes(atQuery) ||
+      (s.slug && s.slug.toLowerCase().includes(atQuery)) ||
       s.description.toLowerCase().includes(atQuery),
   );
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1219,17 +1180,17 @@ export function ChatPanel() {
     // @, pass them to the backend (only those are loaded — there is no
     // auto-selection) and strip the @mentions from the prompt so the model
     // doesn't see raw @tokens. The stored transcript keeps the original text
-    // with the @mentions. Skill names may contain spaces, so we match the
-    // longest known skill name that is a prefix of the @run.
+    // with the @mentions. The canonical token is the skill slug (space-free);
+    // a legacy display-name fallback is also supported.
     // Guard: ensure the skill list is loaded before matching, so a mention
     // typed/pasted before the picker opened (or before the async fetch
     // resolved) is never missed.
-    if (skillsListCache === null || skillsListCache.length === 0) {
-      await ensureSkills();
+    if (getSkillsList().length === 0) {
+      await ensureSkillsList();
     }
     const { skills: mentionSkills, cleaned: cleanedText } = extractMentionSkills(
       text,
-      skillsListCache ?? skillsList,
+      getSkillsList(),
     );
     const finalPrompt =
       skillNotes.length > 0
@@ -2664,18 +2625,22 @@ export function ChatPanel() {
   };
 
   const ensureSkills = useCallback(async () => {
-    const list = await listSkills();
-    skillsListCache = list;
+    const list = await ensureSkillsList();
     setSkillsList(list);
     setSkillsLoading(false);
   }, []);
 
+  // Wire the shared skill cache to the backend fetcher (src/lib/api). Done
+  // once at module init so the cache can be invalidated from anywhere
+  // (e.g. after a skill is saved in Settings) without re-importing.
+  setSkillsFetcher(listSkills);
+
   // Load the skill list up-front (once) so manual @mentions typed/pasted
   // before the picker ever opens — or sent before the async fetch resolves —
-  // are still matched. skillsListCache is module-level, so this runs at most
-  // once across remounts.
+  // are still matched. The cache is module-level (src/lib/skills), so this runs
+  // at most once across remounts.
   useEffect(() => {
-    if (skillsListCache === null) void ensureSkills();
+    if (getSkillsList().length === 0) void ensureSkills();
   }, [ensureSkills]);
 
   const startSkillMention = (at: number) => {
@@ -2690,9 +2655,11 @@ export function ChatPanel() {
     if (!skillMention) return;
     const before = input.slice(0, skillMention.at);
     const after = input.slice(skillMention.at + 1);
-    // Replace the partial token after "@" (e.g. "ski") with the skill name.
+    // Replace the partial token after "@" (e.g. "ski") with the skill's slug —
+    // the canonical, space-free mention token (e.g. "@anthropic-frontend-design").
     const rest = after.replace(/^\S*/, "");
-    const next = `${before}@${skill.name} ${rest}`;
+    const token = skill.slug || skill.name;
+    const next = `${before}@${token} ${rest}`;
     setInput(next);
     setSkillMention(null);
     setSkillMentionQuery("");
@@ -2701,7 +2668,7 @@ export function ChatPanel() {
       const el = textareaRef.current;
       if (el) {
         el.focus();
-        const pos = before.length + skill.name.length + 2;
+        const pos = before.length + token.length + 2;
         el.setSelectionRange(pos, pos);
       }
     });
@@ -3582,7 +3549,7 @@ export function ChatPanel() {
                       acceptSkillMention(s);
                     }}
                   >
-                    <span className="mention-rel">@{s.name}</span>
+                    <span className="mention-rel">@{s.slug || s.name}</span>
                     <span className="mention-hint">{s.description}</span>
                   </div>
                 ))}

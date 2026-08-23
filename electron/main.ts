@@ -413,6 +413,15 @@ function registerIpc(): void {
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
 
+  // --- open external links in the OS browser --------------------------------
+  // Only http(s) URLs are forwarded to the system browser; internal anchors
+  // (#, mailto:, etc.) keep their default behaviour inside the app.
+  ipcMain.handle('open:external', async (_e, url: string) => {
+    if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+      await shell.openExternal(url)
+    }
+  })
+
   // --- app updates (GitHub releases) ---------------------------------------
   ipcMain.handle('updater:check', () => checkForUpdates())
   ipcMain.handle('updater:start', () => startUpdate(mainWindow))

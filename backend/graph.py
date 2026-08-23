@@ -256,7 +256,7 @@ def filter_tools_for_mode(
 
     Mirrors the original agents.py gating exactly: capability-driven denying
     (readFiles/writeFiles/runTerminal/web), the coder-only write restriction,
-    plan-only ``save_plan``, ask-mode drops (read/memory/trivial-prompt schemas),
+    plan-mode persistence (handled by the plan_build node, not a tool), ask-mode drops (read/memory/trivial-prompt schemas),
     ``allow_create`` gating of skill/MCP creation, and file-scope stripping.
     """
     cap = cap or {}
@@ -306,8 +306,6 @@ def filter_tools_for_mode(
     # coder-only (handled in the blocks above); non-coder modes therefore keep
     # only read/search/web/vision capabilities. The Explore subagent reuses the
     # same tool runtime in an isolated context.
-    if mode != "plan":
-        tools.pop("save_plan", None)
     if mode == "ask":
         tools.pop("memory", None)
     if mode == "ask" and _agents._trivial_prompt(prompt):
@@ -1419,9 +1417,8 @@ def detect_test_commands(root: str) -> list[str]:
         cmds.append("ctest --output-on-failure")
     elif os.path.isfile(os.path.join(root, "Makefile")):
         cmds.append("make test")
-    elif any(f.endswith((".c", ".cpp", ".cc", ".cxx")) for f in os.listdir(root)):
-        # no standard test runner; leave a no-op marker so test_node reports it
-        cmds.append("echo 'C/C++ project: no standard test runner detected'")
+    # C/C++ files without CMake/Make have no standard test runner; leave cmds
+    # empty so test_node reports "no tests configured" instead of a false pass.
 
     return cmds
 
@@ -1441,21 +1438,6 @@ async def ask_node(state: AgentState) -> dict:
     queue = state["_queue"]
     reply = await _run_mode_turn(state, "ask", queue)
     return {"final_response": reply}
-
-
-async def plan_node(state: AgentState) -> dict:
-    queue = state["_queue"]
-    reply = await _run_mode_turn(state, "plan", queue)
-    # Persist the plan so Coder can pick it up next turn / this turn.
-    try:
-        if reply.strip().startswith("## Plan"):
-            from tools import slugify
-
-            ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
-            state_db.save_plan(ws, "plan", reply, chat_id=state.get("chat_id", ""))
-    except Exception:  # noqa: BLE001
-        pass
-    return {"plan": reply, "final_response": reply}
 
 
 async def coder_entry(state: AgentState) -> dict:
@@ -2638,10 +2620,13 @@ async def plan_build(state: AgentState) -> dict:
     reply = await _run_mode_turn(state, "plan", queue)
     try:
         if reply.strip().startswith("## Plan"):
-            from tools import slugify
+            from tools import slugify, _self_check_plan_paths
 
             ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
             state_db.save_plan(ws, "plan", reply, chat_id=state.get("chat_id", ""))
+            check_note = _self_check_plan_paths(state["root"], reply)
+            if check_note:
+                queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
     except Exception:  # noqa: BLE001
         pass
     return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}

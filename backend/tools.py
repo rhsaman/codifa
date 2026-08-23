@@ -2831,34 +2831,6 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
-    async def save_plan_tool(title: str, content: str) -> str:
-        """PLAN MODE ONLY. Save the implementation plan you just wrote as markdown in the user data folder (per-chat, never inside the workspace), so the user or Coder mode can pick it up. Each call OVERWRITES this chat's plan â€” call ONCE after your '## Plan' text is final, with `title` (short) and `content` (the full plan markdown). The ONE write capability plan mode has; never writes workspace files."""
-        emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
-        workspace_slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
-        try:
-            _state_db.save_plan(workspace_slug, title, content, chat_id=chat_id)
-        except Exception as exc:  # noqa: BLE001
-            msg = f"could not save plan: {exc}"
-            emit(_error_result("save_plan", msg))
-            return f"ERROR saving plan: {msg}"
-        check_note = _self_check_plan_paths(root, content)
-        emit(
-            {
-                "kind": "tool_result",
-                "tool": "save_plan",
-                "summary": "saved"
-                + (" (self-check flagged paths)" if check_note else ""),
-            }
-        )
-        return (
-            "Saved the plan to the app database for this workspace. "
-            "It will be offered again automatically on the next run in this workspace."
-            + check_note
-        )
-
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
         """Curate the project's durable memory (RAG notes, loaded every future session). If the user asks to remember/keep something (any language), call with action='add' THIS SAME turn â€” the tool call IS the save; saying "I'll remember" saves nothing. action: 'add' (text), 'replace' (subject= find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself (conventions, gotchas, build quirks, stated preferences). ENGLISH. No secrets, personal data, one-offs, or AGENTS.md content. Near cap prefer replace/remove."""
         emit(
@@ -3776,7 +3748,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
             _sub_tools = {
                 name: _invoke(fn)
                 for name, fn in _tool_source.items()
-                if name not in ("task", "update_plan", "save_plan", "vision")
+                if name not in ("task", "update_plan", "vision")
             }
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
@@ -4718,7 +4690,6 @@ Returns each match as a single `path:line:match` line (the matching line only â€
         "glob": glob_tool,
         "read": read_tool,
         "task": task_tool,
-        "save_plan": save_plan_tool,
         "web_search": web_search_tool,
         "search_console": search_console_tool,
         "fetch_url": fetch_url_tool,

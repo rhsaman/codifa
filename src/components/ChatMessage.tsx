@@ -418,20 +418,12 @@ function UsageBadge({
   )
 }
 
-// Any tool that MUTATES persistent state (workspace files, the memory vector
-// store, saved skills/MCP connectors) always renders as its own full, visible
-// card — never swept into the collapsed read-only group. Grouping a write
-// silently is worse than grouping a search: the user has no way to tell it
-// happened, which is exactly the "did this actually save?" confusion this set
-// exists to prevent. Explore sub-agents are also always-visible (isExploreCard
+// Only tools that write to the workspace filesystem always render as their
+// own full, visible card (diff + revert) — every other tool (including
+// memory/skill/connector saves) sweeps into the collapsed Claude-app-style
+// trace group. Explore sub-agents are also always-visible (isExploreCard
 // below) so the explorer never hides inside the collapsed group.
-const ALWAYS_VISIBLE_TOOLS = new Set([
-  'write_file',
-  'edit_file',
-  'memory',
-  'create_skill',
-  'create_mcp',
-])
+const ALWAYS_VISIBLE_TOOLS = new Set(['write_file', 'edit_file'])
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
  *  2+ consecutive read-only/non-mutating tool calls (grep/glob/read/
@@ -544,24 +536,9 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
 
   const flush = (key: string) => {
     if (pending.length === 0) return
-    if (pending.length === 1) {
-      const { activity, index } = pending[0]
-      nodes.push(
-        <ToolCallView
-          key={key}
-          activity={activity}
-          onReverted={() => useStore.getState().markToolReverted(message.id, index)}
-        />,
-      )
-    } else {
-      nodes.push(
-        <ToolGroupView
-          key={key}
-          activities={pending}
-          onReverted={(idx) => useStore.getState().markToolReverted(message.id, idx)}
-        />,
-      )
-    }
+    // Always a collapsible trace group (even for a single call) so grouping
+    // behavior stays uniform and predictable, matching Claude.ai's own trace.
+    nodes.push(<ToolGroupView key={key} activities={pending} />)
     pending = []
   }
 

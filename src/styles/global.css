@@ -6640,20 +6640,13 @@ textarea {
   background: color-mix(in srgb, var(--tool-color) 10%, transparent);
 }
 
-/* Counter: "N tool calls" as plain weighted text — matches Claude-app's
-   quiet summary line rather than a saturated capsule. */
+/* Summary sentence ("9 commands, 3 searches, 2 notes") as plain weighted
+   text — matches Claude-app's quiet trace line rather than a saturated
+   capsule + separate detail chip. Ellipsizes if the head runs out of room. */
 .tool-group-label {
-  font-weight: 600;
-  font-size: 11px;
-  color: var(--text);
-  white-space: nowrap;
-}
-
-.tool-group-detail {
-  font-size: 11px;
+  font-weight: 500;
+  font-size: 12px;
   color: var(--text-dim);
-  opacity: 0.9;
-  /* Ellipsize only when the group head runs out of room. */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6679,56 +6672,83 @@ textarea {
   color: var(--accent);
 }
 
-/* Stacked-cards glyph: the group is a "bundle" of calls — visually distinct
-   from a single tool card (left bar) and from explore (tree). */
-.tool-group-stack {
+/* Expanded trace: a flat vertical timeline — a quiet spine line with one
+   plain row per call (icon + label + status), no per-row card/border. This
+   is the Claude.ai-style expand: a list you scan, not a stack of boxes. */
+.tool-timeline {
   position: relative;
-  width: 15px;
-  height: 15px;
+  padding: 4px 10px 6px 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.tool-timeline::before {
+  content: '';
+  position: absolute;
+  left: 19px;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: var(--hairline);
+}
+
+.tool-timeline-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.tool-timeline-icon {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1;
+  background: var(--bg-panel);
+}
+
+.tool-timeline-icon .spinner {
+  width: 11px;
+  height: 11px;
+  border-width: 2px;
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  border-top-color: var(--accent);
+}
+
+.tool-timeline-label {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
   flex: 0 0 auto;
 }
 
-.tool-group-stack::before,
-.tool-group-stack::after {
-  content: '';
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  width: 11px;
-  height: 11px;
-  border-radius: 3px;
-  border: 1.5px solid color-mix(in srgb, var(--accent) 80%, transparent);
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+.tool-timeline-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
-.tool-group-stack::before {
-  transform: translate(-2px, -2px);
-}
-
-.tool-group-stack::after {
-  transform: translate(2px, 2px);
-  opacity: 0.65;
-}
-
-.tool-group-body {
-  padding: 6px;
-  border-top: 1px solid var(--hairline);
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-/* Nested cards flatten to a quieter inset surface so the group stays the
-   dominant shape and the calls read as rows inside it. */
-.tool-group-body .tool-card {
-  border: 1px solid var(--hairline);
-  background: var(--bg-hover);
-}
-
-/* Keep the group's color identity when expanded, so a call never changes
-   color between the collapsed preview and the open group. */
-.tool-group-body .tool-card:not(.explore) {
-  --tool-color: color-mix(in srgb, var(--accent) 70%, var(--bg));
+.tool-timeline-item .status-ok,
+.tool-timeline-item .status-err,
+.tool-timeline-item .status-denied {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 /* Collapsed preview: the newest 3 calls as a cascading stack of mini-cards.

@@ -189,7 +189,9 @@ def classify_mode(prompt: str, fallback: str = "ask") -> str:
         return "ask"
     if text.startswith("/explore") and (len(text) == 8 or text[8] in " \n\t"):
         return "explore"
-    if fallback in ("ask", "plan", "coder", "explore"):
+    if text.startswith("/reader") and (len(text) == 6 or text[6] in " \n\t"):
+        return "reader"
+    if fallback in ("ask", "plan", "coder", "explore", "reader"):
         return fallback
     return "ask"
 
@@ -283,7 +285,7 @@ def filter_tools_for_mode(
     # runs it only when the question is project-related (gated in ask_entry),
     # otherwise it answers directly. Skills injected as system context are the
     # only ask special-case.
-    if mode in ("plan", "explore", "ask"):
+    if mode in ("plan", "explore", "ask", "reader"):
         for _n in ("glob", "grep", "read", "task"):
             tools.pop(_n, None)
     if mode == "coder":
@@ -296,8 +298,8 @@ def filter_tools_for_mode(
         tools.pop("save_plan", None)
     if mode == "ask":
         tools.pop("memory", None)
-    if mode == "explore":
-        # Exploration is already done; only on-demand capabilities remain.
+    if mode in ("explore", "reader"):
+        # Discovery is already done; only on-demand capabilities remain.
         tools = {
             n: fn
             for n, fn in tools.items()
@@ -548,7 +550,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 )
         except Exception:  # noqa: BLE001
             pass
-    attached = _agents._load_attachments(root, attachments)
+    attached = (
+        _agents._load_attachments(root, attachments)
+        if state.get("mode") != "reader"
+        else []
+    )
     if attached:
         workspace_note += (
             "\n\nThe user attached files and their full contents appear at the START "
@@ -569,7 +575,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     system_final = (
         _agents._mode_declare(mode)
         + _agents._language_directive(prompt)
-        + ("" if mode in ("coder", "ask", "plan", "explore") else _agents._SEARCH_RULE)
+        + ("" if mode in ("coder", "ask", "plan", "explore", "reader") else _agents._SEARCH_RULE)
         + base_prompt
         + workspace_note
     )
@@ -592,6 +598,18 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "web-search on your own initiative. vision / skills / MCP connectors are "
             "available on demand when the question needs external info or attached "
             "images."
+        )
+    if mode == "reader":
+        system_final += (
+            "\n\nFILE CONTEXT: the explicitly specified file(s) have been read for "
+            "you by a deterministic pipeline (targeted line ranges from path:LINE "
+            "refs, an in-file grep of the question's keywords, or a bounded head) and "
+            "are injected above as 'SPECIFIED FILE CONTENTS'. Use THAT context. The "
+            "search tools (glob/grep/read) are NOT available to you -- never try to "
+            "call them. web_search / fetch_url are ONLY present when the user "
+            "explicitly asks to search the web -- never web-search on your own "
+            "initiative. vision / skills / MCP connectors are available on demand "
+            "when the question needs external info or attached images."
         )
 
     try:
@@ -1688,6 +1706,75 @@ def _resolve_file_refs(texts, root) -> list[str]:
     return out
 
 
+# ----- Reader (targeted file reading, no repo discovery) -------------------
+
+READER_CONTEXT_LINES = 30
+READER_HEAD_LINES = 200
+READER_MAX_FILES = 15
+
+
+def _explicit_files(state: AgentState) -> list[str]:
+    """Workspace-relative paths the user explicitly pointed at THIS turn:
+    attachments + the open Neovim file + any file named directly in the request.
+    Used both for routing (ask -> reader) and for the reader's read set."""
+    root = state["root"]
+    attachments = state.get("attachments")
+    nvim_file = state.get("nvim_file", "")
+    files = list(_agents._scoped_rels(root, attachments, nvim_file))
+    for f in _resolve_file_refs([state.get("request", "")], root):
+        if f not in files:
+            files.append(f)
+    return files
+
+
+def _parse_line_refs(
+    request: str, files: list[str]
+) -> dict[str, list[tuple[int, int | None]]]:
+    """Map each explicit file to ``(start, end|None)`` line ranges cited in the
+    request as ``path:123``, ``path#L123`` or ``path:123-145``."""
+    refs: dict[str, list[tuple[int, int | None]]] = {}
+    for rel in files:
+        esc = re.escape(rel)
+        for m in re.finditer(rf"{esc}[:#]L?(\d+)(?:-(\d+))?", request):
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.group(2) else None
+            refs.setdefault(rel, []).append((a, b))
+    return refs
+
+
+def _in_file_grep(root: str, rel: str, patterns: list[re.Pattern]) -> set[int]:
+    """Return 1-indexed line numbers of ``rel`` matching any of ``patterns``."""
+    try:
+        target = _agents.resolve_safe(root, rel)
+    except Exception:  # noqa: BLE001
+        return set()
+    try:
+        with open(target, "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return set()
+    out: set[int] = set()
+    for i, line in enumerate(lines, 1):
+        for rx in patterns:
+            if rx.search(line):
+                out.add(i)
+                break
+    return out
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    rs = sorted(ranges)
+    merged: list[list[int]] = [list(rs[0])]
+    for a, b in rs[1:]:
+        if a <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
 # ----- Repo-discovery nodes (deterministic) -------------------------------
 
 
@@ -1951,13 +2038,16 @@ async def ask_entry(state: AgentState) -> dict:
 
 def _route_ask_entry(state: AgentState) -> str:
     request = state.get("request", "")
-    # Explore only when THIS message references a real file or uses a strong
-    # repo cue. We deliberately do NOT scan the whole history here: the agent's
-    # own prior replies cite file paths, so a history scan would re-trigger
-    # exploration on every subsequent message. The "ببینش about an earlier
-    # file" case is handled by the narrow reference-cue + history check below.
-    if _resolve_file_refs([request], state["root"]):
-        return "repo_derive"
+    # When the user explicitly points at file(s) THIS turn -- an attachment, the
+    # open Neovim file, or a file named directly in the message -- the question is
+    # about THOSE files, so route to the Reader agent, which reads only the needed
+    # parts (no repo-wide discovery / glob).
+    if _explicit_files(state):
+        return "reader"
+    # Otherwise: explore only on a strong repo cue, or a "ببینش about an earlier
+    # file" reference (handled by the narrow reference-cue + history check). We
+    # deliberately do NOT scan the whole history for a file ref here, or the
+    # agent's own prior replies would re-trigger exploration every message.
     if _ask_needs_repo(request):
         return "repo_derive"
     if _has_reference_cue(request) and _resolve_file_refs(
@@ -1979,10 +2069,109 @@ async def ask_answer(state: AgentState) -> dict:
     return {"final_response": reply}
 
 
+async def reader_read(state: AgentState) -> dict:
+    """Deterministically gather ONLY the needed parts of the explicitly specified
+    file(s) -- no LLM, no repo-wide glob/grep.
+
+    Per file, in order of preference:
+      * explicit ``path:LINE`` / ``path#L123`` / ``path:123-145`` refs -> read that range;
+      * otherwise an in-file grep of the question's deterministic keywords -> read each
+        match expanded by ``READER_CONTEXT_LINES``;
+      * fallback (no refs, no keywords) -> a bounded head, never the whole file.
+    """
+    queue = state["_queue"]
+    root = state["root"]
+    request = state.get("request", "")
+    files = _explicit_files(state)[:READER_MAX_FILES]
+    if not files:
+        return {"read_context": ""}
+    spec = _derive_explore_patterns(request)
+    patterns: list[re.Pattern] = []
+    for p in (spec.get("grep", []) or [])[:24]:
+        try:
+            patterns.append(re.compile(p))
+        except re.error:
+            continue
+    line_refs = _parse_line_refs(request, files)
+    tools = _make_explore_tools(state, queue)
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        queue.put_nowait(
+            {
+                "kind": "tool",
+                "tool": "read",
+                "args": {"filePath": f},
+                "summary": f"reading targeted parts of {f}",
+            }
+        )
+        ranges: list[tuple[int, int]] = []
+        if f in line_refs:
+            for a, b in line_refs[f]:
+                end = b or a
+                ranges.append((max(1, a - READER_CONTEXT_LINES), end + READER_CONTEXT_LINES))
+        elif patterns:
+            for n in sorted(_in_file_grep(root, f, patterns)):
+                ranges.append((max(1, n - READER_CONTEXT_LINES), n + READER_CONTEXT_LINES))
+        else:
+            ranges.append((1, READER_HEAD_LINES))
+        for a, b in _merge_ranges(ranges):
+            limit = b - a + 1
+            res = await _run_repo_tool(tools, "read", filePath=f, offset=a, limit=limit)
+            chunk = f"--- {f}:{a}-{b} ---\n{res}"
+            parts.append(chunk)
+            total += len(chunk)
+            if total >= MAX_EXPLORE_READ_CHARS:
+                break
+        queue.put_nowait(
+            {"kind": "tool_result", "tool": "read", "summary": f"read {f}", "status": "ok"}
+        )
+        if total >= MAX_EXPLORE_READ_CHARS:
+            break
+    return {"read_context": "\n\n".join(parts), "reader_files": files}
+
+
+def _build_reader_context(state: AgentState) -> str:
+    rc = state.get("read_context", "")
+    if not rc:
+        return ""
+    return (
+        "SPECIFIED FILE CONTENTS (read deterministically -- do NOT call "
+        "glob/grep/read; use only this context):\n" + rc
+    )
+
+
+async def reader_answer(state: AgentState) -> dict:
+    # Reader is a distinct agent persona; make build_turn_context treat it as such
+    # (correct system note + tool gating), even when auto-triggered from ask mode.
+    state["mode"] = "reader"
+    queue = state["_queue"]
+    extra = _build_reader_context(state)
+    reply = await _run_mode_turn(state, "reader", queue, extra_instruction=extra)
+    return {"final_response": reply}
+
+
 async def plan_understand(state: AgentState) -> dict:
     # Deterministic comprehension is folded into repo_derive; this node exists so
     # the PLAN flow has an explicit "understand -> discover" shape.
     return {}
+
+
+def _route_plan_understand(state: AgentState) -> str:
+    # When the user points at specific file(s) in PLAN mode, read ONLY those
+    # (targeted, no repo-wide discovery) and let the planner build from that
+    # context. Otherwise run the full repo-discovery pipeline as before.
+    if _explicit_files(state):
+        return "reader_read"
+    return "repo_derive"
+
+
+def _route_reader_dispatch(state: AgentState) -> str:
+    # After the targeted read, hand off to the right consumer: PLAN mode feeds
+    # the read context to the planner; everything else gets the Reader answer.
+    if state.get("mode") == "plan":
+        return "plan_build"
+    return "reader_answer"
 
 
 async def plan_build(state: AgentState) -> dict:
@@ -2071,11 +2260,18 @@ def build_graph():
     # does discover it consumes the result and never re-searches from scratch.
     g.add_node("ask_entry", ask_entry)
     g.add_node("ask_answer", ask_answer)
+    g.add_node("reader_read", reader_read)
+    g.add_node("reader_answer", reader_answer)
     g.add_conditional_edges(
         "ask_entry", _route_ask_entry,
-        {"repo_derive": "repo_derive", "ask_answer": "ask_answer"},
+        {"repo_derive": "repo_derive", "ask_answer": "ask_answer", "reader": "reader_read"},
     )
     g.add_edge("ask_answer", "done")
+    g.add_conditional_edges(
+        "reader_read", _route_reader_dispatch,
+        {"reader_answer": "reader_answer", "plan_build": "plan_build"},
+    )
+    g.add_edge("reader_answer", "done")
     # PLAN flow.
     g.add_node("plan_understand", plan_understand)
     g.add_node("plan_build", plan_build)
@@ -2091,11 +2287,15 @@ def build_graph():
     g.add_edge(START, "router")
     g.add_conditional_edges(
         "router", _route_mode,
-        {"ask": "ask_entry", "plan": "plan_understand", "coder": "coder_entry", "explore": "repo_derive"},
+        {"ask": "ask_entry", "plan": "plan_understand", "coder": "coder_entry",
+         "explore": "repo_derive", "reader": "reader_read"},
     )
 
-    # PLAN: understand -> discover -> build -> validate (loop) -> coder.
-    g.add_edge("plan_understand", "repo_derive")
+    # PLAN: understand -> (targeted reader_read | full repo_derive) -> build -> validate.
+    g.add_conditional_edges(
+        "plan_understand", _route_plan_understand,
+        {"reader_read": "reader_read", "repo_derive": "repo_derive"},
+    )
     g.add_edge("plan_build", "plan_validate")
     g.add_conditional_edges(
         "plan_validate", _route_plan_validate,

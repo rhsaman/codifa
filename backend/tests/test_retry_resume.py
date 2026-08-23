@@ -173,7 +173,9 @@ async def test_planner_500_degrades_without_error_event(run_events):
     mock.script = [text_reply("Done")]
     mock.error_at = {0: (500, "server error")}
 
-    events = await run_events("read app.py and summarize it", mode="plan")
+    # Broad plan (no specific file) so the turn routes through repo_derive, whose
+    # search-planner 500 must degrade to the deterministic fallback.
+    events = await run_events("make a plan for the auth system", mode="plan")
 
     assert not any(e.get("kind") == "error" for e in events), \
         "planner 500 must NOT surface as an error event (deterministic fallback)"

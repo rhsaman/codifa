@@ -21,6 +21,57 @@ const TOOL_LABEL: Record<string, string> = {
   vision: 'vision',
 }
 
+/** Small glyph per tool category, shown at the head of each collapsed-group
+ *  timeline row — lets the eye scan a run of calls without reading every
+ *  label (mirrors Claude-app's trace icons). */
+const TOOL_ICON: Record<string, string> = {
+  run_terminal: '❯',
+  list_files: '📁',
+  grep: '🔍',
+  glob: '🔍',
+  web_search: '🌐',
+  fetch_url: '🌐',
+  search_memory: '🧠',
+  memory: '🧠',
+  ask_user: '❓',
+  task: '🧩',
+  vision: '🖼',
+  create_skill: '⚙',
+  create_mcp: '🔌',
+}
+function toolIcon(tool: string): string {
+  return TOOL_ICON[tool] ?? '•'
+}
+
+/** Natural-language piece per tool category for the group header sentence
+ *  ("9 commands, 3 searches, 2 notes") — the Claude-app-style summary line
+ *  instead of a raw tool-name tally. */
+const TOOL_NOUN: Record<string, [string, string]> = {
+  run_terminal: ['command', 'commands'],
+  list_files: ['file listing', 'file listings'],
+  grep: ['search', 'searches'],
+  glob: ['search', 'searches'],
+  web_search: ['web search', 'web searches'],
+  fetch_url: ['page fetch', 'page fetches'],
+  search_memory: ['memory search', 'memory searches'],
+  memory: ['note', 'notes'],
+  ask_user: ['question', 'questions'],
+  task: ['sub-agent call', 'sub-agent calls'],
+  vision: ['image lookup', 'image lookups'],
+  create_skill: ['skill saved', 'skills saved'],
+  create_mcp: ['connector added', 'connectors added'],
+}
+function groupSummary(activities: ToolActivity[]): string {
+  const counts: Record<string, number> = {}
+  for (const a of activities) counts[a.tool] = (counts[a.tool] || 0) + 1
+  return Object.entries(counts)
+    .map(([tool, n]) => {
+      const noun = TOOL_NOUN[tool] ?? ['tool call', 'tool calls']
+      return `${n} ${n === 1 ? noun[0] : noun[1]}`
+    })
+    .join(', ')
+}
+
 /** A task card running the explore agent (opencode-style subagent). */
 export const isExploreCard = (a: ToolActivity) =>
   a.tool === 'task' && a.args?.subagent_type === 'explore'
@@ -274,34 +325,28 @@ function applyReverseDiff(diff: string, current: string): string {
   return content
 }
 
-/** Compact "N read-only calls" summary for a run of consecutive non-write tool
- *  activities, so a search-heavy turn doesn't stack a full row per call. Kept
- *  collapsed by default; expanding reveals the normal ToolCallView for each
- *  one (so args/summary/diff drill-down still works exactly as before). */
+/** Claude-app style trace group: a single collapsible summary line ("9
+ *  commands, 3 searches, 2 notes") for a run of consecutive non-write tool
+ *  activities. Collapsed by default — no preview stack. Expanding reveals a
+ *  flat vertical timeline (icon + label + status per call), not a stack of
+ *  full cards, matching Claude.ai's own tool-trace UI. */
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
-  onReverted,
 }: {
   activities: { activity: ToolActivity; index: number }[]
-  onReverted: (index: number) => void
+  onReverted?: (index: number) => void
 }) {
   const [open, setOpen] = useState(false)
   const running = activities.some((a) => a.activity.status === 'running')
   const errored = activities.every((a) => a.activity.status === 'error')
   const denied = activities.every((a) => a.activity.status === 'denied')
   const totalMs = activities.reduce((sum, a) => sum + (a.activity.elapsedMs || 0), 0)
-
-  const counts: Record<string, number> = {}
-  for (const { activity } of activities) {
-    counts[activity.tool] = (counts[activity.tool] || 0) + 1
-  }
-  const detail = Object.entries(counts)
-    .map(([tool, n]) => `${n} ${TOOL_LABEL[tool] ?? tool}`)
-    .join(', ')
+  const summary = groupSummary(activities.map((a) => a.activity))
 
   return (
     <div className={`tool-group ${errored ? 'error' : running ? 'running' : denied ? 'denied' : 'done'}`}>
       <button className={`tool-group-head ${open ? 'open' : ''}`} onClick={() => setOpen((o) => !o)}>
+        <span className={`chev ${open ? 'open' : ''}`}>▾</span>
         {running ? (
           <span className="spinner" />
         ) : errored ? (
@@ -311,23 +356,15 @@ export const ToolGroupView = memo(function ToolGroupView({
         ) : (
           <span className="status-ok">✓</span>
         )}
-        <span className="tool-group-stack" aria-hidden="true" />
-        <span className="tool-group-label">{activities.length} tool calls</span>
-        <span className="tool-group-detail">{detail}</span>
+        <span className="tool-group-label">{summary}</span>
         <span className="tool-ms">{fmtTime(totalMs)}</span>
-        <span className={`chev ${open ? 'open' : ''}`}>▾</span>
       </button>
-      {!open && <ToolCascade activities={activities.map((a) => a.activity)} />}
       {open && (
-        <div className="tool-group-body">
+        <div className="tool-timeline">
           {activities.map(({ activity, index }) => (
-            <ToolCallView
-              key={index}
-              activity={activity}
-              onReverted={() => onReverted(index)}
-            />
+            <ToolTimelineRow key={index} activity={activity} />
           ))}
-      </div>
+        </div>
       )}
     </div>
   )
@@ -430,6 +467,43 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
         {subSummary}
       </span>
       {activity.summary && <span className="tool-sub-summary">{activity.summary}</span>}
+      <span className="tool-ms">{fmtTime(ms)}</span>
+    </div>
+  )
+})
+
+/** One row in a group's expanded timeline: category icon, tool label, a
+ *  one-line arg summary, status glyph and elapsed time — flat text, no card
+ *  border/background, connected by the `.tool-timeline` spine. Mirrors
+ *  Claude.ai's own trace rows (icon + short description) rather than the
+ *  boxed mini-cards the old cascade preview used. */
+const ToolTimelineRow = memo(function ToolTimelineRow({ activity }: { activity: ToolActivity }) {
+  const [now, setNow] = useState(() => Date.now())
+  const running = activity.status === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 500)
+    return () => clearInterval(t)
+  }, [running])
+  const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  const detail = subArgSummary(activity)
+  return (
+    <div className={`tool-timeline-item ${activity.status}`}>
+      <span className="tool-timeline-icon" aria-hidden="true">
+        {running ? <span className="spinner" /> : toolIcon(activity.tool)}
+      </span>
+      <span className="tool-timeline-label">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
+      {activity.model && (
+        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
+          {activity.model}
+        </span>
+      )}
+      {detail && (
+        <span className="tool-timeline-detail" title={detail}>
+          {detail}
+        </span>
+      )}
+      <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
     </div>
   )

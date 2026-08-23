@@ -1564,6 +1564,45 @@ async def _llm_derive_explore_patterns(request: str, tree_str: str, model) -> di
     return {"glob": glob, "grep": grep, "queries": queries}
 
 
+_LLM_CONDENSE_SYSTEM = (
+    "You are a context condenser for a code-exploration agent. You are given the "
+    "user's request and the raw file contents + grep matches that an earlier "
+    "deterministic search discovered. Produce a SINGLE compact markdown block that "
+    "the planning agent will use as its exploration context.\n"
+    "Rules:\n"
+    "- Keep ONLY content relevant to fulfilling the request: key function/class "
+    "signatures, the specific code the request touches, config values, and exact "
+    "file paths (with line ranges where useful).\n"
+    "- Drop boilerplate, unrelated modules, imports-only files, and verbatim "
+    "duplication between grep hits and full reads.\n"
+    "- Be CONSERVATIVE: when unsure whether something is needed, KEEP it. Missing "
+    "information forces an expensive re-exploration.\n"
+    "- Do NOT answer the request, do not add commentary, do not invent files. "
+    "Output markdown only, no preamble."
+)
+
+
+async def _llm_condense_explore_context(
+    request: str, read_context: str, grep_results: list[str], model
+) -> str | None:
+    """Condense the discovered context into a single relevant markdown block.
+
+    Input is ONLY the request + the explored contents (no conversation history),
+    so the condenser never sees the whole chat. Returns the condensed text, or
+    ``None`` on any failure so the caller keeps the raw context (no data loss)."""
+    grep_block = "\n\n".join(grep_results) if grep_results else "(none)"
+    user = (
+        f"REQUEST:\n{request or ''}\n\n"
+        f"DISCOVERED FILE CONTENTS:\n{read_context or '(none)'}\n\n"
+        f"GREP MATCHES:\n{grep_block}"
+    )
+    try:
+        text, _ = await llm_generate(model, system=_LLM_CONDENSE_SYSTEM, user=user)
+    except Exception:  # noqa: BLE001
+        return None
+    return (text or "").strip() or None
+
+
 def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     """Build the glob/grep/read tool callbacks (no network, no extra LLM)."""
     root = state["root"]
@@ -1878,6 +1917,13 @@ def _build_explore_context(state: AgentState) -> str:
     ]
     if state.get("explore_tree"):
         parts.append("PROJECT TREE:\n" + state["explore_tree"])
+    # When the exploration was condensed (repo_condense), prefer that single
+    # compact block -- it already folds in the relevant grep hits, so we emit it
+    # instead of the raw read dump + separate grep section.
+    condensed = state.get("condensed_context", "")
+    if condensed:
+        parts.append("RELEVANT FILE CONTENTS (condensed from exploration):\n" + condensed)
+        return "\n\n".join(parts)
     greps = state.get("grep_results") or []
     rc = state.get("read_context", "")
     # Files already fully read below would otherwise be injected twice (once as
@@ -2439,6 +2485,64 @@ async def repo_read(state: AgentState) -> dict:
     return {"read_context": "\n\n".join(parts)}
 
 
+async def repo_condense(state: AgentState) -> dict:
+    """Condense the discovered exploration context into one compact block so the
+    planner/explainer receives only what's relevant.
+
+    Token-efficiency: ``read_context`` (up to ~24k chars) is otherwise re-sent on
+    every planner tool step and on every re-explore. Condensing it ONCE here, and
+    having ``_build_explore_context`` prefer the result, removes that repeat cost.
+
+    The condenser runs ONCE per exploration and sees ONLY the request + explored
+    contents (never the conversation history). It uses the SAME model configured
+    for history compaction (Settings -> Tools -> compact model) -- one setting
+    controls both -- falling back to the main model when unset. Skipped
+    (returns nothing) when there's nothing to condense, when the raw context is
+    trivially small (the call wouldn't pay for itself), or when the LLM fails
+    (raw context is kept, never dropped)."""
+    rc = state.get("read_context", "")
+    if not rc:
+        return {}
+    # Below this size the raw context is already small enough that the extra LLM
+    # pass wouldn't save tokens -- use it directly.
+    if len(rc) < 4000:
+        return {}
+    sub = state.get("subagent_models") or {}
+    _providers = state.get("providers") or {}
+    _provider_lookup = (
+        lambda pid: (_providers.get(pid) if isinstance(_providers, dict) else None)
+    )
+    model = resolve_subagent_model(
+        state["provider"], sub.get("compact"), state["base_url"],
+        state["api_key"], state["env_var"], state["oauth_token"],
+        state["model_name"], provider_lookup=_provider_lookup,
+    )
+    if model is None:
+        return {}
+    grep = state.get("grep_results") or []
+    condensed = await _llm_condense_explore_context(
+        state.get("request", ""), rc, grep, model
+    )
+    if not condensed:
+        # LLM failed / returned nothing -> keep the raw context (never lose data)
+        return {}
+    queue = state["_queue"]
+    queue.put_nowait(
+        {
+            "kind": "tool", "tool": "repo_condense",
+            "args": {"chars": len(rc)},
+            "summary": f"condensing {len(rc)} chars of exploration",
+        }
+    )
+    queue.put_nowait(
+        {
+            "kind": "tool_result", "tool": "repo_condense",
+            "summary": f"{len(condensed)} chars", "status": "ok",
+        }
+    )
+    return {"condensed_context": condensed}
+
+
 # ----- Mode nodes that consume the deterministic context ------------------
 
 
@@ -2759,6 +2863,7 @@ def build_graph():
     g.add_node("repo_glob", repo_glob)
     g.add_node("repo_grep", repo_grep)
     g.add_node("repo_read", repo_read)
+    g.add_node("repo_condense", repo_condense)
 
     g.add_edge(START, "router")
     g.add_conditional_edges(
@@ -2788,8 +2893,9 @@ def build_graph():
     g.add_edge("repo_derive", "repo_glob")
     g.add_edge("repo_glob", "repo_grep")
     g.add_edge("repo_grep", "repo_read")
+    g.add_edge("repo_read", "repo_condense")
     g.add_conditional_edges(
-        "repo_read", _route_repo_dispatch,
+        "repo_condense", _route_repo_dispatch,
         {"plan_build": "plan_build", "explore_analyze": "explore_analyze",
          "coder": "coder", "ask_answer": "ask_answer"},
     )

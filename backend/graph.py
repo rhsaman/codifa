@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import json
 import os
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypedDict
 
@@ -427,6 +429,38 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
         return None
 
 
+def _build_skills_section(picked_names: list[str], root: str) -> str:
+    """Assemble the SKILLS section for ``build_turn_context``.
+
+    Attached/picked skills have their FULL body inlined (so the agent adopts
+    the skill's role and follows its instructions); every other known skill is
+    listed compactly in ``AVAILABLE SKILLS`` (name + description only). When
+    nothing is loaded, returns an empty string.
+
+    This is intentionally independent of ``_skill_names_to_strip``: stripping a
+    skill's *name* out of the search-keyword derivation must never prevent its
+    *body* from being inlined here — the skill is still fully used."""
+    all_skills = _agents._load_skills(root)
+    if not all_skills:
+        return ""
+    picked: list[dict] = []
+    manual_names = [n.strip() for n in picked_names if n and n.strip()]
+    if manual_names:
+        by_name = {s["name"].lower(): s for s in all_skills}
+        picked = [by_name[n.lower()] for n in manual_names if n.lower() in by_name]
+    section = _agents._skills_section(
+        [s for s in all_skills if s["name"] not in {p["name"] for p in picked}]
+    )
+    if picked:
+        bodies = "\n\n".join(
+            f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
+            f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
+            for s in picked
+        )
+        section = "\n\n=== ATTACHED SKILLS ===\n" + bodies + section
+    return section
+
+
 async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     """Assemble everything one mode-turn needs: system prompt, history messages,
     the mode-filtered tool set, and the LangChain chat model.
@@ -668,24 +702,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             pass
 
     # Skills.
-    all_skills = _agents._load_skills(root)
-    picked: list[dict] = []
-    manual_names = [n.strip() for n in (skills or []) if n and n.strip()]
-    if manual_names:
-        by_name = {s["name"].lower(): s for s in all_skills}
-        picked = [by_name[n.lower()] for n in manual_names if n.lower() in by_name]
-    if all_skills:
-        section = _agents._skills_section(
-            [s for s in all_skills if s["name"] not in {p["name"] for p in picked}]
-        )
-        if picked:
-            bodies = "\n\n".join(
-                f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
-                f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
-                for s in picked
-            )
-            section = "\n\n=== ATTACHED SKILLS ===\n" + bodies + section
-        system_final += section
+    system_final += _build_skills_section(skills or [], root)
 
     if mode in ("plan", "coder"):
         try:
@@ -732,35 +749,38 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         user_parts.append(scouted)
     if prompt:
         user_parts.append(prompt)
-    # When a vision model is configured we analyze the attached images
-    # SERVER-SIDE (with the vision model) and inject the result, so the main
-    # model always "sees" them — it cannot view the raw image (stripped below)
-    # and must not have to remember to call a vision tool. The vision model is
-    # used directly; there is no fallback to the main model.
-    if image_uris and vision_model:
-        _analysis = await _vision_analyze(vision_model, image_uris)
+    # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
+    # vision model, but FALL BACK to the main model (mirroring the `vision`
+    # tool's own fallback) so an attached image is ALWAYS analyzed
+    # automatically — the agent must not need to be told "look at the image".
+    # If even the fallback model can't analyze it, we surface a note rather
+    # than attaching raw bytes that would just 400.
+    prefetch_model = vision_model or model
+    _analysis = None
+    if image_uris and prefetch_model:
+        _analysis = await _vision_analyze(prefetch_model, image_uris)
         if _analysis:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
-                f"image(s); this is what they show]\n{_analysis}"
+                f"image(s); this is what they show — treat it as part of the "
+                f"request]\n{_analysis}"
             )
         else:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
-                f"image(s) but the configured vision model "
-                f"({getattr(vision_model, 'model_name', '') or 'unknown'}) failed to "
-                f"analyze them. It may not support images or is misconfigured in "
+                f"image(s) but the vision model "
+                f"({getattr(prefetch_model, 'model_name', '') or 'unknown'}) failed "
+                f"to analyze them. It may not support images or is misconfigured in "
                 f"Settings → Subagents → Vision.]"
             )
     elif image_uris:
-        # No vision model: the raw images are attached directly to the main
-        # model below, so just note their presence.
+        # No model available at all (only if `model` itself failed to build).
         user_parts.append(
             f"[context] {len(image_uris)} image(s) are attached and visible to you as "
             "image content."
         )
     user_content: Any
-    if image_uris and (not vision_model or not vision_tool_available):
+    if image_uris and (not prefetch_model or not vision_tool_available) and not _analysis:
         content_blocks = [{"type": "text", "text": "\n\n".join(user_parts)}]
         for uri in image_uris:
             content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
@@ -1274,6 +1294,102 @@ _STOPWORDS = set(
 )
 
 
+def _strip_skill_mentions(prompt: str, skills: list[str] | None) -> str:
+    """Drop attached-skill names from a prompt so the skill's own words don't
+    leak into the glob/grep search-pattern derivation.
+
+    A skill can surface in many forms — an ``@slug`` mention, the raw slug
+    (``anthropic-frontend-design``), the human-readable TITLE with spaces
+    (``Anthropic Frontend Design``), or a reordered / comma-joined variant the
+    model echoes back (``Anthropic, Design, Frontend``). We scrub every
+    permutation of the name's words across space / comma / hyphen / underscore
+    separators as a whole phrase, so the explorer never extracts the title's
+    words (Anthropic/Frontend/Design) as grep keywords. The skill BODY still
+    drives the agent via the system prompt; only the skill's *name* leaves the
+    keywords."""
+    prompt = prompt or ""
+    names = [s.strip() for s in (skills or []) if s and s.strip()]
+    if not names:
+        return prompt
+    lowered = {n.lower() for n in names}
+
+    # Every textual variant of an attached skill name we should scrub.
+    phrases: set[str] = set()
+    for n in names:
+        phrases.add(n)
+        words = [w for w in re.split(r"[\s_\-]+", n) if w]
+        if not words:
+            continue
+        spaced = " ".join(words)
+        phrases.add(spaced)
+        phrases.add(" ".join(w[:1].upper() + w[1:] for w in words))
+        # Every permutation of the name's words, joined by each separator —
+        # catches reordered / comma-joined echoes (Anthropic, Design, Frontend)
+        # exactly instead of only the canonical ordering.
+        if len(words) > 1:
+            for perm in itertools.permutations(words):
+                for sep in (" ", ", ", "-", "_"):
+                    phrases.add(sep.join(perm))
+
+    def _at(m: "re.Match") -> str:
+        tok = m.group(1).lower()
+        if tok in lowered:
+            return " "
+        return m.group(0)
+
+    prompt = re.sub(r"@([A-Za-z0-9_\-]+)", _at, prompt)
+    for v in phrases:
+        if not v:
+            continue
+        prompt = re.sub(rf"(?i)\b{re.escape(v)}\b", " ", prompt)
+    return prompt
+
+
+def _skill_name_appears_in_text(name: str, text: str) -> bool:
+    """True if any textual form of ``name`` (spaced / hyphen / underscore /
+    comma-permuted) appears in ``text``.
+
+    Used to scrub ONLY skills the user actually referenced, so an unrelated
+    skill whose name happens to coincide with a legitimate request word is
+    never deleted from the derive keywords."""
+    text = (text or "").lower()
+    words = [w for w in re.split(r"[\s_\-]+", (name or "").lower()) if w]
+    if not words:
+        return False
+    forms = {name.lower(), " ".join(words)}
+    if len(words) > 1:
+        for perm in itertools.permutations(words):
+            forms.add(", ".join(perm))
+    return any(f and f in text for f in forms)
+
+
+def _skill_names_to_strip(state: AgentState) -> list[str]:
+    """Skill names to keep out of search keywords.
+
+    The attached skills (``state["skills"]``) are always scrubbed, plus any
+    skill the user referenced by name / @mention directly in the request. A
+    skill referenced only through an @mention may not appear in
+    ``state["skills"]`` (the frontend can send ``skills: []``), but its name is
+    still echoed in the message text — so we scrub it too.
+
+    We deliberately do NOT blanket-scrub every skill in the workspace: that
+    would wrongly delete legitimate request words that merely coincide with an
+    unrelated skill's name. The derive should keep only the words that help
+    locate files precisely and correctly."""
+    names = [s for s in (state.get("skills") or []) if s]
+    request = state.get("request") or ""
+    try:
+        for s in _agents._load_skills(state.get("root", "")):
+            n = (s.get("name") or "").strip()
+            if not n or n in names:
+                continue
+            if _skill_name_appears_in_text(n, request):
+                names.append(n)
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
 def _derive_explore_patterns(prompt: str) -> dict:
     """Turn a request into deterministic search patterns (no LLM)."""
     prompt = (prompt or "").strip()
@@ -1327,7 +1443,32 @@ def _derive_explore_patterns(prompt: str) -> dict:
             if len(grep_p) >= 16:
                 break
 
-    # 6. tree root from a mentioned top-level dir (a/b/...).
+    # 6. Semantic glob patterns from salient terms, so the deterministic
+    #    fallback still returns useful globs when the request has no explicit
+    #    path/extension (avoids near-empty globs that force the planner to
+    #    shell out to the terminal). Grounded in the request's own nouns.
+    salient: list[str] = []
+    for ident in re.findall(
+        r"\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)+|"
+        r"[a-z][a-z0-9_]*(?:_[a-z0-9_]+)+)\b",
+        prompt,
+    ):
+        if len(ident) >= 3 and ident.lower() not in _STOPWORDS:
+            salient.append(ident)
+    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", prompt):
+        if w.lower() not in _STOPWORDS and len(w) >= 4:
+            salient.append(w)
+    seen_s: set[str] = set()
+    for term in salient:
+        tl = term.lower()
+        if tl in seen_s:
+            continue
+        seen_s.add(tl)
+        glob_p.add(f"**/*{term}*")
+        if len(glob_p) >= 20:
+            break
+
+    # 7. tree root from a mentioned top-level dir (a/b/...).
     m = re.search(r"\b([a-z][a-z0-9_\-]+)\/[\w\-]", prompt)
     if m:
         tree_root = m.group(1)
@@ -1385,14 +1526,19 @@ def _extract_json_object(text: str) -> dict | None:
 _LLM_DERIVE_SYSTEM = (
     "You are a repository SEARCH PLANNER. Given the user's REQUEST and a "
     "truncated REPO TREE, output ONLY a JSON object (no prose, no markdown "
-    'fences) with these keys:\n'
-    '  "queries":  [natural-language phrases to investigate, e.g. '
-    '"authentication timeout"],\n'
-    '  "globs":    [glob patterns, e.g. "**/*auth*", "src/**/*.ts"],\n'
-    '  "keywords": [regex terms to grep, e.g. "timeout", "session"].\n'
-    "Prefer real paths that appear in the REPO TREE. Keep it focused: "
-    "queries<=8, globs<=10, keywords<=12. If the request is not about the "
-    "repository, return empty lists."
+    "fences) with these keys:\n"
+    '  "globs":    [VALID glob patterns GROUNDED IN THE REPO TREE — use the '
+    'actual directory/file names shown, e.g. "src/components/**/*Auth*.tsx", '
+    '"**/*session*.py"]. Prefer specific paths over bare "**/*"; each glob '
+    "must be syntactically valid and likely to match real files.\n"
+    '  "keywords": [regex terms to grep, e.g. "timeout", "SessionToken"].\n'
+    '  "queries":  [short natural-language phrases describing what to '
+    'investigate, e.g. "authentication timeout" — used for RANKING files, '
+    "NOT as grep patterns].\n"
+    "Do NOT include skill names, @mentions, or the request's framing words in "
+    "any field. Prefer real paths that appear in the REPO TREE. Keep it "
+    "focused: queries<=8, globs<=10, keywords<=12. If the request is not about "
+    "the repository, return empty lists."
 )
 
 
@@ -1441,6 +1587,20 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         permit={"outside": bool(state.get("allow_outside"))},
         store=store, chat_id=state.get("chat_id", ""),
     )
+    # Capture ask_user answers so a clarifying reply can re-trigger exploration
+    # (e.g. the planner asked "where is the current frontend?" and the user
+    # answered). Kept in a module dict keyed by chat_id and consumed by
+    # repo_derive + _route_plan_validate.
+    base_ask = tools.get("ask_user")
+    if base_ask is not None:
+        cid = state.get("chat_id", "")
+        async def _ask_wrapper(question, options=None):
+            answer = await base_ask(question, options)
+            if answer:
+                _ASK_ANSWERS[cid] = answer
+            return answer
+        tools["ask_user"] = _ask_wrapper
+    return tools
 
 
 async def _run_repo_tool(tools: dict, name: str, **kwargs) -> str:
@@ -1463,7 +1623,8 @@ def _parse_glob_files(text: str) -> list[str]:
         if not line or line.startswith("GLOB MATCHES") or line.startswith("("):
             continue
         if "/" in line or re.match(r"^[\w.\-]+\.\w+$", line):
-            out.append(line)
+            if not _is_excluded_discovery_path(line):
+                out.append(line)
     return out
 
 
@@ -1471,7 +1632,7 @@ def _parse_grep_files(text: str) -> list[str]:
     out: list[str] = []
     for line in (text or "").splitlines():
         m = re.match(r"^([^\s:]+):\d+:", line)
-        if m:
+        if m and not _is_excluded_discovery_path(m.group(1)):
             out.append(m.group(1))
     return out
 
@@ -1483,7 +1644,8 @@ def _build_tree(root: str, max_depth: int = 3, max_entries: int = 400) -> str:
     count = 0
     skip_dirs = {
         ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
-        "build", "target", ".mypy_cache", ".pytest_cache",
+        "build", "target", ".mypy_cache", ".pytest_cache", "skills",
+        "release", "_tmp_user_cfg",
     }
     base = root.rstrip(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1519,7 +1681,8 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
     skip_dirs = {
         ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
         "build", "target", ".mypy_cache", ".pytest_cache", ".next", "out",
-        "coverage", ".idea", ".vscode", ".turbo",
+        "coverage", ".idea", ".vscode", ".turbo", "skills", "release",
+        "_tmp_user_cfg",
     }
     out: list[str] = []
     base = root.rstrip(os.sep)
@@ -1541,6 +1704,42 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
             if len(out) >= max_files:
                 return out
     return out
+
+
+def _is_skill_path(path: str) -> bool:
+    """True for skill methodology files (e.g. ``backend/skills/*.md``).
+
+    Skills are already injected via the system prompt (AVAILABLE SKILLS /
+    inlined body), so the explore pipeline must never re-discover or read them
+    as project code — that wastes context and can confuse the planner into
+    treating a skill's instructions as something to modify."""
+    return "skills" in re.split(r"[/\\]", (path or "").strip())
+
+
+# Directories that must never be surfaced as project code during repo
+# discovery. Note: ``backend/tests/*.py`` (real test source) is intentionally
+# NOT excluded — test files are needed when the user asks to write tests.
+_EXCLUDED_DISCOVERY_DIRS = {"skills", "release", "_tmp_user_cfg"}
+
+
+def _is_excluded_discovery_path(path: str) -> bool:
+    """True for paths inside discovery-junk directories:
+
+    * ``skills`` — methodology, already injected via the system prompt.
+    * ``release`` — a full *bundled duplicate copy* of the app that ships
+      inside the repo (e.g. ``release/mac-arm64/.../backend/...``); walking it
+      double-counts the whole codebase and blows the discovery budget.
+    * ``_tmp_user_cfg`` — test-generated temp config (``plan.meta.json`` etc.),
+      not real source.
+
+    Test source (``backend/tests/*.py``) stays discoverable on purpose."""
+    return any(p in _EXCLUDED_DISCOVERY_DIRS for p in re.split(r"[/\\]", (path or "").strip()))
+
+
+# Captured ask_user answers, keyed by chat_id, so the search pipeline can
+# re-derive against a freshly-answered clarifying question (see repo_derive +
+# _route_plan_validate). Cleared by run_graph at the start of each run.
+_ASK_ANSWERS: dict[str, str] = {}
 
 
 def _rank_files_by_prompt(files: list[str], prompt: str) -> list[str]:
@@ -1644,6 +1843,33 @@ def _expand_imports(root: str, files: list[str], budget: int = 80) -> list[str]:
     return files + extra
 
 
+def _fully_read_files(read_context: str) -> set[str]:
+    """Files present as a FULL read in ``read_context`` (``=== <file> ===``).
+
+    Partial reads (``--- <file>:a-b ---``) are intentionally excluded: they may
+    not cover the grep-hit line, so their grep matches must stay."""
+    return {m.group(1) for m in re.finditer(r"^=== (.+?) ===$", read_context, re.MULTILINE)}
+
+
+def _dedup_grep_results(grep_results: list[str], fully_read: set[str]) -> list[str]:
+    """Drop grep-hit lines whose file was already injected in full via
+    ``read_context`` -- otherwise that file's content appears twice (once as
+    FILE CONTENTS READ, once as GREP MATCHES)."""
+    if not fully_read:
+        return list(grep_results)
+    out: list[str] = []
+    for block in grep_results:
+        kept: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^([^\s:]+):\d+:", line)
+            if m and m.group(1) in fully_read:
+                continue
+            kept.append(line)
+        if kept:
+            out.append("\n".join(kept))
+    return out
+
+
 def _build_explore_context(state: AgentState) -> str:
     parts = [
         "REPOSITORY EXPLORATION RESULTS (gathered deterministically -- do NOT "
@@ -1653,9 +1879,14 @@ def _build_explore_context(state: AgentState) -> str:
     if state.get("explore_tree"):
         parts.append("PROJECT TREE:\n" + state["explore_tree"])
     greps = state.get("grep_results") or []
+    rc = state.get("read_context", "")
+    # Files already fully read below would otherwise be injected twice (once as
+    # FILE CONTENTS READ, once as GREP MATCHES) -- drop those grep hits.
+    fully_read = _fully_read_files(rc)
+    if fully_read:
+        greps = _dedup_grep_results(greps, fully_read)
     if greps:
         parts.append("GREP MATCHES:\n" + "\n\n".join(greps)[:12000])
-    rc = state.get("read_context", "")
     if rc:
         parts.append("FILE CONTENTS READ:\n" + rc)
     return "\n\n".join(parts)
@@ -1777,36 +2008,229 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 # ----- Repo-discovery nodes (deterministic) -------------------------------
 
+# --- repo_derive SPEC cache (chat-scoped, content-free) --------------------
+# Caches ONLY the derived search PATTERNS (glob/grep/queries) that repo_derive
+# produces — NEVER file content. glob/grep/read always run LIVE against disk
+# on every single turn regardless of this cache, so a cache hit can never
+# return a stale ANSWER — it only skips the extra LLM planner call and the
+# repo-tree walk when the same normalized keywords were already explored in
+# this chat and nothing on disk has changed since (checked via a bounded
+# mtime signature, mirroring agents.py's `_SCOUT_CACHE`/`_scout_signature`).
+_SPEC_CACHE: dict[str, tuple[str, str, float, dict]] = {}
+_SPEC_CACHE_MAX_CHATS = 500
+# TTL mirrors the TASK memory tier (a few hours) — a cache entry from days ago
+# is more likely to reflect a finished, unrelated task than the current one.
+_SPEC_CACHE_TTL_SECONDS = 3 * 3600
+
+_TREE_CACHE: dict[str, tuple[str, str]] = {}
+_TREE_CACHE_MAX_ROOTS = 500
+
+_MTIME_SIG_SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
+    "build", "target", ".mypy_cache", ".pytest_cache", ".next", "out",
+    "coverage", ".idea", ".vscode", ".turbo",
+}
+
+
+def _repo_mtime_signature(root: str, max_entries: int = 4000) -> str:
+    """Cheap staleness signature for the whole tree: file count + the latest
+    mtime seen (bounded walk, same skip-dirs as `_build_tree`). Catches edits
+    and additions directly (a changed/new file bumps `latest`); catches
+    deletions/renames indirectly via the changed `count`. Never hashes file
+    CONTENT — only used to decide whether a cached SEARCH PLAN is still worth
+    reusing, never to skip an actual glob/grep/read.
+    """
+    count = 0
+    latest = 0.0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames if not d.startswith(".") and d not in _MTIME_SIG_SKIP_DIRS
+        )
+        for f in filenames:
+            if f.startswith("."):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            latest = max(latest, mtime)
+            count += 1
+            if count >= max_entries:
+                return f"{count}:{latest}"
+    return f"{count}:{latest}"
+
+
+def _spec_keyword_signature(request: str) -> str:
+    """Order-independent keyword-set signature for spec-cache matching, so a
+    reworded but semantically identical follow-up in the same chat still hits
+    (e.g. "where is the auth timeout handled" vs "auth timeout, where's that
+    handled")."""
+    toks = {t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", request or "")}
+    toks -= _STOPWORDS
+    return "|".join(sorted(toks))
+
+
+def _build_tree_cached(root: str, root_sig: str, max_depth: int = 3, max_entries: int = 400) -> str:
+    """Same output as `_build_tree`, skipping the walk when `root_sig` (an
+    already-computed `_repo_mtime_signature`) matches the last build for this
+    root — the tree walk repeats on every single repo_derive call otherwise.
+    """
+    cached = _TREE_CACHE.get(root)
+    if cached and cached[0] == root_sig:
+        return cached[1]
+    tree = _build_tree(root, max_depth=max_depth, max_entries=max_entries)
+    if len(_TREE_CACHE) >= _TREE_CACHE_MAX_ROOTS and root not in _TREE_CACHE:
+        _TREE_CACHE.pop(next(iter(_TREE_CACHE)))
+    _TREE_CACHE[root] = (root_sig, tree)
+    return tree
+
+
+def _spec_cache_get(chat_id: str, kw_sig: str, root_sig: str) -> dict | None:
+    if not chat_id or not kw_sig:
+        return None
+    entry = _SPEC_CACHE.get(chat_id)
+    if not entry:
+        return None
+    cached_kw, cached_root_sig, ts, spec = entry
+    if cached_kw != kw_sig or cached_root_sig != root_sig:
+        return None
+    if time.time() - ts > _SPEC_CACHE_TTL_SECONDS:
+        return None
+    return spec
+
+
+def _spec_cache_put(chat_id: str, kw_sig: str, root_sig: str, spec: dict) -> None:
+    if not chat_id or not kw_sig:
+        return
+    if len(_SPEC_CACHE) >= _SPEC_CACHE_MAX_CHATS and chat_id not in _SPEC_CACHE:
+        _SPEC_CACHE.pop(next(iter(_SPEC_CACHE)))
+    _SPEC_CACHE[chat_id] = (kw_sig, root_sig, time.time(), spec)
+
+
+def _rank_files_semantic(root: str, prompt: str, files: list[str], state: AgentState) -> list[str]:
+    """Rank `files` by embedding similarity to `prompt` using the project's own
+    vector store (the same index already built for RAG) instead of naive
+    keyword-overlap counting — no extra LLM call, just an embedding lookup.
+    Files the semantic search doesn't surface keep their keyword-ranked order,
+    appended after the semantic hits. Falls back to pure keyword ranking on
+    any failure or an empty/missing index — never raises.
+    """
+    try:
+        from tools import open_vector_store
+        from vector_store import KIND_FILE
+
+        store = open_vector_store(
+            root, state.get("vector_db_path", ""), state.get("vector_config")
+        )
+        if store is None or store.count_docs(KIND_FILE) == 0:
+            return _rank_files_by_prompt(files, prompt)
+        hits = store.search(prompt, KIND_FILE, top_k=40, min_score=0.25)
+        fileset = set(files)
+        seen: set[str] = set()
+        order: list[str] = []
+        for h in hits:
+            rel = str((h.get("meta") or {}).get("file_path") or "")
+            if rel in fileset and rel not in seen:
+                order.append(rel)
+                seen.add(rel)
+        rest = [f for f in _rank_files_by_prompt(files, prompt) if f not in seen]
+        return order + rest
+    except Exception:  # noqa: BLE001
+        return _rank_files_by_prompt(files, prompt)
+
+
+_GREP_HIT_FILE_RE = re.compile(r"^([^\s:]+):\d+:")
+
+
+def _grep_hit_file(line: str) -> str:
+    m = _GREP_HIT_FILE_RE.match(line)
+    return m.group(1) if m else ""
+
+
+def _read_context_files(read_context: str) -> set[str]:
+    """File paths already fully present in `read_context` (both repo_read's
+    `=== path ===` and reader_read's `--- path:a-b ---` markers), so the grep
+    dump can skip duplicating their content."""
+    files: set[str] = set()
+    for m in re.finditer(r"^=== (.+?) ===$", read_context, re.MULTILINE):
+        files.add(m.group(1))
+    for m in re.finditer(r"^--- (.+?):\d+-\d+ ---$", read_context, re.MULTILINE):
+        files.add(m.group(1))
+    return files
+
 
 async def repo_derive(state: AgentState) -> dict:
     queue = state["_queue"]
     request = state.get("request", "")
-    # Single LLM call to PLAN the search; falls back to the deterministic
-    # derivation on any failure (empty/garbled reply, provider error, timeout).
-    spec: dict | None = None
-    try:
-        model = build_chat_model(
-            state["provider"], state["model_name"], state["base_url"],
-            state["api_key"], state["env_var"], state["oauth_token"],
-            temperature=0, thinking_level="none",
-            max_tokens=1000, timeout=model_timeout_for(state),
-        )
-        spec = await _llm_derive_explore_patterns(
-            request, _build_tree(state["root"]), model
-        )
-    except Exception:  # noqa: BLE001
-        spec = None
-    if spec is None:
-        spec = _derive_explore_patterns(request)
-        spec["queries"] = spec.get("grep", [])
+    root = state["root"]
+    chat_id = state.get("chat_id", "")
+    # Attached-skill names/@mentions must not pollute the search keywords, so
+    # derive patterns from a cleaned prompt. The skill BODY still drives the
+    # agent via the system prompt; only the skill's *name* is kept out of glob/
+    # grep. File references are resolved from the ORIGINAL request below.
+    clean_request = _strip_skill_mentions(request, _skill_names_to_strip(state))
+
+    # A freshly-answered ask_user question (e.g. the planner asked "where is the
+    # current frontend?" and the user replied "components live in src/") is
+    # captured into _ASK_ANSWERS by the wrapped ask_user tool. Fold it into the
+    # derive input (and the cache key) so the search is re-derived against the
+    # new info, then consumed so we don't re-explore the same answer forever.
+    ans = _ASK_ANSWERS.get(chat_id, "")
+    derive_input = clean_request + ("\n" + ans if ans else "")
+
+    # --- spec cache: reuse the derived PATTERNS (never file content) when the
+    # same normalized keywords were already explored in this chat and nothing
+    # on disk has changed since. glob/grep/read below always still run LIVE
+    # against disk regardless of a cache hit, so a hit can never return a
+    # stale answer -- it only skips the extra LLM planner call + tree walk.
+    root_sig = _repo_mtime_signature(root)
+    kw_sig = _spec_keyword_signature(derive_input)
+    cache_hit = False
+    spec = _spec_cache_get(chat_id, kw_sig, root_sig)
+    if spec is not None:
+        spec = dict(spec)
+        cache_hit = True
+    else:
+        # Single LLM call to PLAN the search; on any failure/empty reply we fall
+        # back to (and, on success, MERGE with) the deterministic heuristic --
+        # so a partial/weak LLM spec still gets backed up without a second LLM
+        # call.
+        llm_spec: dict | None = None
+        try:
+            model = build_chat_model(
+                state["provider"], state["model_name"], state["base_url"],
+                state["api_key"], state["env_var"], state["oauth_token"],
+                temperature=0, thinking_level="none",
+                max_tokens=1000, timeout=model_timeout_for(state),
+            )
+            llm_spec = await _llm_derive_explore_patterns(
+                derive_input, _build_tree_cached(root, root_sig), model
+            )
+        except Exception:  # noqa: BLE001
+            llm_spec = None
+        heuristic = _derive_explore_patterns(derive_input)
+        if llm_spec is None:
+            spec = heuristic
+            spec["queries"] = spec.get("grep", [])
+        else:
+            spec = {
+                "glob": sorted(set(llm_spec.get("glob", [])) | set(heuristic.get("glob", [])))[:24],
+                "grep": sorted(set(llm_spec.get("grep", [])) | set(heuristic.get("grep", [])))[:28],
+                "queries": sorted(set(llm_spec.get("queries", [])) | set(heuristic.get("grep", [])))[:24],
+                "tree_root": heuristic.get("tree_root", ""),
+                "question": derive_input,
+            }
+        _spec_cache_put(chat_id, kw_sig, root_sig, spec)
+
     # Force any file the user referenced (in THIS turn OR earlier in the
-    # conversation) into the search plan, so the LLM planner can't silently drop
-    # it (e.g. it focused on the frontend and missed backend/graph.py). This is
-    # deterministic post-processing of the SINGLE planner call -- it adds NO
-    # extra LLM calls, keeping the budget at one.
+    # conversation) into the search plan, so the planner (LLM or cached) can't
+    # silently drop it (e.g. it focused on the frontend and missed
+    # backend/graph.py). Applied AFTER the cache lookup/store so a later turn's
+    # different named files never get baked into (or read back from) the
+    # cached spec for an unrelated request.
     named = _resolve_file_refs(
         [request] + [m.get("content", "") for m in (state.get("history") or [])],
-        state["root"],
+        root,
     )
     if named:
         glob = list(spec.get("glob", []))
@@ -1825,7 +2249,12 @@ async def repo_derive(state: AgentState) -> dict:
             "args": {
                 "glob": spec["glob"], "grep": spec["grep"], "queries": spec["queries"],
             },
-            "summary": "deriving search patterns (LLM planner + deterministic fallback)",
+            "summary": (
+                "reusing search patterns from earlier in this chat (files are still "
+                "re-read live from disk)"
+                if cache_hit else
+                "deriving search patterns (LLM planner + deterministic heuristic, merged)"
+            ),
         }
     )
     queue.put_nowait(
@@ -1833,12 +2262,18 @@ async def repo_derive(state: AgentState) -> dict:
             "kind": "tool_result", "tool": "repo_search",
             "summary": (
                 f"{len(spec['glob'])} glob / {len(spec['grep'])} grep / "
-                f"{len(spec['queries'])} queries"
+                f"{len(spec['queries'])} queries" + (" (cached plan)" if cache_hit else "")
             ),
             "status": "ok",
         }
     )
-    return {"search_spec": spec, "named_files": named}
+    updates: dict = {"search_spec": spec, "named_files": named}
+    # Consume the captured ask_user answer now that we've derived against it, so
+    # the next plan_build loop doesn't re-trigger exploration for the same reply.
+    if ans:
+        updates["_explored_ask_answer"] = ans
+        _ASK_ANSWERS.pop(chat_id, None)
+    return updates
 
 
 async def repo_glob(state: AgentState) -> dict:
@@ -1863,11 +2298,11 @@ async def repo_grep(state: AgentState) -> dict:
     queue = state["_queue"]
     tools = _make_explore_tools(state, queue)
     spec = state.get("search_spec", {}) or {}
-    # LLM planner "queries" become verbatim phrase-grep patterns, on top of the
-    # structural "keywords" (the grep field).
-    patterns = list(
-        dict.fromkeys((spec.get("grep", []) or []) + (spec.get("queries", []) or []))
-    )[:10]
+    # Only the structured "keywords" are valid grep regexes. The "queries"
+    # field holds natural-language phrases (used for ranking, not literal
+    # grep) — feeding them in as regex produces weak/wrong matches, so we
+    # deliberately exclude them here.
+    patterns = list(dict.fromkeys(spec.get("grep", []) or []))[:10]
     files: list[str] = []
     raw: list[str] = []
     for pat in patterns:
@@ -1895,9 +2330,17 @@ async def repo_collect(state: AgentState) -> dict:
             (state.get("explore_glob", []) or []) + (state.get("explore_grep", []) or [])
         )
     )
+    # Only backfill (rank the whole repo when few candidates surfaced) when the
+    # derived spec actually carries something to search for. If glob/grep/
+    # queries are all empty there is nothing to ground a search on, so blindly
+    # ranking the entire repo would read 80 arbitrary files — instead we return
+    # little/nothing and let the planner ask a clarifying question (Part C).
+    meaningful = bool(spec.get("glob") or spec.get("grep") or spec.get("queries"))
     MIN_CANDIDATES = 18
-    if len(files) < MIN_CANDIDATES:
-        ranked = _rank_files_by_prompt(_repo_source_files(state["root"]), rank_text)
+    if meaningful and len(files) < MIN_CANDIDATES:
+        ranked = _rank_files_semantic(
+            state["root"], rank_text, _repo_source_files(state["root"]), state
+        )
         seen = set(files)
         for f in ranked:
             if f not in seen:
@@ -1906,7 +2349,7 @@ async def repo_collect(state: AgentState) -> dict:
             if len(files) >= 80:
                 break
     files = _expand_imports(state["root"], files)
-    top = files[:80]
+    top = [f for f in files[:80] if not _is_excluded_discovery_path(f)]
     queue.put_nowait(
         {
             "kind": "tool", "tool": "collect",
@@ -1950,10 +2393,22 @@ async def repo_read(state: AgentState) -> dict:
     if named:
         files = list(dict.fromkeys(list(named) + files))
     named_set = set(named or [])
-    files = [f for f in files if f in named_set or not _should_skip_read(f)]
+    files = [
+        f for f in files
+        if not _is_excluded_discovery_path(f)
+        and (f in named_set or not _should_skip_read(f))
+    ]
+    # Only backfill (rank the whole repo) when the derived spec is non-empty
+    # (glob/grep/queries). With an empty spec there is nothing to ground the
+    # search on, so we must NOT read 80 arbitrary files — return an empty
+    # context and flag it so the planner asks a clarifying question instead of
+    # guessing from junk (Part C).
+    meaningful = bool(spec.get("glob") or spec.get("grep") or spec.get("queries"))
     MIN_CANDIDATES = 18
-    if len(files) < MIN_CANDIDATES:
-        ranked = _rank_files_by_prompt(_repo_source_files(state["root"]), rank_text)
+    if meaningful and len(files) < MIN_CANDIDATES:
+        ranked = _rank_files_semantic(
+            state["root"], rank_text, _repo_source_files(state["root"]), state
+        )
         seen = set(files)
         for f in ranked:
             if f not in seen:
@@ -1962,7 +2417,11 @@ async def repo_read(state: AgentState) -> dict:
             if len(files) >= 80:
                 break
     files = _expand_imports(state["root"], files)
-    top = files[:MAX_EXPLORE_READ_FILES]
+    top = [f for f in files[:MAX_EXPLORE_READ_FILES] if not _is_excluded_discovery_path(f)]
+    # Nothing to read (empty spec, no named files) -> do not blindly read the
+    # repo. Signal explore_empty so the planner asks what to look for.
+    if not top:
+        return {"read_context": "", "explore_empty": True}
     tools = _make_explore_tools(state, queue)
     parts: list[str] = []
     total = 0
@@ -2085,7 +2544,11 @@ async def reader_read(state: AgentState) -> dict:
     files = _explicit_files(state)[:READER_MAX_FILES]
     if not files:
         return {"read_context": ""}
-    spec = _derive_explore_patterns(request)
+    # same skill-name stripping as repo_derive: the skill's own words must not
+    # become in-file grep keywords.
+    spec = _derive_explore_patterns(
+        _strip_skill_mentions(request, _skill_names_to_strip(state))
+    )
     patterns: list[re.Pattern] = []
     for p in (spec.get("grep", []) or [])[:24]:
         try:
@@ -2216,6 +2679,19 @@ def _route_repo_dispatch(state: AgentState) -> str:
 
 
 def _route_plan_validate(state: AgentState) -> str:
+    # After the planner asked a clarifying question and the user answered, the
+    # answer was captured into _ASK_ANSWERS and folded into repo_derive. If it
+    # hasn't been explored yet, re-run the discovery pipeline against the new
+    # info instead of looping on an empty/bad plan. Bounded by plan_attempts so
+    # a run of unhelpful answers can't loop forever (Part A).
+    if state.get("mode") == "plan":
+        ans = _ASK_ANSWERS.get(state.get("chat_id", ""), "")
+        if (
+            ans
+            and ans != state.get("_explored_ask_answer")
+            and int(state.get("plan_attempts", 0)) < 3
+        ):
+            return "repo_derive"
     if state.get("plan_valid"):
         return "coder"
     if int(state.get("plan_attempts", 0)) < 2:
@@ -2338,6 +2814,9 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     initial["_queue"] = queue
     initial.setdefault("debug_attempts", 0)
     initial.setdefault("max_debug_attempts", MAX_DEBUG_ATTEMPTS)
+    # Drop any stale captured ask_user answer for this chat from a previous run
+    # so Part A re-exploration only fires for answers given in THIS run.
+    _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
     if not (initial.get("request") or "").strip():
         yield {"kind": "error", "content": "empty or whitespace-only prompt — refusing to run"}
         return

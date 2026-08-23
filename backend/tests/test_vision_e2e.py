@@ -29,15 +29,29 @@ def _all_text(body: dict) -> str:
 
 
 @pytest.mark.asyncio
-async def test_image_attached_to_main_model_when_no_vision(run_events):
-    mock.script = [text_reply("I see the screenshot clearly.")]
+async def test_vision_prefetch_falls_back_to_main_when_no_vision_model(run_events):
+    # No dedicated vision subagent model -> prefetch must use the MAIN model
+    # (mirroring the `vision` tool's own fallback) so the image is still
+    # analyzed automatically. The raw image is stripped from the main request
+    # (the analysis text is injected instead).
+    mock.script = [
+        text_reply("PREFETCH_ANALYSIS of the screenshot"),
+        text_reply("FINAL_ANSWER based on the analysis"),
+    ]
     await run_events(
         "what do you see in this image?",
         mode="ask",
+        subagent_models={},  # no vision model configured
         images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
     )
-    assert any(_has_image(b) for b in mock.captured), \
-        "image content part missing from main model request (no vision model)"
+    # 1) the main model received the raw image during pre-fetch
+    assert _has_image(mock.captured[0]), "pre-fetch did not receive the image"
+    # 2) the main model's final call does NOT get the raw image (it is stripped)
+    assert not _has_image(mock.captured[1]), \
+        "main model should not receive the raw image when no vision model is set"
+    # 3) the pre-fetch analysis was injected into the main model's context
+    assert "PREFETCH_ANALYSIS" in _all_text(mock.captured[1]), \
+        "vision analysis was not injected into the main model context"
 
 
 @pytest.mark.asyncio

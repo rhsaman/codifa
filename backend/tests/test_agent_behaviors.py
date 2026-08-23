@@ -9,6 +9,8 @@ import json
 
 from mock_openai import text_reply, tool_call
 
+from agents import _wrap_no_search_bypass, _wrap_readonly_terminal
+
 
 def _text(events):
     return "".join(e.get("content", "") for e in events if e.get("kind") == "text")
@@ -183,3 +185,106 @@ async def test_agent_emits_usage_event_with_true_counts(run_events, mock_server)
     # The event names the model that actually ran, so the sidebar can attribute
     # cost to the right provider/model.
     assert ev.get("model") == "mock-model", f"usage model must be set, got {ev.get('model')}"
+
+
+async def test_run_terminal_blocks_git_history_search():
+    """Plan/ask mode's run_terminal must reject git history/discovery commands
+    (git log/show/blame/ls-files, git diff <ref>) that a planner would otherwise
+    loop on to hunt for code. git status and plain git diff stay allowed."""
+    async def fake(cmd, _timeout=120):
+        return "RAN:" + cmd
+
+    wrapped = _wrap_no_search_bypass(fake)
+
+    blocked = [
+        "git ls-files src/ | head -100",
+        "git show HEAD:src/components/Chat.tsx | head -120",
+        "git log --oneline -20",
+        "git show HEAD",
+        "git blame src/app.py",
+        "git rev-list HEAD",
+        "git grep TODO",
+        "git whatchanged",
+        "git shortlog -sn",
+        "git reflog",
+        "git diff HEAD~3",
+        "git diff a1b2c3d4",
+        "git diff origin/main",
+        "git diff main..feature",
+    ]
+    for cmd in blocked:
+        out = await wrapped(cmd)
+        assert out.startswith("ERROR: `git"), f"expected block for {cmd!r}, got {out!r}"
+
+    allowed = [
+        "git status",
+        "git diff",
+        "git diff --cached",
+        "git diff src/app.py",
+        "git diff --stat src/app.py",
+        "git branch",
+        "pwd",
+        "node --version",
+        "npm run build",
+        "pytest",
+    ]
+    for cmd in allowed:
+        out = await wrapped(cmd)
+        assert out == "RAN:" + cmd, f"expected allow for {cmd!r}, got {out!r}"
+
+
+async def test_plan_readonly_terminal_still_blocks_git_search():
+    """Layered exactly like plan mode: readonly wrapper outside, no-search-bypass
+    inside. git log/show must still be rejected (readonly allows the git prefix
+    but the inner block vetoes it), while git status passes both layers."""
+    async def fake(cmd, _timeout=120):
+        return "RAN:" + cmd
+
+    wrapped = _wrap_readonly_terminal(_wrap_no_search_bypass(fake))
+    out = await wrapped("git show HEAD:src/components/Chat.tsx | head -120")
+    assert out.startswith("ERROR"), out  # blocked (allowlist or inner veto)
+    out = await wrapped("git status")
+    assert out == "RAN:git status", out
+
+
+async def test_plan_readonly_terminal_blocks_discovery_commands():
+    """Plan/ask mode must not be able to shell out to ls/cat/sed/awk/head/tail/
+    wc/find/grep to hunt for files — that's the explore pipeline's job. Only
+    review/verification commands (git status, plain git diff, pwd, build/test/
+    lint, version) are allowed."""
+    async def fake(cmd, _timeout=120):
+        return "RAN:" + cmd
+
+    wrapped = _wrap_readonly_terminal(_wrap_no_search_bypass(fake))
+
+    blocked = [
+        "ls src",
+        "ls -R src/components | head -120",
+        "ls src/styles src/lib src/types",
+        "cat src/components/ToolCallView.tsx",
+        "sed -n '1,200p' src/components/ToolCallView.tsx",
+        "wc -l src/components/*.tsx src/styles/global.css",
+        "find . -name '*.tsx'",
+        "grep -rn foo src/",
+        "head -50 src/app.py",
+        "tail -20 src/app.py",
+        "git log --oneline",
+        "git show HEAD:src/app.py",
+    ]
+    for cmd in blocked:
+        out = await wrapped(cmd)
+        assert out.startswith("ERROR"), f"expected block for {cmd!r}, got {out!r}"
+
+    allowed = [
+        "git status",
+        "git diff",
+        "git diff --cached",
+        "git diff src/app.py",
+        "pwd",
+        "node --version",
+        "npm run build",
+        "pytest",
+    ]
+    for cmd in allowed:
+        out = await wrapped(cmd)
+        assert out == "RAN:" + cmd, f"expected allow for {cmd!r}, got {out!r}"

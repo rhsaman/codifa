@@ -106,14 +106,20 @@ async def test_repo_derive_uses_llm_when_ok(tmp_path):
          patch.object(graph, "llm_generate", new=AsyncMock(return_value=(payload, None))):
         res = await repo_derive(state)
     spec = res["search_spec"]
-    assert spec["glob"] == ["**/login.py"]
-    assert spec["grep"] == ["expires"]
-    assert spec["queries"] == ["login timeout"]
+    # The LLM spec is merged with the deterministic heuristic (semantic globs +
+    # keyword greps) for recall, so we assert the LLM outputs are present rather
+    # than exact equality.
+    assert "**/login.py" in spec["glob"]
+    assert "expires" in spec["grep"]
+    assert "login timeout" in spec["queries"]
 
 
 # --- consumer wiring -------------------------------------------------------
 
-async def test_repo_grep_includes_queries_as_phrase_patterns(tmp_path):
+async def test_repo_grep_uses_only_keywords_not_queries(tmp_path):
+    # `queries` are natural-language phrases for RANKING, not valid grep
+    # regexes — feeding them in as grep patterns yields weak/wrong matches.
+    # Only the structured `keywords` (grep) field is grepped.
     state = {
         "_queue": _q(),
         "root": str(tmp_path),
@@ -130,7 +136,7 @@ async def test_repo_grep_includes_queries_as_phrase_patterns(tmp_path):
         if ev.get("kind") == "tool" and ev.get("tool") == "grep":
             patterns.append(ev["args"]["pattern"])
     assert "session" in patterns
-    assert "auth timeout" in patterns
+    assert "auth timeout" not in patterns
 
 
 async def test_repo_collect_ranks_by_queries(tmp_path):

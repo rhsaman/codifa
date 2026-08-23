@@ -6349,37 +6349,23 @@ textarea {
 /* Single tool call card — always fully expanded (non-collapsible). */
 .tool-card {
   --tool-color: var(--accent);
-  border: none;
-  border-left: 3px solid color-mix(in srgb, var(--tool-color) 55%, transparent);
-  border-radius: 18px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
-    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
-  );
-  /* Flat — no outer shadow; just a hairline top highlight. */
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
   overflow: hidden;
 }
 
-/* Status glow replaces the old outline: a soft accent ring + halo that
-   reads as "live" without any hard border. Static — no pulsing. */
+/* Claude-app style: state is shown by a quiet border tint, not a glow. */
 .tool-card.running {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--tool-color) 22%, transparent);
+  border-color: color-mix(in srgb, var(--tool-color) 45%, var(--border));
 }
 
 .tool-card.error {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
 }
 
 .tool-card.denied {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent);
+  border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
 }
 
 /* Explore uses a dimmer mix of the theme accent than single/group calls —
@@ -6387,17 +6373,13 @@ textarea {
    never reads as a plain single tool. */
 .tool-card.explore {
   --tool-color: color-mix(in srgb, var(--accent) 45%, var(--bg-hover));
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
-    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
-  );
+  background: var(--bg-panel);
 }
 
 .tool-card.explore .tool-sub-list {
   position: relative;
   padding-left: 18px;
-  background: color-mix(in srgb, var(--bg-hover) 85%, var(--tool-color) 15%);
+  background: color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%);
 }
 
 .tool-card.explore .tool-sub-list::before {
@@ -6432,7 +6414,7 @@ textarea {
 }
 
 .tool-card.explore .tool-sub-row.running {
-  background: color-mix(in srgb, var(--bg-hover) 78%, var(--tool-color) 22%);
+  background: color-mix(in srgb, var(--bg-hover) 90%, var(--tool-color) 10%);
 }
 
 .tool-card-head {
@@ -6468,52 +6450,41 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 999px;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  width: 16px;
+  height: 16px;
+  color: var(--text-dim);
   font-size: 10px;
-  opacity: 1;
+  opacity: 0.8;
   flex: 0 0 auto;
-  transition:
-    transform 0.15s,
-    background 0.15s;
+  transition: transform 0.15s, color 0.15s;
 }
 
 .tool-card-head.collapsible:hover .chev {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
 }
 
+/* Claude-app style: tool name is a quiet mono label, not a saturated pill —
+   the accent stays reserved for status/interaction, not decoration. */
 .tool-card-head .tool-name {
   font-family: var(--font-mono);
-  font-weight: 700;
+  font-weight: 600;
   font-size: 11px;
   color: var(--text);
-  background: color-mix(in srgb, var(--tool-color) 22%, transparent);
-  border-radius: 6px;
-  padding: 2px 7px;
   white-space: nowrap;
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--tool-color) 30%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
 }
 
-/* Engine / model / sub-count badge: tonal pill, no outline. Text uses the
-   theme text color for contrast; the tint keeps the tool's accent identity. */
+/* Engine / model / sub-count badge: quiet neutral chip. */
 .tool-card-head .tool-badge {
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--text);
-  background: color-mix(in srgb, var(--tool-color) 22%, transparent);
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  background: var(--bg-hover);
   border: none;
   border-radius: 999px;
   padding: 2px 8px;
   white-space: nowrap;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
 }
 
 .tool-card-head .tool-cmd {
@@ -6581,39 +6552,29 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
-  font-size: 12px;
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
   line-height: 1;
   flex: 0 0 auto;
-  font-weight: 800;
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--status-color) 55%, transparent),
-    0 0 10px -2px color-mix(in srgb, var(--status-color) 45%, transparent);
+  font-weight: 700;
 }
 
-/* Status glyphs are derived from the theme accent, each tinted toward the
-   theme's semantic hue so the three states stay distinguishable while
-   remaining clearly in the theme's palette (accent stays the dominant
-   component): success = accent→green, error = accent→red,
-   denied/stopped = accent→amber. */
+/* Claude-app style: flat glyphs, no filled circle or glow — color alone
+   carries the state, derived from the theme accent toward each semantic hue. */
 .status-ok {
   --status-color: color-mix(in srgb, var(--accent) 60%, var(--success));
   color: var(--status-color);
-  background: color-mix(in srgb, var(--status-color) 26%, transparent);
 }
 
 .status-err {
   --status-color: color-mix(in srgb, var(--accent) 60%, var(--danger));
   color: var(--status-color);
-  background: color-mix(in srgb, var(--status-color) 26%, transparent);
 }
 
 .status-denied {
   --status-color: color-mix(in srgb, var(--accent) 60%, var(--thinking));
   color: var(--status-color);
-  background: color-mix(in srgb, var(--status-color) 26%, transparent);
 }
 
 /* The running spinner inside a tool call uses the full theme accent so it
@@ -6631,8 +6592,7 @@ textarea {
 
 .tool-card-body {
   padding: 9px 10px 10px;
-  /* Tinted hairline carries the tool's color identity into the body. */
-  border-top: 1px solid color-mix(in srgb, var(--tool-color) 24%, transparent);
+  border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -6643,34 +6603,22 @@ textarea {
    group reads as "a summary you can expand", not a single call. */
 .tool-group {
   --tool-color: color-mix(in srgb, var(--accent) 70%, var(--bg));
-  border: none;
-  border-radius: 18px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
-    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
-  );
-  /* Flat — no outer shadow; just a hairline top highlight. */
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
   overflow: hidden;
 }
 
 .tool-group.running {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--tool-color) 22%, transparent);
+  border-color: color-mix(in srgb, var(--tool-color) 45%, var(--border));
 }
 
 .tool-group.denied {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 20%, transparent);
+  border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
 }
 
 .tool-group.error {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--danger) 20%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
 }
 
 .tool-group-head {
@@ -6692,18 +6640,13 @@ textarea {
   background: color-mix(in srgb, var(--tool-color) 10%, transparent);
 }
 
-/* Counter pill: "N tool calls" as a tonal capsule. */
+/* Counter: "N tool calls" as plain weighted text — matches Claude-app's
+   quiet summary line rather than a saturated capsule. */
 .tool-group-label {
-  font-weight: 700;
+  font-weight: 600;
   font-size: 11px;
   color: var(--text);
   white-space: nowrap;
-  background: color-mix(in srgb, var(--tool-color) 20%, transparent);
-  border-radius: 999px;
-  padding: 3px 10px;
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--tool-color) 26%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
 }
 
 .tool-group-detail {
@@ -6718,26 +6661,22 @@ textarea {
   flex: 1 1 auto;
 }
 
-/* Chevron as a tiny circular chip, rotates when open. */
+/* Chevron: quiet glyph, rotates when open, accent only on hover. */
 .tool-group-head .chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 999px;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  width: 16px;
+  height: 16px;
+  color: var(--text-dim);
   font-size: 10px;
-  opacity: 1;
+  opacity: 0.8;
   flex: 0 0 auto;
-  transition:
-    transform 0.15s,
-    background 0.15s;
+  transition: transform 0.15s, color 0.15s;
 }
 
 .tool-group-head:hover .chev {
-  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--accent);
 }
 
 /* Stacked-cards glyph: the group is a "bundle" of calls — visually distinct
@@ -6782,15 +6721,8 @@ textarea {
 /* Nested cards flatten to a quieter inset surface so the group stays the
    dominant shape and the calls read as rows inside it. */
 .tool-group-body .tool-card {
-  border-left: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
-    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
-  );
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.12);
+  border: 1px solid var(--hairline);
+  background: var(--bg-hover);
 }
 
 /* Keep the group's color identity when expanded, so a call never changes
@@ -6816,14 +6748,7 @@ textarea {
   margin-top: -3px;
   border: 1px solid var(--hairline);
   border-radius: 9px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 86%, var(--tool-color, var(--accent)) 14%),
-    color-mix(in srgb, var(--bg-hover) 94%, var(--tool-color, var(--accent)) 6%)
-  );
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
-    0 2px 5px rgba(0, 0, 0, 0.12);
+  background: var(--bg-hover);
   overflow: hidden;
   transition:
     opacity 0.25s ease,
@@ -6837,12 +6762,9 @@ textarea {
   margin-top: 0;
 }
 
-/* newest card pops: stronger edge + shadow */
+/* newest card pops: a touch stronger edge, still flat. */
 .tool-cascade-item:last-child {
   border-color: color-mix(in srgb, var(--text) 12%, var(--hairline));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 3px 8px rgba(0, 0, 0, 0.14);
 }
 
 /* depth: older calls sit further back, slightly dimmed */
@@ -6855,20 +6777,13 @@ textarea {
 }
 
 .tool-cascade-item:hover {
-  transform: translateY(-1px);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
-    0 4px 10px rgba(0, 0, 0, 0.16);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
 }
 
 /* Explorer preview keeps the explore card's dimmer accent mix. */
 .tool-card.explore .tool-cascade-item {
   border-color: color-mix(in srgb, var(--tool-color) 30%, transparent);
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 86%, var(--tool-color) 14%),
-    color-mix(in srgb, var(--bg-hover) 94%, var(--tool-color) 6%)
-  );
+  background: color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%);
 }
 
 .tool-card.explore .tool-cascade-item::before {
@@ -9319,7 +9234,6 @@ textarea {
 .chat-rename-input,
 .seg-steer,
 .msg.user .msg-bubble,
-.tool-card,
 .sidebar-usage-group.open,
 .retry-banner .retry-cancel,
 .plan-block,
@@ -9621,14 +9535,6 @@ textarea {
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--accent) 16%, transparent),
     0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
-}
-
-/* Running tool cards glow with the accent instead of outlining it. */
-.tool-card.running {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 10%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent),
-    0 4px 14px -6px rgba(0, 0, 0, 0.16);
 }
 
 .msg-image {

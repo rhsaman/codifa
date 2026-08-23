@@ -50,6 +50,9 @@ def test_repo_collect_backfills_when_sparse(tmp_path):
         "_queue": _q(),
         "root": str(tmp_path),
         "request": "where is the auth logic",
+        # a non-empty derived spec is required to backfill (empty spec -> the
+        # reader must ask, not blindly rank the whole repo -- see Part C)
+        "search_spec": {"glob": [], "grep": ["auth"], "queries": []},
         "explore_glob": [],
         "explore_grep": [],
     }

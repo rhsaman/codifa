@@ -162,7 +162,9 @@ async def test_repo_collect_ranks_by_request_when_no_queries(tmp_path):
         "_queue": _q(),
         "root": str(tmp_path),
         "request": "auth login flow",
-        "search_spec": {"glob": [], "grep": [], "queries": []},
+        # grep present so the backfill is allowed (empty spec => ask, not rank);
+        # rank_text then falls back to the request and ranks auth_login.py first
+        "search_spec": {"glob": [], "grep": ["login"], "queries": []},
         "explore_glob": [],
         "explore_grep": [],
     }

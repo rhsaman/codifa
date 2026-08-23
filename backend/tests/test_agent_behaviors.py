@@ -18,19 +18,14 @@ def _text(events):
 
 async def test_agent_streams_text_reply_to_user(run_events, mock_server):
     base, mock = mock_server
-    mock.script = [
-        text_reply("discovery"),
-        text_reply("سلام! چطور میتونم کمک کنم؟"),
-    ]
+    mock.script = [text_reply("سلام! چطور میتونم کمک کنم؟")]
     events = await run_events("سلام")
     assert "سلام! چطور میتونم کمک کنم؟" in _text(events)
-    # coder-without-plan runs the deterministic discovery pipeline, so
-    # repo_search/glob/grep/read tool_results are expected. The agent itself
-    # must not have called its own implementation tools.
+    # A plain reply must not trigger any agent implementation tools.
     agent_tool_results = [
         e for e in events
         if e.get("kind") == "tool_result"
-        and e.get("tool") not in ("repo_search", "glob", "grep", "read", "tree")
+        and e.get("tool") not in ("glob", "grep", "read", "repo_search", "tree")
     ]
     assert not agent_tool_results, "a plain reply must not trigger agent tools"
 
@@ -38,7 +33,6 @@ async def test_agent_streams_text_reply_to_user(run_events, mock_server):
 async def test_agent_runs_tool_and_returns_result_to_model(run_events, mock_server):
     base, mock = mock_server
     mock.script = [
-        text_reply("discovery"),
         tool_call("write_file", json.dumps({
             "path": "app.py", "content": "def foo():\n    return 42\n",
         })),
@@ -60,38 +54,13 @@ async def test_agent_runs_tool_and_returns_result_to_model(run_events, mock_serv
 
 async def test_agent_passes_history_into_the_model_request(run_events, mock_server):
     base, mock = mock_server
-    mock.script = [text_reply("discovery"), text_reply("ok")]
+    mock.script = [text_reply("ok")]
     events = await run_events("ادامه بده", history=[{"role": "user", "content": "قبلی"}])
     assert "ok" in _text(events)
-    # captured[0] is the deterministic discovery planner; captured[1] is the
-    # coder turn that receives the conversation history.
+    # The agent turn receives the conversation history.
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
     assert any(m.get("content") == "قبلی" for m in all_messages), \
         "history was not passed into the model request"
-
-
-async def test_agent_routes_general_subagent_on_main_model(run_events, mock_server):
-    """The `general` sub-agent inherits the PARENT's model (it runs on the main
-    model, not a separate slot), and its report must NOT leak into the parent
-    stream — the parent only sees the tool result, not the sub-agent's raw text."""
-    base, mock = mock_server
-    """Plan mode must NOT expose glob/grep/read/task to the LLM -- repository
-    exploration is performed by the deterministic workflow, not the LLM. The
-    workflow still runs (repo_search event) and the turn finishes."""
-    mock.script = [text_reply("I will plan from the injected repo context.")]
-    events = await run_events("where is foo defined?", mode="plan")
-    # The plan LLM had no exploration tools.
-    tool_names = set()
-    for body in mock.captured:
-        for t in body.get("tools") or []:
-            tool_names.add((t.get("function") or {}).get("name"))
-    assert not (tool_names & {"glob", "grep", "read", "task"}), \
-        f"plan LLM must not have exploration tools: {tool_names}"
-    # But the deterministic discovery still ran.
-    assert any(
-        e.get("kind") == "tool" and e.get("tool") == "repo_search" for e in events
-    ), "deterministic repo discovery did not run"
-    assert any(e.get("kind") == "text" for e in events), "turn did not finish"
 
 
 async def test_agent_rejects_empty_prompt_with_error_event(run_events):

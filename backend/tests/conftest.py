@@ -57,7 +57,7 @@ def mock_server():
 
 
 @pytest.fixture(autouse=True)
-def _reset_mock():
+def _reset_mock(request):
     """Every test starts with a clean mock script and capture log."""
     mock.script = []
     mock.captured = []

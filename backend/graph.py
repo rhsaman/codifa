@@ -64,6 +64,22 @@ from tools import make_tool_callbacks
 
 MAX_DEBUG_ATTEMPTS = 3
 
+# Tool calls in this set mutate persistent state (files, terminal, saved
+# memory/skills/connectors) or block on a real human (ask_user) -- they run
+# SEQUENTIALLY, each waiting for the previous to finish, so two writes can
+# never race and a blocking question never overlaps another call. Everything
+# else (grep/glob/read/web_search/fetch_url/vision/search_memory/task -- all
+# read-only) runs CONCURRENTLY via asyncio.gather when the model requests
+# several in the same step, matching opencode's own behavior (regular tool
+# calls run via Promise.all; only Task calls are serialized there, which is a
+# known opencode bug -- github.com/anomalyco/opencode/issues/14195). This does
+# NOT increase token cost: the provider still gets exactly the same set of
+# ToolMessages either way -- only wall-clock latency changes.
+_SEQUENTIAL_TOOLS = {
+    "write_file", "edit_file", "run_terminal", "confirm_action",
+    "memory", "create_skill", "create_mcp", "ask_user",
+}
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -189,11 +205,9 @@ def classify_mode(prompt: str, fallback: str = "ask") -> str:
         return "coder"
     if text.startswith("/ask") and (len(text) == 4 or text[4] in " \n\t"):
         return "ask"
-    if text.startswith("/explore") and (len(text) == 8 or text[8] in " \n\t"):
-        return "explore"
     if text.startswith("/reader") and (len(text) == 6 or text[6] in " \n\t"):
         return "reader"
-    if fallback in ("ask", "plan", "coder", "explore", "reader"):
+    if fallback in ("ask", "plan", "coder", "reader"):
         return fallback
     return "ask"
 
@@ -282,31 +296,17 @@ def filter_tools_for_mode(
     if not (cap.get("web", False) if cap else False) or not explicit_web:
         tools = {n: fn for n, fn in tools.items() if n not in _WEB}
 
-    # Deterministic repo exploration: the LLM must NOT call glob/grep/read/task
-    # in plan/explore/ask. Explore/plan always run the discovery workflow; ask
-    # runs it only when the question is project-related (gated in ask_entry),
-    # otherwise it answers directly. Skills injected as system context are the
-    # only ask special-case.
-    if mode in ("plan", "explore", "ask", "reader"):
-        for _n in ("glob", "grep", "read", "task"):
-            tools.pop(_n, None)
-    if mode == "coder":
-        tools = {
-            n: fn
-            for n, fn in tools.items()
-            if n in ("write_file", "edit_file", "confirm_action", "update_plan", "ask_user")
-        }
+    # Repo search tools (grep/glob/read/task) are now available to the Main
+    # Agent for every mode that needs repo access (coder/plan/ask/reader). The
+    # LLM decides iteratively which to call — there is NO mandatory
+    # glob->grep->read order (this matches OpenCode). Write/terminal tools stay
+    # coder-only (handled in the blocks above); non-coder modes therefore keep
+    # only read/search/web/vision capabilities. The Explore subagent reuses the
+    # same tool runtime in an isolated context.
     if mode != "plan":
         tools.pop("save_plan", None)
     if mode == "ask":
         tools.pop("memory", None)
-    if mode in ("explore", "reader"):
-        # Discovery is already done; only on-demand capabilities remain.
-        tools = {
-            n: fn
-            for n, fn in tools.items()
-            if n in ("web_search", "fetch_url", "search_console", "vision")
-        }
     if mode == "ask" and _agents._trivial_prompt(prompt):
         for n in (
             "update_plan",
@@ -413,20 +413,54 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
 
     system = (
         "You are a vision analysis sub-agent. The user attached image(s) to their "
-        "message. Examine them carefully and reply with a precise, concise analysis "
-        "(under ~400 words) describing exactly what the image shows that is relevant "
-        "to a coding / UI task: on-screen text, numbers, layout, colors, UI elements, "
-        "error messages, stack traces, code. Be literal and complete — this analysis "
-        "is the main agent's only view of the image."
+        "message. Examine them carefully and transcribe what you see VERBATIM and "
+        "completely, because this analysis is the main agent's ONLY view of the "
+        "image. Priorities, in order:\n"
+        "1. TRANSCRIBE ALL visible text exactly as written — especially file paths, "
+        "filenames, code, terminal output, error messages, stack traces, URLs, "
+        "numbers, and UI labels. Do not paraphrase or summarize text; quote it.\n"
+        "2. Describe layout, structure and UI elements (buttons, panels, lists,\n"
+        "   tables) and any colors/icons that carry meaning.\n"
+        "3. If the image is a UI mockup or design reference, note the visual style.\n"
+        "Be literal and exhaustive. Keep prose tight but never drop visible text."
+    )
+    user = (
+        "Analyze the attached image(s). Transcribe every piece of on-screen text "
+        "verbatim (file paths, code, errors), then describe layout/UI."
     )
     try:
         text, _ = await llm_generate(
-            model, system=system, user="Analyze the attached image(s).",
+            model, system=system, user=user,
             images=image_uris, sub=True,
         )
         return (text or "").strip() or None
     except Exception:  # noqa: BLE001
         return None
+
+
+# Per-process cache of vision analyses, keyed by the sorted set of image URIs,
+# so an image attached earlier in a conversation is analyzed ONCE and reused on
+# every follow-up turn instead of being re-sent to the vision model each turn.
+_VISION_CACHE: dict[str, str] = {}
+_VISION_CACHE_MAX = 40
+
+
+async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | None:
+    if not image_uris:
+        return None
+    import hashlib
+
+    key = hashlib.sha256("|".join(sorted(image_uris)).encode("utf-8")).hexdigest()
+    cached = _VISION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = await _vision_analyze(model, image_uris)
+    if result:
+        _VISION_CACHE[key] = result
+        if len(_VISION_CACHE) > _VISION_CACHE_MAX:
+            # Evict the oldest entry (insertion order preserved in dicts).
+            _VISION_CACHE.pop(next(iter(_VISION_CACHE)))
+    return result
 
 
 def _build_skills_section(picked_names: list[str], root: str) -> str:
@@ -485,7 +519,29 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     skills = state.get("skills")
     system_extra = (state.get("system_prompt") or "").strip()
 
-    image_uris = _agents._load_images(images)
+    # Gather images from the CURRENT turn AND every earlier message in the
+    # conversation that carried an image. History is converted to text only
+    # (history_to_langchain_messages drops image content), so without this the
+    # model would "forget" an attached image on the very next turn and claim it
+    # can't see anything. Re-analyzing historical images keeps the image context
+    # alive across follow-up turns.
+    _img_items: list = list(images or [])
+    for _turn in state.get("history") or []:
+        if isinstance(_turn, dict):
+            _ti = _turn.get("images")
+            if _ti:
+                _img_items.extend(_ti)
+    image_uris = _agents._load_images(_img_items)
+    # Deduplicate by content so the same image isn't analyzed repeatedly within
+    # a single turn (current + historical copies). Cross-turn de-duplication is
+    # handled by the vision cache below.
+    _seen: set[str] = set()
+    _deduped: list[str] = []
+    for _u in image_uris:
+        if _u and _u not in _seen:
+            _seen.add(_u)
+            _deduped.append(_u)
+    image_uris = _deduped
 
     # Context window (resolve live when the UI did not supply one).
     ctx = int(state.get("context_window") or 0)
@@ -584,16 +640,29 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 )
         except Exception:  # noqa: BLE001
             pass
-    attached = (
-        _agents._load_attachments(root, attachments)
-        if state.get("mode") != "reader"
-        else []
-    )
-    if attached:
-        workspace_note += (
-            "\n\nThe user attached files and their full contents appear at the START "
-            "of the user's latest message. Read them -- they are the primary focus."
-        )
+    # Attached files are UNIFIED with Neovim: they enter the agent exactly like
+    # the Neovim open file -- as a scoped path + a focus note -- so the agent
+    # reads them on demand via the read/grep tools instead of force-reading
+    # their full contents into the prompt. This keeps the tool runtime the
+    # single source of file access (spec §2/§13) and saves tokens. The actual
+    # scoping is applied via `_scoped_rels` -> `scoped_paths` below.
+    if attachments:
+        try:
+            _att_rels = [
+                os.path.relpath(
+                    _agents.resolve_safe(root, a), _agents.resolve_safe(root, "")
+                )
+                for a in (attachments or [])
+                if a and os.path.isfile(_agents.resolve_safe(root, a))
+            ]
+        except Exception:  # noqa: BLE001
+            _att_rels = []
+        if _att_rels:
+            workspace_note += (
+                "\n\n=== ATTACHED FILES ===\nThe user attached these file(s) as their "
+                "focus: " + ", ".join("`" + f + "`" for f in _att_rels) +
+                ". They are in SCOPE — read them with the read tool when relevant."
+            )
     if scoped_paths:
         workspace_note += (
             "\n\n=== SCOPE (ONLY THESE FILES) ===\nThe user explicitly scoped this "
@@ -609,7 +678,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     system_final = (
         _agents._mode_declare(mode)
         + _agents._language_directive(prompt)
-        + ("" if mode in ("coder", "ask", "plan", "explore", "reader") else _agents._SEARCH_RULE)
+        + ("" if mode in ("coder", "ask", "plan", "reader") else _agents._SEARCH_RULE)
         + base_prompt
         + workspace_note
     )
@@ -621,29 +690,35 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     )
     if system_extra:
         system_final += "\n\nUser-supplied custom prompt (append to the above):\n" + system_extra
-    if mode in ("ask", "plan", "explore"):
+    if image_uris:
         system_final += (
-            "\n\nREPO CONTEXT: relevant files are auto-discovered (deterministic "
-            "glob + grep + directory tree + targeted reads) and injected above as "
-            "'REPOSITORY EXPLORATION RESULTS' before your answer. Use THAT context. "
-            "The search tools (glob/grep/read) are NOT available to you -- never try "
-            "to call them. web_search / fetch_url are ONLY present when the user "
-            "explicitly asks to search the web (e.g. 'search the web for X') -- never "
-            "web-search on your own initiative. vision / skills / MCP connectors are "
-            "available on demand when the question needs external info or attached "
-            "images."
+            "\n\nIMAGE ATTACHED: the user included image(s) in this conversation "
+            "(this turn or an earlier one). A verbatim ATTACHED IMAGE ANALYSIS block "
+            "is included in your message — treat it as ground truth. Transcribe any "
+            "visible file paths / filenames / code / text EXACTLY as analyzed; never "
+            "invent or omit what the image shows."
+        )
+    if mode in ("ask", "plan"):
+        system_final += (
+            "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded "
+            "into this message. When the question touches the project, do the "
+            "exploration JUST-IN-TIME with the search tools (glob / grep / read). "
+            "Fire every search you already know you need in the SAME turn (parallel "
+            "tool calls). For broad multi-file exploration, delegate to the Explore "
+            "sub-agent via task(subagent_type='explore') and work from its report. "
+            "web_search / fetch_url are ONLY present when the user explicitly asks to "
+            "search the web (e.g. 'search the web for X') -- never web-search on your "
+            "own initiative. vision / skills / MCP connectors are available on demand "
+            "when the question needs external info or attached images."
         )
     if mode == "reader":
         system_final += (
-            "\n\nFILE CONTEXT: the explicitly specified file(s) have been read for "
-            "you by a deterministic pipeline (targeted line ranges from path:LINE "
-            "refs, an in-file grep of the question's keywords, or a bounded head) and "
-            "are injected above as 'SPECIFIED FILE CONTENTS'. Use THAT context. The "
-            "search tools (glob/grep/read) are NOT available to you -- never try to "
-            "call them. web_search / fetch_url are ONLY present when the user "
-            "explicitly asks to search the web -- never web-search on your own "
-            "initiative. vision / skills / MCP connectors are available on demand "
-            "when the question needs external info or attached images."
+            "\n\nFOCUSED READING: the user pointed you at specific file(s) (open in "
+            "Neovim, attached, or @mentioned). They are in SCOPE -- read them with the "
+            "read tool (and grep/read within them as needed) to answer. The search "
+            "tools are available, but stay focused on the pointed-at files unless the "
+            "user asks to broaden. vision / skills / MCP connectors are available on "
+            "demand when the question needs external info or attached images."
         )
 
     try:
@@ -712,18 +787,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if saved:
             system_final += saved
 
-    # Workspace scout + history fit.
-    scout_budget = _agents._AUTO_SCOUT_MAX_TOTAL
+    # No pre-injected workspace scout: discovery is the agent's job now (it has
+    # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
+    # design where nothing is force-read into the prompt before the model runs.
     scouted = ""
-    if not scoped_paths and _agents._needs_workspace(prompt):
-        try:
-            scouted = _agents._scout_workspace_cached(root, chat_id, max_total=scout_budget)
-        except Exception:  # noqa: BLE001
-            scouted = ""
-
     history = _agents._fit_history(
         state.get("history") or [],
-        _agents._history_budget(ctx, system_final, scouted, mode),
+        _agents._history_budget(ctx, system_final, "", mode),
     )
     lc_history = history_to_langchain_messages(history)
 
@@ -738,15 +808,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if reuse_tool:
         lc_history.insert(0, SystemMessage(content=reuse_tool))
 
-    # User content (attached files + scout + prompt; images as content parts).
+    # User content (prompt; images as content parts). Attached FILE
+    # contents are no longer force-injected here — they enter via scope + the
+    # focus note above and are read on demand (unified with Neovim). No workspace
+    # scout is injected either; the agent discovers via its tools.
     user_parts: list[Any] = []
-    if attached:
-        user_parts.append(
-            "===== START OF ATTACHED FILES =====\n" + "\n\n".join(attached)
-            + "\n===== END OF ATTACHED FILES ====="
-        )
-    if scouted:
-        user_parts.append(scouted)
     if prompt:
         user_parts.append(prompt)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
@@ -758,26 +824,34 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     prefetch_model = vision_model or model
     _analysis = None
     if image_uris and prefetch_model:
-        _analysis = await _vision_analyze(prefetch_model, image_uris)
+        _analysis = await _vision_analyze_cached(prefetch_model, image_uris)
         if _analysis:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
-                f"image(s); this is what they show — treat it as part of the "
-                f"request]\n{_analysis}"
+                f"image(s); this is exactly what they show — treat it as part of the "
+                f"request and ground your answer on it]\n{_analysis}\n\n"
+                "INSTRUCTION: You MUST use the ATTACHED IMAGE ANALYSIS above. "
+                "Transcribe any visible file paths / filenames / code / text VERBATIM "
+                "into your reply; do not invent or omit them. If a design skill is "
+                "mentioned, apply its guidance to render what the image depicts."
             )
         else:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
                 f"image(s) but the vision model "
-                f"({getattr(prefetch_model, 'model_name', '') or 'unknown'}) failed "
-                f"to analyze them. It may not support images or is misconfigured in "
-                f"Settings → Subagents → Vision.]"
+                f"({getattr(prefetch_model, 'model_name', '') or 'unknown'}) could "
+                f"not analyze them. The model likely does not support images or is "
+                f"misconfigured. ACTION: tell the user to set a Vision model in "
+                f"Settings → Subagents → Vision, or paste the image's text directly. "
+                f"Do NOT guess what the image contains.]"
             )
     elif image_uris:
         # No model available at all (only if `model` itself failed to build).
         user_parts.append(
-            f"[context] {len(image_uris)} image(s) are attached and visible to you as "
-            "image content."
+            f"[context] {len(image_uris)} image(s) are attached but no vision model "
+            "is configured, so you cannot see them. ACTION: tell the user to set a "
+            "Vision model in Settings → Subagents → Vision, or ask them to paste the "
+            "image's text."
         )
     user_content: Any
     if image_uris and (not prefetch_model or not vision_tool_available) and not _analysis:
@@ -877,6 +951,73 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
     }
 
 
+async def _compact_tool_history(
+    msgs: list, compact_model: Any, budget_chars: int
+) -> bool:
+    """Compress older tool results in place when the transcript exceeds the
+    budget. All but the two most-recent ToolMessages are summarized by the
+    compact model into a single compressed ToolMessage; if no compact model is
+    configured they are dropped outright. Returns True if a compaction ran.
+
+    This is the in-turn half of context management (spec §10 / invariant #12):
+    it stops the provider from re-receiving an ever-growing raw tool history on
+    every step. The Explore sub-agent keeps its own isolated transcript, so this
+    only ever touches the Main Agent's own turn loop.
+    """
+    total = sum(len(getattr(m, "content", "") or "") for m in msgs)
+    if total <= budget_chars:
+        return False
+    tool_idx = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
+    if len(tool_idx) <= 2:
+        return False
+    old_idx = tool_idx[:-2]
+    old_text = "\n".join(
+        f"<tool_result>\n{msgs[i].content}\n</tool_result>" for i in old_idx
+    )
+    # Drop the old tool messages first so we always shrink, even if the
+    # summarization call below fails.
+    for i in reversed(old_idx):
+        del msgs[i]
+    if compact_model is None:
+        msgs.append(
+            ToolMessage(
+                content=(
+                    f"[Earlier tool results compacted to save context: "
+                    f"{len(old_idx)} tool outputs removed.]"
+                ),
+                tool_call_id="__compact__",
+            )
+        )
+        return True
+    try:
+        summary, _ = await llm_generate(
+            compact_model,
+            system=(
+                "You are a context compressor for a coding agent. The following "
+                "are EARLIER tool results from this session. Produce ONE concise "
+                "summary (under ~1500 chars) that preserves only what the agent "
+                "still needs: exact file paths, line numbers, symbol/function "
+                "names, and concrete findings. Drop duplicates and raw noise."
+            ),
+            user=old_text,
+        )
+    except Exception:  # noqa: BLE001 — degrade to a plain removal
+        msgs.append(
+            ToolMessage(
+                content=f"[Earlier tool results compacted; {len(old_idx)} outputs removed.]",
+                tool_call_id="__compact__",
+            )
+        )
+        return True
+    msgs.append(
+        ToolMessage(
+            content="[Compressed earlier tool results]\n" + (summary or ""),
+            tool_call_id="__compact__",
+        )
+    )
+    return True
+
+
 async def _run_mode_turn(
     state: AgentState,
     mode: str,
@@ -899,6 +1040,10 @@ async def _run_mode_turn(
     lc_tools = tctx["lc_tools"]
     filtered = tctx["tools"]
     messages: list[BaseMessage] = list(tctx["messages"])
+    # Compact model used for in-turn tool-history compaction (spec §10). May be
+    # None when the user hasn't configured a compact/subagent model — in that
+    # case obsolete tool results are dropped outright instead of summarized.
+    compact_model = tctx.get("compact_model")
 
     if extra_instruction:
         messages.insert(1, SystemMessage(content=extra_instruction))
@@ -997,7 +1142,35 @@ async def _run_mode_turn(
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
                 break
             msgs.append(ai)
-            for tc in ai.tool_calls:
+            # Partition this step's tool calls: read-only ones (grep/glob/read/
+            # web/vision/task/...) run CONCURRENTLY via gather -- they cannot
+            # race each other since none of them mutate anything. Mutating /
+            # blocking calls (_SEQUENTIAL_TOOLS) still run one at a time, in
+            # order, AFTER the concurrent batch, so a write can never race
+            # another write and ask_user never overlaps another call. Order in
+            # `msgs` doesn't need to match request order -- each ToolMessage
+            # carries its own tool_call_id, so the model matches results by id
+            # regardless of position.
+            _tcs = ai.tool_calls
+            _parallel = [tc for tc in _tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
+            _sequential = [tc for tc in _tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
+            if len(_parallel) > 1:
+                _results = await asyncio.gather(
+                    *[
+                        _execute_tool(tc.get("name") or "", tc.get("args") or {})
+                        for tc in _parallel
+                    ]
+                )
+            else:
+                _results = [
+                    await _execute_tool(tc.get("name") or "", tc.get("args") or {})
+                    for tc in _parallel
+                ]
+            for tc, result in zip(_parallel, _results):
+                msgs.append(
+                    ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
+                )
+            for tc in _sequential:
                 name = tc.get("name") or ""
                 args = tc.get("args") or {}
                 # The tool callback emits its own `tool` / `tool_result` events
@@ -1007,6 +1180,13 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
+            # In-turn context management: if the transcript (including every
+            # tool result so far this turn) has grown past the budget, compress
+            # the older tool results so we don't keep re-sending the whole raw
+            # history to the provider on every subsequent step (spec §10).
+            await _compact_tool_history(
+                msgs, compact_model, max(30_000, int(ctx or 0) * 3)
+            )
         return reply
 
     # Essentials retry: free-tier throttle (429 transient) with backoff.
@@ -1114,25 +1294,15 @@ async def coder_entry(state: AgentState) -> dict:
 
 
 def _route_coder_entry(state: AgentState) -> str:
-    if state.get("plan") or state.get("read_context"):
-        return "coder"
-    try:
-        saved = _agents._load_saved_plan(
-            state["root"], chat_id=state.get("chat_id", "")
-        )
-    except Exception:  # noqa: BLE001
-        saved = ""
-    return "coder" if saved else "repo_derive"
+    # Coder now performs its own repo exploration via grep/glob/read tools
+    # directly (OpenCode-style), so it never needs the removed discovery
+    # pipeline. It simply implements (from a plan when one exists).
+    return "coder"
 
 
 async def coder_node(state: AgentState) -> dict:
     queue = state["_queue"]
-    extra = (
-        _build_explore_context(state)
-        if (state.get("read_context") or state.get("grep_results"))
-        else ""
-    )
-    reply = await _run_mode_turn(state, "coder", queue, extra_instruction=extra)
+    reply = await _run_mode_turn(state, "coder", queue)
     return {"coder_result": reply, "final_response": reply}
 
 
@@ -1523,85 +1693,6 @@ def _extract_json_object(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-_LLM_DERIVE_SYSTEM = (
-    "You are a repository SEARCH PLANNER. Given the user's REQUEST and a "
-    "truncated REPO TREE, output ONLY a JSON object (no prose, no markdown "
-    "fences) with these keys:\n"
-    '  "globs":    [VALID glob patterns GROUNDED IN THE REPO TREE — use the '
-    'actual directory/file names shown, e.g. "src/components/**/*Auth*.tsx", '
-    '"**/*session*.py"]. Prefer specific paths over bare "**/*"; each glob '
-    "must be syntactically valid and likely to match real files.\n"
-    '  "keywords": [regex terms to grep, e.g. "timeout", "SessionToken"].\n'
-    '  "queries":  [short natural-language phrases describing what to '
-    'investigate, e.g. "authentication timeout" — used for RANKING files, '
-    "NOT as grep patterns].\n"
-    "Do NOT include skill names, @mentions, or the request's framing words in "
-    "any field. Prefer real paths that appear in the REPO TREE. Keep it "
-    "focused: queries<=8, globs<=10, keywords<=12. If the request is not about "
-    "the repository, return empty lists."
-)
-
-
-async def _llm_derive_explore_patterns(request: str, tree_str: str, model) -> dict | None:
-    """Single LLM call that turns the request into a search plan.
-
-    Returns {"glob":[...], "grep":[...], "queries":[...]} or None on any
-    failure, so the caller can fall back to the deterministic derivation.
-    """
-    user = f"REQUEST:\n{request or ''}\n\nREPO TREE (truncated):\n{tree_str or '(empty)'}"
-    try:
-        text, _ = await llm_generate(model, system=_LLM_DERIVE_SYSTEM, user=user)
-    except Exception:  # noqa: BLE001
-        return None
-    obj = _extract_json_object(text)
-    if not obj:
-        return None
-    glob = _as_list(obj.get("globs"))
-    grep = _as_list(obj.get("keywords"))
-    queries = _as_list(obj.get("queries"))
-    if not (glob or grep or queries):
-        return None
-    return {"glob": glob, "grep": grep, "queries": queries}
-
-
-_LLM_CONDENSE_SYSTEM = (
-    "You are a context condenser for a code-exploration agent. You are given the "
-    "user's request and the raw file contents + grep matches that an earlier "
-    "deterministic search discovered. Produce a SINGLE compact markdown block that "
-    "the planning agent will use as its exploration context.\n"
-    "Rules:\n"
-    "- Keep ONLY content relevant to fulfilling the request: key function/class "
-    "signatures, the specific code the request touches, config values, and exact "
-    "file paths (with line ranges where useful).\n"
-    "- Drop boilerplate, unrelated modules, imports-only files, and verbatim "
-    "duplication between grep hits and full reads.\n"
-    "- Be CONSERVATIVE: when unsure whether something is needed, KEEP it. Missing "
-    "information forces an expensive re-exploration.\n"
-    "- Do NOT answer the request, do not add commentary, do not invent files. "
-    "Output markdown only, no preamble."
-)
-
-
-async def _llm_condense_explore_context(
-    request: str, read_context: str, grep_results: list[str], model
-) -> str | None:
-    """Condense the discovered context into a single relevant markdown block.
-
-    Input is ONLY the request + the explored contents (no conversation history),
-    so the condenser never sees the whole chat. Returns the condensed text, or
-    ``None`` on any failure so the caller keeps the raw context (no data loss)."""
-    grep_block = "\n\n".join(grep_results) if grep_results else "(none)"
-    user = (
-        f"REQUEST:\n{request or ''}\n\n"
-        f"DISCOVERED FILE CONTENTS:\n{read_context or '(none)'}\n\n"
-        f"GREP MATCHES:\n{grep_block}"
-    )
-    try:
-        text, _ = await llm_generate(model, system=_LLM_CONDENSE_SYSTEM, user=user)
-    except Exception:  # noqa: BLE001
-        return None
-    return (text or "").strip() or None
-
 
 def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     """Build the glob/grep/read tool callbacks (no network, no extra LLM)."""
@@ -1626,10 +1717,10 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         permit={"outside": bool(state.get("allow_outside"))},
         store=store, chat_id=state.get("chat_id", ""),
     )
-    # Capture ask_user answers so a clarifying reply can re-trigger exploration
+    # Capture ask_user answers so a clarifying reply can re-trigger planning
     # (e.g. the planner asked "where is the current frontend?" and the user
     # answered). Kept in a module dict keyed by chat_id and consumed by
-    # repo_derive + _route_plan_validate.
+    # _route_plan_validate.
     base_ask = tools.get("ask_user")
     if base_ask is not None:
         cid = state.get("chat_id", "")
@@ -1739,7 +1830,16 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
             ext = f.rsplit(".", 1)[-1].lower() if "." in f else ""
             if ext not in _EXTS:
                 continue
-            out.append(os.path.relpath(os.path.join(dirpath, f), root))
+            rel = os.path.relpath(os.path.join(dirpath, f), root)
+            # Skip root-level .md docs (README/CONTRIBUTING/...) but keep
+            # AGENTS.md and any nested .md (project rule, Part 3).
+            if (
+                os.path.dirname(rel) in ("", ".")
+                and rel.lower().endswith(".md")
+                and rel.lower() != "agents.md"
+            ):
+                continue
+            out.append(rel)
             if len(out) >= max_files:
                 return out
     return out
@@ -1773,6 +1873,23 @@ def _is_excluded_discovery_path(path: str) -> bool:
 
     Test source (``backend/tests/*.py``) stays discoverable on purpose."""
     return any(p in _EXCLUDED_DISCOVERY_DIRS for p in re.split(r"[/\\]", (path or "").strip()))
+
+
+def _is_excluded_root_md(path: str, root: str) -> bool:
+    """True for a root-level ``.md`` file OTHER than AGENTS.md.
+
+    Per project rule, the explore pipeline must not read top-level docs
+    (README, CONTRIBUTING, CHANGELOG, ...) -- they are noise next to the code
+    and bloat the context budget -- while AGENTS.md stays readable. Attached
+    files bypass this entirely (they are read via the Reader, not explore).
+
+    ``path`` is root-relative in the real callers; an absolute path is also
+    accepted (normalized via ``relpath``)."""
+    base = os.path.basename(path or "").lower()
+    if not base.endswith(".md") or base == "agents.md":
+        return False
+    rel = path if not os.path.isabs(path) else os.path.relpath(path, root)
+    return os.path.dirname(rel) in ("", ".")
 
 
 # Captured ask_user answers, keyed by chat_id, so the search pipeline can
@@ -1909,34 +2026,6 @@ def _dedup_grep_results(grep_results: list[str], fully_read: set[str]) -> list[s
     return out
 
 
-def _build_explore_context(state: AgentState) -> str:
-    parts = [
-        "REPOSITORY EXPLORATION RESULTS (gathered deterministically -- do NOT "
-        "call glob/grep/read; use web_search/fetch_url/vision only if the "
-        "question needs external info or attached images):"
-    ]
-    if state.get("explore_tree"):
-        parts.append("PROJECT TREE:\n" + state["explore_tree"])
-    # When the exploration was condensed (repo_condense), prefer that single
-    # compact block -- it already folds in the relevant grep hits, so we emit it
-    # instead of the raw read dump + separate grep section.
-    condensed = state.get("condensed_context", "")
-    if condensed:
-        parts.append("RELEVANT FILE CONTENTS (condensed from exploration):\n" + condensed)
-        return "\n\n".join(parts)
-    greps = state.get("grep_results") or []
-    rc = state.get("read_context", "")
-    # Files already fully read below would otherwise be injected twice (once as
-    # FILE CONTENTS READ, once as GREP MATCHES) -- drop those grep hits.
-    fully_read = _fully_read_files(rc)
-    if fully_read:
-        greps = _dedup_grep_results(greps, fully_read)
-    if greps:
-        parts.append("GREP MATCHES:\n" + "\n\n".join(greps)[:12000])
-    if rc:
-        parts.append("FILE CONTENTS READ:\n" + rc)
-    return "\n\n".join(parts)
-
 
 def _resolve_file_refs(texts, root) -> list[str]:
     """Return repo-relative paths of REAL files referenced anywhere in `texts`
@@ -1988,6 +2077,7 @@ def _resolve_file_refs(texts, root) -> list[str]:
 READER_CONTEXT_LINES = 30
 READER_HEAD_LINES = 200
 READER_MAX_FILES = 15
+MAX_EXPLORE_READ_CHARS = 24_000
 
 
 def _explicit_files(state: AgentState) -> list[str]:
@@ -2054,19 +2144,6 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 # ----- Repo-discovery nodes (deterministic) -------------------------------
 
-# --- repo_derive SPEC cache (chat-scoped, content-free) --------------------
-# Caches ONLY the derived search PATTERNS (glob/grep/queries) that repo_derive
-# produces — NEVER file content. glob/grep/read always run LIVE against disk
-# on every single turn regardless of this cache, so a cache hit can never
-# return a stale ANSWER — it only skips the extra LLM planner call and the
-# repo-tree walk when the same normalized keywords were already explored in
-# this chat and nothing on disk has changed since (checked via a bounded
-# mtime signature, mirroring agents.py's `_SCOUT_CACHE`/`_scout_signature`).
-_SPEC_CACHE: dict[str, tuple[str, str, float, dict]] = {}
-_SPEC_CACHE_MAX_CHATS = 500
-# TTL mirrors the TASK memory tier (a few hours) — a cache entry from days ago
-# is more likely to reflect a finished, unrelated task than the current one.
-_SPEC_CACHE_TTL_SECONDS = 3 * 3600
 
 _TREE_CACHE: dict[str, tuple[str, str]] = {}
 _TREE_CACHE_MAX_ROOTS = 500
@@ -2131,28 +2208,6 @@ def _build_tree_cached(root: str, root_sig: str, max_depth: int = 3, max_entries
     return tree
 
 
-def _spec_cache_get(chat_id: str, kw_sig: str, root_sig: str) -> dict | None:
-    if not chat_id or not kw_sig:
-        return None
-    entry = _SPEC_CACHE.get(chat_id)
-    if not entry:
-        return None
-    cached_kw, cached_root_sig, ts, spec = entry
-    if cached_kw != kw_sig or cached_root_sig != root_sig:
-        return None
-    if time.time() - ts > _SPEC_CACHE_TTL_SECONDS:
-        return None
-    return spec
-
-
-def _spec_cache_put(chat_id: str, kw_sig: str, root_sig: str, spec: dict) -> None:
-    if not chat_id or not kw_sig:
-        return
-    if len(_SPEC_CACHE) >= _SPEC_CACHE_MAX_CHATS and chat_id not in _SPEC_CACHE:
-        _SPEC_CACHE.pop(next(iter(_SPEC_CACHE)))
-    _SPEC_CACHE[chat_id] = (kw_sig, root_sig, time.time(), spec)
-
-
 def _rank_files_semantic(root: str, prompt: str, files: list[str], state: AgentState) -> list[str]:
     """Rank `files` by embedding similarity to `prompt` using the project's own
     vector store (the same index already built for RAG) instead of naive
@@ -2205,369 +2260,6 @@ def _read_context_files(read_context: str) -> set[str]:
     return files
 
 
-async def repo_derive(state: AgentState) -> dict:
-    queue = state["_queue"]
-    request = state.get("request", "")
-    root = state["root"]
-    chat_id = state.get("chat_id", "")
-    # Attached-skill names/@mentions must not pollute the search keywords, so
-    # derive patterns from a cleaned prompt. The skill BODY still drives the
-    # agent via the system prompt; only the skill's *name* is kept out of glob/
-    # grep. File references are resolved from the ORIGINAL request below.
-    clean_request = _strip_skill_mentions(request, _skill_names_to_strip(state))
-
-    # A freshly-answered ask_user question (e.g. the planner asked "where is the
-    # current frontend?" and the user replied "components live in src/") is
-    # captured into _ASK_ANSWERS by the wrapped ask_user tool. Fold it into the
-    # derive input (and the cache key) so the search is re-derived against the
-    # new info, then consumed so we don't re-explore the same answer forever.
-    ans = _ASK_ANSWERS.get(chat_id, "")
-    derive_input = clean_request + ("\n" + ans if ans else "")
-
-    # --- spec cache: reuse the derived PATTERNS (never file content) when the
-    # same normalized keywords were already explored in this chat and nothing
-    # on disk has changed since. glob/grep/read below always still run LIVE
-    # against disk regardless of a cache hit, so a hit can never return a
-    # stale answer -- it only skips the extra LLM planner call + tree walk.
-    root_sig = _repo_mtime_signature(root)
-    kw_sig = _spec_keyword_signature(derive_input)
-    cache_hit = False
-    spec = _spec_cache_get(chat_id, kw_sig, root_sig)
-    if spec is not None:
-        spec = dict(spec)
-        cache_hit = True
-    else:
-        # Single LLM call to PLAN the search; on any failure/empty reply we fall
-        # back to (and, on success, MERGE with) the deterministic heuristic --
-        # so a partial/weak LLM spec still gets backed up without a second LLM
-        # call.
-        llm_spec: dict | None = None
-        try:
-            model = build_chat_model(
-                state["provider"], state["model_name"], state["base_url"],
-                state["api_key"], state["env_var"], state["oauth_token"],
-                temperature=0, thinking_level="none",
-                max_tokens=1000, timeout=model_timeout_for(state),
-            )
-            llm_spec = await _llm_derive_explore_patterns(
-                derive_input, _build_tree_cached(root, root_sig), model
-            )
-        except Exception:  # noqa: BLE001
-            llm_spec = None
-        heuristic = _derive_explore_patterns(derive_input)
-        if llm_spec is None:
-            spec = heuristic
-            spec["queries"] = spec.get("grep", [])
-        else:
-            spec = {
-                "glob": sorted(set(llm_spec.get("glob", [])) | set(heuristic.get("glob", [])))[:24],
-                "grep": sorted(set(llm_spec.get("grep", [])) | set(heuristic.get("grep", [])))[:28],
-                "queries": sorted(set(llm_spec.get("queries", [])) | set(heuristic.get("grep", [])))[:24],
-                "tree_root": heuristic.get("tree_root", ""),
-                "question": derive_input,
-            }
-        _spec_cache_put(chat_id, kw_sig, root_sig, spec)
-
-    # Force any file the user referenced (in THIS turn OR earlier in the
-    # conversation) into the search plan, so the planner (LLM or cached) can't
-    # silently drop it (e.g. it focused on the frontend and missed
-    # backend/graph.py). Applied AFTER the cache lookup/store so a later turn's
-    # different named files never get baked into (or read back from) the
-    # cached spec for an unrelated request.
-    named = _resolve_file_refs(
-        [request] + [m.get("content", "") for m in (state.get("history") or [])],
-        root,
-    )
-    if named:
-        glob = list(spec.get("glob", []))
-        grep = list(spec.get("grep", []))
-        for f in named:
-            if f not in glob:
-                glob.append(f)
-            stem = os.path.splitext(os.path.basename(f))[0]
-            if stem and stem not in grep:
-                grep.append(re.escape(stem))
-        spec["glob"] = glob
-        spec["grep"] = grep
-    queue.put_nowait(
-        {
-            "kind": "tool", "tool": "repo_search",
-            "args": {
-                "glob": spec["glob"], "grep": spec["grep"], "queries": spec["queries"],
-            },
-            "summary": (
-                "reusing search patterns from earlier in this chat (files are still "
-                "re-read live from disk)"
-                if cache_hit else
-                "deriving search patterns (LLM planner + deterministic heuristic, merged)"
-            ),
-        }
-    )
-    queue.put_nowait(
-        {
-            "kind": "tool_result", "tool": "repo_search",
-            "summary": (
-                f"{len(spec['glob'])} glob / {len(spec['grep'])} grep / "
-                f"{len(spec['queries'])} queries" + (" (cached plan)" if cache_hit else "")
-            ),
-            "status": "ok",
-        }
-    )
-    updates: dict = {"search_spec": spec, "named_files": named}
-    # Consume the captured ask_user answer now that we've derived against it, so
-    # the next plan_build loop doesn't re-trigger exploration for the same reply.
-    if ans:
-        updates["_explored_ask_answer"] = ans
-        _ASK_ANSWERS.pop(chat_id, None)
-    return updates
-
-
-async def repo_glob(state: AgentState) -> dict:
-    queue = state["_queue"]
-    tools = _make_explore_tools(state, queue)
-    spec = state.get("search_spec", {}) or {}
-    files: list[str] = []
-    for pat in spec.get("glob", []):
-        queue.put_nowait({"kind": "tool", "tool": "glob", "args": {"pattern": pat}})
-        res = await _run_repo_tool(tools, "glob", pattern=pat)
-        found = _parse_glob_files(res)
-        files.extend(found)
-        queue.put_nowait(
-            {"kind": "tool_result", "tool": "glob", "summary": f"{len(found)} files", "status": "ok"}
-        )
-    seen: set[str] = set()
-    uniq = [f for f in files if not (f in seen or seen.add(f))]
-    return {"explore_glob": uniq}
-
-
-async def repo_grep(state: AgentState) -> dict:
-    queue = state["_queue"]
-    tools = _make_explore_tools(state, queue)
-    spec = state.get("search_spec", {}) or {}
-    # Only the structured "keywords" are valid grep regexes. The "queries"
-    # field holds natural-language phrases (used for ranking, not literal
-    # grep) — feeding them in as regex produces weak/wrong matches, so we
-    # deliberately exclude them here.
-    patterns = list(dict.fromkeys(spec.get("grep", []) or []))[:10]
-    files: list[str] = []
-    raw: list[str] = []
-    for pat in patterns:
-        queue.put_nowait({"kind": "tool", "tool": "grep", "args": {"pattern": pat}})
-        res = await _run_repo_tool(tools, "grep", pattern=pat)
-        raw.append(res)
-        files.extend(_parse_grep_files(res))
-        queue.put_nowait(
-            {"kind": "tool_result", "tool": "grep", "summary": "done", "status": "ok"}
-        )
-    seen: set[str] = set()
-    uniq = [f for f in files if not (f in seen or seen.add(f))]
-    return {"explore_grep": uniq, "grep_results": raw}
-
-
-async def repo_collect(state: AgentState) -> dict:
-    """Backfill + expand the discovered candidate set (kept as a standalone node
-    for callers that still fan-out; the default pipeline folds this into
-    ``repo_read``)."""
-    queue = state["_queue"]
-    spec = state.get("search_spec", {}) or {}
-    rank_text = " ".join(spec.get("queries", []) or []) or (state.get("request", "") or "")
-    files = list(
-        dict.fromkeys(
-            (state.get("explore_glob", []) or []) + (state.get("explore_grep", []) or [])
-        )
-    )
-    # Only backfill (rank the whole repo when few candidates surfaced) when the
-    # derived spec actually carries something to search for. If glob/grep/
-    # queries are all empty there is nothing to ground a search on, so blindly
-    # ranking the entire repo would read 80 arbitrary files — instead we return
-    # little/nothing and let the planner ask a clarifying question (Part C).
-    meaningful = bool(spec.get("glob") or spec.get("grep") or spec.get("queries"))
-    MIN_CANDIDATES = 18
-    if meaningful and len(files) < MIN_CANDIDATES:
-        ranked = _rank_files_semantic(
-            state["root"], rank_text, _repo_source_files(state["root"]), state
-        )
-        seen = set(files)
-        for f in ranked:
-            if f not in seen:
-                files.append(f)
-                seen.add(f)
-            if len(files) >= 80:
-                break
-    files = _expand_imports(state["root"], files)
-    top = [f for f in files[:80] if not _is_excluded_discovery_path(f)]
-    queue.put_nowait(
-        {
-            "kind": "tool", "tool": "collect",
-            "args": {"candidates": len(top)},
-            "summary": f"collected {len(top)} candidate files",
-        }
-    )
-    queue.put_nowait(
-        {"kind": "tool_result", "tool": "collect", "summary": f"{len(top)} files", "status": "ok"}
-    )
-    return {"candidate_files": top}
-
-
-MAX_EXPLORE_READ_FILES = 15
-MAX_EXPLORE_READ_CHARS = 24_000
-
-
-async def repo_read(state: AgentState) -> dict:
-    queue = state["_queue"]
-    # Gather candidates from the deterministic glob + grep passes, backfill when
-    # they surface little, and expand directly-imported files -- then read the
-    # top candidates. This folds the old `repo_tree`/`repo_collect` fan-out into a
-    # single sequential step so the pipeline is: derive -> glob -> grep -> read.
-    spec = state.get("search_spec", {}) or {}
-    rank_text = " ".join(spec.get("queries", []) or []) or (state.get("request", "") or "")
-    files = list(
-        dict.fromkeys(
-            (state.get("explore_glob", []) or []) + (state.get("explore_grep", []) or [])
-        )
-    )
-    # Force any referenced file(s) to the FRONT of the read list so they are
-    # always read, even if glob/grep/ranking did not surface them. Defense in
-    # depth on top of the repo_derive augmentation above.
-    named = state.get("named_files")
-    if named is None:
-        named = _resolve_file_refs(
-            [state.get("request", "")]
-            + [m.get("content", "") for m in (state.get("history") or [])],
-            state["root"],
-        )
-    if named:
-        files = list(dict.fromkeys(list(named) + files))
-    named_set = set(named or [])
-    files = [
-        f for f in files
-        if not _is_excluded_discovery_path(f)
-        and (f in named_set or not _should_skip_read(f))
-    ]
-    # Only backfill (rank the whole repo) when the derived spec is non-empty
-    # (glob/grep/queries). With an empty spec there is nothing to ground the
-    # search on, so we must NOT read 80 arbitrary files — return an empty
-    # context and flag it so the planner asks a clarifying question instead of
-    # guessing from junk (Part C).
-    meaningful = bool(spec.get("glob") or spec.get("grep") or spec.get("queries"))
-    MIN_CANDIDATES = 18
-    if meaningful and len(files) < MIN_CANDIDATES:
-        ranked = _rank_files_semantic(
-            state["root"], rank_text, _repo_source_files(state["root"]), state
-        )
-        seen = set(files)
-        for f in ranked:
-            if f not in seen:
-                files.append(f)
-                seen.add(f)
-            if len(files) >= 80:
-                break
-    files = _expand_imports(state["root"], files)
-    top = [f for f in files[:MAX_EXPLORE_READ_FILES] if not _is_excluded_discovery_path(f)]
-    # Nothing to read (empty spec, no named files) -> do not blindly read the
-    # repo. Signal explore_empty so the planner asks what to look for.
-    if not top:
-        return {"read_context": "", "explore_empty": True}
-    tools = _make_explore_tools(state, queue)
-    parts: list[str] = []
-    total = 0
-    for f in top:
-        queue.put_nowait({"kind": "tool", "tool": "read", "args": {"filePath": f}})
-        res = await _run_repo_tool(tools, "read", filePath=f, limit=200)
-        snippet = f"=== {f} ===\n{res}"
-        parts.append(snippet)
-        total += len(snippet)
-        queue.put_nowait(
-            {"kind": "tool_result", "tool": "read", "summary": f"read {f}", "status": "ok"}
-        )
-        if total >= MAX_EXPLORE_READ_CHARS:
-            break
-    return {"read_context": "\n\n".join(parts)}
-
-
-async def repo_condense(state: AgentState) -> dict:
-    """Condense the discovered exploration context into one compact block so the
-    planner/explainer receives only what's relevant.
-
-    Token-efficiency: ``read_context`` (up to ~24k chars) is otherwise re-sent on
-    every planner tool step and on every re-explore. Condensing it ONCE here, and
-    having ``_build_explore_context`` prefer the result, removes that repeat cost.
-
-    The condenser runs ONCE per exploration and sees ONLY the request + explored
-    contents (never the conversation history). It uses the SAME model configured
-    for history compaction (Settings -> Tools -> compact model) -- one setting
-    controls both -- falling back to the main model when unset. Skipped
-    (returns nothing) when there's nothing to condense, when the raw context is
-    trivially small (the call wouldn't pay for itself), or when the LLM fails
-    (raw context is kept, never dropped)."""
-    rc = state.get("read_context", "")
-    if not rc:
-        return {}
-    # Below this size the raw context is already small enough that the extra LLM
-    # pass wouldn't save tokens -- use it directly.
-    if len(rc) < 4000:
-        return {}
-    sub = state.get("subagent_models") or {}
-    _providers = state.get("providers") or {}
-    _provider_lookup = (
-        lambda pid: (_providers.get(pid) if isinstance(_providers, dict) else None)
-    )
-    model = resolve_subagent_model(
-        state["provider"], sub.get("compact"), state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"],
-        state["model_name"], provider_lookup=_provider_lookup,
-    )
-    if model is None:
-        return {}
-    grep = state.get("grep_results") or []
-    condensed = await _llm_condense_explore_context(
-        state.get("request", ""), rc, grep, model
-    )
-    if not condensed:
-        # LLM failed / returned nothing -> keep the raw context (never lose data)
-        return {}
-    queue = state["_queue"]
-    queue.put_nowait(
-        {
-            "kind": "tool", "tool": "repo_condense",
-            "args": {"chars": len(rc)},
-            "summary": f"condensing {len(rc)} chars of exploration",
-        }
-    )
-    queue.put_nowait(
-        {
-            "kind": "tool_result", "tool": "repo_condense",
-            "summary": f"{len(condensed)} chars", "status": "ok",
-        }
-    )
-    return {"condensed_context": condensed}
-
-
-# ----- Mode nodes that consume the deterministic context ------------------
-
-
-_ASK_REPO_CUES = re.compile(
-    r"where is|where are|find|locate|trace|investigate|"
-    r"which function|which class|which module|which file|which files|"
-    r"implementation of|how does .* work|explain .* code|what does .* do|"
-    r"codebase|source code|"
-    r"کجا|پیدا کن|کدوم تابع|کدوم فانکشن|کدوم کلاس|کدوم ماژول|"
-    r"پیاده سازی|چطور کار",
-    re.I,
-)
-
-
-# Explicit user cues that mean "look at the saved memory now" (so we recall it
-# outside the first-message auto-recall). Persian + English; the user's own word
-# for memory is "مموری".
-_MEMORY_RECALL_CUES = re.compile(
-    r"از مموری|مموری|در حافظه|یادآوری|حافظه|"
-    r"look in memory|from memory|search memory|check memory|what.?s in memory|"
-    r"recall|remember",
-    re.I,
-)
-
-
 _REFERENCE_CUES = re.compile(
     r"ببین|نشون بده|نمایش بده|اون فایل|همون فایل|آن فایل|"
     r"look at it|that file|this file|show me|show it|open it",
@@ -2582,6 +2274,34 @@ def _has_reference_cue(text: str) -> bool:
     return bool(_REFERENCE_CUES.search(text or ""))
 
 
+# Messages that only refer back to a PRIOR answer in the conversation rather
+# than introducing a new, searchable entity (e.g. "look at the paths you
+# mentioned", "همون مسیرهاییکه گفتی رو ببین"). Used to keep a broadened
+# _ASK_REPO_CUES from routing a no-op follow-up into an empty re-explore.
+_FOLLOWUP_CUES = re.compile(
+    r"look at|the paths|mentioned|refer|همون|اون|گفتی|ببین|نشون بده",
+    re.I,
+)
+
+
+def _history_has_assistant_answer(state: AgentState) -> bool:
+    return any(
+        (m.get("role") in ("assistant", "agent")) and (m.get("content") or "").strip()
+        for m in (state.get("history") or [])
+    )
+
+
+def _is_prior_reference_followup(state: AgentState) -> bool:
+    """True for a short follow-up that only refers back to prior discussion and
+    carries no new searchable entity. Such a message matches the broadened
+    _ASK_REPO_CUES (e.g. "مسیر") but would yield an empty exploration, so we
+    let the agent re-state from the prior answer already in history instead of
+    looping on a pointless re-explore."""
+    return bool(_FOLLOWUP_CUES.search(state.get("request", "") or "")) and (
+        _history_has_assistant_answer(state)
+    )
+
+
 def _ask_needs_repo(text: str) -> bool:
     """True when an ask-mode question is about the project/codebase and should
     run the deterministic repo-discovery pipeline (instead of answering from
@@ -2591,11 +2311,10 @@ def _ask_needs_repo(text: str) -> bool:
 
 
 async def ask_entry(state: AgentState) -> dict:
-    # Ask is a GENERAL assistant. It runs the deterministic repo-discovery
-    # pipeline only when the question is project/code-related (gated in
-    # _route_ask_entry); for general questions it answers directly. Ask is
-    # denied glob/grep/read, so when it DOES discover it consumes the result
-    # and never re-searches from scratch.
+    # Ask is a GENERAL assistant. It has grep/glob/read tools directly
+    # (OpenCode-style), so it explores the repo itself when the question is
+    # project/code-related; for general questions it answers directly. It
+    # consumes its own tool results and never re-searches from scratch.
     return {}
 
 
@@ -2607,28 +2326,15 @@ def _route_ask_entry(state: AgentState) -> str:
     # parts (no repo-wide discovery / glob).
     if _explicit_files(state):
         return "reader"
-    # Otherwise: explore only on a strong repo cue, or a "ببینش about an earlier
-    # file" reference (handled by the narrow reference-cue + history check). We
-    # deliberately do NOT scan the whole history for a file ref here, or the
-    # agent's own prior replies would re-trigger exploration every message.
-    if _ask_needs_repo(request):
-        return "repo_derive"
-    if _has_reference_cue(request) and _resolve_file_refs(
-        [request] + [m.get("content", "") for m in (state.get("history") or [])],
-        state["root"],
-    ):
-        return "repo_derive"
+    # Otherwise the agent decides for itself whether to search. A strong repo cue
+    # or an explicit file reference means it likely should; either way it answers
+    # directly with whatever tools it calls.
     return "ask_answer"
 
 
 async def ask_answer(state: AgentState) -> dict:
     queue = state["_queue"]
-    extra = (
-        _build_explore_context(state)
-        if (state.get("read_context") or state.get("grep_results"))
-        else ""
-    )
-    reply = await _run_mode_turn(state, "ask", queue, extra_instruction=extra)
+    reply = await _run_mode_turn(state, "ask", queue)
     return {"final_response": reply}
 
 
@@ -2661,17 +2367,14 @@ async def reader_read(state: AgentState) -> dict:
             continue
     line_refs = _parse_line_refs(request, files)
     tools = _make_explore_tools(state, queue)
-    parts: list[str] = []
-    total = 0
+    # Build every (file, range) read spec up front, then run ALL reads
+    # concurrently via asyncio.gather — opencode-style parallel tool execution.
+    # The read tool offloads the disk read to a worker thread (tools.read_file
+    # -> asyncio.to_thread), so gathered reads overlap instead of running
+    # one-at-a-time. The read tool emits its own tool/tool_result events, so no
+    # manual queue events are needed here.
+    read_specs: list[tuple[str, int, int]] = []  # (file, a, b)
     for f in files:
-        queue.put_nowait(
-            {
-                "kind": "tool",
-                "tool": "read",
-                "args": {"filePath": f},
-                "summary": f"reading targeted parts of {f}",
-            }
-        )
         ranges: list[tuple[int, int]] = []
         if f in line_refs:
             for a, b in line_refs[f]:
@@ -2683,18 +2386,24 @@ async def reader_read(state: AgentState) -> dict:
         else:
             ranges.append((1, READER_HEAD_LINES))
         for a, b in _merge_ranges(ranges):
-            limit = b - a + 1
-            res = await _run_repo_tool(tools, "read", filePath=f, offset=a, limit=limit)
-            chunk = f"--- {f}:{a}-{b} ---\n{res}"
-            parts.append(chunk)
-            total += len(chunk)
-            if total >= MAX_EXPLORE_READ_CHARS:
-                break
-        queue.put_nowait(
-            {"kind": "tool_result", "tool": "read", "summary": f"read {f}", "status": "ok"}
-        )
-        if total >= MAX_EXPLORE_READ_CHARS:
+            read_specs.append((f, a, b))
+
+    async def _read(spec: tuple[str, int, int]) -> str:
+        f, a, b = spec
+        limit = b - a + 1
+        res = await _run_repo_tool(tools, "read", filePath=f, offset=a, limit=limit)
+        return f"--- {f}:{a}-{b} ---\n{res}"
+
+    chunks = await asyncio.gather(*(_read(s) for s in read_specs)) if read_specs else []
+    # Assemble in input order and cap to MAX_EXPLORE_READ_CHARS (trims trailing
+    # parts once the budget is reached — gather keeps order, so the head wins).
+    parts: list[str] = []
+    total = 0
+    for chunk in chunks:
+        if total + len(chunk) > MAX_EXPLORE_READ_CHARS and parts:
             break
+        parts.append(chunk)
+        total += len(chunk)
     return {"read_context": "\n\n".join(parts), "reader_files": files}
 
 
@@ -2727,10 +2436,11 @@ async def plan_understand(state: AgentState) -> dict:
 def _route_plan_understand(state: AgentState) -> str:
     # When the user points at specific file(s) in PLAN mode, read ONLY those
     # (targeted, no repo-wide discovery) and let the planner build from that
-    # context. Otherwise run the full repo-discovery pipeline as before.
+    # context. Otherwise the planner explores the repo itself via grep/glob/read
+    # tools (OpenCode-style) and then builds the plan.
     if _explicit_files(state):
         return "reader_read"
-    return "repo_derive"
+    return "plan_build"
 
 
 def _route_reader_dispatch(state: AgentState) -> str:
@@ -2743,8 +2453,7 @@ def _route_reader_dispatch(state: AgentState) -> str:
 
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
-    extra = _build_explore_context(state)
-    reply = await _run_mode_turn(state, "plan", queue, extra_instruction=extra)
+    reply = await _run_mode_turn(state, "plan", queue)
     try:
         if reply.strip().startswith("## Plan"):
             from tools import slugify
@@ -2764,28 +2473,9 @@ async def plan_validate(state: AgentState) -> dict:
     return {"plan_valid": valid}
 
 
-async def explore_analyze(state: AgentState) -> dict:
-    queue = state["_queue"]
-    extra = _build_explore_context(state)
-    reply = await _run_mode_turn(state, "explore", queue, extra_instruction=extra)
-    return {"explore_answer": reply, "final_response": reply}
-
-
-def _route_repo_dispatch(state: AgentState) -> str:
-    mode = state.get("mode")
-    if mode == "plan":
-        return "plan_build"
-    if mode == "explore":
-        return "explore_analyze"
-    if mode == "coder":
-        return "coder"
-    return "ask_answer"
-
-
 def _route_plan_validate(state: AgentState) -> str:
     # After the planner asked a clarifying question and the user answered, the
-    # answer was captured into _ASK_ANSWERS and folded into repo_derive. If it
-    # hasn't been explored yet, re-run the discovery pipeline against the new
+    # answer was captured into _ASK_ANSWERS. Re-run the planner against the new
     # info instead of looping on an empty/bad plan. Bounded by plan_attempts so
     # a run of unhelpful answers can't loop forever (Part A).
     if state.get("mode") == "plan":
@@ -2795,12 +2485,16 @@ def _route_plan_validate(state: AgentState) -> str:
             and ans != state.get("_explored_ask_answer")
             and int(state.get("plan_attempts", 0)) < 3
         ):
-            return "repo_derive"
+            return "plan_build"
     if state.get("plan_valid"):
-        return "coder"
+        # Plan mode is a read-only deliverable: present the plan once and STOP,
+        # so the user can review / extend it or switch to Coder manually (which
+        # implements from the saved plan). Do NOT auto-jump to Coder -- that
+        # would re-state the whole plan and show it twice.
+        return "done" if state.get("mode") == "plan" else "coder"
     if int(state.get("plan_attempts", 0)) < 2:
         return "plan_build"
-    return "coder"
+    return "done" if state.get("mode") == "plan" else "coder"
 
 
 def _route_mode(state: AgentState) -> str:
@@ -2818,33 +2512,32 @@ def _route_debug(state: AgentState) -> str:
 
 
 def build_graph():
-    """Compile the LangGraph state machine for the agent workflow."""
+    """Compile the LangGraph state machine for the agent workflow.
+
+    OpenCode-style architecture: every agent mode (coder/plan/ask/reader) has
+    direct access to the grep/glob/read tool runtime and decides iteratively
+    which to call — there is NO forced derive stage and NO separate explore
+    pipeline. Broad exploration is delegated to an isolated Explore subagent via
+    the Task tool, whose history never enters the Main Agent context.
+    """
     g = StateGraph(AgentState)
-    # Router + existing test/debug/review/done tail.
     g.add_node("router", router)
     g.add_node("coder", coder_node)
-    # CODER entry: if a plan exists, implement from it (skip discovery);
-    # otherwise run the repo-discovery pipeline first, then implement.
     g.add_node("coder_entry", coder_entry)
-    g.add_conditional_edges(
-        "coder_entry", _route_coder_entry,
-        {"coder": "coder", "repo_derive": "repo_derive"},
-    )
+    g.add_conditional_edges("coder_entry", _route_coder_entry, {"coder": "coder"})
     g.add_node("test", test_node)
     g.add_node("debug", debug_node)
     g.add_node("review", review_node)
     g.add_node("done", done_node)
-    # ASK flow: general assistant that runs the deterministic repo-discovery
-    # pipeline ONLY when the question is project-related (ask_entry gate);
-    # otherwise it answers directly. Ask is denied glob/grep/read, so when it
-    # does discover it consumes the result and never re-searches from scratch.
+    # ASK flow: general assistant with repo tools; answers directly, searching
+    # itself when the question is project-related.
     g.add_node("ask_entry", ask_entry)
     g.add_node("ask_answer", ask_answer)
     g.add_node("reader_read", reader_read)
     g.add_node("reader_answer", reader_answer)
     g.add_conditional_edges(
         "ask_entry", _route_ask_entry,
-        {"repo_derive": "repo_derive", "ask_answer": "ask_answer", "reader": "reader_read"},
+        {"ask_answer": "ask_answer", "reader": "reader_read"},
     )
     g.add_edge("ask_answer", "done")
     g.add_conditional_edges(
@@ -2852,55 +2545,28 @@ def build_graph():
         {"reader_answer": "reader_answer", "plan_build": "plan_build"},
     )
     g.add_edge("reader_answer", "done")
-    # PLAN flow.
+    # PLAN flow: the planner explores via grep/glob/read itself, then builds.
     g.add_node("plan_understand", plan_understand)
     g.add_node("plan_build", plan_build)
     g.add_node("plan_validate", plan_validate)
-    # EXPLORE flow.
-    g.add_node("explore_analyze", explore_analyze)
-    # Shared deterministic repo-discovery workflow (sequential).
-    g.add_node("repo_derive", repo_derive)
-    g.add_node("repo_glob", repo_glob)
-    g.add_node("repo_grep", repo_grep)
-    g.add_node("repo_read", repo_read)
-    g.add_node("repo_condense", repo_condense)
-
-    g.add_edge(START, "router")
-    g.add_conditional_edges(
-        "router", _route_mode,
-        {"ask": "ask_entry", "plan": "plan_understand", "coder": "coder_entry",
-         "explore": "repo_derive", "reader": "reader_read"},
-    )
-
-    # PLAN: understand -> (targeted reader_read | full repo_derive) -> build -> validate.
     g.add_conditional_edges(
         "plan_understand", _route_plan_understand,
-        {"reader_read": "reader_read", "repo_derive": "repo_derive"},
+        {"reader_read": "reader_read", "plan_build": "plan_build"},
     )
     g.add_edge("plan_build", "plan_validate")
     g.add_conditional_edges(
         "plan_validate", _route_plan_validate,
-        {"plan_build": "plan_build", "coder": "coder"},
+        {"plan_build": "plan_build", "coder": "coder", "done": "done"},
     )
 
-    # EXPLORE: discover -> analyze -> done.
-    g.add_edge("explore_analyze", "done")
-
-    # Shared repo-discovery pipeline: ONE LLM planner call, then sequential
-    # glob -> grep -> read. The agent (plan_build / explore_analyze) consumes the
-    # gathered context and has NO glob/grep/read tools, so it never re-searches
-    # the repo from scratch.
-    g.add_edge("repo_derive", "repo_glob")
-    g.add_edge("repo_glob", "repo_grep")
-    g.add_edge("repo_grep", "repo_read")
-    g.add_edge("repo_read", "repo_condense")
+    g.add_edge(START, "router")
     g.add_conditional_edges(
-        "repo_condense", _route_repo_dispatch,
-        {"plan_build": "plan_build", "explore_analyze": "explore_analyze",
-         "coder": "coder", "ask_answer": "ask_answer"},
+        "router", _route_mode,
+        {"ask": "ask_entry", "plan": "plan_understand",
+         "coder": "coder_entry", "reader": "reader_read"},
     )
 
-    # CODER tail (unchanged).
+    # CODER tail.
     g.add_edge("coder", "test")
     g.add_conditional_edges("test", _route_test, {"pass": "review", "fail": "debug"})
     g.add_conditional_edges("debug", _route_debug, {"coder": "coder", "review": "review"})
@@ -2961,3 +2627,27 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
 
 
 
+
+
+# Repo-discovery cue (used by `_ask_needs_repo` and follow-up routing): a strong
+# signal the question is about the project/codebase rather than general chat.
+_ASK_REPO_CUES = re.compile(
+    r"where is|where are|find|locate|trace|investigate|"
+    r"which function|which class|which module|which file|which files|"
+    r"what file|what module|what class|what function|"
+    r"path of|implementation of|how does .* work|explain .* code|what does .* do|"
+    r"codebase|source code|component|"
+    r"کجا|پیدا کن|کدوم تابع|کدوم فانکشن|کدوم کلاس|کدوم ماژول|"
+    r"پیاده سازی|چطور کار|کامپوننت",
+    re.I,
+)
+
+
+# Explicit user cues that mean "look at the saved memory now" (so we recall it
+# outside the first-message auto-recall). Persian + English.
+_MEMORY_RECALL_CUES = re.compile(
+    r"از مموری|مموری|در حافظه|یادآوری|حافظه|"
+    r"look in memory|from memory|search memory|check memory|what.?s in memory|"
+    r"recall|remember",
+    re.I,
+)

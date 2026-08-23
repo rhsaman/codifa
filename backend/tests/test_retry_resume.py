@@ -94,14 +94,13 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
     `messages`) -- nothing is injected or persisted to "teach" it."""
     monkeypatch.setattr(agents, "_THROTTLE_BASE_SECONDS", 0)
     mock.script = [
-        text_reply("discovery"),
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
     ]
-    # coder-without-plan runs discovery first (1 model call: the repo_derive
-    # planner), so the write_file call is request index 1 and its trailing text
-    # reply is index 2.
-    mock.error_at = {2: (429, "Rate limit exceeded. Please try again later.")}
+    # The coder agent writes first (request 0); its trailing text reply is
+    # request 1. Throttle that so the turn retries from the REAL transcript
+    # (the write result is already in `messages`).
+    mock.error_at = {1: (429, "Rate limit exceeded. Please try again later.")}
 
     events = await run_events("create app.py with a foo function", mode="coder")
 
@@ -124,14 +123,13 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
     work), just more retries -- and still no resume- injection."""
     monkeypatch.setattr(agents, "_THROTTLE_BASE_SECONDS", 0)
     mock.script = [
-        text_reply("discovery"),
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
     ]
-    # coder-without-plan runs discovery first (1 model call: the repo_derive
-    # planner), so the write_file trailing text reply is at request indices 2 and 3.
-    mock.error_at = {2: (429, "Rate limit exceeded. Please try again later."),
-                     3: (429, "Rate limit exceeded. Please try again later.")}
+    # The coder agent writes first (request 0); two consecutive throttles on its
+    # trailing text replies (request indices 1 and 2).
+    mock.error_at = {1: (429, "Rate limit exceeded. Please try again later."),
+                     2: (429, "Rate limit exceeded. Please try again later.")}
 
     events = await run_events("create app.py with a foo function", mode="coder")
 
@@ -164,25 +162,6 @@ async def test_fatal_500_surfaces_as_error_no_resume(run_events):
     assert any(e.get("kind") == "error" for e in events), \
         "500 must surface as an error event"
     assert _all_requests_have_no_resume()
-
-
-async def test_planner_500_degrades_without_error_event(run_events):
-    """A 500 on the LLM search-planner (repo_derive) is NON-fatal: it degrades
-    to the deterministic derivation, so the turn still completes (no error
-    event) instead of crashing the whole request."""
-    mock.script = [text_reply("Done")]
-    mock.error_at = {0: (500, "server error")}
-
-    # Broad plan (no specific file) so the turn routes through repo_derive, whose
-    # search-planner 500 must degrade to the deterministic fallback.
-    events = await run_events("make a plan for the auth system", mode="plan")
-
-    assert not any(e.get("kind") == "error" for e in events), \
-        "planner 500 must NOT surface as an error event (deterministic fallback)"
-    assert any(e.get("kind") == "tool" and e.get("tool") == "repo_search" for e in events), \
-        "discovery must still run via the deterministic fallback"
-    assert any(e.get("kind") == "done" for e in events), \
-        "the turn must still complete"
 
 
 async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspace):

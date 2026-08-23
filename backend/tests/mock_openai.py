@@ -113,30 +113,41 @@ def _to_completion(chunks, finish="stop"):
 async def chat_handler(request: Request):
     body = await request.json()
     mock.captured.append(body)
+    # Snapshot the per-test script/error state AT REQUEST START. The mock server
+    # runs on its own thread/loop, so a request that began while an OLD test's
+    # script was active must keep consuming THAT script -- not the NEW test's
+    # script, which the next test may have assigned by the time we pop. Without
+    # this snapshot, a previous test's in-flight (still-streaming) response would
+    # steal the next test's script[0], causing flaky cross-test pollution.
+    script_snapshot = mock.script
+    error_at_snapshot = dict(mock.error_at)
     if mock.reject_parallel and body.get("parallel_tool_calls"):
         mock.statuses.append(400)
         return JSONResponse(
             {"error": {"message": "parallel_tool_calls unsupported", "type": "unsupported"}},
             media_type="application/json",
             status_code=400,
+            headers={"Connection": "close"},
         )
-    if mock.error_at:
+    if error_at_snapshot:
         idx = len(mock.captured) - 1
-        if idx in mock.error_at:
-            status, message = mock.error_at.pop(idx)
+        if idx in error_at_snapshot:
+            status, message = error_at_snapshot[idx]
             mock.statuses.append(status)
             return JSONResponse(
                 {"error": {"message": message, "type": "server_error"}},
                 media_type="application/json",
                 status_code=status,
+                headers={"Connection": "close"},
             )
-    spec = mock.script.pop(0) if mock.script else text_reply("default")
+    spec = script_snapshot.pop(0) if script_snapshot else text_reply("default")
     if spec is None:
         mock.statuses.append(400)
         return JSONResponse(
             {"error": {"message": "bad request", "type": "invalid_request"}},
             media_type="application/json",
             status_code=400,
+            headers={"Connection": "close"},
         )
     mock.statuses.append(200)
     # Derive usage from the REAL request/response sizes so token counts are

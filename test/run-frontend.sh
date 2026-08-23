@@ -72,6 +72,12 @@ npx esbuild test/usageContext.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-uc.mjs >/dev/null 2>&1
 node test/.tmp-uc.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs
+echo ""
+echo "── تست ۱۳: contextUsed (نوار بالا: max(provider input+cache, تخمین کل مکالمه) — تجمعی مثل opencode) ──"
+npx esbuild test/contextUsed.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-cu.mjs >/dev/null 2>&1
+node test/.tmp-cu.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

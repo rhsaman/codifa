@@ -1334,6 +1334,27 @@ textarea {
 .sidebar-usage-tokens {
   font-variant-numeric: tabular-nums;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  text-align: right;
+}
+
+/* Cached (prompt-cache) tokens, shown next to the real token count. Used both
+   inline (grand total / group total: "1.2k · ⚡300") and inside the per-model
+   tokens column where it stacks beneath the real count. */
+.sidebar-usage-cache,
+.sidebar-usage-grand-cache {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  opacity: 0.85;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sidebar-usage-cache {
+  font-size: 0.82em;
 }
 
 .sidebar-usage-cost {

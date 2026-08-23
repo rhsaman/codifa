@@ -179,6 +179,47 @@ export function contextPercent(used: number, windowSize: number | null): number 
   return Math.round((used / windowSize) * 100)
 }
 
+/**
+ * Resolve the context-meter token count shown in the sidebar.
+ *
+ * We take the LARGER of:
+ *  - `realTotal`: the provider's reported `input + cache` tokens from the last
+ *    assistant turn's `usage` event (opencode's precise count), and
+ *  - `estimate`: our full-conversation estimate (system + settled history +
+ *    live turn).
+ *
+ * opencode's proxy may window its reported `input_tokens` to a small slice, so
+ * `realTotal` can UNDER-count the real conversation. Using the max keeps the
+ * meter cumulative and growing — matching opencode's own TUI meter — while
+ * still trusting the provider when it reports more than our estimate. When no
+ * real usage has arrived yet (brand-new chat / right after a compact) the
+ * estimate is the only signal, so it acts as a floor. Output tokens are
+ * EXCLUDED from `realTotal` (they are generated after the prompt and are not
+ * part of the context window).
+ */
+export function computeContextUsed(
+  chat: Chat | null,
+  systemPrompt: string,
+  maxHistory: number,
+  contextWindow?: number,
+  mode?: string,
+): number {
+  const msgs = chat?.messages ?? []
+  const active = msgs.filter((m) => !m.compacted)
+  let realTotal = 0
+  for (let i = active.length - 1; i >= 0; i--) {
+    const m = active[i]
+    const u = m.usage
+    if (m.role === 'assistant' && u && u.outputTokens > 0) {
+      const cached = (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
+      realTotal = (u.inputTokens || 0) + cached
+      break
+    }
+  }
+  const estimate = estimateContextTokens(chat, systemPrompt, maxHistory, contextWindow, mode)
+  return Math.max(realTotal, estimate)
+}
+
 /** Resolve a model's context window from the provider's contextMap, trying
  *  both the bare id (what the picker stores) and the provider-prefixed id
  *  (NVIDIA's /models returns "nvidia/<model>" while the picker stores the

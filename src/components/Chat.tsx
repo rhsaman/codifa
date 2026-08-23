@@ -13,7 +13,7 @@ import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
 import {
   contextPercent,
-  estimateContextTokens,
+  computeContextUsed,
   formatCost,
   formatTokens,
   formatTokensK,
@@ -119,6 +119,51 @@ function wantsSkillOrMcp(text: string): boolean {
   );
   const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)/.test(low);
   return action && target;
+}
+
+/**
+ * Extract @skill mentions from a prompt and return the matched skill names plus
+ * the prompt with those @mentions stripped (the model must not see raw @tokens;
+ * the stored transcript keeps the original text with the @mentions).
+ *
+ * Skill names may contain spaces (e.g. "Anthropic Frontend Design"), so a naive
+ * `@(\w+)` capture would only grab "Anthropic" and miss the skill. Instead we
+ * capture an `@` followed by a run of word / Persian letters and internal
+ * spaces, then keep the LONGEST known skill name that is a prefix of that run
+ * (case-insensitive). This makes "@Anthropic Frontend Design" match the skill.
+ * Any trailing words after the name are preserved (e.g. "...Design please" ->
+ * " please").
+ */
+function extractMentionSkills(
+  text: string,
+  skills: { name: string }[],
+): { skills: Set<string>; cleaned: string } {
+  const found = new Set<string>();
+  const names = skills.map((s) => s.name);
+  const re = /(^|\s)@([\w\u0600-\u06FF]+(?:\s[\w\u0600-\u06FF]+)*)/g;
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const lead = m[1];
+    const raw = m[2];
+    let best: string | null = null;
+    for (const n of names) {
+      if (raw.toLowerCase().startsWith(n.toLowerCase())) {
+        if (!best || n.length > best.length) best = n;
+      }
+    }
+    out += text.slice(last, m.index) + lead;
+    if (best) {
+      found.add(best);
+      out += raw.slice(best.length); // keep any trailing words after the name
+    } else {
+      out += "@" + raw; // leave unmatched @token as-is
+    }
+    last = m.index + m[0].length;
+  }
+  out += text.slice(last);
+  return { skills: found, cleaned: out };
 }
 
 const IMAGE_EXTS = new Set([
@@ -1056,46 +1101,21 @@ export function ChatPanel() {
 
   const ctxWindow = modelContextWindow(provider, activeModel);
 
-  const contextUsed = useMemo(() => {
-    // Take the LAST assistant message that reported real output tokens and sum
-    // input + output — the provider's real usage, no character estimate — so
-    // the meter can't overshoot and then "fall back down" when the first usage
-    // event lands. input_tokens already includes the cache-read/write portion
-    // (see the backend's _usage_event), so cache is NOT added again: adding it
-    // double-counted and inflated the meter past the real window usage, which
-    // also made it disagree with the backend's pre-emptive compact trigger
-    // (input + output) and show >100% while no compaction fired. Because the
-    // backend reports the FULL prompt's input tokens on every request, the sum
-    // is monotonic across a tool loop: the meter only grows within a turn,
-    // never oscillates. With no real usage yet (brand-new chat, or right after
-    // a compact) it falls back to the estimate below — never a dash.
-    const msgs = chat?.messages ?? [];
-    const active = msgs.filter((m) => !m.compacted);
-    for (let i = active.length - 1; i >= 0; i--) {
-      const m = active[i];
-      const u = m.usage;
-      if (m.role === "assistant" && u && u.outputTokens > 0) {
-        return u.inputTokens + u.outputTokens;
-      }
-    }
-    // No real usage yet (brand-new chat, or right after a compact cleared the
-    // tail's usage). Fall back to the character estimate — system prompt +
-    // summary + preserved tail + the in-flight turn's own content/thinking/tool
-    // payload — so the meter shows the ACTUAL context size instead of hiding
-    // behind a dash. This is what makes the meter visibly drop after /compact
-    // AND keep showing the reduced value while the next turn is thinking: the
-    // estimate already includes the live message, so it tracks the first real
-    // usage event closely instead of growing with the live text and then
-    // jumping (the old "oscillating meter" complaint was the per-message badge
-    // estimating live; the titlebar meter just needs the estimate, not a dash).
-    return estimateContextTokens(
-      chat,
-      systemPrompt,
-      maxHistory,
-      ctxWindow ?? undefined,
-      chat?.mode,
-    );
-  }, [chat, systemPrompt, maxHistory, ctxWindow]);
+  // Cumulative, growing context count — see `computeContextUsed` for the
+  // reasoning (max of provider-reported input+cache and the full-conversation
+  // estimate, so it matches opencode's TUI meter and never collapses to a
+  // single message's tokens).
+  const contextUsed = useMemo(
+    () =>
+      computeContextUsed(
+        chat,
+        systemPrompt,
+        maxHistory,
+        ctxWindow ?? undefined,
+        chat?.mode,
+      ),
+    [chat, systemPrompt, maxHistory, ctxWindow],
+  );
 
   const ctxPct = contextPercent(contextUsed, ctxWindow);
 
@@ -1196,20 +1216,11 @@ export function ChatPanel() {
     // @, pass them to the backend (only those are loaded — there is no
     // auto-selection) and strip the @mentions from the prompt so the model
     // doesn't see raw @tokens. The stored transcript keeps the original text
-    // with the @mentions.
-    const mentionSkills = new Set<string>();
-    const cleanedText = text.replace(
-      /@([\w\u0600-\u06FF-]+)/g,
-      (m, name: string) => {
-        const hit = skillsList.find(
-          (s) => s.name.toLowerCase() === name.toLowerCase(),
-        );
-        if (hit) {
-          mentionSkills.add(hit.name);
-          return "";
-        }
-        return m;
-      },
+    // with the @mentions. Skill names may contain spaces, so we match the
+    // longest known skill name that is a prefix of the @run.
+    const { skills: mentionSkills, cleaned: cleanedText } = extractMentionSkills(
+      text,
+      skillsList,
     );
     const finalPrompt =
       skillNotes.length > 0

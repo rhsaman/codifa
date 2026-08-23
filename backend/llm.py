@@ -25,6 +25,7 @@ graph or the tools.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from providers import (
@@ -298,6 +299,15 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import StructuredTool
 
+# Mirrors graph.py's `_SEQUENTIAL_TOOLS` (duplicated, not imported, to avoid a
+# circular import -- graph.py imports FROM this module). Mutating / blocking
+# tool calls run one at a time; everything else may run concurrently. See the
+# comment on graph.py's `_SEQUENTIAL_TOOLS` for the full rationale.
+_SEQUENTIAL_TOOLS = {
+    "write_file", "edit_file", "run_terminal", "confirm_action",
+    "memory", "create_skill", "create_mcp", "ask_user",
+}
+
 
 async def llm_generate(
     model: Any,
@@ -370,11 +380,30 @@ async def langchain_tool_loop(
 
     ``tools`` is a ``{name: callable}`` mapping (sync or async). Returns the
     final textual reply. Used by sub-agents (general/task) that need tools.
+
+    Read-only tool calls requested in the same step run CONCURRENTLY via
+    ``asyncio.gather`` (matching opencode's Promise.all); mutating/blocking
+    tools run sequentially. See ``_SEQUENTIAL_TOOLS``.
     """
     lc_tools = [
         StructuredTool.from_function(func=fn, name=name, description=(fn.__doc__ or name))
         for name, fn in tools.items()
     ]
+    async def _exec(tc):
+        """Execute a single tool call; never raises (errors become a result string)."""
+        name = tc.get("name") or ""
+        args = tc.get("args") or {}
+        fn = tools.get(name)
+        if fn is None:
+            return f"ERROR: unknown tool {name!r}"
+        try:
+            r = fn(**(args or {}))
+            if inspect.isawaitable(r):
+                r = await r
+            return r
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR running {name}: {exc}"
+
     msgs: list[Any] = []
     if system:
         msgs.append(SystemMessage(content=system))
@@ -393,22 +422,30 @@ async def langchain_tool_loop(
             content = getattr(ai, "content", "")
             return str(content) if isinstance(content, str) else str(content or "")
         msgs.append(ai)
-        for tc in tcs:
-            name = tc.get("name") or ""
-            args = tc.get("args") or {}
-            fn = tools.get(name)
-            if fn is None:
-                res = f"ERROR: unknown tool {name!r}"
-            else:
-                try:
-                    r = fn(**(args or {}))
-                    if inspect.isawaitable(r):
-                        r = await r
-                    res = r
-                except Exception as exc:  # noqa: BLE001
-                    res = f"ERROR running {name}: {exc}"
+        # Partition this step's tool calls: read-only tools (grep/glob/read/
+        # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
+        # other since none mutate anything. Mutating/blocking calls
+        # (_SEQUENTIAL_TOOLS) run one at a time, after the concurrent batch, so a
+        # write never races another write and ask_user never overlaps another
+        # call. This mirrors the main-agent loop in graph.py so sub-agents
+        # (explore/general) parallelize like opencode's Promise.all; token cost
+        # is unchanged (the provider still receives every ToolMessage, just
+        # faster). ToolMessages carry their own tool_call_id, so `msgs` order
+        # need not match request order.
+        _parallel = [tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
+        _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
+        if len(_parallel) > 1:
+            _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
+        else:
+            _results = [await _exec(tc) for tc in _parallel]
+        for tc, result in zip(_parallel, _results):
             msgs.append(
-                ToolMessage(content=str(res), tool_call_id=tc.get("id", ""))
+                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
+            )
+        for tc in _sequential:
+            result = await _exec(tc)
+            msgs.append(
+                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
             )
     return ""
 

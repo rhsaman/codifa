@@ -43,38 +43,6 @@ def test_load_images_handles_string_and_dict_mixed(tmp_path):
     ]
 
 
-def test_repo_collect_backfills_when_sparse(tmp_path):
-    (tmp_path / "auth.py").write_text("x = 1\n")
-    (tmp_path / "util.py").write_text("y = 1\n")
-    state = {
-        "_queue": _q(),
-        "root": str(tmp_path),
-        "request": "where is the auth logic",
-        # a non-empty derived spec is required to backfill (empty spec -> the
-        # reader must ask, not blindly rank the whole repo -- see Part C)
-        "search_spec": {"glob": [], "grep": ["auth"], "queries": []},
-        "explore_glob": [],
-        "explore_grep": [],
-    }
-    res = asyncio.run(graph.repo_collect(state))
-    cands = res["candidate_files"]
-    assert len(cands) >= 1
-    # the prompt token "auth" ranks auth.py first
-    assert cands[0] == "auth.py"
-
-
-def test_repo_collect_still_empty_for_empty_repo(tmp_path):
-    state = {
-        "_queue": _q(),
-        "root": str(tmp_path),
-        "request": "anything",
-        "explore_glob": [],
-        "explore_grep": [],
-    }
-    res = asyncio.run(graph.repo_collect(state))
-    assert res["candidate_files"] == []
-
-
 def test_expand_imports_pulls_relative(tmp_path):
     (tmp_path / "main.py").write_text("from . import helper\n")
     (tmp_path / "helper.py").write_text("z = 1\n")

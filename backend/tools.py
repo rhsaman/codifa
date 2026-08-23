@@ -29,7 +29,7 @@ from typing import Any
 
 import providers as _providers
 import state_db as _state_db
-from agent_registry import AGENTS
+from agent_registry import AGENTS, agent_system, agent_tools
 from cache import Cache, cache_path_for
 from embeddings import EmbedderUnavailableError
 from memory_manager import MEM_SHORT_TERM, MemoryConfig, MemoryManager
@@ -1020,13 +1020,17 @@ def _builtin_skills_dir() -> str:
 
 
 def sync_builtin_skills() -> list[str]:
-    """Seed built-in skills from ``backend/skills/*.md`` on every startup.
+    """Seed/re-sync built-in skills from ``backend/skills/*.md`` on every startup.
 
     Scans the shipped skills folder and seeds any skill that is not already in
-    the app database. Existing skills are never overwritten, so user edits and
-    deletions are respected — adding a new ``.md`` file to the folder makes it a
-    built-in skill on the next startup, with no code change required. Returns
-    the names that were seeded.
+    the app database, and re-seeds a built-in whose shipped ``.md`` has changed
+    (so official fixes propagate without manual deletion). Adding a new ``.md``
+    file to the folder makes it a built-in skill on the next startup, with no
+    code change required. Returns the names that were seeded or re-synced.
+
+    Note: built-ins are superseded by shipped updates even if a user edited the
+    stored copy — personal edits should live in user-created skills, not
+    built-ins. Deletions are re-seeded on next startup (built-ins always ship).
     """
     folder = _builtin_skills_dir()
     if not os.path.isdir(folder):
@@ -1037,6 +1041,15 @@ def sync_builtin_skills() -> list[str]:
         existing = []
     existing_slugs = {s.get("slug") for s in existing}
     existing_names = {s.get("name") for s in existing}
+    # Map name/slug -> stored body (frontmatter already stripped by list_skills),
+    # so we can compare against the shipped ``.md`` body below.
+    existing_body: dict[str, str] = {}
+    for s in existing:
+        body = (s.get("content") or "").strip()
+        if s.get("name"):
+            existing_body[s["name"]] = body
+        if s.get("slug"):
+            existing_body[s["slug"]] = body
     seeded: list[str] = []
     for path in sorted(_pyglob.glob(os.path.join(folder, "*.md"))):
         try:
@@ -1044,11 +1057,16 @@ def sync_builtin_skills() -> list[str]:
                 raw = fh.read()
         except OSError:
             continue
-        name, _description, _body = _parse_skill_markdown(raw)
+        name, _description, body = _parse_skill_markdown(raw)
         if not name:
             name = os.path.splitext(os.path.basename(path))[0]
         if name in existing_names or slugify(name) in existing_slugs:
-            continue
+            # Built-in already present: re-sync only when the shipped file
+            # changed, so official updates take effect. Identical copies are
+            # left untouched.
+            stored = existing_body.get(name) or existing_body.get(slugify(name), "")
+            if stored == body.strip():
+                continue
         result = persist_skill(raw, fallback_name=name)
         if result.get("ok"):
             seeded.append(result.get("name") or name)
@@ -3288,10 +3306,12 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
-    async def grep_tool(pattern: str, path: str = "", include: str = "") -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. Respects .gitignore; skips hidden/binary files.
+    async def grep_tool(
+        pattern: str, path: str = "", include: str = "", max_results: int = 50
+    ) -> str:
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match as a `file:line:` header followed by a few surrounding code lines (the matching line is marked with `>`), so you normally do NOT need a separate `read` to see the relevant code. Use this instead of grep+read. Runs on the MAIN model — grep output is returned directly (capped to `tool_out_chars`) so the agent can read the matches itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
+Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
@@ -3324,7 +3344,13 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             }
         )
         try:
-            result = search_in_files(root, pattern, path, SNIPPET_CONTEXT, include)
+            # Offload the blocking scan to a worker thread so the event loop is
+            # free to run other gathered read-only tools concurrently (the
+            # asyncio.gather in graph.py/llm.py otherwise serializes them because
+            # a sync call freezes the loop until it returns).
+            result = await asyncio.to_thread(
+                search_in_files, root, pattern, path, SNIPPET_CONTEXT, include
+            )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("grep", msg))
@@ -3344,40 +3370,29 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 }
             )
             return f"No matches for {pattern!r} under {path or '/'}"
-        # Hard cap on the total characters returned so a broad search can't
-        # flood the context window.
-        def _snippet(m: dict) -> list[str]:
-            rows: dict[int, str] = {}
-            for c in m.get("context_lines") or []:
-                if c.get("line") is not None:
-                    rows[c["line"]] = (c.get("text") or "")[:SNIPPET_LINE_WIDTH]
-            rows[m["line"]] = (m.get("text") or "")[:SNIPPET_LINE_WIDTH]
-            out = [f"{m['file']}:{m['line']}:"]
-            for ln in sorted(rows):
-                mark = ">" if ln == m["line"] else " "
-                out.append(f"   {mark} {ln}: {rows[ln]}")
-            return out
-
+        # Output contract (spec §3): one `path:line:match` line per hit, NO
+        # surrounding code blocks. Capped by max_results and the context budget;
+        # when truncated, tell the agent to narrow the search or read files.
         lines: list[str] = []
         total = 0
         shown = 0
         for m in matches:
-            if shown >= search_count:
+            if shown >= max_results:
                 break
-            block = _snippet(m)
-            block_size = sum(len(b) + 1 for b in block)
-            if lines and total + block_size > tool_out_chars:
+            entry = f"{m['file']}:{m['line']}:{(m.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
+            if lines and total + len(entry) + 1 > tool_out_chars:
                 break
-            lines.extend(block)
+            lines.append(entry)
+            total += len(entry) + 1
             shown += 1
-            total += block_size
-            if total >= tool_out_chars:
-                break
-        note = (
-            f"\n({len(matches)} matches found, {shown} shown)"
-            if len(matches) > shown
-            else ""
-        )
+        if len(matches) > max_results:
+            note = (
+                f"\nFound {len(matches)} matches.\n"
+                f"Showing the first {max_results} relevant matches.\n"
+                "Use a narrower pattern/path or read specific files."
+            )
+        else:
+            note = ""
         raw = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
         _parent_search_cache[cache_key] = raw
         emit(
@@ -3456,8 +3471,8 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
         # model a hard, unambiguous signal to check before declaring success.
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
-    async def glob_tool(pattern: str, path: str = "") -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). Returns matching relative paths, truncated at 50. Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
+    async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
@@ -3490,7 +3505,9 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             }
         )
         try:
-            result = glob_files(root, pattern, path)
+            # Offload the blocking scan to a worker thread (see grep_tool) so
+            # gathered read-only tools actually run in parallel.
+            result = await asyncio.to_thread(glob_files, root, pattern, path)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("glob", msg))
@@ -3510,8 +3527,12 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 }
             )
             return f"No files match {pattern!r} under {path or '/'}."
-        lines = list(matches[:50])
-        note = f"\n({len(matches)} matches shown)" if len(matches) > 50 else ""
+        lines = list(matches[:max_results])
+        note = (
+            f"\n({len(matches)} matches found, showing the first {max_results})"
+            if len(matches) > max_results
+            else ""
+        )
         raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
         _parent_search_cache[cache_key] = raw
         emit(
@@ -3565,7 +3586,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             msg = f"line offset {start} is past the end of the file ({total} lines)"
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
-        body = "\n".join(f"{ln['line']}: {ln['text']}" for ln in lines)
+        body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         if truncated:
             next_line = lines[-1]["line"] + 1
             body = f"{body}\n\n(Showing lines {start}-{lines[-1]['line']} of {total}. Use offset={next_line} to continue.)"
@@ -3579,14 +3600,16 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 "model": _main_name,
             }
         )
-        return f"{filePath}\n{body}"
+        return f"File: {filePath}\nLines: {start}-{lines[-1]['line']} of {total}\n{body}"
 
     async def _read_dir_tool(
         target: str, filePath: str, offset: int, limit: int, _model: str = ""
     ) -> str:
         """Directory branch of the read tool (opencode-style listing)."""
         try:
-            names = sorted(os.listdir(target), key=lambda n: (n.lower(),))
+            names = await asyncio.to_thread(
+                lambda: sorted(os.listdir(target), key=lambda n: (n.lower(),))
+            )
         except PermissionError:
             msg = "permission denied"
             emit(_error_result("read", msg))
@@ -3620,7 +3643,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
     async def task_tool(
         description: str, prompt: str, subagent_type: str, task_id: str = ""
     ) -> str:
-        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks) or 'explore' (broad, read-only repository research that returns a compact summary of relevant files + findings). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
@@ -3664,9 +3687,11 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 f"ERROR: subagent depth limit reached ({_SUBAGENT_DEPTH_LIMIT}) — "
                 "a sub-agent cannot spawn another sub-agent."
             )
-        # General-purpose sub-agent: inherits the parent's tools minus `task`.
-        if subagent_type == "general":
-            return await _run_general_task(description, prompt, task_id)
+        # Dispatch to the registered sub-agent runner. `general` and `explore`
+        # are the two opencode-style sub-agents; the runner pulls each one's
+        # system prompt + tool set from the registry.
+        if subagent_type in AGENTS:
+            return await _run_subagent_task(description, prompt, task_id, subagent_type)
         # No other subagent types supported
         emit(
             {
@@ -3689,31 +3714,37 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
         )
 
-    async def _run_general_task(description: str, prompt: str, task_id: str) -> str:
-        """Run the `general` sub-agent (opencode's general agent).
+    async def _run_subagent_task(
+        description: str, prompt: str, task_id: str, subagent_type: str
+    ) -> str:
+        """Run a registered sub-agent (opencode's `task` + agent registry).
 
-        A general-purpose sub-agent that inherits the parent's tools minus
-        `task` (no nested sub-agents — opencode's subagent_depth=1 default) and
-        runs on the MAIN model. Its tool events are tagged ``sub=True`` via
-        ``_SUB_AGENT_CTX`` and routed to this task card via
+        The sub-agent runs in an isolated context. Its tool events are tagged
+        ``sub=True`` via ``_SUB_AGENT_CTX`` and routed to this task card via
         ``_SUB_AGENT_BRANCH_CTX``, so they never count against the parent's
-        deterministic tool-step budget (they run in an isolated transcript).
+        deterministic tool-step budget (they run in an isolated transcript) and
+        never enter the parent's context. Its final reply is the only thing the
+        Main Agent sees (context isolation, spec §9/§11).
+
+        The system prompt and tool set come from ``agent_registry``: a `tools`
+        list pins an exact (read-only) tool set; ``None`` inherits the parent's
+        tools minus ``task`` (the ``general`` agent).
         """
         from llm import langchain_tool_loop
 
-        _general_model = main_model
-        if _general_model is None:
+        _model = main_model
+        if _model is None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "task",
-                    "args": {"description": description, "subagent_type": "general"},
+                    "args": {"description": description, "subagent_type": subagent_type},
                     "model": "",
                 }
             )
             emit(_error_result("task", "unavailable"))
-            return "ERROR: the general agent is unavailable (no model configured for this session)."
-        _general_name = str(getattr(_general_model, "model_name", "") or "")
+            return "ERROR: the sub-agent is unavailable (no model configured for this session)."
+        _model_name = str(getattr(_model, "model_name", "") or "")
         nonlocal _task_call_seq
         _ecall = _task_call_seq + 1
         _task_call_seq = _ecall
@@ -3722,48 +3753,49 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
             {
                 "kind": "tool",
                 "tool": "task",
-                "args": {"description": description, "subagent_type": "general"},
-                "model": _general_name,
+                "args": {"description": description, "subagent_type": subagent_type},
+                "model": _model_name,
                 "branch": _ecall,
             }
         )
-        # The general sub-agent inherits the parent's tools minus `task` (no
-        # nested sub-agents) and minus the plan/checklist tools that would
-        # pollute the parent's UI state (opencode's general denies todowrite).
         # Inherit the PARENT's actual (mode-filtered) toolset — set by agents.py
         # after capability filtering — so a plan/ask-mode `task` call cannot hand
         # the sub-agent write tools (the read-only bypass). Fall back to the full
         # registry only when no parent toolset was recorded.
         _parent_tools = _PARENT_TOOLS_CTX.get()
         _tool_source = _parent_tools if _parent_tools is not None else _tools
-        _general_tools = {
-            name: _invoke(fn)
-            for name, fn in _tool_source.items()
-            if name not in ("task", "update_plan", "save_plan", "vision")
-        }
+        _reg_tools = agent_tools(subagent_type)
+        if _reg_tools is not None:
+            _allowed = set(_reg_tools)
+            _sub_tools = {
+                name: _invoke(fn)
+                for name, fn in _tool_source.items()
+                if name in _allowed
+            }
+        else:
+            _sub_tools = {
+                name: _invoke(fn)
+                for name, fn in _tool_source.items()
+                if name not in ("task", "update_plan", "save_plan", "vision")
+            }
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         try:
             _output = await langchain_tool_loop(
-                _general_model,
-                system=(
-                    "You are a general-purpose sub-agent. The main agent delegated a "
-                    "task to you. Work through it independently with your tools, then "
-                    "reply with a concise final result (under ~300 words unless the "
-                    "task needs more). You run in an isolated context — the main agent "
-                    "only sees your final reply, so include the concrete findings, "
-                    "exact paths and any numbers it needs. Do not ask the user "
-                    "questions; do not call the task tool."
-                ),
+                _model,
+                system=agent_system(subagent_type)
+                or "You are a sub-agent. Work through the task independently with "
+                "your tools, then reply with a concise final result. Do not ask the "
+                "user questions; do not call the task tool.",
                 user=prompt,
-                tools=_general_tools,
+                tools=_sub_tools,
             )
         except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
             emit(_error_result("task", f"sub-agent failed: {exc}"))
             return (
-                f"ERROR: the general sub-agent failed"
-                f" ({_general_name} model, change it in Settings → Subagents): {exc}"
+                f"ERROR: the {subagent_type} sub-agent failed"
+                f" ({_model_name} model, change it in Settings → Subagents): {exc}"
             )
         finally:
             _SUB_AGENT_CTX.reset(_token)
@@ -3775,7 +3807,7 @@ Returns each match as a `file:line:` header followed by a few surrounding code l
                 "kind": "tool_result",
                 "tool": "task",
                 "summary": f"{len(_output)} chars",
-                "model": _general_name,
+                "model": _model_name,
                 "branch": _ecall,
             }
         )

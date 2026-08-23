@@ -47,7 +47,9 @@ class _FakeGeneralModel:
             self._called = True
             return AIMessage(
                 content="",
-                tool_calls=[{"name": "read", "args": {"filePath": "app.py"}}],
+                tool_calls=[
+                    {"name": "read", "args": {"filePath": "app.py"}, "id": "call_1"}
+                ],
             )
         return AIMessage(content=self._text)
 

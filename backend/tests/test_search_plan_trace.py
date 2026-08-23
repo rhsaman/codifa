@@ -80,9 +80,11 @@ async def test_search_plan_trace(run_events, mock_server, workspace):
         captured = []
         dt = time.perf_counter() - t0
     else:
-        # The deterministic workflow performs the search (grep) itself; the plan
-        # LLM then answers from the injected results (it has no grep tool).
+        # In the OpenCode-style design the PLAN agent searches JUST-IN-TIME: it
+        # calls the grep tool itself (no deterministic pre-search), so we drive
+        # the mock to issue a grep tool call and then answer from the result.
         mock.script = [
+            tool_call("grep", json.dumps({"pattern": "render_header"})),
             text_reply(
                 "render_header is defined in ui.py and returns the model's reported "
                 "context capacity; for local models the header may not show it if the "

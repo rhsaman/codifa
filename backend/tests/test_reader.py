@@ -13,6 +13,7 @@ import pytest
 
 import graph
 from graph import (
+    _ask_needs_repo,
     _explicit_files,
     _in_file_grep,
     _merge_ranges,
@@ -75,14 +76,93 @@ def test_route_ask_for_plain_chat(tmp_path):
     assert _route_ask_entry({"request": "سلام", "root": root}) == "ask_answer"
 
 
-def test_route_repo_derive_for_broad_cue(tmp_path):
+def test_route_ask_answer_for_broad_cue(tmp_path):
     root = _repo(tmp_path)
-    # Strong repo cue, no specific file named -> full Explore discovery.
+    # Strong repo cue, but no specific file pointed at -> the agent answers
+    # directly and searches itself (OpenCode-style), not a separate derive stage.
     assert (
         _route_ask_entry(
             {"request": "where is the auth function in the repo", "root": root}
         )
-        == "repo_derive"
+        == "ask_answer"
+    )
+
+
+# --- Ask-mode repo cues (path / component / file / definition) ---------------
+
+
+def test_ask_needs_repo_for_path_component_cues():
+    # English: asking for the path / component of something must explore.
+    assert _ask_needs_repo("write the exact path of the chat component")
+    assert _ask_needs_repo("what file implements the auth module")
+    assert _ask_needs_repo("where is the session defined?")
+    # Persian: مسیر / کامپوننت must trigger exploration too.
+    assert _ask_needs_repo("مسیر دقیق فایل کامپوننت چت را بنویسید")
+    assert _ask_needs_repo("کامپوننت چت کجاست")
+
+
+def test_ask_does_not_need_repo_for_general_knowledge():
+    # Conceptual / chit-chat questions must NOT trigger exploration.
+    assert not _ask_needs_repo("what is a closure in python?")
+    assert not _ask_needs_repo("سلام")
+
+
+def test_route_ask_entry_path_component_without_file_is_ask_answer(tmp_path):
+    root = _repo(tmp_path)
+    # A path/component question with NO specific file pointed at is answered by
+    # the ask agent itself (it searches via grep/glob/read), not a derive stage.
+    assert (
+        _route_ask_entry(
+            {"request": "write the exact path of the chat component", "root": root}
+        )
+        == "ask_answer"
+    )
+    assert (
+        _route_ask_entry(
+            {"request": "مسیر دقیق فایل کامپوننت چت را بنویسید", "root": root}
+        )
+        == "ask_answer"
+    )
+
+
+def test_route_ask_entry_followup_reference_uses_history(tmp_path):
+    root = _repo(tmp_path)
+    # A follow-up that only refers back to a prior answer ("look at the paths
+    # you mentioned") must NOT re-explore an empty result; it re-states from
+    # the prior answer already in history.
+    history = [{"role": "assistant", "content": "it is src/components/Chat.tsx"}]
+    assert (
+        _route_ask_entry(
+            {
+                "request": "همون مسیرهاییکه گفتی رو ببین",
+                "root": root,
+                "history": history,
+            }
+        )
+        == "ask_answer"
+    )
+    assert (
+        _route_ask_entry(
+            {
+                "request": "look at the paths you mentioned",
+                "root": root,
+                "history": history,
+            }
+        )
+        == "ask_answer"
+    )
+
+
+def test_route_ask_entry_followup_no_history_falls_to_ask(tmp_path):
+    root = _repo(tmp_path)
+    # Same follow-up phrasing but with NO prior answer and no searchable entity
+    # -> it cannot explore, so it falls back to ask_answer (the agent will ask
+    # for clarification) rather than looping on an empty result.
+    assert (
+        _route_ask_entry(
+            {"request": "look at the paths you mentioned", "root": root}
+        )
+        == "ask_answer"
     )
 
 
@@ -112,16 +192,17 @@ def test_route_plan_understand_reader_for_named_file(tmp_path):
     )
 
 
-def test_route_plan_understand_repo_derive_broad(tmp_path):
+def test_route_plan_understand_broad_builds_plan(tmp_path):
     from graph import _route_plan_understand
 
     root = _repo(tmp_path)
-    # Broad plan question, no specific file -> full repo discovery.
+    # Broad plan question, no specific file -> the planner explores itself via
+    # grep/glob/read (OpenCode-style) and builds the plan.
     assert (
         _route_plan_understand(
             {"request": "make a plan for the auth system", "root": root}
         )
-        == "repo_derive"
+        == "plan_build"
     )
 
 

@@ -1,8 +1,8 @@
-"""grep returns match locations AND surrounding code snippets inline.
+"""grep returns match locations as compact `path:line:text` lines.
 
-The efficiency goal: a single `grep` replaces the old grep -> read -> read
-round-trip by bundling a few context lines with every hit, so the model rarely
-needs a separate `read`.
+The efficiency goal: a single `grep` returns the matching line only (no
+surrounding code blocks), so the model scans many hits quickly and then `read`s
+only the files it needs. Results are capped by `max_results` and a char budget.
 """
 import os
 import tempfile
@@ -42,7 +42,7 @@ def _make_wide_ws():
     return root
 
 
-async def test_grep_includes_surrounding_lines():
+async def test_grep_returns_path_line_text():
     root = _make_ws()
     emitted: list[dict] = []
     tools = make_tool_callbacks(
@@ -50,13 +50,12 @@ async def test_grep_includes_surrounding_lines():
     )
     out = await tools["grep"]("TARGET")
     assert out.startswith("MATCHES for 'TARGET'"), out
-    # The matching line is present ...
+    # Compact `path:line:text` form: the matching line only, no surrounding code.
+    assert "app.py:4:" in out
     assert "return compute()  # TARGET" in out
-    # ... and so are lines BEFORE and AFTER it (the snippet), so no `read` needed.
-    assert "setup_one()" in out  # a line BEFORE the hit
-    assert "def gamma(self):" in out  # a line AFTER the hit (within the 3-line window)
-    # The actual hit is marked with '>'.
-    assert "> 4:" in out
+    # Surrounding lines are intentionally NOT bundled (the model reads on demand).
+    assert "setup_one()" not in out
+    assert "def gamma(self):" not in out
 
 
 async def test_grep_snippet_stays_bounded():

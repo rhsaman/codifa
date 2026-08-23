@@ -131,7 +131,9 @@ class ProviderError(RuntimeError):
 #   continuous_usage     Provider streams cumulative usage per chunk (opencode).
 #   cache_headers        Set openrouter_cache_* breakpoints (openrouter).
 #   auto_think           Gate auto-thinking level by context size (cloud LLMs).
-#   unprefixed_id        Model ids carry no provider prefix (opencode).
+#   id_prefix            Provider prefix re-added to bare model ids on the
+#                        request (nvidia, openrouter, opencode). opencode's zen
+#                        gateway requires the prefixed form ("opencode/...").
 #   strip_models_prefix  Strip a leading `models/` from model ids (google).
 #   free_ctx_fallback    Treat `-free` models as 200K context (opencode).
 #   editable_base_url    User can enter a custom base URL (custom/ollama).
@@ -176,7 +178,11 @@ _PROVIDERS: dict[str, dict] = {
         "ua_spoof": True,
         "continuous_usage": True,
         "auto_think": True,
-        "unprefixed_id": True,
+        # opencode.ai/zen takes the model id EXACTLY as stored — both bare ids
+        # ("hy3-free") and provider-prefixed ids ("opencode/claude-3.5-sonnet")
+        # are accepted in the form the UI saves them. Do NOT add or strip a
+        # prefix here: qualifying a bare id to "opencode/<id>" is rejected with
+        # HTTP 401 "Model is not supported" (observed for "hy3-free").
         "free_ctx_fallback": True,
         "parallel_calls": True,
     },
@@ -264,12 +270,14 @@ def _provider_account(provider: str) -> str:
 def qualify_model_id(provider: str, model: str) -> str:
     """Re-add a provider's model-id prefix when the stored id lost it.
 
-    Some gateways (nvidia, openrouter) prefix their OWN models with the
-    provider name — ``nvidia/nemotron-mini-4b-instruct`` — and the API rejects
-    a bare id with a 404. The UI stores the bare form (its picker strips the
-    ``providerId/`` prefix), so put it back when the id no longer carries a
-    vendor/model separator. Ids with a slash (e.g. ``meta/llama-3.3-70b`` on
-    NVIDIA, ``deepseek/deepseek-chat`` on OpenRouter) are left untouched.
+    Some gateways (nvidia, openrouter, opencode) prefix their OWN models with
+    the provider name — ``nvidia/nemotron-mini-4b-instruct``,
+    ``opencode/claude-3.5-sonnet`` — and the API rejects a bare id (opencode
+    responds with HTTP 401 "Model is not supported"). The UI stores the bare
+    form (its picker strips the ``providerId/`` prefix), so put it back when the
+    id no longer carries a vendor/model separator. Ids with a slash (e.g.
+    ``meta/llama-3.3-70b`` on NVIDIA, ``deepseek/deepseek-chat`` on OpenRouter)
+    are left untouched.
     """
     if not model:
         return model

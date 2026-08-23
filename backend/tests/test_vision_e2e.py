@@ -2,7 +2,17 @@ import json
 
 import pytest
 
+import graph
 from mock_openai import mock, text_reply, tool_call
+
+
+@pytest.fixture(autouse=True)
+def _clear_vision_cache():
+    # The vision cache is module-level and keyed by image URI; clear it between
+    # tests so a successful analysis from one test can't satisfy another.
+    graph._VISION_CACHE.clear()
+    yield
+    graph._VISION_CACHE.clear()
 
 
 def _has_image(body: dict) -> bool:
@@ -79,6 +89,33 @@ async def test_vision_model_prefetch_analyzes_and_injects(run_events):
 
 
 @pytest.mark.asyncio
+async def test_vision_analyzes_image_from_history(run_events):
+    # Image attached in an EARLIER message (now living in `history`); the current
+    # turn carries no new image. Vision must still analyze it so the model keeps
+    # "seeing" the image on follow-up turns (history drops image content).
+    mock.script = [
+        text_reply("PREFETCH_ANALYSIS of the earlier screenshot"),
+        text_reply("FINAL_ANSWER based on the analysis"),
+    ]
+    await run_events(
+        "look at the image again",
+        mode="ask",
+        subagent_models={"vision": "mock-model"},
+        history=[
+            {
+                "role": "user",
+                "content": "here is a screenshot",
+                "images": [{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
+            }
+        ],
+        images=[],  # current turn has no new image
+    )
+    assert any(
+        "PREFETCH_ANALYSIS" in _all_text(b) for b in mock.captured
+    ), "vision did not analyze an image attached in an earlier message"
+
+
+@pytest.mark.asyncio
 async def test_vision_prefetch_failure_injects_note(run_events):
     # Vision model errors during pre-fetch -> a clear note is injected (no crash,
     # no fallback to the main model).
@@ -94,23 +131,8 @@ async def test_vision_prefetch_failure_injects_note(run_events):
         images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
     )
     assert any(
-        "failed to analyze" in _all_text(b) for b in mock.captured
+        "could not analyze" in _all_text(b) for b in mock.captured
     ), "pre-fetch failure did not inject a diagnostic note into the context"
-
-
-@pytest.mark.asyncio
-async def test_ask_mode_has_no_explore_tools(run_events):
-    """Ask mode must NOT expose read/grep/glob: repository exploration is the
-    job of the deterministic discovery pipeline (which runs when the question is
-    project-related and injects the gathered context), so the ask LLM never
-    re-searches from zero."""
-    mock.script = [text_reply("done")]
-    await run_events("where is foo defined?", mode="ask")
-    tools = set()
-    for body in mock.captured:
-        for t in body.get("tools", []) or []:
-            fn = t.get("function", {})
-            if fn.get("name"):
-                tools.add(fn["name"])
-    for denied in ("read", "grep", "glob"):
-        assert denied not in tools, f"ask mode must not expose '{denied}': {tools}"
+    assert any(
+        "Settings → Subagents → Vision" in _all_text(b) for b in mock.captured
+    ), "pre-fetch failure note should tell the user to configure a Vision model"

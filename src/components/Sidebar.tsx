@@ -428,13 +428,19 @@ export function Sidebar() {
   // Grand total across every provider group, shown right in the panel header
   // so the full session usage/cost is visible without expanding each group.
   let usageGrandTokens = 0
+  let usageGrandCached = 0
   let usageGrandCost: number | null = null
   for (const [, entries] of usageGroupOrder) {
     for (const e of entries) {
       usageGrandTokens += e.input + e.output
+      usageGrandCached += e.cacheRead + e.cacheWrite
       if (e.cost !== null) usageGrandCost = (usageGrandCost ?? 0) + e.cost
     }
   }
+  // "Real" usage = freshly-computed tokens (input already includes the cached
+  // portion, so subtract it). Cached tokens are served from the prompt cache and
+  // shown separately so the user sees both halves of their usage.
+  const usageGrandReal = Math.max(0, usageGrandTokens - usageGrandCached)
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder()
@@ -857,8 +863,11 @@ export function Sidebar() {
             >
               <span className="sidebar-panel-chevron">{usageCollapsed ? '▸' : '▾'}</span>
               <span className="sidebar-panel-title">Model usage</span>
-              <span className="sidebar-usage-grand-total" title="Total tokens · cost this session">
-                {formatTokens(usageGrandTokens)}
+              <span className="sidebar-usage-grand-total" title="Real (non-cached) tokens · cost this session">
+                {formatTokens(usageGrandReal)}
+                {usageGrandCached > 0 && (
+                  <span className="sidebar-usage-grand-cache" title={`Cached tokens (prompt cache): ${formatTokens(usageGrandCached)}`}> · ⚡{formatTokens(usageGrandCached)}</span>
+                )}
                 {usageGrandCost !== null && <span className="sidebar-usage-grand-cost"> · {formatCost(usageGrandCost)}</span>}
               </span>
               <button
@@ -906,6 +915,8 @@ export function Sidebar() {
                     // so every provider starts expanded by default.
                     const open = !usageGroupsClosed.has(pid)
                     const groupTokens = entries.reduce((s, e) => s + e.input + e.output, 0)
+                    const groupCached = entries.reduce((s, e) => s + e.cacheRead + e.cacheWrite, 0)
+                    const groupReal = Math.max(0, groupTokens - groupCached)
                     const groupCost = entries.reduce<number | null>((s, e) => {
                       if (e.cost === null) return s
                       return (s ?? 0) + e.cost
@@ -927,7 +938,10 @@ export function Sidebar() {
                           <span className="sidebar-usage-group-dot" aria-hidden />
                           <span className="sidebar-usage-group-name">{pcfg?.name ?? pid}</span>
                           <span className="sidebar-usage-group-total">
-                            {formatTokens(groupTokens)}
+                            {formatTokens(groupReal)}
+                            {groupCached > 0 && (
+                              <span className="sidebar-usage-cache" title={`Cached tokens (prompt cache): ${formatTokens(groupCached)}`}> · ⚡{formatTokens(groupCached)}</span>
+                            )}
                             {groupCost !== null && <span className="sidebar-usage-cost"> · {formatCost(groupCost)}</span>}
                           </span>
                         </div>
@@ -938,19 +952,26 @@ export function Sidebar() {
                               <span>Tokens</span>
                               <span>Cost</span>
                             </li>
-                            {entries.map(({ model, input, output, cost }) => (
-                              <li key={model} className="sidebar-usage-item">
-                                <span className="sidebar-usage-model" title={model}>
-                                  {model ? model.split('/').pop() : 'main'}
-                                </span>
-                                <span className="sidebar-usage-tokens">
-                                  {formatTokens(input + output)}
-                                </span>
-                                <span className={`sidebar-usage-cost${cost === null ? ' no-price' : ''}`}>
-                                  {cost !== null ? formatCost(cost) : '—'}
-                                </span>
-                              </li>
-                            ))}
+                            {entries.map(({ model, input, output, cacheRead, cacheWrite, cost }) => {
+                              const cached = cacheRead + cacheWrite
+                              const real = Math.max(0, input - cacheRead - cacheWrite) + output
+                              return (
+                                <li key={model} className="sidebar-usage-item">
+                                  <span className="sidebar-usage-model" title={model}>
+                                    {model ? model.split('/').pop() : 'main'}
+                                  </span>
+                                  <span className="sidebar-usage-tokens">
+                                    {formatTokens(real)}
+                                    {cached > 0 && (
+                                      <span className="sidebar-usage-cache" title={`Cached tokens (prompt cache): ${formatTokens(cached)}`}>⚡ {formatTokens(cached)}</span>
+                                    )}
+                                  </span>
+                                  <span className={`sidebar-usage-cost${cost === null ? ' no-price' : ''}`}>
+                                    {cost !== null ? formatCost(cost) : '—'}
+                                  </span>
+                                </li>
+                              )
+                            })}
                           </ul>
                         )}
                       </div>

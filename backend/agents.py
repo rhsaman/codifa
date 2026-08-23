@@ -635,40 +635,22 @@ def _subagent_target(
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. When a question references a file or clearly needs the codebase (behavior, styling, logic, bugs, file structure, dependencies), the repository is explored for you — a deterministic pipeline gathers the relevant file contents and injects them into your context (REPOSITORY EXPLORATION RESULTS). For casual or general questions no exploration runs; answer from knowledge. USE that context and answer from the real code; you have NO file/search tools and must never re-search from scratch. If a file the user referenced (e.g. backend/graph.py) appears in the injected REPOSITORY EXPLORATION RESULTS / FILE CONTENTS READ, answer from it directly -- never ask the user to paste its contents and never say you cannot read files. Never answer from general knowledge when the answer depends on the real project files. You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search and fetch_url ONLY when the user explicitly asks to search the web - never web-search on your own initiative. Skip file tools for questions unrelated to the project (general knowledge, greetings, or pasted errors from OTHER apps/OS). If the user @mentions a file, its content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references — name exact file paths, functions and line targets — never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you (the auto-injected memory/project-file/web blocks, attached files, earlier tool results, or this conversation), answer directly - do NOT call a tool. Never repeat a search or re-request information already available. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax — never as ASCII art or a plain list. This applies even if the user did not explicitly ask for a diagram (keywords include 'فلوچارت', 'نمودار', 'گراف', 'نقشه', 'draw', 'diagram', 'architecture'). Keep replies concise.",
-    "coder": "You are Coder, an implementation-only code-writing agent inside a desktop IDE. You receive the plan and the exact implementation context (file paths, symbols, line targets, and the current code snippets to match) from Plan mode - use it directly; you do NOT explore the repository. You have NO discovery or execution tools: you cannot grep, glob, read, browse files, run commands, or run tests. Implement strictly from the provided context. If the provided context is insufficient to make an exact edit, call ask_user ONCE with the specific missing detail - do not search. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Tick off each step the moment its implementation is finished — call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next, so every finished task is checked off. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list of the new steps — the completed checklist is cleared and replaced (do not append new steps onto the finished one). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command - file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Do not make unnecessary intermediate calls. Batch related edits into a single change where one suffices; do not repeatedly edit the same code when one edit accomplishes the task. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) - trust it; do not re-run verification yourself. If the plan specifies creating or updating test files, do so, but running tests is Plan mode's job (it has the read-only terminal) - do not attempt to run them. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions - small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. If the user @mentions files, their content is already in your context - do not re-search it. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the write_file/edit_file tool call IS the artifact - never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN - you never implement it. Read-only: run only safe read-only terminal commands — git status, plain git diff for working-tree/staged review, pwd, node/python --version, build/test/lint; never modify/create/delete files. CODE SEARCH / FILE DISCOVERY VIA TERMINAL IS BLOCKED AND ENFORCED: git log/show/blame/rev-list/grep/ls-files, git diff against commits/ranges, and ls/find/cat/sed/awk/head/tail/wc/grep are all rejected by the terminal itself — discovery is the explore pipeline's job, not the terminal's. Never read or list files through the terminal. If the explore context you were given does not contain the file/function/line you need, do NOT shell out to the terminal to hunt — call ask_user with the specific missing detail (or request a fresh explore). Stop scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths - fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code — it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). MINIMIZE EXPLORATION — SEARCH FIRST, THEN READ: do ALL your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Never alternate search and read (search→read→search→read) — that multiplies tool calls and burns tokens for no gain. Read enough context in a SINGLE call (read with offset/limit, or grep with its exact path) instead of repeatedly reading small sections; never reread a file or location you already have. STOP scouting the moment every file, function and line your plan will touch is identified - the plan is your deliverable. Include in the plan the EXACT current code snippets (with enough surrounding context) at each edit site so Coder can match and edit them without reading the files itself; do NOT paste full file contents.",
+    "ask": "You are a mentor inside a desktop IDE. For a question that references the codebase (behavior, styling, logic, bugs, file structure, dependencies), explore JUST-IN-TIME: use grep/glob/read to find and read the relevant code, or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore'). Never answer about the real project from general knowledge when the code is a grep/read away -- but do not search when the answer is already in front of you (memory, conversation, attached files, earlier tool results). You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search / fetch_url ONLY when the user explicitly asks to search the web -- never on your own initiative. Skip search for questions unrelated to the project (greetings, general knowledge, or pasted errors from OTHER apps/OS). If the user @mentions or attaches a file, it is in SCOPE and already noted for you -- read it with the read tool rather than re-searching. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references -- name exact file paths, functions and line targets -- never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you, answer directly -- do NOT call a tool. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax -- never as ASCII art or a plain list. Keep replies concise.",
+    "coder": "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it, doing just-in-time discovery on your own: when you need a file's contents, symbols, or a calling convention, grep/glob/read it first (or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore')) -- you are NOT handed a pre-read context, so look things up right before you edit. You have edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Tick off each step the moment its implementation is finished -- call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list (the finished checklist is cleared). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command -- file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Batch related edits into one change where one suffices; do not repeatedly edit the same code. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions -- small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN -- you never implement it. Discover the codebase yourself, JUST-IN-TIME: use grep/glob/read to find the files, functions and lines your plan will touch (or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore')). You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). Stop scouting the moment every file, function and line your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); do not call it while scouting. save_plan saves your finished plan to the app DB (one per workspace); it auto-checks backtick-quoted paths -- fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code -- it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
 }
-
-SYSTEM_PROMPTS["explore"] = (
-    "You are a repository-exploration analyst inside a desktop IDE. The relevant "
-    "files have ALREADY been discovered for you by a deterministic workflow (glob "
-    "+ grep + directory tree + targeted reads); that output is injected above as "
-    "'REPOSITORY EXPLORATION RESULTS'. Answer the user's question using ONLY that "
-    "context plus your general understanding of code structure - do NOT call "
-    "glob/grep/read (already done). You MAY use web_search / fetch_url / vision if "
-    "the question needs external docs, versions, or attached images. Structure the "
-    "answer: one-sentence goal, then the exact file paths and function/line targets "
-    "that answer the question, explaining the WHY. Match the user's language "
-    "(Persian -> Persian, English -> English). Keep it concise; cite file:line "
-    "references. If the injected context is insufficient, say what is missing rather "
-    "than guessing."
-)
 
 SYSTEM_PROMPTS["reader"] = (
     "You are a focused CODE READER inside a desktop IDE. The user has pointed at "
-    "specific file(s) (attached, open in Neovim, or named directly). The relevant "
-    "parts of those exact file(s) have ALREADY been read for you by a deterministic "
-    "pipeline (targeted line ranges from path:LINE refs, an in-file grep of the "
-    "question's keywords, or a bounded head) and are injected above as 'SPECIFIED "
-    "FILE CONTENTS'. Answer using ONLY that context plus your general understanding "
-    "of code -- do NOT call glob/grep/read (already done, and you have no such "
-    "tools). You MAY use web_search / fetch_url / vision only when the user "
-    "explicitly asks for external info or attaches an image. Explain with exact "
-    "file:line references and the WHY. Match the user's language (Persian -> "
-    "Persian, English -> English). Keep it concise; cite file:line. If the injected "
-    "context is insufficient, say what is missing rather than guessing or inventing "
-    "file contents."
+    "specific file(s) -- open in Neovim, attached, or named directly -- and they are "
+    "in SCOPE for you. Read them with the read tool (and grep/read within them as "
+    "needed) to answer; the search tools are available but stay focused on the "
+    "pointed-at files unless the user asks to broaden. You MAY use web_search / "
+    "fetch_url / vision only when the user explicitly asks for external info or "
+    "attaches an image. Explain with exact file:line references and the WHY. Match "
+    "the user's language (Persian -> Persian, English -> English). Keep it concise; "
+    "cite file:line. If the pointed-at context is insufficient, say what is missing "
+    "rather than inventing file contents."
 )
 
     # Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
@@ -715,19 +697,23 @@ _UNIVERSAL_RULES = (
 _SEARCH_RULE = (
     "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
     "Choose the search tool by the BREADTH of what you need:\n"
-    "1. TARGETED lookup,keyword: search "
-    "directly with grep / glob / read.\n"
-    "2. Wide search: use task with subagent_type='general'. Split independent "
-    "search areas across multiple general agents and launch them IN PARALLEL. "
-    "Use as many as meaningfully reduce search time; avoid redundant agents.\n"
-    "in an isolated context and returns a report.\n"
-    "3. Fire the searches you already know you need in the SAME turn (parallel "
+    "1. TARGETED lookup of a known file/symbol/keyword: search directly with "
+    "grep / glob / read.\n"
+    "2. BROAD / multi-file exploration: use task with "
+    "subagent_type='explore'. It runs grep/glob/read in an ISOLATED context and "
+    "returns a compact report — so delegate wide searches instead of reading "
+    "many files into your own context. Split independent search areas across "
+    "multiple explore agents and launch them IN PARALLEL; use as many as "
+    "meaningfully reduce search time and avoid redundant agents.\n"
+    "3. NON-exploration delegation (summarize, reformat, generate from a report): "
+    "use task with subagent_type='general'.\n"
+    "4. Fire the searches you already know you need in the SAME turn (parallel "
     "tool calls) instead of one at a time.\n"
-    "4. CONTEXT BUDGET: a subagent runs in an isolated context and "
-    "only its compact report enters your context — so for multi-file research "
-    "DELEGATE to a subagent instead of reading many files yourself. When you do "
-    "read a large file, page it with read offset/limit (e.g. limit=300) instead "
-    "of dumping the whole file into context.\n"
+    "5. CONTEXT BUDGET: a subagent runs in an isolated context and only its "
+    "compact report enters your context — so for multi-file research DELEGATE to "
+    "a subagent instead of reading many files yourself. When you DO read a large "
+    "file, page it with read offset/limit (e.g. limit=300) instead of dumping the "
+    "whole file into context.\n"
     "NEVER search or read project files with run_terminal or scripts — only "
     "the file tools (grep / glob / read)."
 )
@@ -947,6 +933,22 @@ def _friendly_retry_reason(exc: BaseException) -> str:
         return (
             "Can't reach the provider — check your internet connection and that "
             "the base URL/port in Settings are correct. Retrying…"
+        )
+    # HTTP 401 — almost always one of two things: a missing/revoked key, or a
+    # model id the gateway doesn't recognize (opencode.ai/zen rejects a bare id
+    # with "Model is not supported"). Surface the right hint instead of the raw
+    # "Error code: 401 - {...}" payload.
+    code = int(getattr(exc, "status_code", 0) or 0)
+    if code == 401:
+        if "model" in low or "not supported" in low:
+            return (
+                "The model isn't recognized by this provider — check the model id "
+                "in Settings (it may be missing its provider prefix, e.g. "
+                "'opencode/...'). Retrying won't help until it's fixed."
+            )
+        return (
+            "Authentication failed (401) — check the API key in Settings. "
+            "Retrying won't help until it's fixed."
         )
     return str(exc)[:200]
 
@@ -2733,6 +2735,53 @@ def _mechanical_summary(older: list[dict], text: str) -> str:
     return "\n".join(parts)
 
 
+# Application / tool error fragments that must NOT survive into the compact
+# summary. Tool results are embedded inside assistant turns (the frontend only
+# sends user/assistant/system roles to the backend), so a failed tool leaks its
+# error text straight into the next compaction. We strip those lines but keep
+# the surrounding real reasoning and any SUCCESSFUL tool output.
+_APP_ERROR_LINE = re.compile(
+    r"^(\[Tool error\]|ERROR\b|Error code:|Traceback \(most recent call last\))",
+    re.IGNORECASE,
+)
+
+
+def _redact_app_errors(text: str) -> str:
+    """Drop app/tool error lines from a message so they don't poison the compact
+    summary. Real user/assistant reasoning and successful tool output are kept.
+
+    A contiguous run of error lines is collapsed to a single breadcrumb so the
+    summarizer still knows a step failed, without inheriting the raw error.
+    Python tracebacks (``Traceback (most recent call last)``) consume their
+    frame lines until the next blank line.
+    """
+    out: list[str] = []
+    in_traceback = False
+    for line in text.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if in_traceback:
+            if s == "":
+                in_traceback = False
+                out.append("")
+                continue
+            # frame/continuation lines are indented or start with File/raise/at
+            if line[:1] in (" ", "\t") or low.startswith(("file ", "at ", "raise ", "except ")):
+                continue
+            in_traceback = False
+        if _APP_ERROR_LINE.match(s):
+            if "traceback" in low:
+                in_traceback = True
+                if not out or not out[-1].startswith("[app/tool error"):
+                    out.append("[app/tool error — details omitted from summary]")
+                continue
+            if not out or not out[-1].startswith("[app/tool error"):
+                out.append("[app/tool error — details omitted from summary]")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 async def _compact_history(
     model: Any,
     history: list[dict],
@@ -2813,6 +2862,11 @@ async def _compact_history(
     # dominate the summary budget.
     def _serialize(msg: dict) -> str:
         content = str(msg.get("content", ""))
+        # Drop app/tool error fragments (failed tool output, provider errors,
+        # tracebacks) so the summarizer only sees real reasoning + successful
+        # tool output — this is what the user asked for ("keep real
+        # user/assistant, not app errors", including tool errors).
+        content = _redact_app_errors(content)
         if len(content) > _TOOL_OUTPUT_MAX_CHARS:
             content = content[:_TOOL_OUTPUT_MAX_CHARS] + "\n[truncated]"
         return content
@@ -2990,38 +3044,6 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
 
 
 
-_MAX_ATTACHMENT_BYTES = 32_000  # per attached file; trimmed to save context
-
-
-def _load_attachments(root: str, rels: list[str] | None) -> list[str]:
-    """Read attached files (absolute paths) into context blocks, sandboxed to root."""
-    blocks: list[str] = []
-    for raw in rels or []:
-        rel = str(raw).strip()
-        if not rel:
-            continue
-        try:
-            target = resolve_safe(root, rel)
-        except PathEscapeError:
-            continue
-        if not os.path.isfile(target) or not _is_text_path(target):
-            continue
-        try:
-            content, truncated = _read_text(target)
-        except OSError:
-            continue
-        if truncated:
-            content += "\n... (file truncated)"
-        if len(content) > _MAX_ATTACHMENT_BYTES:
-            content = (
-                content[:_MAX_ATTACHMENT_BYTES]
-                + "\n...(attachment truncated to save context; use read with offset/limit for specific parts)"
-            )
-        display = os.path.relpath(target, resolve_safe(root, ""))
-        blocks.append(f"===== ATTACHED FILE: {display} =====\n{content}")
-    return blocks
-
-
 _IMAGE_EXTS: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -3034,8 +3056,8 @@ _IMAGE_EXTS: dict[str, str] = {
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 # Vision providers reject (or choke on) huge base64 images. Screenshots are
 # often several MB; shrink them to sane limits before sending.
-_MAX_VISION_DIM = 2000            # longest side sent to a vision model
-_MAX_VISION_BYTES = 4 * 1024 * 1024  # decoded bytes; above this we shrink
+_MAX_VISION_DIM = 2400            # longest side sent to a vision model
+_MAX_VISION_BYTES = 6 * 1024 * 1024  # decoded bytes; above this we shrink
 
 
 def _maybe_downscale_image(data_url: str) -> str:
@@ -3073,10 +3095,16 @@ def _maybe_downscale_image(data_url: str) -> str:
                 (max(1, int(src.size[0] * scale)), max(1, int(src.size[1] * scale)))
             )
         out = BytesIO()
+        # Lossless PNG keeps on-screen text / code crisp (the common case for
+        # screenshots the agent must read); JPEG is only a fallback for opaque
+        # photos, and at high quality so text stays legible.
         fmt = "PNG" if src.mode in ("RGBA", "P", "LA") else "JPEG"
         if fmt == "JPEG" and src.mode in ("RGBA", "P", "LA"):
             src = src.convert("RGB")
-        src.save(out, format=fmt, quality=82)
+        if fmt == "PNG":
+            src.save(out, format="PNG")
+        else:
+            src.save(out, format="JPEG", quality=95)
         new_b64 = base64.b64encode(out.getvalue()).decode("ascii")
         mime = "image/png" if fmt == "PNG" else "image/jpeg"
         return f"data:{mime};base64,{new_b64}"
@@ -3135,9 +3163,9 @@ def _load_images(items: list | None) -> list[str]:
 # refusal and the misreporting.
 _MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder"}
 _MODE_CAPS = {
-    "ask": "You are a read-only MENTOR: for project questions the repository is explored automatically and the relevant file contents are placed in your context, so you answer from the real code. You NEVER write, edit or delete files or run commands.",
-    "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files; your terminal is read-only.",
-    "coder": "You are an implementation-only agent: you create/edit files strictly from the plan's context. You have NO discovery or execution tools — you cannot search, read, browse, or run commands/tests.",
+    "ask": "You are a read-only MENTOR: for project questions, explore the codebase JUST-IN-TIME with grep/glob/read (or delegate broad exploration to the Explore sub-agent via task) and answer from the real code. You NEVER write, edit or delete files or run commands.",
+    "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files. Discover the codebase with grep/glob/read (or delegate to the Explore sub-agent via task) and inspect state with the read-only terminal (git status/diff/build/lint/test).",
+    "coder": "You are an implementation agent: create/edit files from the plan, doing just-in-time discovery with grep/glob/read (or delegate broad exploration to the Explore sub-agent via task) right before you edit. You also have the read-only terminal for build/test/lint.",
 }
 
 # Per-mode output contract appended to the CURRENT-MODE note every turn, so a

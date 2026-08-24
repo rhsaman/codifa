@@ -74,7 +74,7 @@ import type {
   ThinkingLevel,
   ToolActivity,
 } from "../types";
-import { ChatMessageView, RetryBanner, LiveWorkingStatus } from "./ChatMessage";
+import { ChatMessageView, RetryBanner } from "./ChatMessage";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -3198,7 +3198,6 @@ export function ChatPanel() {
                 )}
               </Fragment>
             ))}
-          <LiveWorkingStatus />
           {queuedMsgs.length > 0 && (
             <div className="queued-bubbles">
               {queuedMsgs.map((q) => (

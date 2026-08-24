@@ -416,103 +416,6 @@ function fmtElapsed(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
 }
 
-/**
- * Live status line shown while an assistant message is being generated:
- * a running tool gets "Running: <tool> … Ns", otherwise (nothing streamed yet)
- * "Thinking… Ns". Hidden once text starts arriving or while a retry is active.
- */
-// نشانگر وضعیت «Thinking…»/«Running…» که یک‌بار در انتهای لیست پیام‌ها رندر
-// می‌شود، پس همیشه زیر آخرین پیام (اول زیر پیام کاربر، بعد زیر پیام ایجنت در
-// حال استریم) نمایش داده می‌شود.
-export function LiveWorkingStatus() {
-  const [now, setNow] = useState(() => Date.now());
-  // پرچم سراسری isThinking (توسط لایهٔ استریم از سیگنال thinking بک‌اند ست می‌شود)
-  const isThinking = useStore((s) => s.isThinking);
-  // آخرین پیام ایجنت در حال استریم را از store می‌خوانیم تا زمان‌سنج و ابزار در
-  // حال اجرا را از روی آن محاسبه کنیم (در فاز فکرکردن که هنوز پیام ایجنت ساخته
-  // نشده، undefined است و نشانگر زیر پیام کاربر می‌افتد).
-  const lastAssistant = useStore((s) => {
-    const chat = s.chats.find((c) => c.id === s.activeChatId);
-    if (!chat) return undefined;
-    for (let i = chat.messages.length - 1; i >= 0; i--) {
-      const m = chat.messages[i];
-      if (m.role === "assistant" && m.streaming) return m;
-    }
-    return undefined;
-  });
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, []);
-
-  const running = lastAssistant?.toolActivity?.find(
-    (a) => a.status === "running",
-  );
-  const active = isThinking || !!running;
-
-  // Between backend events (e.g. right after a tool finishes and before the
-  // next "thinking" signal arrives) `active` can flicker false for a moment.
-  // Unmounting/remounting this on every flicker resizes `.chat-messages`, and
-  // since the scroll view is pinned to the bottom while streaming, that snaps
-  // the whole transcript up and down. A tiny state machine smooths this out:
-  // stay 'visible' through brief gaps (grace period), then play a proper
-  // 'leaving' exit animation before actually unmounting — no more instant
-  // pop-in/pop-out that was causing the jump.
-  type Phase = "hidden" | "visible" | "leaving";
-  const [phase, setPhase] = useState<Phase>(active ? "visible" : "hidden");
-  const graceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    const clearTimers = () => {
-      if (graceTimer.current) {
-        clearTimeout(graceTimer.current);
-        graceTimer.current = null;
-      }
-      if (leaveTimer.current) {
-        clearTimeout(leaveTimer.current);
-        leaveTimer.current = null;
-      }
-    };
-    if (active) {
-      clearTimers();
-      setPhase("visible");
-      return;
-    }
-    clearTimers();
-    graceTimer.current = setTimeout(() => {
-      setPhase("leaving");
-      leaveTimer.current = setTimeout(() => setPhase("hidden"), 200);
-    }, 400);
-    return clearTimers;
-  }, [active]);
-
-  if (phase === "hidden") return null;
-  const leaving = phase === "leaving";
-  const startAt = lastAssistant?.createdAt || now;
-  if (running) {
-    return (
-      <div
-        className={`msg-working running${leaving ? " leaving" : ""}`}
-        dir="ltr"
-      >
-        <span className="spinner" />
-        <span className="msg-working-text">Running: {running.tool}</span>
-        <span className="msg-working-elapsed">{fmtElapsed(now - startAt)}</span>
-      </div>
-    );
-  }
-  return (
-    <div
-      className={`msg-working thinking${leaving ? " leaving" : ""}`}
-      dir="ltr"
-    >
-      <span className="msg-working-spark">✦</span>
-      <span className="msg-working-text">Thinking</span>
-      <span className="msg-working-elapsed">{fmtElapsed(now - startAt)}</span>
-    </div>
-  );
-}
-
 function UsageBadge({
   input,
   output,
@@ -532,6 +435,34 @@ function UsageBadge({
       dir="ltr"
     >
       {body}
+    </span>
+  );
+}
+
+/**
+ * نشانگر «در حال فکر کردن» که در ردیف فوتر پیام (سمت مخالف کپی/usage) نمایش
+ * داده می‌شود. ۳ نقطهٔ لودینگ از سمت راست شروع به پر شدن می‌کنند (نقطهٔ اول =
+ * سمت راست زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
+ */
+export function ThinkingIndicator() {
+  const startRef = useRef(Date.now());
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    startRef.current = Date.now();
+    const id = setInterval(() => setElapsed(Date.now() - startRef.current), 250);
+    return () => clearInterval(id);
+  }, []);
+  return (
+    <span className="msg-thinking" aria-label="Thinking">
+      <span className="msg-thinking-inner" dir="ltr">
+        <span className="msg-thinking-text">Thinking</span>
+        <span className="msg-thinking-dots" aria-hidden="true">
+          <span className="dot" />
+          <span className="dot" />
+          <span className="dot" />
+        </span>
+        <span className="msg-thinking-elapsed">{fmtElapsed(elapsed)}</span>
+      </span>
     </span>
   );
 }
@@ -1211,6 +1142,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
             </>
           )}
+          {message.streaming && <ThinkingIndicator />}
         </div>
       )}
 

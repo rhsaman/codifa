@@ -217,3 +217,48 @@ def test_hard_quota_exhausted_still_detected():
     )
     assert agents._is_quota_exhausted(exc) is True
     assert _all_requests_have_no_resume()
+
+
+# ---------------------------------------------------------------------------
+# CLIENT ABORT — a torn-down SSE socket must NOT surface as an error event.
+# ---------------------------------------------------------------------------
+
+
+async def test_client_abort_stops_cleanly_no_error_event(mock_server, workspace):  # noqa: F811
+    """When the client closes the stream mid-turn (abort), the backend must NOT
+    treat the resulting CancelledError as a transient failure and emit an `error`
+    event that would never be read (the SSE socket is already torn down). It
+    should just stop cleanly — unwinding via CancelledError, not a retry/error
+    path that would leave the UI showing a frozen, unresponsive agent."""
+    from agents import run_agent
+
+    base, _mock = mock_server
+    mock.script = [text_reply("Done")]
+    agen = run_agent(
+        provider="custom",
+        model_name="mock-model",
+        base_url=base,
+        api_key="test",
+        root=str(workspace),
+        mode="coder",
+        prompt="say hi",
+        history=[],
+        chat_id="pytest-abort",
+    )
+    # Pull one event, then abort the consumer (simulates the client closing SSE).
+    first = await agen.__anext__()
+    assert first.get("kind") != "error", "the first event must not be an error"
+    # Closing the consumer cancels the generator. The backend must unwind cleanly
+    # (no retry/error path for the dead socket) — so no `error` event is emitted
+    # and the generator terminates without raising.
+    await agen.aclose()
+    # Drain any remaining buffered events; none of them may be an `error` event
+    # for the torn-down socket.
+    remaining = []
+    try:
+        while True:
+            remaining.append(await agen.__anext__())
+    except StopAsyncIteration:
+        pass
+    assert not any(e.get("kind") == "error" for e in remaining), \
+        f"client abort must not emit an error event, got: {remaining}"

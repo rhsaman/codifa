@@ -1016,8 +1016,9 @@ async def chat_compact(req: CompactRequest):
 async def _with_keepalive(agent_iter, timeout: float = 15.0):
     """Yield agent SSE events, injecting a keepalive sentinel whenever the agent
     goes silent for `timeout` seconds so idle sockets survive proxy/OS/TCP
-    timeouts mid-stream. The frontend's parseFrame ignores `: `-prefixed lines,
-    so the comment never reaches onEvent and never resets the stall watchdog."""
+    timeouts mid-stream. The frontend forwards `: `-prefixed lines as a
+    `keepalive` event and refreshes its stall watchdog, so a long-running tool is
+    never mistaken for a dead connection."""
     pending = None
     while True:
         if pending is None:
@@ -1101,8 +1102,9 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         except asyncio.CancelledError:
             # Client disconnected (aborted the stream): the run_agent generator
             # and its background producer task are unwound inside run_agent's
-            # finally block, so just stop iterating cleanly.
-            raise
+            # finally block, so just stop iterating cleanly — do NOT emit a
+            # trailing "done" event, since the user closed the stream themselves.
+            return
         except Exception as exc:  # noqa: BLE001 — must always surface an SSE error
             # Full traceback to the sidecar stderr so an opaque upstream message
             # ("Exceeded maximum output retries (1)", ...) never hides the real

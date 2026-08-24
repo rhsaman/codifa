@@ -18,7 +18,6 @@
   /* Tool-call category colors are derived from the theme accent via
      --tool-color overrides on each card class: single = full accent,
      group = muted mix, explore = dimmer mix. No fixed per-category vars. */
-  /* Live thinking panel (pinned above the chat while the model reasons). */
   --thinking: #f9e2af;
   --radius: 14px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
@@ -5939,6 +5938,7 @@ textarea {
   margin: 14px 0 4px;
 }
 
+
 .queued-bubble {
   position: relative;
   display: flex;
@@ -6198,140 +6198,68 @@ textarea {
   color: var(--text);
 }
 
-/* ---- live working status line (streaming assistant message) ---- */
-.msg-working {
+/* ---- نشانگر thinking در ردیف فوتر پیام (سمت مخالف کپی/usage) ---- */
+.msg-thinking {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin: 4px 0;
-  padding: 6px 13px 6px 10px;
-  border-radius: 999px;
-  font-size: 12px;
+  /* بدون direction روی خودِ المان — جهت از کانتینر ارث‌بری می‌شود تا
+     margin-inline-start: auto در هر دو LTR و RTL درست عمل کند (سمت مخالف
+     کپی/usage). */
+  margin-inline-start: auto;
+  font-size: 11px;
   font-weight: 500;
   color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-  /* Amber (--thinking) tint by default — matches the pinned thinking panel's
-     palette so "the model is reasoning" reads as one consistent color across
-     the app. */
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--bg-panel) 90%, var(--thinking) 10%),
-      color-mix(in srgb, var(--bg-panel) 97%, var(--thinking) 3%));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 22%, transparent),
-    0 4px 14px -8px color-mix(in srgb, var(--thinking) 45%, transparent);
-  animation: msg-working-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
-  transition:
-    opacity 0.2s ease,
-    transform 0.2s ease;
+  white-space: nowrap;
 }
 
-/* Tool-running state gets the theme accent instead of the thinking amber, so
-   "reasoning" and "actively doing something" read as visually distinct. */
-.msg-working.running {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--bg-panel) 90%, var(--accent) 10%),
-      color-mix(in srgb, var(--bg-panel) 97%, var(--accent) 3%));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent),
-    0 4px 14px -8px color-mix(in srgb, var(--accent) 45%, transparent);
-}
-
-/* Exit animation driven by LiveWorkingStatus's grace-period state machine —
-   the element fades/slides out over ~200ms instead of vanishing instantly,
-   so its footprint shrinks smoothly instead of snapping the transcript. */
-.msg-working.leaving {
-  opacity: 0;
-  transform: translateY(-3px) scale(0.97);
-}
-
-@keyframes msg-working-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px) scale(0.96);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-.msg-working .spinner {
-  width: 12px;
-  height: 12px;
-  border-width: 2px;
-}
-
-.msg-working.running .spinner {
-  border-top-color: var(--accent);
-}
-
-/* Sparkle icon for the "thinking" (no active tool) state — a small breathing
-   mark instead of the tool spinner, echoing the pinned thinking panel's ✦. */
-.msg-working-spark {
+/* wrapper داخلی ltr — ترتیب ثابت Thinking → نقطه‌ها → تایمر را در RTL
+   حفظ می‌کند. این المان flex واقعی است که فاصلهٔ بین بچه‌ها را می‌دهد. */
+.msg-thinking-inner {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 12px;
-  height: 12px;
-  font-size: 12px;
-  line-height: 1;
-  color: var(--thinking);
-  animation: msg-working-spark-pulse 1.8s ease-in-out infinite;
+  gap: 12px;
 }
 
-@keyframes msg-working-spark-pulse {
+.msg-thinking-elapsed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  white-space: nowrap;
+}
 
-  0%,
-  100% {
-    opacity: 0.55;
-    transform: scale(0.85);
+/* ۳ نقطه لودینگ — از سمت راست شروع می‌کنند به پر شدن (نقطهٔ اول = سمت راست
+   زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
+   ترتیب بچه‌ها در TSX به‌صورت ltr ثابت است (نقطهٔ اول همیشه سمت راست)،
+   پس انیمیشن صریحاً از راست شروع می‌شود و نیازی به direction نیست. */
+.msg-thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.msg-thinking-dots .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.2;
+  animation: msg-thinking-dot 1.4s ease-in-out infinite;
+}
+
+/* نقطهٔ اول (سمت راست) زودتر روشن می‌شود، سپس دوم و سوم — پر شدن متوالی از راست. */
+.msg-thinking-dots .dot:nth-child(1) { animation-delay: 0s; }
+.msg-thinking-dots .dot:nth-child(2) { animation-delay: 0.2s; }
+.msg-thinking-dots .dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes msg-thinking-dot {
+  0%, 100% {
+    opacity: 0.2;
+    transform: scale(0.7);
   }
-
-  50% {
+  40% {
     opacity: 1;
-    transform: scale(1.08);
-  }
-}
-
-/* Shimmering label — a light sweep across the word gives the line a "live"
-   feel without another pulsing dot competing for attention next to the
-   spinner/spark. */
-.msg-working-text {
-  background: linear-gradient(90deg,
-      var(--text-dim) 30%,
-      var(--text) 50%,
-      var(--text-dim) 70%);
-  background-size: 220% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: msg-working-shimmer 2.2s linear infinite;
-}
-
-@keyframes msg-working-shimmer {
-  0% {
-    background-position: 200% 0;
-  }
-
-  100% {
-    background-position: -20% 0;
-  }
-}
-
-.msg-working-elapsed {
-  opacity: 0.7;
-  font-weight: 400;
-}
-
-@media (prefers-reduced-motion: reduce) {
-
-  .msg-working,
-  .msg-working-spark,
-  .msg-working-text {
-    animation: none;
+    transform: scale(1.3);
   }
 }
 
@@ -6357,35 +6285,6 @@ textarea {
       var(--bg-panel));
   margin: 4px 0;
   overflow: hidden;
-}
-
-/* Live thinking pinned to the top of the chat while the agent is reasoning.
-   Rendered OUTSIDE the scroll container (sibling above .chat-scroll) so it
-   stays in view no matter how far the scrollback grows — no sticky dependency. */
-.thinking-pin {
-  flex: 0 0 auto;
-  max-width: 920px;
-  width: calc(100% - 28px);
-  margin: 14px auto 0;
-  border: none;
-  border-left: 3px solid color-mix(in srgb, var(--thinking) 60%, transparent);
-  border-radius: 12px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--bg-panel) 94%, var(--thinking) 7%),
-      var(--bg-panel));
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.18),
-    0 8px 20px -6px rgba(0, 0, 0, 0.35),
-    0 18px 40px -12px rgba(0, 0, 0, 0.28),
-    0 0 0 1px color-mix(in srgb, var(--thinking) 22%, transparent),
-    0 0 24px -4px color-mix(in srgb, var(--thinking) 30%, transparent);
-  overflow: hidden;
-}
-
-.thinking-pin .thinking-block {
-  border: none;
-  background: none;
-  margin: 0;
 }
 
 .thinking-head {
@@ -6415,11 +6314,6 @@ textarea {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
-}
-
-/* The pinned live-thinking sparkle breathes while the model reasons. */
-.thinking-pin .thinking-dot:not(.busy) {
-  animation: thinking-pulse 2s ease-in-out infinite;
 }
 
 /* While no reasoning text has arrived yet, a small gold spinner stands in
@@ -9814,10 +9708,6 @@ textarea {
 .thinking-block {
   border: none;
   border-left: 3px solid var(--thinking);
-}
-
-.thinking-pin {
-  border: none;
 }
 
 .retry-banner {

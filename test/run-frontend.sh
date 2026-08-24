@@ -135,6 +135,14 @@ npx esbuild test/streamChatReconnect.test.ts --bundle --platform=node --format=e
   --packages=external --external:electron --outfile=test/.tmp-sc.mjs >/dev/null 2>&1
 node test/.tmp-sc.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs
+echo ""
+echo "── تست ۲۴: ThinkingIndicator (۳ نقطه لودینگ به‌جای ✦ + نمایش در فوتر پیام) ──"
+npx esbuild test/thinkingIndicator.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \
+  --outfile=test/.tmp-ti.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-ti.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

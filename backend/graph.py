@@ -1569,6 +1569,11 @@ async def _run_mode_turn(
             reply = await _inner()
             break
         except Exception as exc:  # noqa: BLE001
+            # A client abort (CancelledError) means the user closed the stream —
+            # do NOT retry or emit an error event (it would never be read anyway,
+            # since the SSE socket is already torn down). Just stop cleanly.
+            if isinstance(exc, asyncio.CancelledError):
+                break
             # Hard, non-recoverable failures: don't retry (would fail identically).
             if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
                 queue.put_nowait(

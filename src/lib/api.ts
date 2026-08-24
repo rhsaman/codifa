@@ -302,6 +302,16 @@ export async function streamChat(
 
   const parseFrame = (frame: string) => {
     for (const line of frame.split('\n')) {
+      // SSE comments (": keepalive") are the backend's heartbeat — it sends one
+      // every ~15s ONLY while the agent is legitimately silent (running a tool
+      // or thinking). Forwarding it as a "keepalive" event lets the frontend
+      // refresh its stall watchdog clock, so a long-running tool is never
+      // mistaken for a dead connection. A genuinely dead socket stops emitting
+      // these, which is exactly what the watchdog needs to detect.
+      if (line.startsWith(': ')) {
+        onEvent({ kind: 'keepalive' } as SidecarEvent)
+        continue
+      }
       if (!line.startsWith('data: ')) continue
       const raw = line.slice(6).trim()
       if (!raw) continue

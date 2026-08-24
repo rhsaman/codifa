@@ -1515,6 +1515,15 @@ export function ChatPanel() {
     };
 
     const handleEvent = (event: SidecarEvent) => {
+      // Heartbeat from the backend: it arrives every ~15s while the agent is
+      // legitimately silent (running a tool / thinking). Refresh the watchdog
+      // clock so a long-running tool is NOT mistaken for a dead connection —
+      // only a socket that stops emitting keepalives (a genuinely dead one)
+      // should trip the stall watchdog. No UI work needed.
+      if (event.kind === "keepalive") {
+        lastEventAt.current = Date.now();
+        return;
+      }
       lastEventAt.current = Date.now();
       useStore.getState().setChatStalled(chat.id, false);
       const store = useStore.getState();

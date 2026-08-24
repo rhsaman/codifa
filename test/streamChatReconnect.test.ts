@@ -8,6 +8,7 @@
 //  - a network failure MID-STREAM (reader throws) retries and resumes
 //  - a manual abort does NOT trigger a reconnect (AbortError propagates)
 //  - an HTTP error response (non-2xx) is NOT retried
+//  - SSE ": keepalive" comments are forwarded as "keepalive" events (heartbeat)
 
 // Stub the Electron bridge so ensureSidecar() returns a fixed URL. This MUST
 // run before importing api.ts (which touches window.coder at module load).
@@ -39,12 +40,17 @@ function check(name: string, cond: boolean, extra?: unknown) {
 }
 
 // Build a fake SSE Response whose body streams the given events, then optionally
-// throws mid-read to simulate a dropped connection.
-function makeStreamResponse(events: any[], throwMidStream = false): Response {
+// throws mid-read to simulate a dropped connection. `keepalives` is the number of
+// ": keepalive" heartbeat comments to interleave between events (the backend
+// sends one every ~15s while the agent is legitimately silent).
+function makeStreamResponse(events: any[], throwMidStream = false, keepalives = 0): Response {
   const encoder = new TextEncoder()
   const chunks: Uint8Array[] = []
   for (const ev of events) {
     chunks.push(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`))
+    for (let k = 0; k < keepalives; k++) {
+      chunks.push(encoder.encode(`: keepalive\n\n`))
+    }
   }
   let i = 0
   const body = new ReadableStream<Uint8Array>({
@@ -169,6 +175,32 @@ async function run() {
     }
     check('۵) خطای HTTP باعث retry نمی‌شود', calls === 2, calls)
     check('۵) پیام خطای سرور برگشت', msg.includes('boom'), msg)
+  }
+
+  // 6) SSE ": keepalive" comments are forwarded as "keepalive" events.
+  //    This is the backend's heartbeat while it's legitimately silent (running
+  //    a tool / thinking). The frontend uses it to refresh its stall watchdog
+  //    clock so a long-running tool is never mistaken for a dead connection.
+  //    NOTE: ensureSidecar() also probes `${url}/health` once (cached URL), so
+  //    we only count the actual /chat/stream fetches to assert "no reconnect".
+  {
+    let streamCalls = 0
+    const received: any[] = []
+    ;(globalThis as any).fetch = async (url: string) => {
+      if (url.endsWith('/health')) return new Response(null, { status: 200 })
+      if (url.endsWith('/chat/stream')) streamCalls++
+      // Two text events with a heartbeat comment between them — exactly what
+      // the backend emits while a tool is running.
+      return makeStreamResponse(
+        [{ kind: 'text', content: 'a' }, { kind: 'done' }],
+        false,
+        1,
+      )
+    }
+    await streamChat(baseParams, (e) => received.push(e))
+    check('۶) استریم با keepalive فقط یک‌بار fetch می‌زند', streamCalls === 1, streamCalls)
+    check('۶) event keepalive از کامنت SSE ساخته شد', received.some((e) => e.kind === 'keepalive'), received)
+    check('۶) event های data همچنان رسیدند', received.filter((e) => e.kind !== 'keepalive').length === 2, received)
   }
 
   if (failed > 0) {

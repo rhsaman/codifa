@@ -2548,10 +2548,10 @@ export function ChatPanel() {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           window.alert(
-            `تبدیل گفتار به متن انجام نشد: ${msg}\n` +
+            `Voice transcription failed: ${msg}\n` +
               (msg.includes("Failed to fetch")
-                ? "سرور محلی (Python) احتمالاً متوقف شده است — برنامه را ببندید و دوباره باز کنید."
-                : "لطفاً دوباره تلاش کنید یا اتصال میکروفون را بررسی کنید."),
+                ? "The local Python server is likely down — restart the app."
+                : "Please try again or check your microphone connection."),
           );
         } finally {
           setTranscribing(false);

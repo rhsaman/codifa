@@ -641,16 +641,20 @@ async def transcribe(request: Request) -> dict:
 
     from faster_whisper.audio import decode_audio
 
-    form = await request.form()
-    audio = form.get("audio")
-    if audio is None:
-        raise HTTPException(status_code=400, detail="missing 'audio' field")
-    data = await audio.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty audio")
-    lang = (form.get("lang") or "").strip().lower() or None
-
     try:
+        # Parsing the multipart form (and every downstream step) lives inside the
+        # try so that failures — e.g. a missing `python-multipart` dependency, or
+        # a malformed upload — surface as a 500 with a `detail` message instead of
+        # an unhandled AssertionError that FastAPI turns into a bare 500.
+        form = await request.form()
+        audio = form.get("audio")
+        if audio is None:
+            raise HTTPException(status_code=400, detail="missing 'audio' field")
+        data = await audio.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty audio")
+        lang = (form.get("lang") or "").strip().lower() or None
+
         model = await _get_whisper_model()
         # faster-whisper's decode_audio uses `av` to decode webm/ogg/opus/wav/mp3
         # to a float32 16 kHz PCM array, so any container the browser MediaRecorder
@@ -660,18 +664,25 @@ async def transcribe(request: Request) -> dict:
             "min_silence_duration_ms": 250,
             "speech_pad_ms": 200,
         }
+        # For Persian, steer the model toward correct punctuation and away
+        # from filler words. The previous prompt ("no punctuation") hurt
+        # readability and accuracy for Persian, so it is replaced here.
+        fa_prompt = (
+            "رونویسی فارسی با نشانه‌گذاری صحیح. متن را بدون کلمات اضافه و "
+            "پرکننده بنویسید:"
+        )
         segments, _info = model.transcribe(
             pcm,
-            beam_size=5,
+            beam_size=10,
             language=lang,
             vad_filter=True,
             vad_parameters=vad_parameters,
-            initial_prompt="## Persian dictation, no punctuation and no filler words" if lang == "fa" else None,
+            initial_prompt=fa_prompt if lang == "fa" else None,
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
             condition_on_previous_text=False,
-            no_speech_threshold=0.6,
+            no_speech_threshold=0.5,
             compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
+            log_prob_threshold=-0.8,
             without_timestamps=True,
         )
         text = " ".join(seg.text for seg in segments).strip()

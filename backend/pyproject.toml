@@ -20,6 +20,7 @@ dependencies = [
     "langchain-openai>=1.6.0",
     "langchain-google-genai>=4.3.5",
     "pillow>=12.3.0",
+    "python-multipart>=0.0.32",
 ]
 
 [tool.ruff]

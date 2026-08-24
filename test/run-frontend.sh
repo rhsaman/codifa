@@ -104,6 +104,12 @@ npx esbuild test/ensureSidecar.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-es.mjs >/dev/null 2>&1
 node test/.tmp-es.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs
+echo ""
+echo "── تست ۱۹: transcribeAudio (throw کردن detail سرور روی ۵۰۰ + برگرداندن متن روی ۲۰۰) ──"
+npx esbuild test/transcribe.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-tr.mjs >/dev/null 2>&1
+node test/.tmp-tr.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

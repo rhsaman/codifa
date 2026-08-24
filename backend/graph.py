@@ -1234,6 +1234,16 @@ async def _run_mode_turn(
         steps = 0
         reply = ""
         _no_so = False
+        # --- Repetition-loop guard -----------------------------------------
+        # Some models fall into a degenerate loop where they emit the SAME text
+        # and the SAME tool call on every step. Without a guard the backend
+        # streams that one sentence dozens of times (the user sees a "message
+        # that repeats itself"). If the last N steps are identical we stop and
+        # report it instead of looping up to MAX_STEPS.
+        _last_step_text = ""
+        _last_step_tools = ""
+        _repeat_count = 0
+        _MAX_REPEAT = 3
         while steps < MAX_STEPS:
             steps += 1
             # Live steer injection: user messages typed mid-run.
@@ -1256,6 +1266,7 @@ async def _run_mode_turn(
                 ai: Any = None
                 _astream_count_local = 0
                 _thinking_active = False
+                _step_text = ""
                 # The model is reasoning-capable (flag from the /models payload /
                 # models.dev catalog, forwarded by the frontend). We emit a single
                 # lightweight "active" toggle at the START of the stream so the
@@ -1279,6 +1290,7 @@ async def _run_mode_turn(
                             _thinking_active = False
                             queue.put_nowait({"kind": "thinking", "active": False})
                         queue.put_nowait({"kind": "text", "content": content})
+                        _step_text += content
                     elif isinstance(content, list):
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "text":
@@ -1286,6 +1298,7 @@ async def _run_mode_turn(
                                     _thinking_active = False
                                     queue.put_nowait({"kind": "thinking", "active": False})
                                 queue.put_nowait({"kind": "text", "content": part["text"]})
+                                _step_text += part["text"]
                 if ai is None:
                     break
                 # Safety net for models that only reason and emit no text: make
@@ -1316,6 +1329,36 @@ async def _run_mode_turn(
                         "model response truncated (context length exceeded)"
                     )
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
+                break
+            # --- Repetition-loop detection ----------------------------------
+            # Compare this step's emitted text + tool calls against the previous
+            # step. A model stuck in a loop produces byte-identical steps, so a
+            # short run of identical steps is a reliable signal. We only check
+            # steps that carry tool calls (the final text-only step already
+            # broke above), so normal multi-step work is never flagged.
+            _step_tools = json.dumps(
+                getattr(ai, "tool_calls", None) or [],
+                sort_keys=True,
+                default=str,
+            )
+            if _step_text == _last_step_text and _step_tools == _last_step_tools:
+                _repeat_count += 1
+            else:
+                _repeat_count = 0
+            _last_step_text = _step_text
+            _last_step_tools = _step_tools
+            if _repeat_count >= _MAX_REPEAT:
+                queue.put_nowait(
+                    {
+                        "kind": "error",
+                        "content": (
+                            "The model entered a repetition loop (it kept emitting "
+                            "the same text and tool calls). Stopping to avoid an "
+                            "endless, duplicated response. Try rephrasing your "
+                            "request or breaking it into smaller steps."
+                        ),
+                    }
+                )
                 break
             msgs.append(ai)
             # Partition this step's tool calls: read-only ones (grep/glob/read/

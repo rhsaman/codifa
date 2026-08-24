@@ -66,6 +66,42 @@ async def test_plan_build_emits_self_check_warning(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plan_build_auto_corrects_path(tmp_path, monkeypatch):
+    root = str(tmp_path)
+    # The real file lives under test/, but the plan references it without that
+    # prefix. The self-check should auto-correct the path in-place (exactly one
+    # basename match) and NOT emit a warning.
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    (test_dir / "scrollPos.test.ts").write_text("// fixture\n")
+
+    reply = "## Plan\nEdit `scrollPos.test.ts`.\nFiles: scrollPos.test.ts"
+
+    saved = {}
+
+    def fake_save_plan(workspace, title, content, chat_id=""):
+        saved["content"] = content
+
+    monkeypatch.setattr(graph.state_db, "save_plan", fake_save_plan)
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
+
+    state, q = _state(root, reply)
+    await plan_build(state)
+
+    # The saved plan should have the corrected path, not the wrong one.
+    assert "test/scrollPos.test.ts" in saved["content"]
+    assert "`scrollPos.test.ts`" not in saved["content"]
+
+    # No self-check warning should be emitted for an auto-corrected path.
+    texts = []
+    while not q.empty():
+        item = q.get_nowait()
+        if item.get("kind") == "text":
+            texts.append(item["content"])
+    assert not any("self-check" in t for t in texts)
+
+
+@pytest.mark.asyncio
 async def test_plan_build_skips_save_when_not_plan(tmp_path, monkeypatch):
     root = str(tmp_path)
     reply = "Just a normal reply, no plan header."

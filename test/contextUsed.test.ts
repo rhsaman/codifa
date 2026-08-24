@@ -20,9 +20,10 @@ function mkChat(messages: any[], mode = 'ask'): Chat {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۱) realTotal excludes output tokens (context-window basis):')
+console.log('۱) realTotal includes output + cache (latest turn total, like opencode overflow.ts):')
 {
-  // Provider reports input=5000, output=900 — only input+cache counts.
+  // opencode's isOverflow uses tokens.total = input + output + cache.read + cache.write.
+  // Here usage has no totalTokens, so we sum the parts — output IS included.
   const chat = mkChat([
     { role: 'user', content: 'hi' },
     {
@@ -32,32 +33,42 @@ console.log('۱) realTotal excludes output tokens (context-window basis):')
       usage: { inputTokens: 5000, outputTokens: 900, cacheReadTokens: 0, cacheWriteTokens: 0 },
     },
   ])
-  const sys = 'system'
-  const used = computeContextUsed(chat, sys, 50, 200000, 'ask')
-  // estimate is non-trivial (system + 2 messages + 16k floor), so used >= 5000.
-  check('used ≥ provider input (5000), ignores output', used >= 5000, used)
-  check('used is NOT input+output (5900)', used !== 5900, used)
+  const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
+  check('used = input + output (5900), output included', used === 5900, used)
+
+  // When totalTokens is present it is used directly (it already includes output + cache).
+  const chat2 = mkChat([
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: 'ok',
+      usage: { inputTokens: 5000, outputTokens: 900, totalTokens: 5900, cacheReadTokens: 1200, cacheWriteTokens: 0 },
+    },
+  ])
+  check(
+    'used = totalTokens when present (5900 incl. cache)',
+    computeContextUsed(chat2, 'sys', 50, 200000, 'ask') === 5900,
+    computeContextUsed(chat2, 'sys', 50, 200000, 'ask'),
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۲) windowed provider input → meter uses the larger full-conversation estimate (cumulative, like opencode):')
+console.log('۲) only the LATEST assistant turn drives the meter (no max over history):')
 {
-  // opencode/hy3-free reports a windowed ~5.3K input; the real conversation is
-  // much larger. The meter must NOT collapse to the 5.3K slice.
-  const big = 'x'.repeat(40000) // ~10k tokens of history
+  // An earlier, much larger turn must NOT inflate the meter — opencode uses the
+  // latest request's total, which already re-sends the whole history.
   const chat = mkChat([
-    { role: 'user', content: big },
-    { role: 'assistant', content: big, outputTokens: 100, usage: { inputTokens: 5300, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 } },
-    { role: 'user', content: 'follow-up' },
+    { role: 'user', content: 'big' },
+    { role: 'assistant', content: 'big', outputTokens: 5, usage: { inputTokens: 999999, outputTokens: 5, totalTokens: 1000004 } },
+    { role: 'user', content: 'small follow-up' },
+    { role: 'assistant', content: 'small', outputTokens: 10, usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
   ])
   const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
-  const est = estimateContextTokens(chat, 'sys', 50, 200000, 'ask')
-  check('used equals max(realTotal, estimate)', used === Math.max(5300, est), { used, est })
-  check('used is cumulative (>> windowed 5300)', used > 5300, used)
+  check('used = latest turn total (2010), not the earlier 1M', used === 2010, used)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۳) provider sends full history (realTotal > estimate) → trust the provider:')
+console.log('۳) provider reports a real total → meter trusts it (output included):')
 {
   const chat = mkChat([
     { role: 'user', content: 'hi' },
@@ -69,9 +80,8 @@ console.log('۳) provider sends full history (realTotal > estimate) → trust th
     },
   ])
   const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
-  const est = estimateContextTokens(chat, 'sys', 50, 200000, 'ask')
-  check('used equals the larger provider count', used === Math.max(99999, est), { used, est })
-  check('used reflects provider (99999)', used === 99999 || used === Math.max(99999, est), used)
+  // no totalTokens → input + output = 100009 (output is included, like opencode).
+  check('used includes output (100009)', used === 100009, used)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +97,7 @@ console.log('۴) no usage yet → falls back to the estimate (never a dash):')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۵) estimate grows cumulatively as history grows (the core "like opencode" behavior):')
+console.log('۵) estimate grows cumulatively as history grows (fallback path):')
 {
   const m = (c: string) => ({ role: 'user', content: c, outputTokens: 0 })
   const a = (c: string) => ({ role: 'assistant', content: c, outputTokens: 0 })

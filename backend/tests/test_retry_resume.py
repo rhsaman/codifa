@@ -151,10 +151,9 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
 async def test_fatal_500_surfaces_as_error_no_resume(run_events):
     """A 500 (server error) in the main mode LLM call is fatal, so it surfaces
     as an `error` event and stops -- there is nothing to replay and nothing to
-    learn. (Request index 0 is now the LLM search-planner; index 1 is the mode
-    LLM call, so the fatal 500 is aimed there.)"""
+    learn. The fatal 500 is aimed at the mode LLM call (request index 0)."""
     mock.script = [text_reply("Done")]
-    mock.error_at = {1: (500, "server error")}
+    mock.error_at = {0: (500, "server error")}
 
     events = await run_events("read app.py and summarize it", mode="plan")
 

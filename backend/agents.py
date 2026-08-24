@@ -635,7 +635,7 @@ def _subagent_target(
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "You are a mentor inside a desktop IDE. For a question that references the codebase (behavior, styling, logic, bugs, file structure, dependencies), explore JUST-IN-TIME: use grep/glob/read to find and read the relevant code, or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore'). Never answer about the real project from general knowledge when the code is a grep/read away -- but do not search when the answer is already in front of you (memory, conversation, attached files, earlier tool results). You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target, and always explain the WHY. For current or external info (versions, docs, APIs, error fixes), use web_search / fetch_url ONLY when the user explicitly asks to search the web -- never on your own initiative. Skip search for questions unrelated to the project (greetings, general knowledge, or pasted errors from OTHER apps/OS). If the user @mentions or attaches a file, it is in SCOPE and already noted for you -- read it with the read tool rather than re-searching. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references -- name exact file paths, functions and line targets -- never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you, answer directly -- do NOT call a tool. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax -- never as ASCII art or a plain list. Match the answer length to the question: be terse for quick questions, but go deep with full steps and snippets when the task demands it. Never pad with filler or restate what was asked. Keep replies concise.",
+    "ask": "You are a mentor inside a desktop IDE. For a question that references the codebase (behavior, styling, logic, bugs, file structure, dependencies), explore JUST-IN-TIME: use grep/glob/read to find and read the relevant code, or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore'). Never answer about the real project from general knowledge when the code is a grep/read away -- but do not search when the answer is already in front of you (memory, conversation, attached files, earlier tool results). You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target. Keep answers short (1-3 lines) unless the user explicitly asks for details. For current or external info (versions, docs, APIs, error fixes), use web_search / fetch_url ONLY when the user explicitly asks to search the web -- never on your own initiative. Skip search for questions unrelated to the project (greetings, general knowledge, or pasted errors from OTHER apps/OS). If the user @mentions or attaches a file, it is in SCOPE and already noted for you -- read it with the read tool rather than re-searching. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references -- name exact file paths, functions and line targets -- never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you, answer directly -- do NOT call a tool. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax -- never as ASCII art or a plain list. Match the answer length to the question: be terse for quick questions, but go deep with full steps and snippets when the task demands it. Never pad with filler or restate what was asked. Keep replies concise.",
     "coder": "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it, doing just-in-time discovery on your own: when you need a file's contents, symbols, or a calling convention, grep/glob/read it first (or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore')) -- you are NOT handed a pre-read context, so look things up right before you edit. You have edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Always include a 'write and run tests' step in the checklist for any code change. Tick off each step the moment its implementation is finished -- call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list (the finished checklist is cleared). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command -- file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Batch related edits into one change where one suffices; do not repeatedly edit the same code. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions -- small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself. TEST DISCIPLINE: after any code change, write/update the relevant test for that language and ensure it passes (uv run pytest / npm test / cargo test / go test / mvn test / dotnet test / ...). Never finish with red tests — the system will re-run you on failure and feed the error back, so fix the code until all tests pass.",
     "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN -- you never implement it. Discover the codebase yourself, JUST-IN-TIME: use grep/glob/read to find the files, functions and lines your plan will touch (or delegate broad exploration to the Explore sub-agent via task(subagent_type='explore')). You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). Stop scouting the moment every file, function and line your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); the checklist must always include a 'write and run tests' step for any code change; do not call it while scouting. your finished plan is saved automatically by the pipeline (one per workspace); it auto-checks backtick-quoted paths -- fix any flagged. Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code -- it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
 }
@@ -695,29 +695,50 @@ _UNIVERSAL_RULES = (
     "your work (not caused by you), do NOT silently fix them — report them "
     "briefly as notes/suggestions (e.g. 'this function is unused — should be "
     "deleted', 'there's a bug here: ...').\n"
-    "3. MATCH LENGTH TO NEED: be precise and complete first — never sacrifice "
+    "3. EXTENSIBLE CODE: write, fix and edit code so it stays usable and "
+    "extensible for future needs — general, parameterized, configurable, "
+    "following the project's existing patterns — never a one-off hack that only "
+    "serves the specific case in front of you. When a small generalization (a "
+    "parameter, a lookup table/registry, a shared helper) makes the solution "
+    "serve a whole class of similar tasks instead of one instance, prefer it.\n"
+    "4. PERSIAN TYPOGRAPHY: when replying in Persian, always use the half-space "
+    "(ZWNJ, U+200C) between word components — e.g. کتابخانه‌ها, منسوخ‌شده‌اند, "
+    "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it.\n"
+    "5. MEMORY IS AUTO-INJECTED: this project's relevant durable memory notes are "
+    "loaded into your context automatically every run, so you rarely need "
+    "search_memory — the notes are already in front of you. Only call "
+    "search_memory when you explicitly need MORE than what's already here (a "
+    "different angle, older notes, or a deliberate mid-task re-check). Never call "
+    "it routinely or on every step."
+)
+
+# Length rule for plan/coder ONLY — these modes need full, complete deliverables
+# (a complete plan, full code, thorough explanation) for quality. It is NOT part
+# of _UNIVERSAL_RULES so ask mode stays short by default. Appended to the base
+# prompt only for plan/coder in graph.py.
+_LENGTH_RULE = (
+    "\n\nLENGTH RULE (plan/coder only):\n"
+    "MATCH LENGTH TO NEED: be precise and complete first — never sacrifice "
     "correctness, detail, or the full deliverable your mode requires (a complete "
     "plan, full code, thorough explanation) for the sake of brevity. Cut FILLER "
     "only: no long intros, no restating the question, no repeated caveats, no "
     "padding prose. For quick questions answer in 1-3 sentences; for tasks "
     "needing depth (debugging, architecture, planning, explanations) give the "
     "complete detail. Prefer tight bullets and code snippets over prose; lead "
-    "with the direct answer, then only the context needed to act.\n"
-    "4. EXTENSIBLE CODE: write, fix and edit code so it stays usable and "
-    "extensible for future needs — general, parameterized, configurable, "
-    "following the project's existing patterns — never a one-off hack that only "
-    "serves the specific case in front of you. When a small generalization (a "
-    "parameter, a lookup table/registry, a shared helper) makes the solution "
-    "serve a whole class of similar tasks instead of one instance, prefer it.\n"
-    "5. PERSIAN TYPOGRAPHY: when replying in Persian, always use the half-space "
-    "(ZWNJ, U+200C) between word components — e.g. کتابخانه‌ها, منسوخ‌شده‌اند, "
-    "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it.\n"
-    "6. MEMORY IS AUTO-INJECTED: this project's relevant durable memory notes are "
-    "loaded into your context automatically every run, so you rarely need "
-    "search_memory — the notes are already in front of you. Only call "
-    "search_memory when you explicitly need MORE than what's already here (a "
-    "different angle, older notes, or a deliberate mid-task re-check). Never call "
-    "it routinely or on every step."
+    "with the direct answer, then only the context needed to act."
+)
+
+# Test files must live with the code they test, inside that package's own test
+# directory — regardless of how many packages the repo contains. Appended to
+# the plan and coder prompts (graph.py): plan must reference the right test
+# path, and coder writes the test there.
+_TEST_DIR_RULE = (
+    "\n\nTEST LOCATION RULE (plan & coder):\n"
+    "Place each test file alongside the code it tests, inside the SAME "
+    "package/sub-package as that code — regardless of how many packages the "
+    "repo contains. For a single-package project, use a `test/` (or `tests/`) "
+    "directory at THAT package's root. Never put tests in unrelated folders "
+    "or far from the code under test."
 )
 
 # The search strategy is a FIRST-CLASS rule: it sits at the very top of
@@ -1533,25 +1554,30 @@ def _model_max_output(model: Any) -> int:
         return 0
 
 
-def _usable_tokens(ctx: int, max_output: int = 0) -> int:
-    """opencode `usable`: context window minus the compaction/output reservation."""
+def _usable_tokens(ctx: int, max_output: int = 0, reserved: int | None = None) -> int:
+    """opencode `usable`: context window minus the compaction/output reservation.
+
+    When ``reserved`` is provided (the UI's "compaction headroom" in tokens) it is
+    used directly, clamped to ``[0, ctx]``. Otherwise opencode's default applies:
+    ``reserved = min(COMPACTION_BUFFER, maxOutputTokens)`` where
+    ``maxOutputTokens = min(model.limit.output, 32000)`` — i.e. ``0`` when the
+    model's output limit is unknown, so compaction only fires near the hard limit.
+    """
     if ctx <= 0:
         return 0
-    reserved = min(_COMPACTION_BUFFER, max_output if max_output > 0 else max(ctx // 4, 0))
+    if reserved is None:
+        reserved = min(_COMPACTION_BUFFER, max_output) if max_output > 0 else 0
+    else:
+        reserved = max(0, min(int(reserved), ctx))
     return max(0, ctx - reserved)
 
 
-def _recent_tail_budget(ctx: int, max_output: int = 0) -> int:
+def _recent_tail_budget(
+    ctx: int, max_output: int = 0, reserved: int | None = None
+) -> int:
     """opencode `preserveRecentBudget`: recent turns kept verbatim, in tokens."""
-    usable = _usable_tokens(ctx, max_output)
+    usable = _usable_tokens(ctx, max_output, reserved)
     return min(_MAX_PRESERVE_RECENT_TOKENS, max(_MIN_PRESERVE_RECENT_TOKENS, int(usable * 0.25)))
-
-
-def _preemptive_compact_fraction(ctx: int, max_output: int = 0) -> float:
-    """Fraction of the window at which to compact — opencode's `usable / ctx`."""
-    if ctx <= 0:
-        return 0.60  # historical default when the window is unknown
-    return _usable_tokens(ctx, max_output) / ctx
 
 
 # opencode's compaction agent system prompt (verbatim — keeps the source language).
@@ -1616,9 +1642,11 @@ _SUMMARY_UPDATE_INSTRUCTIONS = (
 )
 
 
-def _summary_output_budget(ctx: int, max_output: int = 0) -> int:
+def _summary_output_budget(
+    ctx: int, max_output: int = 0, reserved: int | None = None
+) -> int:
     """opencode's 4096-token summary ceiling, scaled so it fits small windows."""
-    usable = _usable_tokens(ctx, max_output)
+    usable = _usable_tokens(ctx, max_output, reserved)
     return max(1024, min(_SUMMARY_OUTPUT_TOKENS, usable - 1024))
 
 
@@ -2822,7 +2850,10 @@ async def _compact_history(
     fallback_model: Any = None,
     ctx: int = 0,
     max_output: int = 0,
-) -> list[dict] | None:
+    reserved: int | None = None,
+    last_error: list | None = None,
+    force: bool = False,
+) -> tuple[list[dict], int] | None:
     """Collapse older turns into one structured summary, keeping a recent tail
     verbatim, so a full window can continue instead of being cut off.
 
@@ -2850,7 +2881,7 @@ async def _compact_history(
     """
     if ctx <= 0:
         ctx = 8192  # opencode assumes a window is always known; fall back sensibly
-    tail_budget = _recent_tail_budget(ctx, max_output)
+    tail_budget = _recent_tail_budget(ctx, max_output, reserved)
 
     # --- select the recent tail (kept verbatim) -------------------------------
     # Walk backward keeping whole messages until the token budget is hit
@@ -2867,7 +2898,20 @@ async def _compact_history(
     recent = tail
     older = history[: len(history) - len(tail)]
     if not older:
-        return None
+        if not force:
+            # Auto-compact only runs when the window actually overflows, so a
+            # conversation that fits in the tail has nothing to do.
+            return None
+        # Manual /compact: the user explicitly asked to summarize, even when the
+        # whole conversation currently fits in the recent tail. Keep only the
+        # final turn verbatim and summarize everything before it; a single
+        # message is summarized whole (no verbatim tail).
+        if len(history) > 1:
+            older = history[:-1]
+            recent = history[-1:]
+        else:
+            older = history
+            recent = []
 
     # --- separate any existing "[Compacted earlier context]" summary ----------
     # A previous compact left a summary at the head. On a 2nd+ compact opencode
@@ -2907,10 +2951,12 @@ async def _compact_history(
 
     # Bound the head so the summarize call itself fits the window (opencode
     # refuses to compact when the prompt wouldn't fit; we trim oldest instead).
-    max_head_tokens = max(1024, _usable_tokens(ctx, max_output) - tail_budget - 512)
+    max_head_tokens = max(1024, _usable_tokens(ctx, max_output, reserved) - tail_budget - 512)
     while _estimate_tokens(head_text) > max_head_tokens and len(older_turns_text) > 1:
         older_turns_text.pop(0)
         head_text = "\n\n".join(older_turns_text)
+
+    _exc: list[str] = []
 
     async def _summarize(m: Any) -> str:
         from llm import llm_complete
@@ -2933,10 +2979,17 @@ async def _compact_history(
                 "<conversation> tags above so another coding agent can continue the work.\n\n"
                 + _SUMMARY_TEMPLATE
             )
-        summary = await llm_complete(
-            m, system=_COMPACTION_SYSTEM_PROMPT, user=user_prompt
-        )
-        return (summary or "").strip()
+        try:
+            summary = await llm_complete(
+                m, system=_COMPACTION_SYSTEM_PROMPT, user=user_prompt
+            )
+        except Exception as exc:  # noqa: BLE001
+            _exc.append(f"summarizer error: {str(exc) or repr(exc)}")
+            return ""
+        summary = (summary or "").strip()
+        if not summary:
+            _exc.append("summarizer returned an empty summary")
+        return summary
 
     summary = ""
     try:
@@ -2957,6 +3010,12 @@ async def _compact_history(
             if summary:
                 break
     if not summary:
+        if last_error is not None and _exc:
+            # Surface the real failure reason (e.g. an auth/timeout/empty-output
+            # error from the summarizer) so the manual /compact path can tell the
+            # user *why* it failed instead of a generic "empty summary". Auto-
+            # compact ignores this (passes None) and keeps its no-op fallback.
+            last_error.extend(_exc)
         return None  # compact failed — do NOT drop messages; caller surfaces a retry
 
     # opencode stores a single merged summary; we keep our "[Compacted earlier
@@ -3284,6 +3343,7 @@ async def run_agent(
     images: list[str] | None = None,
     system_prompt: str = "",
     thinking_level: str = "medium",
+    model_reasoning: bool = False,
     context_window: int = 0,
     env_var: str = "",
     oauth_token: str = "",
@@ -3302,7 +3362,7 @@ async def run_agent(
     retrieval_config: dict | None = None,
     subagent_models: dict | None = None,
     chat_id: str = "",
-    compact_threshold: float | None = None,
+    reserved: int | None = None,
     providers: dict | None = None,
 ) -> AsyncIterator[dict]:
     """Run the agent via the LangGraph workflow and yield SSE events.
@@ -3334,6 +3394,7 @@ async def run_agent(
         "images": _to_list(images),
         "system_prompt": system_prompt,
         "thinking_level": thinking_level,
+        "model_reasoning": model_reasoning,
         "context_window": int(context_window or 0),
         "env_var": env_var,
         "oauth_token": oauth_token,
@@ -3352,7 +3413,7 @@ async def run_agent(
         "retrieval_config": retrieval_config,
         "subagent_models": dict(subagent_models or {}),
         "chat_id": chat_id,
-        "compact_threshold": compact_threshold,
+        "reserved": reserved,
         "providers": providers or {},
     }
     async for event in run_graph(initial):

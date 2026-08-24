@@ -467,8 +467,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
   const memorySlidingTtl = useStore((s) => s.memorySlidingTtl)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
-  const compactThreshold = useStore((s) => s.settings.compactThreshold ?? 80)
-  const setCompactThreshold = useStore((s) => s.setCompactThreshold)
+  const compactHeadroom = useStore((s) => s.settings.compactHeadroom ?? 20000)
+  const setCompactHeadroom = useStore((s) => s.setCompactHeadroom)
   const root = useStore((s) => s.root)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
@@ -2238,28 +2238,29 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <>
             <div className="field">
               <div className="field-head">
-                <label>Auto-compact threshold</label>
+                <label>Compaction headroom (tokens)</label>
               </div>
               <div className="hint">
-                When real context usage (input + output tokens) crosses this percentage of
-                the model's window, the conversation is compacted automatically before it
-                overflows. Lower = compact sooner (keeps the window roomier); higher =
-                compact later (keeps more recent turns in full).
+                Tokens reserved below the model's context window before auto-compaction
+                fires (opencode's <code>reserved</code>/<code>COMPACTION_BUFFER</code>).
+                The conversation is summarized once it reaches <code>window − headroom</code>.
+                Lower = compact sooner (roomier window); higher = compact later (more
+                recent turns kept in full). 0 means compaction only at the hard limit.
               </div>
               <div className="font-size-row">
-                <span className="font-size-label">50%</span>
+                <span className="font-size-label">0</span>
                 <input
                   type="range"
-                  min={50}
-                  max={95}
-                  step={5}
-                  value={compactThreshold}
-                  onChange={(e) => setCompactThreshold(Number(e.target.value))}
+                  min={0}
+                  max={64000}
+                  step={1000}
+                  value={compactHeadroom}
+                  onChange={(e) => setCompactHeadroom(Number(e.target.value))}
                 />
-                <span className="font-size-label">95%</span>
-                <span className="font-size-value">{compactThreshold}%</span>
+                <span className="font-size-label">64k</span>
+                <span className="font-size-value">{compactHeadroom.toLocaleString()}</span>
               </div>
-              <div className="hint">Applies on the next message. Default: 80%.</div>
+              <div className="hint">Applies on the next message. Default: 20,000 tokens.</div>
             </div>
         </>
         )}

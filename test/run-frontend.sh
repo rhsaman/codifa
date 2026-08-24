@@ -73,7 +73,7 @@ npx esbuild test/usageContext.test.ts --bundle --platform=node --format=esm \
 node test/.tmp-uc.mjs
 
 echo ""
-echo "── تست ۱۳: contextUsed (نوار بالا: max(provider input+cache, تخمین کل مکالمه) — تجمعی مثل opencode) ──"
+echo "── تست ۱۳: contextUsed (نوار بالا: مجموع توکنِ آخرین پیام دستیار = input+output+cache، مثل overflow.ts در opencode) ──"
 npx esbuild test/contextUsed.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-cu.mjs >/dev/null 2>&1
 node test/.tmp-cu.mjs
@@ -93,6 +93,10 @@ echo "── تست ۱۶: skills cache (رفرش لیست پس از ذخیره/�
 npx esbuild test/skillsCache.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-skillsCache.mjs >/dev/null 2>&1
 node test/.tmp-skillsCache.mjs
+
+echo ""
+echo "── تست ۱۷: thinking (شناسایی مدل‌های reasoning مثل hy3-free برای فعال‌سازی قرص و reasoning_effort) ──"
+node test/thinking.test.ts
 
 rm -f test/.tmp-fork.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs
 echo ""

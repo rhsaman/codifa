@@ -157,10 +157,10 @@ export interface Settings {
    *  Each key maps to a model from the active provider, or empty = use the
    *  parent model. */
   subagentModels?: Record<string, string>
-  /** Pre-emptive auto-compact threshold as a PERCENTAGE of the context window
-   *  (50–95, default 80). When real usage (input + output) crosses this, the
-   *  backend compacts before the window overflows. */
-  compactThreshold?: number
+  /** Compaction headroom (tokens) reserved below the context window — opencode's
+   *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`
+   *  (opencode's `usable`). Default 20_000. */
+  compactHeadroom?: number
   /** Memory TTL / cache config — configurable from Settings → Memory. */
   memory?: {
     /** TASK memory lifetime in hours (default 6). */
@@ -458,4 +458,8 @@ export interface SidecarEvent {
    *  tool fell back to the MAIN model — the UI renders a distinct
    *  'sub-agent failed — using main model' banner instead of a spinner. */
   fallback?: boolean
+  /** Thinking signal: true when the model starts reasoning, false when it
+   *  stops. The backend emits this instead of streaming raw thinking text
+   *  (which slowed the UI); the frontend uses it to glow the composer. */
+  active?: boolean
 }

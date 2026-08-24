@@ -1196,6 +1196,16 @@ async def list_models(
                         m["pricing"] = _models_dev_pricing(catalog, dev_keys, dev_id)
                     if m.get("reasoning") is None:
                         m["reasoning"] = _models_dev_reasoning(catalog, dev_keys, dev_id)
+                    # Cloud gateways flagged `auto_think` (OpenRouter, opencode,
+                    # NVIDIA, Cloudflare, TokenRouter) support steering a reasoning
+                    # effort regardless of the model id — the gateway negotiates it
+                    # with the upstream model. When neither the /models payload nor
+                    # the models.dev catalog says otherwise, treat them as
+                    # reasoning-capable instead of falling back to a name heuristic
+                    # (which would miss ids like "hy3-free" that carry no
+                    # "reason/think" token). No model names are hardcoded here.
+                    if m.get("reasoning") is None and _provider_meta(provider).get("auto_think"):
+                        m["reasoning"] = True
                 if _provider_meta(provider).get("model_class") == "google":
                     # Google's own REST catalog is the authoritative source for
                     # context (inputTokenLimit) / output (outputTokenLimit) —

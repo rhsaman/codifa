@@ -48,6 +48,7 @@ from pydantic import BaseModel, model_validator
 
 import providers
 from agents import (
+    _compact_history,
     _drain_steer,
     _enqueue_steer,
     _is_read_timeout,
@@ -55,6 +56,7 @@ from agents import (
     normalize_mode,
     run_agent,
 )
+from llm import build_chat_model
 
 
 def wants_skill_or_mcp(text: str) -> bool:
@@ -139,6 +141,12 @@ class ChatRequest(BaseModel):
     images: list = []
     system_prompt: str = ""
     thinking_level: str = "medium"
+    # Whether the selected model is reasoning-capable (from the /models
+    # `reasoning` flag). The backend uses this to emit a lightweight composer
+    # glow signal while the model reasons, instead of streaming raw thinking
+    # text. No model names are inferred here — the flag comes straight from the
+    # provider payload / models.dev catalog.
+    model_reasoning: bool = False
     mcp_servers: dict = {}
     # Names of skills the user explicitly attached this turn (via @mention).
     # These are the only skills inlined in full; when empty, no skill body is
@@ -182,10 +190,35 @@ class ChatRequest(BaseModel):
     # "providerId/model" subagent entry can be run on that provider's own base
     # URL / key (not the parent provider's).
     providers: dict = {}
-    # Pre-emptive auto-compact threshold as a fraction of the context window
-    # (0.5–0.95). When real usage (input + output) crosses this, the run
-    # compacts before the window overflows. Default 0.80.
-    compact_threshold: float = 0.8
+    # Compaction headroom (tokens) reserved below the context window — opencode's
+    # `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires when the conversation
+    # reaches `ctx - reserved` (opencode's `usable`). Default 20_000.
+    reserved: int = 20_000
+
+
+class CompactRequest(BaseModel):
+    """Manual ``/compact`` — runs opencode's compaction (structured summary,
+    token-budgeted tail, prior-summary merge) on the supplied history."""
+
+    # Primary summarizer (the user's configured compact subagent if any).
+    provider: str = "custom"
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    env_var: str = ""
+    oauth_token: str = ""
+    # Fallback summarizer (the active chat model) — mirrors opencode's
+    # subagent -> main-model retry when the compact subagent is unavailable.
+    fallback_provider: str = ""
+    fallback_model: str = ""
+    fallback_base_url: str = ""
+    fallback_api_key: str = ""
+    fallback_env_var: str = ""
+    fallback_oauth_token: str = ""
+    # Conversation history to compact, as plain {role, content} turns.
+    history: list[dict] = []
+    context_window: int = 0
+    reserved: int = 2000
 
 
 class ModelsRequest(BaseModel):
@@ -849,6 +882,91 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     return text[:2000]
 
 
+@app.post("/chat/compact")
+async def chat_compact(req: CompactRequest):
+    """Manual ``/compact`` — opencode-style compaction of the supplied history.
+
+    Returns ``{"summary": <text>, "keep": <n>}`` on success, or
+    ``{"summary": null, "error": <reason>}`` when there is nothing to compact or
+    the summarizer failed (the frontend then surfaces the reason as a retry).
+    """
+    import sys
+
+    def _log(msg: str) -> None:
+        print(f"[compact] {msg}", file=sys.stderr, flush=True)
+
+    _log(
+        f"request: provider={req.provider!r} model={req.model!r} "
+        f"fallback={req.fallback_provider!r}/{req.fallback_model!r} "
+        f"history={len(req.history or [])} ctx={req.context_window} reserved={req.reserved}"
+    )
+    if not req.history:
+        _log("empty history -> nothing to do")
+        return {"summary": None, "keep": 0, "error": "no messages to compact"}
+
+    def _build(provider: str, model: str, base_url: str, api_key: str, env_var: str, oauth: str):
+        if not model:
+            return None
+        try:
+            return build_chat_model(
+                provider,
+                model,
+                base_url,
+                api_key,
+                env_var,
+                oauth,
+                temperature=0.0,
+                thinking_level="off",
+                max_tokens=8192,
+                # Bounded so a slow/unreachable provider fails fast with a clear
+                # error instead of hanging until the client disconnects.
+                timeout=50,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}")
+            return None
+
+    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.oauth_token)
+    if model is None:
+        _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})")
+        return {"summary": None, "keep": 0, "error": "invalid primary model"}
+    fallback = _build(
+        req.fallback_provider, req.fallback_model, req.fallback_base_url,
+        req.fallback_api_key, req.fallback_env_var, req.fallback_oauth_token,
+    )
+    _log(f"primary built={bool(model)} fallback built={bool(fallback)}; running _compact_history")
+    ctx = int(req.context_window or 0)
+    last_error: list[str] = []
+    try:
+        result = await _compact_history(
+            model,
+            list(req.history),
+            ctx=ctx,
+            reserved=req.reserved,
+            fallback_model=fallback,
+            last_error=last_error,
+            force=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"_compact_history raised: {exc!r}")
+        return {"summary": None, "keep": 0, "error": str(exc)}
+    if result is None:
+        if last_error:
+            _log(f"failed: {last_error[-1]}")
+            return {"summary": None, "keep": 0, "error": last_error[-1]}
+        _log("nothing to compact (history too short / head already summarized)")
+        return {"summary": None, "keep": 0, "error": "nothing to compact"}
+    new_history, keep = result
+    summary = new_history[0]["content"] if new_history else ""
+    if not summary:
+        _log("empty summary after success")
+        return {"summary": None, "keep": 0, "error": "empty summary"}
+    _log(f"success: keep={keep} summary_len={len(summary)}")
+    return {"summary": summary, "keep": int(keep)}
+    log.warning("[compact] success: keep=%s summary_len=%d", keep, len(summary))
+    return {"summary": summary, "keep": int(keep)}
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     if not req.root or not os.path.isdir(req.root):
@@ -886,6 +1004,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 images=req.images,
                 system_prompt=req.system_prompt,
                 thinking_level=req.thinking_level,
+                model_reasoning=req.model_reasoning,
                 mcp_servers=req.mcp_servers,
                 skills=req.skills,
                 context_window=req.context_window,
@@ -902,7 +1021,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 retrieval_config=req.retrieval_config,
                 subagent_models=req.subagent_models,
                 chat_id=req.chat_id,
-                compact_threshold=req.compact_threshold,
+                reserved=req.reserved,
                 providers=req.providers,
             ):
                 yield _sse(event)

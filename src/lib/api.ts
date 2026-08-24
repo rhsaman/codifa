@@ -199,6 +199,12 @@ export interface StreamParams {
   images?: Array<string | { path: string; dataUrl?: string }>
   systemPrompt?: string
   thinkingLevel?: string
+  /** Whether the selected model is reasoning-capable (from the /models
+   *  `reasoning` flag). The backend uses this to emit a lightweight composer
+   *  glow signal while the model reasons, instead of streaming raw thinking
+   *  text. No model names are inferred here — the flag comes straight from the
+   *  provider payload / models.dev catalog. */
+  modelReasoning?: boolean
   mcpServers?: Record<string, McpServerConfig>
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
@@ -221,9 +227,9 @@ export interface StreamParams {
   /** Full provider configs keyed by provider id, so a "providerId/model"
    *  subagent entry is routed to that provider's own base URL / key. */
   providers?: Record<string, ProviderConfig>
-  /** Pre-emptive auto-compact threshold as a FRACTION of the context window
-   *  (0.5–0.95, default 0.8). */
-  compactThreshold?: number
+  /** Compaction headroom (tokens) reserved below the context window — opencode's
+   *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`. */
+  reserved?: number
   signal?: AbortSignal
 }
 
@@ -258,6 +264,7 @@ export async function streamChat(
       images: params.images ?? [],
       system_prompt: params.systemPrompt ?? '',
       thinking_level: params.thinkingLevel ?? '',
+      model_reasoning: params.modelReasoning ?? false,
       mcp_servers: params.mcpServers ?? {},
       skills: params.skills ?? [],
       allow_create: params.allowCreate ?? false,
@@ -269,7 +276,7 @@ export async function streamChat(
       vector_config: params.vectorConfig ?? null,
       subagent_models: params.subagentModels ?? {},
       providers: params.providers ?? {},
-      compact_threshold: params.compactThreshold ?? 0.8,
+      reserved: params.reserved ?? 20000,
       context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
     }),
   })
@@ -322,6 +329,64 @@ export async function streamChat(
   } finally {
     reader.releaseLock()
   }
+}
+
+/** A provider config used to drive compaction (primary summarizer + fallback). */
+export interface CompactProvider {
+  kind: string
+  model: string
+  baseUrl: string
+  apiKey: string
+  envVar?: string
+  oauthToken?: string
+}
+
+export interface CompactResult {
+  summary: string | null
+  keep: number
+  error?: string
+}
+
+/** Manual ``/compact`` — runs opencode-style compaction on the backend and
+ *  returns the structured summary plus the number of recent turns to keep
+ *  verbatim (opencode's token-budgeted tail). */
+export async function triggerCompact(params: {
+  provider: CompactProvider
+  fallback: CompactProvider
+  history: Array<{ role: string; content: string }>
+  contextWindow?: number
+  reserved?: number
+  signal?: AbortSignal
+}): Promise<CompactResult> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const res = await fetch(`${url}/chat/compact`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: params.signal,
+    body: JSON.stringify({
+      provider: params.provider.kind,
+      model: params.provider.model,
+      base_url: params.provider.baseUrl,
+      api_key: params.provider.apiKey,
+      env_var: params.provider.envVar ?? '',
+      oauth_token: params.provider.oauthToken ?? '',
+      fallback_provider: params.fallback.kind,
+      fallback_model: params.fallback.model,
+      fallback_base_url: params.fallback.baseUrl,
+      fallback_api_key: params.fallback.apiKey,
+      fallback_env_var: params.fallback.envVar ?? '',
+      fallback_oauth_token: params.fallback.oauthToken ?? '',
+      history: params.history,
+      context_window: params.contextWindow ?? 0,
+      reserved: params.reserved ?? 20000,
+    }),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { detail?: string }
+    throw new Error(body.detail || `compact request failed (${res.status})`)
+  }
+  return (await res.json()) as CompactResult
 }
 
 /** Deliver a message to a RUNNING agent for this chat (no abort, injected at

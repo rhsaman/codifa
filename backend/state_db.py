@@ -281,7 +281,7 @@ _DEFAULT_SETTINGS_KEYS = frozenset(
         "mcpServers",
         "mcpEnabled",
         "modes",
-        "compactThreshold",
+        "compactHeadroom",
         "root",
         "dir",
         "recentModels",

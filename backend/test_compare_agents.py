@@ -117,7 +117,7 @@ async def run_our_agent(
             retrieval_config=None,
             subagent_models=None,
             chat_id="test-compare",
-            compact_threshold=None,
+            reserved=None,
         ):
             # Collect usage events
             if event.get("kind") == "usage":

@@ -26,6 +26,7 @@ graph or the tools.
 from __future__ import annotations
 
 import asyncio
+import httpx
 from typing import Any
 
 from providers import (
@@ -127,6 +128,10 @@ def build_chat_model(
     model_class = meta.get("model_class") or "openai"
     headers = _extra_headers(provider, base_url, False)
     to = model_timeout(provider=provider, total=timeout or 300)
+    # LangChain's ChatOpenAI only accepts a SCALAR `timeout` (total seconds);
+    # passing an `httpx.Timeout` object is silently ignored, leaving the request
+    # with no timeout (it hangs until the client gives up). Use the scalar total.
+    lc_timeout = timeout or 300
     tkwargs = _thinking_kwargs(provider, model, thinking_level)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
     if meta.get("parallel_calls"):
@@ -165,7 +170,7 @@ def build_chat_model(
         temperature=temperature,
         max_tokens=max_tokens or None,
         streaming=True,
-        timeout=to if isinstance(to, (int, float)) else None,
+        timeout=lc_timeout,
         model_kwargs=tkwargs,
         default_headers=headers or None,
     )

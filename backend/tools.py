@@ -1710,21 +1710,22 @@ _PLAN_NEW_FILE_MARKERS = ("new file", "create", "new:", "add a new", "to be crea
 _CITATION_RE = re.compile(r"(?<![\w/.])([\w][\w./\-]+\.[A-Za-z0-9]{1,8}):(\d+)")
 
 
-def _self_check_plan_paths(root: str, content: str) -> str:
+def _self_check_plan_paths(root: str, content: str) -> tuple[str, str]:
     """Flag backtick-quoted file paths in a plan that don't exist on disk and
     aren't described nearby as a new file.
 
     Deliberately conservative (only backtick-quoted, extension-bearing paths;
     skips anything near a "new file"-style marker) so it flags likely mistakes
-    without nagging on every intentionally-new file. Returns a short warning
-    suffix, or ``""`` when nothing looks wrong (never raises).
+    without nagging on every intentionally-new file. Returns ``(content, note)``:
+    ``content`` is the (possibly auto-corrected) plan text and ``note`` is a short
+    warning suffix, or ``""`` when nothing looks wrong (never raises).
     """
     try:
         candidates = {m.group(1) for m in _PLAN_PATH_RE.finditer(content or "")}
     except Exception:  # noqa: BLE001
-        return ""
+        return content, ""
     if not candidates:
-        return ""
+        return content, ""
     missing: list[str] = []
     for rel in sorted(candidates):
         if rel.startswith(("http:", "https:")):
@@ -1740,15 +1741,32 @@ def _self_check_plan_paths(root: str, content: str) -> str:
         if any(marker in window for marker in _PLAN_NEW_FILE_MARKERS):
             continue
         missing.append(rel)
+
+    # Auto-correct: if exactly one file with the same basename exists in the
+    # workspace (excluding node_modules / hidden dirs), fix the path in-place
+    # instead of nagging. Genuinely-new files stay flagged.
+    for rel in list(missing):
+        base = os.path.basename(rel)
+        hits: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != "node_modules" and not d.startswith(".")]
+            if base in filenames:
+                hits.append(os.path.relpath(os.path.join(dirpath, base), root))
+        if len(hits) == 1:
+            correct = hits[0].replace(os.sep, "/")
+            content = content.replace(f"`{rel}`", f"`{correct}`")
+            missing.remove(rel)
+
     if not missing:
-        return ""
+        return content, ""
     preview = ", ".join(missing[:6])
     more = f" (+{len(missing) - 6} more)" if len(missing) > 6 else ""
-    return (
+    note = (
         f"\n\n⚠️ SELF-CHECK: {len(missing)} path(s) in the plan don't exist in the workspace and "
         f"weren't marked as new: {preview}{more}. Before finishing, confirm these are correct — either "
         "they're typos/wrong paths (fix them) or genuinely new files (say so explicitly in the plan)."
     )
+    return content, note
 
 
 def _search_python(

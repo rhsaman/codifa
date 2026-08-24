@@ -67,6 +67,30 @@ def _reset_mock(request):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_retry(monkeypatch):
+    """Disable the OpenAI client's automatic retries so fatal HTTP errors
+    (e.g. 500) surface immediately instead of being silently retried and
+    masked. Application-level retries (429 throttle handling in the graph) are
+    unaffected."""
+    try:
+        from openai import AsyncOpenAI, OpenAI
+    except Exception:
+        return
+
+    def _patch(cls):
+        orig = cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            kwargs["max_retries"] = 0
+            return orig(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "__init__", __init__)
+
+    _patch(AsyncOpenAI)
+    _patch(OpenAI)
+
+
 @pytest.fixture
 def workspace(tmp_path):
     """A fresh workspace with one sample file, per test."""

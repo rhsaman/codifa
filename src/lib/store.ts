@@ -428,8 +428,8 @@ interface State {
   removeMcpServer: (name: string) => void
   setMcpEnabled: (name: string, on: boolean) => void
   setSystemPrompt: (mode: AgentMode, text: string) => void
-  /** Pre-emptive auto-compact threshold (percent of context window, 50–95). */
-  setCompactThreshold: (pct: number) => void
+  /** Compaction headroom (tokens) reserved below the context window. */
+  setCompactHeadroom: (tokens: number) => void
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
@@ -631,7 +631,7 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactThreshold: 80 },
+  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactHeadroom: 20000 },
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
@@ -773,12 +773,12 @@ export const useStore = create<State>((set, get) => ({
       mcpEnabled: Array.isArray(raw.mcpEnabled)
         ? raw.mcpEnabled.filter((n: string) => !!raw.mcpServers?.[n])
         : [],
-      compactThreshold:
-        typeof raw.compactThreshold === 'number' &&
-        raw.compactThreshold >= 50 &&
-        raw.compactThreshold <= 95
-          ? raw.compactThreshold
-          : 80,
+      compactHeadroom:
+        typeof raw.compactHeadroom === 'number' &&
+        raw.compactHeadroom >= 0 &&
+        raw.compactHeadroom <= 200_000
+          ? Math.round(raw.compactHeadroom)
+          : 20000,
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
@@ -1864,8 +1864,8 @@ export const useStore = create<State>((set, get) => ({
 
   anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
 
-  setCompactThreshold: (pct: number) => {
-    set((s) => ({ settings: { ...s.settings, compactThreshold: pct } }))
+  setCompactHeadroom: (tokens: number) => {
+    set((s) => ({ settings: { ...s.settings, compactHeadroom: tokens } }))
     get().persist()
   },
 

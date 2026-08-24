@@ -121,6 +121,19 @@ async def main():
         assert "<prior-summary>" in messages_blob, "merge prompt missing <prior-summary> tag"
         print("  OK: prior summary merged (not re-compressed)")
 
+        # 6. Manual /compact (force=True) on a SHORT history that fits entirely
+        #    in the recent tail still produces a summary — only auto-compact
+        #    bails when there is nothing to do.
+        mock.script = [text_reply("Short summary")]
+        mock.captured = []
+        compacted = await _compact_history(
+            compact_model, make_history(2), max_history=5, force=True
+        )
+        assert compacted is not None, "forced compact must summarize short history"
+        new_history, recent_n = compacted
+        assert "Short summary" in new_history[0]["content"], new_history[0]["content"]
+        print("  OK: forced compact summarizes a short history")
+
         print("COMPACT TESTS PASSED")
     finally:
         await stop_server(task)

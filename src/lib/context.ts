@@ -174,35 +174,33 @@ export function formatTokensK(n: number): string {
 
 export function contextPercent(used: number, windowSize: number | null): number | null {
   if (!windowSize || windowSize <= 0) return null
-  // No 100% cap — mirrors opencode's TUI meter, which reports the raw
-  // percentage even past the window (e.g. "105%") so an overflow is visible.
+  // No 100% cap — opencode's overflow check is a raw `count >= usable`, which
+  // can exceed the window, so an overflow stays visible. Report the raw %.
   return Math.round((used / windowSize) * 100)
 }
 
 /**
  * Resolve the context-meter token count shown in the sidebar.
  *
- * We take the LARGER of:
- *  - `realTotal`: the provider's reported `input + cache` tokens, taken as the
- *    MAX across EVERY assistant turn's `usage` event, and
- *  - `estimate`: our full-conversation estimate (system + settled history +
- *    live turn).
+ * Mirrors opencode's server-side accounting in
+ * `packages/opencode/src/session/overflow.ts` (`isOverflow`): the context size
+ * is the LATEST assistant turn's token total —
+ *   total || input + output + cache.read + cache.write
+ * i.e. output AND cache are INCLUDED, and ONLY the most recent request is
+ * used. Each new model call re-sends the entire history, so the latest turn's
+ * total already reflects the full current context (and is exactly what opencode
+ * compares against `usable()` to decide compaction). opencode's `dev` TUI has
+ * no separate percentage meter — this is the underlying accounting it relies
+ * on.
  *
- * Each model call re-sends the ENTIRE history, so the largest per-turn
- * input+cache is the true CURRENT context size — NOT the sum. We therefore
- * scan every assistant message and keep the max (no `break`). `chat.usage` is
- * a per-model SESSION total (the sum of every call's input tokens — it only
- * ever grows) and would massively over-count the context, so it is
- * intentionally NOT used here.
+ * We take the LAST assistant message that carries a `usage` event (the most
+ * recent completed request). `chat.usage` is a per-model SESSION total that
+ * only ever grows, so it must NOT be used here.
  *
- * opencode's proxy may window its reported `input_tokens` to a small slice, so
- * `realTotal` can UNDER-count the real conversation. Using the max keeps the
- * meter cumulative and growing — matching opencode's own TUI meter — while
- * still trusting the provider when it reports more than our estimate. When no
- * real usage has arrived yet (brand-new chat / right after a compact) the
- * estimate is the only signal, so it acts as a floor. Output tokens are
- * EXCLUDED from `realTotal` (they are generated after the prompt and are not
- * part of the context window).
+ * Before the first real usage event arrives (brand-new chat / right after a
+ * compact) there is no turn total, so we fall back to the full-conversation
+ * `estimate`. opencode has no estimate, but the sidebar meter still needs a
+ * value in that window.
  */
 export function computeContextUsed(
   chat: Chat | null,
@@ -214,24 +212,25 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // Scan EVERY assistant message and take the LARGEST input+cache across the
-  // whole conversation. Each model call re-sends the entire history, so the
-  // largest per-turn input+cache is the true (current) context size — NOT the
-  // sum. No `break`: we must scan every message. (chat.usage is a per-model
-  // SESSION total — the sum of every call's input tokens — so it is NOT the
-  // context size and must not be used here; it only ever grows and would
-  // massively over-count.)
+  // Latest assistant turn's token total — matches opencode's `tokens.total`.
   let realTotal = 0
   for (let i = active.length - 1; i >= 0; i--) {
     const m = active[i]
     const u = m.usage
-    if (m.role === 'assistant' && u && u.outputTokens > 0) {
-      const cached = (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
-      realTotal = Math.max(realTotal, (u.inputTokens || 0) + cached)
-    }
+    if (m.role !== 'assistant' || !u) continue
+    const has = u.totalTokens != null || u.inputTokens != null || u.outputTokens != null
+    if (!has) continue
+    realTotal =
+      (u.totalTokens ?? 0) ||
+      (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
+    break
   }
-  const estimate = estimateContextTokens(chat, systemPrompt, maxHistory, contextWindow, mode)
-  return Math.max(realTotal, estimate)
+
+  // No real usage yet → fall back to the estimate (see note above).
+  if (realTotal <= 0) {
+    realTotal = estimateContextTokens(chat, systemPrompt, maxHistory, contextWindow, mode)
+  }
+  return realTotal
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying

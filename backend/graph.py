@@ -102,6 +102,9 @@ class AgentState(TypedDict, total=False):
     oauth_token: str
     context_window: int
     thinking_level: str
+    # Whether the selected model is reasoning-capable (from the /models
+    # `reasoning` flag). Drives the lightweight composer glow signal.
+    model_reasoning: bool
     system_prompt: str
     root: str
     chat_id: str
@@ -120,7 +123,7 @@ class AgentState(TypedDict, total=False):
     retrieval_config: dict
     subagent_models: dict
     providers: dict
-    compact_threshold: float | None
+    reserved: int | None
     # Workflow scratch state
     web_search_results: list
     fetched_content: list
@@ -145,7 +148,6 @@ class AgentState(TypedDict, total=False):
     explore_tree: str
     explore_answer: str
     plan_attempts: int
-    plan_valid: bool
     # Internal transport (NOT serialised by the graph runner; in-memory only)
     _queue: Any
 
@@ -215,27 +217,6 @@ def classify_mode(prompt: str, fallback: str = "ask") -> str:
     return "ask"
 
 
-# Phrases that mean the user EXPLICITLY asked the agent to search the web. Web
-# tools (web_search / fetch_url / search_console) are only exposed to the model
-# when this is true — the agent must never web-search on its own initiative.
-_WEB_REQUEST_RE = re.compile(
-    r"\b(search the web|web search|search online|look up online|google it|"
-    r"browse the web|search google|find on the web|web results?|"
-    r"search for (it|that) online)\b"
-    r"|جستجو\s*(در|توی|کن)?\s*وب|از وب|گوگل\s*کن|سرچ\s*(وب|کن)|بگرد\s*(توی|در)?\s*وب",
-    re.I,
-)
-
-
-def is_explicit_web_request(prompt: str) -> bool:
-    """True only when the user clearly asked to web-search (e.g. "search the web
-    for X", a ``/web`` command, or the Persian equivalents)."""
-    text = (prompt or "").strip().lower()
-    if text.startswith("/web") and (len(text) == 4 or text[4] in " \n\t"):
-        return True
-    return bool(_WEB_REQUEST_RE.search(prompt or ""))
-
-
 # ---------------------------------------------------------------------------
 # Per-mode tool filtering (faithful port of agents.py's data-driven gating)
 # ---------------------------------------------------------------------------
@@ -250,7 +231,6 @@ def filter_tools_for_mode(
     allow_outside: bool,  # noqa: ARG001 - reserved for parity with agents.py
     prompt: str = "",
     root: str = "",
-    explicit_web: bool = False,
 ) -> dict[str, Callable]:
     """Return the mode-appropriate subset of ``tools``.
 
@@ -291,12 +271,13 @@ def filter_tools_for_mode(
         if "run_terminal" in tools:
             tools["run_terminal"] = _agents._wrap_no_search_bypass(tools["run_terminal"])
 
-    # Web tools (web_search / fetch_url / search_console) are only exposed when
-    # the user EXPLICITLY asks to search the web AND the web capability is
-    # granted. This is enforced unconditionally (outside the `has_cap` block) so
-    # the agent never web-searches on its own initiative, even when no capability
-    # map is supplied.
-    if not (cap.get("web", False) if cap else False) or not explicit_web:
+    # Web tools (web_search / fetch_url / search_console) are exposed to the
+    # model whenever the web capability is not explicitly denied. The agent may
+    # use them on its own initiative when it judges a web lookup is needed. They
+    # are only stripped when ``cap["web"]`` is explicitly ``False`` (e.g. a
+    # capability map that denies web access). When no capability map is supplied
+    # (the common case), web tools stay available.
+    if cap.get("web", True) is False:
         tools = {n: fn for n, fn in tools.items() if n not in _WEB}
 
     # Repo search tools (grep/glob/read/task) are now available to the Main
@@ -311,9 +292,6 @@ def filter_tools_for_mode(
     if mode == "ask" and _agents._trivial_prompt(prompt):
         for n in (
             "update_plan",
-            "web_search",
-            "fetch_url",
-            "search_console",
             "memory",
             "search_memory",
             "ask_user",
@@ -359,6 +337,7 @@ def resolve_subagent_model(
     parent_model_name: str = "",
     default_to_parent: bool = True,
     provider_lookup: Any = None,
+    timeout: float | None = None,
 ) -> Any:
     """Resolve a single sub-agent slot entry to a LangChain model.
 
@@ -378,14 +357,14 @@ def resolve_subagent_model(
     if entry is None:
         return build_chat_model(
             provider, parent_model_name, base_url, api_key, env_var,
-            oauth_token, temperature=0.2,
+            oauth_token, temperature=0.2, timeout=timeout,
         ) if (default_to_parent and parent_model_name) else None
     if isinstance(entry, str):
         entry = entry.strip()
         if not entry:
             return build_chat_model(
                 provider, parent_model_name, base_url, api_key, env_var,
-                oauth_token, temperature=0.2,
+                oauth_token, temperature=0.2, timeout=timeout,
             ) if (default_to_parent and parent_model_name) else None
         if entry.lower() in ("main model", "main_model", "main"):
             entry = parent_model_name or entry
@@ -398,7 +377,7 @@ def resolve_subagent_model(
     kind, model, burl, akey, env, oauth = target
     if not model:
         return None
-    return build_chat_model(kind, model, burl, akey, env, oauth, temperature=0.2)
+    return build_chat_model(kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout)
 
 
 async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
@@ -583,6 +562,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["provider"], subagent_models.get("compact"), state["base_url"],
         state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
         provider_lookup=_provider_lookup,
+        # Bounded so an auto-compact summarizer fails fast (and is skipped)
+        # instead of hanging the turn when the provider is slow/unreachable.
+        timeout=50,
     )
     vision_model = resolve_subagent_model(
         state["provider"], subagent_models.get("vision"), state["base_url"],
@@ -616,7 +598,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     filtered = filter_tools_for_mode(
         mode, tools, cap, scoped_paths, allow_create, allow_outside,
         prompt=prompt, root=root,
-        explicit_web=is_explicit_web_request(prompt),
     )
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
@@ -675,6 +656,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     base_prompt = (
         _agents.SYSTEM_PROMPTS.get(mode, _agents.SYSTEM_PROMPTS["ask"])
         + _agents._UNIVERSAL_RULES
+        + (_agents._LENGTH_RULE if mode in ("plan", "coder") else "")
+        + (_agents._TEST_DIR_RULE if mode in ("plan", "coder") else "")
     )
     system_final = (
         _agents._mode_declare(mode)
@@ -1112,6 +1095,81 @@ async def _compact_tool_history(
     return True
 
 
+def _messages_to_dicts(msgs: list) -> list[dict]:
+    """Serialize LangChain messages back to the plain ``{role, content}`` dicts
+    the compaction algorithm (and the frontend) expect."""
+    out: list[dict] = []
+    for m in msgs or []:
+        if isinstance(m, SystemMessage):
+            role = "system"
+        elif isinstance(m, HumanMessage):
+            role = "user"
+        elif isinstance(m, AIMessage):
+            role = "assistant"
+        elif isinstance(m, ToolMessage):
+            role = "tool"
+        else:
+            continue
+        content = getattr(m, "content", "")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            content = "".join(parts)
+        out.append({"role": role, "content": str(content or "")})
+    return out
+
+
+async def _maybe_auto_compact(
+    state: AgentState,
+    queue: asyncio.Queue,
+    model: Any,
+    compact_model: Any,
+    msgs: list,
+    ctx: int,
+) -> None:
+    """opencode `isOverflow` -> auto-compaction.
+
+    Once the assembled transcript reaches the usable window (``ctx - reserved``),
+    summarize the older turns — keeping a recent tail verbatim — and emit the
+    ``compact_start`` / ``compact`` / ``compact_failed`` events the frontend
+    already folds on. The summarizer is the configured compact subagent, falling
+    back to the main model (mirrors opencode's compaction agent + retry).
+    """
+    if ctx <= 0:
+        return
+    max_output = _agents._model_max_output(model)
+    reserved = state.get("reserved")
+    usable = _agents._usable_tokens(ctx, max_output, reserved)
+    dicts = _messages_to_dicts(msgs)
+    total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    if total < usable:
+        return
+    summarizer = compact_model or model
+    queue.put_nowait({"kind": "compact_start"})
+    try:
+        result = await _agents._compact_history(
+            summarizer,
+            dicts,
+            max_history=state.get("max_history", 10),
+            ctx=ctx,
+            max_output=max_output,
+            reserved=reserved,
+            fallback_model=model,
+        )
+    except Exception:  # noqa: BLE001
+        result = None
+    if result is None:
+        queue.put_nowait({"kind": "compact_failed"})
+        return
+    new_history, keep = result
+    summary = new_history[0]["content"] if new_history else ""
+    queue.put_nowait({"kind": "compact", "content": summary, "keep": int(keep)})
+
+
 async def _run_mode_turn(
     state: AgentState,
     mode: str,
@@ -1199,6 +1257,18 @@ async def _run_mode_turn(
                 bound = model.bind_tools(lc_tools)
                 ai: Any = None
                 _astream_count_local = 0
+                _thinking_active = False
+                # The model is reasoning-capable (flag from the /models payload /
+                # models.dev catalog, forwarded by the frontend). We emit a single
+                # lightweight "active" toggle at the START of the stream so the
+                # composer shows a glow for the whole reasoning window — without
+                # streaming the raw chain-of-thought text (which caused heavy
+                # re-renders and slowed the UI). Models that don't reason yield
+                # nothing here.
+                _model_reasoning = bool(state.get("model_reasoning"))
+                if _model_reasoning and not _thinking_active:
+                    _thinking_active = True
+                    queue.put_nowait({"kind": "thinking", "active": True})
                 async for chunk in bound.astream(msgs):
                     _astream_count_local += 1
                     ai = chunk if ai is None else ai + chunk
@@ -1209,15 +1279,11 @@ async def _run_mode_turn(
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "text":
                                 queue.put_nowait({"kind": "text", "content": part["text"]})
-                    # Reasoning/thinking tokens (separate from the visible
-                    # answer) — streamed so the frontend can pin a live
-                    # "thinking" card at the top of the chat while the model
-                    # reasons. Models that don't emit thinking yield "" here.
-                    thinking = _thinking_from_chunk(chunk)
-                    if thinking:
-                        queue.put_nowait({"kind": "thinking", "content": thinking})
                 if ai is None:
                     break
+                if _thinking_active:
+                    _thinking_active = False
+                    queue.put_nowait({"kind": "thinking", "active": False})
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
@@ -1317,6 +1383,13 @@ async def _run_mode_turn(
                 {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
             )
             break
+    # opencode-style proactive auto-compaction: once the conversation reaches the
+    # usable window, summarize the older turns and tell the frontend to fold.
+    if reply and ctx and ctx > 0:
+        try:
+            await _maybe_auto_compact(state, queue, model, compact_model, messages, ctx)
+        except Exception:  # noqa: BLE001
+            pass
     return reply
 
 
@@ -1884,7 +1957,7 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     # Capture ask_user answers so a clarifying reply can re-trigger planning
     # (e.g. the planner asked "where is the current frontend?" and the user
     # answered). Kept in a module dict keyed by chat_id and consumed by
-    # _route_plan_validate.
+    # _route_plan_build.
     base_ask = tools.get("ask_user")
     if base_ask is not None:
         cid = state.get("chat_id", "")
@@ -2058,7 +2131,7 @@ def _is_excluded_root_md(path: str, root: str) -> bool:
 
 # Captured ask_user answers, keyed by chat_id, so the search pipeline can
 # re-derive against a freshly-answered clarifying question (see repo_derive +
-# _route_plan_validate). Cleared by run_graph at the start of each run.
+# _route_plan_build). Cleared by run_graph at the start of each run.
 _ASK_ANSWERS: dict[str, str] = {}
 
 
@@ -2623,8 +2696,8 @@ async def plan_build(state: AgentState) -> dict:
             from tools import slugify, _self_check_plan_paths
 
             ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
+            reply, check_note = _self_check_plan_paths(state["root"], reply)
             state_db.save_plan(ws, "plan", reply, chat_id=state.get("chat_id", ""))
-            check_note = _self_check_plan_paths(state["root"], reply)
             if check_note:
                 queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
     except Exception:  # noqa: BLE001
@@ -2632,19 +2705,11 @@ async def plan_build(state: AgentState) -> dict:
     return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}
 
 
-async def plan_validate(state: AgentState) -> dict:
-    queue = state["_queue"]
-    plan = state.get("plan", "")
-    valid = plan.strip().startswith("## Plan") and "Files:" in plan
-    queue.put_nowait({"kind": "plan_validate", "valid": valid})
-    return {"plan_valid": valid}
-
-
-def _route_plan_validate(state: AgentState) -> str:
+def _route_plan_build(state: AgentState) -> str:
     # After the planner asked a clarifying question and the user answered, the
     # answer was captured into _ASK_ANSWERS. Re-run the planner against the new
-    # info instead of looping on an empty/bad plan. Bounded by plan_attempts so
-    # a run of unhelpful answers can't loop forever (Part A).
+    # info so the plan gets UPDATED instead of looping on an empty/bad plan.
+    # Bounded by plan_attempts so a run of unhelpful answers can't loop forever.
     if state.get("mode") == "plan":
         ans = _ASK_ANSWERS.get(state.get("chat_id", ""), "")
         if (
@@ -2653,14 +2718,9 @@ def _route_plan_validate(state: AgentState) -> str:
             and int(state.get("plan_attempts", 0)) < 3
         ):
             return "plan_build"
-    if state.get("plan_valid"):
-        # Plan mode is a read-only deliverable: present the plan once and STOP,
-        # so the user can review / extend it or switch to Coder manually (which
-        # implements from the saved plan). Do NOT auto-jump to Coder -- that
-        # would re-state the whole plan and show it twice.
-        return "done" if state.get("mode") == "plan" else "coder"
-    if int(state.get("plan_attempts", 0)) < 2:
-        return "plan_build"
+    # Plan mode is a read-only deliverable: present the plan once and STOP, so
+    # the user can review / extend it or switch to Coder manually. Other modes
+    # (e.g. coder invoked with a plan in history) jump straight to coder.
     return "done" if state.get("mode") == "plan" else "coder"
 
 
@@ -2715,14 +2775,12 @@ def build_graph():
     # PLAN flow: the planner explores via grep/glob/read itself, then builds.
     g.add_node("plan_understand", plan_understand)
     g.add_node("plan_build", plan_build)
-    g.add_node("plan_validate", plan_validate)
     g.add_conditional_edges(
         "plan_understand", _route_plan_understand,
         {"reader_read": "reader_read", "plan_build": "plan_build"},
     )
-    g.add_edge("plan_build", "plan_validate")
     g.add_conditional_edges(
-        "plan_validate", _route_plan_validate,
+        "plan_build", _route_plan_build,
         {"plan_build": "plan_build", "coder": "coder", "done": "done"},
     )
 

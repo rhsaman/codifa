@@ -30,6 +30,8 @@ import {
   respondPermission,
   respondAsk,
   listSkills,
+  triggerCompact,
+  type CompactResult,
 } from "../lib/api";
 import type { SkillRow } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
@@ -55,7 +57,7 @@ import type {
   ThinkingLevel,
   ToolActivity,
 } from "../types";
-import { ChatMessageView, RetryBanner, ThinkingBlock } from "./ChatMessage";
+import { ChatMessageView, RetryBanner } from "./ChatMessage";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -170,6 +172,7 @@ function sliceToBudget(
   maxHistory: number,
   contextWindow?: number,
   mode?: AgentMode,
+  headroom?: number,
 ): Array<{
   role: string;
   content: string;
@@ -183,21 +186,27 @@ function sliceToBudget(
     status: string;
   }>;
 }> {
-  // Model-scale the history char budget so small-context models (8k) get a tiny
-  // slice, mirroring the backend's own trimmer.
+  // opencode's tail budget: usable = ctx - reserved, keep a recent tail of
+  // min(15000, max(2000, usable*0.25)) tokens verbatim (~4 chars/token).
+  // `headroom` is the UI's compaction headroom (opencode's `reserved`).
   const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000;
-  const budget = Math.floor(ctx * 1.5); // chars (~37% of window at 4 chars/token); mirrors the backend's conservative history share
-  // Absolute per-mode ceilings: ask replies are guidance (not a scrollback to
-  // re-read verbatim), and coder/plan turn history is mostly tool-call records
-  // that stay relevant longer, but on very large windows the raw ctx*1.5 share
-  // would balloon past what the context window can really hold — so cap each
-  // mode. Mirrors the backend's per-mode caps.
+  const reserved = Math.max(0, Math.min(headroom ?? 20000, ctx));
+  const usable = Math.max(0, ctx - reserved);
+  const MAX_PRESERVE = 15000;
+  const MIN_PRESERVE = 2000;
+  const tailTokens = Math.min(
+    MAX_PRESERVE,
+    Math.max(MIN_PRESERVE, Math.floor(usable * 0.25)),
+  );
+  const tailChars = tailTokens * 4;
+  // Absolute per-mode ceilings mirror the backend's own history trimmer so the
+  // frontend pre-slice and the backend's post-trim agree on the recent tail.
   const MODE_HISTORY_CAPS: Record<string, number> = {
     ask: 60000,
     plan: 120000,
     coder: 140000,
   };
-  const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? "ask"] ?? budget);
+  const capped = Math.min(tailChars, MODE_HISTORY_CAPS[mode ?? "ask"] ?? tailChars);
   // Compact summaries (system role) stand in for the folded older turns — they
   // must ALWAYS survive the maxHistory slice, or the model loses the whole
   // compacted context once the chat grows past maxHistory after a compact and
@@ -354,15 +363,11 @@ export function ChatPanel() {
   const chatHasStreaming = chat?.messages.some((m) => m.streaming) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
   const busy = busyLocal || chatHasStreaming;
-  // Live thinking pinned to the top while the streaming message carries any
-  // thinking text. Deliberately independent of `isThinking`: text chunks toggle
-  // that flag on/off mid-turn, which used to flicker the pin on and off as the
-  // model alternated between emitting text and reasoning.
-  // Live thinking is kept in LOCAL state (not message/store state) so each
-  // streamed token doesn't trigger a full store re-map — that was the source of
-  // the lag. It's only shown pinned at the top while reasoning, then cleared on
-  // done so it never lingers in the transcript.
-  const [liveThinking, setLiveThinking] = useState<string | null>(null);
+  // Global "isThinking" flag (set by the streaming layer from the backend's
+  // lightweight thinking signal). Drives the composer glow animation while the
+  // model is reasoning — no thinking text is streamed to the UI (it slowed
+  // rendering with per-token re-renders).
+  const isThinking = useStore((s) => s.isThinking);
   /** The assistant message currently being rate-limited/retried by the provider,
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
@@ -1065,10 +1070,10 @@ export function ChatPanel() {
 
   const ctxWindow = modelContextWindow(provider, activeModel);
 
-  // Cumulative, growing context count — see `computeContextUsed` for the
-  // reasoning (max of provider-reported input+cache and the full-conversation
-  // estimate, so it matches opencode's TUI meter and never collapses to a
-  // single message's tokens).
+  // Context count for the titlebar meter — see `computeContextUsed`: the latest
+  // assistant turn's token total (input + output + cache), matching opencode's
+  // `overflow.ts` accounting, with the full-conversation estimate as a fallback
+  // before the first usage event.
   const contextUsed = useMemo(
     () =>
       computeContextUsed(
@@ -1285,6 +1290,7 @@ export function ChatPanel() {
       maxHistory,
       ctxWindow ?? undefined,
       chat.mode,
+      useStore.getState().settings.compactHeadroom ?? 20000,
     );
 
     const abort = new AbortController();
@@ -1406,7 +1412,9 @@ export function ChatPanel() {
           .find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
       if (event.kind === "text") {
-        useStore.getState().setStreaming(true, false);
+        // Keep the current "isThinking" flag untouched — a text chunk must not
+        // cancel the composer glow while the model is still reasoning.
+        useStore.getState().setStreaming(true, useStore.getState().isThinking);
         const prev = findMsg()?.content ?? "";
         const chunk = event.content ?? "";
         store.updateMessage(assistantMsg.id, {
@@ -1415,9 +1423,10 @@ export function ChatPanel() {
           retry: null,
         });
       } else if (event.kind === "thinking") {
-        useStore.getState().setStreaming(true, true);
-        const chunkT = event.content ?? "";
-        setLiveThinking((prev) => (prev ?? "") + chunkT);
+        // Lightweight signal only: the backend no longer streams the raw
+        // thinking text (it slowed the UI with per-token re-renders). We just
+        // toggle the global "isThinking" flag so the composer can show a glow.
+        useStore.getState().setStreaming(true, !!event.active);
       } else if (event.kind === "skill") {
         // Deliberately NOT rendered into the chat — the user asked for the
         // "Attached skills" / MCP notes to stay out of the transcript. The
@@ -1789,7 +1798,6 @@ export function ChatPanel() {
         useStore.getState().setChatStalled(chat.id, false);
         lastEventAt.current = Date.now();
         resolveStuckCards();
-        setLiveThinking(null);
       }
     };
 
@@ -1815,6 +1823,13 @@ export function ChatPanel() {
           )
             ? thinkingLevel
             : "",
+          modelReasoning:
+            modelReasoning(activeProvider, activeProvider.model) ??
+            supportsReasoning(
+              activeProvider.model,
+              activeProvider.kind,
+              modelReasoning(activeProvider, activeProvider.model),
+            ),
           mcpServers: (() => {
             const all = s.settings.mcpServers ?? {};
             const sel: Record<string, (typeof all)[string]> = {};
@@ -1838,7 +1853,7 @@ export function ChatPanel() {
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
-          compactThreshold: (s.settings.compactThreshold ?? 80) / 100,
+          reserved: s.settings.compactHeadroom ?? 20000,
           signal: abort.signal,
         },
         handleEvent,
@@ -1892,7 +1907,6 @@ export function ChatPanel() {
       abortRef.current = null;
       useStore.getState().setChatAbort(chat.id, null);
       useStore.getState().setStreaming(false, false);
-      setLiveThinking(null);
       // Keep the retry banner when this turn ended in a failure the user can
       // act on (retry_giveup / watchdog / backend error). Clearing `retry`
       // here would make the banner vanish the instant the stream closes, and
@@ -1985,26 +1999,23 @@ export function ChatPanel() {
       useStore.getState().setChatCompacting(chatId, false);
       return;
     }
-    const transcript = msgs
-      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
-      .join("\n\n")
-      .slice(-120000);
     const rootDir = ch.root || s.root;
     setBusy(true);
     useStore.getState().setChatCompactError(ch.id, null);
     useStore.getState().setChatCompactNotice(ch.id, null);
     useStore.getState().setChatCompacting(ch.id, true);
-    const prompt =
-      "Summarize the following conversation into concise notes for continued work. " +
-      "Keep key decisions, files touched, and open questions. Answer in ENGLISH even if the " +
-      "conversation is in another language (e.g. Persian/Farsi), under 150 words, no preamble.\n\n" +
-      transcript;
-    // Route through the user's configured "compact" tool model (Settings →
-    // Tools) when set, instead of always the chat's active provider/model.
-    // An entry may be "providerId/model" to run on a DIFFERENT provider than
-    // the parent (mirrors the backend's own _resolve_subagent parsing, and the
-    // subagent_models handling above in handleEvent). A bare entry — or none —
-    // runs on the active provider, same as before.
+
+    // Serialize the live conversation — including any prior compact summary —
+    // so the backend can MERGE it into the new one (opencode keeps a running
+    // summary across repeated compactions instead of starting from scratch).
+    const history = ch.messages
+      .filter((m) => !m.compacted)
+      .map((m) => ({ role: m.role, content: m.content ?? "" }));
+
+    // Route the primary summarizer through the user's configured "compact"
+    // subagent (Settings → Tools) when set, else the active provider. The
+    // active provider is always the fallback — the backend retries the compact
+    // subagent on it, mirroring opencode's subagent -> main-model fallback.
     const activeProvider = getChatProvider(ch.id);
     const compactEntry = (s.subagentModels?.compact || "").trim();
     let compactProvider = activeProvider;
@@ -2017,127 +2028,56 @@ export function ChatPanel() {
         : undefined;
       compactProvider = { ...(explicitProvider ?? compactProvider), model: modelName };
     }
-    // True only when the compact call will actually run on a DIFFERENT
-    // provider/model than the active one — used below to decide whether a
-    // failure is worth retrying on the active model.
-    const usedSubagent =
-      compactEntry.length > 0 &&
-      (compactProvider.id !== activeProvider.id ||
-        compactProvider.model !== activeProvider.model);
 
-    // Run the summarizer as a minimal READ-ONLY request against `providerToUse`:
-    // no tools (every cap false), no MCP servers, no skills, and the "ask" base
-    // prompt. This stops the summarizer from being hijacked into tool loops or
-    // plan output, which made /compact hang or return non-summary text in
-    // coder/plan mode.
-    const runSummarizer = async (
-      providerToUse: typeof activeProvider,
-    ): Promise<{ summary: string; failed: boolean; failReason: string }> => {
-      let summary = "";
-      let failed = false;
-      let failReason = "";
-      const ctr = new AbortController();
-      const timeout = setTimeout(() => ctr.abort(), 60_000);
-      try {
-        await streamChat(
-          {
-            provider: providerToUse,
-            root: rootDir,
-            mode: "ask",
-            prompt,
-            history: [],
-            maxHistory: 0,
-            systemPrompt: "",
-            cap: {
-              readFiles: false,
-              writeFiles: false,
-              runTerminal: false,
-              web: false,
-            },
-            mcpServers: {},
-            skills: [],
-            signal: ctr.signal,
-          },
-          (ev) => {
-            if (ev.kind === "text") summary += ev.content ?? "";
-            else if (ev.kind === "error") {
-              failed = true;
-              failReason = ev.content ?? "unknown error";
-            } else if (ev.kind === "usage") {
-              // Manual /compact is a real model call too — accrue its tokens into
-              // the chat's cumulative usage so it shows up in Model usage. This
-              // event kind used to be silently dropped here (handler only looked
-              // at text/error), which is why compact's usage never appeared.
-              if (ev.unbilled) return;
-              const inputTokens = ev.input_tokens ?? 0;
-              const outputTokens = ev.output_tokens ?? 0;
-              if (inputTokens <= 0 && outputTokens <= 0) return;
-              const usageModel =
-                (ev.model || "").trim() || providerToUse.model || "main";
-              useStore.getState().accrueChatUsage(ch.id, usageModel, {
-                input: inputTokens,
-                output: outputTokens,
-                cacheRead: ev.cache_read_tokens ?? 0,
-                cacheWrite: ev.cache_write_tokens ?? 0,
-              });
-            }
-          },
-        );
-      } catch (err) {
-        failed = true;
-        failReason =
-          (err as Error).name === "AbortError"
-            ? "timed out after 60s"
-            : (err as Error).message;
-      } finally {
-        clearTimeout(timeout);
-      }
-      return { summary, failed, failReason };
-    };
-
-    let { summary, failed, failReason } = await runSummarizer(compactProvider);
-    // The configured compact subagent failed (bad model id/key, provider down,
-    // rate limit, etc.) OR returned an empty summary (no error) — fall back to
-    // the chat's active model once, mirroring the backend's own subagent-build
-    // fallback used for AUTO-compact. An empty summary is just as useless as a
-    // failure, so it must trigger the same fallback. Without this, picking a
-    // broken subagent model would silently break manual /compact instead of
-    // degrading to the model that was already working.
-    if ((failed || !summary.trim()) && usedSubagent) {
-      const fb = await runSummarizer(activeProvider);
-      if (!fb.failed && fb.summary.trim()) {
-        summary = fb.summary;
-        failed = false;
-        failReason = "";
-      } else {
-        failReason =
-          `compact subagent failed (${failReason || "unknown error"}); ` +
-          `fallback to active model also failed (${fb.failReason || "empty summary"})`;
-        failed = true;
-      }
+    // Call the backend's opencode-style compaction (structured summary,
+    // token-budgeted tail, prior-summary merge). A 60s timeout bounds the
+    // call; the backend itself retries the compact subagent on the active
+    // model before giving up.
+    const ctr = new AbortController();
+    const timeout = setTimeout(() => ctr.abort(), 60_000);
+    let result: CompactResult | null = null;
+    let errMsg = "";
+    try {
+      result = await triggerCompact({
+        provider: compactProvider,
+        fallback: activeProvider,
+        history,
+        contextWindow: modelContextWindow(activeProvider, activeProvider.model) ?? 0,
+        reserved: useStore.getState().settings.compactHeadroom ?? 20000,
+        signal: ctr.signal,
+      });
+    } catch (err) {
+      errMsg =
+        (err as Error).name === "AbortError"
+          ? "timed out after 60s"
+          : (err as Error).message;
+    } finally {
+      clearTimeout(timeout);
     }
+
     setBusy(false);
     useStore.getState().setChatCompacting(ch.id, false);
     // A compact call just completed → usage may have changed. Refresh the
     // balance chip now, same as a normal turn does.
     setBalanceTick((t) => t + 1);
-    // A summarizer that errored or returned nothing at all is a failed compact
-    // — do NOT collapse the real messages behind a fake "(compact failed)"
-    // summary. Leave the chat untouched and let the user retry manually.
-    if (failed || !summary.trim()) {
-      useStore.getState().setChatCompactError(ch.id, failReason || "empty summary");
+
+    // A summarizer that errored, timed out, or returned nothing is a failed
+    // compact — do NOT collapse the real messages behind a fake summary. Leave
+    // the chat untouched and let the user retry manually.
+    if (!result || !result.summary || result.error) {
+      useStore.getState().setChatCompactError(
+        ch.id,
+        result?.error || errMsg || "empty summary",
+      );
       return;
     }
-    s.compactChat(
-      ch.id,
-      `[Compacted conversation]\n${summary.trim()}`,
-      1, // opencode-style: keep only the last message verbatim
-    );
+    // The backend already returns opencode's "[Compacted earlier context]"
+    // summary and the token-budgeted tail (`keep`) to preserve verbatim — no
+    // extra wrapper, and no hardcoded keep=1.
+    s.compactChat(ch.id, result.summary, result.keep);
     // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
     // history stays recallable via memory later. Never blocks or throws.
-    addMemoryNote(rootDir, `[Compacted conversation]\n${summary.trim()}`).catch(
-      () => { },
-    );
+    addMemoryNote(rootDir, result.summary).catch(() => {});
     useStore.getState().setChatCompactNotice(
       ch.id,
       "Context compacted — older messages are summarized below (after the conversation).",
@@ -2250,7 +2190,20 @@ export function ChatPanel() {
       const ch = s.chats.find((c) => c.id === s.activeChatId);
       if (!ch) return;
       const msg = ch.messages.find((m) => m.id === id);
-      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
+      if (!msg) return;
+      // Resolve to the OWNING user message: a failed/error "retry" can be
+      // triggered from an assistant message's banner, so find the user turn that
+      // produced it before resuming/regenerating.
+      let userMsg = msg;
+      if (msg.role !== "user") {
+        const idx = ch.messages.findIndex((m) => m.id === id);
+        const prevUser = [...ch.messages.slice(0, idx)]
+          .reverse()
+          .find((m) => m.role === "user");
+        if (!prevUser) return;
+        userMsg = prevUser;
+      }
+      if (!userMsg.content.trim()) return;
 
       // RESUME, don't restart: if this user's turn left a failed assistant
       // message behind (partial content + preserved tool activity + plan),
@@ -2258,7 +2211,7 @@ export function ChatPanel() {
       // model continues from where it was cut off instead of redoing the
       // completed work. Only when there is no failed turn to resume do we
       // fall back to the old truncate-and-restart behavior.
-      const idx = ch.messages.findIndex((m) => m.id === id);
+      const idx = ch.messages.findIndex((m) => m.id === userMsg.id);
       const failed = ch.messages
         .slice(idx + 1)
         .find(
@@ -2277,11 +2230,11 @@ export function ChatPanel() {
         setTimeout(
           () =>
             send(
-              msg.content,
-              msg.attachments ?? [],
-              msg.images ?? [],
+              userMsg.content,
+              userMsg.attachments ?? [],
+              userMsg.images ?? [],
               false,
-              msg.id,
+              userMsg.id,
             ),
           0,
         );
@@ -2289,12 +2242,15 @@ export function ChatPanel() {
       }
 
       // No failed assistant turn to resume — restart from this user message.
-      if (!s.truncateTo(id)) return;
-      const text = msg.content;
+      if (!s.truncateTo(userMsg.id)) return;
+      const text = userMsg.content;
       // Give the abort's finally block a tick to reset busy/streaming state
       // before re-sending (send() re-sets busy=true itself, but the abort's
       // finally would otherwise clear it mid-run).
-      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
+      setTimeout(
+        () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
+        0,
+      );
     },
     [busy, send, maxHistory],
   );
@@ -2322,15 +2278,32 @@ export function ChatPanel() {
       const ch = s.chats.find((c) => c.id === s.activeChatId);
       if (!ch) return;
       const msg = ch.messages.find((m) => m.id === id);
-      if (!msg || msg.role !== "user" || !msg.content.trim()) return;
-      // ALWAYS truncate-and-restart: remove this user message and everything
-      // below it, then re-send from scratch (send() creates a fresh user bubble).
+      if (!msg) return;
+      // Resolve the prompt to re-send: if the retry was triggered on a non-user
+      // message, fall back to the nearest preceding user message so we still
+      // regenerate from the right place.
+      const idx = ch.messages.findIndex((m) => m.id === id);
+      const userMsg =
+        msg.role === "user"
+          ? msg
+          : [...ch.messages.slice(0, idx)]
+              .reverse()
+              .find((m) => m.role === "user");
+      if (!userMsg || !userMsg.content.trim()) return;
+      // ALWAYS truncate-and-restart: remove this message and everything below
+      // it, then re-send the prompt from scratch (send() creates a fresh user
+      // bubble). When `id` is a user message it is removed too; when it is an
+      // assistant message, the user prompt above is kept and only the failed
+      // turn + everything below is dropped.
       if (!s.truncateTo(id)) return;
-      const text = msg.content;
+      const text = userMsg.content;
       // Give the abort's finally block a tick to reset busy/streaming state
       // before re-sending (send() re-sets busy=true itself, but the abort's
       // finally would otherwise clear it mid-run).
-      setTimeout(() => send(text, msg.attachments ?? [], msg.images ?? []), 0);
+      setTimeout(
+        () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
+        0,
+      );
     },
     [send],
   );
@@ -2976,12 +2949,6 @@ export function ChatPanel() {
           </div>,
           titlebarEl,
         )}
-
-      {liveThinking !== null && (
-        <div className="thinking-pin">
-          <ThinkingBlock text={liveThinking} />
-        </div>
-      )}
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
@@ -3284,7 +3251,7 @@ export function ChatPanel() {
 
       <div
         ref={composerRef}
-        className={`composer${dragOver ? " dragover" : ""}`}
+        className={`composer${dragOver ? " dragover" : ""}${isThinking ? " thinking" : ""}`}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}

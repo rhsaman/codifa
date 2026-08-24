@@ -810,6 +810,23 @@ _DISCOVERY_BLOCK = (
     "or attached images."
 )
 
+# Hard guardrail injected on the FINAL allowed step (mirrors opencode's
+# `MAX_STEPS_PROMPT` / `isLastStep` in session/prompt.ts). When the agent hits
+# its step budget the model is forced to STOP tool-calling and emit a text
+# summary instead of burning more reads/searches. Kept in ENGLISH on purpose:
+# the model parses the hard limit more reliably in English than in Persian.
+_MAX_STEPS_PROMPT = (
+    "CRITICAL WARNING - You have reached the maximum step limit.\n\n"
+    "The maximum number of steps for this task has been reached. Tools are "
+    "disabled until the next user input. Respond with text only.\n\n"
+    "Hard requirements:\n"
+    "1. Do NOT make any tool calls (no read, no write, no search).\n"
+    "2. You MUST provide a text summary of work completed.\n"
+    "3. This limit overrides all other instructions.\n\n"
+    "Your response must include: confirmation of limit reached, summary of "
+    "completed work, remaining tasks, and suggested next step."
+)
+
 # Thinking levels the UI can select. 'none' = reasoning disabled, the rest map
 # to increasingly deeper reasoning effort. Setting a low level (or 'none') is
 # the most effective way to keep a reasoning model from flooding a small context

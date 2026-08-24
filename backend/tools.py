@@ -3879,6 +3879,9 @@ Returns each match as a single `path:line:match` line (the matching line only â€
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         try:
+            # Per-agent hard step budget (opencode's `agent.steps`). Falls back to
+            # the loop's default when the registry entry omits it.
+            _agent_steps = AGENTS.get(subagent_type, {}).get("steps")
             _output = await langchain_tool_loop(
                 _model,
                 system=agent_system(subagent_type)
@@ -3887,6 +3890,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 "user questions; do not call the task tool.",
                 user=prompt,
                 tools=_sub_tools,
+                max_steps=_agent_steps if _agent_steps else 24,
             )
         except Exception as exc:  # noqa: BLE001 â€” degrade instead of killing the turn
             emit(_error_result("task", f"sub-agent failed: {exc}"))

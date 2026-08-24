@@ -1341,6 +1341,13 @@ async def _run_mode_turn(
         _MIN_REPEAT_LEN = 20
         while steps < MAX_STEPS:
             steps += 1
+            # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
+            # final allowed step, force the model to stop tool-calling and
+            # summarize instead of burning more reads/searches. Without this the
+            # loop just breaks at MAX_STEPS and returns an empty reply, so the
+            # model never learns it should stop and tends to spam reads first.
+            if steps >= MAX_STEPS:
+                msgs.append(AIMessage(content=_agents._MAX_STEPS_PROMPT))
             # Live steer injection: user messages typed mid-run.
             steers = await _agents._drain_steer(chat_id)
             if steers:

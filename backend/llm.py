@@ -297,11 +297,18 @@ async def chat_model_settings(
 import inspect
 
 from langchain_core.messages import (
+    AIMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_core.tools import StructuredTool
+
+# The hard step-limit prompt is defined once in agents.py (kept in English on
+# purpose) and reused here so the sub-agent loop mirrors the main loop's
+# isLastStep guardrail. agents.py only imports llm lazily (inside functions),
+# so this top-level import does not create a circular dependency.
+from agents import _MAX_STEPS_PROMPT
 
 # Mirrors graph.py's `_SEQUENTIAL_TOOLS` (duplicated, not imported, to avoid a
 # circular import -- graph.py imports FROM this module). Mutating / blocking
@@ -415,6 +422,11 @@ async def langchain_tool_loop(
     steps = 0
     while steps < max_steps:
         steps += 1
+        # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
+        # final allowed step, force the sub-agent to stop tool-calling and
+        # summarize instead of burning more reads/searches.
+        if steps >= max_steps:
+            msgs.append(AIMessage(content=_MAX_STEPS_PROMPT))
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
         tcs = getattr(ai, "tool_calls", None)
         if not tcs:

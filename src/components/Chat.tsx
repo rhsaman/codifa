@@ -442,6 +442,21 @@ export function ChatPanel() {
   );
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
+  // The thinking ring is an SVG stroke whose corner radius must track the
+  // composer's height (it grows with multi-line input). We measure the inner
+  // box and feed a dynamic rx so the ring stays a clean rounded-rect at any
+  // height instead of distorting.
+  const [ringRx, setRingRx] = useState(23);
+  useEffect(() => {
+    const inner = composerRef.current?.querySelector<HTMLElement>(".composer-inner");
+    if (!inner) return;
+    const update = () =>
+      setRingRx(Math.min(23, Math.max(8, inner.clientHeight / 2 - 3)));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, []);
   // Per-chat scroll restoration: captured once per mount (the panel remounts on
   // every chat switch via key={activeChatId}). If the user last left this chat
   // scrolled up, don't auto-pin to the bottom on return.
@@ -3460,6 +3475,48 @@ export function ChatPanel() {
             );
           })()}
         <div className="composer-inner">
+          {isThinking && (
+            // See the CSS comment above `.composer-thinking-ring` in global.css for
+            // why this is an SVG stroke (pathLength=100) instead of a rotated
+            // conic-gradient: the composer is a very wide, short box, and an
+            // angle-based gradient moves at wildly uneven speed on that shape.
+            <svg
+              className="composer-thinking-ring"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <rect
+                className="composer-thinking-ring-halo"
+                x={1.5}
+                y={1.5}
+                width="100%"
+                height="100%"
+                rx={ringRx}
+                ry={ringRx}
+                pathLength={100}
+              />
+              <rect
+                className="composer-thinking-ring-tail"
+                x={1.5}
+                y={1.5}
+                width="100%"
+                height="100%"
+                rx={ringRx}
+                ry={ringRx}
+                pathLength={100}
+              />
+              <rect
+                className="composer-thinking-ring-head"
+                x={1.5}
+                y={1.5}
+                width="100%"
+                height="100%"
+                rx={ringRx}
+                ry={ringRx}
+                pathLength={100}
+              />
+            </svg>
+          )}
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}

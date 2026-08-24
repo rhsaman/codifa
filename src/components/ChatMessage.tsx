@@ -561,6 +561,21 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
   // (see isCaptionCandidate). Cleared once used or once it turns out nothing
   // groupable followed it.
   let pendingCaption: string | null = null
+  // A run of consecutive narrated rows / groups (no real prose between them)
+  // accumulates here instead of going straight into `nodes`, so the whole run
+  // wraps in ONE card (see wrapTrace) instead of each item floating as its
+  // own bordered box with a gap around it.
+  let trace: ReactNode[] = []
+
+  const wrapTrace = (key: string) => {
+    if (trace.length === 0) return
+    nodes.push(
+      <div key={key} className="tool-trace">
+        {trace}
+      </div>,
+    )
+    trace = []
+  }
 
   const flush = (key: string) => {
     if (pending.length === 0) return
@@ -568,11 +583,11 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
       // یک فراخوانی تکی: با caption مدل (اگر بود) در یک بلوکِ واحد رندر می‌شود —
       // به‌جای یک پاراگراف جدا بالای یک ردیف ابزارِ بی‌ربط.
       const { activity } = pending[0]
-      nodes.push(<ToolNarratedRow key={key} caption={pendingCaption ?? undefined} activity={activity} />)
+      trace.push(<ToolNarratedRow key={key} caption={pendingCaption ?? undefined} activity={activity} />)
     } else {
       // 2+ consecutive read-only calls collapse into one trace group, headed
       // by the same caption instead of only the generic count summary.
-      nodes.push(<ToolGroupView key={key} activities={pending} caption={pendingCaption ?? undefined} />)
+      trace.push(<ToolGroupView key={key} activities={pending} caption={pendingCaption ?? undefined} />)
     }
     pending = []
     pendingCaption = null
@@ -596,6 +611,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
   segs.forEach((seg, i) => {
     if (seg.kind === 'user') {
       flush(`grp-${i}`)
+      wrapTrace(`trace-${i}`)
       if (pendingCaption) {
         renderProse(`cap-${i}`, pendingCaption)
         pendingCaption = null
@@ -617,7 +633,8 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
 
       // Does this text immediately precede a groupable (non-always-visible)
       // tool call? If so, hold it back as that call's caption instead of
-      // rendering it as its own paragraph.
+      // rendering it as its own paragraph — the run stays inside the same
+      // trace card, it doesn't get wrapped/broken here.
       const next = segs[i + 1]
       const nextActivity = next && next.kind === 'tool' ? message.toolActivity?.[next.index] : undefined
       const nextIsGroupable =
@@ -628,6 +645,8 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
         return
       }
 
+      // Genuine prose — the trace run (if any) is really over now.
+      wrapTrace(`trace-${i}`)
       renderProse(String(i), seg.text)
       return
     }
@@ -635,6 +654,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
     if (!activity) return
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush(`grp-${i}`)
+      wrapTrace(`trace-${i}`)
       if (pendingCaption) {
         renderProse(`cap-${i}`, pendingCaption)
         pendingCaption = null
@@ -651,6 +671,7 @@ function renderSegments(message: ChatMessage, onRetry?: (id: string) => void): R
     }
   })
   flush('grp-end')
+  wrapTrace('trace-end')
   if (pendingCaption) renderProse('cap-end', pendingCaption)
   return nodes
 }

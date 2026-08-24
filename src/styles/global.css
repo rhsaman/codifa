@@ -2131,11 +2131,7 @@ textarea {
   margin: 4px 4px;
 }
 
-.msg-bubble.segmented > .tool-narrated {
-  margin: 4px 4px;
-}
-
-.msg-bubble.segmented > .tool-single {
+.msg-bubble.segmented > .tool-trace {
   margin: 4px 4px;
 }
 
@@ -2570,67 +2566,102 @@ textarea {
     var(--shadow-pop);
 }
 
-/* While the model is reasoning, a soft light arc orbits the composer border so
-   the user sees "thinking" without streaming any reasoning text into the UI.
-   The arc is a masked conic-gradient ring rotated via transform (universal
-   support) so it literally travels around the input box. */
+/* ---- thinking glow: a comet of light orbiting the composer ---- */
+/* While the model is reasoning, a comet (bright gold head + blue tail) travels
+   around the composer's border at constant speed, with a soft breathing bloom
+   behind the whole box.
+
+   This used to be a single conic-gradient pseudo-element rotated by angle —
+   looked fine on a roughly-square box, but the composer is a very WIDE, SHORT
+   rectangle (~760×90px). A conic-gradient's angle doesn't map to perimeter
+   distance evenly on a non-square box: the comet crawled along the short
+   left/right edges (nearly a full side lit at once) and blurred past almost
+   instantly on the long top/bottom edges — it read as static/broken, not
+   "rotating". See ComposerThinkingRing in Chat.tsx.
+
+   The fix is an SVG rounded-rect stroke with `pathLength={100}`: dasharray/
+   dashoffset are then expressed as a PERCENTAGE OF THE ACTUAL PERIMETER,
+   however wide or tall the box is, so animating stroke-dashoffset linearly
+   moves the comet at genuinely constant visual speed all the way around —
+   no distortion on any aspect ratio. Three stacked rects, same rect geometry,
+   same animation: a wide blurred halo, a thin blue tail, a short bright head
+   sitting at the tail's leading edge (both dasharrays start at 0, so the
+   head's short "on" segment sits inside the tail's longer one). */
 .composer.thinking .composer-inner {
   position: relative;
-  border-radius: 24px;
+  animation: composer-thinking-breathe 4s ease-in-out infinite;
 }
 
-.composer.thinking .composer-inner::before {
-  content: "";
+.composer-thinking-ring {
   position: absolute;
-  inset: -2px;
-  border-radius: inherit;
-  padding: 2px;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    color-mix(in srgb, var(--accent) 85%, #fff) 55deg,
-    var(--accent) 90deg,
-    transparent 150deg,
-    transparent 360deg
-  );
-  /* Show only the ring (border) by masking out the inner area. */
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  animation: composer-thinking-orbit 2.4s linear infinite;
+  inset: 1.5px;
+  width: calc(100% - 3px);
+  height: calc(100% - 3px);
+  overflow: visible;
   pointer-events: none;
-  z-index: 1;
+  z-index: 3;
 }
 
-/* A gentle ambient glow keeps the whole box warm while the arc travels. */
-.composer.thinking .composer-inner {
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
-    0 0 26px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 0 60px color-mix(in srgb, var(--accent) 10%, transparent),
-    var(--shadow-pop);
+.composer-thinking-ring rect {
+  fill: none;
+  stroke-linecap: round;
+  /* A slow, even orbit reads as "calmly working through a thought" rather
+     than a frantic spinner. */
+  animation: composer-ring-travel 3.4s linear infinite;
 }
 
-@keyframes composer-thinking-orbit {
+.composer-thinking-ring-halo {
+  stroke: var(--accent);
+  stroke-width: 7;
+  stroke-dasharray: 20 80;
+  opacity: 0.32;
+  filter: blur(7px);
+}
+
+.composer-thinking-ring-tail {
+  stroke: var(--accent);
+  stroke-width: 2.25;
+  stroke-dasharray: 20 80;
+  opacity: 0.85;
+}
+
+.composer-thinking-ring-head {
+  stroke: color-mix(in srgb, var(--thinking) 85%, #fff 15%);
+  stroke-width: 2.25;
+  stroke-dasharray: 4 96;
+}
+
+@keyframes composer-ring-travel {
   to {
-    transform: rotate(360deg);
+    stroke-dashoffset: -100;
   }
 }
 
-/* Respect users who prefer less motion: hold a static, evenly-lit ring. */
+@keyframes composer-thinking-breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent),
+      0 0 22px color-mix(in srgb, var(--accent) 12%, transparent),
+      var(--shadow-pop);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
+      0 0 38px color-mix(in srgb, var(--accent) 20%, transparent),
+      var(--shadow-pop);
+  }
+}
+
+/* Respect users who prefer less motion: a working-status indicator
+   communicates real state (not decorative motion), so instead of freezing it
+   entirely we just slow it way down — it still visibly progresses, but calmly. */
 @media (prefers-reduced-motion: reduce) {
-  .composer.thinking .composer-inner::before {
-    animation: none;
-    background: conic-gradient(
-      from 0deg,
-      transparent 0deg,
-      var(--accent) 90deg,
-      transparent 180deg,
-      var(--accent) 270deg,
-      transparent 360deg
-    );
+  .composer.thinking .composer-inner {
+    animation-duration: 8s;
+  }
+  .composer-thinking-ring rect {
+    animation-duration: 9s;
   }
 }
 
@@ -6797,6 +6828,50 @@ textarea {
   font-size: 12px;
   color: var(--text-dim);
   overflow: hidden;
+}
+
+/* ---- unified tool trace ---- */
+/* Wraps a whole RUN of consecutive narrated rows / groups (see wrapTrace in
+   ChatMessage.tsx) in ONE quiet card. Before this, every caption+call pair
+   rendered as its own separately-bordered box with a gap around it — with a
+   multi-step turn (5-10 calls) that reads as a stack of disconnected floating
+   cards. Now the whole run shares one border and a hairline divider between
+   items, so it reads as a single sequence of steps. */
+.tool-trace {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.tool-trace > .tool-narrated,
+.tool-trace > .tool-group,
+.tool-trace > .tool-single {
+  border: none;
+  border-radius: 0;
+  background: none;
+}
+
+.tool-trace > .tool-narrated + .tool-narrated,
+.tool-trace > .tool-narrated + .tool-group,
+.tool-trace > .tool-narrated + .tool-single,
+.tool-trace > .tool-group + .tool-narrated,
+.tool-trace > .tool-group + .tool-group,
+.tool-trace > .tool-group + .tool-single,
+.tool-trace > .tool-single + .tool-narrated,
+.tool-trace > .tool-single + .tool-group,
+.tool-trace > .tool-single + .tool-single {
+  border-top: 1px solid var(--hairline);
+}
+
+.tool-trace > .tool-narrated .tool-narrated-caption,
+.tool-trace > .tool-narrated .tool-narrated-row,
+.tool-trace > .tool-group .tool-narrated-caption,
+.tool-trace > .tool-single {
+  padding-top: 6px;
+  padding-bottom: 6px;
 }
 
 /* ---- grouped read-only tool calls (see ToolGroupView) ---- */

@@ -1274,13 +1274,24 @@ async def _run_mode_turn(
                     ai = chunk if ai is None else ai + chunk
                     content = chunk.content
                     if isinstance(content, str) and content:
+                        # The first text token means reasoning has finished, so
+                        # close the thinking window immediately (don't keep the
+                        # ring lit through the whole text generation phase).
+                        if _thinking_active:
+                            _thinking_active = False
+                            queue.put_nowait({"kind": "thinking", "active": False})
                         queue.put_nowait({"kind": "text", "content": content})
                     elif isinstance(content, list):
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "text":
+                                if _thinking_active:
+                                    _thinking_active = False
+                                    queue.put_nowait({"kind": "thinking", "active": False})
                                 queue.put_nowait({"kind": "text", "content": part["text"]})
                 if ai is None:
                     break
+                # Safety net for models that only reason and emit no text: make
+                # sure the thinking window is always closed at stream end.
                 if _thinking_active:
                     _thinking_active = False
                     queue.put_nowait({"kind": "thinking", "active": False})

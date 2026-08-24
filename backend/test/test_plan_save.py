@@ -199,3 +199,57 @@ def _await(value):
         return value
 
     return _coro()
+
+
+def _plan_ws(root: str) -> str:
+    import os
+
+    from tools import slugify
+
+    return slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+
+
+@pytest.mark.asyncio
+async def test_emit_saved_checklist_reloads_in_both_modes(tmp_path, monkeypatch):
+    # The persisted checklist (todos) must be reloaded and emitted as a
+    # 'plan' event in BOTH plan and coder mode, so it survives chat reloads
+    # and mode switches. The plan dir is redirected to tmp_path so the test
+    # leaves no real files in the project tree.
+    import state_db
+    from graph import _emit_saved_checklist
+
+    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path / "plan"))
+
+    root = str(tmp_path)
+    ws = _plan_ws(root)
+    items = [
+        {"id": "step-0", "content": "a", "status": "completed"},
+        {"id": "step-1", "content": "b", "status": "in_progress"},
+    ]
+    state_db.save_plan_checklist(ws, "plan", items, chat_id="c1")
+
+    for mode in ("plan", "coder"):
+        q: asyncio.Queue = asyncio.Queue()
+        # build_turn_context calls _emit_saved_checklist for both modes, so we
+        # exercise the helper directly to keep the test fast & offline.
+        _emit_saved_checklist(q, root, "c1")
+        emitted = [e for e in list(q._queue) if e.get("kind") == "plan"]
+        assert any(e.get("items") == items for e in emitted), mode
+
+
+@pytest.mark.asyncio
+async def test_emit_saved_checklist_no_items_is_silent(tmp_path, monkeypatch):
+    # When no checklist was persisted, nothing should be emitted.
+    import state_db
+    from graph import _emit_saved_checklist
+
+    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path / "plan"))
+
+    root = str(tmp_path)
+    ws = _plan_ws(root)
+    state_db.save_plan_checklist(ws, "plan", [], chat_id="c2")
+
+    q: asyncio.Queue = asyncio.Queue()
+    _emit_saved_checklist(q, root, "c2")
+    emitted = [e for e in list(q._queue) if e.get("kind") == "plan"]
+    assert emitted == []

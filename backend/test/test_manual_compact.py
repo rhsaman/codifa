@@ -137,3 +137,44 @@ def test_compact_history_fresh_no_prior(monkeypatch):
     assert new_history[0]["content"] == "[Compacted earlier context]\nFRESH"
     # The tail (recent turns) is preserved verbatim and reported via `keep`.
     assert keep >= 1
+
+
+def test_compact_logs_info_to_stdout_not_stderr(client, capsys):
+    # Informational lines (request / built / success) must NOT be written to
+    # stderr (which the terminal renders red); only genuine problems should.
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    res = client.post(
+        "/chat/compact",
+        json={
+            "provider": "custom",
+            "model": "m",
+            "base_url": "u",
+            "api_key": "k",
+            "fallback_provider": "custom",
+            "fallback_model": "m",
+            "fallback_base_url": "u",
+            "fallback_api_key": "k",
+            "history": history,
+            "context_window": 100000,
+            "reserved": 2000,
+        },
+    )
+    assert res.status_code == 200
+    out, err = capsys.readouterr()
+    assert "success: keep=" in out, out
+    assert "[compact]" in out, out
+    # No informational line should leak to stderr on the happy path.
+    assert "success: keep=" not in err, err
+
+
+def test_compact_empty_history_warns_to_stderr(client, capsys):
+    # A genuine problem (empty history) should surface on stderr at WARNING.
+    res = client.post("/chat/compact", json={"history": []})
+    assert res.status_code == 200
+    out, err = capsys.readouterr()
+    assert "empty history -> nothing to do" in err, err
+    assert "WARNING" in err, err
+    assert "empty history -> nothing to do" not in out, out

@@ -1438,7 +1438,26 @@ export function ChatPanel() {
         watchdogAutoRetriedRef.current += 1;
         const msgs = chat?.messages ?? [];
         const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-        if (lastUser) retryMessageRef.current(lastUser.id);
+        if (lastUser) {
+          // RESUME the same user turn WITHOUT truncating: retryMessage() would
+          // call truncateTo() here because the stalled assistant turn isn't
+          // flagged failed/error yet (the stream is still alive, just silent),
+          // which deletes every message after the user turn. Abort the stalled
+          // stream first, then re-send the same user message so the backend
+          // continues from where it was cut off — no messages are lost.
+          if (!abort.signal.aborted) abort.abort();
+          setTimeout(
+            () =>
+              send(
+                lastUser.content,
+                lastUser.attachments ?? [],
+                lastUser.images ?? [],
+                false,
+                lastUser.id,
+              ),
+            0,
+          );
+        }
         return;
       }
       if (Date.now() - stalledSinceRef.current > HARD_STALL_GRACE_MS) {

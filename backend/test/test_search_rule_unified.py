@@ -89,3 +89,27 @@ def test_read_docstring_encourages_parallel_reads():
     src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
     text = src.read_text(encoding="utf-8")
     assert "read multiple independent files in parallel" in text
+
+
+def test_discovery_block_delegates_broad_search_to_explore():
+    """The DISCOVERY block (ask/plan modes) must not contradict _SEARCH_RULE:
+    broad / multi-file exploration is delegated to the explore sub-agent, not
+    done inline with grep/glob/read."""
+    block = agents._DISCOVERY_BLOCK
+    assert "subagent_type='explore'" in block
+    assert "BROAD" in block.upper()
+    # It frames grep/glob/read as the TARGETED path, not the broad one.
+    assert "TARGETED" in block.upper()
+
+
+def test_discovery_block_is_single_source_of_truth():
+    """The DISCOVERY block must mirror _SEARCH_RULE's framing: grep/glob/read
+    are for TARGETED lookups, explore is for BROAD/multi-file."""
+    block = agents._DISCOVERY_BLOCK
+    rule = agents._SEARCH_RULE
+    # Both must agree on the explore-for-broad delegation.
+    assert "subagent_type='explore'" in block
+    assert "subagent_type='explore'" in rule
+    # Neither should make broad search optional via 'or delegate'.
+    assert "or delegate" not in block.lower()
+    assert "or delegate" not in rule.lower()

@@ -71,3 +71,18 @@ def test_non_coder_strips_write_and_terminal_but_keeps_web():
     assert "write_file" not in tools
     assert "run_terminal" not in tools
     assert _WEB <= set(tools)
+
+
+def test_parent_tools_contextvar_is_set_after_filtering():
+    """filter_tools_for_mode must record the mode-filtered toolset in
+    _PARENT_TOOLS_CTX so a sub-agent spawned via `task` inherits exactly these
+    tools (closing the read-only bypass)."""
+    from tools import _PARENT_TOOLS_CTX
+
+    filtered = filter_tools_for_mode(
+        "plan", _fake_tools(), {}, set(), True, False, prompt="x", root=""
+    )
+    assert _PARENT_TOOLS_CTX.get() is filtered
+    # The recorded toolset must reflect mode filtering (no write/terminal in plan).
+    assert "write_file" not in _PARENT_TOOLS_CTX.get()
+    assert "run_terminal" not in _PARENT_TOOLS_CTX.get()

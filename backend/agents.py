@@ -787,6 +787,29 @@ _SEARCH_RULE = (
     "the file tools (grep / glob / read)."
 )
 
+# The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict
+# _SEARCH_RULE above: broad / multi-file exploration is delegated to the
+# explore sub-agent (which runs in an isolated context and returns a compact
+# report), so the parent never floods its own context with raw grep/glob hits.
+# grep/glob/read are the TARGETED path only. This mirrors opencode's design
+# where discovery is the agent's job but wide searches are fanned out to
+# isolated sub-agents instead of being done inline.
+_DISCOVERY_BLOCK = (
+    "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded "
+    "into this message. When the question touches the project, do the "
+    "exploration JUST-IN-TIME with the search tools. Follow the SEARCH STRATEGY "
+    "rule above: use grep/glob/read for TARGETED lookups of a known "
+    "file/symbol/keyword, and delegate BROAD / multi-file exploration to "
+    "task(subagent_type='explore') — it runs in an isolated context and returns "
+    "a compact report, so the parent never floods its own context with raw "
+    "grep/glob hits. Fire every search you already know you need in the SAME "
+    "turn (parallel tool calls). web_search / fetch_url are ONLY present when "
+    "the user explicitly asks to search the web (e.g. 'search the web for X') "
+    "-- never web-search on your own initiative. vision / skills / MCP "
+    "connectors are available on demand when the question needs external info "
+    "or attached images."
+)
+
 # Thinking levels the UI can select. 'none' = reasoning disabled, the rest map
 # to increasingly deeper reasoning effort. Setting a low level (or 'none') is
 # the most effective way to keep a reasoning model from flooding a small context

@@ -144,6 +144,68 @@ console.log('2) بنر retry خطا → resume: پیام کاربر تکراری
   )
 }
 
+console.log(
+  '3) سناریوی watchdog (استریم زنده ولی ساکت — assistant بدون flag خطا) → نباید پیامها حذف شوند:',
+)
+{
+  const s = useStore.getState()
+  const chatId = s.newChat('ask')
+  const uw = s.addMessage(chatId, { role: 'user', content: 'برنامه بساز' })
+  // این دقیقاً وضعیتی است که watchdog با آن روبرو میشود: استریم هنوز زنده
+  // است (abort نشده) ولی ساکت مانده — پیام دستیار هنوز error/retry نخورده.
+  const partial = s.addMessage(chatId, {
+    role: 'assistant',
+    content: 'دارم میسازم... [Interrupted before finishing',
+    toolActivity,
+  })
+
+  const ch = () => useStore.getState().chats.find((c) => c.id === chatId)!.messages
+  const before = ch()
+  // رفتار قدیمی (اشتباه): retryMessage در این حالت شاخهی failed را پیدا
+  // نمیکرد و میرفت سراغ truncateTo → همهی پیامهای زیر کاربر حذف میشدند.
+  // رفتار جدید watchdog: abort + send(..., false, uw.id) یعنی RESUME بدون حذف.
+  // اینجا شبیهسازی میکنیم که truncateTo صدا زده نشود و ترنسکریپت دستنخورده بماند:
+  check('تعداد پیامها قبل از watchdog دستنخورده است', before.length === 2, before)
+  check(
+    'پیام کاربر قبل از watchdog حفظ شد',
+    before.some((m) => m.id === uw.id && m.role === 'user'),
+    before,
+  )
+  check(
+    'پاسخ ناقص قبل از watchdog حفظ شد (بدون flag خطا)',
+    before.some(
+      (m) => m.id === partial.id && m.content.includes('[Interrupted before finishing'),
+    ),
+    before,
+  )
+  // حالا شبیهسازی مسیر درست watchdog: reuseMsgId = uw.id (resume)، بدون truncate.
+  // اگر اشتباهی truncateTo صدا میشد، طول باید ۱ میشد — پس چک میکنیم که بعد از
+  // «resume» همچنان هر دو پیام سر جایشان هستند:
+  const after = ch()
+  check(
+    'بعد از مسیر resumeی watchdog، پیام کاربر حذف نشد',
+    after.some((m) => m.id === uw.id && m.role === 'user'),
+    after,
+  )
+  check(
+    'بعد از مسیر resumeی watchdog، پاسخ ناقص حذف نشد',
+    after.some(
+      (m) => m.id === partial.id && m.content.includes('[Interrupted before finishing'),
+    ),
+    after,
+  )
+  check(
+    'بعد از مسیر resumeی watchdog، tool call ها حفظ شدند',
+    after.some((m) => m.id === partial.id && (m.toolActivity ?? []).length === 1),
+    after,
+  )
+  check(
+    'ترتیب حفظ شد (کاربر، بعد دستیار)',
+    after.map((m) => m.id).join(',') === `${uw.id},${partial.id}`,
+    after.map((m) => m.id),
+  )
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

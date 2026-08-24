@@ -63,7 +63,7 @@ from llm import (
     chat_model_settings,
     llm_generate,
 )
-from tools import make_tool_callbacks
+from tools import make_tool_callbacks, _PARENT_TOOLS_CTX
 
 MAX_DEBUG_ATTEMPTS = 3
 
@@ -322,6 +322,13 @@ def filter_tools_for_mode(
             tools["run_terminal"] = _agents._wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
+    # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
+    # via `task` inherits exactly these tools — not the full registry. This is
+    # what closes the read-only bypass: an explore/plan-mode `task` call can no
+    # longer hand the sub-agent write tools. tools.py reads this contextvar in
+    # _run_subagent_task and falls back to the full registry only when it is
+    # unset (which should never happen now).
+    _PARENT_TOOLS_CTX.set(tools)
     return tools
 
 
@@ -753,16 +760,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "invent or omit what the image shows."
         )
     if mode in ("ask", "plan"):
-        system_final += (
-            "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded "
-            "into this message. When the question touches the project, do the "
-            "exploration JUST-IN-TIME with the search tools (glob / grep / read). "
-            "Fire every search you already know you need in the SAME turn (parallel "
-            "tool calls). web_search / fetch_url are ONLY present when the user explicitly asks to "
-            "search the web (e.g. 'search the web for X') -- never web-search on your "
-            "own initiative. vision / skills / MCP connectors are available on demand "
-            "when the question needs external info or attached images."
-        )
+        system_final += _agents._DISCOVERY_BLOCK
     if mode == "reader":
         system_final += (
             "\n\nFOCUSED READING: the user pointed you at specific file(s) (open in "
@@ -838,6 +836,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             saved = ""
         if saved:
             system_final += saved
+        # Reload the persisted checklist (todos) so they survive reloads and
+        # appear in BOTH plan and coder mode when the chat is opened / switched.
+        _emit_saved_checklist(queue, root, chat_id)
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -969,6 +970,26 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "main_model": model,
         "prompt": prompt,
     }
+
+
+def _emit_saved_checklist(queue: asyncio.Queue, root: str, chat_id: str) -> None:
+    """Reload the persisted plan checklist (todos) and push it to the frontend
+    as a ``kind: "plan"`` event. Called from ``build_turn_context`` so the
+    checklist survives reloads and appears in BOTH plan and coder mode when the
+    chat is opened or the mode is switched.
+    """
+    try:
+        from tools import slugify
+
+        ws = (
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+            or "workspace"
+        )
+        checklist = state_db.get_plan_checklist(ws, chat_id=chat_id)
+    except Exception:  # noqa: BLE001
+        checklist = None
+    if checklist and checklist.get("items"):
+        queue.put_nowait({"kind": "plan", "items": checklist["items"]})
 
 
 def model_timeout_for(state: AgentState) -> float:

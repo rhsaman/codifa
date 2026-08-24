@@ -11,6 +11,7 @@ import argparse
 import ast
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -903,8 +904,44 @@ async def chat_compact(req: CompactRequest):
     """
     import sys
 
-    def _log(msg: str) -> None:
-        print(f"[compact] {msg}", file=sys.stderr, flush=True)
+    # Route through the standard logging module so informational messages land
+    # on stdout (not red stderr) while genuine problems still surface at
+    # WARNING/ERROR on stderr. A dedicated, non-propagating logger keeps this
+    # isolated from the root file handler configured at startup.
+    #
+    # Handlers resolve their stream dynamically (at emit time) so they always
+    # target the *current* sys.stdout/sys.stderr — important under test
+    # frameworks that swap those streams (e.g. pytest's capsys).
+    class _DynamicStreamHandler(logging.StreamHandler):
+        def __init__(self, stream_getter):
+            super().__init__(stream=sys.stderr)  # placeholder; resolved per emit
+            self._stream_getter = stream_getter
+
+        def emit(self, record):
+            # Resolve the *current* stream at emit time so pytest's capsys (and
+            # any other stdout/stderr swap) is honoured.
+            self.stream = self._stream_getter()
+            super().emit(record)
+
+    _logger = logging.getLogger("codifa.compact")
+    if not _logger.handlers:
+        _logger.propagate = False
+        _logger.setLevel(logging.DEBUG)
+
+        _info_handler = _DynamicStreamHandler(lambda: sys.stdout)
+        _info_handler.setLevel(logging.DEBUG)
+        _info_handler.addFilter(lambda r: r.levelno < logging.WARNING)
+        _info_handler.setFormatter(logging.Formatter("[compact] %(message)s"))
+
+        _err_handler = _DynamicStreamHandler(lambda: sys.stderr)
+        _err_handler.setLevel(logging.WARNING)
+        _err_handler.setFormatter(logging.Formatter("[compact] %(levelname)s %(message)s"))
+
+        _logger.addHandler(_info_handler)
+        _logger.addHandler(_err_handler)
+
+    def _log(msg: str, level: int = logging.INFO) -> None:
+        _logger.log(level, msg)
 
     _log(
         f"request: provider={req.provider!r} model={req.model!r} "
@@ -912,7 +949,7 @@ async def chat_compact(req: CompactRequest):
         f"history={len(req.history or [])} ctx={req.context_window} reserved={req.reserved}"
     )
     if not req.history:
-        _log("empty history -> nothing to do")
+        _log("empty history -> nothing to do", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "no messages to compact"}
 
     def _build(provider: str, model: str, base_url: str, api_key: str, env_var: str, oauth: str):
@@ -934,12 +971,12 @@ async def chat_compact(req: CompactRequest):
                 timeout=50,
             )
         except Exception as exc:  # noqa: BLE001
-            _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}")
+            _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}", level=logging.WARNING)
             return None
 
     model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.oauth_token)
     if model is None:
-        _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})")
+        _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "invalid primary model"}
     fallback = _build(
         req.fallback_provider, req.fallback_model, req.fallback_base_url,
@@ -959,23 +996,42 @@ async def chat_compact(req: CompactRequest):
             force=True,
         )
     except Exception as exc:  # noqa: BLE001
-        _log(f"_compact_history raised: {exc!r}")
+        _log(f"_compact_history raised: {exc!r}", level=logging.ERROR)
         return {"summary": None, "keep": 0, "error": str(exc)}
     if result is None:
         if last_error:
-            _log(f"failed: {last_error[-1]}")
+            _log(f"failed: {last_error[-1]}", level=logging.WARNING)
             return {"summary": None, "keep": 0, "error": last_error[-1]}
-        _log("nothing to compact (history too short / head already summarized)")
+        _log("nothing to compact (history too short / head already summarized)", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "nothing to compact"}
     new_history, keep = result
     summary = new_history[0]["content"] if new_history else ""
     if not summary:
-        _log("empty summary after success")
+        _log("empty summary after success", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "empty summary"}
     _log(f"success: keep={keep} summary_len={len(summary)}")
     return {"summary": summary, "keep": int(keep)}
-    log.warning("[compact] success: keep=%s summary_len=%d", keep, len(summary))
-    return {"summary": summary, "keep": int(keep)}
+
+
+async def _with_keepalive(agent_iter, timeout: float = 15.0):
+    """Yield agent SSE events, injecting a keepalive sentinel whenever the agent
+    goes silent for `timeout` seconds so idle sockets survive proxy/OS/TCP
+    timeouts mid-stream. The frontend's parseFrame ignores `: `-prefixed lines,
+    so the comment never reaches onEvent and never resets the stall watchdog."""
+    pending = None
+    while True:
+        if pending is None:
+            pending = asyncio.ensure_future(agent_iter.__anext__())
+        try:
+            # shield keeps the in-flight __anext__() alive across timeouts so a
+            # slow event isn't dropped — we just keep waiting and emit sentinels.
+            event = await asyncio.wait_for(asyncio.shield(pending), timeout=timeout)
+            pending = None
+            yield event
+        except asyncio.TimeoutError:
+            yield {"kind": "_keepalive"}
+        except StopAsyncIteration:
+            return
 
 
 @app.post("/chat/stream")
@@ -1001,7 +1057,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def event_gen():
         try:
-            async for event in run_agent(
+            async for event in _with_keepalive(
+                run_agent(
                 provider=req.provider,
                 model_name=req.model,
                 base_url=req.base_url,
@@ -1034,8 +1091,12 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 chat_id=req.chat_id,
                 reserved=req.reserved,
                 providers=req.providers,
+                )
             ):
-                yield _sse(event)
+                if event.get("kind") == "_keepalive":
+                    yield ": keepalive\n\n"
+                else:
+                    yield _sse(event)
 
         except asyncio.CancelledError:
             # Client disconnected (aborted the stream): the run_agent generator

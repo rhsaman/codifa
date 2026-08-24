@@ -1236,14 +1236,18 @@ async def _run_mode_turn(
         _no_so = False
         # --- Repetition-loop guard -----------------------------------------
         # Some models fall into a degenerate loop where they emit the SAME text
-        # and the SAME tool call on every step. Without a guard the backend
-        # streams that one sentence dozens of times (the user sees a "message
-        # that repeats itself"). If the last N steps are identical we stop and
-        # report it instead of looping up to MAX_STEPS.
+        # on every step -- often while calling a DIFFERENT tool each time (e.g.
+        # reading a new file). Without a guard the backend streams that one
+        # sentence dozens of times (the user sees a "message that repeats
+        # itself"). We detect a run of identical emitted text and stop, instead
+        # of looping up to MAX_STEPS. We compare ONLY the text (not the tool
+        # calls) because the loop variant we actually hit keeps the text
+        # byte-identical while varying the tool, and we require a minimum length
+        # so short filler lines in normal multi-step work are never flagged.
         _last_step_text = ""
-        _last_step_tools = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
+        _MIN_REPEAT_LEN = 20
         while steps < MAX_STEPS:
             steps += 1
             # Live steer injection: user messages typed mid-run.
@@ -1331,29 +1335,28 @@ async def _run_mode_turn(
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
                 break
             # --- Repetition-loop detection ----------------------------------
-            # Compare this step's emitted text + tool calls against the previous
-            # step. A model stuck in a loop produces byte-identical steps, so a
-            # short run of identical steps is a reliable signal. We only check
-            # steps that carry tool calls (the final text-only step already
-            # broke above), so normal multi-step work is never flagged.
-            _step_tools = json.dumps(
-                getattr(ai, "tool_calls", None) or [],
-                sort_keys=True,
-                default=str,
-            )
-            if _step_text == _last_step_text and _step_tools == _last_step_tools:
+            # Compare this step's emitted text against the previous step. A model
+            # stuck in a loop keeps emitting byte-identical text (while often
+            # varying the tool call), so a short run of identical text is a
+            # reliable signal. We only check steps that carry tool calls (the
+            # final text-only step already broke above), and we ignore very short
+            # text so normal filler lines in multi-step work are never flagged.
+            if (
+                _step_text
+                and len(_step_text) >= _MIN_REPEAT_LEN
+                and _step_text == _last_step_text
+            ):
                 _repeat_count += 1
             else:
                 _repeat_count = 0
             _last_step_text = _step_text
-            _last_step_tools = _step_tools
             if _repeat_count >= _MAX_REPEAT:
                 queue.put_nowait(
                     {
                         "kind": "error",
                         "content": (
                             "The model entered a repetition loop (it kept emitting "
-                            "the same text and tool calls). Stopping to avoid an "
+                            "the same text on every step). Stopping to avoid an "
                             "endless, duplicated response. Try rephrasing your "
                             "request or breaking it into smaller steps."
                         ),

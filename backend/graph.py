@@ -2229,7 +2229,7 @@ def _build_tree(root: str, max_depth: int = 3, max_entries: int = 400) -> str:
     skip_dirs = {
         ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
         "build", "target", ".mypy_cache", ".pytest_cache", "skills",
-        "release", "_tmp_user_cfg",
+        "release",
     }
     base = root.rstrip(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -2266,7 +2266,6 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
         ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
         "build", "target", ".mypy_cache", ".pytest_cache", ".next", "out",
         "coverage", ".idea", ".vscode", ".turbo", "skills", "release",
-        "_tmp_user_cfg",
     }
     out: list[str] = []
     base = root.rstrip(os.sep)
@@ -2312,7 +2311,7 @@ def _is_skill_path(path: str) -> bool:
 # Directories that must never be surfaced as project code during repo
 # discovery. Note: ``backend/tests/*.py`` (real test source) is intentionally
 # NOT excluded — test files are needed when the user asks to write tests.
-_EXCLUDED_DISCOVERY_DIRS = {"skills", "release", "_tmp_user_cfg"}
+_EXCLUDED_DISCOVERY_DIRS = {"skills", "release"}
 
 
 def _is_excluded_discovery_path(path: str) -> bool:
@@ -2322,8 +2321,6 @@ def _is_excluded_discovery_path(path: str) -> bool:
     * ``release`` — a full *bundled duplicate copy* of the app that ships
       inside the repo (e.g. ``release/mac-arm64/.../backend/...``); walking it
       double-counts the whole codebase and blows the discovery budget.
-    * ``_tmp_user_cfg`` — test-generated temp config (``plan.meta.json`` etc.),
-      not real source.
 
     Test source (``backend/tests/*.py``) stays discoverable on purpose."""
     return any(p in _EXCLUDED_DISCOVERY_DIRS for p in re.split(r"[/\\]", (path or "").strip()))

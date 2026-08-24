@@ -10,9 +10,9 @@ Parent = opencode (deepseek-v4-flash-free). Sub-agent entries:
 """
 import os
 import sys
+import tempfile
 
-_TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_user_cfg")
-os.makedirs(_TMP, exist_ok=True)
+_TMP = tempfile.mkdtemp(prefix="coder-user-cfg-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
 _THIS = os.path.dirname(os.path.abspath(__file__))

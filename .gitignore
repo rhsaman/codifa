@@ -39,7 +39,7 @@ out/
 *.pkg
 
 # Test temp artifacts (real test files ARE tracked — see test/ and backend/tests/)
-backend/tests/_tmp_*/
+backend/test/_tmp_*/
 test/.tmp-*
 test/dump-ssr.out.mjs
 

@@ -12,6 +12,7 @@ import os
 import pytest
 
 import graph
+import tools
 from graph import (
     _ask_needs_repo,
     _explicit_files,
@@ -21,6 +22,17 @@ from graph import (
     _route_ask_entry,
     reader_read,
 )
+
+
+def _make_read(root):
+    """Build the real `read` tool bound to ``root`` with a no-op emit."""
+    captured = []
+
+    def emit(event):
+        captured.append(event)
+
+    cbs = tools.make_tool_callbacks(root, emit)
+    return cbs["read"], captured
 
 
 def _repo(tmp_path):
@@ -311,3 +323,77 @@ async def test_reader_read_line_ref_window(tmp_path, monkeypatch):
     }
     result = await reader_read(state)
     assert "--- backend/graph.py:20-80 ---" in result["read_context"]
+
+
+# --- read tool: opencode-style format & pagination ------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_file_xml_format(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("alpha\nbeta\ngamma\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py")
+    assert "<path>a.py</path>" in out
+    assert "<type>file</type>" in out
+    assert "<content>" in out
+    assert "1 | alpha" in out
+    assert "2 | beta" in out
+    assert "3 | gamma" in out
+    assert "(End of file - total 3 lines)" in out
+
+
+@pytest.mark.asyncio
+async def test_read_file_more_footer(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("".join(f"line{i}\n" for i in range(1, 21)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py", offset=1, limit=5)
+    assert "(Showing lines 1-5 of 20. Use offset=6 to continue.)" in out
+    assert "<path>a.py</path>" in out
+    assert "<type>file</type>" in out
+
+
+@pytest.mark.asyncio
+async def test_read_file_cut_footer(tmp_path):
+    # Many SHORT lines so the accumulated output crosses the 50 KB byte cap
+    # (MAX_READ_EXCERPT_BYTES) well before the line `limit`, exercising the
+    # `cut` branch (not `more`). Each line is ~100 bytes; 1000 lines > 50 KB.
+    f = tmp_path / "big.py"
+    f.write_text("".join(f"x = {i:06d} " + "y" * 80 + "\n" for i in range(1000)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="big.py", offset=1, limit=2000)
+    assert "Output capped at" in out
+    assert "Use offset=" in out
+    assert "(End of file" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_dir_xml_format(tmp_path):
+    (tmp_path / "a.py").write_text("a\n")
+    (tmp_path / "b.py").write_text("b\n")
+    (tmp_path / "sub").mkdir()
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath=".")
+    assert "<path>." in out
+    assert "<type>directory</type>" in out
+    assert "<entries>" in out
+    assert "a.py" in out
+    assert "b.py" in out
+    assert "sub/" in out
+    assert "(3 entries)" in out
+
+
+@pytest.mark.asyncio
+async def test_read_dir_paginated_footer(tmp_path):
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("x\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath=".", offset=1, limit=2)
+    assert "Showing 2 of 5 entries" in out
+    assert "Use 'offset' parameter to read beyond entry 2" in out

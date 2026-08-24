@@ -8,9 +8,9 @@ fallback to the main model in the app).
 import asyncio
 import os
 import sys
+import tempfile
 
-_TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_live")
-os.makedirs(_TMP, exist_ok=True)
+_TMP = tempfile.mkdtemp(prefix="coder-live-subagent-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
 _THIS = os.path.dirname(os.path.abspath(__file__))

@@ -773,16 +773,23 @@ MAX_READ_EXCERPT_BYTES = 50_000  # total read-tool output cap, like opencode's r
 def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
     """Read a slice of ``path``'s lines, opencode ``read``-style.
 
-    Returns ``{"path", "lines": [{line, text}], "start", "total", "truncated"}``.
+    Returns ``{"path", "lines": [{line, text}], "start", "total", "cut", "more"}``.
     ``offset`` is 1-indexed; ``limit`` caps the number of lines returned (both
     defaulted by the caller). Long lines are truncated to ``MAX_LINE_LENGTH``.
     Reads the file streaming (line by line) so it works on big files.
+
+    ``cut`` is True when the 50 KB byte cap (``MAX_READ_EXCERPT_BYTES``) was hit
+    -- the file is bigger than what fits in one read even with a large ``limit``.
+    ``more`` is True when the ``limit`` line cap was hit -- there are more lines
+    beyond the returned window. The caller uses these to pick the right footer,
+    exactly like opencode's ``flags.cut`` / ``flags.more``.
     """
     start = max(1, int(offset or 1))
     cap = max(1, int(limit or 0))
     lines: list[dict] = []
     total = 0
-    truncated = False
+    cut = False        # hit the 50 KB byte cap
+    more = False       # hit the `limit` line cap
     bytes_used = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -801,7 +808,7 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                 # context even when `limit` is large.
                 size = len(text.encode("utf-8", errors="replace")) + 1
                 if bytes_used + size > MAX_READ_EXCERPT_BYTES:
-                    truncated = True
+                    cut = True
                     # keep scanning to count total lines (cheap) so the footer is right
                     for _extra in fh:
                         total += 1
@@ -809,7 +816,7 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                 lines.append({"line": lineno, "text": text})
                 bytes_used += size
                 if len(lines) >= cap:
-                    truncated = True
+                    more = True
                     # keep scanning to count total lines (cheap) so the footer is right
                     for _extra in fh:
                         total += 1
@@ -821,14 +828,16 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
             "lines": [],
             "start": start,
             "total": 0,
-            "truncated": False,
+            "cut": False,
+            "more": False,
         }
     return {
         "path": path,
         "lines": lines,
         "start": start,
         "total": total,
-        "truncated": truncated,
+        "cut": cut,
+        "more": more,
     }
 
 
@@ -3651,17 +3660,25 @@ Returns each match as a single `path:line:match` line (the matching line only â€
         lines = excerpt["lines"]
         start = excerpt["start"]
         total = excerpt["total"]
-        truncated = excerpt["truncated"]
         if not lines:
             msg = f"line offset {start} is past the end of the file ({total} lines)"
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
-        if truncated:
-            next_line = lines[-1]["line"] + 1
-            body = f"{body}\n\n(Showing lines {start}-{lines[-1]['line']} of {total}. Use offset={next_line} to continue.)"
+        last = lines[-1]["line"]
+        next_line = last + 1
+        if excerpt["cut"]:
+            body += (
+                f"\n\n(Output capped at {MAX_READ_EXCERPT_BYTES // 1024} KB. "
+                f"Showing lines {start}-{last}. Use offset={next_line} to continue.)"
+            )
+        elif excerpt["more"]:
+            body += (
+                f"\n\n(Showing lines {start}-{last} of {total}. "
+                f"Use offset={next_line} to continue.)"
+            )
         else:
-            body = f"{body}\n\n(End of file â€” total {total} lines)"
+            body += f"\n\n(End of file - total {total} lines)"
         emit(
             {
                 "kind": "tool_result",
@@ -3670,7 +3687,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 "model": _main_name,
             }
         )
-        return f"File: {filePath}\nLines: {start}-{lines[-1]['line']} of {total}\n{body}"
+        return f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
 
     async def _read_dir_tool(
         target: str, filePath: str, offset: int, limit: int, _model: str = ""
@@ -3694,10 +3711,12 @@ Returns each match as a single `path:line:match` line (the matching line only â€
         start = max(1, int(offset or 1))
         count = max(1, min(int(limit or 2000), 2000))
         window = entries[start - 1 : start - 1 + count]
+        truncated = start - 1 + len(window) < len(entries)
         footer = (
-            f"({len(entries)} entries, showing {start}-{start - 1 + len(window)})"
-            if start - 1 + len(window) < len(entries)
-            else f"({len(entries)} entries)"
+            f"\n(Showing {len(window)} of {len(entries)} entries. "
+            f"Use 'offset' parameter to read beyond entry {start + len(window) - 1})"
+            if truncated
+            else f"\n({len(entries)} entries)"
         )
         body = "\n".join(window) if window else "(empty directory)"
         emit(
@@ -3708,7 +3727,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 "model": _model,
             }
         )
-        return f"DIRECTORY {filePath or '/'}\n{body}\n{footer}"
+        return f"<path>{filePath or '/'}</path>\n<type>directory</type>\n<entries>\n{body}\n{footer}\n</entries>"
 
     async def task_tool(
         description: str, prompt: str, subagent_type: str, task_id: str = ""

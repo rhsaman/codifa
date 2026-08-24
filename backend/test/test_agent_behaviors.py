@@ -257,3 +257,15 @@ async def test_plan_readonly_terminal_blocks_discovery_commands():
     for cmd in allowed:
         out = await wrapped(cmd)
         assert out == "RAN:" + cmd, f"expected allow for {cmd!r}, got {out!r}"
+
+
+def test_plan_output_contract_requires_summary():
+    """Plan mode's output contract must force a short summary at the end of every
+    plan so the user can grasp the goal/changed files/outcome quickly — and the
+    summary must follow the plan's own language (not be hard-coded to one)."""
+    from agents import _MODE_OUTPUT
+
+    contract = _MODE_OUTPUT["plan"].lower()
+    assert "summary" in contract, "plan contract must require a summary section"
+    assert "same language" in contract, \
+        "plan contract must require the summary in the plan's own language"

@@ -12,9 +12,9 @@ Run: cd backend && uv run python -m pytest tests/test_subagent_models.py -q
 """
 import os
 import sys
+import tempfile
 
-_TMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_user_cfg")
-os.makedirs(_TMP, exist_ok=True)
+_TMP = tempfile.mkdtemp(prefix="coder-subagent-models-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
 _THIS = os.path.dirname(os.path.abspath(__file__))

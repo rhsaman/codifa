@@ -12,6 +12,7 @@ from agents import (
     _AUTO_EXPLORE_THRESHOLD,
     _AUTO_EXPLORE_WEB_THRESHOLD,
     _reset_search_call_count,
+    _SUB_AGENT_CTX,
     _wrap_auto_explore_router,
 )
 
@@ -96,3 +97,35 @@ async def test_counter_resets_per_turn():
     _reset_search_call_count()
     out = await tool(pattern="x", path="src", include="*.py" if False else "*.py")
     assert out == "DIRECT"
+
+
+async def test_subagent_tools_run_directly_even_when_broad():
+    """The explore sub-agent must never route its own searches back to itself.
+
+    Inside the sub-agent context (``_SUB_AGENT_CTX`` set), even a repo-wide grep
+    or repeated calls must run directly — otherwise the sub-agent deadlocks with
+    "explore is blocked" hints and makes zero real tool calls.
+    """
+    tool = _wrap("grep")
+    token = _SUB_AGENT_CTX.set(True)
+    try:
+        # A repo-wide grep (broad) must still run directly inside the sub-agent.
+        assert await tool(pattern="TODO") == "DIRECT"
+        # Repeated calls past the threshold must also run directly.
+        for _ in range(_AUTO_EXPLORE_THRESHOLD + 2):
+            assert await tool(pattern="x", path="src", include="*.py") == "DIRECT"
+    finally:
+        _SUB_AGENT_CTX.reset(token)
+
+
+async def test_subagent_web_tools_run_directly():
+    """web_search/fetch_url inside the sub-agent run directly, not routed."""
+    web = _wrap("web_search")
+    fetch = _wrap("fetch_url")
+    token = _SUB_AGENT_CTX.set(True)
+    try:
+        for _ in range(_AUTO_EXPLORE_WEB_THRESHOLD + 2):
+            assert await web(query="x") == "DIRECT"
+            assert await fetch(url="https://example.com/doc") == "DIRECT"
+    finally:
+        _SUB_AGENT_CTX.reset(token)

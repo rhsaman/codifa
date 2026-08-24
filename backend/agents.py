@@ -42,6 +42,7 @@ from secret_utils import decrypt_secret
 from tools import (
     _PARENT_TOOLS_CTX,
     _SCOUT_CTX,
+    _SUB_AGENT_CTX,
     LOG_FILENAME,
     PathEscapeError,
     _is_text_path,
@@ -617,6 +618,12 @@ def _wrap_auto_explore_router(fn: Callable):
 
     @functools.wraps(fn)
     async def wrapped(*args, **kwargs):
+        # The explore sub-agent already runs in an isolated context — it must
+        # never route its own searches back to itself (that deadlocks it with
+        # "explore is blocked" hints and zero real tool calls). Only the MAIN
+        # agent's search/web tools are routed; sub-agent tools run directly.
+        if _SUB_AGENT_CTX.get():
+            return await fn(*args, **kwargs)
         _SEARCH_CALL_COUNT_CTX.set(_SEARCH_CALL_COUNT_CTX.get() + 1)
         count = _SEARCH_CALL_COUNT_CTX.get()
         threshold = (
@@ -3395,7 +3402,10 @@ _MODE_OUTPUT = {
         "Your reply MUST be an implementation plan: open with '## Plan', then ordered steps with exact file paths "
         "and line targets, targeted snippets for Coder mode, and how to verify — never do the work, and end by "
         "offering to switch to Coder mode to implement it. End the plan with a 'Files: path1, path2, ...' line "
-        "listing every file the implementation will touch."
+        "listing every file the implementation will touch. ALWAYS append a short summary section at the very end "
+        "of the plan — a few scannable bullets covering the goal, the changed files, and the outcome, so the user "
+        "can grasp it quickly without re-reading the whole plan. The summary MUST be written in the SAME language "
+        "as the rest of the plan (e.g. '## خلاصه' if the plan is in Persian, '## Summary' if in English, etc.)."
     ),
     "coder": "",
 }

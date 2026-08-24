@@ -1,1 +1,0 @@
-render_header is defined in ui.py and returns the model's reported context capacity; for local models the header may not show it if the window isn't reported.

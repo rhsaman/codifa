@@ -123,6 +123,77 @@ def test_save_plan_tool_removed_from_registry():
     assert "save_plan" not in _tools
 
 
+@pytest.mark.asyncio
+async def test_update_plan_persists_checklist(tmp_path, monkeypatch):
+    # update_plan must write the checklist to disk (not just emit to the UI),
+    # so todos survive reloads.
+    saved = {}
+
+    def fake_save_plan_checklist(workspace, title, items, chat_id=""):
+        saved["items"] = items
+        saved["chat_id"] = chat_id
+
+    monkeypatch.setattr(
+        graph.state_db, "save_plan_checklist", fake_save_plan_checklist
+    )
+
+    from tools import make_tool_callbacks
+
+    events = []
+
+    def emit(ev):
+        events.append(ev)
+
+    tools = make_tool_callbacks(
+        root=str(tmp_path), emit=emit, main_model=None, chat_id="c1"
+    )
+    items = [
+        {"content": "step one", "status": "completed"},
+        {"content": "step two", "status": "in_progress"},
+        {"content": "step three", "status": "pending"},
+    ]
+    result = await tools["update_plan"](items)
+
+    assert "Plan updated" in result
+    assert saved.get("chat_id") == "c1"
+    assert len(saved.get("items", [])) == 3
+    # The plan event must still be emitted to the UI.
+    assert any(e.get("kind") == "plan" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_plan_build_logs_on_save_failure(tmp_path, monkeypatch):
+    # A failing save_plan must NOT be silently swallowed — the reply is still
+    # returned and the failure is logged (not raising into the caller).
+    root = str(tmp_path)
+    reply = "## Plan\n1. do the thing\nFiles: backend/graph.py"
+
+    def boom(workspace, title, content, chat_id=""):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(graph.state_db, "save_plan", boom)
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
+
+    state, q = _state(root, reply)
+    # Should not raise; returns the reply unchanged.
+    result = await plan_build(state)
+    assert result["plan"] == reply
+
+
+@pytest.mark.asyncio
+async def test_plan_build_handles_non_string_reply(tmp_path, monkeypatch):
+    # If the turn returns None (or any non-str), plan_build must not crash on
+    # .strip() and must return an empty plan string.
+    root = str(tmp_path)
+
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(None))
+    monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: None)
+
+    state, q = _state(root, "")
+    result = await plan_build(state)
+    assert result["plan"] == ""
+
+
 def _await(value):
     async def _coro():
         return value

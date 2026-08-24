@@ -136,3 +136,55 @@ async def test_vision_prefetch_failure_injects_note(run_events):
     assert any(
         "Settings → Subagents → Vision" in _all_text(b) for b in mock.captured
     ), "pre-fetch failure note should tell the user to configure a Vision model"
+
+
+@pytest.mark.asyncio
+async def test_vision_retries_transient_500_then_succeeds(run_events):
+    # A transient 500 on the FIRST vision request must be retried (not silently
+    # dropped). The retry recovers and the analysis is injected normally.
+    mock.script = [
+        text_reply("PREFETCH_ANALYSIS after a transient 500"),
+        text_reply("FINAL_ANSWER based on the analysis"),
+    ]
+    # 500 on request index 0 (the vision pre-fetch); the retry hits index 1.
+    mock.error_at = {0: (500, "transient server error")}
+    await run_events(
+        "what do you see in this image?",
+        mode="ask",
+        subagent_models={"vision": "mock-model"},
+        images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
+    )
+    # The analysis recovered from the 500 and was injected into the main model.
+    assert any(
+        "PREFETCH_ANALYSIS" in _all_text(b) for b in mock.captured
+    ), "vision did not recover from a transient 500 and inject the analysis"
+    # Exactly two vision requests were made (one 500 + one successful retry),
+    # proving the transient failure was retried rather than silently dropped.
+    vision_requests = [b for b in mock.captured if _has_image(b)]
+    assert len(vision_requests) == 2, \
+        "a transient 500 should be retried (expected 2 vision requests)"
+
+
+@pytest.mark.asyncio
+async def test_vision_non_transient_400_not_retried(run_events):
+    # A permanent 400 must NOT be retried — it should surface immediately as a
+    # diagnostic note (no wasted retries, no silent drop).
+    mock.script = [text_reply("FINAL_ANSWER")]
+    mock.error_at = {0: (400, "vision boom")}
+    await run_events(
+        "what do you see in this image?",
+        mode="ask",
+        subagent_models={"vision": "mock-model"},
+        images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
+    )
+    # The 400 is permanent -> no retry -> the diagnostic note is injected.
+    assert any(
+        "could not analyze" in _all_text(b) for b in mock.captured
+    ), "permanent 400 failure did not inject a diagnostic note"
+    # Exactly one vision request was attempted (no retry on a 400).
+    vision_requests = [
+        b for b in mock.captured
+        if _has_image(b)
+    ]
+    assert len(vision_requests) == 1, \
+        "a permanent 400 should not be retried (expected 1 vision request)"

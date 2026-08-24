@@ -741,6 +741,23 @@ _TEST_DIR_RULE = (
     "or far from the code under test."
 )
 
+# Doing-tasks guidance (mirrors opencode's "Doing tasks" section): how to use the
+# search tools, verify work, and what NOT to do. Appended to every mode's prompt
+# via graph.py so the agent behaves consistently across ask/coder/plan.
+_DOING_TASKS = (
+    "\n\nDOING TASKS (every implementation/search mode):\n"
+    "1. Use the available search tools (grep/glob/read) to understand the "
+    "codebase and the user's query. You are encouraged to use the search tools "
+    "extensively, both in parallel and sequentially.\n"
+    "2. Implement the solution using all tools available to you.\n"
+    "3. Verify the solution if possible with tests. NEVER assume a specific "
+    "test framework or script — check the project's setup first.\n"
+    "4. The pipeline auto-checks syntax/typecheck after each write/edit — trust "
+    "it; do not re-run verification yourself unless a test fails or the user "
+    "asks.\n"
+    "5. NEVER commit changes unless the user explicitly asks you to."
+)
+
 # The search strategy is a FIRST-CLASS rule: it sits at the very top of
 # every mode's prompt (right after the mode declaration + language rule) so the
 # agent always picks the right tool for the breadth of the search. It replaces
@@ -1029,83 +1046,12 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
     return any(p in low for p in _QUOTA_EXHAUSTED_PHRASES)
 
 
-# Retry-hints that mark a 429 as a SHORT-LIVED throttle (the gateway asks us to
-# wait and try again) rather than a hard daily/monthly/credit exhaustion, which
-# will keep failing for minutes or hours.
-_THROTTLE_HINT_PHRASES = (
-    "try again later",
-    "please try again",
-    "please retry",
-    "retry after",
-    "try again in",
-    "temporarily",
-    "too many requests",
-    "slow down",
-    "back off",
-    "later",
-)
-# Throttle-markers that narrow the match to generator/rate-limit errors so a
-# hard-date quota phrase in the same message can't sneak a real exhaustion into
-# the unlimited-retry branch.
-_THROTTLE_RATE_PHRASES = (
-    "rate limit",
-    "ratelimit",
-    "too many requests",
-    "429",
-    "freeusagelimit",
-)
-
-# Bounded retry budget for free-tier throttles and the base backoff (seconds).
-# The graph's retry loop uses these so transient throttles recover without the
-# caller spending the normal retry budget. Configurable so tests can zero it.
-_THROTTLE_MAX_ATTEMPTS = 4
-_THROTTLE_BASE_SECONDS = 30
-
-
-def _is_transient_throttle(exc: BaseException) -> bool:
-    """Detect a SHORT-lived free-tier rate limit (e.g. ``429
-    FreeUsageLimitError: Rate limit exceeded. Please try again later.``) as
-    opposed to a hard quota exhaustion. Such throttles are retried without an
-    attempt ceiling (the user stops them), so the caller must NOT spend the
-    normal bounded retry budget on them — and must NOT write them to the fatal
-    log, since they are expected to recur on free tiers.
-    """
-    # Honor Retry-After when the transport exposes it (e.g. httpx/openai
-    # responses carry `.headers`): its presence means "transient, come back
-    # then", not "exhausted for the day".
-    cur: BaseException | None = exc
-    seen: set[int] = set()
-    earliest_status = 0
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        try:
-            code = int(getattr(cur, "status_code", 0) or 0)
-        except (TypeError, ValueError):
-            code = 0
-        if code:
-            earliest_status = earliest_status or code
-        headers = getattr(cur, "headers", None)
-        if headers:
-            try:
-                val = headers.get("Retry-After") or headers.get("retry-after")
-                if val is not None:
-                    return True
-            except Exception:  # noqa: BLE001, S110 — headers may be a response object
-                pass
-        cur = cur.__cause__
-    text = str(exc)
-    low = text.lower()
-    try:
-        status = int(getattr(exc, "status_code", 0) or 0) or earliest_status
-    except (TypeError, ValueError):
-        status = earliest_status or 0
-    # Only treat a 429 (or a retryable status) as a throttle; a hard quota with
-    # a stray "try again later" inside a 4xx that isn't retryable stays a quota.
-    if status and status not in _RETRYABLE_STATUS:
-        return False
-    if not any(ph in low for ph in _THROTTLE_RATE_PHRASES):
-        return False
-    return any(hint in low for hint in _THROTTLE_HINT_PHRASES)
+# Unified retry budget for ALL transient provider failures (throttle 429, 5xx,
+# timeout, network blip). The graph's retry loop uses these so any transient
+# failure recovers automatically — up to this many attempts, 30s apart — instead
+# of giving up on the first blip. Configurable so tests can zero the backoff.
+_RETRY_MAX_ATTEMPTS = 10
+_RETRY_BASE_SECONDS = 30
 
 
 def _is_image_rejection(exc: BaseException) -> bool:

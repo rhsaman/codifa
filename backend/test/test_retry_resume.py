@@ -3,11 +3,13 @@
 The LangGraph migration removed the old pydantic-ai ``resume_tool`` replay and
 the durable resume-file mechanism. On error the agent now:
 
-* continues on a transient throttle (429) via a bounded backoff, re-sending the
-  REAL transcript (tool results are already in ``messages``) -- no synthetic
-  "you already did X" injection and nothing is persisted to "teach" the model;
-* surfaces a fatal error (400/500) as an ``error`` event and stops gracefully,
-  without writing a durable replay file.
+* continues on ANY transient provider failure (429 throttle, 5xx, timeout,
+  network blip) via a unified bounded backoff (``_RETRY_MAX_ATTEMPTS`` attempts,
+  30s apart), re-sending the REAL transcript (tool results are already in
+  ``messages``) -- no synthetic "you already did X" injection and nothing is
+  persisted to "teach" the model;
+* surfaces a hard/fatal error (400 / quota exhausted / auth) as an ``error``
+  event and stops gracefully, without writing a durable replay file.
 
 Run: pytest backend/tests/test_retry_resume.py (or via run_tests.py).
 """
@@ -92,7 +94,7 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
     """A 429 (free-tier throttle) after a completed write: the turn retries, and
     the model continues from the REAL transcript (the write result is already in
     `messages`) -- nothing is injected or persisted to "teach" it."""
-    monkeypatch.setattr(agents, "_THROTTLE_BASE_SECONDS", 0)
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
@@ -106,7 +108,7 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
 
     retries = _retry_events(events)
     assert retries, "expected an auto-retry event after the throttle"
-    assert "rate limit" in retries[0].get("reason", ""), retries[0]
+    assert "rate limit" in retries[0].get("reason", "").lower(), retries[0]
 
     last = _body_with_write()
     assert last is not None, "expected a captured request containing the write call"
@@ -121,7 +123,7 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
 async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
     """Two consecutive throttles: still exactly one write call (no duplicated
     work), just more retries -- and still no resume- injection."""
-    monkeypatch.setattr(agents, "_THROTTLE_BASE_SECONDS", 0)
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
@@ -148,18 +150,28 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_fatal_500_surfaces_as_error_no_resume(run_events):
-    """A 500 (server error) in the main mode LLM call is fatal, so it surfaces
-    as an `error` event and stops -- there is nothing to replay and nothing to
-    learn. The fatal 500 is aimed at the mode LLM call (request index 0)."""
+async def test_500_retries_then_giveup_after_budget(run_events, monkeypatch):
+    """A 500 (server error) is now a transient failure, so it auto-retries up to
+    the unified budget (``_RETRY_MAX_ATTEMPTS``) instead of surfacing as a fatal
+    error immediately. After exhausting the budget it gives up (a ``retry_giveup``
+    or ``error`` event) rather than hanging forever. Every request is forced to
+    500 so the turn keeps hitting the transient failure until the budget runs
+    out."""
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [text_reply("Done")]
-    mock.error_at = {0: (500, "server error")}
+    # Force a 500 on EVERY request index (0..budget) so the turn never succeeds
+    # before the retry budget is exhausted.
+    mock.error_at = {i: (500, "server error") for i in range(agents._RETRY_MAX_ATTEMPTS + 1)}
 
     events = await run_events("read app.py and summarize it", mode="plan")
 
-    assert not _retry_events(events), "500 is fatal -- no auto-retry"
-    assert any(e.get("kind") == "error" for e in events), \
-        "500 must surface as an error event"
+    retries = _retry_events(events)
+    assert retries, "500 must now auto-retry (it is a transient failure)"
+    assert len(retries) <= agents._RETRY_MAX_ATTEMPTS, \
+        f"retries must stay within the budget, got {len(retries)}"
+    # After exhausting the budget it must give up (retry_giveup or error), not hang.
+    assert any(e.get("kind") in ("retry_giveup", "error") for e in events), \
+        "500 must surface as retry_giveup/error after the budget is spent"
     assert _all_requests_have_no_resume()
 
 

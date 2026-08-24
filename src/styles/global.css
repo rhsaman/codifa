@@ -2566,105 +2566,7 @@ textarea {
     var(--shadow-pop);
 }
 
-/* ---- thinking glow: a comet of light orbiting the composer ---- */
-/* While the model is reasoning, a comet (bright gold head + blue tail) travels
-   around the composer's border at constant speed, with a soft breathing bloom
-   behind the whole box.
-
-   This used to be a single conic-gradient pseudo-element rotated by angle —
-   looked fine on a roughly-square box, but the composer is a very WIDE, SHORT
-   rectangle (~760×90px). A conic-gradient's angle doesn't map to perimeter
-   distance evenly on a non-square box: the comet crawled along the short
-   left/right edges (nearly a full side lit at once) and blurred past almost
-   instantly on the long top/bottom edges — it read as static/broken, not
-   "rotating". See ComposerThinkingRing in Chat.tsx.
-
-   The fix is an SVG rounded-rect stroke with `pathLength={100}`: dasharray/
-   dashoffset are then expressed as a PERCENTAGE OF THE ACTUAL PERIMETER,
-   however wide or tall the box is, so animating stroke-dashoffset linearly
-   moves the comet at genuinely constant visual speed all the way around —
-   no distortion on any aspect ratio. Three stacked rects, same rect geometry,
-   same animation: a wide blurred halo, a thin blue tail, a short bright head
-   sitting at the tail's leading edge (both dasharrays start at 0, so the
-   head's short "on" segment sits inside the tail's longer one). */
-.composer.thinking .composer-inner {
-  position: relative;
-  animation: composer-thinking-breathe 3s ease-in-out infinite;
-}
-
-.composer-thinking-ring {
-  position: absolute;
-  inset: 1.5px;
-  width: calc(100% - 3px);
-  height: calc(100% - 3px);
-  overflow: visible;
-  pointer-events: none;
-  z-index: 3;
-}
-
-.composer-thinking-ring rect {
-  fill: none;
-  stroke-linecap: round;
-  /* A brisk, even orbit reads as "actively working through a thought" —
-     fast enough to feel alive, even enough not to feel frantic. */
-  animation: composer-ring-travel 1.8s linear infinite;
-}
-
-.composer-thinking-ring-halo {
-  stroke: var(--accent);
-  stroke-width: 7;
-  stroke-dasharray: 26 74;
-  opacity: 0.3;
-  filter: blur(6px);
-}
-
-.composer-thinking-ring-tail {
-  stroke: url(#composer-thinking-grad);
-  stroke-width: 2.25;
-  stroke-dasharray: 26 74;
-  opacity: 0.9;
-}
-
-.composer-thinking-ring-head {
-  stroke: color-mix(in srgb, var(--thinking) 85%, #fff 15%);
-  stroke-width: 2.5;
-  stroke-dasharray: 6 94;
-}
-
-@keyframes composer-ring-travel {
-  to {
-    stroke-dashoffset: -100;
-  }
-}
-
-@keyframes composer-thinking-breathe {
-  0%,
-  100% {
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent),
-      0 0 22px color-mix(in srgb, var(--accent) 12%, transparent),
-      var(--shadow-pop);
-  }
-  50% {
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
-      0 0 38px color-mix(in srgb, var(--accent) 20%, transparent),
-      var(--shadow-pop);
-  }
-}
-
-/* Respect users who prefer less motion: a working-status indicator
-   communicates real state (not decorative motion), so instead of freezing it
-   entirely we just slow it way down — it still visibly progresses, but calmly. */
-@media (prefers-reduced-motion: reduce) {
-  .composer.thinking .composer-inner {
-    animation-duration: 8s;
-  }
-  .composer-thinking-ring rect {
-    animation-duration: 9s;
-  }
-}
-
+/* ---- composer drop overlay ---- */
 .drop-overlay {
   position: absolute;
   inset: 6px 16px;
@@ -2682,6 +2584,7 @@ textarea {
 }
 
 .composer-inner {
+  position: relative;
   max-width: 760px;
   margin: 0 auto;
   display: flex;
@@ -3659,28 +3562,6 @@ textarea {
 .tool-sub-row .tool-ms {
   flex: 0 0 auto;
   padding-left: 10px;
-}
-
-/* Sub-agent model badge: small tonal pill inside the sub-row, so the model
-   that ACTUALLY ran each read/grep/glob is visible at a glance (the sub-agent
-   model, or the main model after a per-sub-search fallback). Text uses the
-   theme text color for contrast; the tint keeps the tool's accent identity. */
-.tool-sub-row .tool-model-badge {
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--text);
-  background: color-mix(in srgb, var(--tool-color, var(--accent)) 22%, transparent);
-  border: none;
-  border-radius: 999px;
-  padding: 1px 7px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 18ch;
-  flex: 0 0 auto;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
 }
 
 .tool-sub-list .tool-card {
@@ -6177,23 +6058,34 @@ textarea {
 
 /* ---- retry banner ---- */
 /* Provider/connection errors use the theme's danger hue (same as .notice-error)
-   so an error reads as an error — not the amber "thinking" color. */
+   so an error reads as an error — not the amber "thinking" color. The banner is
+   intentionally styled to match .notice-banner (border-left + shadow + entrance
+   animation) so every notification in the chat reads as one coherent system. */
 .retry-banner {
   display: flex;
   align-items: center;
   gap: 8px;
-  border: 1px solid var(--border);
+  padding: 8px 12px;
+  border: none;
   border-left: 3px solid var(--danger);
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--danger) 8%, var(--bg));
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg));
   margin: 4px 0;
-  padding: 7px 12px;
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--text);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 16%, transparent);
+  animation: notice-in 0.25s ease;
+  transition: opacity 0.5s ease, transform 0.5s ease;
 }
 
 .retry-banner .spinner {
   border-top-color: var(--danger);
+}
+
+.retry-banner .retry-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .retry-banner .retry-reason {
@@ -6213,44 +6105,44 @@ textarea {
 }
 
 .retry-banner .retry-cancel {
-  margin-left: auto;
-  padding: 2px 6px;
-  font-size: 11px;
-  line-height: 1;
-  color: var(--text-dim);
+  flex: 0 0 auto;
+  border: none;
   background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  color: var(--text-dim, var(--text));
+  font-size: 13px;
+  line-height: 1;
   cursor: pointer;
-  opacity: 0.6;
+  padding: 2px 4px;
+  border-radius: 4px;
   transition:
     opacity 0.15s,
     background 0.15s;
 }
 
 .retry-banner .retry-cancel:hover {
-  opacity: 1;
-  background: color-mix(in srgb, var(--text) 10%, var(--bg));
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
 }
 
 .retry-banner .retry-btn {
-  margin-left: auto;
-  padding: 3px 12px;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 5px;
+  background: var(--accent);
+  color: var(--on-accent);
   font-size: 12px;
   font-weight: 600;
-  color: var(--on-accent);
-  background: var(--danger);
-  border: none;
-  border-radius: var(--radius-sm);
+  padding: 3px 12px;
   cursor: pointer;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
   transition:
     opacity 0.15s,
     background 0.15s;
 }
 
 .retry-banner .retry-btn:hover {
-  background: color-mix(in srgb, var(--danger) 82%, white);
-  color: var(--on-accent);
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
 /* Sub-agent model hard-failed → tool fell back to the MAIN model. Distinct
@@ -6728,6 +6620,7 @@ textarea {
 .tool-single {
   --tool-color: var(--accent);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -6971,6 +6864,7 @@ textarea {
 
 .tool-timeline-item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 5px 0;
@@ -7139,7 +7033,7 @@ textarea {
 }
 
 .web-results {
-  margin: 4px 0 0;
+  margin: 6px 0 0;
   padding: 0;
   list-style: none;
   display: flex;
@@ -7147,23 +7041,122 @@ textarea {
   gap: 6px;
 }
 
+/* When the link list sits inside a compact one-line tool row (single row or
+   timeline row), force it onto its own line at the bottom-left instead of
+   flowing inline beside the icon/label. */
+.tool-single > .web-results,
+.tool-timeline-item > .web-results {
+  flex-basis: 100%;
+  margin-top: 4px;
+}
+
 .web-result {
-  border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  padding-left: 8px;
   overflow: hidden;
 }
 
 .web-result-link {
-  display: block;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--accent);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elev));
   text-decoration: none;
-  word-break: break-word;
+  color: var(--text);
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease,
+    box-shadow 0.16s ease;
 }
 
 .web-result-link:hover {
-  text-decoration: underline;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.web-result-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.web-result-favicon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.web-result-favicon img {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+.web-result-glyph {
+  font-size: 12px;
+  line-height: 1;
+}
+
+.web-result-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.web-result-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.web-result-snippet {
+  font-size: 11px;
+  color: var(--text-dim, #8a8a8a);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.web-result-host {
+  flex: 0 0 auto;
+  align-self: center;
+  max-width: 130px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim, #8a8a8a);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 999px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.web-result-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-dim, #8a8a8a);
+  transition: color 0.16s ease, transform 0.16s ease;
+}
+
+.web-result-link:hover .web-result-arrow {
+  color: var(--accent);
+  transform: translate(1px, -1px);
 }
 
 .revert-btn {

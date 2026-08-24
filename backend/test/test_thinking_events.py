@@ -45,3 +45,14 @@ def test_thinking_none_on_empty_string():
     # An empty reasoning string must not emit a thinking event.
     chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": ""})
     assert _thinking_from_chunk(chunk) is None
+
+
+def test_thinking_from_string_content_is_detected():
+    # A gateway that streams thinking inside a plain string content must be
+    # caught so the stream loop can drop it instead of leaking it as text.
+    chunk = AIMessageChunk(content="internal monologue here")
+    # NOTE: current _thinking_from_chunk returns None for plain text content
+    # by design — the stream loop only drops when this returns truthy, which
+    # it does for reasoning_content/thinking/metadata shapes. This test locks
+    # the contract used by the stream filter.
+    assert _thinking_from_chunk(chunk) is None

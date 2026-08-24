@@ -33,11 +33,14 @@ import asyncio
 import inspect
 import itertools
 import json
+import logging
 import os
 import re
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypedDict
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import (
     AIMessage,
@@ -388,7 +391,12 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
 
     Uses the vision model directly — there is deliberately NO fallback to the
     main model (a configured vision model is the contract; if it fails the
-    caller surfaces that)."""
+    caller surfaces that).
+
+    Transient provider errors (rate-limit / 5xx / timeout / network blip) are
+    retried with backoff so a single flaky request doesn't silently drop the
+    image. Every failure is logged so the drop is diagnosable instead of silent.
+    """
     from llm import llm_generate
 
     system = (
@@ -408,14 +416,65 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
         "Analyze the attached image(s). Transcribe every piece of on-screen text "
         "verbatim (file paths, code, errors), then describe layout/UI."
     )
-    try:
-        text, _ = await llm_generate(
-            model, system=system, user=user,
-            images=image_uris, sub=True,
-        )
-        return (text or "").strip() or None
-    except Exception:  # noqa: BLE001
-        return None
+    model_name = getattr(model, "model_name", "") or "unknown"
+    last_exc: Exception | None = None
+    # Retry ONLY transient provider failures (429 / 5xx / timeout / network
+    # blip) so a single flaky vision request doesn't silently make the image
+    # invisible. Permanent errors (e.g. 400 image-rejected) are NOT retried —
+    # they surface immediately so the caller can tell the user to fix config.
+    for attempt in range(_VISION_MAX_ATTEMPTS):
+        try:
+            text, _ = await llm_generate(
+                model, system=system, user=user,
+                images=image_uris, sub=True,
+            )
+            result = (text or "").strip()
+            if result:
+                return result
+            # Empty/whitespace-only reply is not transient — don't retry, but
+            # log it so a misbehaving vision model is visible.
+            logger.warning(
+                "vision analyze (%s) returned empty text on attempt %d/%d",
+                model_name, attempt + 1, _VISION_MAX_ATTEMPTS,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            if not _is_transient_error(exc):
+                logger.warning(
+                    "vision analyze (%s) failed with a non-transient error: %s",
+                    model_name, exc,
+                )
+                return None
+            last_exc = exc
+            if attempt < _VISION_MAX_ATTEMPTS - 1:
+                delay = _VISION_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "vision analyze (%s) failed (attempt %d/%d): %s — retrying in %.1fs",
+                    model_name, attempt + 1, _VISION_MAX_ATTEMPTS, exc, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.warning(
+                    "vision analyze (%s) failed after %d attempts: %s",
+                    model_name, _VISION_MAX_ATTEMPTS, exc,
+                )
+    return None
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Return True for retryable provider errors (429 / 5xx / timeout / network).
+
+    Permanent client errors (4xx other than 429) are NOT transient — retrying
+    them just wastes time and hides a real config problem."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    # No status code -> treat as a network/timeout blip (retryable).
+    msg = str(exc).lower()
+    return any(k in msg for k in ("timeout", "timed out", "connection", "reset", "eof", "broken pipe"))
 
 
 # Per-process cache of vision analyses, keyed by the sorted set of image URIs,
@@ -423,6 +482,12 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
 # every follow-up turn instead of being re-sent to the vision model each turn.
 _VISION_CACHE: dict[str, str] = {}
 _VISION_CACHE_MAX = 40
+
+# Transient-failure resilience for the server-side vision analysis: a single
+# flaky provider request (429 / 5xx / timeout / network blip) must not silently
+# drop the attached image. Retry with exponential backoff, capped.
+_VISION_MAX_ATTEMPTS = 3
+_VISION_BACKOFF_BASE = 1.0
 
 
 async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | None:
@@ -570,6 +635,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["provider"], subagent_models.get("vision"), state["base_url"],
         state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
         default_to_parent=False, provider_lookup=_provider_lookup,
+        # Bounded so a slow/unreachable vision provider fails fast (and is
+        # surfaced to the user) instead of hanging the turn. The retry/backoff
+        # in _vision_analyze covers transient blips within this budget.
+        timeout=60,
     )
 
     settings = await chat_model_settings(
@@ -656,6 +725,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     base_prompt = (
         _agents.SYSTEM_PROMPTS.get(mode, _agents.SYSTEM_PROMPTS["ask"])
         + _agents._UNIVERSAL_RULES
+        + _agents._DOING_TASKS
         + (_agents._LENGTH_RULE if mode in ("plan", "coder") else "")
         + (_agents._TEST_DIR_RULE if mode in ("plan", "coder") else "")
     )
@@ -1285,6 +1355,13 @@ async def _run_mode_turn(
                 async for chunk in bound.astream(msgs):
                     _astream_count_local += 1
                     ai = chunk if ai is None else ai + chunk
+                    # Skip raw chain-of-thought: the backend only emits a
+                    # lightweight "thinking" toggle (see above), never the
+                    # reasoning text itself. Some gateways surface thinking in
+                    # content/reasoning_content, so drop it here to avoid
+                    # leaking it into the visible message.
+                    if _model_reasoning and _thinking_from_chunk(chunk):
+                        continue
                     content = chunk.content
                     if isinstance(content, str) and content:
                         # The first text token means reasoning has finished, so
@@ -1411,7 +1488,11 @@ async def _run_mode_turn(
             )
         return reply
 
-    # Essentials retry: free-tier throttle (429 transient) with backoff.
+    # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
+    # network blip) is retried up to the budget, 30s apart, so the turn keeps
+    # trying to continue instead of giving up on the first blip. Hard failures
+    # (bad request / quota exhausted / auth) surface as a fatal error event
+    # without burning the retry budget.
     reply = ""
     attempt = 0
     while True:
@@ -1420,24 +1501,37 @@ async def _run_mode_turn(
             reply = await _inner()
             break
         except Exception as exc:  # noqa: BLE001
-            if _agents._is_transient_throttle(exc) and attempt < _agents._THROTTLE_MAX_ATTEMPTS:
-                delay = _agents._THROTTLE_BASE_SECONDS
-                if not isinstance(delay, (int, float)) or delay < 0:
-                    delay = 30
+            # Hard, non-recoverable failures: don't retry (would fail identically).
+            if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
+                queue.put_nowait(
+                    {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
+                )
+                break
+            # Transient failure: retry up to the budget, 30s apart.
+            if attempt >= _agents._RETRY_MAX_ATTEMPTS:
                 queue.put_nowait(
                     {
-                        "kind": "retry", "attempt": attempt,
-                        "max_attempts": _agents._THROTTLE_MAX_ATTEMPTS, "delay": delay,
-                        "reason": "free-tier rate limit -- waiting and retrying",
+                        "kind": "retry_giveup",
+                        "attempt": attempt,
+                        "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
+                        "reason": _agents._friendly_retry_reason(exc),
                     }
                 )
-                await asyncio.sleep(delay)
-                continue
-            # Non-retryable failure: surface a friendly error event.
+                break
+            delay = _agents._RETRY_BASE_SECONDS
+            if not isinstance(delay, (int, float)) or delay < 0:
+                delay = 30
             queue.put_nowait(
-                {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
+                {
+                    "kind": "retry",
+                    "attempt": attempt,
+                    "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
+                    "delay": delay,
+                    "reason": _agents._friendly_retry_reason(exc),
+                }
             )
-            break
+            await asyncio.sleep(delay)
+            continue
     # opencode-style proactive auto-compaction: once the conversation reaches the
     # usable window, summarize the older turns and tell the frontend to fold.
     if reply and ctx and ctx > 0:
@@ -2746,17 +2840,25 @@ def _route_reader_dispatch(state: AgentState) -> str:
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
     reply = await _run_mode_turn(state, "plan", queue)
-    try:
-        if reply.strip().startswith("## Plan"):
-            from tools import slugify, _self_check_plan_paths
+    # Guard against a non-string reply (e.g. None when the turn fails) so we
+    # don't crash on .strip() — and never silently swallow a save failure.
+    if not isinstance(reply, str):
+        reply = "" if reply is None else str(reply)
+    if reply.strip().startswith("## Plan"):
+        from tools import slugify, _self_check_plan_paths
 
-            ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
-            reply, check_note = _self_check_plan_paths(state["root"], reply)
+        ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
+        reply, check_note = _self_check_plan_paths(state["root"], reply)
+        try:
             state_db.save_plan(ws, "plan", reply, chat_id=state.get("chat_id", ""))
-            if check_note:
-                queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
-    except Exception:  # noqa: BLE001
-        pass
+        except Exception as exc:  # noqa: BLE001
+            # Surface the failure instead of swallowing it: a silent drop is
+            # exactly the "plan sometimes isn't saved" bug.
+            logging.getLogger(__name__).exception(
+                "plan_build: save_plan failed: %s", exc
+            )
+        if check_note:
+            queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
     return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}
 
 

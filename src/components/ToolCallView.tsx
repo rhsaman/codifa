@@ -1,8 +1,9 @@
 import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
-import type { ToolActivity } from '../types'
+import type { ToolActivity, SearchResultItem } from '../types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
 import { fixZwsp } from '../lib/bidi'
+import { handleLinkClick } from '../lib/link'
 import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
 
@@ -87,6 +88,73 @@ function StatusIcon({ status }: { status: ToolActivity['status'] }) {
   if (status === 'denied') return <span className="status-denied">⏹</span>
   return <span className="status-ok">✓</span>
 }
+
+/** Extract a clean host label (e.g. "github.com") from a URL for the
+ *  favicon + source chip. Falls back to the raw URL when it can't parse. */
+function hostOf(url?: string): string {
+  if (!url) return ''
+  try {
+    return new URL(url).host.replace(/^www\./, '')
+  } catch {
+    return url
+  }
+}
+
+/** Shared, beautifully-styled list of web_search result links. Rendered in
+ *  EVERY tool view (full card, single row, narrated row, timeline row) so the
+ *  links the model found are always visible — not just in the expanded card.
+ *  Pure presentational component (no store/fullscreen hooks) so it can be
+ *  unit-tested in isolation. */
+export const WebResultLinks = memo(function WebResultLinks({
+  items,
+}: {
+  items: SearchResultItem[]
+}) {
+  if (!items || items.length === 0) return null
+  return (
+    <ul className="web-results" dir="auto">
+      {items.map((it, i) => {
+        const host = hostOf(it.url)
+        return (
+          <li key={i} className="web-result">
+            <a
+              className="web-result-link"
+              href={it.url}
+              target="_blank"
+              rel="noreferrer"
+              title={it.url}
+              onClick={(e) => {
+                // Open external links in the OS browser, not inside the app's
+                // own BrowserWindow. window.coder.openExternal → shell.openExternal.
+                handleLinkClick(e, it.url, (url) => void window.coder.openExternal(url))
+              }}
+            >
+              <span className="web-result-favicon" aria-hidden="true">
+                {host ? (
+                  <img
+                    src={`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`}
+                    alt=""
+                    loading="lazy"
+                    width={16}
+                    height={16}
+                  />
+                ) : (
+                  <span className="web-result-glyph">🔗</span>
+                )}
+              </span>
+              <span className="web-result-text">
+                <span className="web-result-title">{it.title || it.url}</span>
+                {it.snippet && <span className="web-result-snippet">{it.snippet}</span>}
+              </span>
+              <span className="web-result-host">{host}</span>
+              <span className="web-result-arrow" aria-hidden="true">↗</span>
+            </a>
+          </li>
+        )
+      })}
+    </ul>
+  )
+})
 
 /** Keys already rendered as dedicated chips in the tool-card head. */
 const HEADER_SHOWN_KEYS = new Set([
@@ -469,11 +537,6 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
     <div className={`tool-sub-row ${activity.status}${running ? ' running' : ''}`}>
       <StatusIcon status={activity.status} />
       <span className="tool-sub-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-      {activity.model && (
-        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
-          {activity.model}
-        </span>
-      )}
       <span className="tool-sub-args" title={subSummary}>
         {subSummary}
       </span>
@@ -504,11 +567,6 @@ const ToolTimelineRow = memo(function ToolTimelineRow({ activity }: { activity: 
         {running ? <span className="spinner" /> : toolIcon(activity.tool)}
       </span>
       <span className="tool-timeline-label">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-      {activity.model && (
-        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
-          {activity.model}
-        </span>
-      )}
       {detail && (
         <span className="tool-timeline-detail" title={detail}>
           {detail}
@@ -516,6 +574,7 @@ const ToolTimelineRow = memo(function ToolTimelineRow({ activity }: { activity: 
       )}
       <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
+      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
     </div>
   )
 })
@@ -619,11 +678,6 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     <div className={`tool-single ${activity.status}${running ? ' running' : ''}`}>
       <StatusIcon status={activity.status} />
       <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-      {activity.model && (
-        <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
-          {activity.model}
-        </span>
-      )}
       {activity.tool === 'web_search' && activity.engine && (
         <span className="tool-badge">{activity.engine}</span>
       )}
@@ -636,6 +690,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
         <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
       )}
       <span className="tool-ms">{fmtTime(ms)}</span>
+      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
     </div>
   )
 })
@@ -679,11 +734,6 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
       <div className="tool-narrated-row">
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-        {activity.model && (
-          <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
-            {activity.model}
-          </span>
-        )}
         {activity.tool === 'web_search' && activity.engine && (
           <span className="tool-badge">{activity.engine}</span>
         )}
@@ -697,6 +747,7 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
         )}
         <span className="tool-ms">{fmtTime(ms)}</span>
       </div>
+      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
     </div>
   )
 })
@@ -781,11 +832,6 @@ export const ToolCallView = memo(function ToolCallView({
             ? 'explore'
             : TOOL_LABEL[activity.tool] ?? activity.tool}
         </span>
-        {activity.model && (
-          <span className="tool-badge tool-model-badge" title={`Ran on ${activity.model}`}>
-            {activity.model}
-          </span>
-        )}
         {activity.tool === 'task' && !!activity.args?.subagent_type && (
           <span className="tool-badge">{String(activity.args.subagent_type)}</span>
         )}
@@ -890,15 +936,7 @@ export const ToolCallView = memo(function ToolCallView({
             </div>
           )}
           {activity.tool === 'web_search' && activity.items && activity.items.length > 0 && (
-            <ul className="web-results">
-              {activity.items.map((it, i) => (
-                <li key={i} className="web-result">
-                  <a className="web-result-link" href={it.url} target="_blank" rel="noreferrer">
-                    {it.title || it.url}
-                  </a>
-                </li>
-              ))}
-            </ul>
+            <WebResultLinks items={activity.items} />
           )}
           {activity.diff && <DiffView diff={activity.diff} />}
           {isWrite && activity.diff && !activity.reverted && (

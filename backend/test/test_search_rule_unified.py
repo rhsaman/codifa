@@ -55,3 +55,37 @@ def test_search_rule_is_the_single_source_of_truth():
         # The only place 'explore' should appear in a mode prompt now is the
         # explore agent's own registry prompt, not the parent mode prompts.
         assert "delegate broad exploration" not in prompt
+
+
+def test_doing_tasks_block_appended_to_every_mode():
+    """_DOING_TASKS (opencode-style 'Doing tasks' guidance) must be defined and
+    instruct the agent to use the search tools and never commit unprompted."""
+    block = agents._DOING_TASKS
+    assert "grep/glob/read" in block
+    assert "NEVER commit changes" in block
+    # It must not contradict the auto-verify discipline already in the coder
+    # prompt (both say trust the auto-check).
+    assert "auto-checks" in block
+
+
+def test_tool_docstrings_reference_explore_delegation():
+    """grep/glob docstrings must mirror opencode: an open-ended search should be
+    delegated to the explore sub-agent rather than done inline.
+
+    The tool functions are nested inside make_tool_callbacks, so we assert on
+    the source text of tools.py rather than importing the functions directly.
+    """
+    import pathlib  # noqa: E402
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
+    text = src.read_text(encoding="utf-8")
+    assert "subagent_type='explore'" in text
+
+
+def test_read_docstring_encourages_parallel_reads():
+    """read docstring must mirror opencode: read multiple files in parallel."""
+    import pathlib  # noqa: E402
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
+    text = src.read_text(encoding="utf-8")
+    assert "read multiple independent files in parallel" in text

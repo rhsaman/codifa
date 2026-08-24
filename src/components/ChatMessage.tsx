@@ -289,7 +289,9 @@ export function RetryBanner({
     return () => clearInterval(t)
   }, [delay])
   const unlimited = maxAttempts <= 0
-  const isRateLimit = unlimited && (reason?.toLowerCase().includes('rate limit') || reason?.toLowerCase().includes('quota'))
+  const isRateLimit =
+    reason?.toLowerCase().includes('rate limit') ||
+    reason?.toLowerCase().includes('quota')
   const countdown =
     delay > 0
       ? left > 0
@@ -341,7 +343,7 @@ export function RetryBanner({
   return (
     <div className="retry-banner" title={reason || undefined}>
       {!gaveUp && <span className="spinner" />}
-      <span>
+      <span className="retry-text">
         {label}
         {suffix}
         {who ? <span className="retry-who">{who}</span> : null}
@@ -377,30 +379,47 @@ function fmtElapsed(ms: number): string {
  * a running tool gets "Running: <tool> … Ns", otherwise (nothing streamed yet)
  * "Thinking… Ns". Hidden once text starts arriving or while a retry is active.
  */
-function LiveWorkingStatus({ message }: { message: ChatMessage }) {
+// نشانگر وضعیت «Thinking…»/«Running…» که یک‌بار در انتهای لیست پیام‌ها رندر
+// می‌شود، پس همیشه زیر آخرین پیام (اول زیر پیام کاربر، بعد زیر پیام ایجنت در
+// حال استریم) نمایش داده می‌شود.
+export function LiveWorkingStatus() {
   const [now, setNow] = useState(() => Date.now())
+  // پرچم سراسری isThinking (توسط لایهٔ استریم از سیگنال thinking بک‌اند ست می‌شود)
+  const isThinking = useStore((s) => s.isThinking)
+  // آخرین پیام ایجنت در حال استریم را از store می‌خوانیم تا زمان‌سنج و ابزار در
+  // حال اجرا را از روی آن محاسبه کنیم (در فاز فکرکردن که هنوز پیام ایجنت ساخته
+  // نشده، undefined است و نشانگر زیر پیام کاربر می‌افتد).
+  const lastAssistant = useStore((s) => {
+    const chat = s.chats.find((c) => c.id === s.activeChatId)
+    if (!chat) return undefined
+    for (let i = chat.messages.length - 1; i >= 0; i--) {
+      const m = chat.messages[i]
+      if (m.role === 'assistant' && m.streaming) return m
+    }
+    return undefined
+  })
   useEffect(() => {
-    if (!message.streaming) return
     const t = setInterval(() => setNow(Date.now()), 500)
     return () => clearInterval(t)
-  }, [message.streaming])
+  }, [])
 
-  const running = message.toolActivity?.find((a) => a.status === 'running')
+  const running = lastAssistant?.toolActivity?.find((a) => a.status === 'running')
+  if (!isThinking && !running) return null
+  const startAt = lastAssistant?.createdAt || now
   if (running) {
     return (
       <div className="msg-working" dir="ltr">
         <span className="spinner" />
         <span>
-          Running: {running.tool} … {fmtElapsed(now - (message.createdAt || now))}
+          Running: {running.tool} … {fmtElapsed(now - startAt)}
         </span>
       </div>
     )
   }
-  if (message.content) return null
   return (
     <div className="msg-working thinking" dir="ltr">
       <span className="msg-working-dot" />
-      <span>Thinking… {fmtElapsed(now - (message.createdAt || now))}</span>
+      <span>Thinking… {fmtElapsed(now - startAt)}</span>
     </div>
   )
 }
@@ -767,10 +786,6 @@ export const ChatMessageView = memo(function ChatMessageView({
         )}
         {roleLabel}
       </div>
-
-      {!isUser && message.streaming && !message.retry && (
-        <LiveWorkingStatus message={message} />
-      )}
 
       {!isUser && message.plan && message.plan.length > 0 && (
         <div className="plan-block" dir={dir}>

@@ -8,7 +8,12 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, getChatProvider, useStore, defaultMaxHistoryFor } from "../lib/store";
+import {
+  getActiveProvider,
+  getChatProvider,
+  useStore,
+  defaultMaxHistoryFor,
+} from "../lib/store";
 import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
 import {
@@ -33,12 +38,24 @@ import {
   triggerCompact,
   type CompactResult,
 } from "../lib/api";
+
 import type { SkillRow } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
-import { extractMentionSkills, getSkillsList, ensureSkillsList, invalidateSkillsList, setSkillsFetcher } from "../lib/skills";
+import {
+  extractMentionSkills,
+  getSkillsList,
+  ensureSkillsList,
+  invalidateSkillsList,
+  setSkillsFetcher,
+} from "../lib/skills";
 import { detectDir, prepareContent } from "../lib/bidi";
-import { registerChatSend, sendPendingSteerNext, sendQueuedNext, uid2 } from "../lib/chatSends";
+import {
+  registerChatSend,
+  sendPendingSteerNext,
+  sendQueuedNext,
+  uid2,
+} from "../lib/chatSends";
 import { composerScrollPadding } from "../lib/scrollPadding";
 import {
   GLOBAL_SHORTCUTS,
@@ -57,7 +74,7 @@ import type {
   ThinkingLevel,
   ToolActivity,
 } from "../types";
-import { ChatMessageView, RetryBanner } from "./ChatMessage";
+import { ChatMessageView, RetryBanner, LiveWorkingStatus } from "./ChatMessage";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -75,9 +92,10 @@ const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
   ["high", "High"],
   ["xhigh", "Extra high"],
 ];
-const THINKING_LABELS = Object.fromEntries(
-  THINKING_OPTIONS,
-) as Record<ThinkingLevel, string>;
+const THINKING_LABELS = Object.fromEntries(THINKING_OPTIONS) as Record<
+  ThinkingLevel,
+  string
+>;
 const THINKING_DESCS: Record<ThinkingLevel, string> = {
   "": "Default reasoning",
   none: "No reasoning — fastest replies",
@@ -111,9 +129,10 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
  *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too. */
 function wantsSkillOrMcp(text: string): boolean {
   const low = text.toLowerCase();
-  const action = /(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b/.test(
-    low,
-  );
+  const action =
+    /(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b/.test(
+      low,
+    );
   const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)/.test(low);
   return action && target;
 }
@@ -206,7 +225,10 @@ function sliceToBudget(
     plan: 120000,
     coder: 140000,
   };
-  const capped = Math.min(tailChars, MODE_HISTORY_CAPS[mode ?? "ask"] ?? tailChars);
+  const capped = Math.min(
+    tailChars,
+    MODE_HISTORY_CAPS[mode ?? "ask"] ?? tailChars,
+  );
   // Compact summaries (system role) stand in for the folded older turns — they
   // must ALWAYS survive the maxHistory slice, or the model loses the whole
   // compacted context once the chat grows past maxHistory after a compact and
@@ -244,8 +266,9 @@ export function ChatPanel() {
     const ch = s.chats.find((c) => c.id === s.activeChatId) ?? null;
     const overrideId = ch?.providerId;
     return (
-      s.settings.providers.find((x) => x.id === (overrideId ?? s.settings.activeProviderId)) ??
-      s.settings.providers[0]
+      s.settings.providers.find(
+        (x) => x.id === (overrideId ?? s.settings.activeProviderId),
+      ) ?? s.settings.providers[0]
     );
   });
   const activeModel = chat?.model ?? provider.model;
@@ -363,11 +386,6 @@ export function ChatPanel() {
   const chatHasStreaming = chat?.messages.some((m) => m.streaming) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
   const busy = busyLocal || chatHasStreaming;
-  // Global "isThinking" flag (set by the streaming layer from the backend's
-  // lightweight thinking signal). Drives the composer glow animation while the
-  // model is reasoning — no thinking text is streamed to the UI (it slowed
-  // rendering with per-token re-renders).
-  const isThinking = useStore((s) => s.isThinking);
   /** The assistant message currently being rate-limited/retried by the provider,
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
@@ -400,7 +418,9 @@ export function ChatPanel() {
   const [skillMentionQuery, setSkillMentionQuery] = useState("");
   const [skillMentionIdx, setSkillMentionIdx] = useState(0);
   const [skillsList, setSkillsList] = useState<SkillRow[]>(getSkillsList());
-  const [skillsLoading, setSkillsLoading] = useState(getSkillsList().length === 0);
+  const [skillsLoading, setSkillsLoading] = useState(
+    getSkillsList().length === 0,
+  );
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
@@ -411,6 +431,10 @@ export function ChatPanel() {
   const [transcribing, setTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
+  // Mirror of `recording` so the global keydown handler (which lives in a
+  // useEffect with a stable closure) can read the latest value without
+  // re-subscribing on every render.
+  const recordingRef = useRef(false);
   // Pending ask/permission requests live on the chat in the store
   // (Chat.pendingAsk / Chat.pendingPermission), NOT local state:
   // `<ChatPanel key={activeChatId} />` fully unmounts/remounts on every chat
@@ -442,21 +466,6 @@ export function ChatPanel() {
   );
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
-  // The thinking ring is an SVG stroke whose corner radius must track the
-  // composer's height (it grows with multi-line input). We measure the inner
-  // box and feed a dynamic rx so the ring stays a clean rounded-rect at any
-  // height instead of distorting.
-  const [ringRx, setRingRx] = useState(23);
-  useEffect(() => {
-    const inner = composerRef.current?.querySelector<HTMLElement>(".composer-inner");
-    if (!inner) return;
-    const update = () =>
-      setRingRx(Math.min(23, Math.max(8, inner.clientHeight / 2 - 3)));
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(inner);
-    return () => ro.disconnect();
-  }, []);
   // Per-chat scroll restoration: captured once per mount (the panel remounts on
   // every chat switch via key={activeChatId}). If the user last left this chat
   // scrolled up, don't auto-pin to the bottom on return.
@@ -498,7 +507,11 @@ export function ChatPanel() {
   /** Last computed scroll anchor (updated on every user scroll; flushed to the
    *  store on unmount / app close so a quick chat switch never loses the
    *  viewport). */
-  const lastScrollPosRef = useRef<{ id: string; offset: number; atBottom: boolean } | null>(null);
+  const lastScrollPosRef = useRef<{
+    id: string;
+    offset: number;
+    atBottom: boolean;
+  } | null>(null);
   /** While a saved viewport is being restored, keep re-anchoring to it as the
    *  content around the anchor actually renders (content-visibility placeholders
    *  → real heights, images, code blocks). Cleared once stable or when the user
@@ -524,6 +537,10 @@ export function ChatPanel() {
    *  (not by the user clicking Stop) — so the catch block can show a real
    *  error instead of silently treating it like a user-initiated cancel. */
   const watchdogAbortedRef = useRef(false);
+  /** Number of times the stall watchdog has auto-retried the current turn, so
+   *  it retries on a bounded loop (then escalates to a forced abort) instead of
+   *  looping forever on a genuinely dead connection. */
+  const watchdogAutoRetriedRef = useRef(0);
   const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
@@ -555,7 +572,10 @@ export function ChatPanel() {
   useEffect(() => {
     if (!thinkingOpen) return;
     function onDocClick(e: MouseEvent) {
-      if (thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+      if (
+        thinkingRef.current &&
+        !thinkingRef.current.contains(e.target as Node)
+      ) {
         setThinkingOpen(false);
       }
     }
@@ -569,6 +589,29 @@ export function ChatPanel() {
       document.removeEventListener("keydown", onKey);
     };
   }, [thinkingOpen]);
+
+  // While recording, Space stops the recording from anywhere — even when the
+  // textarea is focused (a focused input would otherwise swallow the key and
+  // just insert a space). Only a plain Space toggles; modifier combos fall
+  // through to normal handling. Registered unconditionally so it works in the
+  // normal (non-thinking) state too.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (
+        recordingRef.current &&
+        e.key === " " &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        toggleRecordingRef.current();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
 
   // Auto-dismiss the "Context compacted" notice: show it ~4.5s, fade out over
   // 0.5s, then clear it from the store. Per-chat, so switching away and back
@@ -623,9 +666,11 @@ export function ChatPanel() {
       const active = (e as CustomEvent<boolean>).detail === true;
       useStore.getState().setPrefixNotice(
         active
-          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(PREFIX_SHORTCUTS)
-              .map((k) => (k === " " ? "Space" : k))
-              .join(" / ")}`
+          ? `Prefix ${PREFIX_LABEL} active — press ${Object.keys(
+            PREFIX_SHORTCUTS,
+          )
+            .map((k) => (k === " " ? "Space" : k))
+            .join(" / ")}`
           : null,
       );
     };
@@ -746,8 +791,11 @@ export function ChatPanel() {
    *  on return; the ResizeObserver reconcile re-pins while streaming anyway. */
   const AT_BOTTOM_EPS = 8;
   /** Snapshot the current viewport as a message-anchored scroll position. */
-  const computeScrollPos = (el: HTMLDivElement): { id: string; offset: number; atBottom: boolean } | null => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+  const computeScrollPos = (
+    el: HTMLDivElement,
+  ): { id: string; offset: number; atBottom: boolean } | null => {
+    const atBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
     // At the bottom (the common case while streaming) there is nothing to scan:
     // the id is unused for atBottom restores, so return without touching the DOM.
     if (atBottom) return { id: "", offset: 0, atBottom: true };
@@ -797,7 +845,8 @@ export function ChatPanel() {
       restoreTargetRef.current = null;
       restoreScrollRef.current = null;
     }
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+    const atBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
     stickToBottom.current = atBottom;
     // Bail out when unchanged so scrolling doesn't re-render the whole panel on
     // every tick — the jump button only flips once per boundary crossing.
@@ -826,7 +875,9 @@ export function ChatPanel() {
     // switch / restart restores the bottom instead of a stale scrolled-up spot.
     // The id is unused for atBottom restores, so no DOM scan is needed here.
     if (chat?.id) {
-      const lastId = chat.messages.length ? (chat.messages[chat.messages.length - 1].id ?? "") : "";
+      const lastId = chat.messages.length
+        ? (chat.messages[chat.messages.length - 1].id ?? "")
+        : "";
       lastScrollPosRef.current = { id: lastId, offset: 0, atBottom: true };
       useStore.getState().setChatScrollPos(chat.id, lastScrollPosRef.current);
     }
@@ -858,7 +909,8 @@ export function ChatPanel() {
         if (a) {
           const cRect = el.getBoundingClientRect();
           const aRect = a.getBoundingClientRect();
-          const desired = el.scrollTop + (aRect.top - cRect.top - target.offset);
+          const desired =
+            el.scrollTop + (aRect.top - cRect.top - target.offset);
           if (Math.abs(desired - el.scrollTop) > 1) {
             restoreScrollRef.current = desired;
             el.scrollTop = desired;
@@ -872,7 +924,8 @@ export function ChatPanel() {
         }
         return;
       }
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+      const atBottom =
+        el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
       if (stickToBottom.current) {
         el.scrollTop = el.scrollHeight;
       } else if (!atBottom) {
@@ -944,7 +997,9 @@ export function ChatPanel() {
       // of jumping to the bottom, so the user returns as close as possible to
       // where they left off.
       const rendered = new Set(
-        Array.from(el.querySelectorAll<HTMLElement>("[data-msg-id]")).map((n) => n.dataset.msgId ?? ""),
+        Array.from(el.querySelectorAll<HTMLElement>("[data-msg-id]")).map(
+          (n) => n.dataset.msgId ?? "",
+        ),
       );
       const msgs = chat?.messages ?? [];
       const idx = msgs.findIndex((m) => m.id === pos.id);
@@ -961,7 +1016,9 @@ export function ChatPanel() {
         // (closest to where the compacted/truncated range used to be).
         anchorId = rendered.values().next().value ?? "";
       }
-      anchor = anchorId ? el.querySelector<HTMLElement>(`[data-msg-id="${anchorId}"]`) : null;
+      anchor = anchorId
+        ? el.querySelector<HTMLElement>(`[data-msg-id="${anchorId}"]`)
+        : null;
     }
     if (!anchor) {
       // Nothing left to anchor to → fall back to the newest messages.
@@ -1017,13 +1074,13 @@ export function ChatPanel() {
       pushToStore();
       useStore.getState().flushNow();
     };
-    window.addEventListener('coder:flush-ui', pushToStore);
-    window.addEventListener('pagehide', flushOnClose);
-    window.addEventListener('beforeunload', flushOnClose);
+    window.addEventListener("coder:flush-ui", pushToStore);
+    window.addEventListener("pagehide", flushOnClose);
+    window.addEventListener("beforeunload", flushOnClose);
     return () => {
-      window.removeEventListener('coder:flush-ui', pushToStore);
-      window.removeEventListener('pagehide', flushOnClose);
-      window.removeEventListener('beforeunload', flushOnClose);
+      window.removeEventListener("coder:flush-ui", pushToStore);
+      window.removeEventListener("pagehide", flushOnClose);
+      window.removeEventListener("beforeunload", flushOnClose);
       flush();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1127,9 +1184,9 @@ export function ChatPanel() {
       const cacheWrite = u.cacheWrite ?? 0;
       const cost = price
         ? ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
-          (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
-          (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
-          (u.output / 1_000_000) * price.output
+        (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+        (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
+        (u.output / 1_000_000) * price.output
         : null;
       out.push({
         model,
@@ -1208,10 +1265,8 @@ export function ChatPanel() {
     if (getSkillsList().length === 0) {
       await ensureSkillsList();
     }
-    const { skills: mentionSkills, cleaned: cleanedText } = extractMentionSkills(
-      text,
-      getSkillsList(),
-    );
+    const { skills: mentionSkills, cleaned: cleanedText } =
+      extractMentionSkills(text, getSkillsList());
     const finalPrompt =
       skillNotes.length > 0
         ? `${cleanedText}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
@@ -1298,7 +1353,9 @@ export function ChatPanel() {
         thinking: m.thinking,
         plan: m.plan,
         mode: m.mode,
-        toolActivity: (m.toolActivity ?? []).filter((a) => a.status !== "running"),
+        toolActivity: (m.toolActivity ?? []).filter(
+          (a) => a.status !== "running",
+        ),
       }));
     const history = sliceToBudget(
       allHistory,
@@ -1316,6 +1373,7 @@ export function ChatPanel() {
     lastEventAt.current = Date.now();
     stalledSinceRef.current = null;
     watchdogAbortedRef.current = false;
+    watchdogAutoRetriedRef.current = 0;
     useStore.getState().setStreaming(true, false);
 
     // Append a text slice to the message's segment list, merging into the
@@ -1335,18 +1393,23 @@ export function ChatPanel() {
       return cur;
     };
 
-    // Watchdog: if the provider stalls (no SSE event at all), surface a hint so
-    // the run doesn't silently hang at a "retrying" banner. 180s because the
-    // backend read timeout is 300s and slow free-tier thinking models can pause
-    // well past 60s between streamed chunks — a 60s threshold false-alarmed
-    // during legitimate long thinking.
-    // If the silence continues for a further HARD_STALL_GRACE_MS past that
-    // hint, force-abort: a truly dead connection (backend process crashed, a
-    // socket that never signals close, ...) produces NO event ever, so
+    // Watchdog: if the provider stalls (no SSE event at all), auto-retry ONCE
+    // after a short silence instead of hanging. 30s because the backend's own
+    // retry loop already covers transient 5xx/throttle blips with a 30s backoff
+    // and emits a `retry` event — so reaching 30s of TOTAL silence means the
+    // backend isn't even retrying (dead socket / crashed process / a thinking
+    // model that's genuinely stuck). Auto-retry re-sends the last user turn and
+    // lets the backend's retry loop take over if it's a real failure. We retry
+    // on a LOOP with exponential backoff (not just once) so a flaky connection
+    // self-heals instead of leaving the user stuck — but only force-abort if
+    // the silence continues well past the final retry (truly dead socket /
+    // crashed backend). A truly dead connection produces NO event ever, so
     // handleEvent's own "error" path can never fire on its own — without this,
     // `busy` stays true and the composer's Send button stays stuck on the stop
     // icon forever, with no visible error at all.
     const HARD_STALL_GRACE_MS = 120_000;
+    const WATCHDOG_MAX_RETRIES = 5;
+    const WATCHDOG_BASE_BACKOFF_MS = 30_000;
     const stallTimer = setInterval(() => {
       // While the agent is waiting for the user to answer a permission /
       // confirm / ask request, it is legitimately paused — never treat that
@@ -1357,6 +1420,8 @@ export function ChatPanel() {
         useStore.getState().setChatStalled(chat.id, false);
         return;
       }
+      // A tool that's still running gets a much longer leash — it's doing real
+      // work, not stalled on the provider.
       const limit = toolRunningRef.current ? 900_000 : 180_000;
       const elapsed = Date.now() - lastEventAt.current;
       if (elapsed <= limit) {
@@ -1365,6 +1430,17 @@ export function ChatPanel() {
       }
       useStore.getState().setChatStalled(chat.id, true);
       if (stalledSinceRef.current == null) stalledSinceRef.current = Date.now();
+      // Auto-retry on a loop with exponential backoff. Each retry re-sends the
+      // last user turn; the backend's own retry loop handles transient failures.
+      // Only force-abort if we've exhausted the retries AND the silence drags on
+      // far past the last one (a genuinely dead connection).
+      if (watchdogAutoRetriedRef.current < WATCHDOG_MAX_RETRIES) {
+        watchdogAutoRetriedRef.current += 1;
+        const msgs = chat?.messages ?? [];
+        const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+        if (lastUser) retryMessageRef.current(lastUser.id);
+        return;
+      }
       if (Date.now() - stalledSinceRef.current > HARD_STALL_GRACE_MS) {
         watchdogAbortedRef.current = true;
         abort.abort();
@@ -1386,7 +1462,8 @@ export function ChatPanel() {
         .getState()
         .chats.find((c) => c.id === chat.id)
         ?.messages.find((m) => m.id === assistantMsg.id);
-      if (!msg || !msg.toolActivity?.some((a) => a.status === "running")) return;
+      if (!msg || !msg.toolActivity?.some((a) => a.status === "running"))
+        return;
       const now = Date.now();
       useStore.getState().updateMessage(assistantMsg.id, {
         toolActivity: msg.toolActivity.map((a) =>
@@ -1480,10 +1557,13 @@ export function ChatPanel() {
           const prefix = slash > 0 ? entry.slice(0, slash) : "";
           const explicitProvider = prefix
             ? store.settings.providers.find(
-                (p) => p.id === prefix || p.kind === prefix,
-              )
+              (p) => p.id === prefix || p.kind === prefix,
+            )
             : undefined;
-          store.addRecentModel(ranModel, explicitProvider?.id ?? activeProvider.id);
+          store.addRecentModel(
+            ranModel,
+            explicitProvider?.id ?? activeProvider.id,
+          );
         }
       } else if (event.kind === "tool") {
         toolRunningRef.current = true;
@@ -1504,7 +1584,8 @@ export function ChatPanel() {
         // fragments.
         if (event.sub) {
           const prev = findMsg()?.toolActivity ?? [];
-          const branch = typeof event.branch === "number" ? event.branch : undefined;
+          const branch =
+            typeof event.branch === "number" ? event.branch : undefined;
           const next = prev.map((a): ToolActivity => {
             if (a.tool === "task" && a.status === "running") {
               // Parallel fan-out: nest each branch's sub-events under ITS OWN
@@ -1585,13 +1666,23 @@ export function ChatPanel() {
           const target =
             gotId && act.status === "running" && act.callId === event.call_id;
           const branchMatch =
-            gotBranch && act.status === "running" && act.branch === event.branch;
+            gotBranch &&
+            act.status === "running" &&
+            act.branch === event.branch;
           const fallback =
-            !gotId && !gotBranch && act.tool === event.tool && act.status === "running";
+            !gotId &&
+            !gotBranch &&
+            act.tool === event.tool &&
+            act.status === "running";
           if (target || branchMatch || fallback) {
             return {
               ...act,
-              status: event.status === "error" ? "error" : event.status === "denied" ? "denied" : "done",
+              status:
+                event.status === "error"
+                  ? "error"
+                  : event.status === "denied"
+                    ? "denied"
+                    : "done",
               summary: event.summary,
               engine: event.engine,
               items: event.results,
@@ -1642,9 +1733,10 @@ export function ChatPanel() {
           // preserved verbatim (`keep`), so we fold the SAME older turns and keep
           // the SAME recent ones — the summary never contradicts the tail it
           // renders next. Fall back to maxHistory on older backends.
-          const backendKeep = Number.isFinite(event.keep) && (event.keep ?? -1) >= 0
-            ? event.keep
-            : undefined;
+          const backendKeep =
+            Number.isFinite(event.keep) && (event.keep ?? -1) >= 0
+              ? event.keep
+              : undefined;
           store.compactChat(
             chatId,
             event.content ?? "",
@@ -1654,10 +1746,12 @@ export function ChatPanel() {
           // /compact path shows, so the user knows older messages were folded
           // into a summary. Stored per-chat so it's still there if the user
           // switches away and comes back (no auto-dismiss — dismissed via ✕).
-          useStore.getState().setChatCompactNotice(
-            chat.id,
-            "Context compacted — older messages are summarized below (after the conversation).",
-          );
+          useStore
+            .getState()
+            .setChatCompactNotice(
+              chat.id,
+              "Context compacted — older messages are summarized below (after the conversation).",
+            );
         }
       } else if (event.kind === "compact_failed") {
         // Auto-compact failed — the backend did NOT drop any messages. Surface
@@ -1665,10 +1759,13 @@ export function ChatPanel() {
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
         useStore.getState().setChatCompacting(chat.id, false);
-        useStore.getState().setChatCompactError(
-          chat.id,
-          event.reason || "Automatic compaction failed — nothing was deleted.",
-        );
+        useStore
+          .getState()
+          .setChatCompactError(
+            chat.id,
+            event.reason ||
+            "Automatic compaction failed — nothing was deleted.",
+          );
       } else if (event.kind === "plan") {
         const incoming = event.items ?? [];
         // Get current plan from store (not stale assistantMsg.plan)
@@ -1761,7 +1858,10 @@ export function ChatPanel() {
           store.updateMessage(assistantMsg.id, { segments: nextSegments });
         }
         for (const id of ids) {
-          store.updateMessage(id, { steerPending: false, steerInterleaved: true });
+          store.updateMessage(id, {
+            steerPending: false,
+            steerInterleaved: true,
+          });
         }
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
@@ -2037,11 +2137,15 @@ export function ChatPanel() {
     if (compactEntry) {
       const slash = compactEntry.indexOf("/");
       const prefix = slash > 0 ? compactEntry.slice(0, slash) : "";
-      const modelName = slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
+      const modelName =
+        slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
       const explicitProvider = prefix
         ? s.settings.providers.find((p) => p.id === prefix || p.kind === prefix)
         : undefined;
-      compactProvider = { ...(explicitProvider ?? compactProvider), model: modelName };
+      compactProvider = {
+        ...(explicitProvider ?? compactProvider),
+        model: modelName,
+      };
     }
 
     // Call the backend's opencode-style compaction (structured summary,
@@ -2057,7 +2161,8 @@ export function ChatPanel() {
         provider: compactProvider,
         fallback: activeProvider,
         history,
-        contextWindow: modelContextWindow(activeProvider, activeProvider.model) ?? 0,
+        contextWindow:
+          modelContextWindow(activeProvider, activeProvider.model) ?? 0,
         reserved: useStore.getState().settings.compactHeadroom ?? 20000,
         signal: ctr.signal,
       });
@@ -2080,10 +2185,9 @@ export function ChatPanel() {
     // compact — do NOT collapse the real messages behind a fake summary. Leave
     // the chat untouched and let the user retry manually.
     if (!result || !result.summary || result.error) {
-      useStore.getState().setChatCompactError(
-        ch.id,
-        result?.error || errMsg || "empty summary",
-      );
+      useStore
+        .getState()
+        .setChatCompactError(ch.id, result?.error || errMsg || "empty summary");
       return;
     }
     // The backend already returns opencode's "[Compacted earlier context]"
@@ -2092,11 +2196,13 @@ export function ChatPanel() {
     s.compactChat(ch.id, result.summary, result.keep);
     // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
     // history stays recallable via memory later. Never blocks or throws.
-    addMemoryNote(rootDir, result.summary).catch(() => {});
-    useStore.getState().setChatCompactNotice(
-      ch.id,
-      "Context compacted — older messages are summarized below (after the conversation).",
-    );
+    addMemoryNote(rootDir, result.summary).catch(() => { });
+    useStore
+      .getState()
+      .setChatCompactNotice(
+        ch.id,
+        "Context compacted — older messages are summarized below (after the conversation).",
+      );
     // Stay where the user is (normally the bottom, where the live conversation
     // continues). The messages-change effect below keeps the view pinned to
     // the bottom; do NOT yank the view up to the summary — that reads as the
@@ -2121,14 +2227,20 @@ export function ChatPanel() {
         if (ch && s.undoMessage()) {
           s.addMessage(ch.id, { role: "assistant", content: "↩ Undone." });
         } else {
-          s.addMessage(ch?.id ?? "", { role: "assistant", content: "Nothing to undo." });
+          s.addMessage(ch?.id ?? "", {
+            role: "assistant",
+            content: "Nothing to undo.",
+          });
         }
         break;
       case "/redo":
         if (ch && s.redoMessage()) {
           s.addMessage(ch.id, { role: "assistant", content: "↪ Redone." });
         } else {
-          s.addMessage(ch?.id ?? "", { role: "assistant", content: "Nothing to redo." });
+          s.addMessage(ch?.id ?? "", {
+            role: "assistant",
+            content: "Nothing to redo.",
+          });
         }
         break;
       case "/help":
@@ -2180,10 +2292,12 @@ export function ChatPanel() {
         break;
       }
       default:
-        useStore.getState().setChatCmdError(
-          ch?.id ?? "",
-          `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
-        );
+        useStore
+          .getState()
+          .setChatCmdError(
+            ch?.id ?? "",
+            `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
+          );
     }
   };
 
@@ -2302,8 +2416,8 @@ export function ChatPanel() {
         msg.role === "user"
           ? msg
           : [...ch.messages.slice(0, idx)]
-              .reverse()
-              .find((m) => m.role === "user");
+            .reverse()
+            .find((m) => m.role === "user");
       if (!userMsg || !userMsg.content.trim()) return;
       // ALWAYS truncate-and-restart: remove this message and everything below
       // it, then re-send the prompt from scratch (send() creates a fresh user
@@ -2411,9 +2525,7 @@ export function ChatPanel() {
     const norm = await api.normalizeImage(p).catch(() => null);
     const path = norm?.path || p;
     const dataUrl =
-      norm?.dataUrl ||
-      (await api.readImage(p).catch(() => null)) ||
-      undefined;
+      norm?.dataUrl || (await api.readImage(p).catch(() => null)) || undefined;
     setImages((imgs) => {
       const hit = imgs.find((i) => i.origPath === p || i.path === p);
       if (hit) {
@@ -2525,6 +2637,7 @@ export function ChatPanel() {
       };
       rec.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
+        recordingRef.current = false;
         setRecording(false);
         const type = mediaChunksRef.current[0]?.type ?? mime;
         const blob = new Blob(mediaChunksRef.current, { type });
@@ -2535,23 +2648,28 @@ export function ChatPanel() {
         }
         setTranscribing(true);
         try {
-          const lang = dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
-          console.debug("[voice] transcribing", { mime: blob.type, bytes: blob.size, lang });
+          const lang =
+            dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
+          console.debug("[voice] transcribing", {
+            mime: blob.type,
+            bytes: blob.size,
+            lang,
+          });
           const text = await transcribeAudio(blob, setTranscribing, lang);
           if (text) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
-            textareaRef.current?.focus();
+            requestAnimationFrame(() => textareaRef.current?.focus());
           } else {
             console.debug("[voice] empty transcription (silence/unrecognized)");
             window.alert("Nothing was recognized — please try again.");
           }
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
+          const msg = err instanceof Error ? err.message : String(err);
           window.alert(
             `Voice transcription failed: ${msg}\n` +
-              (msg.includes("Failed to fetch")
-                ? "The local Python server is likely down — restart the app."
-                : "Please try again or check your microphone connection."),
+            (msg.includes("Failed to fetch")
+              ? "The local Python server is likely down — restart the app."
+              : "Please try again or check your microphone connection."),
           );
         } finally {
           setTranscribing(false);
@@ -2559,6 +2677,7 @@ export function ChatPanel() {
       };
       mediaRecorderRef.current = rec;
       rec.start();
+      recordingRef.current = true;
       setRecording(true);
       console.debug("[voice] recording started", { mime: rec.mimeType });
     } catch (err) {
@@ -2572,6 +2691,7 @@ export function ChatPanel() {
   const stopRecording = () => {
     const rec = mediaRecorderRef.current;
     if (rec && rec.state !== "inactive") {
+      recordingRef.current = false;
       rec.stop();
       mediaRecorderRef.current = null;
     }
@@ -2857,6 +2977,21 @@ export function ChatPanel() {
     useStore.getState().chatAborts[chatIdRef.current]?.abort();
   };
 
+  // Dismiss the retry banner WITHOUT deleting the turn: clear the message's
+  // `retry` flag (so the banner unmounts) and then abort the stream. The
+  // default `stop` alone leaves the banner up because the stream's `finally`
+  // block keeps `retry` for gaveUp/watchdog failures — so we must clear it
+  // explicitly here. This is the ✕ button on the error/stalled banner.
+  const dismissRetry = useCallback(() => {
+    const msgs = chat?.messages ?? [];
+    const target =
+      retryingMsg ?? [...msgs].reverse().find((m) => m.role === "assistant");
+    if (target) {
+      useStore.getState().updateMessage(target.id, { retry: null });
+    }
+    stop();
+  }, [retryingMsg, stop, chat?.messages]);
+
   if (!chat) {
     const noWorkspace = workspaces.length === 0;
     const pickWorkspace = async () => {
@@ -3006,9 +3141,8 @@ export function ChatPanel() {
                   );
                 }}
               >
-                Load{" "}
-                {Math.min(MSG_PAGE, chat.messages.length - msgLimit)} earlier
-                message
+                Load {Math.min(MSG_PAGE, chat.messages.length - msgLimit)}{" "}
+                earlier message
                 {chat.messages.length - msgLimit === 1 ? "" : "s"}…
               </button>
             </div>
@@ -3017,25 +3151,26 @@ export function ChatPanel() {
             .slice(Math.max(0, chat.messages.length - msgLimit))
             .map((m: ChatMessage) => (
               <Fragment key={m.id}>
-              <ChatMessageView message={m} onRetry={onRetry} />
-              {/* Newer messages render tool cards inline via `segments`; only
+                <ChatMessageView message={m} onRetry={onRetry} />
+                {/* Newer messages render tool cards inline via `segments`; only
                   older persisted messages without segments keep the stacked
                   timeline below the bubble. */}
-              {!m.segments && m.toolActivity && m.toolActivity.length > 0 && (
-                <div className="tool-timeline">
-                  {m.toolActivity.map((act, i) => (
-                    <ToolCallView
-                      key={i}
-                      activity={act}
-                      onReverted={() =>
-                        useStore.getState().markToolReverted(m.id, i)
-                      }
-                    />
-                  ))}
-                </div>
-              )}
-            </Fragment>
-          ))}
+                {!m.segments && m.toolActivity && m.toolActivity.length > 0 && (
+                  <div className="tool-timeline">
+                    {m.toolActivity.map((act, i) => (
+                      <ToolCallView
+                        key={i}
+                        activity={act}
+                        onReverted={() =>
+                          useStore.getState().markToolReverted(m.id, i)
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
+              </Fragment>
+            ))}
+          <LiveWorkingStatus />
           {queuedMsgs.length > 0 && (
             <div className="queued-bubbles">
               {queuedMsgs.map((q) => (
@@ -3052,12 +3187,30 @@ export function ChatPanel() {
                   <div className="queued-bubble-head">
                     <span className="queued-bubble-icon">
                       {q.kind === "steer" ? (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <svg
+                          width="12"
+                          height="12"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
                           <path d="M9 14L4 9l5-5" />
                           <path d="M4 9h10a5 5 0 015 5v6" />
                         </svg>
                       ) : (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <svg
+                          width="12"
+                          height="12"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
                           <circle cx="12" cy="12" r="9" />
                           <path d="M12 7v5l3 3" />
                         </svg>
@@ -3112,132 +3265,164 @@ export function ChatPanel() {
               ))}
             </div>
           )}
-          {retryingMsg?.retry && (
-            <RetryBanner
-              attempt={retryingMsg.retry.attempt}
-              maxAttempts={retryingMsg.retry.maxAttempts}
-              delay={retryingMsg.retry.delay}
-              reason={retryingMsg.retry.reason}
-              gaveUp={retryingMsg.retry.gaveUp}
-              watchdog={retryingMsg.retry.watchdog}
-              model={retryingMsg.retry.model}
-              agent={retryingMsg.retry.agent}
-              fallback={retryingMsg.retry.fallback}
-              stalled={stalled}
-              onRetry={() => {
-                const msgs = chat?.messages ?? [];
-                const idx = msgs.findIndex((m) => m.id === retryingMsg.id);
-                const userMsg = [...msgs.slice(0, idx)]
-                  .reverse()
-                  .find((m) => m.role === "user");
-                if (userMsg) retryMessageRef.current(userMsg.id);
-              }}
-              onCancel={stop}
-            />
-          )}
-          {(cmdError || compactError || compactNotice || prefixNotice || compacting || (busy && stalled && !retryingMsg?.retry)) && (
-            <div className="chat-notices">
-              {compacting && (
-                <div className="notice-banner notice-loading" dir="ltr">
-                  <span className="notice-icon">
-                    <span className="spinner" />
-                  </span>
-                  <span className="notice-text">
-                    Compacting context — older messages are being summarized…
-                  </span>
-                </div>
-              )}
-              {busy && stalled && (
-                <div className="notice-banner notice-warn" dir="ltr">
-                  <span className="notice-icon">
-                    <span className="spinner" />
-                  </span>
-                  <span className="notice-text">
-                    {toolRunningRef.current
-                      ? "Tool is still running… (Stop to cancel)"
-                      : "Still waiting for the provider… (Stop to cancel)"}
-                  </span>
-                </div>
-              )}
-              {cmdError && (
-                <div className="notice-banner notice-error" dir="ltr">
-                  <span className="notice-icon">⚠</span>
-                  <span className="notice-text">{cmdError}</span>
-                  <button
-                    type="button"
-                    className="notice-dismiss"
-                    onClick={() => useStore.getState().setChatCmdError(chat.id, null)}
-                    title="Dismiss"
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
-              {compactError && (
-                <div className="notice-banner notice-error" dir="ltr">
-                  <span className="notice-icon">⚠</span>
-                  <span className="notice-text">
-                    Compact failed — {compactError}
-                  </span>
-                  <button
-                    type="button"
-                    className="notice-btn"
-                    disabled={busy}
-                    onClick={() => void compactContext()}
-                  >
-                    Retry
-                  </button>
-                  <button
-                    type="button"
-                    className="notice-dismiss"
-                    onClick={() => useStore.getState().setChatCompactError(chat.id, null)}
-                    title="Dismiss"
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
-              {compactNotice && (
-                <div
-                  className={`notice-banner notice-info${noticeLeaving ? " notice-leaving" : ""}`}
-                  dir="ltr"
-                >
-                  <span className="notice-icon">
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="3"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
+          {(() => {
+            // A real retry banner, OR a stalled-but-busy run (no retry event
+            // yet) — both render the SAME RetryBanner so the user always has a
+            // one-click Retry and the "still waiting" hint, never a dead-end
+            // "Still waiting" notice with only a Stop button.
+            const effectiveRetry =
+              retryingMsg?.retry ??
+              (busy && stalled
+                ? {
+                  attempt: 1,
+                  maxAttempts: 10,
+                  delay: 30,
+                  reason: "Still waiting for the provider…",
+                  gaveUp: false,
+                }
+                : null);
+            if (!effectiveRetry) return null;
+            return (
+              <RetryBanner
+                attempt={effectiveRetry.attempt}
+                maxAttempts={effectiveRetry.maxAttempts}
+                delay={effectiveRetry.delay}
+                reason={effectiveRetry.reason}
+                gaveUp={effectiveRetry.gaveUp}
+                watchdog={effectiveRetry.watchdog}
+                model={effectiveRetry.model}
+                agent={effectiveRetry.agent}
+                fallback={effectiveRetry.fallback}
+                stalled={stalled}
+                onRetry={() => {
+                  // Resume-only: re-send the last user turn WITHOUT deleting
+                  // anything. The error banner must never fall through to
+                  // retryMessage's truncate-and-restart branch (which wipes the
+                  // whole turn) — it only appears when there is no failed
+                  // assistant message to resume, so we go straight to the
+                  // resume path here.
+                  const msgs = chat?.messages ?? [];
+                  const idx = retryingMsg
+                    ? msgs.findIndex((m) => m.id === retryingMsg.id)
+                    : -1;
+                  const userMsg = [
+                    ...msgs.slice(0, idx === -1 ? msgs.length : idx),
+                  ]
+                    .reverse()
+                    .find((m) => m.role === "user");
+                  if (userMsg) {
+                    send(
+                      userMsg.content,
+                      userMsg.attachments ?? [],
+                      userMsg.images ?? [],
+                      false,
+                      userMsg.id,
+                    );
+                  }
+                }}
+                onCancel={dismissRetry}
+              />
+            );
+          })()}
+          {(cmdError ||
+            compactError ||
+            compactNotice ||
+            prefixNotice ||
+            compacting) && (
+              <div className="chat-notices">
+                {compacting && (
+                  <div className="notice-banner notice-loading" dir="ltr">
+                    <span className="notice-icon">
+                      <span className="spinner" />
+                    </span>
+                    <span className="notice-text">
+                      Compacting context — older messages are being summarized…
+                    </span>
+                  </div>
+                )}
+                {cmdError && (
+                  <div className="notice-banner notice-error" dir="ltr">
+                    <span className="notice-icon">⚠</span>
+                    <span className="notice-text">{cmdError}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatCmdError(chat.id, null)
+                      }
+                      title="Dismiss"
                     >
-                      <path d="M20 6 9 17l-5-5" />
-                    </svg>
-                  </span>
-                  <span className="notice-text">{compactNotice}</span>
-                  <button
-                    type="button"
-                    className="notice-dismiss"
-                    onClick={() =>
-                      useStore.getState().setChatCompactNotice(chat.id, null)
-                    }
-                    title="Dismiss"
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {compactError && (
+                  <div className="notice-banner notice-error" dir="ltr">
+                    <span className="notice-icon">⚠</span>
+                    <span className="notice-text">
+                      Compact failed — {compactError}
+                    </span>
+                    <button
+                      type="button"
+                      className="notice-btn"
+                      disabled={busy}
+                      onClick={() => void compactContext()}
+                    >
+                      Retry
+                    </button>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatCompactError(chat.id, null)
+                      }
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {compactNotice && (
+                  <div
+                    className={`notice-banner notice-info${noticeLeaving ? " notice-leaving" : ""}`}
+                    dir="ltr"
                   >
-                    ✕
-                  </button>
-                </div>
-              )}
-              {prefixNotice && (
-                <div className="notice-banner notice-prefix" dir="ltr">
-                  <span className="notice-icon">⌨</span>
-                  <span className="notice-text">{prefixNotice}</span>
-                </div>
-              )}
-            </div>
-          )}
+                    <span className="notice-icon">
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    </span>
+                    <span className="notice-text">{compactNotice}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatCompactNotice(chat.id, null)
+                      }
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {prefixNotice && (
+                  <div className="notice-banner notice-prefix" dir="ltr">
+                    <span className="notice-icon">⌨</span>
+                    <span className="notice-text">{prefixNotice}</span>
+                  </div>
+                )}
+              </div>
+            )}
         </div>
         {showJump && (
           <button
@@ -3269,7 +3454,7 @@ export function ChatPanel() {
 
       <div
         ref={composerRef}
-        className={`composer${dragOver ? " dragover" : ""}${isThinking ? " thinking" : ""}`}
+        className={`composer${dragOver ? " dragover" : ""}`}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}
@@ -3310,7 +3495,9 @@ export function ChatPanel() {
                         className="ask-option"
                         onClick={() => {
                           void respondAsk(askReq.id, opt);
-                          useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+                          useStore
+                            .getState()
+                            .setChatPendingAsk(chatIdRef.current, null);
                         }}
                       >
                         <span className="ask-option-mark">
@@ -3353,7 +3540,9 @@ export function ChatPanel() {
                       ) {
                         e.preventDefault();
                         void respondAsk(askReq.id, askFreeText.trim());
-                        useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+                        useStore
+                          .getState()
+                          .setChatPendingAsk(chatIdRef.current, null);
                       }
                     }}
                   />
@@ -3364,7 +3553,9 @@ export function ChatPanel() {
                       disabled={!askFreeText.trim()}
                       onClick={() => {
                         void respondAsk(askReq.id, askFreeText.trim());
-                        useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+                        useStore
+                          .getState()
+                          .setChatPendingAsk(chatIdRef.current, null);
                       }}
                     >
                       {fa ? "ارسال" : "Send"}
@@ -3421,7 +3612,10 @@ export function ChatPanel() {
                   </code>
                 ) : null}
                 {permissionReq.reason ? (
-                  <div className="perm-reason" dir={detectDir(permissionReq.reason)}>
+                  <div
+                    className="perm-reason"
+                    dir={detectDir(permissionReq.reason)}
+                  >
                     {prepareContent(permissionReq.reason, fa ? "rtl" : "ltr")}
                   </div>
                 ) : null}
@@ -3432,7 +3626,9 @@ export function ChatPanel() {
                     className="btn perm-deny"
                     onClick={() => {
                       void respondPermission(permissionReq.id, false);
-                      useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+                      useStore
+                        .getState()
+                        .setChatPendingPermission(chatIdRef.current, null);
                     }}
                   >
                     {denyLabel}
@@ -3443,7 +3639,9 @@ export function ChatPanel() {
                       className="btn perm-allow"
                       onClick={() => {
                         void respondPermission(permissionReq.id, true);
-                        useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+                        useStore
+                          .getState()
+                          .setChatPendingPermission(chatIdRef.current, null);
                       }}
                     >
                       {fa ? "تأیید" : "Confirm"}
@@ -3455,7 +3653,9 @@ export function ChatPanel() {
                         className="btn perm-allow"
                         onClick={() => {
                           void respondPermission(permissionReq.id, true);
-                          useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+                          useStore
+                            .getState()
+                            .setChatPendingPermission(chatIdRef.current, null);
                         }}
                       >
                         {fa ? "اجازه موقت" : "Allow once"}
@@ -3466,7 +3666,9 @@ export function ChatPanel() {
                         onClick={() => {
                           void respondPermission(permissionReq.id, true);
                           useStore.getState().setOutsideAllowed(true);
-                          useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+                          useStore
+                            .getState()
+                            .setChatPendingPermission(chatIdRef.current, null);
                         }}
                       >
                         {fa ? "همیشه اجازه بده" : "Always allow"}
@@ -3478,60 +3680,6 @@ export function ChatPanel() {
             );
           })()}
         <div className="composer-inner">
-          {isThinking && (
-            // See the CSS comment above `.composer-thinking-ring` in global.css for
-            // why this is an SVG stroke (pathLength=100) instead of a rotated
-            // conic-gradient: the composer is a very wide, short box, and an
-            // angle-based gradient moves at wildly uneven speed on that shape.
-            <svg
-              className="composer-thinking-ring"
-              aria-hidden="true"
-              focusable="false"
-            >
-              <defs>
-                <linearGradient
-                  id="composer-thinking-grad"
-                  x1="0%"
-                  y1="0%"
-                  x2="100%"
-                  y2="100%"
-                >
-                  <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.2" />
-                  <stop offset="100%" stopColor="var(--thinking)" stopOpacity="1" />
-                </linearGradient>
-              </defs>
-              <rect
-                className="composer-thinking-ring-halo"
-                x={1.5}
-                y={1.5}
-                width="100%"
-                height="100%"
-                rx={ringRx}
-                ry={ringRx}
-                pathLength={100}
-              />
-              <rect
-                className="composer-thinking-ring-tail"
-                x={1.5}
-                y={1.5}
-                width="100%"
-                height="100%"
-                rx={ringRx}
-                ry={ringRx}
-                pathLength={100}
-              />
-              <rect
-                className="composer-thinking-ring-head"
-                x={1.5}
-                y={1.5}
-                width="100%"
-                height="100%"
-                rx={ringRx}
-                ry={ringRx}
-                pathLength={100}
-              />
-            </svg>
-          )}
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}
@@ -3693,7 +3841,6 @@ export function ChatPanel() {
               </div>
             )}
             <textarea
-              ref={textareaRef}
               className="composer-input"
               rows={1}
               // Follows the app-wide dir toggle (same as message bubbles) instead of
@@ -3712,6 +3859,7 @@ export function ChatPanel() {
                   ? "Ask the agent…  (⌘P file · ⚡ skill · / command)"
                   : "Open a project folder first (⌘O)…"
               }
+              ref={textareaRef}
               value={input}
               onChange={onInputChange}
               onKeyDown={onKeyDown}
@@ -3803,28 +3951,24 @@ export function ChatPanel() {
                     {nvimDiags.map((d, i) => {
                       const sev =
                         d.severity === 1 ||
-                        d.severity === "Error" ||
-                        d.severity === "error"
+                          d.severity === "Error" ||
+                          d.severity === "error"
                           ? "error"
                           : d.severity === 2 ||
-                              d.severity === "Warning" ||
-                              d.severity === "warning"
+                            d.severity === "Warning" ||
+                            d.severity === "warning"
                             ? "warning"
                             : d.severity === 3 ||
-                                d.severity === "Information" ||
-                                d.severity === "information"
+                              d.severity === "Information" ||
+                              d.severity === "information"
                               ? "info"
                               : "hint";
                       const loc = `${(d.lnum ?? 0) + 1}:${(d.col ?? 0) + 1}`;
-                      const src =
-                        d.source
-                          ? `${d.source}${d.code != null ? ` ${d.code}` : ""}`
-                          : "";
+                      const src = d.source
+                        ? `${d.source}${d.code != null ? ` ${d.code}` : ""}`
+                        : "";
                       return (
-                        <div
-                          key={i}
-                          className={`nvim-diag nvim-diag-${sev}`}
-                        >
+                        <div key={i} className={`nvim-diag nvim-diag-${sev}`}>
                           <span className="nvim-diag-sev">
                             {sev === "error"
                               ? "✕"
@@ -3834,9 +3978,7 @@ export function ChatPanel() {
                           </span>
                           <span className="nvim-diag-loc">{loc}</span>
                           <span className="nvim-diag-msg">{d.message}</span>
-                          {src && (
-                            <span className="nvim-diag-src">{src}</span>
-                          )}
+                          {src && <span className="nvim-diag-src">{src}</span>}
                         </div>
                       );
                     })}
@@ -3852,11 +3994,7 @@ export function ChatPanel() {
                 const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
                 const name = idx >= 0 ? a.slice(idx + 1) : a;
                 return (
-                  <span
-                    className="attachment-chip file-chip"
-                    key={a}
-                    title={a}
-                  >
+                  <span className="attachment-chip file-chip" key={a} title={a}>
                     <svg
                       className="chip-file-icon"
                       width="13"
@@ -3884,24 +4022,24 @@ export function ChatPanel() {
                   </span>
                 );
               })}
-                {images.map((img) => (
-                  <span className="attachment-chip image-chip" key={img.path}>
-                    {img.dataUrl ? (
-                      <img className="chip-thumb" src={img.dataUrl} alt="" />
-                    ) : (
-                      <span className="chip-thumb placeholder" />
-                    )}
-                    <span className="chip-name">{img.name}</span>
-                    <button
-                      className="chip-x"
-                      onClick={() => removeImage(img.path)}
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
+              {images.map((img) => (
+                <span className="attachment-chip image-chip" key={img.path}>
+                  {img.dataUrl ? (
+                    <img className="chip-thumb" src={img.dataUrl} alt="" />
+                  ) : (
+                    <span className="chip-thumb placeholder" />
+                  )}
+                  <span className="chip-name">{img.name}</span>
+                  <button
+                    className="chip-x"
+                    onClick={() => removeImage(img.path)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
 
           <div className="composer-row">
             <span className="composer-left">

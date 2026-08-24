@@ -2609,6 +2609,10 @@ def make_tool_callbacks(
     store: VectorStore | None = None,
     chat_id: str = "",
 ) -> dict[str, Callable]:
+    # Bind chat_id into the closure so tools (e.g. update_plan) can persist
+    # per-chat state to disk via state_db. Previously chat_id was accepted but
+    # never captured, so update_plan could only emit to the UI — never save.
+    _chat_id = chat_id
     """Build the agent tools bound to ``root`` with an emit callback.
 
     ``emit`` receives a dict like ``{"kind": "tool"|"tool_result", "tool": name,
@@ -3055,6 +3059,18 @@ def make_tool_callbacks(
         _plan_nudge_state["has_in_progress"] = any(
             i["status"] == "in_progress" for i in normalized
         )
+        # Persist the checklist to disk (not just the UI emit) so the todos
+        # survive reloads and aren't lost when only the graph node writes the
+        # plan markdown. The workspace slug mirrors plan_build's save_plan key.
+        try:
+            ws = slugify(
+                os.path.basename(os.path.realpath(root).rstrip(os.sep))
+            ) or "workspace"
+            _state_db.save_plan_checklist(
+                ws, "plan", normalized, chat_id=_chat_id
+            )
+        except Exception:  # noqa: BLE001, S110 — persistence is best-effort
+            pass
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
         emit(
@@ -3372,7 +3388,7 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search."""
+Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) whenever you need to find files containing specific patterns; for an open-ended search across many locations, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
@@ -3533,7 +3549,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
@@ -3607,7 +3623,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         return raw
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself."""
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself. Use the read tool to read files; read multiple independent files in parallel in a single turn when you know their paths."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {

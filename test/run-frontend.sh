@@ -110,6 +110,31 @@ npx esbuild test/transcribe.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-tr.mjs >/dev/null 2>&1
 node test/.tmp-tr.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs
+echo ""
+echo "── تست ۲۰: voice auto-send (اولین Space/Enter بعد از ترانسکریپشن پیام را می‌فرستد) ──"
+node test/voice.test.ts
+
+echo ""
+echo "── تست ۲۱: web results (نمایش لینک‌های web_search در UI) ──"
+npx esbuild test/webResults.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --outfile=test/.tmp-wr.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-wr.mjs
+
+echo ""
+echo "── تست ۲۲: RetryBanner (نوتیفیکیشن خطای یکدست: stalled + rate-limit + gave-up) ──"
+npx esbuild test/retryBanner.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \
+  --outfile=test/.tmp-rb.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-rb.mjs
+
+echo ""
+echo "── تست ۲۳: streamChat reconnect (لایهٔ خودترمیم روی SSE: خطای اتصال/وسط استریم retry، قطع دستی/HTTP خیر) ──"
+npx esbuild test/streamChatReconnect.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=test/.tmp-sc.mjs >/dev/null 2>&1
+node test/.tmp-sc.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

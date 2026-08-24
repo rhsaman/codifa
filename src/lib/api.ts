@@ -291,58 +291,15 @@ export async function streamChat(
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
 
-  const res = await fetch(`${url}/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: params.signal,
-    body: JSON.stringify({
-      provider: params.provider.kind,
-      api_key: params.provider.apiKey,
-      env_var: params.provider.envVar ?? '',
-      base_url: params.provider.baseUrl,
-      auth_type: params.provider.authType ?? '',
-      oauth_client_id: params.provider.oauthClientId ?? '',
-      oauth_client_secret: params.provider.oauthClientSecret ?? '',
-      oauth_refresh_token: params.provider.oauthRefreshToken ?? '',
-      model: params.provider.model,
-      root: params.root,
-      mode: params.mode,
-      prompt: params.prompt,
-      chat_id: params.chatId ?? '',
-      history: params.history,
-      max_history: params.maxHistory ?? 10,
-      attachments: params.attachments ?? [],
-      images: params.images ?? [],
-      system_prompt: params.systemPrompt ?? '',
-      thinking_level: params.thinkingLevel ?? '',
-      model_reasoning: params.modelReasoning ?? false,
-      mcp_servers: params.mcpServers ?? {},
-      skills: params.skills ?? [],
-      allow_create: params.allowCreate ?? false,
-      cap: params.cap ?? {},
-      allow_outside: params.allowOutside ?? false,
-      nvim_file: params.nvimFile ?? "",
-      nvim_diagnostics: params.nvimDiagnostics ?? [],
-      vector_db_path: params.vectorDbPath ?? "",
-      vector_config: params.vectorConfig ?? null,
-      subagent_models: params.subagentModels ?? {},
-      providers: params.providers ?? {},
-      reserved: params.reserved ?? 20000,
-      context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
-    }),
-  })
+  // Self-healing reconnect: if the network drops mid-stream (a fetch/reader
+  // error that is NOT a manual abort and NOT an HTTP error from the backend),
+  // retry with exponential backoff instead of leaving the user stuck on a dead
+  // "Still waiting" state. HTTP errors (5xx, etc.) are NOT retried here — the
+  // backend already runs its own retry loop, and a non-2xx is a deliberate
+  // response, not a dropped connection.
+  const MAX_RECONNECT_ATTEMPTS = 5
+  const BASE_BACKOFF_MS = 1000
 
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error((body as { detail?: string }).detail || `chat request failed (${res.status})`)
-  }
-  if (!res.body) throw new Error('no response body')
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  // Parse one complete SSE frame (everything between two blank lines).
   const parseFrame = (frame: string) => {
     for (const line of frame.split('\n')) {
       if (!line.startsWith('data: ')) continue
@@ -357,28 +314,105 @@ export async function streamChat(
     }
   }
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
+  let attempt = 0
+  while (true) {
+    // A manual stop must never trigger a reconnect — bail before any work.
+    if (params.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
 
-      let idx: number
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const chunk = buffer.slice(0, idx)
-        buffer = buffer.slice(idx + 2)
-        parseFrame(chunk)
-      }
+    // Phase 1: connect. A network failure to even reach the sidecar is
+    // retryable; an HTTP error response is not.
+    let res: Response
+    try {
+      res = await fetch(`${url}/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: params.signal,
+        body: JSON.stringify({
+          provider: params.provider.kind,
+          api_key: params.provider.apiKey,
+          env_var: params.provider.envVar ?? '',
+          base_url: params.provider.baseUrl,
+          auth_type: params.provider.authType ?? '',
+          oauth_client_id: params.provider.oauthClientId ?? '',
+          oauth_client_secret: params.provider.oauthClientSecret ?? '',
+          oauth_refresh_token: params.provider.oauthRefreshToken ?? '',
+          model: params.provider.model,
+          root: params.root,
+          mode: params.mode,
+          prompt: params.prompt,
+          chat_id: params.chatId ?? '',
+          history: params.history,
+          max_history: params.maxHistory ?? 10,
+          attachments: params.attachments ?? [],
+          images: params.images ?? [],
+          system_prompt: params.systemPrompt ?? '',
+          thinking_level: params.thinkingLevel ?? '',
+          model_reasoning: params.modelReasoning ?? false,
+          mcp_servers: params.mcpServers ?? {},
+          skills: params.skills ?? [],
+          allow_create: params.allowCreate ?? false,
+          cap: params.cap ?? {},
+          allow_outside: params.allowOutside ?? false,
+          nvim_file: params.nvimFile ?? "",
+          nvim_diagnostics: params.nvimDiagnostics ?? [],
+          vector_db_path: params.vectorDbPath ?? "",
+          vector_config: params.vectorConfig ?? null,
+          subagent_models: params.subagentModels ?? {},
+          providers: params.providers ?? {},
+          reserved: params.reserved ?? 20000,
+          context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
+        }),
+      })
+    } catch (err) {
+      // fetch() threw (connection refused / DNS / dropped socket) — retryable.
+      if (params.signal?.aborted) throw err
+      attempt++
+      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
+      await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))
+      continue
     }
-    // Flush whatever is left after the last blank line: the final SSE frame
-    // usually arrives WITHOUT a trailing "\n\n" (the stream just closes), so
-    // without this the LAST text/done/usage event is silently dropped and the
-    // streamed message looks truncated — "the ending gets deleted". Also flush
-    // any pending multi-byte UTF-8 tail (decoder.decode() with no args).
-    buffer += decoder.decode()
-    if (buffer.trim()) parseFrame(buffer)
-  } finally {
-    reader.releaseLock()
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error((body as { detail?: string }).detail || `chat request failed (${res.status})`)
+    }
+    if (!res.body) throw new Error('no response body')
+
+    // Phase 2: read the SSE stream. A network error mid-read is retryable; we
+    // re-run the whole request (the backend resumes from the same user turn).
+    try {
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        let idx: number
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const chunk = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          parseFrame(chunk)
+        }
+      }
+      // Flush whatever is left after the last blank line: the final SSE frame
+      // usually arrives WITHOUT a trailing "\n\n" (the stream just closes), so
+      // without this the LAST text/done/usage event is silently dropped and the
+      // streamed message looks truncated — "the ending gets deleted". Also
+      // flush any pending multi-byte UTF-8 tail (decoder.decode() with no args).
+      buffer += decoder.decode()
+      if (buffer.trim()) parseFrame(buffer)
+      return // clean completion — no reconnect needed
+    } catch (err) {
+      // A manual abort must propagate immediately, not trigger a reconnect.
+      if (params.signal?.aborted || (err as Error).name === 'AbortError') throw err
+      attempt++
+      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
+      await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))
+      continue
+    }
   }
 }
 

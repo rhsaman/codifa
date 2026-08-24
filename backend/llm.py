@@ -157,7 +157,6 @@ def build_chat_model(
             temperature=temperature,
             max_output_tokens=max_tokens or None,
             streaming=True,
-            default_headers=headers or None,
             timeout=to if isinstance(to, (int, float)) else None,
         )
 

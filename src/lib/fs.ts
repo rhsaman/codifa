@@ -49,6 +49,7 @@ export const api = {
   hasSettingsFile: (): Promise<boolean> => window.coder.hasSettingsFile(),
   moveDataPath: (p: string): Promise<string> => window.coder.moveDataPath(p),
   onSidecarChanged: (cb: () => void): (() => void) => window.coder.onSidecarChanged(cb),
+  onSidecarDead: (cb: () => void): (() => void) => window.coder.onSidecarDead(cb),
   onFlushPersist: (cb: () => void): (() => void) => window.coder.onFlushPersist(cb),
   flushPersistDone: (): void => window.coder.flushPersistDone(),
   onMigrateProgress: (cb: (evt: { label: string; pct: number }) => void): (() => void) =>

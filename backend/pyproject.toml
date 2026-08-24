@@ -19,6 +19,7 @@ dependencies = [
     "langchain-core>=1.6.0",
     "langchain-openai>=1.6.0",
     "langchain-google-genai>=4.3.5",
+    "pillow>=12.3.0",
 ]
 
 [tool.ruff]

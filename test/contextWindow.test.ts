@@ -14,6 +14,7 @@
   coder: {
     getSidecarUrl: async () => 'http://127.0.0.1:8899',
     onSidecarChanged: () => {},
+    onSidecarDead: () => {},
   },
 }
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage

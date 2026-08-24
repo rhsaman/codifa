@@ -69,6 +69,11 @@ const api = {
     ipcRenderer.on('sidecar:changed', listener)
     return () => ipcRenderer.removeListener('sidecar:changed', listener)
   },
+  onSidecarDead: (cb: () => void): (() => void) => {
+    const listener = (): void => cb()
+    ipcRenderer.on('sidecar:dead', listener)
+    return () => ipcRenderer.removeListener('sidecar:dead', listener)
+  },
   onFlushPersist: (cb: () => void): (() => void) => {
     const listener = (): void => cb()
     ipcRenderer.on('flush-persist', listener)

@@ -8,8 +8,35 @@ api.onSidecarChanged(() => {
   sidecarUrl = null
 })
 
+// The Electron sidecar process crashed (e.g. segfault while loading the Whisper
+// model). Its port is now dead, so drop the cached URL immediately instead of
+// waiting for the next health probe to fail with "Failed to fetch".
+api.onSidecarDead(() => {
+  sidecarUrl = null
+})
+
+/**
+ * Verify a cached sidecar URL is still alive with a short health probe.
+ * Returns true when the server answers `/health` within the timeout.
+ */
+async function isSidecarAlive(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(1500) })
+    return res.ok
+  } catch {
+    // Network-level failure (server down / port dead) — treat as dead.
+    return false
+  }
+}
+
 export async function ensureSidecar(): Promise<string | null> {
-  if (sidecarUrl) return sidecarUrl
+  if (sidecarUrl) {
+    // The cached URL may point at a dead process (e.g. the Python sidecar
+    // crashed while loading the Whisper model). Probe before trusting it so we
+    // don't keep hitting a dead port and surfacing "Failed to fetch".
+    if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
+    sidecarUrl = null
+  }
   const url = await api.getSidecarUrl()
   if (url) sidecarUrl = url
   return sidecarUrl
@@ -76,6 +103,30 @@ export async function transcribeAudio(
     }
     const data = (await res.json()) as { text: string }
     return (data.text ?? '').trim()
+  } catch (err) {
+    // A network-level failure (TypeError) means the sidecar is unreachable —
+    // its cached URL is stale. Drop the cache and retry once against a freshly
+    // resolved URL (which restarts the sidecar if needed).
+    if (err instanceof TypeError) {
+      sidecarUrl = null
+      const retryUrl = await ensureSidecar()
+      if (retryUrl && retryUrl !== url) {
+        const res = await fetch(`${retryUrl}/transcribe`, {
+          method: 'POST',
+          body: form,
+          signal: AbortSignal.timeout(120_000),
+        })
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(
+            (body as { detail?: string }).detail || `transcription failed (${res.status})`,
+          )
+        }
+        const data = (await res.json()) as { text: string }
+        return (data.text ?? '').trim()
+      }
+    }
+    throw err
   } finally {
     if (onModelLoading) onModelLoading(false)
   }

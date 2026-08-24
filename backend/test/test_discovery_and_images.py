@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from agents import _load_images
+from agents import _load_images, _maybe_downscale_image, _MAX_VISION_DIM, _MAX_VISION_BYTES
 import graph
 
 
@@ -41,6 +41,46 @@ def test_load_images_handles_string_and_dict_mixed(tmp_path):
         "data:image/png;base64," + __import__("base64").b64encode(b"\x89PNG\r\n\x1a\n").decode(),
         "data:image/png;base64,CCCC",
     ]
+
+
+def _make_png_data_url(width: int, height: int) -> str:
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    # Noisy image (like a real screenshot) so PNG does not compress to nothing.
+    arr = np.random.randint(0, 256, (height, width, 3), dtype="uint8")
+    img = Image.fromarray(arr, "RGB")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    b64 = __import__("base64").b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def test_downscale_shrinks_oversized_image():
+    # A screenshot-sized image well above the vision limits must be shrunk.
+    big = _make_png_data_url(4000, 3000)
+    assert len(__import__("base64").b64decode(big.split(",", 1)[1])) > _MAX_VISION_BYTES
+    out = _maybe_downscale_image(big)
+    assert out.startswith("data:image/")
+    raw = __import__("base64").b64decode(out.split(",", 1)[1])
+    assert len(raw) <= _MAX_VISION_BYTES
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(raw)) as img:
+        assert max(img.size) <= _MAX_VISION_DIM
+
+
+def test_downscale_keeps_small_image_untouched():
+    small = _make_png_data_url(800, 600)
+    assert _maybe_downscale_image(small) == small
+
+
+def test_downscale_ignores_non_image_data_url():
+    assert _maybe_downscale_image("data:text/plain;base64,QUJD") == "data:text/plain;base64,QUJD"
 
 
 def test_expand_imports_pulls_relative(tmp_path):

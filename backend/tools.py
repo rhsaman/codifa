@@ -2477,6 +2477,77 @@ def _is_terminal_search(command: str) -> bool:
     return False
 
 
+# Commands that MUTATE the filesystem / system state. Used to keep the explore
+# sub-agent read-only: it may inspect the codebase but must never write, delete,
+# move, install, or otherwise change state (matching opencode's explore agent,
+# which is allowed to run bash only for read-only inspection).
+_TERMINAL_WRITE = {
+    "rm", "mv", "cp", "dd", "mkfs", "touch", "mkdir", "rmdir", "chmod", "chown",
+    "chgrp", "ln", "truncate", "shred", "install", "rename", "tee", "sudo", "su",
+    "doas", "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
+    "mount", "umount", "insmod", "rmmod", "modprobe", "iptables", "systemctl",
+    "service", "crontab", "useradd", "userdel", "usermod", "groupadd", "passwd",
+    "chpasswd", "npm", "yarn", "pnpm", "pip", "pip3", "uv", "cargo", "go", "make",
+    "cmake", "gradle", "mvn", "npx", "bundle", "gem", "apt", "apt-get", "dnf",
+    "yum", "brew", "docker", "podman", "kubectl", "helm", "terraform", "ansible",
+    "rsync", "scp", "wget", "curl", "patch", "python", "python3", "node", "ruby",
+    "perl", "bash", "sh", "zsh", "source", "eval", "exec", "xargs", "env",
+    "export", "set", "alias", "printf", "echo",
+}
+
+# git subcommands that mutate the repo (git read commands like log/show/diff/
+# grep/status are allowed for exploration). NOTE: `branch`/`tag` are intentionally
+# excluded here — plain `git branch`/`git tag` (list) are read-only and allowed;
+# only their delete forms (`git branch -d`, `git tag -d`) are blocked below.
+_GIT_WRITE = {
+    "commit", "push", "checkout", "add", "reset", "rm", "mv", "merge", "rebase",
+    "clean", "stash", "clone", "init", "am", "cherry-pick",
+    "revert", "fetch", "pull",
+}
+
+
+def _is_terminal_write(command: str) -> bool:
+    """Heuristic: does ``command`` mutate the filesystem or system state?
+
+    Scans every ``&&``/``;``/``|``/newline segment; if any *meaningful* command
+    is a write/mutate operation (or a shell/interpreter that could write), the
+    whole command is treated as a write. Used to keep the explore sub-agent
+    strictly read-only.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    _SKIP = {"cd", "pwd", "clear", "time"}
+    for seg in re.split(r"&&|;|\||\n", cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        parts = seg.split()
+        first = parts[0].lower() if parts else ""
+        if first in _SKIP:
+            continue
+        # Bare output redirects to a real file are writes; redirect to /dev/null
+        # is a no-op (allowed), and fd-to-fd redirects like `2>&1` don't write a
+        # file either. After stripping those, any remaining `>` is a real write.
+        if re.search(r">>?", seg):
+            _stripped = re.sub(r">>?\s*/dev/null\b", " ", seg)
+            _stripped = re.sub(r"\d*>&\d+", " ", _stripped)
+            if re.search(r">>?", _stripped):
+                return True
+        if first == "git":
+            sub = parts[1].lower() if len(parts) > 1 else ""
+            # `git branch -d/-D`, `git tag -d` delete; plain `git branch`/`git tag`
+            # (list) are read-only.
+            if sub in _GIT_WRITE or (sub in ("branch", "tag") and "-d" in parts):
+                return True
+            return False
+        if first in _TERMINAL_WRITE:
+            return True
+        # First meaningful command is not a write — stop here.
+        return False
+    return False
+
+
 def _tool_event(ev: dict) -> dict:
     """Shape a tool event for the SSE stream: whitelist the fields the UI can
     render. LIVES HERE (not in agents.py) so the backend tests can import it
@@ -3768,6 +3839,26 @@ Returns each match as a single `path:line:match` line (the matching line only �
                 for name, fn in _tool_source.items()
                 if name not in ("task", "update_plan", "vision")
             }
+        # Keep the explore sub-agent strictly read-only: wrap run_terminal so any
+        # command that would mutate the filesystem / system state is rejected
+        # before it runs (opencode's explore agent is bash-read-only).
+        if subagent_type == "explore" and "run_terminal" in _sub_tools:
+            _orig_terminal = _tool_source.get("run_terminal")
+
+            async def _readonly_terminal(
+                command: str, timeout: int = TERMINAL_TIMEOUT
+            ) -> str:
+                if _is_terminal_write(command):
+                    return (
+                        "ERROR: the explore agent is read-only and may not run "
+                        "commands that modify the filesystem or system state "
+                        f"(blocked: {command!r}). Use grep/glob/read for "
+                        "inspection, or delegate mutating work to the main agent "
+                        "via the task tool."
+                    )
+                return await _orig_terminal(command=command, timeout=timeout)
+
+            _sub_tools["run_terminal"] = _readonly_terminal
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)

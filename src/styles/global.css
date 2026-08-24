@@ -2589,7 +2589,7 @@ textarea {
    head's short "on" segment sits inside the tail's longer one). */
 .composer.thinking .composer-inner {
   position: relative;
-  animation: composer-thinking-breathe 4s ease-in-out infinite;
+  animation: composer-thinking-breathe 3s ease-in-out infinite;
 }
 
 .composer-thinking-ring {
@@ -2605,30 +2605,30 @@ textarea {
 .composer-thinking-ring rect {
   fill: none;
   stroke-linecap: round;
-  /* A slow, even orbit reads as "calmly working through a thought" rather
-     than a frantic spinner. */
-  animation: composer-ring-travel 3.4s linear infinite;
+  /* A brisk, even orbit reads as "actively working through a thought" —
+     fast enough to feel alive, even enough not to feel frantic. */
+  animation: composer-ring-travel 1.8s linear infinite;
 }
 
 .composer-thinking-ring-halo {
   stroke: var(--accent);
   stroke-width: 7;
-  stroke-dasharray: 20 80;
-  opacity: 0.32;
-  filter: blur(7px);
+  stroke-dasharray: 26 74;
+  opacity: 0.3;
+  filter: blur(6px);
 }
 
 .composer-thinking-ring-tail {
-  stroke: var(--accent);
+  stroke: url(#composer-thinking-grad);
   stroke-width: 2.25;
-  stroke-dasharray: 20 80;
-  opacity: 0.85;
+  stroke-dasharray: 26 74;
+  opacity: 0.9;
 }
 
 .composer-thinking-ring-head {
   stroke: color-mix(in srgb, var(--thinking) 85%, #fff 15%);
-  stroke-width: 2.25;
-  stroke-dasharray: 4 96;
+  stroke-width: 2.5;
+  stroke-dasharray: 6 94;
 }
 
 @keyframes composer-ring-travel {

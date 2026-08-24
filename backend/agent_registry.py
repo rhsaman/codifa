@@ -73,8 +73,8 @@ AGENTS: dict[str, dict] = {
         "name": "explore",
         "description": EXPLORE_DESCRIPTION,
         "mode": "subagent",
-        # Read-only-leaning exploration tool set (no write/task) — matches
-        # opencode's explore agent: grep/glob/read/run_terminal + web/vision only.
+        # Read-only exploration tool set (no write/task) — matches opencode's
+        # explore agent: grep/glob/read/run_terminal (read-only-wrapped) + web/vision.
         "tools": [
             "grep",
             "glob",

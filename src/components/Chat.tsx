@@ -2546,9 +2546,12 @@ export function ChatPanel() {
             window.alert("Nothing was recognized — please try again.");
           }
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
           window.alert(
-            `Voice transcription failed: ${err instanceof Error ? err.message : String(err)
-            }`,
+            `تبدیل گفتار به متن انجام نشد: ${msg}\n` +
+              (msg.includes("Failed to fetch")
+                ? "سرور محلی (Python) احتمالاً متوقف شده است — برنامه را ببندید و دوباره باز کنید."
+                : "لطفاً دوباره تلاش کنید یا اتصال میکروفون را بررسی کنید."),
           );
         } finally {
           setTranscribing(false);
@@ -3485,6 +3488,18 @@ export function ChatPanel() {
               aria-hidden="true"
               focusable="false"
             >
+              <defs>
+                <linearGradient
+                  id="composer-thinking-grad"
+                  x1="0%"
+                  y1="0%"
+                  x2="100%"
+                  y2="100%"
+                >
+                  <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.2" />
+                  <stop offset="100%" stopColor="var(--thinking)" stopOpacity="1" />
+                </linearGradient>
+              </defs>
               <rect
                 className="composer-thinking-ring-halo"
                 x={1.5}

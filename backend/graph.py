@@ -662,7 +662,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     system_final = (
         _agents._mode_declare(mode)
         + _agents._language_directive(prompt)
-        + ("" if mode in ("coder", "ask", "plan", "reader") else _agents._SEARCH_RULE)
+        + _agents._SEARCH_RULE
         + base_prompt
         + workspace_note
     )
@@ -688,9 +688,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "into this message. When the question touches the project, do the "
             "exploration JUST-IN-TIME with the search tools (glob / grep / read). "
             "Fire every search you already know you need in the SAME turn (parallel "
-            "tool calls). For broad multi-file exploration, delegate to the Explore "
-            "sub-agent via task(subagent_type='explore') and work from its report. "
-            "web_search / fetch_url are ONLY present when the user explicitly asks to "
+            "tool calls). web_search / fetch_url are ONLY present when the user explicitly asks to "
             "search the web (e.g. 'search the web for X') -- never web-search on your "
             "own initiative. vision / skills / MCP connectors are available on demand "
             "when the question needs external info or attached images."

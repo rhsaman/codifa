@@ -1,5 +1,5 @@
 import { execSync, spawn, ChildProcess } from 'child_process'
-import { app } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as net from 'net'
@@ -189,6 +189,15 @@ async function doStart(): Promise<SidecarHandle> {
       console.error(`[sidecar] exited with code ${code}`)
     }
     handle = null
+    // An unexpected death (crash while loading the Whisper model, segfault in
+    // CTranslate2/onnxruntime, OOM, etc.) leaves the renderer holding a stale
+    // cached URL that keeps returning "Failed to fetch". Tell every window so
+    // the client drops its cache and re-resolves (restarting) on the next call.
+    if (!stopping) {
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (!w.isDestroyed()) w.webContents.send('sidecar:dead')
+      }
+    }
   })
   child.on('error', (err) => {
     console.error('[sidecar] spawn error', err)

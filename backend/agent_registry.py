@@ -52,7 +52,12 @@ EXPLORE_SYSTEM = (
     "- Return file paths as absolute paths in your final response\n"
     "- For clear communication, avoid using emojis\n"
     "- Do not create any files, or run bash commands that modify the user's system state in any way\n\n"
-    "Complete the user's search request efficiently and report your findings clearly."
+    "When the answer needs external information (library docs, API references, "
+    "framework guides), use web_search to find the right pages and fetch_url to "
+    "read their contents directly — you have full access to web_search / "
+    "fetch_url / search_console alongside glob/grep/read, so read documentation "
+    "yourself instead of guessing. Complete the user's search request "
+    "efficiently and report your findings clearly."
 )
 
 # The registry. ``tools`` is the sub-agent's tool set:

@@ -679,46 +679,6 @@ def save_plan(workspace: str, title: str, content: str, chat_id: str = "") -> No
         )
 
 
-def save_plan_checklist(
-    workspace: str, title: str, items: list[dict], chat_id: str = ""
-) -> None:
-    """Persist the live checklist (update_plan items) for a workspace+chat.
-
-    The plan markdown is saved by the graph node (plan_build); the checklist is
-    a separate sidecar so the step-by-step todos survive reloads and aren't lost
-    when only the node writes the markdown. Stored as
-    ``plan/<ws>/<chat>/plan.checklist.json``.
-    """
-    with _LOCK:
-        _migrate_legacy_db()
-        d = _plan_dir(workspace, chat_id)
-        _atomic_write_json(
-            os.path.join(d, "plan.checklist.json"),
-            {
-                "workspace": str(workspace or ""),
-                "chat_id": str(chat_id or ""),
-                "title": str(title or ""),
-                "items": items or [],
-                "updated_at": _now(),
-            },
-        )
-
-
-def get_plan_checklist(workspace: str, chat_id: str = "") -> dict | None:
-    """Return ``{"workspace", "chat_id", "title", "items"}`` or None if absent."""
-    with _LOCK:
-        d = _plan_dir(workspace, chat_id)
-        data = _read_json(os.path.join(d, "plan.checklist.json"))
-        if not isinstance(data, dict):
-            return None
-        return {
-            "workspace": data.get("workspace", ""),
-            "chat_id": data.get("chat_id", ""),
-            "title": data.get("title", ""),
-            "items": data.get("items", []),
-        }
-
-
 def _most_recent_chat_dir(ws_dir: str) -> str | None:
     best: tuple[float, str] | None = None
     try:

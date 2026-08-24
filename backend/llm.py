@@ -29,6 +29,9 @@ import asyncio
 import httpx
 from typing import Any
 
+from langchain_core.messages import AIMessageChunk
+from langchain_openai import ChatOpenAI
+
 from providers import (
     OPENCODE_UA,
     _provider_meta,
@@ -51,6 +54,66 @@ _THINKING_LEVELS = {
     "high": "high",
     "xhigh": "xhigh",
 }
+
+
+class ReasoningChatOpenAI(ChatOpenAI):
+    """ChatOpenAI that normalizes gateway-specific reasoning fields.
+
+    Some OpenAI-compatible gateways (notably opencode) stream chain-of-thought
+    under ``delta.reasoning`` instead of the ``reasoning_content`` field
+    LangChain expects. ``langchain-openai`` (≤1.6) silently drops
+    ``delta.reasoning`` (and even ``delta.reasoning_content`` in the Chat
+    Completions path), so the thinking text would otherwise leak into the
+    visible ``content`` stream.
+
+    This subclass lifts any reasoning text found in ``delta.reasoning`` /
+    ``delta.reasoning_content`` onto ``AIMessageChunk.additional_kwargs`` so the
+    backend's existing ``_thinking_from_chunk`` filter can drop it before it
+    reaches the frontend. We patch the *output* message chunk (not the raw
+    ``delta``) because the parent parser ignores ``reasoning_content`` entirely
+    and would otherwise discard our backfill.
+    """
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict,
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ) -> Any:
+        generation_chunk = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation_chunk is None:
+            return None
+        # Pull reasoning text out of the raw delta (the parent parser drops it).
+        raw_reasoning: str | None = None
+        if isinstance(chunk, dict):
+            for choice in chunk.get("choices") or []:
+                delta = (choice or {}).get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                # Prefer an explicit reasoning_content, fall back to delta.reasoning
+                # (opencode's wire format). Skip when content is also present so we
+                # never mislabel a real answer token as thinking.
+                rc = delta.get("reasoning_content")
+                if isinstance(rc, str) and rc:
+                    raw_reasoning = rc
+                elif delta.get("reasoning") is not None and not delta.get("content"):
+                    raw_reasoning = str(delta["reasoning"])
+                if raw_reasoning:
+                    break
+        if raw_reasoning:
+            message = generation_chunk.message
+            ak = dict(getattr(message, "additional_kwargs", {}) or {})
+            # Only set when not already populated, to avoid clobbering a gateway
+            # that already surfaces reasoning through additional_kwargs.
+            if not ak.get("reasoning_content"):
+                ak["reasoning_content"] = raw_reasoning
+                try:
+                    message.additional_kwargs = ak
+                except Exception:  # noqa: BLE001
+                    pass
+        return generation_chunk
 
 
 class ProviderError(RuntimeError):
@@ -175,7 +238,9 @@ def build_chat_model(
     )
     if reasoning_effort is not None:
         lc_kwargs["reasoning_effort"] = reasoning_effort
-    return ChatOpenAI(**lc_kwargs)
+    # Use the reasoning-normalizing subclass so gateways that stream thinking
+    # under delta.reasoning (opencode) don't leak it into the visible content.
+    return ReasoningChatOpenAI(**lc_kwargs)
 
 
 _MAX_OUTPUT_TOKENS = 128_000
@@ -463,6 +528,14 @@ async def langchain_tool_loop(
             msgs.append(
                 ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
             )
+    # The loop ended by hitting max_steps (not by the model returning a
+    # final text reply). Recover the last textual answer the sub-agent
+    # produced so it never returns an empty result to the parent.
+    for _m in reversed(msgs):
+        if isinstance(_m, AIMessage):
+            _c = getattr(_m, "content", "")
+            if isinstance(_c, str) and _c.strip():
+                return _c.strip()
     return ""
 
 

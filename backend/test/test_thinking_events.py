@@ -56,3 +56,35 @@ def test_thinking_from_string_content_is_detected():
     # it does for reasoning_content/thinking/metadata shapes. This test locks
     # the contract used by the stream filter.
     assert _thinking_from_chunk(chunk) is None
+
+
+async def test_raw_thinking_in_content_does_not_leak(run_events, mock_server, workspace):
+    """opencode streams thinking under delta.reasoning (reasoning_content is
+    nulled). The backend must drop those tokens and never emit them as 'text'
+    events, while still emitting the real answer text."""
+    from agents import run_agent
+
+    base, mock = mock_server
+    # Script: a reasoning model that first streams thinking under delta.reasoning,
+    # then the real answer text under delta.content.
+    mock.script = [[
+        {"id": "c-0", "object": "chat.completion.chunk", "created": 0,
+         "model": "mock-model",
+         "choices": [{"index": 0, "delta": {"reasoning": "بذار کد رو چک کنم"}, "finish_reason": None}]},
+        {"id": "c-1", "object": "chat.completion.chunk", "created": 0,
+         "model": "mock-model",
+         "choices": [{"index": 0, "delta": {"content": "جواب اینه: سلام"}, "finish_reason": None}]},
+        {"id": "c-end", "object": "chat.completion.chunk", "created": 0,
+         "model": "mock-model",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]]
+    events = []
+    async for ev in run_agent(
+        provider="custom", model_name="mock-model", base_url=base,
+        api_key="test", root=str(workspace), mode="coder", prompt="سلام",
+        history=[], chat_id="pytest-raw-think", model_reasoning=True,
+    ):
+        events.append(ev)
+    texts = [e["content"] for e in events if e.get("kind") == "text"]
+    assert "بذار کد رو چک کنم" not in texts, f"raw thinking leaked: {texts}"
+    assert any("جواب اینه: سلام" in t for t in texts), f"answer missing: {texts}"

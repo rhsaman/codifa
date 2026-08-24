@@ -102,9 +102,9 @@ async def test_plan_build_auto_corrects_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_plan_build_skips_save_when_not_plan(tmp_path, monkeypatch):
+async def test_plan_build_skips_save_when_empty(tmp_path, monkeypatch):
     root = str(tmp_path)
-    reply = "Just a normal reply, no plan header."
+    reply = ""
 
     calls = []
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: calls.append(1))
@@ -113,6 +113,39 @@ async def test_plan_build_skips_save_when_not_plan(tmp_path, monkeypatch):
     state, q = _state(root, reply)
     await plan_build(state)
     assert len(calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_build_saves_with_variant_header(tmp_path, monkeypatch):
+    # The model is told to open with '## Plan', but it sometimes prefixes a
+    # lead-in or uses a variant header. The plan must STILL be saved (the
+    # "plan sometimes isn't saved" bug). We exercise _normalize_plan_reply
+    # directly plus the full plan_build path for each variant.
+    from graph import _normalize_plan_reply
+
+    variants = [
+        "## Plan\n1. do the thing\nFiles: backend/graph.py",
+        "## plan\n1. do the thing\nFiles: backend/graph.py",
+        "### Plan:\n1. do the thing\nFiles: backend/graph.py",
+        "Here is the plan:\n## Plan\n1. do the thing\nFiles: backend/graph.py",
+        "1. do the thing\nFiles: backend/graph.py",  # no header at all
+    ]
+    for v in variants:
+        assert _normalize_plan_reply(v).lstrip().lower().startswith("## plan") or (
+            v.strip() == _normalize_plan_reply(v)
+        ), v
+
+    # Full path: every variant must hit the disk exactly once.
+    root = str(tmp_path)
+    saved = {}
+    monkeypatch.setattr(
+        graph.state_db, "save_plan", lambda *a, **k: saved.update(dict(workspace=a[0], content=a[2]))
+    )
+    for v in variants:
+        monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(v))
+        state, q = _state(root, v)
+        await plan_build(state)
+        assert saved.get("content", "").strip(), v
 
 
 def test_save_plan_tool_removed_from_registry():
@@ -124,19 +157,11 @@ def test_save_plan_tool_removed_from_registry():
 
 
 @pytest.mark.asyncio
-async def test_update_plan_persists_checklist(tmp_path, monkeypatch):
-    # update_plan must write the checklist to disk (not just emit to the UI),
-    # so todos survive reloads.
-    saved = {}
-
-    def fake_save_plan_checklist(workspace, title, items, chat_id=""):
-        saved["items"] = items
-        saved["chat_id"] = chat_id
-
-    monkeypatch.setattr(
-        graph.state_db, "save_plan_checklist", fake_save_plan_checklist
-    )
-
+async def test_update_plan_emits_checklist_only(tmp_path, monkeypatch):
+    # update_plan must emit the checklist to the UI but must NOT persist it to
+    # disk (the checklist is session-only now, to avoid re-loading stale todos
+    # on every message). The persistence helper was removed entirely, so we
+    # only assert the UI event is still emitted.
     from tools import make_tool_callbacks
 
     events = []
@@ -155,8 +180,6 @@ async def test_update_plan_persists_checklist(tmp_path, monkeypatch):
     result = await tools["update_plan"](items)
 
     assert "Plan updated" in result
-    assert saved.get("chat_id") == "c1"
-    assert len(saved.get("items", [])) == 3
     # The plan event must still be emitted to the UI.
     assert any(e.get("kind") == "plan" for e in events)
 
@@ -199,57 +222,3 @@ def _await(value):
         return value
 
     return _coro()
-
-
-def _plan_ws(root: str) -> str:
-    import os
-
-    from tools import slugify
-
-    return slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
-
-
-@pytest.mark.asyncio
-async def test_emit_saved_checklist_reloads_in_both_modes(tmp_path, monkeypatch):
-    # The persisted checklist (todos) must be reloaded and emitted as a
-    # 'plan' event in BOTH plan and coder mode, so it survives chat reloads
-    # and mode switches. The plan dir is redirected to tmp_path so the test
-    # leaves no real files in the project tree.
-    import state_db
-    from graph import _emit_saved_checklist
-
-    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path / "plan"))
-
-    root = str(tmp_path)
-    ws = _plan_ws(root)
-    items = [
-        {"id": "step-0", "content": "a", "status": "completed"},
-        {"id": "step-1", "content": "b", "status": "in_progress"},
-    ]
-    state_db.save_plan_checklist(ws, "plan", items, chat_id="c1")
-
-    for mode in ("plan", "coder"):
-        q: asyncio.Queue = asyncio.Queue()
-        # build_turn_context calls _emit_saved_checklist for both modes, so we
-        # exercise the helper directly to keep the test fast & offline.
-        _emit_saved_checklist(q, root, "c1")
-        emitted = [e for e in list(q._queue) if e.get("kind") == "plan"]
-        assert any(e.get("items") == items for e in emitted), mode
-
-
-@pytest.mark.asyncio
-async def test_emit_saved_checklist_no_items_is_silent(tmp_path, monkeypatch):
-    # When no checklist was persisted, nothing should be emitted.
-    import state_db
-    from graph import _emit_saved_checklist
-
-    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path / "plan"))
-
-    root = str(tmp_path)
-    ws = _plan_ws(root)
-    state_db.save_plan_checklist(ws, "plan", [], chat_id="c2")
-
-    q: asyncio.Queue = asyncio.Queue()
-    _emit_saved_checklist(q, root, "c2")
-    emitted = [e for e in list(q._queue) if e.get("kind") == "plan"]
-    assert emitted == []

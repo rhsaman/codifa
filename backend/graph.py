@@ -163,14 +163,39 @@ class AgentState(TypedDict, total=False):
 def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
     """Convert plain ``{role, content}`` turns to LangChain messages.
 
-    Tool/plan/resume metadata carried on assistant turns is dropped here -- it is
-    re-injected as system notes by the turn runner (essentials-only resume), not
-    as real tool-call messages.
+    Assistant turns may carry a ``toolActivity`` array (the frontend sends it on
+    every assistant message: tool name, args, ``callId``, and the completed
+    result). We reconstruct those as real ``AIMessage(tool_calls=[...])`` +
+    ``ToolMessage`` pairs so the model SEES what it already did and does NOT
+    re-run the tool calls after a reconnect/interrupt -- the transcript alone
+    (no synthetic "you already did X" injection) carries the prior work forward.
     """
     out: list[BaseMessage] = []
     for turn in history or []:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
+        tool_activity = turn.get("toolActivity") or []
+        # Reconstruct assistant tool calls from the carried toolActivity so a
+        # resumed turn continues instead of redoing completed work.
+        if role == "assistant" and tool_activity:
+            tool_calls: list[dict] = []
+            tool_msgs: list[BaseMessage] = []
+            for ta in tool_activity:
+                if not isinstance(ta, dict):
+                    continue
+                tc_id = str(ta.get("callId") or f"ta-{len(tool_calls)}")
+                tool_calls.append({
+                    "name": ta.get("tool", "tool"),
+                    "args": ta.get("args", {}) or {},
+                    "id": tc_id,
+                })
+                # Prefer the full tool result (items); fall back to the summary.
+                result = ta.get("items") or ta.get("summary") or ""
+                tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
+            if tool_calls:
+                out.append(AIMessage(content=content, tool_calls=tool_calls))
+                out.extend(tool_msgs)
+                continue
         if not content:
             continue
         if role == "system":
@@ -242,6 +267,9 @@ def filter_tools_for_mode(
     plan-mode persistence (handled by the plan_build node, not a tool), ask-mode drops (read/memory/trivial-prompt schemas),
     ``allow_create`` gating of skill/MCP creation, and file-scope stripping.
     """
+    # Reset the per-turn search counter so the auto-router's "repeated calls"
+    # threshold is measured per model turn (not across the whole session).
+    _agents._reset_search_call_count()
     cap = cap or {}
     _WEB = {"web_search", "fetch_url", "search_console"}
     has_cap = any(
@@ -322,6 +350,19 @@ def filter_tools_for_mode(
             tools["run_terminal"] = _agents._wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
+    # Auto-router: steer BROAD / repeated searches to the explore sub-agent.
+    # Applied to the search/web tools in the NON-scoped case (in scoped mode
+    # glob/task are already stripped, and grep/read are wrapped for scope). The
+    # router only intercepts genuinely broad or repeated calls — targeted
+    # grep/glob/read/web_search/fetch_url still run directly, before AND after
+    # any explore call, so the model keeps full direct access for precise
+    # lookups. The explore sub-agent itself also has web_search/fetch_url/glob/
+    # grep/read, so wide searches (and the docs they need) run in isolation.
+    if not scoped:
+        for n in ("grep", "glob", "read", "web_search", "fetch_url"):
+            if n in tools:
+                tools[n] = _agents._wrap_auto_explore_router(tools[n])
+
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
     # what closes the read-only bypass: an explore/plan-mode `task` call can no
@@ -836,9 +877,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             saved = ""
         if saved:
             system_final += saved
-        # Reload the persisted checklist (todos) so they survive reloads and
-        # appear in BOTH plan and coder mode when the chat is opened / switched.
-        _emit_saved_checklist(queue, root, chat_id)
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -970,26 +1008,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "main_model": model,
         "prompt": prompt,
     }
-
-
-def _emit_saved_checklist(queue: asyncio.Queue, root: str, chat_id: str) -> None:
-    """Reload the persisted plan checklist (todos) and push it to the frontend
-    as a ``kind: "plan"`` event. Called from ``build_turn_context`` so the
-    checklist survives reloads and appears in BOTH plan and coder mode when the
-    chat is opened or the mode is switched.
-    """
-    try:
-        from tools import slugify
-
-        ws = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
-        checklist = state_db.get_plan_checklist(ws, chat_id=chat_id)
-    except Exception:  # noqa: BLE001
-        checklist = None
-    if checklist and checklist.get("items"):
-        queue.put_nowait({"kind": "plan", "items": checklist["items"]})
 
 
 def model_timeout_for(state: AgentState) -> float:
@@ -1368,6 +1386,8 @@ async def _run_mode_turn(
                 ai: Any = None
                 _astream_count_local = 0
                 _thinking_active = False
+                _answer_started = False
+                _saw_real_reasoning = False
                 _step_text = ""
                 # The model is reasoning-capable (flag from the /models payload /
                 # models.dev catalog, forwarded by the frontend). We emit a single
@@ -1387,8 +1407,17 @@ async def _run_mode_turn(
                     # lightweight "thinking" toggle (see above), never the
                     # reasoning text itself. Some gateways surface thinking in
                     # content/reasoning_content, so drop it here to avoid
-                    # leaking it into the visible message.
+                    # leaking it into the visible message. The OpenAI-compatible
+                    # ChatOpenAI subclass (see llm.py) already normalizes
+                    # delta.reasoning -> reasoning_content, so _thinking_from_chunk
+                    # catches it; plain string content that is actually thinking
+                    # (reasoning_content nulled out) is caught by the same helper.
                     if _model_reasoning and _thinking_from_chunk(chunk):
+                        # Real reasoning surfaced in a dedicated field
+                        # (reasoning_content / reasoning / thinking). Drop it and
+                        # remember we saw genuine reasoning so a later plain
+                        # content token is treated as the answer, not thinking.
+                        _saw_real_reasoning = True
                         continue
                     content = chunk.content
                     if isinstance(content, str) and content:
@@ -1398,6 +1427,17 @@ async def _run_mode_turn(
                         if _thinking_active:
                             _thinking_active = False
                             queue.put_nowait({"kind": "thinking", "active": False})
+                        # Some gateways (opencode) null reasoning_content and
+                        # stream the chain-of-thought as plain string content
+                        # before the real answer. When reasoning is enabled and
+                        # we never saw genuine reasoning in a dedicated field,
+                        # treat that pre-answer content as thinking so it never
+                        # leaks into the visible message. Once we've seen real
+                        # reasoning (or already started the answer) the content
+                        # is the actual answer.
+                        if _model_reasoning and not _saw_real_reasoning and not _answer_started:
+                            _answer_started = True
+                            continue
                         queue.put_nowait({"kind": "text", "content": content})
                         _step_text += content
                     elif isinstance(content, list):
@@ -2872,13 +2912,14 @@ async def plan_build(state: AgentState) -> dict:
     # don't crash on .strip() — and never silently swallow a save failure.
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
-    if reply.strip().startswith("## Plan"):
+    if reply.strip():
         from tools import slugify, _self_check_plan_paths
 
         ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
-        reply, check_note = _self_check_plan_paths(state["root"], reply)
+        plan_body = _normalize_plan_reply(reply)
+        plan_body, check_note = _self_check_plan_paths(state["root"], plan_body)
         try:
-            state_db.save_plan(ws, "plan", reply, chat_id=state.get("chat_id", ""))
+            state_db.save_plan(ws, "plan", plan_body, chat_id=state.get("chat_id", ""))
         except Exception as exc:  # noqa: BLE001
             # Surface the failure instead of swallowing it: a silent drop is
             # exactly the "plan sometimes isn't saved" bug.
@@ -2887,7 +2928,26 @@ async def plan_build(state: AgentState) -> dict:
             )
         if check_note:
             queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
+        reply = plan_body
     return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}
+
+
+def _normalize_plan_reply(reply: str) -> str:
+    """Return the plan body to persist.
+
+    The model is told to open with ``## Plan``, but it sometimes prefixes a
+    short lead-in or uses a variant header (``## plan``, ``### Plan``,
+    ``## Plan:``). We still persist the plan in those cases instead of silently
+    dropping it (the "plan sometimes isn't saved" bug). If no header is present
+    at all but we're in plan mode, the whole reply IS the plan.
+    """
+    import re
+
+    text = (reply or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
+    return text[m.start():] if m else text
 
 
 def _route_plan_build(state: AgentState) -> str:

@@ -3059,18 +3059,11 @@ def make_tool_callbacks(
         _plan_nudge_state["has_in_progress"] = any(
             i["status"] == "in_progress" for i in normalized
         )
-        # Persist the checklist to disk (not just the UI emit) so the todos
-        # survive reloads and aren't lost when only the graph node writes the
-        # plan markdown. The workspace slug mirrors plan_build's save_plan key.
-        try:
-            ws = slugify(
-                os.path.basename(os.path.realpath(root).rstrip(os.sep))
-            ) or "workspace"
-            _state_db.save_plan_checklist(
-                ws, "plan", normalized, chat_id=_chat_id
-            )
-        except Exception:  # noqa: BLE001, S110 — persistence is best-effort
-            pass
+        # The checklist is intentionally NOT persisted to disk anymore — it
+        # lives only for the current session/UI. Persisting it caused the
+        # checklist to be re-loaded and re-emitted on every message (and on
+        # every graph node), which clobbered in-turn edits and reloaded stale
+        # todos. We only emit it to the UI now.
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
         emit(

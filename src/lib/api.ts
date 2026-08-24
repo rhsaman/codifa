@@ -1,6 +1,6 @@
 import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, SidecarEvent } from '../types'
 import { api } from './fs'
-import { modelContextWindow } from './context'
+import { modelContextWindow, scaleReserved } from './context'
 
 let sidecarUrl: string | null = null
 
@@ -359,7 +359,13 @@ export async function streamChat(
           vector_config: params.vectorConfig ?? null,
           subagent_models: params.subagentModels ?? {},
           providers: params.providers ?? {},
-          reserved: params.reserved ?? 20000,
+          // Scale the compaction headroom to the window: keep the 20k default for
+          // large models, but clamp it down for small windows so compaction never
+          // fires near the start (opencode clamps reserved to maxOutputTokens).
+          reserved: scaleReserved(
+            modelContextWindow(params.provider, params.provider.model) ?? 0,
+            params.reserved ?? 20000,
+          ),
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })

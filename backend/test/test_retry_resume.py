@@ -192,4 +192,28 @@ async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspa
     # No durable resume file is persisted on error (we don't learn on error).
     resume = state_db.load_turn_resume(str(workspace), "pytest-chat")
     assert resume is None, "no durable resume file should be written on error"
+
+
+def test_free_usage_limit_is_transient_not_quota():
+    """A free-tier gateway's ``FreeUsageLimitError`` carrying a "Rate limit
+    exceeded. Please try again later." message is a BRIEF 429 throttle, not a
+    permanent quota cap. It must NOT be treated as quota-exhausted (which would
+    skip the retry loop and surface as a fatal error immediately) — the unified
+    30s backoff should ride it out."""
+    exc = RuntimeError(
+        'Error code: 429 - {"error": {"type": "FreeUsageLimitError", '
+        '"message": "Rate limit exceeded. Please try again later."}}'
+    )
+    assert agents._is_quota_exhausted(exc) is False
+    assert agents._is_retryable(exc) is True
+
+
+def test_hard_quota_exhausted_still_detected():
+    """A genuine usage-quota cap (no transient phrase) is still detected as
+    exhausted and skips the retry loop."""
+    exc = RuntimeError(
+        'Error code: 429 - {"error": {"type": "FreeUsageLimitError", '
+        '"message": "You have reached your usage limit. Upgrade to continue."}}'
+    )
+    assert agents._is_quota_exhausted(exc) is True
     assert _all_requests_have_no_resume()

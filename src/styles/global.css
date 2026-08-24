@@ -27,12 +27,10 @@
      outlines: a hairline tinted from the text color instead of a solid box. */
   --hairline: color-mix(in srgb, var(--text) 10%, transparent);
   --shadow-pop:
-    inset 0 1px 0 rgba(255, 255, 255, 0.07),
-    0 4px 14px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 4px 14px rgba(0, 0, 0, 0.35),
     0 28px 64px -16px rgba(0, 0, 0, 0.55);
   --shadow-card:
-    inset 0 1px 0 rgba(255, 255, 255, 0.06),
-    0 1px 2px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.25),
     0 10px 26px -12px rgba(0, 0, 0, 0.45);
 
   --font-sans:
@@ -230,11 +228,9 @@ textarea {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
-    var(--bg-alt)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
   border-right: none;
   box-shadow:
     inset -1px 0 0 color-mix(in srgb, var(--text) 5%, transparent),
@@ -269,11 +265,9 @@ textarea {
   padding: 9px 0;
   border-radius: 14px;
   border: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 16%, var(--bg-input)),
-    color-mix(in srgb, var(--accent) 8%, var(--bg-input))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 16%, var(--bg-input)),
+      color-mix(in srgb, var(--accent) 8%, var(--bg-input)));
   color: var(--text);
   font-size: 13px;
   font-weight: 600;
@@ -291,11 +285,9 @@ textarea {
 }
 
 .sidebar-new-btn:hover {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 22%, var(--bg-input)),
-    color-mix(in srgb, var(--accent) 12%, var(--bg-input))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 22%, var(--bg-input)),
+      color-mix(in srgb, var(--accent) 12%, var(--bg-input)));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
     0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent),
@@ -428,11 +420,9 @@ textarea {
   /* Tinted with the theme's main accent color (--accent) so the current chat
      reads as one cohesive highlighted card in the active theme — independent
      of the workspace color, which stays on the group header dot. */
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 20%, var(--bg-alt)) 0%,
-    color-mix(in srgb, var(--accent) 9%, var(--bg-alt)) 100%
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 20%, var(--bg-alt)) 0%,
+      color-mix(in srgb, var(--accent) 9%, var(--bg-alt)) 100%);
   color: var(--text);
   font-weight: 500;
   box-shadow:
@@ -511,19 +501,23 @@ textarea {
     0 0 12px color-mix(in srgb, var(--success) 45%, transparent);
   animation: chat-unread-pop 0.3s ease-out;
 }
+
 @keyframes chat-unread-pop {
   0% {
     transform: scale(0);
     opacity: 0;
   }
+
   70% {
     transform: scale(1.25);
   }
+
   100% {
     transform: scale(1);
     opacity: 1;
   }
 }
+
 /* Unread chats read a touch stronger, so the new message is easy to spot. */
 .chat-item.unread .chat-item-title {
   font-weight: 600;
@@ -543,9 +537,11 @@ textarea {
   color: var(--on-accent);
   animation: chat-streaming-pulse 1.2s ease-in-out infinite;
 }
+
 .chat-item-pending.permission {
   background: var(--thinking);
 }
+
 .chat-item-pending.ask {
   background: var(--link);
 }
@@ -571,11 +567,13 @@ textarea {
 }
 
 @keyframes chat-streaming-pulse {
+
   0%,
   100% {
     opacity: 0.35;
     transform: scale(0.85);
   }
+
   50% {
     opacity: 1;
     transform: scale(1.15);
@@ -656,6 +654,7 @@ textarea {
     opacity: 0;
     transform: translateY(-4px) scale(0.98);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -977,8 +976,7 @@ textarea {
   gap: 4px;
   padding-left: 10px;
   margin: 2px 0 2px 16px;
-  border-left: 2px solid
-    color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent);
 }
 
 .sidebar-footer {
@@ -996,11 +994,9 @@ textarea {
 .sidebar-panel {
   border: none;
   border-radius: 14px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%),
-    var(--bg-input)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%),
+      var(--bg-input));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 1px 4px rgba(0, 0, 0, 0.08);
@@ -1475,7 +1471,7 @@ textarea {
 }
 
 .update-btn::before {
-  content: '';
+  content: "";
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -1488,13 +1484,16 @@ textarea {
   0% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
   }
+
   100% {
     box-shadow: 0 0 0 6px transparent;
   }
 }
 
 .update-btn:hover {
-  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 70%, var(--text)));
+  background: linear-gradient(135deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 70%, var(--text)));
   color: var(--on-accent);
   border-color: transparent;
   transform: translateY(-1px);
@@ -1612,10 +1611,12 @@ textarea {
   text-align: center;
   cursor: zoom-in;
 }
+
 .mermaid-block svg {
   max-width: 100%;
   height: auto;
 }
+
 /* Fallback while the assistant is still streaming an incomplete diagram: show
    the raw source as a code block instead of an error. */
 .mermaid-fallback {
@@ -1642,12 +1643,12 @@ textarea {
   margin-bottom: 0.3em;
 }
 
-.markdown-body li > p {
+.markdown-body li>p {
   margin-bottom: 0.3em;
 }
 
-.markdown-body li > ul,
-.markdown-body li > ol {
+.markdown-body li>ul,
+.markdown-body li>ol {
   margin-top: 0.4em;
   margin-bottom: 0;
 }
@@ -1656,7 +1657,7 @@ textarea {
   margin-bottom: 0;
 }
 
-.markdown-body > :last-child,
+.markdown-body> :last-child,
 .markdown-body p:last-child,
 .markdown-body ul:last-child,
 .markdown-body ol:last-child,
@@ -1838,7 +1839,7 @@ textarea {
   white-space: pre;
 }
 
-.markdown-body :not(pre) > code {
+.markdown-body :not(pre)>code {
   direction: ltr;
   unicode-bidi: isolate;
 }
@@ -1878,11 +1879,9 @@ textarea {
   position: relative;
   /* Same surface as the sidebar: --bg-alt with a faint accent tint at the
      top, so the chat and sidebar read as one continuous surface. */
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
-    var(--bg-alt)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
 }
 
 .chat-toolbar {
@@ -1951,11 +1950,9 @@ textarea {
   padding: 0;
   border-radius: 50%;
   border: 1px solid var(--border);
-  background: linear-gradient(
-    180deg,
-    var(--bg-panel),
-    color-mix(in srgb, var(--bg-panel) 90%, var(--accent-dim))
-  );
+  background: linear-gradient(180deg,
+      var(--bg-panel),
+      color-mix(in srgb, var(--bg-panel) 90%, var(--accent-dim)));
   color: var(--text);
   display: inline-flex;
   align-items: center;
@@ -2033,7 +2030,9 @@ textarea {
   border-radius: 999px;
   padding: 6px 14px;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
 }
 
 .load-older-btn:hover {
@@ -2066,11 +2065,9 @@ textarea {
   height: 18px;
   border-radius: 50%;
   margin-inline-end: 7px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--accent) 24%, var(--bg-panel)),
-    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
-  );
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 24%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
   color: var(--accent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
   vertical-align: -4px;
@@ -2097,10 +2094,12 @@ textarea {
 }
 
 @keyframes steer-pulse {
+
   0%,
   100% {
     opacity: 0.35;
   }
+
   50% {
     opacity: 1;
   }
@@ -2119,19 +2118,19 @@ textarea {
   padding: 10px 0 0;
 }
 
-.msg-bubble.segmented > .chat-message.markdown-body {
+.msg-bubble.segmented>.chat-message.markdown-body {
   padding: 0 4px;
 }
 
-.msg-bubble.segmented > .tool-card {
+.msg-bubble.segmented>.tool-card {
   margin: 4px 4px;
 }
 
-.msg-bubble.segmented > .tool-group {
+.msg-bubble.segmented>.tool-group {
   margin: 4px 4px;
 }
 
-.msg-bubble.segmented > .tool-trace {
+.msg-bubble.segmented>.tool-trace {
   margin: 4px 4px;
 }
 
@@ -2140,7 +2139,7 @@ textarea {
    tool cards stacking below. Full-width, mirroring a normal user message
    EXACTLY — the .msg.user wrapper reuses the same role header + bubble styles,
    so an interleaved steer is indistinguishable from the user's own messages. */
-.msg-bubble.segmented > .msg.user.seg-steer {
+.msg-bubble.segmented>.msg.user.seg-steer {
   /* Clear gap both sides so the bubble reads as a separate user message, not a
      tool card glued to its neighbors (the surrounding tool cards use 4px). */
   margin: 16px 0;
@@ -2149,7 +2148,7 @@ textarea {
   content-visibility: visible;
 }
 
-.msg-bubble.segmented > .chat-message + .chat-message {
+.msg-bubble.segmented>.chat-message+.chat-message {
   margin-top: 2px;
 }
 
@@ -2183,11 +2182,9 @@ textarea {
   /* Solid theme-accent fill (iMessage-style) so the user bubble is instantly
      distinct from the dark tinted tool cards. Text flips to --on-accent for
      guaranteed contrast on the bright surface. */
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
-    color-mix(in srgb, var(--accent) 74%, var(--bg-panel))
-  );
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 74%, var(--bg-panel)));
   border: none;
   border-radius: 18px 18px 18px 6px;
   color: var(--on-accent);
@@ -2200,7 +2197,7 @@ textarea {
 
 /* Real speech-bubble tail — a small triangle on the user's side (LTR: left). */
 .msg.user .msg-bubble::after {
-  content: '';
+  content: "";
   position: absolute;
   bottom: 0;
   left: -7px;
@@ -2345,11 +2342,9 @@ textarea {
   border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
   border-left: 3px solid var(--accent);
   border-radius: calc(var(--radius) + 3px);
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--accent) 8%, var(--bg)) 0%,
-    color-mix(in srgb, var(--accent) 3%, var(--bg)) 100%
-  );
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 8%, var(--bg)) 0%,
+      color-mix(in srgb, var(--accent) 3%, var(--bg)) 100%);
   box-shadow: 0 2px 10px color-mix(in srgb, var(--shadow) 22%, transparent);
   overflow: hidden;
   margin: 4px 0 10px;
@@ -2544,12 +2539,10 @@ textarea {
   /* The composer floats over the conversation: a translucent wash lets the
      messages scroll behind the input and stay visible through it, fading
      from a subtle tint at the bottom edge to fully transparent at the top. */
-  background: linear-gradient(
-    to top,
-    color-mix(in srgb, var(--bg-panel) 45%, transparent) 0%,
-    color-mix(in srgb, var(--bg-panel) 18%, transparent) 55%,
-    transparent 100%
-  );
+  background: linear-gradient(to top,
+      color-mix(in srgb, var(--bg-panel) 45%, transparent) 0%,
+      color-mix(in srgb, var(--bg-panel) 18%, transparent) 55%,
+      transparent 100%);
   transition: box-shadow 0.15s;
 }
 
@@ -2589,11 +2582,9 @@ textarea {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--bg-input) 94%, #fff 6%),
-    var(--bg-input)
-  );
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg-input) 94%, #fff 6%),
+      var(--bg-input));
   border: none;
   border-radius: 24px;
   padding: 14px 16px 12px;
@@ -2828,6 +2819,7 @@ textarea {
 }
 
 @keyframes wave-dance {
+
   0%,
   100% {
     height: 30%;
@@ -2850,6 +2842,7 @@ textarea {
 }
 
 @keyframes mic-pulse {
+
   0%,
   100% {
     opacity: 1;
@@ -2863,7 +2856,9 @@ textarea {
 .send-btn {
   width: 36px;
   height: 36px;
-  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 78%, #000));
+  background: linear-gradient(135deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 78%, #000));
   color: var(--on-accent);
   box-shadow:
     0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent),
@@ -2912,6 +2907,7 @@ textarea {
 }
 
 @keyframes stop-pulse {
+
   0%,
   100% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 40%, transparent);
@@ -3041,6 +3037,7 @@ textarea {
     opacity: 0;
     transform: translateX(var(--mode-x, -50%)) translateY(6px) scale(0.97);
   }
+
   to {
     opacity: 1;
     transform: translateX(var(--mode-x, -50%)) translateY(0) scale(1);
@@ -3078,11 +3075,9 @@ textarea {
 }
 
 .mode-menu-item.active {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 16%, transparent),
-    color-mix(in srgb, var(--accent) 8%, transparent)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 16%, transparent),
+      color-mix(in srgb, var(--accent) 8%, transparent));
   box-shadow:
     inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent),
     0 1px 8px -3px color-mix(in srgb, var(--accent) 40%, transparent);
@@ -3466,11 +3461,9 @@ textarea {
   padding: 7px 10px;
   border: none;
   border-radius: 12px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-panel) 96%, var(--text) 4%),
-    var(--bg-panel)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 96%, var(--text) 4%),
+      var(--bg-panel));
   box-shadow: var(--shadow-card);
 }
 
@@ -3526,12 +3519,14 @@ textarea {
   min-width: 0;
 }
 
-.tool-sub-row + .tool-sub-row {
+.tool-sub-row+.tool-sub-row {
   border-top: 1px solid var(--hairline);
 }
 
 .tool-sub-row.running {
-  background: color-mix(in srgb, var(--bg-raised) 88%, var(--tool-color, var(--accent)) 12%);
+  background: color-mix(in srgb,
+      var(--bg-raised) 88%,
+      var(--tool-color, var(--accent)) 12%);
 }
 
 .tool-sub-row .tool-sub-name {
@@ -3565,11 +3560,9 @@ textarea {
 }
 
 .tool-sub-list .tool-card {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
-    color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
+      color-mix(in srgb, var(--bg-hover) 92%, var(--tool-color) 8%));
 }
 
 .tool-sub-list .tool-card-head {
@@ -3725,12 +3718,18 @@ textarea {
   margin-bottom: 20px;
   overflow: hidden;
   background: var(--bg);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
-  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.04),
+    0 0 0 1px rgba(0, 0, 0, 0.02);
+  transition:
+    box-shadow 0.2s ease,
+    border-color 0.2s ease;
 }
 
 .settings-group:hover {
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.04);
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.06),
+    0 0 0 1px rgba(0, 0, 0, 0.04);
   border-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
 }
 
@@ -3740,18 +3739,23 @@ textarea {
   gap: 12px;
   padding: 16px 18px 14px;
   border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, var(--accent) 4%),
+      var(--bg));
   position: relative;
 }
 
 .settings-group-head::after {
-  content: '';
+  content: "";
   position: absolute;
   bottom: 0;
   left: 0;
   right: 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 20%, transparent), transparent);
+  background: linear-gradient(90deg,
+      transparent,
+      color-mix(in srgb, var(--accent) 20%, transparent),
+      transparent);
 }
 
 .settings-group-icon {
@@ -3759,7 +3763,7 @@ textarea {
   line-height: 1.4;
   flex-shrink: 0;
   margin-top: 1px;
-  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.1));
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.1));
 }
 
 .settings-group-title {
@@ -3843,7 +3847,7 @@ textarea {
   flex-shrink: 0;
 }
 
-.settings-row-control input[type='number'] {
+.settings-row-control input[type="number"] {
   width: 90px;
   padding: 8px 10px;
   font-size: 13px;
@@ -3851,14 +3855,17 @@ textarea {
   border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
 }
 
-.settings-row-control input[type='number']:hover {
+.settings-row-control input[type="number"]:hover {
   border-color: color-mix(in srgb, var(--border) 60%, var(--accent) 40%);
 }
 
-.settings-row-control input[type='number']:focus {
+.settings-row-control input[type="number"]:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
@@ -3903,13 +3910,15 @@ textarea {
   inset: 0;
   background: var(--border);
   border-radius: 999px;
-  transition: background 0.2s ease, box-shadow 0.2s ease;
+  transition:
+    background 0.2s ease,
+    box-shadow 0.2s ease;
   cursor: pointer;
-  box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
 .switch-slider::before {
-  content: '';
+  content: "";
   position: absolute;
   width: 18px;
   height: 18px;
@@ -3917,21 +3926,27 @@ textarea {
   top: 3px;
   background: #fff;
   border-radius: 50%;
-  transition: transform 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94), background 0.2s ease;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05);
+  transition:
+    transform 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94),
+    background 0.2s ease;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.15),
+    0 0 0 1px rgba(0, 0, 0, 0.05);
 }
 
-.switch input:checked + .switch-slider {
+.switch input:checked+.switch-slider {
   background: var(--accent);
-  box-shadow: inset 0 1px 3px rgba(0,0,0,0.1), 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  box-shadow:
+    inset 0 1px 3px rgba(0, 0, 0, 0.1),
+    0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
-.switch input:checked + .switch-slider::before {
+.switch input:checked+.switch-slider::before {
   transform: translateX(20px);
   background: #fff;
 }
 
-.switch input:focus-visible + .switch-slider {
+.switch input:focus-visible+.switch-slider {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
@@ -3939,7 +3954,7 @@ textarea {
   transform: scale(1.1);
 }
 
-.switch input:checked:hover + .switch-slider::before {
+.switch input:checked:hover+.switch-slider::before {
   transform: translateX(20px) scale(1.1);
 }
 
@@ -3958,12 +3973,19 @@ textarea {
 }
 
 @keyframes settings-saved-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .settings-saved::before {
-  content: '✓';
+  content: "✓";
   display: inline-flex;
   width: 18px;
   height: 18px;
@@ -4011,7 +4033,10 @@ textarea {
   border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
 }
 
 .data-path-row input:hover {
@@ -4039,7 +4064,9 @@ textarea {
 
 /* Danger zone group — distinct red accent for destructive actions */
 .settings-group:has(.btn.danger) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--danger) 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, var(--danger) 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--danger) 30%);
 }
 
@@ -4053,7 +4080,9 @@ textarea {
 
 .settings-group:has(.btn.danger):hover {
   border-color: color-mix(in srgb, var(--border) 50%, var(--danger) 50%);
-  box-shadow: 0 2px 8px rgba(229, 72, 77, 0.08), 0 0 0 1px rgba(229, 72, 77, 0.1);
+  box-shadow:
+    0 2px 8px rgba(229, 72, 77, 0.08),
+    0 0 0 1px rgba(229, 72, 77, 0.1);
 }
 
 .settings-group:has(.btn.danger) .settings-row:hover {
@@ -4063,7 +4092,9 @@ textarea {
 /* Current usage group — subtle blue accent for info */
 .settings-group:has(.settings-group-icon:contains("📊")) .settings-group-head,
 .settings-group:has(.settings-group-title:contains("Current usage")) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, var(--accent) 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
 }
 
@@ -4079,7 +4110,9 @@ textarea {
 
 /* Result cache group — subtle purple accent for performance */
 .settings-group:has(.settings-group-icon:contains("⚡")) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #a855f7 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, #a855f7 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, #a855f7 30%);
 }
 
@@ -4093,7 +4126,9 @@ textarea {
 
 .settings-group:has(.settings-group-icon:contains("⚡")):hover {
   border-color: color-mix(in srgb, var(--border) 50%, #a855f7 50%);
-  box-shadow: 0 2px 8px rgba(168, 85, 247, 0.08), 0 0 0 1px rgba(168, 85, 247, 0.1);
+  box-shadow:
+    0 2px 8px rgba(168, 85, 247, 0.08),
+    0 0 0 1px rgba(168, 85, 247, 0.1);
 }
 
 .settings-group:has(.settings-group-icon:contains("⚡")) .settings-row:hover {
@@ -4102,7 +4137,9 @@ textarea {
 
 /* Agent memory notes group — subtle green accent for memory */
 .settings-group:has(.settings-group-icon:contains("📝")) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #22c55e 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, #22c55e 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, #22c55e 30%);
 }
 
@@ -4116,7 +4153,9 @@ textarea {
 
 .settings-group:has(.settings-group-icon:contains("📝")):hover {
   border-color: color-mix(in srgb, var(--border) 50%, #22c55e 50%);
-  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.08), 0 0 0 1px rgba(34, 197, 94, 0.1);
+  box-shadow:
+    0 2px 8px rgba(34, 197, 94, 0.08),
+    0 0 0 1px rgba(34, 197, 94, 0.1);
 }
 
 .settings-group:has(.settings-group-icon:contains("📝")) .settings-row:hover {
@@ -4125,7 +4164,9 @@ textarea {
 
 /* RAG memory group — subtle blue accent */
 .settings-group:has(.settings-group-icon:contains("🧠")) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, var(--accent) 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, var(--accent) 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, var(--accent) 30%);
 }
 
@@ -4139,7 +4180,9 @@ textarea {
 
 .settings-group:has(.settings-group-icon:contains("🧠")):hover {
   border-color: color-mix(in srgb, var(--border) 50%, var(--accent) 50%);
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.08), 0 0 0 1px rgba(99, 102, 241, 0.1);
+  box-shadow:
+    0 2px 8px rgba(99, 102, 241, 0.08),
+    0 0 0 1px rgba(99, 102, 241, 0.1);
 }
 
 .settings-group:has(.settings-group-icon:contains("🧠")) .settings-row:hover {
@@ -4149,7 +4192,9 @@ textarea {
 /* Data & maintenance group — subtle orange accent */
 .settings-group:has(.settings-group-icon:contains("🗂")) .settings-group-head,
 .settings-group:has(.settings-group-icon:contains("🗂️")) .settings-group-head {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 96%, #f97316 4%), var(--bg));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 96%, #f97316 4%),
+      var(--bg));
   border-bottom-color: color-mix(in srgb, var(--border) 70%, #f97316 30%);
 }
 
@@ -4166,7 +4211,9 @@ textarea {
 .settings-group:has(.settings-group-icon:contains("🗂")):hover,
 .settings-group:has(.settings-group-icon:contains("🗂️")):hover {
   border-color: color-mix(in srgb, var(--border) 50%, #f97316 50%);
-  box-shadow: 0 2px 8px rgba(249, 115, 22, 0.08), 0 0 0 1px rgba(249, 115, 22, 0.1);
+  box-shadow:
+    0 2px 8px rgba(249, 115, 22, 0.08),
+    0 0 0 1px rgba(249, 115, 22, 0.1);
 }
 
 .settings-group:has(.settings-group-icon:contains("🗂")) .settings-row:hover,
@@ -4492,7 +4539,7 @@ textarea {
   border-top: 1px solid var(--border);
 }
 
-.settings-search input[type='search'] {
+.settings-search input[type="search"] {
   width: 100%;
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -4506,7 +4553,7 @@ textarea {
   margin-top: 8px;
 }
 
-.settings-search input[type='search']:focus {
+.settings-search input[type="search"]:focus {
   border-color: var(--accent);
 }
 
@@ -4746,11 +4793,11 @@ textarea {
   transition: transform 0.15s ease;
 }
 
-.plugin-switch input:checked + .plugin-switch-track {
+.plugin-switch input:checked+.plugin-switch-track {
   background: var(--accent);
 }
 
-.plugin-switch input:checked + .plugin-switch-track::after {
+.plugin-switch input:checked+.plugin-switch-track::after {
   transform: translateX(15px);
   background: #fff;
 }
@@ -5760,11 +5807,9 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-panel) 94%, var(--text) 6%),
-    var(--bg-panel)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 94%, var(--text) 6%),
+      var(--bg-panel));
   border: none;
   border-radius: 999px;
   padding: 4px 10px;
@@ -5799,11 +5844,9 @@ textarea {
   gap: 6px;
   padding: 3px 8px 3px 5px;
   border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-panel) 94%, var(--text) 6%),
-    color-mix(in srgb, var(--bg-panel) 98%, var(--text) 2%)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 94%, var(--text) 6%),
+      color-mix(in srgb, var(--bg-panel) 98%, var(--text) 2%));
   max-width: 46ch;
   transition:
     border-color 0.15s,
@@ -5860,11 +5903,9 @@ textarea {
    use the theme accent so they read as part of the app's palette. */
 .attachment-chip.queued-chip {
   border: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
-    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
   max-width: 56ch;
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
@@ -5874,11 +5915,9 @@ textarea {
 
 .attachment-chip.queued-chip.steer-chip {
   border: none;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
-    color-mix(in srgb, var(--accent) 10%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 22%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 10%, var(--bg-panel)));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--accent) 35%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.15),
@@ -5907,11 +5946,9 @@ textarea {
   gap: 8px;
   border-radius: 14px;
   padding: 12px 14px 12px 16px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--link) 10%, var(--bg-panel)),
-    color-mix(in srgb, var(--link) 4%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--link) 10%, var(--bg-panel)),
+      color-mix(in srgb, var(--link) 4%, var(--bg-panel)));
   border: 1px solid color-mix(in srgb, var(--link) 26%, var(--border));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--link) 16%, transparent),
@@ -5928,19 +5965,15 @@ textarea {
   bottom: 10px;
   width: 3px;
   border-radius: 3px;
-  background: linear-gradient(
-    to bottom,
-    var(--link),
-    color-mix(in srgb, var(--link) 35%, transparent)
-  );
+  background: linear-gradient(to bottom,
+      var(--link),
+      color-mix(in srgb, var(--link) 35%, transparent));
 }
 
 .queued-bubble.steer {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 10%, var(--bg-panel)),
-    color-mix(in srgb, var(--success) 4%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 10%, var(--bg-panel)),
+      color-mix(in srgb, var(--success) 4%, var(--bg-panel)));
   border-color: color-mix(in srgb, var(--success) 26%, var(--border));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--success) 16%, transparent),
@@ -5949,11 +5982,9 @@ textarea {
 }
 
 .queued-bubble.steer::before {
-  background: linear-gradient(
-    to bottom,
-    var(--success),
-    color-mix(in srgb, var(--success) 35%, transparent)
-  );
+  background: linear-gradient(to bottom,
+      var(--success),
+      color-mix(in srgb, var(--success) 35%, transparent));
 }
 
 .queued-bubble-head {
@@ -6006,9 +6037,11 @@ textarea {
   0% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse) 45%, transparent);
   }
+
   70% {
     box-shadow: 0 0 0 6px transparent;
   }
+
   100% {
     box-shadow: 0 0 0 0 transparent;
   }
@@ -6075,7 +6108,9 @@ textarea {
   color: var(--text);
   box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 16%, transparent);
   animation: notice-in 0.25s ease;
-  transition: opacity 0.5s ease, transform 0.5s ease;
+  transition:
+    opacity 0.5s ease,
+    transform 0.5s ease;
 }
 
 .retry-banner .spinner {
@@ -6167,11 +6202,60 @@ textarea {
 .msg-working {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   margin: 4px 0;
+  padding: 6px 13px 6px 10px;
+  border-radius: 999px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+  /* Amber (--thinking) tint by default — matches the pinned thinking panel's
+     palette so "the model is reasoning" reads as one consistent color across
+     the app. */
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 90%, var(--thinking) 10%),
+      color-mix(in srgb, var(--bg-panel) 97%, var(--thinking) 3%));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--thinking) 22%, transparent),
+    0 4px 14px -8px color-mix(in srgb, var(--thinking) 45%, transparent);
+  animation: msg-working-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+
+/* Tool-running state gets the theme accent instead of the thinking amber, so
+   "reasoning" and "actively doing something" read as visually distinct. */
+.msg-working.running {
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 90%, var(--accent) 10%),
+      color-mix(in srgb, var(--bg-panel) 97%, var(--accent) 3%));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent),
+    0 4px 14px -8px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Exit animation driven by LiveWorkingStatus's grace-period state machine —
+   the element fades/slides out over ~200ms instead of vanishing instantly,
+   so its footprint shrinks smoothly instead of snapping the transcript. */
+.msg-working.leaving {
+  opacity: 0;
+  transform: translateY(-3px) scale(0.97);
+}
+
+@keyframes msg-working-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .msg-working .spinner {
@@ -6180,15 +6264,79 @@ textarea {
   border-width: 2px;
 }
 
-.msg-working-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: pulse 1.2s ease-in-out infinite;
+.msg-working.running .spinner {
+  border-top-color: var(--accent);
+}
+
+/* Sparkle icon for the "thinking" (no active tool) state — a small breathing
+   mark instead of the tool spinner, echoing the pinned thinking panel's ✦. */
+.msg-working-spark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--thinking);
+  animation: msg-working-spark-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes msg-working-spark-pulse {
+
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.85);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* Shimmering label — a light sweep across the word gives the line a "live"
+   feel without another pulsing dot competing for attention next to the
+   spinner/spark. */
+.msg-working-text {
+  background: linear-gradient(90deg,
+      var(--text-dim) 30%,
+      var(--text) 50%,
+      var(--text-dim) 70%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: msg-working-shimmer 2.2s linear infinite;
+}
+
+@keyframes msg-working-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+
+  100% {
+    background-position: -20% 0;
+  }
+}
+
+.msg-working-elapsed {
+  opacity: 0.7;
+  font-weight: 400;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  .msg-working,
+  .msg-working-spark,
+  .msg-working-text {
+    animation: none;
+  }
 }
 
 @keyframes pulse {
+
   0%,
   100% {
     opacity: 0.35;
@@ -6204,11 +6352,9 @@ textarea {
   border: none;
   border-left: 3px solid color-mix(in srgb, var(--thinking) 55%, transparent);
   border-radius: 12px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-panel) 96%, var(--thinking) 6%),
-    var(--bg-panel)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 96%, var(--thinking) 6%),
+      var(--bg-panel));
   margin: 4px 0;
   overflow: hidden;
 }
@@ -6224,11 +6370,9 @@ textarea {
   border: none;
   border-left: 3px solid color-mix(in srgb, var(--thinking) 60%, transparent);
   border-radius: 12px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg-panel) 94%, var(--thinking) 7%),
-    var(--bg-panel)
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 94%, var(--thinking) 7%),
+      var(--bg-panel));
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.18),
     0 8px 20px -6px rgba(0, 0, 0, 0.35),
@@ -6289,11 +6433,13 @@ textarea {
 }
 
 @keyframes thinking-pulse {
+
   0%,
   100% {
     opacity: 1;
     transform: scale(1);
   }
+
   50% {
     opacity: 0.55;
     transform: scale(0.88);
@@ -6399,7 +6545,7 @@ textarea {
 }
 
 .tool-card.explore .tool-sub-list::before {
-  content: '';
+  content: "";
   position: absolute;
   left: 7px;
   top: 6px;
@@ -6414,7 +6560,7 @@ textarea {
 }
 
 .tool-card.explore .tool-sub-row::before {
-  content: '';
+  content: "";
   position: absolute;
   left: -16px;
   top: 50%;
@@ -6425,7 +6571,7 @@ textarea {
   background: color-mix(in srgb, var(--tool-color) 30%, transparent);
 }
 
-.tool-card.explore .tool-sub-row + .tool-sub-row {
+.tool-card.explore .tool-sub-row+.tool-sub-row {
   border-top: none;
 }
 
@@ -6472,7 +6618,9 @@ textarea {
   font-size: 10px;
   opacity: 0.8;
   flex: 0 0 auto;
-  transition: transform 0.15s, color 0.15s;
+  transition:
+    transform 0.15s,
+    color 0.15s;
 }
 
 .tool-card-head.collapsible:hover .chev {
@@ -6519,7 +6667,7 @@ textarea {
   min-width: 0;
 }
 
-.tool-card-head .tool-path + .tool-path {
+.tool-card-head .tool-path+.tool-path {
   margin-left: 3px;
 }
 
@@ -6739,30 +6887,30 @@ textarea {
   overflow: hidden;
 }
 
-.tool-trace > .tool-narrated,
-.tool-trace > .tool-group,
-.tool-trace > .tool-single {
+.tool-trace>.tool-narrated,
+.tool-trace>.tool-group,
+.tool-trace>.tool-single {
   border: none;
   border-radius: 0;
   background: none;
 }
 
-.tool-trace > .tool-narrated + .tool-narrated,
-.tool-trace > .tool-narrated + .tool-group,
-.tool-trace > .tool-narrated + .tool-single,
-.tool-trace > .tool-group + .tool-narrated,
-.tool-trace > .tool-group + .tool-group,
-.tool-trace > .tool-group + .tool-single,
-.tool-trace > .tool-single + .tool-narrated,
-.tool-trace > .tool-single + .tool-group,
-.tool-trace > .tool-single + .tool-single {
+.tool-trace>.tool-narrated+.tool-narrated,
+.tool-trace>.tool-narrated+.tool-group,
+.tool-trace>.tool-narrated+.tool-single,
+.tool-trace>.tool-group+.tool-narrated,
+.tool-trace>.tool-group+.tool-group,
+.tool-trace>.tool-group+.tool-single,
+.tool-trace>.tool-single+.tool-narrated,
+.tool-trace>.tool-single+.tool-group,
+.tool-trace>.tool-single+.tool-single {
   border-top: 1px solid var(--hairline);
 }
 
-.tool-trace > .tool-narrated .tool-narrated-caption,
-.tool-trace > .tool-narrated .tool-narrated-row,
-.tool-trace > .tool-group .tool-narrated-caption,
-.tool-trace > .tool-single {
+.tool-trace>.tool-narrated .tool-narrated-caption,
+.tool-trace>.tool-narrated .tool-narrated-row,
+.tool-trace>.tool-group .tool-narrated-caption,
+.tool-trace>.tool-single {
   padding-top: 6px;
   padding-bottom: 6px;
 }
@@ -6834,7 +6982,9 @@ textarea {
   font-size: 10px;
   opacity: 0.8;
   flex: 0 0 auto;
-  transition: transform 0.15s, color 0.15s;
+  transition:
+    transform 0.15s,
+    color 0.15s;
 }
 
 .tool-group-head:hover .chev {
@@ -6853,7 +7003,7 @@ textarea {
 }
 
 .tool-timeline::before {
-  content: '';
+  content: "";
   position: absolute;
   left: 19px;
   top: 10px;
@@ -6930,7 +7080,9 @@ textarea {
   gap: 0;
   padding: 8px 10px 10px;
   border-top: 1px solid color-mix(in srgb, var(--tool-color, var(--accent)) 30%, transparent);
-  background: color-mix(in srgb, var(--bg-hover) 72%, var(--tool-color, var(--accent)) 28%);
+  background: color-mix(in srgb,
+      var(--bg-hover) 72%,
+      var(--tool-color, var(--accent)) 28%);
 }
 
 .tool-cascade-item {
@@ -6977,7 +7129,7 @@ textarea {
 }
 
 .tool-card.explore .tool-cascade-item::before {
-  content: '';
+  content: "";
   position: absolute;
   left: 0;
   top: 0;
@@ -7015,7 +7167,7 @@ textarea {
 }
 
 .tool-card-head .tool-arg-key::after {
-  content: ':';
+  content: ":";
 }
 
 .tool-card-head .tool-arg-val {
@@ -7044,8 +7196,8 @@ textarea {
 /* When the link list sits inside a compact one-line tool row (single row or
    timeline row), force it onto its own line at the bottom-left instead of
    flowing inline beside the icon/label. */
-.tool-single > .web-results,
-.tool-timeline-item > .web-results {
+.tool-single>.web-results,
+.tool-timeline-item>.web-results {
   flex-basis: 100%;
   margin-top: 4px;
 }
@@ -7064,7 +7216,10 @@ textarea {
   background: color-mix(in srgb, var(--accent) 6%, var(--bg-elev));
   text-decoration: none;
   color: var(--text);
-  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease,
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease,
     box-shadow 0.16s ease;
 }
 
@@ -7151,7 +7306,9 @@ textarea {
   align-self: center;
   font-size: 12px;
   color: var(--text-dim, #8a8a8a);
-  transition: color 0.16s ease, transform 0.16s ease;
+  transition:
+    color 0.16s ease,
+    transform 0.16s ease;
 }
 
 .web-result-link:hover .web-result-arrow {
@@ -7236,7 +7393,8 @@ textarea {
      the content is shorter — that's what makes a full-width diff actually
      use the width instead of leaving a dead empty area. */
   display: grid;
-  grid-template-columns: 2.5em minmax(max-content, 1fr) 2.5em minmax(max-content, 1fr);
+  grid-template-columns: 2.5em minmax(max-content, 1fr) 2.5em minmax(max-content,
+      1fr);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.1);
@@ -7250,7 +7408,7 @@ textarea {
   display: contents;
 }
 
-.diff-side-head > span {
+.diff-side-head>span {
   position: sticky;
   top: 0;
   z-index: 1;
@@ -7261,7 +7419,7 @@ textarea {
   font-size: 10.5px;
 }
 
-.diff-side-head > span:nth-child(1) {
+.diff-side-head>span:nth-child(1) {
   grid-column: 1 / 3;
   padding: 3px 10px;
   color: var(--danger);
@@ -7269,7 +7427,7 @@ textarea {
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
 }
 
-.diff-side-head > span:nth-child(2) {
+.diff-side-head>span:nth-child(2) {
   grid-column: 3 / 5;
   padding: 3px 10px;
   color: var(--success);
@@ -7299,23 +7457,23 @@ textarea {
   min-width: 0;
 }
 
-.diff-side-row > .diff-side-num:first-child {
+.diff-side-row>.diff-side-num:first-child {
   border-right: 1px solid var(--hairline);
 }
 
-.diff-side-row > .diff-side-num:nth-child(3) {
+.diff-side-row>.diff-side-num:nth-child(3) {
   border-left: 1px solid var(--hairline);
   border-right: 1px solid var(--hairline);
 }
 
-.diff-side-row.del > .diff-side-num:first-child,
-.diff-side-row.mod > .diff-side-num:first-child {
+.diff-side-row.del>.diff-side-num:first-child,
+.diff-side-row.mod>.diff-side-num:first-child {
   color: var(--danger);
   background: color-mix(in srgb, var(--bg-raised) 82%, var(--danger) 18%);
 }
 
-.diff-side-row.add > .diff-side-num:nth-child(3),
-.diff-side-row.mod > .diff-side-num:nth-child(3) {
+.diff-side-row.add>.diff-side-num:nth-child(3),
+.diff-side-row.mod>.diff-side-num:nth-child(3) {
   color: var(--success);
   background: color-mix(in srgb, var(--bg-raised) 82%, var(--success) 18%);
 }
@@ -7337,11 +7495,11 @@ textarea {
   opacity: 0.75;
 }
 
-.diff-side-row.mod > .diff-side-cell.diff-del {
+.diff-side-row.mod>.diff-side-cell.diff-del {
   background: color-mix(in srgb, var(--bg-raised) 92%, var(--danger) 8%);
 }
 
-.diff-side-row.mod > .diff-side-cell.diff-add {
+.diff-side-row.mod>.diff-side-cell.diff-add {
   background: color-mix(in srgb, var(--bg-raised) 92%, var(--success) 8%);
 }
 
@@ -8106,6 +8264,7 @@ textarea {
 }
 
 @keyframes pulse {
+
   0%,
   100% {
     opacity: 1;
@@ -8124,11 +8283,9 @@ textarea {
   margin-top: 8px;
   align-self: flex-start;
   max-width: 100%;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 18%, var(--bg-panel)),
-    color-mix(in srgb, var(--success) 8%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 18%, var(--bg-panel)),
+      color-mix(in srgb, var(--success) 8%, var(--bg-panel)));
   border: none;
   border-radius: 999px;
   padding: 4px 10px 4px 5px;
@@ -8147,11 +8304,9 @@ textarea {
 }
 
 .nvim-label:hover {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 26%, var(--bg-panel)),
-    color-mix(in srgb, var(--success) 13%, var(--bg-panel))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 26%, var(--bg-panel)),
+      color-mix(in srgb, var(--success) 13%, var(--bg-panel)));
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--success) 26%, transparent),
     0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent),
@@ -8159,11 +8314,9 @@ textarea {
 }
 
 .nvim-label.selected {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 34%, var(--bg-input)),
-    color-mix(in srgb, var(--success) 18%, var(--bg-input))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 34%, var(--bg-input)),
+      color-mix(in srgb, var(--success) 18%, var(--bg-input)));
   color: var(--text);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--success) 30%, transparent),
@@ -8177,11 +8330,9 @@ textarea {
   justify-content: center;
   padding: 2px 7px;
   border-radius: 999px;
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 85%, white),
-    color-mix(in srgb, var(--success) 60%, var(--bg))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 85%, white),
+      color-mix(in srgb, var(--success) 60%, var(--bg)));
   color: var(--on-accent);
   font-weight: 700;
   font-size: 9px;
@@ -8221,11 +8372,9 @@ textarea {
 }
 
 .nvim-label.selected .nvim-check {
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--success) 85%, white),
-    color-mix(in srgb, var(--success) 60%, var(--bg))
-  );
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--success) 85%, white),
+      color-mix(in srgb, var(--success) 60%, var(--bg)));
   color: var(--on-accent);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--success) 35%, transparent),
@@ -8418,7 +8567,9 @@ textarea {
   font-size: 12px;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow) 16%, transparent);
   animation: notice-in 0.25s ease;
-  transition: opacity 0.5s ease, transform 0.5s ease;
+  transition:
+    opacity 0.5s ease,
+    transform 0.5s ease;
 }
 
 @keyframes notice-in {
@@ -8426,6 +8577,7 @@ textarea {
     opacity: 0;
     transform: translateY(-6px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -8495,6 +8647,7 @@ textarea {
   from {
     width: 100%;
   }
+
   to {
     width: 0%;
   }
@@ -8776,12 +8929,10 @@ textarea {
   position: absolute;
   inset: 0;
   pointer-events: auto;
-  background: linear-gradient(
-    90deg,
-    rgba(0, 0, 0, 0.32) 0%,
-    rgba(0, 0, 0, 0.16) 45%,
-    rgba(0, 0, 0, 0.04) 100%
-  );
+  background: linear-gradient(90deg,
+      rgba(0, 0, 0, 0.32) 0%,
+      rgba(0, 0, 0, 0.16) 45%,
+      rgba(0, 0, 0, 0.04) 100%);
   opacity: 0;
   animation: reading-scrim-in 0.3s ease forwards;
 }
@@ -8812,16 +8963,12 @@ textarea {
   border-radius: 18px;
   overflow: hidden;
   background:
-    radial-gradient(
-      120% 55% at 100% 0%,
+    radial-gradient(120% 55% at 100% 0%,
       color-mix(in srgb, var(--accent) 10%, transparent) 0%,
-      transparent 60%
-    ),
-    radial-gradient(
-      90% 40% at 0% 100%,
+      transparent 60%),
+    radial-gradient(90% 40% at 0% 100%,
       color-mix(in srgb, var(--accent) 5%, transparent) 0%,
-      transparent 55%
-    ),
+      transparent 55%),
     var(--bg-panel);
   border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
   box-shadow: var(--shadow-pop);
@@ -8844,18 +8991,16 @@ textarea {
 /* Thin gradient accent line along the panel's top edge — a subtle "focus"
    cue that ties the card to the app's accent color. */
 .reading-mode-panel::before {
-  content: '';
+  content: "";
   position: absolute;
   top: 0;
   inset-inline: 0;
   height: 2px;
   z-index: 3;
-  background: linear-gradient(
-    90deg,
-    color-mix(in srgb, var(--accent) 55%, transparent),
-    var(--accent) 50%,
-    color-mix(in srgb, var(--accent) 55%, var(--text))
-  );
+  background: linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 55%, transparent),
+      var(--accent) 50%,
+      color-mix(in srgb, var(--accent) 55%, var(--text)));
   pointer-events: none;
 }
 
@@ -8875,7 +9020,7 @@ textarea {
 }
 
 .reading-mode-resize-handle::after {
-  content: '';
+  content: "";
   position: absolute;
   top: 0;
   right: 2px;
@@ -8908,17 +9053,15 @@ textarea {
 /* Soft accent glow along the header's bottom edge — direction-agnostic
    (symmetric), so it reads the same in LTR and RTL. */
 .reading-mode-head::after {
-  content: '';
+  content: "";
   position: absolute;
   inset-inline: 0;
   bottom: -1px;
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in srgb, var(--accent) 30%, transparent) 50%,
-    transparent
-  );
+  background: linear-gradient(90deg,
+      transparent,
+      color-mix(in srgb, var(--accent) 30%, transparent) 50%,
+      transparent);
   pointer-events: none;
 }
 
@@ -9000,11 +9143,9 @@ textarea {
   inset-block: 0;
   inset-inline-start: 0;
   border-radius: 3px;
-  background: linear-gradient(
-    90deg,
-    var(--accent),
-    color-mix(in srgb, var(--accent) 60%, var(--text))
-  );
+  background: linear-gradient(90deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 60%, var(--text)));
   transition: width 0.15s ease;
 }
 
@@ -9098,7 +9239,7 @@ textarea {
 
 /* Accent bar on the active section, like Claude Code's docs sidebar. */
 .reading-mode-item.active::before {
-  content: '';
+  content: "";
   position: absolute;
   inset-inline-start: 0;
   top: 10px;
@@ -9207,11 +9348,9 @@ textarea {
   height: 26px;
   margin-top: 1px;
   border-radius: 8px;
-  background: linear-gradient(
-    135deg,
-    var(--accent),
-    color-mix(in srgb, var(--accent) 70%, var(--text))
-  );
+  background: linear-gradient(135deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 70%, var(--text)));
   color: var(--on-accent);
   font-size: 12px;
   font-weight: 800;
@@ -9467,7 +9606,7 @@ textarea {
   line-height: 1.5;
 }
 
-.download-gate-card > .btn {
+.download-gate-card>.btn {
   align-self: stretch;
   margin-top: 16px;
   padding: 9px 16px;
@@ -9592,15 +9731,15 @@ textarea {
 .skill-card-body,
 .plugin-fields,
 .settings-tabs,
-.tool-sub-row + .tool-sub-row,
+.tool-sub-row+.tool-sub-row,
 .context-meter-cost,
 .context-meter-models,
 .model-select-item.add,
 .model-picker-section:not(:first-child),
 .sidebar-usage-list,
-.diff-side-head > span,
-.diff-side-row > .diff-side-num:first-child,
-.diff-side-row > .diff-side-num:nth-child(3) {
+.diff-side-head>span,
+.diff-side-row>.diff-side-num:first-child,
+.diff-side-row>.diff-side-num:nth-child(3) {
   border-color: var(--hairline);
 }
 
@@ -9641,11 +9780,9 @@ textarea {
 .msg.user .msg-bubble {
   /* Solid theme-accent fill (iMessage-style) — clearly distinct from the dark
      tinted tool cards. Text flips to --on-accent for guaranteed contrast. */
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
-    color-mix(in srgb, var(--accent) 74%, var(--bg-panel))
-  );
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 90%, var(--bg-panel)),
+      color-mix(in srgb, var(--accent) 74%, var(--bg-panel)));
   color: var(--on-accent);
   /* Flat and clean — just a hairline inner top highlight, no outer shadow. */
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--on-accent) 14%, transparent);
@@ -9829,12 +9966,14 @@ textarea {
 .msg-image {
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.14);
 }
+
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 8px;
   margin-top: 10px;
 }
+
 .theme-card {
   position: relative;
   display: flex;
@@ -9848,32 +9987,43 @@ textarea {
   color: var(--text);
   cursor: pointer;
   text-align: left;
-  transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+  transition:
+    border-color 0.12s,
+    box-shadow 0.12s,
+    transform 0.12s;
 }
+
 .theme-card:hover {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   box-shadow: 0 2px 10px -4px rgba(0, 0, 0, 0.4);
   transform: translateY(-1px);
 }
+
 .theme-card.active {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 2px 10px -4px rgba(0, 0, 0, 0.4);
+  box-shadow:
+    0 0 0 1px var(--accent),
+    0 2px 10px -4px rgba(0, 0, 0, 0.4);
 }
+
 .theme-swatch {
   display: flex;
   gap: 4px;
 }
+
 .theme-swatch i {
   width: 14px;
   height: 14px;
   border-radius: 50%;
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
+
 .theme-name {
   font-size: 13px;
   font-weight: 600;
   line-height: 1.2;
 }
+
 .theme-check {
   position: absolute;
   top: 8px;
@@ -9909,11 +10059,9 @@ textarea {
   width: 560px;
   height: 560px;
   border-radius: 50%;
-  background: radial-gradient(
-    circle,
-    color-mix(in srgb, var(--accent) 16%, transparent) 0%,
-    transparent 65%
-  );
+  background: radial-gradient(circle,
+      color-mix(in srgb, var(--accent) 16%, transparent) 0%,
+      transparent 65%);
   filter: blur(48px);
   animation: loading-glow-pulse 3.2s ease-in-out infinite;
 }
@@ -9923,10 +10071,15 @@ textarea {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(color-mix(in srgb, var(--text) 4%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in srgb, var(--text) 4%, transparent) 1px, transparent 1px);
+    linear-gradient(color-mix(in srgb, var(--text) 4%, transparent) 1px,
+      transparent 1px),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--text) 4%, transparent) 1px,
+      transparent 1px);
   background-size: 44px 44px;
-  -webkit-mask-image: radial-gradient(ellipse at center, black 0%, transparent 72%);
+  -webkit-mask-image: radial-gradient(ellipse at center,
+      black 0%,
+      transparent 72%);
   mask-image: radial-gradient(ellipse at center, black 0%, transparent 72%);
   animation: loading-grid-drift 24s linear infinite;
 }
@@ -9950,14 +10103,16 @@ textarea {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0%,
-    var(--accent) 28%,
-    transparent 58%
-  );
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), black calc(100% - 3px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 4px), black calc(100% - 3px));
+  background: conic-gradient(from 0deg,
+      transparent 0%,
+      var(--accent) 28%,
+      transparent 58%);
+  -webkit-mask: radial-gradient(farthest-side,
+      transparent calc(100% - 4px),
+      black calc(100% - 3px));
+  mask: radial-gradient(farthest-side,
+      transparent calc(100% - 4px),
+      black calc(100% - 3px));
   animation: loading-spin 1.1s linear infinite;
 }
 
@@ -10005,12 +10160,10 @@ textarea {
   font-size: 30px;
   letter-spacing: 0.32em;
   text-indent: 0.32em;
-  background: linear-gradient(
-    90deg,
-    var(--text) 0%,
-    var(--accent) 50%,
-    var(--text) 100%
-  );
+  background: linear-gradient(90deg,
+      var(--text) 0%,
+      var(--accent) 50%,
+      var(--text) 100%);
   background-size: 200% 100%;
   -webkit-background-clip: text;
   background-clip: text;
@@ -10067,6 +10220,7 @@ textarea {
   from {
     opacity: 0;
   }
+
   to {
     opacity: 1;
   }
@@ -10079,11 +10233,13 @@ textarea {
 }
 
 @keyframes loading-glow-pulse {
+
   0%,
   100% {
     transform: scale(1);
     opacity: 0.7;
   }
+
   50% {
     transform: scale(1.18);
     opacity: 1;
@@ -10097,12 +10253,14 @@ textarea {
 }
 
 @keyframes loading-dot {
+
   0%,
   60%,
   100% {
     transform: translateY(0);
     opacity: 0.35;
   }
+
   30% {
     transform: translateY(-4px);
     opacity: 1;
@@ -10116,6 +10274,7 @@ textarea {
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   .loading-screen__glow,
   .loading-screen__grid,
   .loading-logo__ring,
@@ -10311,6 +10470,7 @@ textarea {
   justify-content: center;
   padding: 2vh 2vw;
 }
+
 .fullscreen-modal-panel {
   position: relative;
   width: 96vw;
@@ -10323,6 +10483,7 @@ textarea {
   border-radius: var(--radius);
   box-shadow: var(--shadow-pop);
 }
+
 .fullscreen-modal-head {
   display: flex;
   align-items: center;
@@ -10332,6 +10493,7 @@ textarea {
   border-bottom: 1px solid var(--border);
   color: var(--text);
 }
+
 .fullscreen-modal-title {
   font-weight: 600;
   font-size: 13px;
@@ -10340,6 +10502,7 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 .fullscreen-close {
   flex: none;
   background: var(--bg-raised);
@@ -10352,9 +10515,11 @@ textarea {
   font-size: 14px;
   line-height: 1;
 }
+
 .fullscreen-close:hover {
   background: var(--bg-hover);
 }
+
 .fullscreen-modal-body {
   flex: 1;
   min-height: 0;
@@ -10363,6 +10528,7 @@ textarea {
   overflow: hidden;
   padding: 0;
 }
+
 .fullscreen-pan-viewport {
   position: relative;
   flex: 1;
@@ -10373,12 +10539,14 @@ textarea {
   user-select: none;
   -webkit-user-select: none;
 }
+
 .fullscreen-pan-content {
   transform-origin: 0 0;
   will-change: transform;
   min-height: 100%;
   min-width: 100%;
 }
+
 .fullscreen-marquee {
   position: absolute;
   border: 1px solid var(--accent);
@@ -10386,6 +10554,7 @@ textarea {
   pointer-events: none;
   z-index: 1;
 }
+
 .fullscreen-zoom-bar {
   position: absolute;
   bottom: 14px;
@@ -10402,6 +10571,7 @@ textarea {
   color: var(--text);
   box-shadow: var(--shadow-pop);
 }
+
 .fullscreen-zoom-bar button {
   background: var(--bg-alt);
   color: var(--text);
@@ -10413,17 +10583,21 @@ textarea {
   font-size: 14px;
   line-height: 1;
 }
+
 .fullscreen-zoom-bar button:hover {
   background: var(--bg-hover);
 }
+
 .diff-fullscreen-body {
   padding: 0;
 }
+
 .fullscreen-empty {
   color: var(--text-dim);
   padding: 24px;
   font-size: 13px;
 }
+
 .mermaid-fullscreen {
   width: 100%;
   height: 100%;
@@ -10432,6 +10606,7 @@ textarea {
   justify-content: center;
   overflow: auto;
 }
+
 .mermaid-fullscreen .mermaid-block {
   cursor: default;
   width: 100%;
@@ -10455,6 +10630,7 @@ textarea {
   line-height: 1;
   margin-left: 6px;
 }
+
 .tool-fullscreen-btn:hover {
   color: var(--text);
   border-color: var(--accent);

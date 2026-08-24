@@ -280,3 +280,20 @@ export function formatCost(usd: number): string {
   if (usd < 0.01) return `$${usd.toFixed(4)}`
   return `$${usd.toFixed(2)}`
 }
+
+/**
+ * Scale the compaction headroom (reserved tokens) to the model's context window.
+ *
+ * opencode clamps its `COMPACTION_BUFFER` to `maxOutputTokens`, so the reserved
+ * buffer never dominates a small window. We mirror that: keep the UI's default
+ * headroom (usually 20k) for large windows, but clamp it down for small windows
+ * so auto-compaction never fires near the start of a conversation.
+ *
+ * - `cw <= 0` (unknown window): pass the headroom through unchanged.
+ * - otherwise: `min(headroom, max(2000, 10% of cw))`.
+ */
+export function scaleReserved(cw: number, headroom: number): number {
+  if (cw <= 0) return headroom
+  const cap = Math.max(2000, Math.round(cw * 0.1))
+  return Math.min(headroom, cap)
+}

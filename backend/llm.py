@@ -43,6 +43,75 @@ from providers import (
     qualify_model_id,
 )
 
+def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
+    """Remove literal ``<think>…</think>`` reasoning from streamed text.
+
+    Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
+    emit their chain-of-thought as a literal ``<think>…</think>`` block inside
+    the ``content`` stream instead of using a dedicated reasoning field. We drop
+    it from the visible text so it never leaks to the frontend. The tag may span
+    multiple streamed deltas, so the ``in_think`` / ``think_buf`` state is
+    preserved across calls.
+    """
+    if not text:
+        return text, in_think, think_buf
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if not in_think:
+            start = text.find("<think", i)
+            if start == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:start])
+            in_think = True
+            i = start + len("<think")
+            # Consume the optional 'i' of the <thinking> variant, then skip to
+            # the closing '>' of the opening tag.
+            if i < n and text[i] == "i":
+                i += 1
+            gt = text.find(">", i)
+            if gt == -1:
+                think_buf += text[i:]
+                i = n
+            else:
+                i = gt + 1
+        else:
+            end = text.find("</think>", i)
+            if end == -1:
+                think_buf += text[i:]
+                i = n
+            else:
+                think_buf += text[i:end]
+                in_think = False
+                i = end + len("</think>")
+    return "".join(out), in_think, think_buf
+
+
+def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3) -> bool:
+    """Detect a degenerate text loop at the tail of ``text``.
+
+    Models sometimes emit the same sentence/phrase dozens of times with no
+    tool call (e.g. "Let me check that. Let me check that. …"). The existing
+    guards only watch the tool-call signature, so this text-only check catches
+    it. It only flags *exact* back-to-back repetition of a bounded-length unit,
+    so normal prose that happens to reuse a phrase a couple of times never
+    trips it. ``min_len``/``max_len`` bound the repeated unit; ``min_reps`` is
+    how many consecutive copies we need to call it a loop.
+    """
+    if not text or len(text) < min_len * min_reps:
+        return False
+    for unit in range(min(max_len, len(text) // min_reps), min_len - 1, -1):
+        tail = text[-(unit * min_reps):]
+        if len(tail) < unit * min_reps:
+            continue
+        first = tail[:unit]
+        if all(tail[i * unit:(i + 1) * unit] == first for i in range(1, min_reps)):
+            return True
+    return False
+
+
 # Thinking level -> the downstream "reasoning effort" token. '' / 'none' mean
 # reasoning is disabled. LangChain forwards these through model_kwargs to the
 # OpenAI-compatible endpoint (OpenAI o1/o3, OpenRouter, DeepSeek-reasoner, ...).
@@ -94,12 +163,14 @@ class ReasoningChatOpenAI(ChatOpenAI):
                 if not isinstance(delta, dict):
                     continue
                 # Prefer an explicit reasoning_content, fall back to delta.reasoning
-                # (opencode's wire format). Skip when content is also present so we
-                # never mislabel a real answer token as thinking.
+                # (opencode's wire format). opencode may send reasoning AND content
+                # in the same delta, so we no longer skip reasoning when content is
+                # present — both are lifted onto additional_kwargs and the backend's
+                # _thinking_from_chunk filter drops the reasoning before the frontend.
                 rc = delta.get("reasoning_content")
                 if isinstance(rc, str) and rc:
                     raw_reasoning = rc
-                elif delta.get("reasoning") is not None and not delta.get("content"):
+                elif delta.get("reasoning") is not None:
                     raw_reasoning = str(delta["reasoning"])
                 if raw_reasoning:
                     break
@@ -546,6 +617,23 @@ async def langchain_tool_loop(
                     "model response truncated by the provider (context length exceeded)"
                 )
             content = getattr(ai, "content", "")
+            if isinstance(content, str):
+                # Drop any literal <think>…</think> reasoning some models emit
+                # inline (DeepSeek/Qwen/llama.cpp) so it never reaches the parent.
+                content = _strip_think_tags(content, False, "")[0]
+                # Guard against a degenerate text loop (the model repeating the
+                # same sentence dozens of times with no tool call). The doom-loop
+                # guard only watches tool-call signatures, so this catches the
+                # no-tool-call case. Return only the non-repeating prefix.
+                if _is_repeating(content):
+                    import re as _re
+
+                    _logger.warning("sub-agent reply entered a text repetition loop; truncating")
+                    # Keep the longest non-repeating prefix.
+                    _unit = min(200, len(content) // 3)
+                    while _unit >= 20 and _is_repeating(content[: _unit * 3]):
+                        _unit = max(20, _unit // 2)
+                    content = content[: _unit * 3] + " … [repetition loop truncated]"
             return str(content) if isinstance(content, str) else str(content or "")
         msgs.append(ai)
         # Partition this step's tool calls: read-only tools (grep/glob/read/

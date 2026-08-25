@@ -54,6 +54,7 @@ from langgraph.graph import END, START, StateGraph
 
 import agents as _agents
 import state_db
+from agents import normalize_mode
 from context_builder import build_context as _build_rag_context
 from llm import (
     ProviderError,
@@ -207,41 +208,12 @@ def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
 
 
 # ---------------------------------------------------------------------------
-# Mode classification (Router)
+# Mode routing
 # ---------------------------------------------------------------------------
-
-_CODE_HINTS = (
-    r"\b(write|implement|create|add|fix|refactor|edit|delete|change|update|"
-    r"rename|migrate|patch)\b"
-)
-_EXPLORE_HINTS = (
-    r"\b(where is|find|locate|how does|trace|investigate|explore|understand|"
-    r"what files|which file|search the repo|plan)\b"
-)
-
-
-def classify_mode(prompt: str, fallback: str = "ask") -> str:
-    """Determine the workflow mode from the request.
-
-    Explicit ``/plan``, ``/code`` and ``/ask`` prefixes in the prompt always win
-    (so chat commands can override the toolbar mode); otherwise we trust the
-    mode the UI selected. The fallback is normalized via ``normalize_mode`` so
-    legacy/UI names (e.g. "chat", "codewriter") resolve to the right mode
-    instead of silently collapsing to "ask".
-    """
-    fallback = _agents.normalize_mode(fallback)
-    text = (prompt or "").strip().lower()
-    if text.startswith("/plan") and (len(text) == 5 or text[5] in " \n\t"):
-        return "plan"
-    if text.startswith("/code") and (len(text) == 5 or text[5] in " \n\t"):
-        return "coder"
-    if text.startswith("/ask") and (len(text) == 4 or text[4] in " \n\t"):
-        return "ask"
-    if text.startswith("/reader") and (len(text) == 6 or text[6] in " \n\t"):
-        return "reader"
-    if fallback in ("ask", "plan", "coder", "reader"):
-        return fallback
-    return "ask"
+# The UI/toolbar mode is authoritative. We only honor an explicit slash command
+# (/plan, /code, /ask, /reader) in the prompt — never infer the mode from
+# keywords (that would override the user's explicit selection and make the agent
+# think it's in Coder while the user picked Plan). See ``router`` below.
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +441,16 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
     # blip) so a single flaky vision request doesn't silently make the image
     # invisible. Permanent errors (e.g. 400 image-rejected) are NOT retried —
     # they surface immediately so the caller can tell the user to fix config.
+    _start = time.monotonic()
     for attempt in range(_VISION_MAX_ATTEMPTS):
+        # Stop early if we've burned the whole wall-clock budget — don't start
+        # another (expensive) attempt that would blow past the 90s cap.
+        if time.monotonic() - _start >= _VISION_TOTAL_BUDGET:
+            logger.warning(
+                "vision analyze (%s) hit the %ds total budget after %d attempt(s)",
+                model_name, int(_VISION_TOTAL_BUDGET), attempt,
+            )
+            break
         try:
             text, _ = await llm_generate(
                 model, system=system, user=user,
@@ -494,7 +475,15 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
                 return None
             last_exc = exc
             if attempt < _VISION_MAX_ATTEMPTS - 1:
-                delay = _VISION_BACKOFF_BASE * (2 ** attempt)
+                _elapsed = time.monotonic() - _start
+                _remaining = _VISION_TOTAL_BUDGET - _elapsed
+                if _remaining <= 0:
+                    logger.warning(
+                        "vision analyze (%s) exhausted the %ds budget before retry",
+                        model_name, int(_VISION_TOTAL_BUDGET),
+                    )
+                    break
+                delay = min(_VISION_BACKOFF_BASE * (2 ** attempt), _remaining)
                 logger.warning(
                     "vision analyze (%s) failed (attempt %d/%d): %s — retrying in %.1fs",
                     model_name, attempt + 1, _VISION_MAX_ATTEMPTS, exc, delay,
@@ -535,6 +524,10 @@ _VISION_CACHE_MAX = 40
 # drop the attached image. Retry with exponential backoff, capped.
 _VISION_MAX_ATTEMPTS = 3
 _VISION_BACKOFF_BASE = 1.0
+# Hard wall-clock cap on the ENTIRE vision analysis (all attempts + backoff).
+# Prevents a slow/unreachable vision provider from locking the turn for minutes
+# (3 attempts × 30s timeout + backoff ≈ 90s worst case).
+_VISION_TOTAL_BUDGET = 90.0
 
 
 async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | None:
@@ -689,7 +682,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # Bounded so a slow/unreachable vision provider fails fast (and is
         # surfaced to the user) instead of hanging the turn. The retry/backoff
         # in _vision_analyze covers transient blips within this budget.
-        timeout=60,
+        timeout=30,
     )
     explore_model = resolve_subagent_model(
         state["provider"], subagent_models.get("explore"), state["base_url"],
@@ -1092,6 +1085,80 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
     }
 
 
+def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
+    """Remove literal ``<think>…</think>`` reasoning from streamed text.
+
+    Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
+    emit their chain-of-thought as a literal ``<think>…</think>`` block inside
+    the ``content`` stream instead of using a dedicated reasoning field. We drop
+    it from the visible text so it never leaks to the frontend. The tag may span
+    multiple streamed deltas, so the ``in_think`` / ``think_buf`` state is
+    preserved across calls.
+    """
+    if not text:
+        return text, in_think, think_buf
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if not in_think:
+            start = text.find("<think", i)
+            if start == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:start])
+            in_think = True
+            i = start + len("<think")
+            # Consume the optional 'i' of the <thinking> variant, then skip to
+            # the closing '>' of the opening tag.
+            if i < n and text[i] == "i":
+                i += 1
+            gt = text.find(">", i)
+            if gt == -1:
+                think_buf += text[i:]
+                i = n
+            else:
+                i = gt + 1
+        else:
+            end = text.find("</think>", i)
+            if end == -1:
+                think_buf += text[i:]
+                i = n
+            else:
+                think_buf += text[i:end]
+                in_think = False
+                i = end + len("</think>")
+    return "".join(out), in_think, think_buf
+
+
+def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3) -> bool:
+    """Detect a degenerate text loop at the tail of ``text``.
+
+    Models sometimes emit the same sentence/phrase dozens of times with no
+    tool call (e.g. "Let me check that. Let me check that. …"). The existing
+    guards only watch the tool-call signature, so this text-only check catches
+    it. It only flags *exact* back-to-back repetition of a bounded-length unit,
+    so normal prose that happens to reuse a phrase (or even a sentence) a couple
+    of times never trips it.
+
+    ``min_len``/``max_len`` bound the repeated unit so a single repeated
+    character or a huge block can't false-positive. ``min_reps`` is how many
+    consecutive copies we need to call it a loop.
+    """
+    if not text or len(text) < min_len * min_reps:
+        return False
+    # Scan candidate unit lengths from longest to shortest so we match the
+    # largest repeated phrase first (e.g. a whole sentence, not one word).
+    for unit in range(min(max_len, len(text) // min_reps), min_len - 1, -1):
+        tail = text[-(unit * min_reps):]
+        if len(tail) < unit * min_reps:
+            continue
+        first = tail[:unit]
+        if all(tail[i * unit:(i + 1) * unit] == first for i in range(1, min_reps)):
+            return True
+    return False
+
+
 def _thinking_from_chunk(chunk: Any) -> str | None:
     """Extract reasoning/thinking text from a streamed LangChain chunk.
 
@@ -1253,6 +1320,9 @@ async def _maybe_auto_compact(
     if total <= 0:
         # Fallback to the char estimate when no usage was reported (local models).
         total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    # opencode fires compaction when the latest turn reaches `usable`
+    # (ctx - reserved). We mirror that exactly: a single setting
+    # (compactHeadroom / reserved) controls when auto-compaction runs.
     if total < usable:
         return
     summarizer = compact_model or model
@@ -1294,6 +1364,12 @@ async def _run_mode_turn(
     """
     chat_id = state.get("chat_id", "")
     ctx = state.get("context_window") or 0
+    # The `mode` parameter is authoritative for THIS turn. `reader_answer` and
+    # other nodes mutate `state["mode"]` on the shared LangGraph state, so we
+    # copy it and override with the parameter before building the context —
+    # otherwise a previous node's mode would leak into this turn's system prompt.
+    state = dict(state)
+    state["mode"] = mode
     tctx = await build_turn_context(state, queue)
     model = tctx["model"]
     # The real model id the LangChain client will hit (e.g. a sub-agent model
@@ -1389,6 +1465,27 @@ async def _run_mode_turn(
                 _answer_started = False
                 _saw_real_reasoning = False
                 _model_reasoning = bool(state.get("model_reasoning"))
+                # opencode (and some gateways) may stream the FULL text in every
+                # chunk (cumulative) instead of just the delta. Detect it once on
+                # the second chunk: if the new chunk's content already starts with
+                # what we have, it's cumulative — from then on replace, don't
+                # append. This is O(1) per chunk after the first comparison.
+                _cumulative: bool | None = None
+                # Literal <think>…</think> tags some models emit inline (DeepSeek/
+                # Qwen/llama.cpp). State is preserved across chunks because the tag
+                # may span multiple streamed deltas.
+                _in_think = False
+                _think_buf = ""
+                # Degenerate text-loop guard: accumulate the visible reply in a
+                # buffer and, every few chunks, check whether the model has
+                # started repeating itself verbatim (e.g. "Let me check. Let me
+                # check." 80 times). The existing guards only watch tool-call
+                # signatures, so a no-tool-call text loop slips through. We break
+                # the stream early and surface a warning instead of emitting the
+                # full duplicated output.
+                _reply_buf = ""
+                _repeat_check_every = 4
+                _chunk_idx = 0
                 # Emit the lightweight "thinking" toggle ONLY when the model
                 # actually produces reasoning content (a dedicated reasoning
                 # field caught by _thinking_from_chunk) — NOT merely because it
@@ -1398,7 +1495,14 @@ async def _run_mode_turn(
                 # answer text (below) and as a safety net at stream end.
                 async for chunk in bound.astream(msgs):
                     _astream_count_local += 1
-                    ai = chunk if ai is None else ai + chunk
+                    if ai is None:
+                        ai = chunk
+                    else:
+                        if _cumulative is None:
+                            cur = ai.content if isinstance(ai.content, str) else ""
+                            nxt = chunk.content if isinstance(chunk.content, str) else ""
+                            _cumulative = bool(cur) and nxt.startswith(cur)
+                        ai = chunk if _cumulative else ai + chunk
                     # Skip raw chain-of-thought: the backend only emits a
                     # lightweight "thinking" toggle (see above), never the
                     # reasoning text itself. Some gateways surface thinking in
@@ -1416,6 +1520,13 @@ async def _run_mode_turn(
                         continue
                     content = chunk.content
                     if isinstance(content, str) and content:
+                        # Strip literal <think>…</think> reasoning blocks that
+                        # some models emit inline (DeepSeek/Qwen/llama.cpp).
+                        content, _in_think, _think_buf = _strip_think_tags(
+                            content, _in_think, _think_buf
+                        )
+                        if not content:
+                            continue
                         # The first text token means reasoning has finished, so
                         # close the thinking window immediately (don't keep the
                         # ring lit through the whole text generation phase).
@@ -1427,12 +1538,26 @@ async def _run_mode_turn(
                         # before the real answer. When reasoning is enabled and
                         # we never saw genuine reasoning in a dedicated field,
                         # treat that pre-answer content as thinking so it never
-                        # leaks into the visible message. Once we've seen real
-                        # reasoning (or already started the answer) the content
-                        # is the actual answer.
-                        if _model_reasoning and not _saw_real_reasoning and not _answer_started:
-                            _answer_started = True
+                        # leaks into the visible message. We keep dropping content
+                        # until we actually SEE real reasoning (or the stream ends
+                        # with no reasoning at all — handled below). Using a single
+                        # boolean flip here would only drop the first chunk and let
+                        # the rest of the CoT leak through.
+                        if _model_reasoning and not _saw_real_reasoning:
                             continue
+                        _reply_buf += content
+                        _chunk_idx += 1
+                        if _chunk_idx % _repeat_check_every == 0 and _is_repeating(_reply_buf):
+                            queue.put_nowait(
+                                {
+                                    "kind": "warn",
+                                    "content": (
+                                        "The model entered a text repetition loop; "
+                                        "showing partial output."
+                                    ),
+                                }
+                            )
+                            break
                         queue.put_nowait({"kind": "text", "content": content})
                     elif isinstance(content, list):
                         for part in content:
@@ -1448,6 +1573,14 @@ async def _run_mode_turn(
                 if _thinking_active:
                     _thinking_active = False
                     queue.put_nowait({"kind": "thinking", "active": False})
+                # If reasoning was enabled but we never saw a real reasoning field,
+                # the pre-answer plain-content we dropped above was actually the
+                # answer (opencode sent no reasoning at all). Re-emit it so the
+                # user never gets an empty reply.
+                if _model_reasoning and not _saw_real_reasoning:
+                    dropped = ai.content if isinstance(ai.content, str) else ""
+                    if dropped:
+                        queue.put_nowait({"kind": "text", "content": dropped})
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
@@ -1482,6 +1615,16 @@ async def _run_mode_turn(
                     reply = ai.content if isinstance(ai.content, str) else str(ai.content)
                     break
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
+                if _is_repeating(reply if isinstance(reply, str) else ""):
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                "The model entered a text repetition loop; "
+                                "showing partial output."
+                            ),
+                        }
+                    )
                 break
             # --- Repetition-loop detection (tool-call signature) -------------
             # A real loop repeats the SAME tool call with IDENTICAL arguments on
@@ -1728,9 +1871,25 @@ def detect_test_commands(root: str) -> list[str]:
 
 
 def router(state: AgentState) -> dict:
-    """Determine the requested mode (ASK / PLAN / CODER)."""
-    mode = classify_mode(state.get("request", ""), state.get("mode", "ask"))
-    return {"mode": mode}
+    """Determine the requested mode (ASK / PLAN / CODER / READER).
+
+    The UI/toolbar mode is authoritative. We only honor an explicit slash
+    command (/plan, /code, /ask, /reader) in the prompt — never infer the
+    mode from keywords like "write/fix/edit" (that would override the user's
+    explicit Plan selection and make the agent think it's in Coder).
+    """
+    prompt = state.get("request", "") or ""
+    text = prompt.strip().lower()
+    if text.startswith("/plan") and (len(text) == 5 or text[5] in " \n\t"):
+        return {"mode": "plan"}
+    if text.startswith("/code") and (len(text) == 5 or text[5] in " \n\t"):
+        return {"mode": "coder"}
+    if text.startswith("/ask") and (len(text) == 4 or text[4] in " \n\t"):
+        return {"mode": "ask"}
+    if text.startswith("/reader") and (len(text) == 7 or text[7] in " \n\t"):
+        return {"mode": "reader"}
+    # UI mode wins — no keyword inference (fixes mode confusion bug).
+    return {"mode": _agents.normalize_mode(state.get("mode", "ask"))}
 
 
 async def ask_node(state: AgentState) -> dict:
@@ -2976,7 +3135,7 @@ def _route_plan_build(state: AgentState) -> str:
 
 
 def _route_mode(state: AgentState) -> str:
-    return state.get("mode", "ask")
+    return normalize_mode(state.get("mode", "ask"))
 
 
 def _route_test(state: AgentState) -> str:

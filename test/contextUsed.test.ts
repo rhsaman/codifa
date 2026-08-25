@@ -1,8 +1,5 @@
 import './_globals.ts'
-import {
-  computeContextUsed,
-  estimateContextTokens,
-} from '../src/lib/context.ts'
+import { computeContextUsed } from '../src/lib/context.ts'
 import type { Chat } from '../src/types.ts'
 
 function check(name: string, cond: any, extra?: any) {
@@ -53,10 +50,11 @@ console.log('۱) realTotal includes output + cache (latest turn total, like open
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۲) only the LATEST assistant turn drives the meter (no max over history):')
+console.log('۲) meter is CUMULATIVE across all non-compacted assistant turns (like opencode):')
 {
-  // An earlier, much larger turn must NOT inflate the meter — opencode uses the
-  // latest request's total, which already re-sends the whole history.
+  // opencode's TUI sums the whole (non-compacted) conversation, so the meter
+  // only ever grows and never drops between turns. Every assistant turn's
+  // usage is added, not just the latest.
   const chat = mkChat([
     { role: 'user', content: 'big' },
     { role: 'assistant', content: 'big', outputTokens: 5, usage: { inputTokens: 999999, outputTokens: 5, totalTokens: 1000004 } },
@@ -64,7 +62,24 @@ console.log('۲) only the LATEST assistant turn drives the meter (no max over hi
     { role: 'assistant', content: 'small', outputTokens: 10, usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
   ])
   const used = computeContextUsed(chat, 'sys', 200000)
-  check('used = latest turn total (2010), not the earlier 1M', used === 2010, used)
+  // 1000004 + 2010 = 1002014 (both turns summed, cumulative)
+  check('used = sum of all turns (1002014), not just latest', used === 1002014, used)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('۲ب) compacted turns are excluded from the cumulative total:')
+{
+  // After a compaction, the compacted messages are dropped from the sum — the
+  // meter resets to the post-compact conversation, exactly like opencode.
+  const chat = mkChat([
+    { role: 'user', content: 'big' },
+    { role: 'assistant', content: 'big', outputTokens: 5, usage: { inputTokens: 999999, outputTokens: 5, totalTokens: 1000004 }, compacted: true },
+    { role: 'user', content: 'small follow-up' },
+    { role: 'assistant', content: 'small', outputTokens: 10, usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
+  ])
+  const used = computeContextUsed(chat, 'sys', 200000)
+  // only the non-compacted turn counts → 2010
+  check('used = 2010 (compacted turn excluded)', used === 2010, used)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,29 +100,35 @@ console.log('۳) provider reports a real total → meter trusts it (output inclu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۴) no usage yet → falls back to the estimate (never a dash):')
+console.log('۴) no usage yet → returns 0 (opencode shows empty meter, no estimate fallback):')
 {
   const chat = mkChat([
     { role: 'user', content: 'hello there friend' },
     { role: 'assistant', content: 'hi' }, // no usage object
   ])
   const used = computeContextUsed(chat, 'sys', 200000)
-  const est = estimateContextTokens(chat, 'sys', 200000)
-  check('used equals the estimate when no usage', used === est, { used, est })
+  check('used is 0 when no usage event yet', used === 0, used)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۵) estimate grows cumulatively as history grows (fallback path):')
+console.log('۵) reasoning tokens are included in the latest turn total:')
 {
-  const m = (c: string) => ({ role: 'user', content: c, outputTokens: 0 })
-  const a = (c: string) => ({ role: 'assistant', content: c, outputTokens: 0 })
-  const base = mkChat([m('seed'), a('seed'), m('seed')])
-  const grown = mkChat([m('seed'), a('seed'), m('seed'), a('seed'.repeat(50)), m('seed'.repeat(50)), a('seed'.repeat(50))])
-  const e0 = estimateContextTokens(base, 'sys', 200000)
-  const e1 = estimateContextTokens(grown, 'sys', 200000)
-  check('estimate increases with more history', e1 > e0, { e0, e1 })
-  // And computeContextUsed (no usage) tracks that growth.
-  check('computeContextUsed grows with history', computeContextUsed(grown, 'sys', 200000) > computeContextUsed(base, 'sys', 200000))
+  const chat = mkChat([
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: 'ok',
+      usage: {
+        inputTokens: 100,
+        outputTokens: 50,
+        reasoningTokens: 30,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      },
+    },
+  ])
+  // 100 + 50 + 30 = 180 (reasoning included, like opencode)
+  check('used includes reasoning (180)', computeContextUsed(chat, 'sys', 200000) === 180, computeContextUsed(chat, 'sys', 200000))
 }
 
 console.log((globalThis as any).__FAILED ? '\n✗ برخی تستها شکست خوردند' : '\n✓ همه تستها پاس شدند')

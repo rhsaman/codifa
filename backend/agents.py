@@ -3260,8 +3260,8 @@ _IMAGE_EXTS: dict[str, str] = {
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 # Vision providers reject (or choke on) huge base64 images. Screenshots are
 # often several MB; shrink them to sane limits before sending.
-_MAX_VISION_DIM = 2400  # longest side sent to a vision model
-_MAX_VISION_BYTES = 6 * 1024 * 1024  # decoded bytes; above this we shrink
+_MAX_VISION_DIM = 1536  # longest side sent to a vision model
+_MAX_VISION_BYTES = 3 * 1024 * 1024  # decoded bytes; above this we shrink
 
 
 def _maybe_downscale_image(data_url: str) -> str:

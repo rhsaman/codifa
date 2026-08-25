@@ -1853,7 +1853,6 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({ settings: { ...s.settings, compactHeadroom: tokens } }))
     get().persist()
   },
-
   setNvimFile: (abs) => set({ nvimFile: abs }),
   setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),
 }))

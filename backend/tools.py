@@ -290,6 +290,20 @@ def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
     return ""
 
 
+def _explore_fail_note(agent: str, model: str, exc: Exception) -> str:
+    """A structured failure note for the explore sub-agent that steers the Main
+    Agent AWAY from reading the whole codebase manually. Instead of a raw error
+    that triggers 'find the bug yourself' behavior, it tells the Main Agent to
+    re-delegate with a NARROWER scope (a specific folder/pattern/symbol) so the
+    explore agent can succeed cheaply on the retry."""
+    text = str(exc).strip()
+    return (
+        f"ERROR: the {agent} sub-agent failed ({model}): {text}. "
+        "Do NOT read the whole codebase manually. Re-delegate with a NARROWER "
+        "scope (name the folder/pattern/symbol) via task(subagent_type='explore')."
+    )
+
+
 # Web-search backends are pluggable via Settings → Plugins. Each engine is a
 # function ``(query, max_results, cfg) -> list[dict]`` where ``cfg`` is that
 # plugin's saved row; a new engine later = add its function here + one entry in
@@ -3901,40 +3915,83 @@ EFFICIENCY: Prefer grep (with context) over reading whole files — grep first, 
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
-        try:
-            # Per-agent hard step budget (opencode's `agent.steps`). Falls back to
-            # the loop's default when the registry entry omits it.
-            _agent_steps = AGENTS.get(subagent_type, {}).get("steps")
-            # Hand the sub-agent the parent's context window so its isolated
-            # transcript can auto-compact mid-run (llm._auto_compact_subagent)
-            # instead of overflowing and failing the whole task when it reads
-            # many large files. 0 means "no budget" -> no compaction (legacy
-            # behavior for sessions without a known window).
-            _ctx = int(context_window) if context_window and context_window > 0 else 0
-            _output = await langchain_tool_loop(
-                _model,
-                system=agent_system(subagent_type)
-                or "You are a sub-agent. Work through the task independently with "
-                "your tools, then reply with a concise final result. Do not ask the "
-                "user questions; do not call the task tool.",
-                user=prompt,
-                tools=_sub_tools,
-                max_steps=_agent_steps if _agent_steps else 24,
-                ctx=_ctx,
-                compact_model=_model,
-                reserved=reserved if reserved is not None else 20_000,
-                emit=emit,
-            )
-        except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
-            emit(_error_result("task", f"sub-agent failed: {exc}"))
-            return (
-                f"ERROR: the {subagent_type} sub-agent failed"
-                f" ({_model_name} model, change it in Settings → Subagents): {exc}"
-            )
-        finally:
+        # Per-agent hard step budget (opencode's `agent.steps`). Falls back to
+        # the loop's default when the registry entry omits it.
+        _agent_steps = AGENTS.get(subagent_type, {}).get("steps")
+        # Hand the sub-agent the parent's context window so its isolated
+        # transcript can auto-compact mid-run (llm._auto_compact_subagent)
+        # instead of overflowing and failing the whole task when it reads
+        # many large files. 0 means "no budget" -> no compaction (legacy
+        # behavior for sessions without a known window).
+        _ctx = int(context_window) if context_window and context_window > 0 else 0
+        _attempts = 0
+        _last_exc: Exception | None = None
+        while _attempts < _SUBAGENT_MAX_ATTEMPTS:
+            _attempts += 1
+            try:
+                _output = await langchain_tool_loop(
+                    _model,
+                    system=agent_system(subagent_type)
+                    or "You are a sub-agent. Work through the task independently with "
+                    "your tools, then reply with a concise final result. Do not ask the "
+                    "user questions; do not call the task tool.",
+                    user=prompt,
+                    tools=_sub_tools,
+                    max_steps=_agent_steps if _agent_steps else 24,
+                    ctx=_ctx,
+                    compact_model=_model,
+                    reserved=reserved if reserved is not None else 20_000,
+                    emit=emit,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
+                _last_exc = exc
+                if _model is main_model or main_model is None:
+                    # Already on the main model (or no fallback) — give up.
+                    break
+                if _attempts < _SUBAGENT_MAX_ATTEMPTS:
+                    # Transient blip on the explore model: retry on the same
+                    # model before falling back to the main model.
+                    await asyncio.sleep(_SUBAGENT_RETRY_SECONDS)
+                    continue
+                # Retries on the explore model are exhausted: fall back to the
+                # main model for one final attempt (sticky, like _run_distill).
+                _emit_fallback("explore", "explore", _model, main_model, exc)
+                _model = main_model
+                _model_name = str(getattr(_model, "model_name", "") or "")
+                try:
+                    _output = await langchain_tool_loop(
+                        _model,
+                        system=agent_system(subagent_type)
+                        or "You are a sub-agent. Work through the task independently "
+                        "with your tools, then reply with a concise final result. Do "
+                        "not ask the user questions; do not call the task tool.",
+                        user=prompt,
+                        tools=_sub_tools,
+                        max_steps=_agent_steps if _agent_steps else 24,
+                        ctx=_ctx,
+                        compact_model=_model,
+                        reserved=reserved if reserved is not None else 20_000,
+                        emit=emit,
+                    )
+                    _last_exc = None  # fallback succeeded — clear the prior error
+                    break
+                except Exception as exc2:  # noqa: BLE001
+                    _last_exc = exc2
+                    break
+        if _last_exc is not None:
+            # Either the main model also failed, or we exhausted retries and
+            # fell back but still failed. Return a structured note that steers
+            # the Main Agent to re-delegate with a narrower scope instead of
+            # reading the whole codebase manually.
+            emit(_error_result("task", f"sub-agent failed: {_last_exc}"))
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
+            return _explore_fail_note(subagent_type, _model_name, _last_exc)
+        _SUB_AGENT_CTX.reset(_token)
+        _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
+        _TASK_DEPTH_CTX.reset(_depth_token)
         _output = (_output or "").strip()
         emit(
             {

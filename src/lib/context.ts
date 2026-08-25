@@ -94,39 +94,6 @@ export function estimateContextChars(
   return chars
 }
 
-export function estimateContextTokens(
-  chat: Chat | null,
-  systemPrompt: string,
-  contextWindow?: number,
-): number {
-  const msgs = chat?.messages ?? []
-  let weight = 0
-  weight += weightedCharCount(systemPrompt)
-  // Same realistic floor as estimateContextChars (see note there): the builtin
-  // prompt + workspace note is thousands of chars, not 2200.
-  weight += 16000
-  const active = msgs.filter((m) => !m.compacted)
-  const talk = active.filter(
-    (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
-  )
-  const { settled, live } = budgetedSettledHistory(talk)
-  for (const m of settled) {
-    weight += weightedCharCount(m.content)
-    if (m.thinking) weight += weightedCharCount(m.thinking)
-  }
-  if (live) {
-    weight += weightedCharCount(live.content)
-    if (live.thinking) weight += weightedCharCount(live.thinking)
-    for (const act of live.toolActivity ?? []) {
-      weight += weightedCharCount(act.tool)
-      if (act.args) weight += weightedCharCount(JSON.stringify(act.args))
-      if (act.summary) weight += weightedCharCount(act.summary)
-      if (act.diff) weight += weightedCharCount(act.diff)
-    }
-  }
-  return Math.floor(weight / CHARS_PER_TOKEN)
-}
-
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
@@ -141,16 +108,16 @@ export function formatTokensK(n: number): string {
 }
 
 /**
- * Context-meter percentage, aligned with opencode's compaction trigger.
+ * Context-meter percentage, aligned 100% with opencode.
  *
- * opencode's `isOverflow` compares the latest turn's token total against
- * `usable()` (window minus the reserved compaction buffer), NOT the raw window.
- * So the meter should fill toward `usable` — that's the point where compaction
- * actually fires. We scale the reserved headroom to the window (mirroring
- * opencode's clamp of `COMPACTION_BUFFER` to `maxOutputTokens`) via `scaleReserved`.
+ * opencode's TUI shows `tokens.total / limit.context` — i.e. the RAW window,
+ * NOT `usable` (window minus the reserved compaction buffer). The meter is a
+ * raw display of how full the model's context window is, independent of where
+ * auto-compaction fires. So we divide by the raw `windowSize` here.
  *
- * `reserved` is the user's compaction headroom (settings `compactHeadroom`),
- * passed through from the UI — never hardcoded here.
+ * `reserved` is kept in the signature for call-site compatibility (the UI still
+ * passes `compactHeadroom`), but it is intentionally NOT used in the
+ * calculation — opencode does not subtract it from the meter's denominator.
  *
  * No 100% cap: opencode's overflow check is a raw `count >= usable`, which can
  * exceed the window, so an overflow stays visible. Report the raw %.
@@ -161,28 +128,23 @@ export function contextPercent(
   reserved = 0,
 ): number | null {
   if (!windowSize || windowSize <= 0) return null
-  const usable = Math.max(0, windowSize - scaleReserved(windowSize, reserved))
-  if (usable <= 0) return Math.round((used / windowSize) * 100)
-  return Math.round((used / usable) * 100)
+  return Math.round((used / windowSize) * 100)
 }
 
 /**
  * Resolve the context-meter token count shown in the sidebar.
  *
- * Mirrors opencode's server-side accounting in
- * `packages/opencode/src/session/overflow.ts` (`isOverflow`): the context size
- * is the LATEST assistant turn's token total —
- *   total || input + output + cache.read + cache.write
- * i.e. output AND cache are INCLUDED, and ONLY the most recent request is
- * used. Each new model call re-sends the entire history, so the latest turn's
- * total already reflects the full current context (and is exactly what opencode
- * compares against `usable()` to decide compaction). opencode's `dev` TUI has
- * no separate percentage meter — this is the underlying accounting it relies
- * on.
+ * Mirrors opencode's context meter: the meter is CUMULATIVE across the whole
+ * (non-compacted) conversation — it sums every assistant turn's token total,
+ * so it only ever grows and never drops between turns (exactly what the
+ * opencode TUI shows). Each new model call re-sends the entire history, so the
+ * running sum reflects the total context that has been sent across the
+ * session.
  *
- * We take the LAST assistant message that carries a `usage` event (the most
- * recent completed request). `chat.usage` is a per-model SESSION total that
- * only ever grows, so it must NOT be used here.
+ * We sum the `usage` of every non-compacted assistant message. `chat.usage` is
+ * a per-model SESSION total that only ever grows and is NOT reset by a compact,
+ * so it must NOT be used here — summing the per-turn `usage` fields naturally
+ * resets when `compacted` messages are filtered out.
  *
  * Before the first real usage event arrives (brand-new chat / right after a
  * compact) there is no turn total, so we fall back to the full-conversation
@@ -197,11 +159,13 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // Latest assistant turn's token total — matches opencode's `tokens.total`.
-  // Skip zero-usage assistant messages (like compact messages with all-zero tokens).
-  let realTotal = 0
-  for (let i = active.length - 1; i >= 0; i--) {
-    const m = active[i]
+  // Cumulative session token total — mirrors opencode's meter, which sums the
+  // whole (non-compacted) conversation rather than just the latest turn. Each
+  // assistant message carries its own turn's usage; summing them gives the
+  // total context sent across the session, so the meter only ever grows (until
+  // a compact resets it by dropping the compacted messages).
+  let total = 0
+  for (const m of active) {
     if (m.role !== 'assistant') continue
     const u = m.usage
     if (!u) continue
@@ -210,23 +174,19 @@ export function computeContextUsed(
     // together. When the provider reports `totalTokens` it already includes
     // output + cache, so summing everything double-counts. Prefer `totalTokens`
     // when present, otherwise sum the parts (output + cache included).
-    const total =
+    const turn =
       u.totalTokens ??
       (u.inputTokens || 0) +
         (u.outputTokens || 0) +
+        (u.reasoningTokens ?? 0) +
         (u.cacheReadTokens ?? 0) +
         (u.cacheWriteTokens ?? 0)
-    if (total > 0) {
-      realTotal = total
-      break
-    }
+    if (turn > 0) total += turn
   }
 
-  // No real usage yet → fall back to the estimate (see note above).
-  if (realTotal <= 0) {
-    realTotal = estimateContextTokens(chat, systemPrompt, contextWindow)
-  }
-  return realTotal
+  // opencode shows 0% until the first real usage event arrives — no estimate
+  // fallback. If there is no assistant turn with usage yet, the meter is empty.
+  return total
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying

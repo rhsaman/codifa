@@ -1101,20 +1101,20 @@ export function ChatPanel() {
   const ctxWindow = modelContextWindow(provider, activeModel);
 
   // Context count for the titlebar meter — see `computeContextUsed`: the latest
-  // assistant turn's token total (input + output + cache), matching opencode's
-  // `overflow.ts` accounting, with the full-conversation estimate as a fallback
-  // before the first usage event.
+  // assistant turn's token total (input + output + reasoning + cache), matching
+  // opencode's `overflow.ts` accounting. opencode shows 0% until the first real
+  // usage event arrives — no estimate fallback — so a brand-new chat reads empty.
   const contextUsed = useMemo(
     () =>
       computeContextUsed(chat, systemPrompt, ctxWindow ?? undefined),
     [chat, systemPrompt, ctxWindow],
   );
 
-  // Compaction headroom (reserved tokens) comes from the user's settings, so the
-  // meter fills toward `usable = window - reserved` — the point where opencode's
-  // auto-compaction actually fires. Never hardcoded; the user controls it.
-  const compactHeadroom = useStore.getState().settings.compactHeadroom ?? 20000
-  const ctxPct = contextPercent(contextUsed, ctxWindow, compactHeadroom);
+  // opencode's meter compares the latest turn's total against the RAW window
+  // (`limit.context`), NOT `usable = window - reserved`. The reserved headroom is
+  // still used by the backend to trigger auto-compaction, but the meter itself
+  // is raw — so we pass no `reserved` here.
+  const ctxPct = contextPercent(contextUsed, ctxWindow);
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -3031,8 +3031,8 @@ export function ChatPanel() {
               className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact. The % is relative to the usable window (model's ${formatTokens(ctxWindow)} window minus the ${formatTokens(compactHeadroom)} compaction headroom) — the point where auto-compaction fires.`
-                  : "Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact. The % is relative to the usable window (window minus the compaction headroom)."
+                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). Auto-compaction fires separately on the usable window (window minus the compaction headroom).`
+                  : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
               }
               dir="ltr"
             >

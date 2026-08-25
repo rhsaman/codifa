@@ -120,10 +120,14 @@ class _ReadHeavyModel:
     async def ainvoke(self, msgs):
         self._n += 1
         if self._n <= self._steps:
+            # Vary the path per step so the doom-loop guard (same name+args 3x
+            # in a row) does not abort the loop before the final reply — we want
+            # to exercise repeated large reads + mid-run compaction, not the
+            # repeated-call stopper.
             return AIMessage(
                 content="",
                 tool_calls=[
-                    {"name": "read", "args": {"filePath": "big.txt"}, "id": f"c{self._n}"}
+                    {"name": "read", "args": {"filePath": f"big{self._n}.txt"}, "id": f"c{self._n}"}
                 ],
             )
         return AIMessage(content=self._reply)

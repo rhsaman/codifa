@@ -188,3 +188,72 @@ async def test_vision_non_transient_400_not_retried(run_events):
     ]
     assert len(vision_requests) == 1, \
         "a permanent 400 should not be retried (expected 1 vision request)"
+
+
+@pytest.mark.asyncio
+async def test_vision_downscales_large_image():
+    # A large image (3000x3000) must be downscaled to <= 1536 on its longest
+    # side so vision providers don't choke on it (the source of slow vision).
+    from io import BytesIO
+
+    from PIL import Image
+
+    import agents as _agents
+
+    big = BytesIO()
+    Image.new("RGB", (3000, 3000), (255, 0, 0)).save(big, format="PNG")
+    data_url = "data:image/png;base64," + __import__("base64").b64encode(big.getvalue()).decode()
+
+    out = _agents._maybe_downscale_image(data_url)
+    _, b64 = out.split(",", 1)
+    raw = __import__("base64").b64decode(b64)
+    with Image.open(BytesIO(raw)) as img:
+        assert max(img.size) <= 1536, \
+            "large image was not downscaled to the 1536px vision limit"
+
+
+@pytest.mark.asyncio
+async def test_vision_model_timeout_is_bounded():
+    # The vision model must be built with a bounded timeout (30s) so a slow
+    # provider fails fast instead of hanging the turn for minutes.
+    model = graph.resolve_subagent_model(
+        "custom", "mock-model", "http://localhost:1", "test", "", None, "",
+        default_to_parent=False, timeout=30,
+    )
+    # LangChain stores the scalar timeout as `request_timeout` on the model.
+    actual = getattr(model, "request_timeout", None) or getattr(model, "timeout", None)
+    assert actual == 30, \
+        "vision model should be built with a bounded timeout of 30s"
+
+
+@pytest.mark.asyncio
+async def test_vision_respects_total_budget(monkeypatch):
+    # The whole vision analysis must respect the total wall-clock budget and
+    # stop retrying once it is exhausted (no multi-minute turn lock).
+    import asyncio
+
+    monkeypatch.setattr(graph, "_VISION_TOTAL_BUDGET", 2.0)
+
+    # Each attempt takes ~1s and fails transiently (500); with a 2s budget the
+    # loop must stop after at most 2 attempts, not run all 3.
+    calls = {"n": 0}
+
+    async def _slow_fail(*args, **kwargs):
+        calls["n"] += 1
+        await asyncio.sleep(1.0)
+        raise RuntimeError("500: transient server error")
+
+    monkeypatch.setattr(graph, "llm_generate", _slow_fail)
+
+    class _FakeModel:
+        model_name = "mock-vision"
+
+    start = asyncio.get_event_loop().time()
+    result = await graph._vision_analyze(_FakeModel(), ["data:image/png;base64,AAAA"])
+    elapsed = asyncio.get_event_loop().time() - start
+
+    assert result is None, "vision should give up (None) when the budget is exhausted"
+    assert calls["n"] <= 2, \
+        "vision should stop retrying once the total budget is exhausted"
+    assert elapsed < 5.0, \
+        f"vision analysis blew past the 2s budget (took {elapsed:.1f}s)"

@@ -277,7 +277,7 @@ export interface StreamParams {
    *  subagent entry is routed to that provider's own base URL / key. */
   providers?: Record<string, ProviderConfig>
   /** Compaction headroom (tokens) reserved below the context window — opencode's
-   *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`. */
+   *  `reserved`. Auto-compaction fires at `ctx - reserved`. */
   reserved?: number
   signal?: AbortSignal
 }

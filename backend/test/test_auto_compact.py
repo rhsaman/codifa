@@ -236,3 +236,91 @@ def test_auto_compact_uses_real_usage_when_present(monkeypatch):
     assert events == ["compact_start", "compact"]
     # Real usage (160k) was used, NOT the char estimate (which would be tiny).
     assert calls.get("estimate", 0) == 0
+
+
+def test_auto_compact_fires_at_usable_like_opencode():
+    # opencode fires compaction when total >= usable (ctx - reserved), with no
+    # extra proactive buffer. A turn at/above usable must compact; below must not.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        ai = AIMessage(content="answer")
+        ai.usage_metadata = {
+            "input_tokens": 170_000,
+            "output_tokens": 15_000,
+            "cache_read_input_tokens": 0,
+        }
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
+        events, _ = asyncio.run(
+            _run_trigger(messages, reserved=20_000, ctx=200_000)
+        )
+    finally:
+        graph._agents._compact_history = original
+
+    # 185k >= usable 180k -> compaction fires (opencode behavior).
+    assert events == ["compact_start", "compact"]
+
+
+def test_auto_compact_fires_on_usable_threshold():
+    # opencode fires compaction when the latest turn reaches `usable`
+    # (ctx - reserved). With reserved=20k on a 200k window, usable=180k.
+    # A 185k turn (below the 200k overflow, but >= usable) must compact.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        ai = AIMessage(content="answer")
+        ai.usage_metadata = {
+            "input_tokens": 170_000,
+            "output_tokens": 15_000,
+            "cache_read_input_tokens": 0,
+        }
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
+        state = {"reserved": 20_000}
+        q = _Queue()
+        asyncio.run(graph._maybe_auto_compact(state, q, None, None, messages, 200_000))
+        events = [e["kind"] for e in q.items]
+    finally:
+        graph._agents._compact_history = original
+
+    # 185k >= usable 180k -> compaction fires (opencode behavior).
+    assert events == ["compact_start", "compact"]
+
+
+def test_auto_compact_respects_reserved_setting():
+    # The single "Compaction headroom (tokens)" setting (reserved) controls the
+    # threshold. A larger reserved (40k) lowers usable to 160k: a 170k turn must
+    # compact, while a 130k turn must NOT.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        # 170k turn with reserved=40k -> usable 160k -> fires.
+        ai = AIMessage(content="answer")
+        ai.usage_metadata = {"input_tokens": 160_000, "output_tokens": 10_000, "cache_read_input_tokens": 0}
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
+        state = {"reserved": 40_000}
+        q = _Queue()
+        asyncio.run(graph._maybe_auto_compact(state, q, None, None, messages, 200_000))
+        events_170k = [e["kind"] for e in q.items]
+
+        # 130k turn with reserved=40k -> usable 160k -> silent.
+        ai2 = AIMessage(content="answer")
+        ai2.usage_metadata = {"input_tokens": 120_000, "output_tokens": 10_000, "cache_read_input_tokens": 0}
+        messages2 = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai2]
+        state2 = {"reserved": 40_000}
+        q2 = _Queue()
+        asyncio.run(graph._maybe_auto_compact(state2, q2, None, None, messages2, 200_000))
+        events_130k = [e["kind"] for e in q2.items]
+    finally:
+        graph._agents._compact_history = original
+
+    assert events_170k == ["compact_start", "compact"]
+    assert events_130k == []

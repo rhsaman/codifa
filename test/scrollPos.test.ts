@@ -117,6 +117,23 @@ console.log('4) موقعیت per-chat است (چتهای دیگر دست نمی�
   check('چت B بدون scrollPos ماند', chatB.scrollPos == null, chatB.scrollPos)
 }
 
+console.log('5) flushNow حین استریم سیو فوری موقعیت را مینویسد:')
+{
+  const s = useStore.getState()
+  const chatId = s.newChat('ask')
+  // پیام در حال استریم → anyStreaming() = true (persist حین استریم deferred میشود)
+  const m = s.addMessage(chatId, { role: 'assistant', content: '…', streaming: true })
+  // موقعیت فقط در حافظه (بدون persist) ست میشود:
+  s.setChatScrollPosMem(chatId, { id: m.id, offset: -7, atBottom: false })
+  const writesBefore = writes.length
+  // معادل منطق flush در Chat.tsx: push به store + flushNow
+  s.flushNow()
+  const payload = lastChatsWrite()?.find((c) => c.id === chatId)
+  check('flushNow حین استریم نوشت فوری انجام داد', writes.length > writesBefore, writes.length - writesBefore)
+  check('موقعیت in-memory در snapshot دیسک هست', payload?.scrollPos?.id === m.id && (payload?.scrollPos as any)?.offset === -7, payload?.scrollPos)
+  s.setStreaming(false, false)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست ناموفق`)
   process.exit(1)

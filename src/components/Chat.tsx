@@ -56,6 +56,7 @@ import {
   uid2,
 } from "../lib/chatSends";
 import { composerScrollPadding } from "../lib/scrollPadding";
+import { isAtBottom } from "../lib/scroll";
 import {
   GLOBAL_SHORTCUTS,
   PREFIX_LABEL,
@@ -739,16 +740,11 @@ export function ChatPanel() {
     });
   }, [wroot, attachments]);
 
-  /** Distance from the bottom still treated as "at bottom". Kept small (8px) so
-   *  a slight scroll-up is saved exactly instead of snapping back to the bottom
-   *  on return; the ResizeObserver reconcile re-pins while streaming anyway. */
-  const AT_BOTTOM_EPS = 8;
   /** Snapshot the current viewport as a message-anchored scroll position. */
   const computeScrollPos = (
     el: HTMLDivElement,
   ): { id: string; offset: number; atBottom: boolean } | null => {
-    const atBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+    const atBottom = isAtBottom(el);
     // At the bottom (the common case while streaming) there is nothing to scan:
     // the id is unused for atBottom restores, so return without touching the DOM.
     if (atBottom) return { id: "", offset: 0, atBottom: true };
@@ -798,8 +794,7 @@ export function ChatPanel() {
       restoreTargetRef.current = null;
       restoreScrollRef.current = null;
     }
-    const atBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+    const atBottom = isAtBottom(el);
     stickToBottom.current = atBottom;
     // Bail out when unchanged so scrolling doesn't re-render the whole panel on
     // every tick — the jump button only flips once per boundary crossing.
@@ -877,11 +872,13 @@ export function ChatPanel() {
         }
         return;
       }
-      const atBottom =
-        el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_EPS;
+      const atBottom = isAtBottom(el);
       if (stickToBottom.current) {
         el.scrollTop = el.scrollHeight;
-      } else if (!atBottom) {
+        setShowJump(false);
+      } else if (atBottom) {
+        setShowJump(false);
+      } else {
         setShowJump(true);
       }
     };
@@ -939,9 +936,16 @@ export function ChatPanel() {
   useLayoutEffect(() => {
     if (restoredRef.current) return;
     const pos = initialScrollPos;
-    if (!pos || pos.atBottom) return;
     const el = scrollRef.current;
     if (!el) return;
+    if (!pos || pos.atBottom) {
+      // کاربر در پایین بود (یا موقعیتی ذخیره نشده) → مستقیماً به پایین اسکرول کن.
+      // حین استریم محتوا رشد می‌کند و reconcile/auto-scroll پین را حفظ می‌کنند.
+      restoredRef.current = true;
+      stickToBottom.current = true;
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
     let anchor = el.querySelector<HTMLElement>(`[data-msg-id="${pos.id}"]`);
     let anchorId = pos.id;
     if (!anchor) {
@@ -1014,11 +1018,12 @@ export function ChatPanel() {
         useStore.getState().setChatScrollPosMem(cid, lastScrollPosRef.current);
       }
     };
-    // Unmount (chat switch): push + persist so the position survives.
+    // Unmount (chat switch): push + flushNow so the position survives even
+    // mid-stream (persist() is deferred while streaming, so it could be lost).
     const flush = () => {
       pushToStore();
       if (cid && lastScrollPosRef.current) {
-        useStore.getState().persist();
+        useStore.getState().flushNow();
       }
     };
     // App close: push the position into the store AND force an immediate write,

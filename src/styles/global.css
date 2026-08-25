@@ -773,38 +773,16 @@ textarea {
   display: flex;
   align-items: center;
   width: 100%;
-  padding: 4px 6px 4px 8px;
+  padding: 5px 6px 5px 8px;
   border-radius: 10px;
-  /* Workspace-colored at all times, not just on hover: each group carries
-     its own --ws hue (set inline per group), so every workspace header
-     keeps its color even when the cursor is elsewhere. */
-  background: color-mix(in srgb, var(--ws, transparent) 10%, var(--bg-input));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 8%, transparent);
+  background: transparent;
   transition:
     background 0.12s,
-    color 0.12s,
-    box-shadow 0.12s;
+    color 0.12s;
 }
 
 .sidebar-group-head:hover {
-  background: color-mix(in srgb, var(--ws, transparent) 18%, var(--bg-input));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ws, var(--text)) 14%, transparent);
-}
-
-/* Workspace-colored group: the header label takes the workspace hue the user
-   picked (muted blend with the theme text so it stays readable on the theme
-   bg), and the head tint is a touch stronger so the chosen color reads
-   clearly in the sidebar. */
-.sidebar-group.ws-colored .sidebar-group-label {
-  color: color-mix(in srgb, var(--ws) 72%, var(--text));
-}
-
-.sidebar-group.ws-colored .sidebar-group-head {
-  background: color-mix(in srgb, var(--ws) 13%, var(--bg-input));
-}
-
-.sidebar-group.ws-colored .sidebar-group-head:hover {
-  background: color-mix(in srgb, var(--ws) 20%, var(--bg-input));
+  background: var(--bg-input);
 }
 
 .sidebar-group-toggle {

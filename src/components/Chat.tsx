@@ -1329,9 +1329,13 @@ export function ChatPanel() {
     // from history they are reading).
     if (forceScroll) forceScrollToBottom();
 
-    // Clear any lingering retry banner from a previous message before sending.
+    // Clear any lingering retry banner and stale streaming flag from a previous
+    // message before sending. A prior turn that was aborted/interrupted may have
+    // left an assistant message with streaming:true; without this cleanup the new
+    // turn would add a second streaming message and show two "Thinking" indicators.
     for (const m of chat.messages) {
       if (m.retry) s.updateMessage(m.id, { retry: null });
+      if (m.streaming) s.updateMessage(m.id, { streaming: false });
     }
 
     const allHistory = chat.messages

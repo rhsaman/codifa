@@ -1,17 +1,17 @@
 """Live test: the agentic tool-loop detects and stops a repetition loop.
 
-Some models fall into a degenerate loop where they emit the SAME text on every
-step -- often while calling a DIFFERENT tool each time (e.g. reading a new
-file). Without a guard the backend streams that one sentence dozens of times
-(the user sees a "message that repeats itself"). The repetition-loop guard in
-graph._inner must stop after a few identical text steps and emit a single
-friendly error event instead of looping up to MAX_STEPS.
+A real repetition loop repeats the SAME tool call with IDENTICAL arguments on
+every step. Genuine multi-step work varies the args (e.g. reading different
+files), so it must NOT trip the guard. The guard in graph._inner is based on
+the tool-call signature (name + args), not emitted text -- matching opencode's
+doom-loop detection. It must stop after a few identical-signature steps and
+emit a single friendly error event instead of looping up to MAX_STEPS.
 
 Guards:
-1. A model that emits byte-identical TEXT every step (even with DIFFERENT tool
-   calls each time) is stopped and a "repetition loop" error event is emitted.
-2. The number of streamed text events stays bounded (the loop does NOT run to
-   MAX_STEPS), so the frontend never receives dozens of duplicated sentences.
+1. A model that calls the SAME tool with IDENTICAL args every step (even with
+   identical text) is stopped and a "repetition loop" error event is emitted.
+2. A model that emits identical TEXT but calls DIFFERENT tools (different args)
+   each step is NOT flagged -- that is genuine multi-step work.
 3. A normal text-only reply (no tool calls) is NOT flagged as a loop.
 """
 import asyncio
@@ -33,10 +33,8 @@ import graph as _graph  # noqa: E402
 
 
 class _LoopModel:
-    """LangChain-style model that emits the SAME text every step but a
-    DIFFERENT tool call each time -- the exact variant that slipped past the
-    old text+tool guard (the model keeps saying the same sentence while reading
-    a new file on every step)."""
+    """LangChain-style model that calls the SAME tool with IDENTICAL args on
+    every step -- a genuine repetition loop (the doom-loop variant)."""
 
     model_name = "fake-loop"
 
@@ -44,8 +42,28 @@ class _LoopModel:
         return self
 
     async def astream(self, msgs):
-        # Count prior AI steps so each tool call is unique (different file),
-        # but the emitted TEXT is byte-identical every step.
+        yield AIMessage(
+            content=(
+                "بگذارم ببینم finally واقعاً isThinking را ریست می‌کند یا نه، "
+                "و CSS چطور انیمیشن را کنترل می‌کند."
+            ),
+            tool_calls=[
+                {"name": "read", "args": {"path": "same.py"}, "id": "call_1"}
+            ],
+        )
+
+
+class _SameTextDiffToolsModel:
+    """LangChain-style model that emits identical TEXT every step but calls a
+    DIFFERENT tool (different args) each time -- genuine multi-step work (e.g.
+    reading a new file on every step). Must NOT be flagged as a loop."""
+
+    model_name = "fake-same-text-diff-tools"
+
+    def bind_tools(self, tools):
+        return self
+
+    async def astream(self, msgs):
         n = len([m for m in msgs if getattr(m, "type", "") == "ai"]) + 1
         yield AIMessage(
             content=(
@@ -108,7 +126,7 @@ async def main():
         "request": "x",
     }
 
-    # --- Case 1: repetition loop must be detected and stopped. ----------------
+    # --- Case 1: repetition loop (same tool + identical args) is detected. -----
     loop_events = await _run_with(_LoopModel(), state)
     errors = [e for e in loop_events if e.get("kind") == "error"]
     assert errors, "expected a repetition-loop error event"
@@ -118,7 +136,13 @@ async def main():
     assert len(text_events) <= 10, f"too many duplicated text events: {len(text_events)}"
     print(f"  repetition loop stopped after {len(text_events)} text events")
 
-    # --- Case 2: a normal text-only reply is NOT flagged as a loop. -----------
+    # --- Case 2: identical text but DIFFERENT tools is NOT a loop. -------------
+    diff_events = await _run_with(_SameTextDiffToolsModel(), state)
+    errors = [e for e in diff_events if e.get("kind") == "error"]
+    assert not errors, f"multi-step work wrongly flagged as a loop: {errors}"
+    print("  identical-text / different-tool work not flagged as a loop")
+
+    # --- Case 3: a normal text-only reply is NOT flagged as a loop. -----------
     text_events = await _run_with(_TextOnlyModel(), state)
     errors = [e for e in text_events if e.get("kind") == "error"]
     assert not errors, f"text-only reply wrongly flagged as a loop: {errors}"

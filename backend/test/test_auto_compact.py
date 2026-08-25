@@ -77,7 +77,7 @@ def test_auto_compact_fires_above_usable():
 
 
 def test_messages_to_dicts_roles():
-    dicts = graph._messages_to_dicts(
+    dicts = graph._agents._messages_to_dicts(
         [
             SystemMessage(content="s"),
             HumanMessage(content="h"),
@@ -137,7 +137,9 @@ def test_backend_context_window_manual_override(monkeypatch):
                 state["api_key"], state["env_var"], oauth_token=state["oauth_token"],
             )
         if ctx <= 0:
-            ctx = graph._agents.DEFAULT_CONTEXT_WINDOW_FLOOR
+            # opencode leaves the window unknown (usable=0 -> compaction off)
+            # instead of falling back to a 32k floor.
+            ctx = 0
         return ctx
 
     # Manual window set -> model_context is never called, value wins.
@@ -155,3 +157,82 @@ def test_backend_context_window_manual_override(monkeypatch):
         # The patched model_context raises exactly this — confirms the
         # live-resolution branch runs when no manual window is supplied.
         assert "model_context should not be called" in str(exc)
+
+
+def test_chat_model_settings_output_cap_parity(monkeypatch):
+    # opencode's OUTPUT_TOKEN_MAX: unknown output limit -> use 32k, never an
+    # 8192 ctx-derived clamp that truncates ("context length exceeded") on an
+    # empty context.
+    async def _no_max_output(*a, **k):
+        return 0
+
+    import llm as _llm
+    import providers as _providers
+
+    monkeypatch.setattr(_providers, "model_max_output", _no_max_output)
+
+    async def _get(mode, ctx):
+        return await _llm.chat_model_settings(
+            mode=mode, ctx=ctx, thinking_level="off", provider="custom",
+            model_name="x", base_url="", api_key="",
+        )
+
+    # Unknown output limit (max_output=0) -> 32k regardless of ctx.
+    assert asyncio.run(_get("coder", 0))["max_tokens"] == 32_000
+    assert asyncio.run(_get("coder", 32_000))["max_tokens"] == 32_000
+    # Known large output limit is capped at opencode's 32k ceiling.
+    async def _big_max_output(*a, **k):
+        return 200_000
+
+    monkeypatch.setattr(_providers, "model_max_output", _big_max_output)
+    assert asyncio.run(_get("coder", 200_000))["max_tokens"] == 32_000
+    # A small known output limit is honored (not clamped to 32k).
+    async def _small_max_output(*a, **k):
+        return 8_192
+
+    monkeypatch.setattr(_providers, "model_max_output", _small_max_output)
+    assert asyncio.run(_get("coder", 200_000))["max_tokens"] == 8_192
+    # ask mode still caps at 8k on top of the 32k ceiling.
+    assert asyncio.run(_get("ask", 200_000))["max_tokens"] == 8_000
+
+
+def test_auto_compact_uses_real_usage_when_present(monkeypatch):
+    # opencode's isOverflow counts the LATEST assistant turn's real token total
+    # (input+output+cache), not a char estimate of the whole transcript. Patch
+    # _estimate_tokens to a sentinel so we can prove the real usage path wins.
+    async def _fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3)
+
+    calls = {}
+
+    def _fake_estimate(content):
+        calls.setdefault("estimate", 0)
+        calls["estimate"] += 1
+        return 1
+
+    original_compact = graph._agents._compact_history
+    original_estimate = graph._agents._estimate_tokens
+    graph._agents._compact_history = _fake_compact
+    graph._agents._estimate_tokens = _fake_estimate
+    try:
+        # A single assistant turn carrying real usage_metadata well above the
+        # usable window -> compaction must fire using the REAL token total.
+        ai = AIMessage(content="answer")
+        ai.usage_metadata = {
+            "input_tokens": 200_000,
+            "output_tokens": 50_000,
+            "cache_read_input_tokens": 10_000,
+        }
+        messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="hi"),
+            ai,
+        ]
+        events, items = asyncio.run(_run_trigger(messages, reserved=20_000, ctx=200_000))
+    finally:
+        graph._agents._compact_history = original_compact
+        graph._agents._estimate_tokens = original_estimate
+
+    assert events == ["compact_start", "compact"]
+    # Real usage (160k) was used, NOT the char estimate (which would be tiny).
+    assert calls.get("estimate", 0) == 0

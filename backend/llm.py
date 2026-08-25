@@ -243,8 +243,12 @@ def build_chat_model(
     return ReasoningChatOpenAI(**lc_kwargs)
 
 
-_MAX_OUTPUT_TOKENS = 128_000
-_FALLBACK_OUTPUT_TOKENS = 8_192
+# opencode's OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts):
+# when a model's real output limit is unknown, assume 32k -- NOT a ctx-derived
+# 8192 clamp. The old 128k ceiling let max_tokens balloon past the window and
+# the old 8192 fallback clamped small windows so models truncated ("context
+# length exceeded") even on an empty context.
+_MAX_OUTPUT_TOKENS = 32_000
 
 
 def _is_local_provider(provider: str, base_url: str) -> bool:
@@ -340,7 +344,10 @@ async def chat_model_settings(
     if max_output > 0:
         max_tokens = min(max_output, _MAX_OUTPUT_TOKENS)
     else:
-        max_tokens = min(max(1_024, ctx // 4), _FALLBACK_OUTPUT_TOKENS) if ctx > 0 else 0
+        # opencode: unknown output limit -> OUTPUT_TOKEN_MAX (32k), never ctx//4.
+        # The old `min(max(1024, ctx // 4), 8192)` clamped small windows to 8k and
+        # made models truncate ("context length exceeded") even on an empty context.
+        max_tokens = _MAX_OUTPUT_TOKENS
     if mode == "ask":
         max_tokens = min(max_tokens, 8_000)
     if scope == "narrow":
@@ -373,7 +380,14 @@ from langchain_core.tools import StructuredTool
 # purpose) and reused here so the sub-agent loop mirrors the main loop's
 # isLastStep guardrail. agents.py only imports llm lazily (inside functions),
 # so this top-level import does not create a circular dependency.
-from agents import _MAX_STEPS_PROMPT
+from agents import (
+    _MAX_STEPS_PROMPT,
+    _compact_history,
+    _estimate_tokens,
+    _messages_to_dicts,
+    _model_max_output,
+    _usable_tokens,
+)
 
 # Mirrors graph.py's `_SEQUENTIAL_TOOLS` (duplicated, not imported, to avoid a
 # circular import -- graph.py imports FROM this module). Mutating / blocking
@@ -451,6 +465,9 @@ async def langchain_tool_loop(
     user: str,
     tools: dict[str, Any],
     max_steps: int = 24,
+    ctx: int = 0,
+    compact_model: Any = None,
+    reserved: int | None = None,
 ) -> str:
     """Run a bounded tool-calling loop on a LangChain model.
 
@@ -528,6 +545,17 @@ async def langchain_tool_loop(
             msgs.append(
                 ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
             )
+        # Reclaim the sub-agent's isolated context mid-run before it overflows
+        # and the whole task fails. Mirrors graph._maybe_auto_compact but works
+        # directly on the LangChain message list (no state/queue), so a sub-agent
+        # that reads many large files can keep going instead of hitting
+        # context_length_exceeded. Any failure degrades silently (the next step
+        # simply retries with the uncompacted transcript).
+        if ctx > 0:
+            try:
+                await _auto_compact_subagent(msgs, model, ctx, reserved)
+            except Exception:  # noqa: BLE001
+                pass
     # The loop ended by hitting max_steps (not by the model returning a
     # final text reply). Recover the last textual answer the sub-agent
     # produced so it never returns an empty result to the parent.
@@ -537,6 +565,55 @@ async def langchain_tool_loop(
             if isinstance(_c, str) and _c.strip():
                 return _c.strip()
     return ""
+
+
+async def _auto_compact_subagent(
+    msgs: list, model: Any, ctx: int, reserved: int | None
+) -> bool:
+    """Compact a sub-agent's transcript in place when it nears the context limit.
+
+    Mirrors ``graph._maybe_auto_compact`` but works directly on the LangChain
+    message list (no ``AgentState``/queue) so a sub-agent's isolated context can
+    be reclaimed mid-run instead of overflowing and failing the whole task. The
+    older turns are summarized (keeping a recent tail verbatim) and the list is
+    rebuilt in place. Returns True when a compaction happened.
+    """
+    if ctx <= 0:
+        return False
+    max_output = _model_max_output(model)
+    usable = _usable_tokens(ctx, max_output, reserved)
+    dicts = _messages_to_dicts(msgs)
+    total = sum(_estimate_tokens(d["content"]) for d in dicts)
+    if total < usable:
+        return False
+    result = await _compact_history(
+        model,
+        dicts,
+        ctx=ctx,
+        max_output=max_output,
+        reserved=reserved,
+        fallback_model=model,
+    )
+    if not result:
+        return False
+    new_history, _keep = result
+    rebuilt: list[Any] = []
+    had_system = bool(msgs) and isinstance(msgs[0], SystemMessage)
+    if had_system:
+        rebuilt.append(msgs[0])
+    for d in new_history:
+        role = d.get("role")
+        content = str(d.get("content") or "")
+        if role == "system" and had_system:
+            continue
+        if role == "assistant":
+            rebuilt.append(AIMessage(content=content))
+        elif role == "tool":
+            rebuilt.append(HumanMessage(content=f"[tool result]\n{content}"))
+        else:
+            rebuilt.append(HumanMessage(content=content))
+    msgs[:] = rebuilt
+    return True
 
 
 def usage_event(metadata: Any, model: str = "", sub: bool = False) -> dict | None:

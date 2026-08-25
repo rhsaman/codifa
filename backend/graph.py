@@ -649,7 +649,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001
             ctx = 0
     if ctx <= 0:
-        ctx = _agents.DEFAULT_CONTEXT_WINDOW_FLOOR
+        # opencode leaves the window unknown (usable=0 -> compaction off) instead
+        # of falling back to a 32k floor that silently shrinks max_tokens. The
+        # output cap now comes from OUTPUT_TOKEN_MAX (llm.py), so an unknown-window
+        # model still works without a fake small window.
+        ctx = 0
 
     store = open_vector_store(
         root, state.get("vector_db_path", ""), state.get("vector_config")
@@ -1202,34 +1206,6 @@ async def _compact_tool_history(
     return True
 
 
-def _messages_to_dicts(msgs: list) -> list[dict]:
-    """Serialize LangChain messages back to the plain ``{role, content}`` dicts
-    the compaction algorithm (and the frontend) expect."""
-    out: list[dict] = []
-    for m in msgs or []:
-        if isinstance(m, SystemMessage):
-            role = "system"
-        elif isinstance(m, HumanMessage):
-            role = "user"
-        elif isinstance(m, AIMessage):
-            role = "assistant"
-        elif isinstance(m, ToolMessage):
-            role = "tool"
-        else:
-            continue
-        content = getattr(m, "content", "")
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    parts.append(part.get("text", ""))
-                elif isinstance(part, str):
-                    parts.append(part)
-            content = "".join(parts)
-        out.append({"role": role, "content": str(content or "")})
-    return out
-
-
 async def _maybe_auto_compact(
     state: AgentState,
     queue: asyncio.Queue,
@@ -1251,8 +1227,25 @@ async def _maybe_auto_compact(
     max_output = _agents._model_max_output(model)
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
-    dicts = _messages_to_dicts(msgs)
-    total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    dicts = _agents._messages_to_dicts(msgs)
+    # opencode's isOverflow counts the LATEST assistant turn's real token total
+    # (input+output+cache), not a char estimate of the whole transcript.
+    total = 0
+    for _m in reversed(msgs):
+        if isinstance(_m, AIMessage):
+            _um = getattr(_m, "usage_metadata", None) or {}
+            _it = int(_um.get("input_tokens") or _um.get("prompt_tokens") or 0)
+            _ot = int(_um.get("output_tokens") or _um.get("completion_tokens") or 0)
+            _cr = int(
+                _um.get("cache_read_input_tokens")
+                or _um.get("cache_creation_input_tokens")
+                or 0
+            )
+            total = _it + _ot + _cr
+            break
+    if total <= 0:
+        # Fallback to the char estimate when no usage was reported (local models).
+        total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
     if total < usable:
         return
     summarizer = compact_model or model
@@ -1343,20 +1336,17 @@ async def _run_mode_turn(
         steps = 0
         reply = ""
         _no_so = False
-        # --- Repetition-loop guard -----------------------------------------
-        # Some models fall into a degenerate loop where they emit the SAME text
-        # on every step -- often while calling a DIFFERENT tool each time (e.g.
-        # reading a new file). Without a guard the backend streams that one
-        # sentence dozens of times (the user sees a "message that repeats
-        # itself"). We detect a run of identical emitted text and stop, instead
-        # of looping up to MAX_STEPS. We compare ONLY the text (not the tool
-        # calls) because the loop variant we actually hit keeps the text
-        # byte-identical while varying the tool, and we require a minimum length
-        # so short filler lines in normal multi-step work are never flagged.
-        _last_step_text = ""
+        # --- Repetition-loop guard (opencode-aligned) -----------------------
+        # opencode stops a degenerate loop via MAX_STEPS + finish_reason=="length"
+        # and has no text-comparison guard. We keep a guard but base it on the
+        # TOOL-CALL SIGNATURE (name + args), not emitted text: a real loop repeats
+        # the SAME tool call with IDENTICAL arguments, whereas genuine multi-step
+        # work varies the args (e.g. reading different files). The old text
+        # comparison false-positived on models that emit similar phrasing while
+        # doing real work.
+        _last_tool_sig = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
-        _MIN_REPEAT_LEN = 20
         while steps < MAX_STEPS:
             steps += 1
             # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -1388,7 +1378,6 @@ async def _run_mode_turn(
                 _thinking_active = False
                 _answer_started = False
                 _saw_real_reasoning = False
-                _step_text = ""
                 # The model is reasoning-capable (flag from the /models payload /
                 # models.dev catalog, forwarded by the frontend). We emit a single
                 # lightweight "active" toggle at the START of the stream so the
@@ -1439,7 +1428,6 @@ async def _run_mode_turn(
                             _answer_started = True
                             continue
                         queue.put_nowait({"kind": "text", "content": content})
-                        _step_text += content
                     elif isinstance(content, list):
                         for part in content:
                             if isinstance(part, dict) and part.get("type") == "text":
@@ -1447,7 +1435,6 @@ async def _run_mode_turn(
                                     _thinking_active = False
                                     queue.put_nowait({"kind": "thinking", "active": False})
                                 queue.put_nowait({"kind": "text", "content": part["text"]})
-                                _step_text += part["text"]
                 if ai is None:
                     break
                 # Safety net for models that only reason and emit no text: make
@@ -1474,36 +1461,47 @@ async def _run_mode_turn(
             if not getattr(ai, "tool_calls", None):
                 meta = getattr(ai, "response_metadata", {}) or {}
                 if meta.get("finish_reason") == "length":
-                    raise ProviderError(
-                        "model response truncated (context length exceeded)"
+                    # opencode treats length-truncation as a normal (partial) stop,
+                    # not an error. Return the partial reply so the user still gets
+                    # output instead of a fatal "context length exceeded" error.
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                "Response truncated by the model (max output tokens "
+                                "reached). Showing partial output."
+                            ),
+                        }
                     )
+                    reply = ai.content if isinstance(ai.content, str) else str(ai.content)
+                    break
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
                 break
-            # --- Repetition-loop detection ----------------------------------
-            # Compare this step's emitted text against the previous step. A model
-            # stuck in a loop keeps emitting byte-identical text (while often
-            # varying the tool call), so a short run of identical text is a
-            # reliable signal. We only check steps that carry tool calls (the
-            # final text-only step already broke above), and we ignore very short
-            # text so normal filler lines in multi-step work are never flagged.
-            if (
-                _step_text
-                and len(_step_text) >= _MIN_REPEAT_LEN
-                and _step_text == _last_step_text
-            ):
+            # --- Repetition-loop detection (tool-call signature) -------------
+            # A real loop repeats the SAME tool call with IDENTICAL arguments on
+            # every step. Genuine multi-step work varies the args (e.g. reading
+            # different files), so it never trips this guard. The old text
+            # comparison false-positived on models that emit similar phrasing
+            # while doing real work.
+            _tool_sig = json.dumps(
+                [(tc.get("name"), tc.get("args")) for tc in (ai.tool_calls or [])],
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            if _tool_sig and _tool_sig == _last_tool_sig:
                 _repeat_count += 1
             else:
                 _repeat_count = 0
-            _last_step_text = _step_text
+            _last_tool_sig = _tool_sig
             if _repeat_count >= _MAX_REPEAT:
                 queue.put_nowait(
                     {
                         "kind": "error",
                         "content": (
-                            "The model entered a repetition loop (it kept emitting "
-                            "the same text on every step). Stopping to avoid an "
-                            "endless, duplicated response. Try rephrasing your "
-                            "request or breaking it into smaller steps."
+                            "The model entered a repetition loop (it kept calling the "
+                            "same tool with identical arguments on every step). "
+                            "Stopping to avoid an endless, duplicated response. Try "
+                            "rephrasing your request or breaking it into smaller steps."
                         ),
                     }
                 )

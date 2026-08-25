@@ -58,6 +58,12 @@ from tools import (
     user_coder_dir,
 )
 from vector_store import KIND_MEMORY, VectorStore
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 # Steer messages injected into a RUNNING agent without interrupting it. Keyed
 # by chat_id; each entry is {"id", "prompt"}. The frontend POSTs here while the
@@ -1303,17 +1309,10 @@ def _is_empty_output_error(exc: BaseException) -> bool:
 DEFAULT_CONTEXT_WINDOW_FLOOR = 32_000
 
 # Universal ceiling for max_tokens when the model's REAL advertised output
-# limit is known (see _settings_for). Models like opencode's free
-# deepseek-v4-flash-free genuinely allow 128K output (models.dev limit.output),
-# so the ceiling must sit at 128K — an 8192 ceiling would silently shrink the
-# advertised limit and thinking models would hit it before responding.
-_MAX_OUTPUT_TOKENS = 128_000
-
-# Conservative cap for the FALLBACK budget (no advertised output limit): a
-# budget scaled from the resolved context window (ctx // 4), capped here.
-# 8192 output tokens is plenty for a coding assistant; many providers reject
-# larger values outright.
-_FALLBACK_OUTPUT_TOKENS = 8_192
+# limit is known (see _settings_for). Mirrors opencode's OUTPUT_TOKEN_MAX:
+# an unknown output limit falls back to 32k, never a ctx-derived 8192 clamp
+# that would truncate ("context length exceeded") even on an empty context.
+_MAX_OUTPUT_TOKENS = 32_000
 
 # Output-token ceiling for NARROW/targeted turns.
 # A targeted lookup/fix needs a short direct reply — the code itself is written
@@ -1682,6 +1681,38 @@ _MAX_PRESERVE_RECENT_TOKENS = 15_000
 def _estimate_tokens(text: str) -> int:
     """Heuristic token count (~4 chars/token), matching opencode's Token.estimate."""
     return max(1, len(text or "") // 4)
+
+
+def _messages_to_dicts(msgs: list) -> list[dict]:
+    """Serialize LangChain messages back to the plain ``{role, content}`` dicts
+    the compaction algorithm (and the frontend) expect.
+
+    Kept here (not in graph.py) so the sub-agent loop in ``llm.py`` can reuse it
+    without importing graph.py (which would be a circular import).
+    """
+    out: list[dict] = []
+    for m in msgs or []:
+        if isinstance(m, SystemMessage):
+            role = "system"
+        elif isinstance(m, HumanMessage):
+            role = "user"
+        elif isinstance(m, AIMessage):
+            role = "assistant"
+        elif isinstance(m, ToolMessage):
+            role = "tool"
+        else:
+            continue
+        content = getattr(m, "content", "")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            content = "".join(parts)
+        out.append({"role": role, "content": str(content or "")})
+    return out
 
 
 def _model_max_output(model: Any) -> int:

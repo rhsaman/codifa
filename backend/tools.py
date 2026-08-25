@@ -3894,6 +3894,12 @@ Returns each match as a single `path:line:match` line (the matching line only â€
             # Per-agent hard step budget (opencode's `agent.steps`). Falls back to
             # the loop's default when the registry entry omits it.
             _agent_steps = AGENTS.get(subagent_type, {}).get("steps")
+            # Hand the sub-agent the parent's context window so its isolated
+            # transcript can auto-compact mid-run (llm._auto_compact_subagent)
+            # instead of overflowing and failing the whole task when it reads
+            # many large files. 0 means "no budget" -> no compaction (legacy
+            # behavior for sessions without a known window).
+            _ctx = int(context_window) if context_window and context_window > 0 else 0
             _output = await langchain_tool_loop(
                 _model,
                 system=agent_system(subagent_type)
@@ -3903,6 +3909,9 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 user=prompt,
                 tools=_sub_tools,
                 max_steps=_agent_steps if _agent_steps else 24,
+                ctx=_ctx,
+                compact_model=_model,
+                reserved=20_000,
             )
         except Exception as exc:  # noqa: BLE001 â€” degrade instead of killing the turn
             emit(_error_result("task", f"sub-agent failed: {exc}"))

@@ -140,11 +140,30 @@ export function formatTokensK(n: number): string {
   return Math.round(n).toLocaleString("en-US")
 }
 
-export function contextPercent(used: number, windowSize: number | null): number | null {
+/**
+ * Context-meter percentage, aligned with opencode's compaction trigger.
+ *
+ * opencode's `isOverflow` compares the latest turn's token total against
+ * `usable()` (window minus the reserved compaction buffer), NOT the raw window.
+ * So the meter should fill toward `usable` — that's the point where compaction
+ * actually fires. We scale the reserved headroom to the window (mirroring
+ * opencode's clamp of `COMPACTION_BUFFER` to `maxOutputTokens`) via `scaleReserved`.
+ *
+ * `reserved` is the user's compaction headroom (settings `compactHeadroom`),
+ * passed through from the UI — never hardcoded here.
+ *
+ * No 100% cap: opencode's overflow check is a raw `count >= usable`, which can
+ * exceed the window, so an overflow stays visible. Report the raw %.
+ */
+export function contextPercent(
+  used: number,
+  windowSize: number | null,
+  reserved = 0,
+): number | null {
   if (!windowSize || windowSize <= 0) return null
-  // No 100% cap — opencode's overflow check is a raw `count >= usable`, which
-  // can exceed the window, so an overflow stays visible. Report the raw %.
-  return Math.round((used / windowSize) * 100)
+  const usable = Math.max(0, windowSize - scaleReserved(windowSize, reserved))
+  if (usable <= 0) return Math.round((used / windowSize) * 100)
+  return Math.round((used / usable) * 100)
 }
 
 /**
@@ -179,17 +198,28 @@ export function computeContextUsed(
   const active = msgs.filter((m) => !m.compacted)
 
   // Latest assistant turn's token total — matches opencode's `tokens.total`.
+  // Skip zero-usage assistant messages (like compact messages with all-zero tokens).
   let realTotal = 0
   for (let i = active.length - 1; i >= 0; i--) {
     const m = active[i]
+    if (m.role !== 'assistant') continue
     const u = m.usage
-    if (m.role !== 'assistant' || !u) continue
-    const has = u.totalTokens != null || u.inputTokens != null || u.outputTokens != null
-    if (!has) continue
-    realTotal =
-      (u.totalTokens ?? 0) ||
-      (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
-    break
+    if (!u) continue
+    // opencode's `isOverflow` uses `tokens.total || input + output + cache.read
+    // + cache.write` — i.e. `total` OR the sum of parts, never both added
+    // together. When the provider reports `totalTokens` it already includes
+    // output + cache, so summing everything double-counts. Prefer `totalTokens`
+    // when present, otherwise sum the parts (output + cache included).
+    const total =
+      u.totalTokens ??
+      (u.inputTokens || 0) +
+        (u.outputTokens || 0) +
+        (u.cacheReadTokens ?? 0) +
+        (u.cacheWriteTokens ?? 0)
+    if (total > 0) {
+      realTotal = total
+      break
+    }
   }
 
   // No real usage yet → fall back to the estimate (see note above).

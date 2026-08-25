@@ -1105,7 +1105,11 @@ export function ChatPanel() {
     [chat, systemPrompt, ctxWindow],
   );
 
-  const ctxPct = contextPercent(contextUsed, ctxWindow);
+  // Compaction headroom (reserved tokens) comes from the user's settings, so the
+  // meter fills toward `usable = window - reserved` — the point where opencode's
+  // auto-compaction actually fires. Never hardcoded; the user controls it.
+  const compactHeadroom = useStore.getState().settings.compactHeadroom ?? 20000
+  const ctxPct = contextPercent(contextUsed, ctxWindow, compactHeadroom);
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -3022,8 +3026,8 @@ export function ChatPanel() {
               className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact (of the model's ${formatTokens(ctxWindow)} window).`
-                  : "Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact."
+                  ? `Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact. The % is relative to the usable window (model's ${formatTokens(ctxWindow)} window minus the ${formatTokens(compactHeadroom)} compaction headroom) — the point where auto-compaction fires.`
+                  : "Context used: real tokens of the last completed reply, or the estimated size while a turn is streaming / right after a compact. The % is relative to the usable window (window minus the compaction headroom)."
               }
               dir="ltr"
             >

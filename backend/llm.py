@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import httpx
+import json
 from typing import Any
 
 from langchain_core.messages import AIMessageChunk
@@ -507,6 +508,12 @@ async def langchain_tool_loop(
         msgs.append(SystemMessage(content=system))
     msgs.append(HumanMessage(content=user))
     steps = 0
+    # opencode's doom-loop guard: if the model issues the SAME tool call (same
+    # name + same args) N times in a row, it is stuck in a loop — stop burning
+    # tokens and force it to report findings instead.
+    _last_call_sig = None
+    _same_call_streak = 0
+    _DOOM_LOOP_LIMIT = 3
     while steps < max_steps:
         steps += 1
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -566,6 +573,30 @@ async def langchain_tool_loop(
             msgs.append(
                 ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
             )
+        # --- doom-loop guard (opencode's repeated-call detector) ---
+        # Build a signature of THIS step's tool calls; if it matches the previous
+        # step exactly N times in a row, the model is looping — inject a hard
+        # stop so it reports findings instead of burning more tokens.
+        _step_sig = "|".join(
+            f"{tc.get('name')}:{json.dumps(tc.get('args') or {}, sort_keys=True, ensure_ascii=False)}"
+            for tc in tcs
+        )
+        if _step_sig == _last_call_sig:
+            _same_call_streak += 1
+        else:
+            _same_call_streak = 1
+            _last_call_sig = _step_sig
+        if _same_call_streak >= _DOOM_LOOP_LIMIT:
+            msgs.append(
+                SystemMessage(
+                    content=(
+                        "You have issued the same tool call 3 times in a row with "
+                        "identical arguments — this is a loop. Stop calling tools and "
+                        "report your findings in text now."
+                    )
+                )
+            )
+            break
         # Reclaim the sub-agent's isolated context mid-run before it overflows
         # and the whole task fails. Mirrors graph._maybe_auto_compact but works
         # directly on the LangChain message list (no state/queue), so a sub-agent

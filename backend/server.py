@@ -215,7 +215,11 @@ class CompactRequest(BaseModel):
     # Conversation history to compact, as plain {role, content} turns.
     history: list[dict] = []
     context_window: int = 0
-    reserved: int = 2000
+    # Default matches the auto-compact `reserved` (20_000) and the UI's
+    # `compactHeadroom` default, so a manual /compact without an explicit
+    # headroom behaves identically to auto-compaction. The frontend always
+    # sends the user's actual `compactHeadroom` here, so this is only a fallback.
+    reserved: int = 20_000
 
 
 class ModelsRequest(BaseModel):

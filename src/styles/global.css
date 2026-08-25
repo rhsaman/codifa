@@ -253,56 +253,59 @@ textarea {
   }
 }
 
-.sidebar-new {
+.sidebar-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 12px 10px 8px;
+}
+
+.sidebar-head .sidebar-search-box {
+  flex: 1 1 auto;
+}
+
+.sidebar-head-actions {
+  display: inline-flex;
+  gap: 4px;
   flex: 0 0 auto;
 }
 
-.sidebar-new-btn {
-  width: 100%;
-  display: flex;
+.sidebar-head-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 9px 0;
-  border-radius: 14px;
-  border: none;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 16%, var(--bg-input)),
-      color-mix(in srgb, var(--accent) 8%, var(--bg-input)));
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 600;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.12);
-  transition:
-    background 0.15s,
-    transform 0.1s,
-    box-shadow 0.15s;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
 }
 
-.sidebar-new-btn svg {
+.sidebar-head-btn svg {
+  color: var(--text-dim);
+}
+
+.sidebar-head-btn:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-input));
+}
+
+.sidebar-head-btn:hover svg {
   color: var(--accent);
 }
 
-.sidebar-new-btn:hover {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 22%, var(--bg-input)),
-      color-mix(in srgb, var(--accent) 12%, var(--bg-input)));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent),
-    0 4px 12px -4px color-mix(in srgb, var(--accent) 35%, transparent);
+.sidebar-head-btn:active {
+  transform: scale(0.96);
 }
 
-.sidebar-new-btn:active {
-  transform: scale(0.98);
-}
-
-.sidebar-search {
-  flex: 0 0 auto;
-  padding: 0 10px 8px;
+.sidebar-head-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 /* The box wraps icon + input + clear so the icon and clear button center
@@ -325,7 +328,8 @@ textarea {
 
 .sidebar-search-input {
   width: 100%;
-  padding: 8px 34px;
+  height: 32px;
+  padding: 0 34px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg-input);
@@ -335,6 +339,11 @@ textarea {
   transition:
     border-color 0.15s,
     box-shadow 0.15s;
+}
+
+.sidebar-search-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .sidebar-search-input:hover {
@@ -394,6 +403,14 @@ textarea {
   font-size: 12px;
   color: var(--text-dim);
   text-align: center;
+}
+
+.sidebar-result-count {
+  padding: 4px 12px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
 }
 
 .chat-item {

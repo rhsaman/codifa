@@ -162,6 +162,7 @@ export function Sidebar() {
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Click-based kebab menu: opens on click, stays open while hovering the
   // popup (no hover-gap race), and closes on outside click or re-click.
@@ -177,6 +178,18 @@ export function Sidebar() {
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [menuOpenId]);
+
+  // ⌘K / Ctrl+K focuses the chat search — the natural "find my chat" shortcut.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const open = useStore((s) => s.sidebarOpen);
   const dir = useStore((s) => s.dir);
@@ -619,28 +632,7 @@ export function Sidebar() {
         title="Drag to resize sidebar"
         onMouseDown={startSidebarResize}
       />
-      <div className="sidebar-new">
-        <button
-          className="sidebar-new-btn"
-          onClick={newWorkspace}
-          title="Create a new workspace"
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.2"
-            strokeLinecap="round"
-          >
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          New workspace
-        </button>
-      </div>
-
-      <div className="sidebar-search">
+      <div className="sidebar-head">
         <div className="sidebar-search-box">
           <svg
             className="sidebar-search-icon"
@@ -656,11 +648,15 @@ export function Sidebar() {
             <path d="M21 21l-4.3-4.3" />
           </svg>
           <input
+            ref={searchInputRef}
             className="sidebar-search-input"
             type="text"
             placeholder="Search chats…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setSearch("");
+            }}
             spellCheck={false}
             dir={dir}
           />
@@ -684,6 +680,25 @@ export function Sidebar() {
             </button>
           )}
         </div>
+        <div className="sidebar-head-actions">
+          <button
+            className="sidebar-head-btn"
+            title="New workspace"
+            onClick={newWorkspace}
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+            >
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div className="sidebar-list">
@@ -695,6 +710,11 @@ export function Sidebar() {
         )}
         {searching && chats.length > 0 && visibleGroups.length === 0 && (
           <div className="sidebar-empty">No chats match “{search.trim()}”</div>
+        )}
+        {searching && visibleGroups.length > 0 && (
+          <div className="sidebar-result-count">
+            {visibleGroups.reduce((n, g) => n + g.chats.length, 0)} chats found
+          </div>
         )}
         {visibleGroups.map((g) => {
           const isCollapsed = collapsed.has(g.key) && !searching;

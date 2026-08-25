@@ -149,6 +149,15 @@ npx esbuild test/contextBudget.test.ts --bundle --platform=node --format=esm \
   --packages=external --external:electron --outfile=test/.tmp-cb.mjs >/dev/null 2>&1
 node test/.tmp-cb.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs
+echo ""
+echo "── تست ۲۶: Sidebar (هدر یکپارچه: سرچ بالا + دکمهٔ فشرده) ──"
+npx esbuild test/sidebar.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \
+  --alias:../src/lib/store=./test/sidebar-store-stub.ts \
+  --outfile=test/.tmp-sb.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-sb.mjs
+
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs test/.tmp-sb.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

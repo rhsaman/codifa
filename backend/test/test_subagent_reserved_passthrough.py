@@ -63,6 +63,7 @@ async def _run_with_reserved(reserved):
             root=os.getcwd(),
             emit=lambda ev: None,
             context_window=0,
+            main_model=_RecordingModel(),
             reserved=reserved,
         )
         await cbs["task"](

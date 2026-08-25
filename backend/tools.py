@@ -55,6 +55,15 @@ SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
 SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
 
+# Parent search cache: avoids re-running ripgrep + re-distilling identical
+# searches. Module-level (NOT per-closure) so it is SHARED across the main
+# agent AND every sub-agent (explore/general) built from this module — and
+# across parallel explore agents in the same turn. This keeps tool-call counts
+# down (no redundant grep/glob) without any quality loss: the cached result is
+# byte-for-byte what a fresh scan would return. Keyed by
+# (tool, pattern, path, include).
+_parent_search_cache: dict[tuple[str, str, str, str], str] = {}
+
 # Sub-agent model calls (web distiller)
 # share the parent turn's retry policy so a free-tier rate limit or connection
 # blip on the gateway retries the sub-agent instead of failing the whole turn
@@ -2740,10 +2749,6 @@ def make_tool_callbacks(
     # broken model).
     _fallback_state: dict[str, bool] = {}
 
-    # Parent search cache: avoids re-running ripgrep + re-distilling identical
-    # searches within the same turn. Keyed by (tool, pattern, path, include).
-    _parent_search_cache: dict[tuple[str, str, str, str], str] = {}
-
     def _emit_fallback(
         slot: str,
         agent_label: str,
@@ -3392,7 +3397,9 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) whenever you need to find files containing specific patterns; for an open-ended search across many locations, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) whenever you need to find files containing specific patterns; for an open-ended search across many locations, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline.
+
+EFFICIENCY: Prefer grep (with context) over reading whole files — grep first, then read only the specific lines/files it points to. When you already know the searches you need, fire several greps in the SAME turn (parallel tool calls) instead of one at a time; combine alternatives with `foo|bar` to collapse multiple searches into one."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
@@ -3553,7 +3560,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
@@ -3627,7 +3634,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         return raw
 
     async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself. Use the read tool to read files; read multiple independent files in parallel in a single turn when you know their paths."""
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself. Use the read tool to read files; read multiple independent files in parallel in a single turn when you know their paths. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {
@@ -4068,6 +4075,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
+        """Search the web for a query and return the top results (title, URL, snippet). Results are cached for 24h, so repeating the exact same query costs no extra call. If you need several searches, fire all `web_search` calls in the SAME turn (parallel tool calls) — combine alternatives with `foo|bar` to collapse several searches into one. Before `fetch_url`, run `web_search` first to find the right URL; then fetch only the URLs you actually need — not every result."""
         # The model that will distill the results: the web sub-agent, or the
         # MAIN model once this slot has fallen back earlier in the turn.
         _web_runner = main_model if _fallback_state.get("web") else web_model
@@ -4084,6 +4092,12 @@ Returns each match as a single `path:line:match` line (the matching line only �
                 "model": _web_runner_name,
             }
         )
+        cache = _get_result_cache()
+        ck = f"web:{query}"
+        cached = cache.get(ck)
+        if cached:
+            emit({"kind": "tool_result", "tool": "web_search", "summary": "cached"})
+            return cached
         result = await asyncio.to_thread(web_search, query, max_results)
         if "error" in result:
             msg = result["error"]
@@ -4159,7 +4173,9 @@ Returns each match as a single `path:line:match` line (the matching line only �
                             "model": str(getattr(ran_model, "model_name", "") or ""),
                         }
                     )
-                    return f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
+                    _result = f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
+                    cache.set(ck, _result, 86400)
+                    return _result
             except Exception as exc:  # noqa: BLE001 — fall back to raw results
                 # Both the web subagent AND the main model failed — tell the user
                 # which one to fix in Settings → Subagents, then return raw
@@ -4195,10 +4211,11 @@ Returns each match as a single `path:line:match` line (the matching line only �
                 "model": _web_runner_name,
             }
         )
+        cache.set(ck, raw_results, 86400)
         return raw_results
 
     async def fetch_url_tool(url: str, full: bool = False) -> str:
-        """Fetch a web page / raw file and return its extracted text (Markdown). Returns the FULL page content — no summarization, exactly like opencode's `webfetch` and codex's `web_fetch`. Pages are capped at 100k chars (codex's cap) so one fetch can never flood the context window; pass `full=True` to lift the cap for copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs). Every call re-sends the whole conversation, so it costs real tokens."""
+        """Fetch a web page / raw file and return its extracted text (Markdown). Returns the FULL page content — no summarization, exactly like opencode's `webfetch` and codex's `web_fetch`. Pages are capped at 100k chars (codex's cap) so one fetch can never flood the context window; pass `full=True` to lift the cap for copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs). Every call re-sends the whole conversation, so it costs real tokens. If you need several URLs, fire all `fetch_url` calls in the SAME turn (parallel tool calls). Before `fetch_url`, run `web_search` to find the right URL; then fetch only the URLs you actually need — not every result."""
         effective_full = bool(full)
         emit(
             {

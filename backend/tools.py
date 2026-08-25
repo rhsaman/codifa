@@ -2611,7 +2611,9 @@ def make_tool_callbacks(
     web_model: Any = None,
     main_model: Any = None,
     vision_model: Any = None,
+    explore_model: Any = None,
     image_uris: list[str] | None = None,
+    reserved: int | None = None,
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
     permit: dict | None = None,
@@ -3822,6 +3824,8 @@ Returns each match as a single `path:line:match` line (the matching line only â€
         from llm import langchain_tool_loop
 
         _model = main_model
+        if subagent_type == "explore" and explore_model is not None:
+            _model = explore_model
         if _model is None:
             emit(
                 {
@@ -3911,7 +3915,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 max_steps=_agent_steps if _agent_steps else 24,
                 ctx=_ctx,
                 compact_model=_model,
-                reserved=20_000,
+                reserved=reserved if reserved is not None else 20_000,
                 emit=emit,
             )
         except Exception as exc:  # noqa: BLE001 â€” degrade instead of killing the turn

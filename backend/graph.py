@@ -691,6 +691,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # in _vision_analyze covers transient blips within this budget.
         timeout=60,
     )
+    explore_model = resolve_subagent_model(
+        state["provider"], subagent_models.get("explore"), state["base_url"],
+        state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
+        default_to_parent=True, provider_lookup=_provider_lookup,
+    )
 
     settings = await chat_model_settings(
         mode, ctx, state.get("thinking_level", ""), state["provider"],
@@ -708,7 +713,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     tools = make_tool_callbacks(
         root, lambda ev: queue.put_nowait(ev),
         context_window=ctx, web_model=web_model, main_model=model,
-        vision_model=vision_model, image_uris=image_uris,
+        vision_model=vision_model, explore_model=explore_model, image_uris=image_uris,
+        reserved=state.get("reserved"),
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
         permit={"outside": allow_outside}, store=store, chat_id=chat_id,

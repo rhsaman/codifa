@@ -779,9 +779,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         + (_agents._LENGTH_RULE if mode in ("plan", "coder") else "")
         + (_agents._TEST_DIR_RULE if mode in ("plan", "coder") else "")
     )
+    # Language directive depends on the CURRENT prompt (Persian/English
+    # detection), so it must NOT live in the system prompt — otherwise the cache
+    # prefix breaks every turn and prefix caching never hits. It is injected into
+    # the user turn instead (see user_parts below). Same for the per-turn RAG
+    # block.
+    lang_directive = _agents._language_directive(prompt)
     system_final = (
         _agents._mode_declare(mode)
-        + _agents._language_directive(prompt)
         + _agents._SEARCH_RULE
         + base_prompt
         + workspace_note
@@ -829,6 +834,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     except Exception:  # noqa: BLE001
         rag_settings = None
     learned_memory = ""
+    rag_block_for_user = ""
     if rag_settings and getattr(rag_settings, "auto_recall", False):
         # Recall the saved memory (learned notes) automatically ONLY on the
         # FIRST message of a chat, or when the user EXPLICITLY asks to look at
@@ -857,17 +863,18 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     )
                 )
         # Project file/web RAG context is a SEPARATE mechanism from the learned
-        # memory recall above and continues to be injected when enabled.
+        # memory recall above and continues to be injected when enabled. It
+        # depends on the CURRENT prompt, so keep it OUT of the system prompt
+        # (it would break the cache prefix every turn) and inject it into the
+        # user turn instead.
         try:
             if rag_settings.active_kinds():
-                rag_block = _build_rag_context(
+                rag_block_for_user = _build_rag_context(
                     store, prompt, rag_settings, max_chars=2600,
                     per_section_chars=1200, kinds=("file", "web"),
-                )
-                if rag_block:
-                    system_final += rag_block
+                ) or ""
         except Exception:  # noqa: BLE001
-            pass
+            rag_block_for_user = ""
 
     # Skills.
     system_final += _build_skills_section(skills or [], root)
@@ -891,6 +898,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # overflow, so large windows are handled without silently dropping turns.
     history = state.get("history") or []
     lc_history = history_to_langchain_messages(history)
+    try:
+        _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
+        print(
+            f"[CTX_DEBUG] history_msgs={len(history)} lc_msgs={len(lc_history)} "
+            f"est_tokens={_hist_chars // 4}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     if mode == "coder":
         reuse = _agents._plan_reuse_note(history)
@@ -940,6 +956,16 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     user_parts: list[Any] = []
     if prompt:
         user_parts.append(prompt)
+    # Prompt-dependent blocks (language directive + per-turn RAG context) are
+    # injected HERE, into the user turn, instead of the system prompt. This keeps
+    # the system prompt fully static so prefix caching hits consistently across
+    # turns (previously these prompt-derived strings sat inside the system
+    # message and changed the cache prefix every turn, causing cache_read=0
+    # spikes and unstable input_tokens).
+    if lang_directive:
+        user_parts.append(lang_directive)
+    if rag_block_for_user:
+        user_parts.append(rag_block_for_user)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
     # vision model, but FALL BACK to the main model (mirroring the `vision`
     # tool's own fallback) so an attached image is ALWAYS analyzed
@@ -1036,7 +1062,44 @@ def model_timeout_for(state: AgentState) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
+def _estimate_content_tokens(content: Any) -> int:
+    """Token estimate for a message content that may be a string or a list of
+    content blocks (text/image)."""
+    if not content:
+        return 0
+    if isinstance(content, str):
+        return _agents._estimate_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for p in content:
+            if isinstance(p, dict):
+                total += _agents._estimate_tokens(p.get("text", "") or "")
+            else:
+                total += _agents._estimate_tokens(str(p))
+        return total
+    return _agents._estimate_tokens(str(content))
+
+
+def _estimate_prompt_tokens(messages: list) -> int | None:
+    """Local, stable token estimate of the FULL input prompt sent this turn
+    (every message in `messages`: system + history + current user turn + tools).
+
+    This — not the provider's per-request input+output total — is what the
+    context meter should reflect: it grows monotonically with the conversation
+    history and is independent of how long the model's OUTPUT happens to be
+    this turn (output length otherwise makes the running-max meter pin to an
+    old value and stop moving). Mirrors opencode's message-list based context
+    count."""
+    try:
+        total = 0
+        for m in messages or []:
+            total += _estimate_content_tokens(getattr(m, "content", ""))
+        return total
+    except Exception:
+        return None
+
+
+def _usage_event_from_ai(ai: Any, model: str, prompt_tokens: int | None = None) -> dict | None:
     """Build a frontend ``usage`` event from a LangChain ``AIMessage``.
 
     LangChain surfaces token counts in ``usage_metadata`` (OpenAI/Google),
@@ -1058,31 +1121,110 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
         return None
     if input_tokens <= 0 and output_tokens <= 0:
         return None
-    cache_read = 0
-    cache_write = 0
-    details = um.get("input_token_details") or {}
-    if isinstance(details, dict):
-        cache_read = int(
-            details.get("cached_tokens")
-            or details.get("cache_read_tokens")
-            or um.get("cache_read_input_tokens")
-            or 0
-        )
-        cache_write = int(
-            details.get("cache_creation_tokens")
-            or details.get("cache_write_tokens")
-            or um.get("cache_creation_input_tokens")
-            or 0
-        )
+    cache_read, cache_write, key_additive = _extract_cache_tokens(um)
+    # Additive (cache must be added to input) when the cache key is Anthropic-native
+    # (cache_read_input_tokens / cache_creation_input_tokens, where input excludes
+    # it), OR when the cached portion is LARGER than input_tokens (proving input
+    # excludes the cache). Otherwise the cache is a SUBSET of input_tokens and the
+    # provider's total_tokens already counts it (adding it back would double-count).
+    additive = (
+        key_additive
+        or (cache_read > 0 and input_tokens < cache_read)
+        or (cache_write > 0 and input_tokens < cache_write)
+    )
+    if additive:
+        # Cache is separate from input_tokens -> add it back for the true total.
+        total_tokens = input_tokens + output_tokens + cache_read + cache_write
+    else:
+        provided_total = um.get("total_tokens") or 0
+        total_tokens = provided_total if provided_total else input_tokens + output_tokens
+    import json as _json
+
+    try:
+        _um_dump = _json.dumps(um, default=str)
+    except Exception:
+        _um_dump = repr(um)
+    print(
+        f"[USAGE_DEBUG] model={model!r} in={input_tokens} out={output_tokens} "
+        f"cache_read={cache_read} cache_write={cache_write} additive={additive} "
+        f"ctx={prompt_tokens} um={_um_dump[:3000]}",
+        flush=True,
+    )
+    # `context_tokens` is the LOCAL estimate of the full input prompt sent this
+    # turn (system + history + current user turn + tools), independent of how
+    # long the model's OUTPUT happens to be. The frontend takes a running max
+    # over the chat's assistant messages so the meter reflects the true
+    # (monotonic) context and never drops as the conversation grows — and
+    # because this estimate excludes output, a long-output turn can no longer
+    # pin the running-max to an old value and stop the meter from moving.
     return {
         "kind": "usage",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": total_tokens,
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
+        "context_tokens": prompt_tokens,
         "model": model or "",
     }
+
+
+def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
+    """Extract cache read/write token counts from ANY provider's usage metadata.
+
+    Provider conventions handled (read-side / write-side):
+
+    * Anthropic (LangChain): ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+      at top level OR nested under ``input_token_details`` — ADDITIVE with
+      ``input_tokens`` (the cached history is sent separately each turn).
+    * OpenRouter-style ``input_token_details.cache_read`` / ``cache_creation`` and
+      OpenAI / Google ``input_token_details.cached_tokens`` (or ``cache_read_tokens``)
+      — a SUBSET of ``input_tokens``; the provider's ``total_tokens`` already
+      includes them, so they must NOT be added back.
+    * OpenAI raw: ``prompt_tokens_details.cached_tokens``.
+
+    Returns ``(cache_read, cache_write, additive)`` where ``additive`` is True when
+    the cache is reported separately from ``input_tokens`` and must be summed in.
+    Any unrecognised ``cache*`` key falls through to the generic scan below.
+    """
+    details = um.get("input_token_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    prompt_details = um.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+
+    # Anthropic-style (additive): input_tokens excludes the cached history.
+    anthropic_read = (
+        details.get("cache_read_input_tokens")
+        or um.get("cache_read_input_tokens")
+        or 0
+    )
+    anthropic_write = (
+        details.get("cache_creation_input_tokens")
+        or um.get("cache_creation_input_tokens")
+        or 0
+    )
+    # OpenAI / Google-style (subset of input_tokens; total already counts it).
+    openai_read = (
+        details.get("cached_tokens")
+        or details.get("cache_read")
+        or details.get("cache_read_tokens")
+        or prompt_details.get("cached_tokens")
+        or um.get("cache_read_tokens")
+        or 0
+    )
+    openai_write = (
+        details.get("cache_creation")
+        or details.get("cache_creation_tokens")
+        or details.get("cache_write_tokens")
+        or um.get("cache_write_tokens")
+        or 0
+    )
+    cache_read = int(anthropic_read or openai_read or 0)
+    cache_write = int(anthropic_write or openai_write or 0)
+    key_additive = bool(anthropic_read or anthropic_write)
+    return cache_read, cache_write, key_additive
 
 
 def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
@@ -1302,29 +1444,29 @@ async def _maybe_auto_compact(
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
     dicts = _agents._messages_to_dicts(msgs)
-    # opencode's isOverflow counts the LATEST assistant turn's real token total
-    # (input+output+cache), not a char estimate of the whole transcript.
-    total = 0
-    for _m in reversed(msgs):
-        if isinstance(_m, AIMessage):
-            _um = getattr(_m, "usage_metadata", None) or {}
-            _it = int(_um.get("input_tokens") or _um.get("prompt_tokens") or 0)
-            _ot = int(_um.get("output_tokens") or _um.get("completion_tokens") or 0)
-            _cr = int(
-                _um.get("cache_read_input_tokens")
-                or _um.get("cache_creation_input_tokens")
-                or 0
-            )
-            total = _it + _ot + _cr
-            break
-    if total <= 0:
-        # Fallback to the char estimate when no usage was reported (local models).
+    # Use the STABLE LOCAL estimate of the WHOLE transcript (system + history +
+    # current user turn + tools) — the same basis as the context meter. This is
+    # provider-independent and avoids two bugs in reading raw provider
+    # `usage_metadata` off the last AIMessage: (a) only Anthropic cache keys were
+    # read, so OpenAI/OpenRouter/hy3-free cache was always 0; (b) adding
+    # cache_read to input_tokens double-counts for SUBSET providers (cache is
+    # already inside input_tokens there), over-estimating and firing compaction
+    # early. The local estimate also never under/over-reports on cache hits or
+    # misses the way a single turn's provider usage does.
+    total = _estimate_prompt_tokens(msgs)
+    if total is None or total <= 0:
+        # Fallback to the char estimate when the local estimate is unavailable
+        # (e.g. un-tokenizable message content, or local models with no usage).
         total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
     # opencode fires compaction when the latest turn reaches `usable`
     # (ctx - reserved). We mirror that exactly: a single setting
     # (compactHeadroom / reserved) controls when auto-compaction runs.
     if total < usable:
         return
+    # opencode prune: clear old tool outputs (not the whole turn) before the
+    # heavier summarization pass, so a large-but-not-overflowing transcript
+    # still sheds context. Runs in place on the serialized history.
+    _agents._prune_history(dicts)
     summarizer = compact_model or model
     queue.put_nowait({"kind": "compact_start"})
     try:
@@ -1465,12 +1607,6 @@ async def _run_mode_turn(
                 _answer_started = False
                 _saw_real_reasoning = False
                 _model_reasoning = bool(state.get("model_reasoning"))
-                # opencode (and some gateways) may stream the FULL text in every
-                # chunk (cumulative) instead of just the delta. Detect it once on
-                # the second chunk: if the new chunk's content already starts with
-                # what we have, it's cumulative — from then on replace, don't
-                # append. This is O(1) per chunk after the first comparison.
-                _cumulative: bool | None = None
                 # Literal <think>…</think> tags some models emit inline (DeepSeek/
                 # Qwen/llama.cpp). State is preserved across chunks because the tag
                 # may span multiple streamed deltas.
@@ -1495,23 +1631,16 @@ async def _run_mode_turn(
                 # answer text (below) and as a safety net at stream end.
                 async for chunk in bound.astream(msgs):
                     _astream_count_local += 1
-                    if ai is None:
-                        ai = chunk
-                    else:
-                        if _cumulative is None:
-                            cur = ai.content if isinstance(ai.content, str) else ""
-                            nxt = chunk.content if isinstance(chunk.content, str) else ""
-                            _cumulative = bool(cur) and nxt.startswith(cur)
-                        ai = chunk if _cumulative else ai + chunk
-                    # Skip raw chain-of-thought: the backend only emits a
-                    # lightweight "thinking" toggle (see above), never the
-                    # reasoning text itself. Some gateways surface thinking in
-                    # content/reasoning_content, so drop it here to avoid
-                    # leaking it into the visible message. The OpenAI-compatible
-                    # ChatOpenAI subclass (see llm.py) already normalizes
-                    # delta.reasoning -> reasoning_content, so _thinking_from_chunk
-                    # catches it; plain string content that is actually thinking
-                    # (reasoning_content nulled out) is caught by the same helper.
+                    # LangChain accumulates streamed deltas via AIMessageChunk.__add__
+                    # (the standard, documented mechanism). We rely on it rather than
+                    # hand-rolling delta/cumulative detection, which was fragile.
+                    ai = chunk if ai is None else ai + chunk
+                    # Drop raw chain-of-thought. The backend only emits a
+                    # lightweight "thinking" toggle, never the reasoning text.
+                    # _thinking_from_chunk catches reasoning surfaced in a
+                    # dedicated field (reasoning_content / thinking part /
+                    # additional_kwargs) — the OpenAI-compatible subclass in
+                    # llm.py normalizes delta.reasoning into that field.
                     if _model_reasoning and _thinking_from_chunk(chunk):
                         _saw_real_reasoning = True
                         if not _thinking_active:
@@ -1520,31 +1649,22 @@ async def _run_mode_turn(
                         continue
                     content = chunk.content
                     if isinstance(content, str) and content:
-                        # Strip literal <think>…</think> reasoning blocks that
-                        # some models emit inline (DeepSeek/Qwen/llama.cpp).
+                        # Some gateways emit CoT as a literal <think>…</think>
+                        # block inside content (LangChain does NOT normalize this
+                        # for arbitrary OpenAI-compatible servers), so strip it.
                         content, _in_think, _think_buf = _strip_think_tags(
                             content, _in_think, _think_buf
                         )
                         if not content:
                             continue
-                        # The first text token means reasoning has finished, so
-                        # close the thinking window immediately (don't keep the
-                        # ring lit through the whole text generation phase).
+                        # First answer token closes the thinking window.
                         if _thinking_active:
                             _thinking_active = False
                             queue.put_nowait({"kind": "thinking", "active": False})
-                        # Some gateways (opencode) null reasoning_content and
-                        # stream the chain-of-thought as plain string content
-                        # before the real answer. When reasoning is enabled and
-                        # we never saw genuine reasoning in a dedicated field,
-                        # treat that pre-answer content as thinking so it never
-                        # leaks into the visible message. We keep dropping content
-                        # until we actually SEE real reasoning (or the stream ends
-                        # with no reasoning at all — handled below). Using a single
-                        # boolean flip here would only drop the first chunk and let
-                        # the rest of the CoT leak through.
-                        if _model_reasoning and not _saw_real_reasoning:
-                            continue
+                        # Scan for a degenerate text loop (the model repeating
+                        # itself with no tool call). The tool-call guard below
+                        # only watches signatures, so this catches the no-tool
+                        # case; we abort mid-stream instead of dumping it all.
                         _reply_buf += content
                         _chunk_idx += 1
                         if _chunk_idx % _repeat_check_every == 0 and _is_repeating(_reply_buf):
@@ -1558,6 +1678,12 @@ async def _run_mode_turn(
                                 }
                             )
                             break
+                        # Gateways that null reasoning_content and stream CoT as
+                        # plain content before the real answer: while reasoning is
+                        # enabled and we haven't seen a genuine reasoning field,
+                        # treat this pre-answer content as thinking and drop it.
+                        if _model_reasoning and not _saw_real_reasoning:
+                            continue
                         queue.put_nowait({"kind": "text", "content": content})
                     elif isinstance(content, list):
                         for part in content:
@@ -1579,12 +1705,30 @@ async def _run_mode_turn(
                 # user never gets an empty reply.
                 if _model_reasoning and not _saw_real_reasoning:
                     dropped = ai.content if isinstance(ai.content, str) else ""
+                    if dropped and _is_repeating(dropped):
+                        queue.put_nowait(
+                            {
+                                "kind": "warn",
+                                "content": (
+                                    "The model entered a text repetition loop; "
+                                    "showing partial output."
+                                ),
+                            }
+                        )
+                        # Truncate to the non-repeating prefix so the user never
+                        # sees the full 80x loop dumped at stream end.
+                        _unit = min(200, len(dropped) // 3)
+                        while _unit >= 20 and _is_repeating(dropped[: _unit * 3]):
+                            _unit = max(20, _unit // 2)
+                        dropped = dropped[: _unit * 3] + " … [repetition loop truncated]"
                     if dropped:
                         queue.put_nowait({"kind": "text", "content": dropped})
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
-                usage_ev = _usage_event_from_ai(ai, model_id)
+                usage_ev = _usage_event_from_ai(
+                    ai, model_id, prompt_tokens=_estimate_prompt_tokens(messages)
+                )
                 if usage_ev:
                     queue.put_nowait(usage_ev)
             except Exception as exc:  # surfaced to the retry wrapper

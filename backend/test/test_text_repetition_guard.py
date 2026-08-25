@@ -64,3 +64,19 @@ def test_strip_think_thinking_variant():
     out, in_think, buf = _strip_think_tags(text, False, "")
     assert out == "x  y"
     assert "hidden" in buf
+
+
+def test_repeating_dropped_reasoning_content_truncated():
+    # Mirror the stream-end re-emit path for reasoning models that sent no
+    # dedicated reasoning field: the dropped pre-answer content (which is
+    # actually the answer) must be truncated, not dumped whole.
+    dropped = "Let me check that. " * 80
+    assert _is_repeating(dropped) is True
+    # Replicate the truncation logic from graph.py stream-end handler.
+    _unit = min(200, len(dropped) // 3)
+    while _unit >= 20 and _is_repeating(dropped[: _unit * 3]):
+        _unit = max(20, _unit // 2)
+    truncated = dropped[: _unit * 3] + " … [repetition loop truncated]"
+    assert len(truncated) < len(dropped)
+    assert _is_repeating(truncated) is False
+    assert truncated.endswith("… [repetition loop truncated]")

@@ -15,6 +15,9 @@
   --danger: #f38ba8;
   --success: #a6e3a1;
   --link: #89b4fa;
+  /* Freshly-processed (non-cached) tokens, shown next to the cached (⚡)
+     badge in the Model usage panel -- Catppuccin Mocha peach. */
+  --fresh: #fab387;
   /* Tool-call category colors are derived from the theme accent via
      --tool-color overrides on each card class: single = full accent,
      group = muted mix, explore = dimmer mix. No fixed per-category vars. */

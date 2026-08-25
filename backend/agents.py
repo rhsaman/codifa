@@ -2954,6 +2954,44 @@ def _redact_app_errors(text: str) -> str:
     return "\n".join(out)
 
 
+_PRUNE_PROTECT_TOKENS = 40_000
+_PRUNE_MIN_TOKENS = 20_000
+_PRUNE_PROTECTED_TOOLS = frozenset({"skill"})
+
+
+def _prune_history(history: list[dict], enabled: bool = True) -> list[dict]:
+    """Drop old, large tool outputs so a long transcript sheds context before the
+    heavier summarization pass (mirrors opencode's prune: only tool outputs from
+    turns older than the final two are cleared, and protected tools never are).
+
+    Runs in place on ``history`` and returns it. Nothing is touched when pruning is
+    disabled, the transcript has fewer than two user turns, or the old tool output
+    is below ``_PRUNE_PROTECT_TOKENS``.
+    """
+    if not enabled:
+        return history
+    user_idx = [i for i, m in enumerate(history) if m.get("role") == "user"]
+    if len(user_idx) < 2:
+        return history
+    # Tool outputs inside the final two user turns stay (recent context).
+    protected_start = user_idx[-2]
+    candidates = [
+        i
+        for i, m in enumerate(history)
+        if m.get("role") == "tool"
+        and i < protected_start
+        and m.get("tool") not in _PRUNE_PROTECTED_TOOLS
+    ]
+    old_tokens = sum(
+        _estimate_tokens(str(m.get("content", ""))) for m in (history[i] for i in candidates)
+    )
+    if old_tokens < _PRUNE_PROTECT_TOKENS:
+        return history
+    for i in candidates:
+        history[i] = {**history[i], "content": "[Old tool result content cleared]", "compacted": True}
+    return history
+
+
 async def _compact_history(
     model: Any,
     history: list[dict],

@@ -762,7 +762,55 @@ async def _auto_compact_subagent(
     return True
 
 
-def usage_event(metadata: Any, model: str = "", sub: bool = False) -> dict | None:
+def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
+    """Extract cache read/write token counts from ANY provider's usage metadata.
+
+    Kept local to avoid a cross-import with graph.py. Handles Anthropic
+    (cache_read_input_tokens / cache_read, additive with input_tokens), OpenAI /
+    Google (cached_tokens, a subset of input_tokens), and OpenAI raw
+    (prompt_tokens_details.cached_tokens). Returns (cache_read, cache_write, additive)
+    where ``additive`` means the cache is reported separately and must be summed in.
+    """
+    details = um.get("input_token_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    prompt_details = um.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    anthropic_read = (
+        details.get("cache_read_input_tokens")
+        or um.get("cache_read_input_tokens")
+        or 0
+    )
+    anthropic_write = (
+        details.get("cache_creation_input_tokens")
+        or um.get("cache_creation_input_tokens")
+        or 0
+    )
+    openai_read = (
+        details.get("cached_tokens")
+        or details.get("cache_read")
+        or details.get("cache_read_tokens")
+        or prompt_details.get("cached_tokens")
+        or um.get("cache_read_tokens")
+        or 0
+    )
+    openai_write = (
+        details.get("cache_creation")
+        or details.get("cache_creation_tokens")
+        or details.get("cache_write_tokens")
+        or um.get("cache_write_tokens")
+        or 0
+    )
+    cache_read = int(anthropic_read or openai_read or 0)
+    cache_write = int(anthropic_write or openai_write or 0)
+    key_additive = bool(anthropic_read or anthropic_write)
+    return cache_read, cache_write, key_additive
+
+
+def usage_event(
+    metadata: Any, model: str = "", sub: bool = False, prompt_tokens: int | None = None
+) -> dict | None:
     """Build a SSE ``usage`` event from a LangChain ``usage_metadata`` mapping.
 
     Mirrors ``agents._usage_event``'s output shape so the frontend context meter
@@ -774,25 +822,38 @@ def usage_event(metadata: Any, model: str = "", sub: bool = False) -> dict | Non
         if isinstance(metadata, dict):
             input_tokens = int(metadata.get("input_tokens", 0) or 0)
             output_tokens = int(metadata.get("output_tokens", 0) or 0)
-            details = metadata.get("input_token_details") or {}
-            cache_read = int(
-                metadata.get("cache_read_input_tokens")
-                or (details.get("cached_tokens") if isinstance(details, dict) else 0)
-                or (details.get("cache_read_tokens") if isinstance(details, dict) else 0)
-                or 0
-            )
-            cache_write = int(
-                metadata.get("cache_creation_input_tokens")
-                or (details.get("cache_creation_tokens") if isinstance(details, dict) else 0)
-                or (details.get("cache_write_tokens") if isinstance(details, dict) else 0)
-                or 0
-            )
+            cache_read, cache_write, key_additive = _extract_cache_tokens(metadata)
         else:
             input_tokens = int(getattr(metadata, "input_tokens", 0) or 0)
             output_tokens = int(getattr(metadata, "output_tokens", 0) or 0)
             cache_read = int(getattr(metadata, "cache_read_input_tokens", 0) or 0)
             cache_write = int(getattr(metadata, "cache_creation_input_tokens", 0) or 0)
-        total = input_tokens + output_tokens
+            key_additive = bool(cache_read or cache_write)
+        # Additive when Anthropic-native key, or when cached portion exceeds
+        # input_tokens (input excludes the cache). Otherwise cache is a subset of
+        # input_tokens and the provider total already counts it.
+        additive = (
+            key_additive
+            or (cache_read > 0 and input_tokens < cache_read)
+            or (cache_write > 0 and input_tokens < cache_write)
+        )
+        import json as _json
+
+        try:
+            _md_dump = _json.dumps(metadata, default=str)
+        except Exception:
+            _md_dump = repr(metadata)
+        print(
+            f"[USAGE_DEBUG] llm model={model!r} in={input_tokens} out={output_tokens} "
+            f"cache_read={cache_read} cache_write={cache_write} additive={additive} "
+            f"metadata={_md_dump[:3000]}",
+            flush=True,
+        )
+        if additive:
+            total = input_tokens + output_tokens + cache_read + cache_write
+        else:
+            provided_total = metadata.get("total_tokens") if isinstance(metadata, dict) else getattr(metadata, "total_tokens", 0)
+            total = (provided_total or 0) if (provided_total or 0) else input_tokens + output_tokens
         if total <= 0:
             return None
         return {
@@ -802,6 +863,7 @@ def usage_event(metadata: Any, model: str = "", sub: bool = False) -> dict | Non
             "total_tokens": total,
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
+            "context_tokens": prompt_tokens,
             "model": model or "",
             "sub": sub,
         }

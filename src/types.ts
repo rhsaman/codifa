@@ -231,6 +231,7 @@ export interface TokenUsage {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  contextTokens?: number
   reasoningTokens?: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
@@ -449,6 +450,7 @@ export interface SidecarEvent {
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number
+  context_tokens?: number
   cache_read_tokens?: number
   cache_write_tokens?: number
   /** Overflow events are REJECTED (unbilled) requests — never counted in billed totals. */

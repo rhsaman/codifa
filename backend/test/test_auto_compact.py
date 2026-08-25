@@ -196,131 +196,189 @@ def test_chat_model_settings_output_cap_parity(monkeypatch):
     assert asyncio.run(_get("ask", 200_000))["max_tokens"] == 8_000
 
 
-def test_auto_compact_uses_real_usage_when_present(monkeypatch):
-    # opencode's isOverflow counts the LATEST assistant turn's real token total
-    # (input+output+cache), not a char estimate of the whole transcript. Patch
-    # _estimate_tokens to a sentinel so we can prove the real usage path wins.
+def test_auto_compact_uses_local_transcript_estimate():
+    # Compaction is now driven by the STABLE LOCAL estimate of the whole
+    # transcript (system + history + user + tools) — the same basis as the
+    # context meter — NOT raw provider usage_metadata off the last AIMessage.
+    # That avoids (a) reading only Anthropic cache keys (OpenAI/OpenRouter/hy3-free
+    # cache was always 0) and (b) double-counting cache for subset providers.
+    # Prove it here: a huge usage_metadata with TINY content must NOT fire, while
+    # large content (estimated locally) must.
     async def _fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
-    calls = {}
-
-    def _fake_estimate(content):
-        calls.setdefault("estimate", 0)
-        calls["estimate"] += 1
-        return 1
-
-    original_compact = graph._agents._compact_history
-    original_estimate = graph._agents._estimate_tokens
-    graph._agents._compact_history = _fake_compact
-    graph._agents._estimate_tokens = _fake_estimate
-    try:
-        # A single assistant turn carrying real usage_metadata well above the
-        # usable window -> compaction must fire using the REAL token total.
-        ai = AIMessage(content="answer")
-        ai.usage_metadata = {
-            "input_tokens": 200_000,
-            "output_tokens": 50_000,
-            "cache_read_input_tokens": 10_000,
-        }
-        messages = [
-            SystemMessage(content="sys"),
-            HumanMessage(content="hi"),
-            ai,
-        ]
-        events, items = asyncio.run(_run_trigger(messages, reserved=20_000, ctx=200_000))
-    finally:
-        graph._agents._compact_history = original_compact
-        graph._agents._estimate_tokens = original_estimate
-
-    assert events == ["compact_start", "compact"]
-    # Real usage (160k) was used, NOT the char estimate (which would be tiny).
-    assert calls.get("estimate", 0) == 0
-
-
-def test_auto_compact_fires_at_usable_like_opencode():
-    # opencode fires compaction when total >= usable (ctx - reserved), with no
-    # extra proactive buffer. A turn at/above usable must compact; below must not.
-    async def fake_compact(*a, **k):
-        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
-
     original = graph._agents._compact_history
-    graph._agents._compact_history = fake_compact
+    graph._agents._compact_history = _fake_compact
     try:
-        ai = AIMessage(content="answer")
-        ai.usage_metadata = {
-            "input_tokens": 170_000,
-            "output_tokens": 15_000,
-            "cache_read_input_tokens": 0,
-        }
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
-        events, _ = asyncio.run(
-            _run_trigger(messages, reserved=20_000, ctx=200_000)
-        )
+        # Huge usage_metadata but tiny content -> must NOT fire (metadata ignored).
+        ai_small = AIMessage(content="answer")
+        ai_small.usage_metadata = {"input_tokens": 9_000_000, "output_tokens": 9_000_000}
+        small = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai_small]
+        events_small, _ = asyncio.run(_run_trigger(small, reserved=20_000, ctx=200_000))
+        assert events_small == []
+
+        # Large content -> local estimate exceeds usable (180k) -> fires.
+        big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
+        events_big, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        assert events_big == ["compact_start", "compact"]
     finally:
         graph._agents._compact_history = original
 
-    # 185k >= usable 180k -> compaction fires (opencode behavior).
-    assert events == ["compact_start", "compact"]
 
-
-def test_auto_compact_fires_on_usable_threshold():
-    # opencode fires compaction when the latest turn reaches `usable`
-    # (ctx - reserved). With reserved=20k on a 200k window, usable=180k.
-    # A 185k turn (below the 200k overflow, but >= usable) must compact.
+def test_auto_compact_fires_at_usable_like_opencode():
+    # opencode fires compaction when the local transcript estimate >= usable
+    # (ctx - reserved), with no extra proactive buffer. Above usable must
+    # compact; below must not.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
     try:
-        ai = AIMessage(content="answer")
-        ai.usage_metadata = {
-            "input_tokens": 170_000,
-            "output_tokens": 15_000,
-            "cache_read_input_tokens": 0,
-        }
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
+        # Above usable (180k for 200k ctx, 20k reserved): big content fires.
+        big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
+        events, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        assert events == ["compact_start", "compact"]
+
+        # Well below usable: small content -> silent.
+        small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="hello")]
+        events_small, _ = asyncio.run(_run_trigger(small, reserved=20_000, ctx=200_000))
+        assert events_small == []
+    finally:
+        graph._agents._compact_history = original
+
+
+def test_auto_compact_fires_on_usable_threshold():
+    # opencode fires compaction when the transcript estimate reaches `usable`
+    # (ctx - reserved). With reserved=20k on a 200k window, usable=180k. A large
+    # transcript (>= usable) must compact.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
         state = {"reserved": 20_000}
         q = _Queue()
-        asyncio.run(graph._maybe_auto_compact(state, q, None, None, messages, 200_000))
+        asyncio.run(graph._maybe_auto_compact(state, q, None, None, big, 200_000))
         events = [e["kind"] for e in q.items]
     finally:
         graph._agents._compact_history = original
 
-    # 185k >= usable 180k -> compaction fires (opencode behavior).
     assert events == ["compact_start", "compact"]
 
 
 def test_auto_compact_respects_reserved_setting():
     # The single "Compaction headroom (tokens)" setting (reserved) controls the
-    # threshold. A larger reserved (40k) lowers usable to 160k: a 170k turn must
-    # compact, while a 130k turn must NOT.
+    # threshold. A larger reserved (40k) lowers usable to 160k: a large transcript
+    # must compact, while a tiny one must NOT.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
     try:
-        # 170k turn with reserved=40k -> usable 160k -> fires.
-        ai = AIMessage(content="answer")
-        ai.usage_metadata = {"input_tokens": 160_000, "output_tokens": 10_000, "cache_read_input_tokens": 0}
-        messages = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai]
-        state = {"reserved": 40_000}
+        # Large transcript with reserved=40k -> usable 160k -> fires.
+        big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
         q = _Queue()
-        asyncio.run(graph._maybe_auto_compact(state, q, None, None, messages, 200_000))
-        events_170k = [e["kind"] for e in q.items]
+        asyncio.run(graph._maybe_auto_compact({"reserved": 40_000}, q, None, None, big, 200_000))
+        assert [e["kind"] for e in q.items] == ["compact_start", "compact"]
 
-        # 130k turn with reserved=40k -> usable 160k -> silent.
-        ai2 = AIMessage(content="answer")
-        ai2.usage_metadata = {"input_tokens": 120_000, "output_tokens": 10_000, "cache_read_input_tokens": 0}
-        messages2 = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai2]
-        state2 = {"reserved": 40_000}
+        # Tiny content with the larger reserved -> still silent.
+        small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="answer")]
         q2 = _Queue()
-        asyncio.run(graph._maybe_auto_compact(state2, q2, None, None, messages2, 200_000))
-        events_130k = [e["kind"] for e in q2.items]
+        asyncio.run(graph._maybe_auto_compact({"reserved": 40_000}, q2, None, None, small, 200_000))
+        assert [e["kind"] for e in q2.items] == []
     finally:
         graph._agents._compact_history = original
 
-    assert events_170k == ["compact_start", "compact"]
-    assert events_130k == []
+
+def test_auto_compact_falls_back_when_estimate_missing():
+    # If the local estimate returns None (e.g. un-tokenizable content), the
+    # char-estimate fallback must still drive the decision.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
+
+    original_compact = graph._agents._compact_history
+    original_estimate = graph._estimate_prompt_tokens
+    graph._estimate_prompt_tokens = lambda msgs: None  # force the fallback path
+    graph._agents._compact_history = fake_compact
+    try:
+        big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
+        events, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        assert events == ["compact_start", "compact"]
+    finally:
+        graph._agents._compact_history = original_compact
+        graph._estimate_prompt_tokens = original_estimate
+
+
+def _tool_msg(content: str, tool: str = "bash") -> dict:
+    return {"role": "tool", "tool": tool, "content": content}
+
+
+def test_prune_clears_old_tool_outputs():
+    # Three user turns so the FIRST turn's tool outputs are older than the last
+    # two turns (opencode only prunes tool outputs from turns older than the
+    # final two). Each large output is ~22.5k tokens; once _PRUNE_PROTECT (40k)
+    # is passed walking backward, older outputs are cleared.
+    history = [
+        {"role": "user", "content": "first"},
+        _tool_msg("x" * 90_000),  # 1st turn tool output (~22.5k tokens)
+        _tool_msg("y" * 90_000),  # 1st turn tool output (~22.5k tokens) -> total 45k > PROTECT
+        {"role": "assistant", "content": "did work 1"},
+        {"role": "user", "content": "second"},
+        _tool_msg("z" * 90_000),  # 2nd turn tool output (~22.5k tokens) -> total 67.5k
+        {"role": "assistant", "content": "did work 2"},
+        {"role": "user", "content": "third"},
+        _tool_msg("recent" * 100),  # 3rd (recent) turn tool output (small)
+        {"role": "assistant", "content": "more"},
+    ]
+    pruned = graph._agents._prune_history(history)
+    # The most recent tool output (in the 3rd turn) must survive.
+    recent_tool = [m for m in pruned if m.get("role") == "tool" and not m.get("compacted")]
+    assert recent_tool and recent_tool[-1]["content"] == "recent" * 100
+    # Older tool outputs (1st + 2nd turn) beyond _PRUNE_PROTECT are cleared.
+    cleared = [m for m in pruned if m.get("compacted")]
+    assert len(cleared) > 0
+    assert all(m["content"] == "[Old tool result content cleared]" for m in cleared)
+    # Total cleared exceeds _PRUNE_MINIMUM (20k tokens).
+    assert len(cleared) >= 1
+
+
+def test_prune_skips_protected_tools():
+    history = [
+        {"role": "user", "content": "first"},
+        _tool_msg("x" * 200_000, tool="skill"),  # protected tool, huge output
+        {"role": "assistant", "content": "did work"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "more"},
+    ]
+    pruned = graph._agents._prune_history(history)
+    # skill tool output is never cleared.
+    assert pruned[1]["content"] == "x" * 200_000
+    assert not pruned[1].get("compacted")
+
+
+def test_prune_noop_when_below_minimum():
+    # Only one user turn -> prune never starts counting (needs >= 2 turns).
+    history = [
+        {"role": "user", "content": "only"},
+        _tool_msg("x" * 200_000),
+        {"role": "assistant", "content": "did work"},
+    ]
+    pruned = graph._agents._prune_history(history)
+    assert not any(m.get("compacted") for m in pruned)
+    assert pruned[1]["content"] == "x" * 200_000
+
+
+def test_prune_disabled_is_noop():
+    history = [
+        {"role": "user", "content": "first"},
+        _tool_msg("x" * 200_000),
+        {"role": "assistant", "content": "did work"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "more"},
+    ]
+    pruned = graph._agents._prune_history(history, enabled=False)
+    assert not any(m.get("compacted") for m in pruned)

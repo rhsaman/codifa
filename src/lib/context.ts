@@ -94,6 +94,18 @@ export function estimateContextChars(
   return chars
 }
 
+/** Token-estimate variant of {@link estimateContextChars}: divides the weighted
+ *  character count by the Latin chars-per-token ratio so callers can compare
+ *  against provider token budgets. Used by the context-meter tests and as the
+ *  source for {@link computeContextUsed}'s post-compact / fresh-chat fallback. */
+export function estimateContextTokens(
+  chat: Chat | null,
+  systemPrompt: string,
+  contextWindow?: number,
+): number {
+  return Math.round(estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN)
+}
+
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
@@ -134,22 +146,26 @@ export function contextPercent(
 /**
  * Resolve the context-meter token count shown in the sidebar.
  *
- * Mirrors opencode's context meter: the meter is CUMULATIVE across the whole
- * (non-compacted) conversation — it sums every assistant turn's token total,
- * so it only ever grows and never drops between turns (exactly what the
- * opencode TUI shows). Each new model call re-sends the entire history, so the
- * running sum reflects the total context that has been sent across the
- * session.
+ * The meter must show the TRUE context sent to the model this turn — the full
+ * non-compacted history (system prompt + every user/assistant exchange) — NOT
+ * just the last message's provider-reported `usage`.
  *
- * We sum the `usage` of every non-compacted assistant message. `chat.usage` is
- * a per-model SESSION total that only ever grows and is NOT reset by a compact,
- * so it must NOT be used here — summing the per-turn `usage` fields naturally
- * resets when `compacted` messages are filtered out.
+ * Some providers are stateful or only surface billable (non-cached) tokens, so
+ * their per-turn `usage` can be far smaller than the real context (the meter
+ * would then "only show the latest message" and keep shrinking). We therefore
+ * estimate the real context directly from the history we actually send
+ * (`estimateContextChars`) — provider-independent and always correct — and use
+ * that as the baseline. When the provider reports a usage for the latest
+ * assistant turn that is at least as large as our estimate (i.e. it reports the
+ * full context, cache included), we trust it for precision; otherwise the
+ * estimate wins. This is the opencode-faithful behaviour: opencode's TUI shows
+ * the last message's `tokens.total`, which already equals the whole context
+ * because the full history is re-sent every turn — and when a provider
+ * under-reports, our estimate restores that true context instead of collapsing
+ * to a single message.
  *
- * Before the first real usage event arrives (brand-new chat / right after a
- * compact) there is no turn total, so we fall back to the full-conversation
- * `estimate`. opencode has no estimate, but the sidebar meter still needs a
- * value in that window.
+ * `chat.usage` (per-model SESSION total, only-ever-growing) is intentionally
+ * NOT used here — it is a lifetime counter, not the current context window.
  */
 export function computeContextUsed(
   chat: Chat | null,
@@ -159,34 +175,48 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // Cumulative session token total — mirrors opencode's meter, which sums the
-  // whole (non-compacted) conversation rather than just the latest turn. Each
-  // assistant message carries its own turn's usage; summing them gives the
-  // total context sent across the session, so the meter only ever grows (until
-  // a compact resets it by dropping the compacted messages).
-  let total = 0
+  // The meter must show the TRUE context we actually send to the model this
+  // turn — the full non-compacted history (system prompt + every user/assistant
+  // exchange) — not just the last message's provider-reported usage.
+  //
+  // Some providers are stateful or only surface billable (non-cached) tokens, so
+  // their per-turn `usage` can be far smaller than the real context (the meter
+  // would then "only show the latest message" and keep shrinking). Estimate the
+  // real context directly from the history we send; this is provider-independent
+  // and always correct. Compute it up front so it also serves as the stable
+  // fallback when no usage has arrived yet.
+  const estimated = Math.round(
+    estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN,
+  )
+
+  // The meter must be MONOTONIC: it reflects the peak context consumed in the
+  // chat so far, never dropping as the conversation grows. Provider
+  // `input_tokens` can momentarily dip (cache hits report a smaller total than
+  // a cache-miss resend, and some gateways under-report on cache hits), so we
+  // take the running MAX of `contextTokens` (the backend's accurate per-request
+  // total) across every non-compacted assistant turn. Until a compact clears
+  // the history, the max can only stay flat or rise — exactly the opencode
+  // behaviour the user expects.
+  let best = estimated
   for (const m of active) {
-    if (m.role !== 'assistant') continue
     const u = m.usage
-    if (!u) continue
-    // opencode's `isOverflow` uses `tokens.total || input + output + cache.read
-    // + cache.write` — i.e. `total` OR the sum of parts, never both added
-    // together. When the provider reports `totalTokens` it already includes
-    // output + cache, so summing everything double-counts. Prefer `totalTokens`
-    // when present, otherwise sum the parts (output + cache included).
-    const turn =
-      u.totalTokens ??
+    if (!u || m.role !== 'assistant') continue
+    const parts =
       (u.inputTokens || 0) +
-        (u.outputTokens || 0) +
-        (u.reasoningTokens ?? 0) +
-        (u.cacheReadTokens ?? 0) +
-        (u.cacheWriteTokens ?? 0)
-    if (turn > 0) total += turn
+      (u.outputTokens || 0) +
+      (u.reasoningTokens ?? 0) +
+      (u.cacheReadTokens ?? 0) +
+      (u.cacheWriteTokens ?? 0)
+    const reported =
+      u.contextTokens != null
+        ? u.contextTokens
+        : u.totalTokens != null
+          ? u.totalTokens
+          : parts
+    if (reported > best) best = reported
   }
 
-  // opencode shows 0% until the first real usage event arrives — no estimate
-  // fallback. If there is no assistant turn with usage yet, the meter is empty.
-  return total
+  return best
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying
@@ -235,6 +265,89 @@ export function formatCost(usd: number): string {
   if (usd <= 0) return '$0'
   if (usd < 0.01) return `$${usd.toFixed(4)}`
   return `$${usd.toFixed(2)}`
+}
+
+export type ModelPricing = {
+  input: number
+  output: number
+  cacheRead?: number
+  cacheWrite?: number
+}
+
+/**
+ * Look up a model's pricing from a provider `pricingMap`, tolerating the small
+ * id mismatches that occur between the id the backend records usage under and
+ * the id a provider's `/models` endpoint advertises pricing under
+ * (`models/` prefix, provider prefix, bare last path segment, etc.).
+ *
+ * Returns `null` when no price is known — callers should render "—" rather than
+ * guess, so a missing live price is visible instead of silently mispriced.
+ */
+export function priceForModel(
+  pricingMap: Record<string, ModelPricing> | undefined,
+  model: string,
+): ModelPricing | null {
+  if (!pricingMap || !model) return null
+  const norm = (m: string) => (m || '').replace(/^models\//, '')
+  const bare = (m: string) => norm(m).split('/').pop() || m
+  const candidates = [model, norm(model), bare(model)]
+  for (const c of candidates) {
+    const hit = pricingMap[c]
+    if (hit) return hit
+  }
+  const targetBare = bare(model)
+  for (const [k, v] of Object.entries(pricingMap)) {
+    if (norm(k) === norm(model) || bare(k) === targetBare) return v
+  }
+  return null
+}
+
+/**
+ * Billed cost (USD) for one model's accumulated usage.
+ *
+ * `input` already INCLUDES the cached portion for subset-convention providers
+ * (OpenAI / OpenRouter / Google: `cache_read` is a subset of `input_tokens`),
+ * so the cached tokens are split out and billed at their own (usually cheaper)
+ * rate. The provider never reports a usage event with an `additive` cache flag
+ * to the frontend, and every provider the app talks to uses the subset
+ * convention, so this is the only correct formula here.
+ */
+export function computeUsageCost(
+  price: ModelPricing | null,
+  u: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+): number | null {
+  if (!price) return null
+  const cacheRead = u.cacheRead ?? 0
+  const cacheWrite = u.cacheWrite ?? 0
+  return (
+    ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
+    (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+    (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
+    (u.output / 1_000_000) * price.output
+  )
+}
+
+/**
+ * Same billed total as `computeUsageCost`, but split into the "fresh" portion
+ * (non-cached input + all output, billed at the full input/output rate) and
+ * the "cached" portion (cache-read/cache-write, billed at the provider's
+ * cheaper cache rate when advertised). Lets the UI show WHY the total is what
+ * it is, instead of just the combined number.
+ */
+export function computeUsageCostBreakdown(
+  price: ModelPricing | null,
+  u: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+): { total: number; fresh: number; cached: number } | null {
+  if (!price) return null
+  const cacheRead = u.cacheRead ?? 0
+  const cacheWrite = u.cacheWrite ?? 0
+  const fresh =
+    (Math.max(0, u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
+    (u.output / 1_000_000) * price.output
+  const cached =
+    (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
+    (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input)
+  return { total: fresh + cached, fresh, cached }
 }
 
 /**

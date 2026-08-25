@@ -90,6 +90,76 @@ def test_usage_event_surfaces_anthropic_cache_write():
     assert ev["cache_write_tokens"] == 150
 
 
+def test_usage_event_surfaces_anthropic_nested_cache():
+    # LangChain's Anthropic integration nests cache counts under
+    # input_token_details (cache_read_input_tokens / cache_creation_input_tokens),
+    # not the OpenAI-style cached_tokens nor a top-level key. The frontend context
+    # meter depends on this being surfaced as cache_read/cache_write, otherwise it
+    # collapses to the non-cached input_tokens and under-reports the true context.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 350,
+            "output_tokens": 40,
+            "total_tokens": 5400,
+            "input_token_details": {
+                "cache_read_input_tokens": 5000,
+                "cache_creation_input_tokens": 10,
+            },
+        },
+    )
+    ev = _usage_event_from_ai(ai, "anthropic/claude")
+    assert ev["input_tokens"] == 350
+    assert ev["output_tokens"] == 40
+    assert ev["cache_read_tokens"] == 5000
+    assert ev["cache_write_tokens"] == 10
+    assert ev["total_tokens"] == 350 + 40 + 5000 + 10
+
+
+def test_usage_event_cache_read_is_subset_of_input():
+    # OpenRouter / OpenAI-style providers nest the cached history under
+    # input_token_details.cache_read, but input_tokens ALREADY includes it
+    # (total = input + output already counts the cache). So the cache is a SUBSET:
+    # surface it for cost math, but do NOT add it back to the total (that would
+    # double-count). The true context is the provider's total_tokens (5847).
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 5776,
+            "output_tokens": 71,
+            "total_tokens": 5847,
+            "input_token_details": {"cache_read": 5568},
+            "output_token_details": {"reasoning": 32},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "openrouter/anthropic")
+    assert ev["input_tokens"] == 5776
+    assert ev["output_tokens"] == 71
+    assert ev["cache_read_tokens"] == 5568
+    assert ev["cache_write_tokens"] == 0
+    # cache_read is a subset of input_tokens -> total stays the provider total.
+    assert ev["total_tokens"] == 5847
+
+
+def test_usage_event_promotes_to_additive_when_cache_exceeds_input():
+    # A provider that reports cache under the literal `cache_read` key but where
+    # the cached portion is LARGER than input_tokens proves input excludes the
+    # cache -> promote to additive so the true context is reconstructed.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 208,
+            "output_tokens": 40,
+            "total_tokens": 248,
+            "input_token_details": {"cache_read": 5568},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "anthropic/proxy")
+    assert ev["cache_read_tokens"] == 5568
+    # 208 (new) + 40 (out) + 5568 (cached) = 5816 true context.
+    assert ev["total_tokens"] == 208 + 40 + 5568
+
+
 def test_usage_event_returns_none_when_no_usage():
     ai = AIMessage(content="hi")
     assert _usage_event_from_ai(ai, "m") is None

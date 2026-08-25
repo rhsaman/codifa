@@ -50,6 +50,7 @@ from pydantic import BaseModel, model_validator
 import providers
 from agents import (
     _compact_history,
+    _prune_history,
     _drain_steer,
     _enqueue_steer,
     _is_read_timeout,
@@ -985,10 +986,13 @@ async def chat_compact(req: CompactRequest):
     _log(f"primary built={bool(model)} fallback built={bool(fallback)}; running _compact_history")
     ctx = int(req.context_window or 0)
     last_error: list[str] = []
+    # opencode prune: clear old tool outputs before the summarization pass.
+    history = list(req.history)
+    _prune_history(history)
     try:
         result = await _compact_history(
             model,
-            list(req.history),
+            history,
             ctx=ctx,
             reserved=req.reserved,
             fallback_model=fallback,

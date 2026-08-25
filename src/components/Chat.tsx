@@ -23,6 +23,8 @@ import {
   formatTokensK,
   modelContextWindow,
   modelReasoning,
+  priceForModel,
+  computeUsageCost,
 } from "../lib/context";
 import {
   addMemoryNote,
@@ -1133,17 +1135,12 @@ export function ChatPanel() {
     }> = [];
     for (const [model, u] of Object.entries(usage)) {
       if (u.input + u.output <= 0) continue;
-      const price = provider.pricingMap?.[model] ?? null;
+      const price = priceForModel(provider.pricingMap, model);
       // input_tokens already includes the cache-read/write portion; bill the
       // cache lines at their own cheaper rate when advertised, else full input.
       const cacheRead = u.cacheRead ?? 0;
       const cacheWrite = u.cacheWrite ?? 0;
-      const cost = price
-        ? ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
-        (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
-        (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
-        (u.output / 1_000_000) * price.output
-        : null;
+      const cost = computeUsageCost(price, { input: u.input, output: u.output, cacheRead, cacheWrite });
       out.push({
         model,
         input: u.input,
@@ -1882,6 +1879,7 @@ export function ChatPanel() {
               inputTokens,
               outputTokens,
               totalTokens: total,
+              contextTokens: event.context_tokens ?? undefined,
               cacheReadTokens: event.cache_read_tokens ?? 0,
               cacheWriteTokens: event.cache_write_tokens ?? 0,
             },

@@ -1142,7 +1142,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
             </>
           )}
-          {message.streaming && <ThinkingIndicator />}
+          {message.streaming && message.thinkingActive && <ThinkingIndicator />}
         </div>
       )}
 

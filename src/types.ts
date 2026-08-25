@@ -288,6 +288,10 @@ export interface ChatMessage {
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
+  /** True only while the backend has confirmed the model is actually
+   *  producing reasoning content (driven by the {kind:"thinking",active:true}
+   *  event). Gates the in-message "Thinking" indicator. */
+  thinkingActive?: boolean
   /** True when this message was persisted mid-stream (heartbeat snapshot) and
    *  the app died before the turn completed — shown as "interrupted" after a
    *  crash/power cut instead of looking like a complete reply. Cleared by the

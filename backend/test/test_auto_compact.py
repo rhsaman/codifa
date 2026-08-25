@@ -40,7 +40,7 @@ class _Queue:
 
 
 async def _run_trigger(messages, reserved=20_000, ctx=200_000):
-    state = {"reserved": reserved, "max_history": 10}
+    state = {"reserved": reserved}
     q = _Queue()
     await graph._maybe_auto_compact(state, q, None, None, messages, ctx)
     return [e["kind"] for e in q.items], q.items
@@ -57,7 +57,7 @@ def test_auto_compact_silent_below_usable():
 
 def test_auto_compact_fires_above_usable():
     async def fake_compact(*a, **k):
-        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3)
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
@@ -201,7 +201,7 @@ def test_auto_compact_uses_real_usage_when_present(monkeypatch):
     # (input+output+cache), not a char estimate of the whole transcript. Patch
     # _estimate_tokens to a sentinel so we can prove the real usage path wins.
     async def _fake_compact(*a, **k):
-        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3)
+        return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     calls = {}
 

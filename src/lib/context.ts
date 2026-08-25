@@ -28,51 +28,23 @@ function weightedCharCount(text: string): number {
  * that would become `history` on the NEXT turn, and the currently-streaming
  * message (if any) which is the turn still in flight.
  *
- * This mirrors `sliceToBudget` in Chat.tsx exactly: slice to the last
- * `maxHistory` settled messages, then trim further to the same char budget
- * (contextWindow * 1.5, capped at 60k for ask mode) the frontend actually
- * sends. Without this second trim the estimate silently overshoots whatever
- * the backend will really receive.
+ * opencode sends the FULL history every turn and compacts on overflow — it
+ * never drops messages by count or by a per-mode char budget. We mirror that
+ * exactly: keep every non-streaming message (system summaries already survive
+ * at the head), and let the backend compact on overflow. This fixes two bugs:
+ * switching mode no longer shrinks the context (no MODE_HISTORY_CAPS), and
+ * messages no longer disappear every turn (no maxHistory tail slice).
  */
 function budgetedSettledHistory(
   talk: Chat['messages'],
-  maxHistory: number,
-  contextWindow?: number,
-  mode?: string,
 ): { settled: Chat['messages']; live: Chat['messages'][number] | null } {
   const live =
     talk.length > 0 && talk[talk.length - 1].streaming ? talk[talk.length - 1] : null
   const rest = live ? talk.slice(0, -1) : talk
-
-  const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000
-  const budget = Math.floor(ctx * 1.5)
-  // Absolute per-mode ceilings — mirrors sliceToBudget in Chat.tsx exactly.
-  // ask: mentor guidance needs little scrollback; coder/plan turns carry more
-  // tool-call history that stays relevant, so they get higher (but still
-  // bounded) caps. Keeps runaway history from blowing past the window on very
-  // large-context models before the 80% auto-compact threshold kicks in.
-  const MODE_HISTORY_CAPS: Record<string, number> = {
-    ask: 60000,
-    plan: 120000,
-    coder: 140000,
-  }
-  const capped = Math.min(budget, MODE_HISTORY_CAPS[mode ?? 'ask'] ?? budget)
-  // Compact summaries (system role) must always survive the maxHistory slice —
-  // mirrors sliceToBudget in Chat.tsx, so the estimate matches what is really
-  // sent (the summary stands in for the folded older turns).
-  const systems = rest.filter((m) => m.role === 'system')
-  const recent = [
-    ...systems,
-    ...rest.filter((m) => m.role !== 'system').slice(-maxHistory),
-  ]
-  const kept: Chat['messages'] = []
-  let acc = 0
-  for (const m of [...recent].reverse()) {
-    if (m.role !== 'system' && kept.length > 0 && acc + m.content.length > capped) break
-    kept.push(m)
-    acc += m.content.length
-  }
-  return { settled: kept.reverse(), live }
+  // opencode sends the whole settled history; system summaries (compacted
+  // context) stay at the head so the estimate matches what is really sent.
+  const settled = rest
+  return { settled, live }
 }
 
 /**
@@ -86,9 +58,7 @@ function budgetedSettledHistory(
 export function estimateContextChars(
   chat: Chat | null,
   systemPrompt: string,
-  maxHistory: number,
   contextWindow?: number,
-  mode?: string,
 ): number {
   const msgs = chat?.messages ?? []
   let chars = 0
@@ -104,7 +74,7 @@ export function estimateContextChars(
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
-  const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
+  const { settled, live } = budgetedSettledHistory(talk)
   for (const m of settled) {
     chars += m.content.length
     // Reasoning text is round-tripped to the model as a ThinkingPart on every
@@ -127,9 +97,7 @@ export function estimateContextChars(
 export function estimateContextTokens(
   chat: Chat | null,
   systemPrompt: string,
-  maxHistory: number,
   contextWindow?: number,
-  mode?: string,
 ): number {
   const msgs = chat?.messages ?? []
   let weight = 0
@@ -141,7 +109,7 @@ export function estimateContextTokens(
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
-  const { settled, live } = budgetedSettledHistory(talk, maxHistory, contextWindow, mode)
+  const { settled, live } = budgetedSettledHistory(talk)
   for (const m of settled) {
     weight += weightedCharCount(m.content)
     if (m.thinking) weight += weightedCharCount(m.thinking)
@@ -205,9 +173,7 @@ export function contextPercent(used: number, windowSize: number | null): number 
 export function computeContextUsed(
   chat: Chat | null,
   systemPrompt: string,
-  maxHistory: number,
   contextWindow?: number,
-  mode?: string,
 ): number {
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
@@ -228,7 +194,7 @@ export function computeContextUsed(
 
   // No real usage yet → fall back to the estimate (see note above).
   if (realTotal <= 0) {
-    realTotal = estimateContextTokens(chat, systemPrompt, maxHistory, contextWindow, mode)
+    realTotal = estimateContextTokens(chat, systemPrompt, contextWindow)
   }
   return realTotal
 }

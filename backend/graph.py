@@ -119,7 +119,6 @@ class AgentState(TypedDict, total=False):
     allow_create: bool
     nvim_file: str
     nvim_diagnostics: list
-    max_history: int
     skills: list[str]
     vector_db_path: str
     vector_config: dict
@@ -886,10 +885,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
     # design where nothing is force-read into the prompt before the model runs.
     scouted = ""
-    history = _agents._fit_history(
-        state.get("history") or [],
-        _agents._history_budget(ctx, system_final, "", mode),
-    )
+    # opencode sends the FULL history every turn and compacts on overflow — it
+    # never trims history by a char/token budget before sending (that caused
+    # messages to disappear every turn and mode switches to shrink context).
+    # The backend's auto-compact (_maybe_auto_compact) still fires on real
+    # overflow, so large windows are handled without silently dropping turns.
+    history = state.get("history") or []
     lc_history = history_to_langchain_messages(history)
 
     if mode == "coder":
@@ -1254,7 +1255,6 @@ async def _maybe_auto_compact(
         result = await _agents._compact_history(
             summarizer,
             dicts,
-            max_history=state.get("max_history", 10),
             ctx=ctx,
             max_output=max_output,
             reserved=reserved,
@@ -1265,9 +1265,13 @@ async def _maybe_auto_compact(
     if result is None:
         queue.put_nowait({"kind": "compact_failed"})
         return
-    new_history, keep = result
+    new_history, keep, compact_usage = result
     summary = new_history[0]["content"] if new_history else ""
     queue.put_nowait({"kind": "compact", "content": summary, "keep": int(keep)})
+    # Accrue the tokens the summarizer itself consumed so the session total
+    # (the "Model usage" sidebar) is complete.
+    if compact_usage:
+        queue.put_nowait(compact_usage)
 
 
 async def _run_mode_turn(
@@ -1378,17 +1382,14 @@ async def _run_mode_turn(
                 _thinking_active = False
                 _answer_started = False
                 _saw_real_reasoning = False
-                # The model is reasoning-capable (flag from the /models payload /
-                # models.dev catalog, forwarded by the frontend). We emit a single
-                # lightweight "active" toggle at the START of the stream so the
-                # composer shows a glow for the whole reasoning window — without
-                # streaming the raw chain-of-thought text (which caused heavy
-                # re-renders and slowed the UI). Models that don't reason yield
-                # nothing here.
                 _model_reasoning = bool(state.get("model_reasoning"))
-                if _model_reasoning and not _thinking_active:
-                    _thinking_active = True
-                    queue.put_nowait({"kind": "thinking", "active": True})
+                # Emit the lightweight "thinking" toggle ONLY when the model
+                # actually produces reasoning content (a dedicated reasoning
+                # field caught by _thinking_from_chunk) — NOT merely because it
+                # is flagged reasoning-capable. A reasoning model that goes
+                # straight to text (or an auto-think gateway sending no thinking
+                # chunks) shows no indicator. The window closes on the first
+                # answer text (below) and as a safety net at stream end.
                 async for chunk in bound.astream(msgs):
                     _astream_count_local += 1
                     ai = chunk if ai is None else ai + chunk
@@ -1402,11 +1403,10 @@ async def _run_mode_turn(
                     # catches it; plain string content that is actually thinking
                     # (reasoning_content nulled out) is caught by the same helper.
                     if _model_reasoning and _thinking_from_chunk(chunk):
-                        # Real reasoning surfaced in a dedicated field
-                        # (reasoning_content / reasoning / thinking). Drop it and
-                        # remember we saw genuine reasoning so a later plain
-                        # content token is treated as the answer, not thinking.
                         _saw_real_reasoning = True
+                        if not _thinking_active:
+                            _thinking_active = True
+                            queue.put_nowait({"kind": "thinking", "active": True})
                         continue
                     content = chunk.content
                     if isinstance(content, str) and content:

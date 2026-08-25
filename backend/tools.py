@@ -3912,6 +3912,7 @@ Returns each match as a single `path:line:match` line (the matching line only â€
                 ctx=_ctx,
                 compact_model=_model,
                 reserved=20_000,
+                emit=emit,
             )
         except Exception as exc:  # noqa: BLE001 â€” degrade instead of killing the turn
             emit(_error_result("task", f"sub-agent failed: {exc}"))

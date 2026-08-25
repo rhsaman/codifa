@@ -452,10 +452,14 @@ async def llm_complete(
     system: str = "",
     user: str,
     images: list[str] | None = None,
-) -> str:
-    """Run a single LLM completion (no tools) and return the text reply."""
-    text, _ = await llm_generate(model, system=system, user=user, images=images)
-    return text
+) -> tuple[str, dict | None]:
+    """Run a single LLM completion (no tools) and return ``(text, usage_event)``.
+
+    The usage event (or ``None``) is surfaced so callers that summarize/compact
+    can accrue those tokens into the session total instead of silently dropping
+    them.
+    """
+    return await llm_generate(model, system=system, user=user, images=images)
 
 
 async def langchain_tool_loop(
@@ -468,6 +472,7 @@ async def langchain_tool_loop(
     ctx: int = 0,
     compact_model: Any = None,
     reserved: int | None = None,
+    emit: Any = None,
 ) -> str:
     """Run a bounded tool-calling loop on a LangChain model.
 
@@ -510,6 +515,22 @@ async def langchain_tool_loop(
         if steps >= max_steps:
             msgs.append(AIMessage(content=_MAX_STEPS_PROMPT))
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
+        # Surface the sub-agent's own token usage so the frontend can accrue it
+        # into the chat-wide session totals (the "Model usage" sidebar). The
+        # main-agent loop emits usage from agents.py; sub-agents run through this
+        # LangChain loop and were silently dropping usage_metadata. The caller's
+        # `emit` (tools._emit) stamps `sub=True` so it stays out of the parent's
+        # context meter while still counting toward the session total.
+        if emit is not None:
+            _um = getattr(ai, "usage_metadata", None)
+            if _um:
+                _ev = usage_event(
+                    _um,
+                    model=str(getattr(model, "model_name", "") or ""),
+                    sub=True,
+                )
+                if _ev:
+                    emit(_ev)
         tcs = getattr(ai, "tool_calls", None)
         if not tcs:
             meta = getattr(ai, "response_metadata", {}) or {}
@@ -553,7 +574,7 @@ async def langchain_tool_loop(
         # simply retries with the uncompacted transcript).
         if ctx > 0:
             try:
-                await _auto_compact_subagent(msgs, model, ctx, reserved)
+                await _auto_compact_subagent(msgs, model, ctx, reserved, emit)
             except Exception:  # noqa: BLE001
                 pass
     # The loop ended by hitting max_steps (not by the model returning a
@@ -568,7 +589,7 @@ async def langchain_tool_loop(
 
 
 async def _auto_compact_subagent(
-    msgs: list, model: Any, ctx: int, reserved: int | None
+    msgs: list, model: Any, ctx: int, reserved: int | None, emit: Any = None
 ) -> bool:
     """Compact a sub-agent's transcript in place when it nears the context limit.
 
@@ -596,7 +617,13 @@ async def _auto_compact_subagent(
     )
     if not result:
         return False
-    new_history, _keep = result
+    new_history, _keep, compact_usage = result
+    # Accrue the tokens the summarizer itself consumed so the session total
+    # (the "Model usage" sidebar) is complete. The caller's `emit` (tools._emit)
+    # stamps `sub=True`, keeping these out of the parent's context meter while
+    # still counting toward the session total.
+    if emit is not None and compact_usage:
+        emit(compact_usage)
     rebuilt: list[Any] = []
     had_system = bool(msgs) and isinstance(msgs[0], SystemMessage)
     if had_system:

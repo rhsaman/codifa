@@ -168,10 +168,6 @@ class ChatRequest(BaseModel):
     # lnum/col/severity/source/code/message). Summarized into the agent's
     # context so it can see what's wrong in the active file.
     nvim_diagnostics: list[dict] = []
-    # Recent-message budget from the client ("Messages to remember"). The
-    # backend uses it to decide how many recent turns to keep verbatim when it
-    # auto-compacts an overflowing context, so recent work is never lost.
-    max_history: int = 10
     # Chat id (renderer-side) so plans can be stored per chat
     # (<data>/plan/<workspace>/<chat-id>/plan.md) instead of per workspace.
     chat_id: str = ""
@@ -1004,13 +1000,13 @@ async def chat_compact(req: CompactRequest):
             return {"summary": None, "keep": 0, "error": last_error[-1]}
         _log("nothing to compact (history too short / head already summarized)", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "nothing to compact"}
-    new_history, keep = result
+    new_history, keep, compact_usage = result
     summary = new_history[0]["content"] if new_history else ""
     if not summary:
         _log("empty summary after success", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "empty summary"}
     _log(f"success: keep={keep} summary_len={len(summary)}")
-    return {"summary": summary, "keep": int(keep)}
+    return {"summary": summary, "keep": int(keep), "usage": compact_usage}
 
 
 async def _with_keepalive(agent_iter, timeout: float = 15.0):
@@ -1084,7 +1080,6 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 allow_outside=req.allow_outside,
                 nvim_file=req.nvim_file,
                 nvim_diagnostics=req.nvim_diagnostics,
-                max_history=req.max_history,
                 vector_db_path=req.vector_db_path,
                 vector_config=req.vector_config,
                 retrieval_config=req.retrieval_config,

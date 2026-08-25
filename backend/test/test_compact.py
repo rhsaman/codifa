@@ -56,10 +56,10 @@ async def main():
         mock.script = [None, text_reply("Fallback summary")]
         mock.captured = []
         compacted = await _compact_history(
-            compact_model, history, max_history=5, fallback_model=main_model
+            compact_model, history, fallback_model=main_model
         )
         assert compacted is not None, "fallback compact must succeed"
-        new_history, recent_n = compacted
+        new_history, recent_n, _usage = compacted
         assert new_history[0]["content"].startswith(
             "[Compacted earlier context]"
         ), new_history[0]
@@ -75,7 +75,7 @@ async def main():
         mock.script = [text_reply(""), text_reply("Fallback summary")]
         mock.captured = []
         compacted = await _compact_history(
-            compact_model, history, max_history=5, fallback_model=main_model
+            compact_model, history, fallback_model=main_model
         )
         assert compacted is not None, "empty-summary fallback must succeed"
         new_history, _ = compacted
@@ -86,7 +86,7 @@ async def main():
         #    surfaces compact_failed; nothing is dropped).
         mock.script = [None]
         mock.captured = []
-        compacted = await _compact_history(compact_model, history, max_history=5)
+        compacted = await _compact_history(compact_model, history)
         assert compacted is None, "no fallback -> None expected"
         print("  OK: no fallback -> None (compact_failed path)")
 
@@ -94,7 +94,7 @@ async def main():
         #    any model request.
         mock.script = []
         mock.captured = []
-        compacted = await _compact_history(compact_model, make_history(1), max_history=5)
+        compacted = await _compact_history(compact_model, make_history(1))
         assert compacted is None, "single-message history -> None expected"
         assert not mock.captured, "no model request should be made"
         print("  OK: single-message history -> None, no request")
@@ -108,10 +108,10 @@ async def main():
         mock.script = [text_reply("Merged summary")]
         mock.captured = []
         compacted = await _compact_history(
-            compact_model, merge_history, max_history=5
+            compact_model, merge_history
         )
         assert compacted is not None, "merge compact must succeed"
-        new_history, _ = compacted
+        new_history, _, _usage = compacted
         assert "Merged summary" in new_history[0]["content"], new_history[0]["content"]
         # The prior summary must have been sent to the model for merging.
         assert mock.captured, "summarizer request should have been captured"
@@ -127,10 +127,10 @@ async def main():
         mock.script = [text_reply("Short summary")]
         mock.captured = []
         compacted = await _compact_history(
-            compact_model, make_history(2), max_history=5, force=True
+            compact_model, make_history(2), force=True
         )
         assert compacted is not None, "forced compact must summarize short history"
-        new_history, recent_n = compacted
+        new_history, recent_n, _usage = compacted
         assert "Short summary" in new_history[0]["content"], new_history[0]["content"]
         print("  OK: forced compact summarizes a short history")
 

@@ -264,21 +264,6 @@ function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][
   return st
 }
 
-/** Default "Messages to remember" (cloud/global). Local providers (ollama) use
- *  a smaller default (see `defaultMaxHistoryFor`), since their models usually
- *  have small context windows. */
-export const DEFAULT_MAX_HISTORY = 10
-
-/** Local providers keep far fewer past messages by default — a small local
- *  model's context window is quickly flooded by several verbose tool-loop turns. */
-export const LOCAL_MAX_HISTORY = 3
-
-/** Resolve the default "Messages to remember" for a provider kind: local
- *  providers get `LOCAL_MAX_HISTORY`, everything else `DEFAULT_MAX_HISTORY`. */
-export function defaultMaxHistoryFor(kind: ProviderKind | undefined | null): number {
-  return PROVIDER_META[kind ?? 'custom']?.local ? LOCAL_MAX_HISTORY : DEFAULT_MAX_HISTORY
-}
-
 export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.name]),
 ) as Record<ProviderKind, string>
@@ -1752,9 +1737,9 @@ export const useStore = create<State>((set, get) => ({
         // summary. `keep` is the EXACT number of recent turns to preserve (the
         // backend reports it for auto-compact; the manual /compact path passes
         // 1 — opencode-style, only the last message survives verbatim). The
-        // summary is appended so the next turn's sliceToBudget (which sends the
-        // last maxHistory entries, system-first) keeps summary + recent together
-        // without contradicting either.
+        // summary is appended so the next turn (which sends the FULL history,
+        // system-first) keeps summary + recent together without contradicting
+        // either.
         const recentStart = Math.max(nonSys.length - keep, 0)
         const compactedIds = new Set(
           nonSys.slice(0, recentStart).map((m) => m.id),
@@ -1798,7 +1783,7 @@ export const useStore = create<State>((set, get) => ({
         // Append the summary at the END of the conversation so it renders AFTER
         // the agent's message (the user wants the checkpoint below the reply, not
         // above it). The model still receives it first on the next request because
-        // sliceToBudget sorts system messages first regardless of array order.
+        // the backend sends the FULL history system-first regardless of array order.
         messages.push(summaryMsg)
         return {
           ...c,

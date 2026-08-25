@@ -56,6 +56,7 @@ async def test_auto_compact_subagent_compacts_in_place():
                 {"role": "user", "content": "recent tail kept verbatim"},
             ],
             1,
+            None,
         )
 
     original = _llm._compact_history
@@ -85,7 +86,7 @@ async def test_auto_compact_subagent_noop_below_budget():
 
     async def fake_compact(*a, **k):
         called["n"] += 1
-        return None
+        return None  # noqa: unnecessary-return-none
 
     original = _llm._compact_history
     _llm._compact_history = fake_compact
@@ -148,6 +149,7 @@ async def test_langchain_tool_loop_autocompacts_with_ctx():
                 {"role": "user", "content": "recent"},
             ],
             1,
+            None,
         )
 
     model = _ReadHeavyModel(steps=4, reply="FINISHED")
@@ -209,6 +211,7 @@ async def test_task_tool_passes_context_window_to_subagent():
                 {"role": "user", "content": "recent"},
             ],
             1,
+            None,
         )
 
     model = _ReadThenReplyModel()

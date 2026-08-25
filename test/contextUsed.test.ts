@@ -33,7 +33,7 @@ console.log('۱) realTotal includes output + cache (latest turn total, like open
       usage: { inputTokens: 5000, outputTokens: 900, cacheReadTokens: 0, cacheWriteTokens: 0 },
     },
   ])
-  const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
+  const used = computeContextUsed(chat, 'sys', 200000)
   check('used = input + output (5900), output included', used === 5900, used)
 
   // When totalTokens is present it is used directly (it already includes output + cache).
@@ -47,8 +47,8 @@ console.log('۱) realTotal includes output + cache (latest turn total, like open
   ])
   check(
     'used = totalTokens when present (5900 incl. cache)',
-    computeContextUsed(chat2, 'sys', 50, 200000, 'ask') === 5900,
-    computeContextUsed(chat2, 'sys', 50, 200000, 'ask'),
+    computeContextUsed(chat2, 'sys', 200000) === 5900,
+    computeContextUsed(chat2, 'sys', 200000),
   )
 }
 
@@ -63,7 +63,7 @@ console.log('۲) only the LATEST assistant turn drives the meter (no max over hi
     { role: 'user', content: 'small follow-up' },
     { role: 'assistant', content: 'small', outputTokens: 10, usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
   ])
-  const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
+  const used = computeContextUsed(chat, 'sys', 200000)
   check('used = latest turn total (2010), not the earlier 1M', used === 2010, used)
 }
 
@@ -79,7 +79,7 @@ console.log('۳) provider reports a real total → meter trusts it (output inclu
       usage: { inputTokens: 99999, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
     },
   ])
-  const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
+  const used = computeContextUsed(chat, 'sys', 200000)
   // no totalTokens → input + output = 100009 (output is included, like opencode).
   check('used includes output (100009)', used === 100009, used)
 }
@@ -91,8 +91,8 @@ console.log('۴) no usage yet → falls back to the estimate (never a dash):')
     { role: 'user', content: 'hello there friend' },
     { role: 'assistant', content: 'hi' }, // no usage object
   ])
-  const used = computeContextUsed(chat, 'sys', 50, 200000, 'ask')
-  const est = estimateContextTokens(chat, 'sys', 50, 200000, 'ask')
+  const used = computeContextUsed(chat, 'sys', 200000)
+  const est = estimateContextTokens(chat, 'sys', 200000)
   check('used equals the estimate when no usage', used === est, { used, est })
 }
 
@@ -103,11 +103,11 @@ console.log('۵) estimate grows cumulatively as history grows (fallback path):')
   const a = (c: string) => ({ role: 'assistant', content: c, outputTokens: 0 })
   const base = mkChat([m('seed'), a('seed'), m('seed')])
   const grown = mkChat([m('seed'), a('seed'), m('seed'), a('seed'.repeat(50)), m('seed'.repeat(50)), a('seed'.repeat(50))])
-  const e0 = estimateContextTokens(base, 'sys', 50, 200000, 'ask')
-  const e1 = estimateContextTokens(grown, 'sys', 50, 200000, 'ask')
+  const e0 = estimateContextTokens(base, 'sys', 200000)
+  const e1 = estimateContextTokens(grown, 'sys', 200000)
   check('estimate increases with more history', e1 > e0, { e0, e1 })
   // And computeContextUsed (no usage) tracks that growth.
-  check('computeContextUsed grows with history', computeContextUsed(grown, 'sys', 50, 200000, 'ask') > computeContextUsed(base, 'sys', 50, 200000, 'ask'))
+  check('computeContextUsed grows with history', computeContextUsed(grown, 'sys', 200000) > computeContextUsed(base, 'sys', 200000))
 }
 
 console.log((globalThis as any).__FAILED ? '\n✗ برخی تستها شکست خوردند' : '\n✓ همه تستها پاس شدند')

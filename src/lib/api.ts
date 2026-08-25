@@ -241,8 +241,6 @@ export interface StreamParams {
       status: string
     }>
   }>
-  /** How many recent messages to send per turn / preserve verbatim on compact. */
-  maxHistory?: number
   attachments?: string[]
   /** Each image is a path string OR an object {path, dataUrl}; the backend
    *  prefers an inline dataUrl so it never depends on reading the frontend's
@@ -352,7 +350,6 @@ export async function streamChat(
           prompt: params.prompt,
           chat_id: params.chatId ?? '',
           history: params.history,
-          max_history: params.maxHistory ?? 10,
           attachments: params.attachments ?? [],
           images: params.images ?? [],
           system_prompt: params.systemPrompt ?? '',

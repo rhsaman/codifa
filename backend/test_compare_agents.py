@@ -111,7 +111,6 @@ async def run_our_agent(
             allow_outside=False,
             nvim_file="",
             nvim_diagnostics=None,
-            max_history=10,
             vector_db_path="",
             vector_config=None,
             retrieval_config=None,

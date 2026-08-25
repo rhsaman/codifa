@@ -2705,72 +2705,6 @@ def _scout_workspace_cached(root: str, chat_id: str, max_total: int) -> str:
     return result
 
 
-def _fit_history(history: list[dict], budget_chars: int) -> list[dict]:
-    """Trim prior turns to ``budget_chars`` characters, keeping the most recent.
-
-    Pydantic-ai re-sends the full history on every model request inside the tool
-    loop, so keeping the history bounded is the single biggest lever for making
-    small-context models (8k) finish without overflowing.
-    """
-    if budget_chars <= 0:
-        return []
-    total = sum(len(str(t.get("content", ""))) for t in history)
-    if total <= budget_chars:
-        return history
-    kept: list[dict] = []
-    acc = 0
-    for turn in reversed(history):
-        c = len(str(turn.get("content", "")))
-        is_system = turn.get("role") == "system"
-        # Compact summaries (system role) stand in for the folded older turns —
-        # never drop them to the char budget (mirrors the frontend's
-        # sliceToBudget), or the model loses the compacted context and
-        # "starts from scratch" on the next turn.
-        if acc + c > budget_chars and kept and not is_system:
-            break
-        kept.append(turn)
-        acc += c
-    return list(reversed(kept))
-
-
-def _history_budget(ctx: int, system_text: str, scouted: str, mode: str = "ask") -> int:
-    """Char budget for the history given the model's context window.
-
-    Rough char/token ratio of 4. The window must also hold the system prompt,
-    tool schemas, scouting, the tool-loop re-sends (pydantic-ai re-sends the
-    whole accumulated turn on every tool step) and the reply, so history gets a
-    conservative share — and a hard ceiling keeps it from ever eating the whole
-    window even when the char/token ratio is worse than 4:1 (mixed/Persian text
-    is denser than English).
-
-    Ask (mentor) turns stay conversational and rarely need deep recall of very
-    old turns, so their history share is capped lower — keeping the recent
-    conversation fully intact while trimming only the extra-long tail of old
-    chats. Coder/Plan keep the window-scaled share for rich project context.
-    """
-    if ctx <= 0:
-        return 200_000
-    base_chars = len(system_text) + len(scouted or "")
-    if ctx <= 16_000:
-        share = 0.30
-        floor = 800
-    else:
-        share = 0.35
-        floor = 4_000
-    budget = max(floor, int(ctx * 4 * share) - base_chars)
-    # Hard ceiling (~31% of the window in tokens at 4 chars/token) so a large
-    # window never lets the history alone blow past the real token limit.
-    budget = min(budget, int(ctx * 1.25))
-    # Absolute per-mode ceilings (must mirror the frontend's sliceToBudget):
-    # ask stays conversational, coder/plan carry more tool-call history that
-    # stays relevant, but both are capped so runaway growth is caught well
-    # before the compact threshold even on huge windows.
-    budget = min(
-        budget, {"ask": 60_000, "plan": 120_000, "coder": 140_000}.get(mode, 200_000)
-    )
-    return budget
-
-
 def _is_output_budget_exhausted(exc: BaseException) -> bool:
     """True for pydantic-ai's specific "the model burned its entire per-request
     `max_tokens` output budget on invisible reasoning/thinking tokens and
@@ -3020,7 +2954,6 @@ def _redact_app_errors(text: str) -> str:
 async def _compact_history(
     model: Any,
     history: list[dict],
-    max_history: int = 10,
     max_chars: int = 30_000,
     usage_cap=None,
     fallback_model: Any = None,
@@ -3029,7 +2962,7 @@ async def _compact_history(
     reserved: int | None = None,
     last_error: list | None = None,
     force: bool = False,
-) -> tuple[list[dict], int] | None:
+) -> tuple[list[dict], int, dict | None] | None:
     """Collapse older turns into one structured summary, keeping a recent tail
     verbatim, so a full window can continue instead of being cut off.
 
@@ -3136,7 +3069,7 @@ async def _compact_history(
 
     _exc: list[str] = []
 
-    async def _summarize(m: Any) -> str:
+    async def _summarize(m: Any) -> tuple[str, dict | None]:
         from llm import llm_complete
 
         if existing_summary:
@@ -3158,20 +3091,21 @@ async def _compact_history(
                 + _SUMMARY_TEMPLATE
             )
         try:
-            summary = await llm_complete(
+            summary, usage = await llm_complete(
                 m, system=_COMPACTION_SYSTEM_PROMPT, user=user_prompt
             )
         except Exception as exc:  # noqa: BLE001
             _exc.append(f"summarizer error: {str(exc) or repr(exc)}")
-            return ""
+            return "", None
         summary = (summary or "").strip()
         if not summary:
             _exc.append("summarizer returned an empty summary")
-        return summary
+        return summary, usage
 
     summary = ""
+    compact_usage: dict | None = None
     try:
-        summary = await _summarize(model)
+        summary, compact_usage = await _summarize(model)
     except Exception:  # noqa: BLE001
         summary = ""
     # The configured compact subagent failed (bad key, provider down, rate
@@ -3182,7 +3116,7 @@ async def _compact_history(
     if not summary and fallback_model is not None and fallback_model is not model:
         for _ in range(3):
             try:
-                summary = await _summarize(fallback_model)
+                summary, compact_usage = await _summarize(fallback_model)
             except Exception:  # noqa: BLE001
                 summary = ""
             if summary:
@@ -3202,6 +3136,7 @@ async def _compact_history(
         [{"role": "system", "content": "[Compacted earlier context]\n" + summary}]
         + recent,
         len(recent),
+        compact_usage,
     )
 
 
@@ -3535,7 +3470,6 @@ async def run_agent(
     allow_outside: bool = False,
     nvim_file: str = "",
     nvim_diagnostics: list | None = None,
-    max_history: int = 10,
     vector_db_path: str = "",
     vector_config: dict | None = None,
     retrieval_config: dict | None = None,
@@ -3586,7 +3520,6 @@ async def run_agent(
         "allow_outside": allow_outside,
         "nvim_file": nvim_file,
         "nvim_diagnostics": _to_list(nvim_diagnostics),
-        "max_history": max_history,
         "vector_db_path": vector_db_path,
         "vector_config": vector_config,
         "retrieval_config": retrieval_config,

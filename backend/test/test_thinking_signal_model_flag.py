@@ -1,17 +1,18 @@
-"""Behavior test: the composer glow signal is driven by the model's
-``reasoning`` flag, NOT by raw thinking text.
+"""Behavior test: the composer glow signal follows REAL reasoning output,
+NOT merely the model's ``reasoning`` flag.
 
-The frontend only needs to know WHEN the model is reasoning (to show a glow
-around the composer), not the chain-of-thought text — streaming the full
-thinking content caused heavy re-renders and slowed the UI. So the backend must
-emit a single ``{"kind": "thinking", "active": True}`` toggle at the START of a
-reasoning-capable model's stream, and ``{"kind": "thinking", "active": False}``
-when it ends, with NO ``content`` field.
+The frontend only needs to know WHEN the model is actually reasoning (to show a
+glow around the composer), not the chain-of-thought text — streaming the full
+thinking content caused heavy re-renders and slowed the UI. So the backend emits
+a ``{"kind": "thinking", "active": True}`` toggle ONLY when it sees genuine
+reasoning content in a dedicated field (reasoning_content / reasoning /
+thinking), and ``{"kind": "thinking", "active": False}`` when it ends, with NO
+``content`` field.
 
 This pins the contract so a future change can't silently start streaming
-reasoning text again, and proves the signal follows the model flag (not the
-presence of thinking chunks — many auto_think gateways send no thinking text at
-all, so relying on it would leave the glow dark).
+reasoning text again, and proves the signal follows real reasoning output — a
+reasoning-capable model that goes straight to text (or an auto-think gateway
+sending no thinking chunks) must NOT glow.
 """
 
 from agents import run_agent
@@ -41,16 +42,13 @@ async def _collect(prompt, model_reasoning, mock_server, workspace):
     return events
 
 
-async def test_reasoning_model_emits_thinking_signal(run_events, mock_server, workspace):
-    """A reasoning-capable model must glow (active:True) even when the provider
-    sends NO thinking text chunks."""
+async def test_reasoning_model_without_reasoning_content_emits_no_thinking_signal(run_events, mock_server, workspace):
+    """A reasoning-capable model that produces NO reasoning content (goes
+    straight to text) must NOT show a thinking signal — the signal now follows
+    real reasoning output, not the model's reasoning flag."""
     events = await _collect("سلام", True, mock_server, workspace)
     thinking = [e for e in events if e.get("kind") == "thinking"]
-    assert thinking, f"expected a thinking signal for a reasoning model, got {[e.get('kind') for e in events]}"
-    assert thinking[0] == {"kind": "thinking", "active": True}, f"unexpected start: {thinking[0]}"
-    assert {"kind": "thinking", "active": False} in thinking, f"missing end toggle: {thinking}"
-    # No raw thinking text may leak into the stream.
-    assert all("content" not in e for e in thinking), "thinking signal must carry no content"
+    assert not thinking, f"thinking signal must not fire without real reasoning, got {thinking}"
 
 
 async def test_non_reasoning_model_emits_no_thinking_signal(run_events, mock_server, workspace):

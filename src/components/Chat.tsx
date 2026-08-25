@@ -12,7 +12,6 @@ import {
   getActiveProvider,
   getChatProvider,
   useStore,
-  defaultMaxHistoryFor,
 } from "../lib/store";
 import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
@@ -188,10 +187,7 @@ function sliceToBudget(
       status: string;
     }>;
   }>,
-  maxHistory: number,
   contextWindow?: number,
-  mode?: AgentMode,
-  headroom?: number,
 ): Array<{
   role: string;
   content: string;
@@ -205,55 +201,13 @@ function sliceToBudget(
     status: string;
   }>;
 }> {
-  // opencode's tail budget: usable = ctx - reserved, keep a recent tail of
-  // min(15000, max(2000, usable*0.25)) tokens verbatim (~4 chars/token).
-  // `headroom` is the UI's compaction headroom (opencode's `reserved`).
-  const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000;
-  const reserved = Math.max(0, Math.min(headroom ?? 20000, ctx));
-  const usable = Math.max(0, ctx - reserved);
-  const MAX_PRESERVE = 15000;
-  const MIN_PRESERVE = 2000;
-  const tailTokens = Math.min(
-    MAX_PRESERVE,
-    Math.max(MIN_PRESERVE, Math.floor(usable * 0.25)),
-  );
-  const tailChars = tailTokens * 4;
-  // Absolute per-mode ceilings mirror the backend's own history trimmer so the
-  // frontend pre-slice and the backend's post-trim agree on the recent tail.
-  const MODE_HISTORY_CAPS: Record<string, number> = {
-    ask: 60000,
-    plan: 120000,
-    coder: 140000,
-  };
-  const capped = Math.min(
-    tailChars,
-    MODE_HISTORY_CAPS[mode ?? "ask"] ?? tailChars,
-  );
-  // Compact summaries (system role) stand in for the folded older turns — they
-  // must ALWAYS survive the maxHistory slice, or the model loses the whole
-  // compacted context once the chat grows past maxHistory after a compact and
-  // "starts from scratch". Slice only the non-system turns to maxHistory, then
-  // re-prepend every system message (the budget loop below already keeps them).
-  const systems = history.filter((m) => m.role === "system");
-  const recent = [
-    ...systems,
-    ...history.filter((m) => m.role !== "system").slice(-maxHistory),
-  ];
-  const kept: typeof history = [];
-  let acc = 0;
-  for (const m of [...recent].reverse()) {
-    // System-role messages (a compact summary) are small but crucial: always
-    // keep them even if the char budget would otherwise trim the oldest turn.
-    if (
-      m.role !== "system" &&
-      kept.length > 0 &&
-      acc + m.content.length > capped
-    )
-      break;
-    kept.push(m);
-    acc += m.content.length;
-  }
-  return kept.reverse();
+  // opencode sends the FULL history every turn and compacts on overflow — it
+  // never drops messages by count or by a per-mode char budget. Keep everything
+  // (system summaries already survive at the head); the backend compacts on
+  // overflow. This fixes two bugs: switching mode no longer shrinks the
+  // context (no MODE_HISTORY_CAPS), and messages no longer disappear every turn
+  // (no maxHistory tail slice).
+  return history;
 }
 
 export function ChatPanel() {
@@ -340,7 +294,6 @@ export function ChatPanel() {
   const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
   const modes = useStore((s) => allModes(s.settings));
-  const maxHistory = defaultMaxHistoryFor(provider.kind);
   const nvimFile = useStore((s) => s.nvimFile);
   const nvimDiags = useStore((s) => s.nvimDiagnostics);
   const nvimDiagCounts = useMemo(() => {
@@ -1148,14 +1101,8 @@ export function ChatPanel() {
   // before the first usage event.
   const contextUsed = useMemo(
     () =>
-      computeContextUsed(
-        chat,
-        systemPrompt,
-        maxHistory,
-        ctxWindow ?? undefined,
-        chat?.mode,
-      ),
-    [chat, systemPrompt, maxHistory, ctxWindow],
+      computeContextUsed(chat, systemPrompt, ctxWindow ?? undefined),
+    [chat, systemPrompt, ctxWindow],
   );
 
   const ctxPct = contextPercent(contextUsed, ctxWindow);
@@ -1361,13 +1308,7 @@ export function ChatPanel() {
           (a) => a.status !== "running",
         ),
       }));
-    const history = sliceToBudget(
-      allHistory,
-      maxHistory,
-      ctxWindow ?? undefined,
-      chat.mode,
-      useStore.getState().settings.compactHeadroom ?? 20000,
-    );
+    const history = sliceToBudget(allHistory);
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -1545,12 +1486,14 @@ export function ChatPanel() {
           content: prev + chunk,
           segments: appendTextSegment(findMsg()?.segments, chunk),
           retry: null,
+          thinkingActive: false,
         });
       } else if (event.kind === "thinking") {
-        // Lightweight signal only: the backend no longer streams the raw
-        // thinking text (it slowed the UI with per-token re-renders). We just
-        // toggle the global "isThinking" flag so the composer can show a glow.
+        // Lightweight signal: the backend now emits active:True ONLY when the
+        // model actually produces reasoning content. Drive the per-message
+        // thinking indicator from it (not from mere streaming).
         useStore.getState().setStreaming(true, !!event.active);
+        store.updateMessage(assistantMsg.id, { thinkingActive: !!event.active });
       } else if (event.kind === "skill") {
         // Deliberately NOT rendered into the chat — the user asked for the
         // "Attached skills" / MCP notes to stay out of the transcript. The
@@ -1764,16 +1707,13 @@ export function ChatPanel() {
           // Auto-compact: the backend tells us exactly how many recent turns it
           // preserved verbatim (`keep`), so we fold the SAME older turns and keep
           // the SAME recent ones — the summary never contradicts the tail it
-          // renders next. Fall back to maxHistory on older backends.
+          // renders next. Fall back to 1 (opencode-style: only the last message
+          // survives verbatim) on older backends that don't report `keep`.
           const backendKeep =
             Number.isFinite(event.keep) && (event.keep ?? -1) >= 0
               ? event.keep
               : undefined;
-          store.compactChat(
-            chatId,
-            event.content ?? "",
-            backendKeep ?? maxHistory,
-          );
+          store.compactChat(chatId, event.content ?? "", backendKeep ?? 1);
           // Auto-compact completed — surface the same confirmation the manual
           // /compact path shows, so the user knows older messages were folded
           // into a summary. Stored per-chat so it's still there if the user
@@ -1957,7 +1897,6 @@ export function ChatPanel() {
           chatId: chat.id,
           prompt: promptWithResume,
           history,
-          maxHistory,
           attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
           images: imgs.map((i) =>
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
@@ -2069,6 +2008,7 @@ export function ChatPanel() {
           (curMsg.retry.gaveUp === true || curMsg.retry.watchdog === true));
       useStore.getState().updateMessage(assistantMsg.id, {
         streaming: false,
+        thinkingActive: false,
         ...(keepRetry ? {} : { retry: null }),
       });
       // A turn just completed → usage changed. Refresh the balance chip now.
@@ -2413,7 +2353,7 @@ export function ChatPanel() {
         0,
       );
     },
-    [busy, send, maxHistory],
+    [busy, send],
   );
 
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a

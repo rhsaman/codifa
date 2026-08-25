@@ -18,10 +18,11 @@ def client(monkeypatch):
     async def fake_compact(model, history, ctx=0, reserved=2000, fallback_model=None, last_error=None, force=False):
         # Mirror `_compact_history`'s contract: a new history whose first
         # message carries the opencode-style prefix, plus the number of
-        # recent turns preserved verbatim.
+        # recent turns preserved verbatim, plus the summarizer's usage (None here).
         return (
             [{"role": "system", "content": "[Compacted earlier context]\nmerged"}],
             2,
+            None,
         )
 
     monkeypatch.setattr(server, "_compact_history", fake_compact)
@@ -97,14 +98,17 @@ def test_compact_history_merges_prior_summary(monkeypatch):
     async def fake_llm(m, system="", user=""):
         captured["system"] = system
         captured["user"] = user
-        return "MERGED"
+        return "MERGED", None
 
     monkeypatch.setattr(llm, "llm_complete", fake_llm)
+    import importlib
+
+    importlib.reload(agents)
 
     class DummyModel:
         pass
 
-    new_history, keep = asyncio.run(
+    new_history, keep, _usage = asyncio.run(
         agents._compact_history(
             DummyModel(), _big_history(with_prior=True), ctx=10000, reserved=20000
         )
@@ -122,14 +126,17 @@ def test_compact_history_fresh_no_prior(monkeypatch):
 
     async def fake_llm(m, system="", user=""):
         captured["received"] = user
-        return "FRESH"
+        return "FRESH", None
 
     monkeypatch.setattr(llm, "llm_complete", fake_llm)
+    import importlib
+
+    importlib.reload(agents)
 
     class DummyModel:
         pass
 
-    new_history, keep = asyncio.run(
+    new_history, keep, _usage = asyncio.run(
         agents._compact_history(
             DummyModel(), _big_history(with_prior=False), ctx=10000, reserved=20000
         )

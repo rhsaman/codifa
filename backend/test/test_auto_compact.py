@@ -76,6 +76,50 @@ def test_auto_compact_fires_above_usable():
     assert compact["content"].startswith("[Compacted earlier context]")
 
 
+async def _run_trigger_with_input(messages, last_input_tokens, reserved=20_000, ctx=200_000):
+    state = {"reserved": reserved}
+    q = _Queue()
+    await graph._maybe_auto_compact(
+        state, q, None, None, messages, ctx, last_input_tokens=last_input_tokens
+    )
+    return [e["kind"] for e in q.items], q.items
+
+
+def test_auto_compact_uses_last_input_tokens():
+    # A small transcript (local estimate below usable) but a reported
+    # last_input_tokens above usable must still fire compaction — proving
+    # auto-compaction is driven by the same input_tokens the context meter
+    # displays, not just the local estimate.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[c]"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="hello")]
+        events, _ = asyncio.run(_run_trigger_with_input(small, last_input_tokens=190_000))
+    finally:
+        graph._agents._compact_history = original
+    assert events == ["compact_start", "compact"]
+
+
+def test_auto_compact_low_last_input_tokens_stays_silent():
+    # A large transcript whose local estimate would fire compaction, but a low
+    # reported last_input_tokens keeps it silent — proving last_input_tokens
+    # overrides the estimate.
+    events, _ = asyncio.run(
+        _run_trigger_with_input(
+            [
+                SystemMessage(content="x" * 1000),
+                HumanMessage(content="y" * 800_000),
+                AIMessage(content="z" * 800_000),
+            ],
+            last_input_tokens=10_000,
+        )
+    )
+    assert events == []
+
+
 def test_messages_to_dicts_roles():
     dicts = graph._agents._messages_to_dicts(
         [

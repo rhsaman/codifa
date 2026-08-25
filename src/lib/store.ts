@@ -72,8 +72,6 @@ let lastMidStreamPersist = 0
 // Bounds on persisted toolActivity so the chat JSON (and every heartbeat IPC
 // payload) stays small even for tool calls with huge args/diffs/results.
 const MAX_TOOL_TEXT = 4000 // summary / diff
-const MAX_TOOL_ITEMS = 50 // web_search etc. result rows
-const MAX_TOOL_SNIPPET = 500 // per result snippet
 const MAX_TOOL_ARG = 2000 // per string value inside args
 
 function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
@@ -92,13 +90,12 @@ function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
       }
       out.args = args
     }
-    if (Array.isArray(out.items)) {
-      out.items = out.items.slice(0, MAX_TOOL_ITEMS).map((it) =>
-        typeof it.snippet === 'string' && it.snippet.length > MAX_TOOL_SNIPPET
-          ? { ...it, snippet: it.snippet.slice(0, MAX_TOOL_SNIPPET) + '…' }
-          : it,
-      )
-    }
+    // NOTE: `items` (the full tool result) is intentionally NOT truncated here.
+    // It is the actual context the model receives (rebuilt into ToolMessages on
+    // the backend), so trimming it would silently shrink the context sent to the
+    // provider. We keep `summary`/`diff`/`args` trimming for file-size sanity,
+    // but the verbatim result must stay complete so "all messages up to the last
+    // compact" are truly sent. This is the user's explicit "send full context".
     if (Array.isArray(out.children)) out.children = trimToolActivity(out.children)
     return out
   })

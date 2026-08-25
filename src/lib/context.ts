@@ -1,4 +1,4 @@
-import type { Chat } from '../types'
+import type { Chat, TokenUsage } from '../types'
 import { PERSIAN_RANGE } from './bidi'
 
 export const CHARS_PER_TOKEN = 4
@@ -175,48 +175,38 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // The meter must show the TRUE context we actually send to the model this
-  // turn — the full non-compacted history (system prompt + every user/assistant
-  // exchange) — not just the last message's provider-reported usage.
-  //
-  // Some providers are stateful or only surface billable (non-cached) tokens, so
-  // their per-turn `usage` can be far smaller than the real context (the meter
-  // would then "only show the latest message" and keep shrinking). Estimate the
-  // real context directly from the history we send; this is provider-independent
-  // and always correct. Compute it up front so it also serves as the stable
-  // fallback when no usage has arrived yet.
+  // `estimated` is the local history estimate (system prompt + every non-compacted
+  // exchange). It is only the fallback used before the first usage event arrives
+  // (or a fixture that omits `total_tokens`); in normal operation the meter uses
+  // the backend's `total_tokens`, described below.
   const estimated = Math.round(
     estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN,
   )
 
-  // The meter must be MONOTONIC: it reflects the peak context consumed in the
-  // chat so far, never dropping as the conversation grows. Provider
-  // `input_tokens` can momentarily dip (cache hits report a smaller total than
-  // a cache-miss resend, and some gateways under-report on cache hits), so we
-  // take the running MAX of `contextTokens` (the backend's accurate per-request
-  // total) across every non-compacted assistant turn. Until a compact clears
-  // the history, the max can only stay flat or rise — exactly the opencode
-  // behaviour the user expects.
-  let best = estimated
+  // The title-bar meter reflects the CURRENT turn's backend-reported
+  // `input_tokens` — the provider's (langgraph's) authoritative count of how
+  // many tokens were actually sent in the prompt this turn (`in` in the
+  // backend's `[USAGE_DEBUG]`). That is the true "context used": it excludes the
+  // model's OUTPUT (which is not context) and is cache-stable (a cache hit does
+  // not change it), so the meter neither exceeds the real input nor gets "stuck"
+  // at an old peak. It tracks the live conversation and may only drop when the
+  // context genuinely shrinks (e.g. after auto-compaction), which is the correct,
+  // opencode-faithful behaviour. Backend auto-compaction is driven by this same
+  // `input_tokens`, so the meter and the compaction trigger always agree.
+  //
+  // Before the first usage event arrives (a brand-new chat) there is no
+  // `input_tokens` yet, so we fall back to the local history estimate.
+  let last: TokenUsage | null = null
   for (const m of active) {
     const u = m.usage
-    if (!u || m.role !== 'assistant') continue
-    const parts =
-      (u.inputTokens || 0) +
-      (u.outputTokens || 0) +
-      (u.reasoningTokens ?? 0) +
-      (u.cacheReadTokens ?? 0) +
-      (u.cacheWriteTokens ?? 0)
-    const reported =
-      u.contextTokens != null
-        ? u.contextTokens
-        : u.totalTokens != null
-          ? u.totalTokens
-          : parts
-    if (reported > best) best = reported
+    if (u && m.role === "assistant") last = u
   }
-
-  return best
+  if (last && last.inputTokens != null && last.inputTokens > 0) return last.inputTokens
+  // No `total_tokens` on the latest main turn yet (only happens before the first
+  // usage event, or a fixture that omits it — the real app always sets it):
+  // fall back to the local history estimate, which reflects the true context
+  // window size rather than just the last message's raw token count.
+  return estimated
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying

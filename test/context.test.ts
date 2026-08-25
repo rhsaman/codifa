@@ -67,17 +67,36 @@ console.log('۳) computeContextUsed falls back to a positive estimate when no us
   check('وقتی usage نیست برآورد مثبت برمی‌گردد (نه 0)', used > 0, used)
 }
 
-console.log('۴) trusts the provider when it reports the LARGER full context (incl. cache):')
+console.log('۴) trusts the provider when it reports the LARGER input_tokens (full context, cache already folded in for subset):')
 {
   const chat = {
     messages: [
       mkMsg('user', null),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50, totalTokens: 99999, cacheReadTokens: 5000 }),
+      mkMsg('assistant', { inputTokens: 99999, outputTokens: 50, cacheReadTokens: 5000 }),
     ],
   }
   const used = computeContextUsed(chat as any, '', 200000)
-  // estimate ~4000; provider reports 99999 (full context incl. cache) → meter trusts it
+  // estimate ~4000; provider reports 99999 input_tokens (full context) → meter trusts it
   check('متر مقدار بزرگتر گزارش‌شده را می‌پذیرد (99999)', used === 99999, used)
+}
+
+console.log('۴ب) meter follows the LATEST message inputTokens (the backend input):')
+{
+  // The meter mirrors the latest main request's input_tokens — the same value
+  // that drives auto-compaction. Earlier turns' input_tokens are ignored, and the
+  // larger middle turn (9000) does not pin it.
+  const chat = {
+    messages: [
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 5000, outputTokens: 50, contextTokens: 1000 }),
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 9000, outputTokens: 400, contextTokens: 2000 }),
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 4000, outputTokens: 60, contextTokens: 3000 }),
+    ],
+  }
+  const used = computeContextUsed(chat as any, '', 200000)
+  check('متر آخرین inputTokens را نشان می‌دهد (4000)', used === 4000, used)
 }
 
 console.log('۵) compacted messages are excluded from the estimated context:')
@@ -87,7 +106,7 @@ console.log('۵) compacted messages are excluded from the estimated context:')
       mkMsg('user', null),
       { ...mkMsg('assistant', { inputTokens: 1, outputTokens: 1 }, 'z'.repeat(400)), compacted: true },
       mkMsg('user', null),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50 }),
+      mkMsg('assistant', { outputTokens: 50 }),
     ],
   }
   const used = computeContextUsed(chat as any, '', 200000)

@@ -900,9 +900,19 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     lc_history = history_to_langchain_messages(history)
     try:
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
+        _tool_items_chars = 0
+        for _h in history:
+            for _ta in (_h.get("toolActivity") or []):
+                _its = _ta.get("items")
+                if isinstance(_its, list):
+                    for _it in _its:
+                        if isinstance(_it, dict):
+                            _tool_items_chars += len(str(_it.get("snippet", "")))
+                        else:
+                            _tool_items_chars += len(str(_it))
         print(
             f"[CTX_DEBUG] history_msgs={len(history)} lc_msgs={len(lc_history)} "
-            f"est_tokens={_hist_chars // 4}",
+            f"est_tokens={_hist_chars // 4} tool_items_chars={_tool_items_chars}",
             flush=True,
         )
     except Exception:
@@ -1016,6 +1026,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     messages: list[BaseMessage] = [SystemMessage(content=system_final)]
     messages.extend(lc_history)
     messages.append(HumanMessage(content=user_content))
+
+    try:
+        _sys_chars = len(str(system_final))
+        _user_chars = (
+            len(user_content)
+            if isinstance(user_content, str)
+            else sum(len(str(c.get("text", ""))) for c in user_content if isinstance(c, dict))
+        )
+        print(
+            f"[CTX_DEBUG] sys_chars={_sys_chars} hist_chars={_hist_chars} "
+            f"user_chars={_user_chars} total_chars={_sys_chars + _hist_chars + _user_chars}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     # Convert the mode-filtered fns to LangChain StructuredTools.
     lc_tools = [
@@ -1429,6 +1454,7 @@ async def _maybe_auto_compact(
     compact_model: Any,
     msgs: list,
     ctx: int,
+    last_input_tokens: int | None = None,
 ) -> None:
     """opencode `isOverflow` -> auto-compaction.
 
@@ -1444,16 +1470,25 @@ async def _maybe_auto_compact(
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
     dicts = _agents._messages_to_dicts(msgs)
-    # Use the STABLE LOCAL estimate of the WHOLE transcript (system + history +
-    # current user turn + tools) — the same basis as the context meter. This is
-    # provider-independent and avoids two bugs in reading raw provider
-    # `usage_metadata` off the last AIMessage: (a) only Anthropic cache keys were
-    # read, so OpenAI/OpenRouter/hy3-free cache was always 0; (b) adding
-    # cache_read to input_tokens double-counts for SUBSET providers (cache is
-    # already inside input_tokens there), over-estimating and firing compaction
-    # early. The local estimate also never under/over-reports on cache hits or
-    # misses the way a single turn's provider usage does.
-    total = _estimate_prompt_tokens(msgs)
+    # Diagnostic: surface the real window/threshold so we can confirm compaction
+    # only fires when the prompt genuinely nears the window (and not spuriously).
+    print(
+        f"[CTX_DEBUG] auto_compact ctx={ctx} reserved={reserved} usable={usable} "
+        f"total={total} msgs={len(msgs)}",
+        flush=True,
+    )
+    # Auto-compaction fires off the SAME `input_tokens` the context meter
+    # displays (tracked on `state["last_input_tokens"]` at the usage-emit site),
+    # so the meter and the compaction trigger always agree. `input_tokens` is the
+    # provider's (langgraph's) count of tokens actually sent in the prompt this
+    # turn — the true context size (excludes output). Fall back to the stable
+    # local estimate of the whole transcript when no usage has been reported yet
+    # (e.g. the very first turn, or a provider that reports none).
+    total = (
+        last_input_tokens
+        if last_input_tokens and last_input_tokens > 0
+        else _estimate_prompt_tokens(msgs)
+    )
     if total is None or total <= 0:
         # Fallback to the char estimate when the local estimate is unavailable
         # (e.g. un-tokenizable message content, or local models with no usage).
@@ -1730,6 +1765,7 @@ async def _run_mode_turn(
                     ai, model_id, prompt_tokens=_estimate_prompt_tokens(messages)
                 )
                 if usage_ev:
+                    state["last_input_tokens"] = usage_ev["input_tokens"]
                     queue.put_nowait(usage_ev)
             except Exception as exc:  # surfaced to the retry wrapper
                 # A few local OpenAI-compatible servers (old llama.cpp / custom
@@ -1900,7 +1936,15 @@ async def _run_mode_turn(
     # usable window, summarize the older turns and tell the frontend to fold.
     if reply and ctx and ctx > 0:
         try:
-            await _maybe_auto_compact(state, queue, model, compact_model, messages, ctx)
+            await _maybe_auto_compact(
+                state,
+                queue,
+                model,
+                compact_model,
+                messages,
+                ctx,
+                last_input_tokens=state.get("last_input_tokens"),
+            )
         except Exception:  # noqa: BLE001
             pass
     return reply

@@ -1196,16 +1196,12 @@ export function ChatPanel() {
     }
     s.addRecentModel(activeProvider.model, activeProvider.id);
 
-    // Enabled MCP connectors (persistent switches) become an explicit
-    // instruction on this turn.
+    // NOTE: MCP connectors are no longer injected as a text instruction. The
+    // backend now opens a real connection to each enabled server and registers
+    // its tools directly with the model, so a textual "use the MCP tools" note
+    // is both redundant and misleading (it used to be the ONLY thing wired up,
+    // which is why MCP tools silently never worked).
     const skillNotes: string[] = [];
-    for (const name of s.settings.mcpEnabled ?? []) {
-      if (s.settings.mcpServers?.[name]) {
-        skillNotes.push(
-          `Use the MCP tools from server "${name}" where relevant.`,
-        );
-      }
-    }
     // Manual @skill mentions: extract the skill names the user attached with
     // @, pass them to the backend (only those are loaded — there is no
     // auto-selection) and strip the @mentions from the prompt so the model
@@ -1925,9 +1921,14 @@ export function ChatPanel() {
             ),
           mcpServers: (() => {
             const all = s.settings.mcpServers ?? {};
+            const enabled = s.settings.mcpEnabled ?? [];
+            // If the user hasn't explicitly toggled any connector on/off, send
+            // every configured connector (they added them intending to use
+            // them). This also covers connectors created via the `/mcp`
+            // command that haven't reached the UI store yet.
+            const names = enabled.length > 0 ? enabled : Object.keys(all);
             const sel: Record<string, (typeof all)[string]> = {};
-            for (const n of s.settings.mcpEnabled ?? [])
-              if (all[n]) sel[n] = all[n];
+            for (const n of names) if (all[n]) sel[n] = all[n];
             return sel;
           })(),
           skills: Array.from(mentionSkills),

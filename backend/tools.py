@@ -3411,9 +3411,7 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) whenever you need to find files containing specific patterns; for an open-ended search across many locations, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline.
-
-EFFICIENCY: Prefer grep (with context) over reading whole files — grep first, then read only the specific lines/files it points to. When you already know the searches you need, fire several greps in the SAME turn (parallel tool calls) instead of one at a time; combine alternatives with `foo|bar` to collapse multiple searches into one."""
+Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)

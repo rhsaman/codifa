@@ -794,6 +794,18 @@ export const useStore = create<State>((set, get) => ({
     loadedSettings.mcpServers = mergedMcp
     const builtins = (dbMcp.builtins ?? []).filter((n) => mergedMcp[n])
 
+    // First run / nothing explicitly enabled yet → turn on built-in connectors
+    // (e.g. Docker) by default. Once the user has configured mcpEnabled, we
+    // respect their explicit on/off choices and stop overriding it.
+    const userEnabled = raw.mcpEnabled
+    const enabledSet = new Set(
+      Array.isArray(userEnabled) ? userEnabled.filter((n: string) => !!mergedMcp[n]) : [],
+    )
+    if (!Array.isArray(userEnabled) || userEnabled.length === 0) {
+      for (const b of builtins) enabledSet.add(b)
+    }
+    loadedSettings.mcpEnabled = [...enabledSet]
+
     // Rows for removed engines (e.g. Google Custom Search, sunset by Google) are
     // dropped here so they disappear from Settings → Plugins on reload. Labels
     // are canonicalized per kind (a removed engine previously coerced to
@@ -1040,17 +1052,23 @@ export const useStore = create<State>((set, get) => ({
   },
 
   addMcpServer: (name, cfg) => {
-    set((s) => ({
-      settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
-    }))
+    set((s) => {
+      const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
+      const cur = s.settings.mcpEnabled ?? []
+      const mcpEnabled = cur.includes(name) ? cur : [...cur, name]
+      return { settings: { ...s.settings, mcpServers, mcpEnabled } }
+    })
     get().persist()
     void saveMcp(name, cfg)
   },
 
   updateMcpServer: (name, cfg) => {
-    set((s) => ({
-      settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
-    }))
+    set((s) => {
+      const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
+      const cur = s.settings.mcpEnabled ?? []
+      const mcpEnabled = cur.includes(name) ? cur : [...cur, name]
+      return { settings: { ...s.settings, mcpServers, mcpEnabled } }
+    })
     get().persist()
     void saveMcp(name, cfg)
   },

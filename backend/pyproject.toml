@@ -21,6 +21,7 @@ dependencies = [
     "langchain-google-genai>=4.3.5",
     "pillow>=12.3.0",
     "python-multipart>=0.0.32",
+    "mcp>=2.1.1",
 ]
 
 [tool.ruff]

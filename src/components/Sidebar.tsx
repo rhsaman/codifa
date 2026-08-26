@@ -164,6 +164,18 @@ export function Sidebar() {
   const [search, setSearch] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  // Multi-select state for bulk-deleting chats within a workspace.
+  const [selectedChats, setSelectedChats] = useState<Set<string>>(new Set());
+  const toggleChatSelected = (id: string) => {
+    setSelectedChats((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const clearSelected = () => setSelectedChats(new Set());
+
   // Click-based kebab menu: opens on click, stays open while hovering the
   // popup (no hover-gap race), and closes on outside click or re-click.
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
@@ -723,6 +735,9 @@ export function Sidebar() {
           const pendingCount = g.chats.filter(
             (c) => c.pendingAsk || c.pendingPermission,
           ).length;
+          const selectedInGroup = g.chats.filter((c) =>
+            selectedChats.has(c.id),
+          ).length;
           return (
             <div
               key={g.key}
@@ -762,7 +777,12 @@ export function Sidebar() {
                     )}
                   </svg>
                   <span className="sidebar-group-label">{g.label}</span>
-                  <span className="sidebar-group-count">{g.chats.length}</span>
+                  <span
+                    className="sidebar-group-count"
+                    data-selected={selectedInGroup > 0}
+                  >
+                    {selectedInGroup > 0 ? selectedInGroup : g.chats.length}
+                  </span>
                   {pendingCount > 0 && (
                     <span
                       className="sidebar-group-pending"
@@ -890,6 +910,47 @@ export function Sidebar() {
                     </button>
                   </div>
                 )}
+                {selectedInGroup > 0 && (
+                  <div className="group-bulk-actions">
+                    <button
+                      className="group-delete-selected"
+                      title={`Delete ${selectedInGroup} selected conversation(s)`}
+                      onClick={() => {
+                        const ids = g.chats
+                          .map((c) => c.id)
+                          .filter((id) => selectedChats.has(id));
+                        if (
+                          window.confirm(
+                            `Delete ${ids.length} conversation(s)?`,
+                          )
+                        ) {
+                          ids.forEach((id) =>
+                            useStore.getState().deleteChat(id),
+                          );
+                          setSelectedChats((prev) => {
+                            const next = new Set(prev);
+                            ids.forEach((id) => next.delete(id));
+                            return next;
+                          });
+                        }
+                      }}
+                    >
+                      <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                      </svg>
+                      {selectedInGroup}
+                    </button>
+                  </div>
+                )}
               </div>
               {!isCollapsed && (
                 <div
@@ -910,7 +971,7 @@ export function Sidebar() {
                     return (
                       <div
                         key={c.id}
-                        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}`}
+                        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}`}
                         onClick={() => useStore.getState().setActiveChat(c.id)}
                         title={prepareContent(titleOf(c), dir)}
                       >
@@ -1028,6 +1089,14 @@ export function Sidebar() {
                           />
                         ) : (
                           <span className="chat-item-title-row" dir={dir}>
+                            <input
+                              type="checkbox"
+                              className="chat-select-checkbox"
+                              checked={selectedChats.has(c.id)}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={() => toggleChatSelected(c.id)}
+                              title="Select this chat"
+                            />
                             <span
                               className="chat-item-title"
                               onDoubleClick={(e) => {
@@ -1208,12 +1277,6 @@ export function Sidebar() {
               >
                 {formatTokens(usageGrandTotal)}
                 {usageGrandCached > 0 && (
-                  <span className="sidebar-usage-grand-fresh">
-                    {" "}
-                    · 🔥{formatTokens(usageGrandFresh)}
-                  </span>
-                )}
-                {usageGrandCached > 0 && (
                   <span className="sidebar-usage-grand-cache">
                     {" "}
                     · ⚡{formatTokens(usageGrandCached)}
@@ -1360,12 +1423,6 @@ export function Sidebar() {
                           >
                             {formatTokens(groupTokens)}
                             {groupCached > 0 && (
-                              <span className="sidebar-usage-fresh">
-                                {" "}
-                                · 🔥{formatTokens(groupFresh)}
-                              </span>
-                            )}
-                            {groupCached > 0 && (
                               <span className="sidebar-usage-cache">
                                 {" "}
                                 · ⚡{formatTokens(groupCached)}
@@ -1394,9 +1451,22 @@ export function Sidebar() {
                                 cacheRead,
                                 cacheWrite,
                                 cost,
+                                costFresh,
+                                costCached,
                               }) => {
                                 const cached = cacheRead + cacheWrite;
                                 const total = input + output;
+                                const fresh = Math.max(0, total - cached);
+                                const itemTitle = [
+                                  fresh > 0
+                                    ? `Fresh (non-cached): ${formatTokens(fresh)} tokens${costFresh !== null ? ` · ${formatCost(costFresh)}` : ""}`
+                                    : "",
+                                  cached > 0
+                                    ? `Cached: ${formatTokens(cached)} tokens${costCached !== null ? ` · ${formatCost(costCached)}` : ""}`
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ");
                                 return (
                                   <li
                                     key={model}
@@ -1408,19 +1478,25 @@ export function Sidebar() {
                                     >
                                       {model ? model.split("/").pop() : "main"}
                                     </span>
-                                    <span className="sidebar-usage-tokens">
+                                    <span
+                                      className="sidebar-usage-tokens"
+                                      title={itemTitle || undefined}
+                                    >
                                       {formatTokens(total)}
                                       {cached > 0 && (
-                                        <span
-                                          className="sidebar-usage-cache"
-                                          title={`Cached tokens (prompt cache): ${formatTokens(cached)}`}
-                                        >
-                                          ⚡ {formatTokens(cached)}
+                                        <span className="sidebar-usage-breakdown">
+                                          <span className="sidebar-usage-fresh">
+                                            🔥 {formatTokens(fresh)}
+                                          </span>
+                                          <span className="sidebar-usage-cache">
+                                            ⚡ {formatTokens(cached)}
+                                          </span>
                                         </span>
                                       )}
                                     </span>
                                     <span
                                       className={`sidebar-usage-cost${cost === null ? " no-price" : ""}`}
+                                      title={itemTitle || undefined}
                                     >
                                       {cost !== null ? formatCost(cost) : "—"}
                                     </span>

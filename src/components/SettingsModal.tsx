@@ -688,6 +688,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
+  const setMcpEnabled = useStore((s) => s.setMcpEnabled)
   const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string }>>([])
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
   const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
@@ -1681,6 +1682,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     defaultOpen
                     onSave={(_oldName, newName, next) => {
                       addMcpServer(newName, next)
+                      setMcpEnabled(newName, true)
                       setAddingMcp(false)
                     }}
                     onDelete={() => setAddingMcp(false)}
@@ -1705,6 +1707,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     onSave={(oldName, newName, next) => {
                       if (oldName && oldName !== newName) removeMcpServer(oldName)
                       addMcpServer(newName, next)
+                      setMcpEnabled(newName, true)
                     }}
                     onDelete={(n) => {
                       if (window.confirm(`Delete MCP connector "${n}"?`)) removeMcpServer(n)

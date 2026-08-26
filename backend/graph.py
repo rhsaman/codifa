@@ -57,14 +57,14 @@ import state_db
 from agents import normalize_mode
 from context_builder import build_context as _build_rag_context
 from llm import (
-    ProviderError,
     _is_stream_options_error,
     _strip_stream_options,
     build_chat_model,
     chat_model_settings,
     llm_generate,
 )
-from tools import make_tool_callbacks, _PARENT_TOOLS_CTX
+from mcp_bridge import build_mcp_tools
+from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
 MAX_DEBUG_ATTEMPTS = 3
 
@@ -227,7 +227,7 @@ def filter_tools_for_mode(
     cap: dict | None,
     scoped_paths: set[str],
     allow_create: bool,
-    allow_outside: bool,  # noqa: ARG001 - reserved for parity with agents.py
+    allow_outside: bool,
     prompt: str = "",
     root: str = "",
 ) -> dict[str, Callable]:
@@ -718,6 +718,19 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         mode, tools, cap, scoped_paths, allow_create, allow_outside,
         prompt=prompt, root=root,
     )
+
+    # --- MCP bridge -------------------------------------------------------
+    # Previously the runtime never opened a connection to the configured MCP
+    # servers, so their tools (e.g. the Docker MCP connector) were unreachable
+    # and the frontend only injected a no-op text note. We now connect for real
+    # and merge the live tools into the same `filtered` dict the tool loop
+    # reads, plus expose a cleanup coroutine so the caller can close the
+    # sessions when the turn ends.
+    mcp_tools, mcp_cleanup = await build_mcp_tools(
+        state.get("mcp_servers") or {}, lambda ev: queue.put_nowait(ev)
+    )
+    for t in mcp_tools:
+        filtered[t.name] = t.func
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
     # image directly to the main model, otherwise the model could never see it.
@@ -1042,10 +1055,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     except Exception:
         pass
 
-    # Convert the mode-filtered fns to LangChain StructuredTools.
+    # Convert the mode-filtered fns to LangChain StructuredTools. MCP tools are
+    # already StructuredTools (built in build_mcp_tools), so they pass through.
     lc_tools = [
-        StructuredTool.from_function(func=fn, name=name, description=(fn.__doc__ or name))
-        for name, fn in filtered.items()
+        t if isinstance(t, StructuredTool) else
+        StructuredTool.from_function(func=t, name=name, description=(t.__doc__ or name))
+        for name, t in filtered.items()
     ]
 
     return {
@@ -1062,6 +1077,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "vision_model": vision_model,
         "main_model": model,
         "prompt": prompt,
+        "mcp_cleanup": mcp_cleanup,
     }
 
 
@@ -1554,6 +1570,7 @@ async def _run_mode_turn(
     model_id = getattr(model, "model_name", None) or state.get("model_name", "")
     lc_tools = tctx["lc_tools"]
     filtered = tctx["tools"]
+    mcp_cleanup = tctx.get("mcp_cleanup")
     messages: list[BaseMessage] = list(tctx["messages"])
     # Compact model used for in-turn tool-history compaction (spec §10). May be
     # None when the user hasn't configured a compact/subagent model — in that
@@ -1890,48 +1907,57 @@ async def _run_mode_turn(
     # without burning the retry budget.
     reply = ""
     attempt = 0
-    while True:
-        attempt += 1
-        try:
-            reply = await _inner()
-            break
-        except Exception as exc:  # noqa: BLE001
-            # A client abort (CancelledError) means the user closed the stream —
-            # do NOT retry or emit an error event (it would never be read anyway,
-            # since the SSE socket is already torn down). Just stop cleanly.
-            if isinstance(exc, asyncio.CancelledError):
+    try:
+        while True:
+            attempt += 1
+            try:
+                reply = await _inner()
                 break
-            # Hard, non-recoverable failures: don't retry (would fail identically).
-            if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
-                queue.put_nowait(
-                    {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
-                )
-                break
-            # Transient failure: retry up to the budget, 30s apart.
-            if attempt >= _agents._RETRY_MAX_ATTEMPTS:
+            except Exception as exc:  # noqa: BLE001
+                # A client abort (CancelledError) means the user closed the stream —
+                # do NOT retry or emit an error event (it would never be read anyway,
+                # since the SSE socket is already torn down). Just stop cleanly.
+                if isinstance(exc, asyncio.CancelledError):
+                    break
+                # Hard, non-recoverable failures: don't retry (would fail identically).
+                if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
+                    queue.put_nowait(
+                        {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
+                    )
+                    break
+                # Transient failure: retry up to the budget, 30s apart.
+                if attempt >= _agents._RETRY_MAX_ATTEMPTS:
+                    queue.put_nowait(
+                        {
+                            "kind": "retry_giveup",
+                            "attempt": attempt,
+                            "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
+                            "reason": _agents._friendly_retry_reason(exc),
+                        }
+                    )
+                    break
+                delay = _agents._RETRY_BASE_SECONDS
+                if not isinstance(delay, (int, float)) or delay < 0:
+                    delay = 30
                 queue.put_nowait(
                     {
-                        "kind": "retry_giveup",
+                        "kind": "retry",
                         "attempt": attempt,
                         "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
+                        "delay": delay,
                         "reason": _agents._friendly_retry_reason(exc),
                     }
                 )
-                break
-            delay = _agents._RETRY_BASE_SECONDS
-            if not isinstance(delay, (int, float)) or delay < 0:
-                delay = 30
-            queue.put_nowait(
-                {
-                    "kind": "retry",
-                    "attempt": attempt,
-                    "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
-                    "delay": delay,
-                    "reason": _agents._friendly_retry_reason(exc),
-                }
-            )
-            await asyncio.sleep(delay)
-            continue
+                await asyncio.sleep(delay)
+                continue
+    finally:
+        # Close every opened MCP session so stdio subprocesses / HTTP
+        # connections don't leak across turns.
+        if mcp_cleanup is not None:
+            try:
+                await mcp_cleanup()
+            except Exception:  # noqa: BLE001
+                pass
     # opencode-style proactive auto-compaction: once the conversation reaches the
     # usable window, summarize the older turns and tell the frontend to fold.
     if reply and ctx and ctx > 0:
@@ -2263,14 +2289,7 @@ def _should_skip_read(rel: str) -> bool:
     return ext in _SKIP_READ_EXTS
 
 _STOPWORDS = set(
-    """
-    what where which when how does the and for with that this from into your you
-    are is it of to a an do i we they file files code function class mode plan
-    ask use using need want find search show list explain describe trace
-    understand investigate look looking who why can could should would may
-    might repo repository project inside their our its as at by be been has have
-    had will would not no yes
-    """.split()
+    ["what", "where", "which", "when", "how", "does", "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "is", "it", "of", "to", "a", "an", "do", "i", "we", "they", "file", "files", "code", "function", "class", "mode", "plan", "ask", "use", "using", "need", "want", "find", "search", "show", "list", "explain", "describe", "trace", "understand", "investigate", "look", "looking", "who", "why", "can", "could", "should", "would", "may", "might", "repo", "repository", "project", "inside", "their", "our", "its", "as", "at", "by", "be", "been", "has", "have", "had", "will", "would", "not", "no", "yes"]
 )
 
 
@@ -2311,7 +2330,7 @@ def _strip_skill_mentions(prompt: str, skills: list[str] | None) -> str:
                 for sep in (" ", ", ", "-", "_"):
                     phrases.add(sep.join(perm))
 
-    def _at(m: "re.Match") -> str:
+    def _at(m: re.Match) -> str:
         tok = m.group(1).lower()
         if tok in lowered:
             return " "
@@ -3070,7 +3089,7 @@ def _read_context_files(read_context: str) -> set[str]:
 _REFERENCE_CUES = re.compile(
     r"ببین|نشون بده|نمایش بده|اون فایل|همون فایل|آن فایل|"
     r"look at it|that file|this file|show me|show it|open it",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -3087,7 +3106,7 @@ def _has_reference_cue(text: str) -> bool:
 # _ASK_REPO_CUES from routing a no-op follow-up into an empty re-explore.
 _FOLLOWUP_CUES = re.compile(
     r"look at|the paths|mentioned|refer|همون|اون|گفتی|ببین|نشون بده",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -3266,14 +3285,14 @@ async def plan_build(state: AgentState) -> dict:
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
     if reply.strip():
-        from tools import slugify, _self_check_plan_paths
+        from tools import _self_check_plan_paths, slugify
 
         ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
         plan_body = _normalize_plan_reply(reply)
         plan_body, check_note = _self_check_plan_paths(state["root"], plan_body)
         try:
             state_db.save_plan(ws, "plan", plan_body, chat_id=state.get("chat_id", ""))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Surface the failure instead of swallowing it: a silent drop is
             # exactly the "plan sometimes isn't saved" bug.
             logging.getLogger(__name__).exception(
@@ -3462,7 +3481,7 @@ _ASK_REPO_CUES = re.compile(
     r"codebase|source code|component|"
     r"کجا|پیدا کن|کدوم تابع|کدوم فانکشن|کدوم کلاس|کدوم ماژول|"
     r"پیاده سازی|چطور کار|کامپوننت",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -3472,5 +3491,5 @@ _MEMORY_RECALL_CUES = re.compile(
     r"از مموری|مموری|در حافظه|یادآوری|حافظه|"
     r"look in memory|from memory|search memory|check memory|what.?s in memory|"
     r"recall|remember",
-    re.I,
+    re.IGNORECASE,
 )

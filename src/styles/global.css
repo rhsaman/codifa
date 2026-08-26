@@ -631,6 +631,51 @@ textarea {
     background 0.12s;
 }
 
+/* Multi-select checkbox on each chat — hidden until hover/selection so the
+   list stays clean, but always reachable for bulk delete. */
+.chat-select-checkbox {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0 2px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.chat-item:hover .chat-select-checkbox,
+.chat-item.selected .chat-select-checkbox {
+  opacity: 1;
+}
+.chat-item.selected {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+}
+
+/* Bulk-delete button shown in a workspace header once chats are selected. */
+.group-bulk-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+}
+.group-delete-selected {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg));
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  transition: background 0.12s, border-color 0.12s;
+}
+.group-delete-selected:hover {
+  background: color-mix(in srgb, var(--danger) 22%, var(--bg));
+}
+
 .chat-item:hover .chat-item-kebab,
 .chat-item.active .chat-item-kebab,
 .chat-item-kebab-wrap:hover .chat-item-kebab,
@@ -923,13 +968,28 @@ textarea {
 .sidebar-group-count {
   flex: 0 0 auto;
   font-size: 10.5px;
-  font-weight: 600;
-  color: var(--text-dim);
-  background: var(--bg-input);
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
   border-radius: 999px;
-  padding: 1px 7px;
+  padding: 2px 7px;
   min-width: 20px;
   text-align: center;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.sidebar-group.ws-colored .sidebar-group-count {
+  color: var(--ws);
+  background: color-mix(in srgb, var(--ws) 14%, var(--bg-input));
+  border-color: color-mix(in srgb, var(--ws) 28%, transparent);
+  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--ws) 30%, transparent);
+}
+.sidebar-group-count[data-selected="true"] {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-input));
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
 .color-backdrop {
@@ -1365,9 +1425,19 @@ textarea {
   text-align: right;
 }
 
+/* Second line under the per-model total: fresh (🔥) and cached (⚡) badges sit
+   side by side in one row instead of stacking on their own lines, so a model
+   with both never grows to three cramped rows. */
+.sidebar-usage-breakdown {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 /* Cached (prompt-cache) tokens, shown next to the real token count. Used both
    inline (grand total / group total: "1.2k · ⚡300") and inside the per-model
-   tokens column where it stacks beneath the real count. */
+   tokens column where it sits next to the fresh badge on the second line. */
 .sidebar-usage-cache,
 .sidebar-usage-grand-cache {
   font-variant-numeric: tabular-nums;
@@ -1379,6 +1449,19 @@ textarea {
 
 .sidebar-usage-cache {
   font-size: 0.82em;
+}
+
+/* Freshly-processed (non-cached) tokens — same placement pattern as the
+   cached badge above but in --fresh (peach) so the two are never confused at
+   a glance. Only shown inline on the per-model row (header/group totals keep
+   the fresh figure in a tooltip instead, to avoid crowding the pill). */
+.sidebar-usage-fresh {
+  font-variant-numeric: tabular-nums;
+  color: var(--fresh);
+  opacity: 0.85;
+  font-weight: 600;
+  font-size: 0.82em;
+  white-space: nowrap;
 }
 
 .sidebar-usage-cost {

@@ -122,6 +122,9 @@ def _is_repeating(
 # Thinking level -> the downstream "reasoning effort" token. '' / 'none' mean
 # reasoning is disabled. LangChain forwards these through model_kwargs to the
 # OpenAI-compatible endpoint (OpenAI o1/o3, OpenRouter, DeepSeek-reasoner, ...).
+# LangChain's ChatOpenAI only accepts the OpenAI-standard effort tokens
+# (minimal / low / medium / high). 'xhigh' is NOT a valid value and 400s on
+# OpenAI-family models, so it is intentionally omitted here.
 _THINKING_LEVELS = {
     "": None,
     "none": False,
@@ -129,7 +132,6 @@ _THINKING_LEVELS = {
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "xhigh",
 }
 
 
@@ -219,12 +221,26 @@ def _extra_headers(provider: str, base_url: str, cache: bool) -> dict[str, str]:
     return headers
 
 
-def _thinking_kwargs(provider: str, model: str, thinking_level: str) -> dict[str, Any]:
-    """Return ``model_kwargs`` carrying the reasoning effort, or {} when off."""
+def _thinking_kwargs(
+    provider: str,
+    model: str,
+    thinking_level: str,
+    model_reasoning: bool = False,
+) -> dict[str, Any]:
+    """Return ``model_kwargs`` carrying the reasoning effort, or {} when off.
+
+    The reasoning effort is sent when EITHER:
+      * the provider is a cloud gateway flagged ``auto_think`` (OpenRouter,
+        opencode, NVIDIA, Cloudflare, TokenRouter), OR
+      * the selected model is explicitly reasoning-capable (``model_reasoning``
+        True) — this covers local/custom providers (ollama ``deepseek-r1``,
+        a custom OpenAI-compatible endpoint running a reasoning model) that
+        don't carry the cloud ``auto_think`` flag.
+    """
     level = _THINKING_LEVELS.get((thinking_level or "").strip())
     if level is None or level is False:
         return {}
-    if not _provider_meta(provider).get("auto_think"):
+    if not (_provider_meta(provider).get("auto_think") or model_reasoning):
         return {}
     # deepseek-reasoner / deepseek-r1 expose reasoning via `reasoning_effort`.
     # Other auto-think gateways (openrouter/openai) accept the same field with
@@ -243,6 +259,7 @@ def build_chat_model(
     temperature: float = 0.0,
     max_tokens: int = 0,
     thinking_level: str = "",
+    model_reasoning: bool = False,
     timeout: float = 0,
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
@@ -250,6 +267,12 @@ def build_chat_model(
     Mirrors ``providers.build_model``'s resolution (qualify id, credential
     chain, UA spoof, reasoning) but returns a ``BaseChatModel`` instead of a
     pydantic-ai ``Model``.
+
+    ``model_reasoning`` is the per-model capability flag (from the provider's
+    ``/models`` ``reasoning`` field). It lets local / custom providers that
+    don't carry the cloud ``auto_think`` flag still receive a reasoning effort
+    when the selected model is known to support reasoning (e.g. ollama's
+    ``deepseek-r1``).
     """
     if not model:
         raise ProviderError("no model selected")
@@ -270,7 +293,7 @@ def build_chat_model(
     # passing an `httpx.Timeout` object is silently ignored, leaving the request
     # with no timeout (it hangs until the client gives up). Use the scalar total.
     lc_timeout = timeout or 300
-    tkwargs = _thinking_kwargs(provider, model, thinking_level)
+    tkwargs = _thinking_kwargs(provider, model, thinking_level, model_reasoning)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
     if meta.get("parallel_calls"):
         tkwargs["parallel_tool_calls"] = True
@@ -289,6 +312,17 @@ def build_chat_model(
     if model_class == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
+        # Gemini doesn't accept OpenAI's `reasoning_effort`; it uses a numeric
+        # `thinking_budget` (tokens). Map the same effort levels to budgets so
+        # the UI's thinking slider actually steers Gemini reasoning depth.
+        # (Gemini 2.5+ exposes thinking; older models ignore the field.)
+        google_thinking: dict[str, int] = {
+            "minimal": 1024,
+            "low": 4096,
+            "medium": 12288,
+            "high": 32768,
+        }
+        thinking_budget = google_thinking.get((thinking_level or "").strip())
         return ChatGoogleGenerativeAI(
             model=model.removeprefix("models/") or model,
             google_api_key=key or None,
@@ -296,6 +330,7 @@ def build_chat_model(
             max_output_tokens=max_tokens or None,
             streaming=True,
             timeout=to if isinstance(to, (int, float)) else None,
+            thinking_budget=thinking_budget,
         )
 
     lc_kwargs: dict[str, Any] = {

@@ -818,6 +818,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         temperature=settings["temperature"],
         max_tokens=settings["max_tokens"],
         thinking_level=settings["thinking_level"],
+        model_reasoning=state.get("model_reasoning", False),
         timeout=model_timeout_for(state),
     )
 

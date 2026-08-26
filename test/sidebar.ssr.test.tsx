@@ -31,11 +31,11 @@
 ;(globalThis as any).openExternal = async () => {}
 
 const { renderToString } = await import("react-dom/server")
-// Import useStore from Sidebar itself so esbuild collapses both the test's
-// import and Sidebar's internal "../lib/store" import to ONE module instance.
-// (Sidebar re-exports useStore.) Seed BEFORE importing Sidebar so the store
-// snapshot the component reads during renderToString already has the chats.
+const { Sidebar } = await import("../src/components/Sidebar")
 const { useStore } = await import("../src/lib/store")
+
+// Seed the store state before rendering. Zustand reads the live state at
+// render time, so setState() before renderToString drives the SSR output.
 useStore.setState({
   workspaces: [{ key: "/demo", label: "Demo", root: "/demo", color: "#4f8" }],
   chats: [
@@ -44,8 +44,7 @@ useStore.setState({
   ],
   pinnedWorkspaces: [],
   pinnedChats: [],
-} as any)
-const { Sidebar } = await import("../src/components/Sidebar")
+})
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -94,9 +93,19 @@ console.log("۲) تیک‌زدن چندتایی چت‌ها و حذف یک‌ج�
     "دکمهٔ حذف یک‌جا در حالت پیش‌فرض رندر نمی‌شود",
     !html.includes("group-delete-selected"),
   )
-  // The chat-count badge was intentionally removed per user request, so it must
-  // NOT render in the default state.
-  check("بج تعداد چت‌ها دیگر رندر نمی‌شود", !html.includes("sidebar-group-count"))
+  // The chat-count badge renders the group's chat count (2 for the seeded demo
+  // workspace) and is NOT in the selected state by default.
+  const countMatch = html.match(/sidebar-group-count[^>]*>(\d+)</)
+  check("بج تعداد چت‌ها رندر می‌شود", html.includes("sidebar-group-count"))
+  check(
+    "بج تعداد چت‌ها برابر با تعداد چت‌های گروه است (۲)",
+    countMatch ? countMatch[1] === "2" : false,
+    countMatch?.[1],
+  )
+  check(
+    "در حالت پیش‌فرض data-selected روی false است",
+    html.includes('data-selected="false"'),
+  )
 }
 
 if (failed > 0) {

@@ -36,7 +36,6 @@ export type ThinkingLevel =
   | 'low'
   | 'medium'
   | 'high'
-  | 'xhigh'
 
 /** Transport type for an MCP tool connector. */
 export type McpTransport = 'stdio' | 'http' | 'sse'

@@ -93,7 +93,6 @@ const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
   ["low", "Low"],
   ["medium", "Medium"],
   ["high", "High"],
-  ["xhigh", "Extra high"],
 ];
 const THINKING_LABELS = Object.fromEntries(THINKING_OPTIONS) as Record<
   ThinkingLevel,
@@ -106,7 +105,6 @@ const THINKING_DESCS: Record<ThinkingLevel, string> = {
   low: "Light reasoning — faster replies",
   medium: "Balanced reasoning — default",
   high: "Deep reasoning — better answers",
-  xhigh: "Maximum effort — best answers",
 };
 
 const COMMANDS: Array<{ name: string; hint: string }> = [

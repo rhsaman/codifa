@@ -968,6 +968,9 @@ _MAX_STEPS_PROMPT = (
 # the most effective way to keep a reasoning model from flooding a small context
 # window with thinking tokens and getting cut off. '' (legacy clients) falls
 # back to the provider default / auto-inject behavior.
+# LangChain's ChatOpenAI only accepts the OpenAI-standard effort tokens
+# (minimal / low / medium / high). 'xhigh' is NOT a valid value and 400s on
+# OpenAI-family models, so it is intentionally omitted here.
 _THINKING_LEVELS = {
     "": None,
     "none": False,
@@ -975,7 +978,6 @@ _THINKING_LEVELS = {
     "low": "low",
     "medium": "medium",
     "high": "high",
-    "xhigh": "xhigh",
 }
 
 # HTTP status codes that are worth retrying (transient server / rate-limit).

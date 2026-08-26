@@ -144,6 +144,18 @@ export function contextPercent(
 }
 
 /**
+ * Decide whether the context meter should show its warning (yellow) state.
+ *
+ * Warn when the used context reaches the usable window (`window - reserved`),
+ * i.e. the SAME point where backend auto-compaction fires — NOT at a fixed
+ * percentage of the raw window. `usable` may be null when the window is unknown.
+ */
+export function contextWarn(used: number, usable: number | null): boolean {
+  if (usable == null || usable <= 0) return false
+  return used >= usable
+}
+
+/**
  * Resolve the context-meter token count shown in the sidebar.
  *
  * The meter must show the TRUE context sent to the model this turn — the full

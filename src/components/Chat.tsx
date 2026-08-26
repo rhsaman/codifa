@@ -22,6 +22,8 @@ import {
   formatTokens,
   formatTokensK,
   modelContextWindow,
+  scaleReserved,
+  contextWarn,
   modelReasoning,
   priceForModel,
   computeUsageCost,
@@ -1116,6 +1118,13 @@ export function ChatPanel() {
   // still used by the backend to trigger auto-compaction, but the meter itself
   // is raw — so we pass no `reserved` here.
   const ctxPct = contextPercent(contextUsed, ctxWindow);
+
+  // Warn (yellow) when used context reaches the usable window
+  // (`window - reserved`) — the same point where backend auto-compaction fires
+  // — not at a fixed percentage of the raw window.
+  const reserved =
+    ctxWindow != null ? scaleReserved(ctxWindow, settings.compactHeadroom ?? 20000) : 0
+  const usable = ctxWindow != null ? Math.max(0, ctxWindow - reserved) : null
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -3048,10 +3057,10 @@ export function ChatPanel() {
               {activeModel || "no model"}
             </span>
             <span
-              className={`badge context-meter${ctxPct !== null && ctxPct >= 70 ? " warn" : ""}`}
+              className={`badge context-meter${contextWarn(contextUsed, usable) ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). Auto-compaction fires separately on the usable window (window minus the compaction headroom).`
+                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the usable window (${formatTokens(usable ?? 0)} tokens = window minus the ${formatTokens(reserved)}-token compaction headroom) — the same point where auto-compaction fires.`
                   : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
               }
               dir="ltr"

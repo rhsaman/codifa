@@ -120,3 +120,28 @@ async def test_old_threshold_would_have_blocked_serial_searches(run_events, mock
     )
     # Restore the real threshold for any later test.
     agents._AUTO_EXPLORE_THRESHOLD = 8
+
+
+from unittest import mock
+
+
+def test_broad_path_with_many_files_is_routed():
+    """A `path` no longer dodges detection: if the scope actually holds more
+    than _BROAD_FILE_COUNT files, even a scoped grep is treated as broad and
+    routed to explore on the FIRST call (no waiting for the counter)."""
+    with mock.patch(
+        "agents._walk_files", return_value=[f"f{i}.py" for i in range(200)]
+    ):
+        assert agents._is_broad_search("grep", {"pattern": "foo", "path": "src"}) is True
+
+
+def test_small_path_not_broad():
+    with mock.patch("agents._walk_files", return_value=["agents.py"]):
+        assert (
+            agents._is_broad_search("grep", {"pattern": "foo", "path": "backend/agents.py"})
+            is False
+        )
+
+
+def test_bare_grep_still_broad():
+    assert agents._is_broad_search("grep", {"pattern": "foo"}) is True

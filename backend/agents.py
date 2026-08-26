@@ -43,6 +43,7 @@ from tools import (
     _SUB_AGENT_CTX,
     LOG_FILENAME,
     PathEscapeError,
+    _walk_files,
     list_files,
     read_file,
     resolve_safe,
@@ -555,6 +556,10 @@ _SEARCH_CALL_COUNT_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
 _AUTO_EXPLORE_THRESHOLD = 8
 # Web lookups are expensive (network + context); allow fewer before routing.
 _AUTO_EXPLORE_WEB_THRESHOLD = 1
+# A scope whose file count exceeds this is treated as broad even when `path`
+# is given (catches "path=src" wrapping a huge tree). _walk_files is cached
+# (10s TTL), so counting is essentially free.
+_BROAD_FILE_COUNT = 100
 
 # Tools covered by the auto-router (repo search + web/document lookups).
 _AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
@@ -569,7 +574,14 @@ def _reset_search_call_count() -> None:
 
 def _is_broad_search(tool_name: str, kwargs: dict) -> bool:
     """Return True when a single call is objectively a BROAD / expensive search
-    that belongs in the isolated explore context rather than inline."""
+    that belongs in the isolated explore context rather than inline.
+
+    A bare grep/glob (no path/include) is always broad. Additionally, even when
+    a `path` is given, if the scope actually contains more than
+    ``_BROAD_FILE_COUNT`` files we treat it as broad — this catches models
+    wrapping a huge tree in a token `path="src"` to dodge detection. File
+    counting reuses the cached ``_walk_files`` so it costs almost nothing.
+    """
     if tool_name == "glob":
         pattern = str(kwargs.get("pattern") or "")
         include = str(kwargs.get("include") or kwargs.get("path") or "")
@@ -579,7 +591,17 @@ def _is_broad_search(tool_name: str, kwargs: dict) -> bool:
         path = str(kwargs.get("path") or "").strip()
         include = str(kwargs.get("include") or "").strip()
         # Repo-wide grep (no path AND no include) scans everything -> broad.
-        return (not path) and (not include)
+        if not path and not include:
+            return True
+        if path:
+            try:
+                if len(_walk_files(path)) > _BROAD_FILE_COUNT:
+                    return True
+            except OSError:
+                # Unreadable/invalid path: fall back to the conservative rule
+                # (don't block a possibly-valid scoped search).
+                return False
+        return False
     # read / web_search / fetch_url are targeted by nature; broadness is judged
     # by repetition (handled by the counter), not by a single call's shape.
     return False

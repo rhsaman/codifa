@@ -63,13 +63,22 @@ SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compac
 _parent_search_cache: dict[tuple[str, str, str, str], str] = {}
 
 
-def _invalidate_read_cache_for(path: str) -> None:
+def _invalidate_read_cache_for(path: str, root: str) -> None:
     """Drop any cached read_tool result for ``path`` (any offset/limit).
 
     Called after edit_file/write_file so a re-read reflects new content
-    instead of returning stale cached bytes. Keyed by ("read", path, offset, limit).
+    instead of returning stale cached bytes. Keyed by the normalized
+    absolute path ("read", target, offset, limit) — see ``_read_target`` —
+    so invalidation matches regardless of how the model spelled the path
+    (``src/main.py`` vs ``./src/main.py`` vs an absolute path under root).
     """
-    stale = [k for k in _parent_search_cache if k[0] == "read" and k[1] == path]
+    try:
+        norm = resolve_safe(root, path, allow_coder=True)
+    except PathEscapeError:
+        # Path escapes the sandbox: read_tool never cached it, so there is
+        # nothing to invalidate.
+        return
+    stale = [k for k in _parent_search_cache if k[0] == "read" and k[1] == norm]
     for k in stale:
         del _parent_search_cache[k]
 
@@ -2874,7 +2883,7 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
-        _invalidate_read_cache_for(path)
+        _invalidate_read_cache_for(path, root)
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -3329,7 +3338,7 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
-        _invalidate_read_cache_for(path)
+        _invalidate_read_cache_for(path, root)
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
@@ -3409,7 +3418,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # agent to narrow the search or read files.
         lines: list[str] = []
         total = 0
-        for shown, m in enumerate(matches, start=1):
+        for shown, m in enumerate(matches):
             if shown >= max_results:
                 break
             ctx_lines = m.get("context_lines") or []
@@ -3607,10 +3616,19 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         notes, directory listing) — batch just calls this once per path
         concurrently instead of the caller looping one read_tool call at a
         time."""
-        # Cache keyed by (tool, path, offset, limit). A re-read of the same
-        # region (the standard post-edit pattern) returns the cached bytes
-        # instead of re-scanning the file — no CPU cost, just a cache hit.
-        cache_key = ("read", filePath, str(offset), str(limit))
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("read", msg))
+            return f"ERROR reading {filePath}: {msg}"
+        # Cache keyed by the normalized absolute path (tool, target, offset,
+        # limit). A re-read of the same region (the standard post-edit pattern)
+        # returns the cached bytes instead of re-scanning the file — no CPU
+        # cost, just a cache hit. Normalizing means the key matches regardless
+        # of how the model spelled the path, and lines up with the key
+        # _invalidate_read_cache_for() computes after edit/write.
+        cache_key = ("read", target, str(offset), str(limit))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -3622,12 +3640,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 }
             )
             return cached
-        try:
-            target = resolve_safe(root, filePath, allow_coder=True)
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit(_error_result("read", msg))
-            return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
             raw = await _read_dir_tool(target, filePath, offset, limit, _main_name)
             _parent_search_cache[cache_key] = raw

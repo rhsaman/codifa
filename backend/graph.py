@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypedDict
 
@@ -65,7 +66,7 @@ from llm import (
     llm_generate,
 )
 from mcp_bridge import build_mcp_tools
-from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
+from tools import _PARENT_TOOLS_CTX, make_tool_callbacks, _tool_event
 
 MAX_DEBUG_ATTEMPTS = 3
 
@@ -1000,7 +1001,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             if learned_memory:
                 system_final += learned_memory
                 queue.put_nowait(
-                    _agents._tool_event(
+                    _tool_event(
                         {
                             "kind": "tool",
                             "tool": "search_memory",
@@ -3878,6 +3879,19 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
         try:
             async for _ in graph.astream(initial, stream_mode="updates"):
                 pass
+        except Exception as _exc:  # noqa: BLE001 — surface the real failure
+            # Never swallow the error silently: a bare `queue.put(None)` would
+            # end the stream with NO error event, so the frontend sees a sudden
+            # "disconnect" (the message just cuts off) instead of a real error
+            # it can show as a Retry banner. This is the root cause of the
+            # intermittent "first/any message disconnects instantly" reports.
+            traceback.print_exc()
+            await queue.put(
+                {
+                    "kind": "error",
+                    "content": f"agent crashed before producing output: {_exc!r}",
+                }
+            )
         finally:
             await queue.put(None)
 

@@ -422,6 +422,45 @@ async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_read_cache_invalidates_across_path_spellings(tmp_path):
+    """Invalidation must match regardless of how the model spells the path.
+
+    The read cache is keyed by the normalized absolute path, so editing the
+    same file via a different spelling (e.g. ``./a.py`` instead of ``a.py``)
+    must still drop the cached entry — otherwise a re-read would return stale
+    bytes. This guards the latent bug where a raw-string key would miss the
+    mismatch and serve old content after an edit.
+    """
+    f = tmp_path / "a.py"
+    f.write_text("alpha\nbeta\n")
+    root = str(tmp_path)
+
+    captured = []
+
+    def emit(event):
+        captured.append(event)
+
+    cbs = tools.make_tool_callbacks(root, emit)
+    read = cbs["read"]
+    edit_file = cbs["edit_file"]
+
+    r1 = await read(filePath="a.py")
+    assert "1 | alpha" in r1
+    # Same path, different spelling -> must still hit the cache (same normalized key).
+    r2 = await read(filePath="./a.py")
+    assert r1 == r2
+    assert any(
+        e.get("kind") == "tool_result" and e.get("summary") == "cached" for e in captured
+    )
+
+    # Edit using the alternate spelling -> cache must be invalidated.
+    await edit_file(path="./a.py", old_string="alpha", new_string="ALPHA")
+    r3 = await read(filePath="a.py")
+    assert "1 | ALPHA" in r3
+    assert r3 != r1
+
+
+@pytest.mark.asyncio
 async def test_read_dir_paginated_footer(tmp_path):
     for i in range(5):
         (tmp_path / f"f{i}.py").write_text("x\n")

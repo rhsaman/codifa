@@ -31,15 +31,11 @@
 ;(globalThis as any).openExternal = async () => {}
 
 const { renderToString } = await import("react-dom/server")
-// Import useStore from the store module directly (the SAME physical file the
-// Sidebar component imports via "../lib/store"). esbuild resolves both
-// "../src/lib/store" (from the test) and "../lib/store" (from Sidebar) to the
-// same module ONLY when we alias them — see run-frontend.sh. This guarantees we
-// mutate the exact store instance the SSR render sees (no dual-module copies).
+// Import useStore from Sidebar itself so esbuild collapses both the test's
+// import and Sidebar's internal "../lib/store" import to ONE module instance.
+// (Sidebar re-exports useStore.) Seed BEFORE importing Sidebar so the store
+// snapshot the component reads during renderToString already has the chats.
 const { useStore } = await import("../src/lib/store")
-const { Sidebar } = await import("../src/components/Sidebar")
-
-// Seed the real zustand store so the SSR snapshot picks up the workspace + chats.
 useStore.setState({
   workspaces: [{ key: "/demo", label: "Demo", root: "/demo", color: "#4f8" }],
   chats: [
@@ -49,6 +45,7 @@ useStore.setState({
   pinnedWorkspaces: [],
   pinnedChats: [],
 } as any)
+const { Sidebar } = await import("../src/components/Sidebar")
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {

@@ -98,6 +98,25 @@ async def test_counter_resets_per_turn():
     assert out == "DIRECT"
 
 
+async def test_counter_persists_across_calls_without_reset():
+    """The counter is NOT reset between model turns within one user message.
+
+    Without an explicit reset, repeated calls keep accumulating past the
+    threshold and stay routed — this is what fixes the "wait one-by-one" pattern
+    where the router would otherwise block after a few searches in a single
+    message (the counter used to be reset on every _run_mode_turn).
+    """
+    tool = _wrap("grep")
+    for _ in range(_AUTO_EXPLORE_THRESHOLD):
+        assert await tool(pattern="x", path="src", include="*.py") == "DIRECT"
+    # Past the threshold -> routed.
+    out = await tool(pattern="x", path="src", include="*.py")
+    assert "explore" in out and out != "DIRECT"
+    # No reset between calls -> still routed on the next call.
+    out2 = await tool(pattern="y", path="src", include="*.py")
+    assert "explore" in out2 and out2 != "DIRECT"
+
+
 async def test_subagent_tools_run_directly_even_when_broad():
     """The explore sub-agent must never route its own searches back to itself.
 

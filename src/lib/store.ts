@@ -795,16 +795,13 @@ export const useStore = create<State>((set, get) => ({
     loadedSettings.mcpServers = mergedMcp
     const builtins = (dbMcp.builtins ?? []).filter((n) => mergedMcp[n])
 
-    // First run / nothing explicitly enabled yet → turn on built-in connectors
-    // (e.g. Docker) by default. Once the user has configured mcpEnabled, we
-    // respect their explicit on/off choices and stop overriding it.
+    // Respect the user's explicit on/off choices for MCP connectors. Built-in
+    // connectors (e.g. Docker) default to OFF — the user turns them on via the
+    // composer chip or Settings → MCP. We never auto-enable them.
     const userEnabled = raw.mcpEnabled
     const enabledSet = new Set(
       Array.isArray(userEnabled) ? userEnabled.filter((n: string) => !!mergedMcp[n]) : [],
     )
-    if (!Array.isArray(userEnabled) || userEnabled.length === 0) {
-      for (const b of builtins) enabledSet.add(b)
-    }
     loadedSettings.mcpEnabled = [...enabledSet]
 
     // Rows for removed engines (e.g. Google Custom Search, sunset by Google) are
@@ -1055,9 +1052,9 @@ export const useStore = create<State>((set, get) => ({
   addMcpServer: (name, cfg) => {
     set((s) => {
       const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
-      const cur = s.settings.mcpEnabled ?? []
-      const mcpEnabled = cur.includes(name) ? cur : [...cur, name]
-      return { settings: { ...s.settings, mcpServers, mcpEnabled } }
+      // New connectors default to OFF — the user turns them on via the composer
+      // chip or Settings → MCP. We never auto-enable.
+      return { settings: { ...s.settings, mcpServers } }
     })
     get().persist()
     void saveMcp(name, cfg)
@@ -1066,9 +1063,7 @@ export const useStore = create<State>((set, get) => ({
   updateMcpServer: (name, cfg) => {
     set((s) => {
       const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
-      const cur = s.settings.mcpEnabled ?? []
-      const mcpEnabled = cur.includes(name) ? cur : [...cur, name]
-      return { settings: { ...s.settings, mcpServers, mcpEnabled } }
+      return { settings: { ...s.settings, mcpServers } }
     })
     get().persist()
     void saveMcp(name, cfg)

@@ -62,6 +62,17 @@ SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compac
 # (tool, pattern, path, include).
 _parent_search_cache: dict[tuple[str, str, str, str], str] = {}
 
+
+def _invalidate_read_cache_for(path: str) -> None:
+    """Drop any cached read_tool result for ``path`` (any offset/limit).
+
+    Called after edit_file/write_file so a re-read reflects new content
+    instead of returning stale cached bytes. Keyed by ("read", path, offset, limit).
+    """
+    stale = [k for k in _parent_search_cache if k[0] == "read" and k[1] == path]
+    for k in stale:
+        del _parent_search_cache[k]
+
 # Sub-agent model calls (web distiller)
 # share the parent turn's retry policy so a free-tier rate limit or connection
 # blip on the gateway retries the sub-agent instead of failing the whole turn
@@ -2939,6 +2950,9 @@ def make_tool_callbacks(
                 "summary": f"{len(content)} chars",
             }
         )
+        # Invalidate any cached read_tool result for this path so a re-read
+        # reflects the new content instead of returning stale cached bytes.
+        _invalidate_read_cache_for(path)
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -3391,6 +3405,9 @@ def make_tool_callbacks(
         emit(
             {"kind": "tool_result", "tool": "edit_file", "summary": f"+{adds}/-{dels}"}
         )
+        # Invalidate any cached read_tool result for this path so a re-read
+        # reflects the new content instead of returning stale cached bytes.
+        _invalidate_read_cache_for(path)
         verify_note = await asyncio.to_thread(verify_edit, root, path)
         return (
             f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
@@ -3668,6 +3685,21 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         notes, directory listing) — batch just calls this once per path
         concurrently instead of the caller looping one read_tool call at a
         time."""
+        # Cache keyed by (tool, path, offset, limit). A re-read of the same
+        # region (the standard post-edit pattern) returns the cached bytes
+        # instead of re-scanning the file — no CPU cost, just a cache hit.
+        cache_key = ("read", filePath, str(offset), str(limit))
+        cached = _parent_search_cache.get(cache_key)
+        if cached is not None:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": "cached",
+                    "model": _main_name,
+                }
+            )
+            return cached
         try:
             target = resolve_safe(root, filePath, allow_coder=True)
         except PathEscapeError as exc:
@@ -3676,6 +3708,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             return f"ERROR reading {filePath}: {msg}"
         if os.path.isdir(target):
             raw = await _read_dir_tool(target, filePath, offset, limit, _main_name)
+            _parent_search_cache[cache_key] = raw
             return raw
         if not os.path.exists(target):
             msg = "file not found"
@@ -3720,7 +3753,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "model": _main_name,
             }
         )
-        return f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+        raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+        _parent_search_cache[cache_key] = raw
+        return raw
 
     async def read_tool(
         filePath: str,

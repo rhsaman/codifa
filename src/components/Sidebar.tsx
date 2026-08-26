@@ -137,7 +137,7 @@ function buildGroups(
 
 export function Sidebar() {
   const chats = useStore((s) => s.chats);
-  if (typeof console !== "undefined") console.log("DBG sidebar chats:", chats.length, "ws:", useStore.getState().workspaces.length);
+  if (typeof console !== "undefined") console.log("DBG sidebar chats:", chats.length, "ws:", useStore.getState().workspaces.length, "getState.chats:", useStore.getState().chats.length);
   const workspaces = useStore((s) => s.workspaces);
   const activeChatId = useStore((s) => s.activeChatId);
   const workspaceColors = useStore((s) => s.workspaceColors);

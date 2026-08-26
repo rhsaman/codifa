@@ -543,20 +543,23 @@ def _wrap_no_search_bypass(fn: Callable):
 _SEARCH_CALL_COUNT_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
     "search_call_count", default=0
 )
-# Number of search/web calls in one turn after which the router treats the
-# agent as "flailing" and forces delegation to explore. Tunable.
-_AUTO_EXPLORE_THRESHOLD = 3
+# Number of search/web calls in one user message after which the router treats
+# the agent as "flailing" and forces delegation to explore. Tunable. Measured
+# across the whole user-message sequence (reset only at run_graph start), so a
+# single message that greps many times still trips the router instead of being
+# reset on every model turn.
+_AUTO_EXPLORE_THRESHOLD = 2
 # Web lookups are expensive (network + context); allow fewer before routing.
-_AUTO_EXPLORE_WEB_THRESHOLD = 2
+_AUTO_EXPLORE_WEB_THRESHOLD = 1
 
 # Tools covered by the auto-router (repo search + web/document lookups).
 _AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
 
 
 def _reset_search_call_count() -> None:
-    """Reset the per-turn search counter. Called by the pipeline at the start
-    of every model turn (filter_tools_for_mode) so the threshold is measured
-    per turn, not across the whole session."""
+    """Reset the search counter at the START of each user message (run_graph),
+    so the auto-router's "repeated calls" threshold is measured across the
+    whole user-message sequence, not reset on every model turn."""
     _SEARCH_CALL_COUNT_CTX.set(0)
 
 

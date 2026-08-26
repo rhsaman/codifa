@@ -64,7 +64,7 @@ AGENTS: dict[str, dict] = {
         "system": GENERAL_SYSTEM,
         # Hard step budget for this sub-agent (mirrors opencode's `agent.steps`).
         # None -> fall back to the caller's default max_steps.
-        "steps": 30,
+        "steps": 15,
     },
     "explore": {
         "name": "explore",

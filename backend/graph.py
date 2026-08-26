@@ -263,9 +263,6 @@ def filter_tools_for_mode(
     plan-mode persistence (handled by the plan_build node, not a tool), ask-mode drops (read/memory/trivial-prompt schemas),
     ``allow_create`` gating of skill/MCP creation, and file-scope stripping.
     """
-    # Reset the per-turn search counter so the auto-router's "repeated calls"
-    # threshold is measured per model turn (not across the whole session).
-    _agents._reset_search_call_count()
     cap = cap or {}
     _WEB = {"web_search", "fetch_url", "search_console"}
     has_cap = any(
@@ -3447,6 +3444,12 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     # Drop any stale captured ask_user answer for this chat from a previous run
     # so Part A re-exploration only fires for answers given in THIS run.
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
+    # Reset the cross-turn search counter at the START of each user message
+    # (not per model-turn), so the auto-router's "repeated calls" threshold is
+    # measured across the whole user-message sequence (coder→test→debug→coder),
+    # not reset on every _run_mode_turn. Fixes the "wait one-by-one" pattern
+    # where the router would block after a few searches within a single message.
+    _agents._reset_search_call_count()
     if not (initial.get("request") or "").strip():
         yield {"kind": "error", "content": "empty or whitespace-only prompt — refusing to run"}
         return

@@ -189,9 +189,13 @@ async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspa
 
     assert any(e.get("kind") == "error" for e in events), \
         "fatal 400 must surface as an error event (no raise)"
-    # No durable resume file is persisted on error (we don't learn on error).
+    # The durable resume file is KEPT on a hard error (not cleared) so a
+    # same-prompt retry can replay the already-done tool work instead of
+    # re-running it from scratch. See test_resume.py scenarios 2/5.
     resume = state_db.load_turn_resume(str(workspace), "pytest-chat")
-    assert resume is None, "no durable resume file should be written on error"
+    assert resume is not None, "resume file must survive a hard error for retry"
+    assert isinstance(resume.get("tools"), list) and resume["tools"], \
+        "resume file should hold the completed tool work"
 
 
 def test_free_usage_limit_is_transient_not_quota():

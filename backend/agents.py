@@ -3558,6 +3558,12 @@ async def run_agent(
         "chat_id": chat_id,
         "reserved": reserved,
         "providers": providers or {},
+        # Mutable flag shared between graph._run_mode_turn (detects a hard
+        # failure) and graph.run_graph._drive (decides whether to clear the
+        # durable resume file). Seeded HERE — on the original `initial` that is
+        # passed straight into run_graph — because LangGraph hands nodes a copy
+        # of the state, so a setdefault inside run_graph would never reach them.
+        "_run_flags": {"hard_error": False},
     }
     async for event in run_graph(initial):
         yield event

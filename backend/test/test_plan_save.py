@@ -32,7 +32,7 @@ async def test_plan_build_saves_once(tmp_path, monkeypatch):
         calls.append((workspace, title, content, chat_id))
 
     monkeypatch.setattr(graph.state_db, "save_plan", fake_save_plan)
-    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(reply))
 
     state, _q = _state(root, reply)
     result = await plan_build(state)
@@ -51,7 +51,7 @@ async def test_plan_build_skips_save_when_empty(tmp_path, monkeypatch):
 
     calls = []
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: calls.append(1))
-    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(reply))
 
     state, _q = _state(root, reply)
     await plan_build(state)
@@ -86,7 +86,7 @@ async def test_plan_build_saves_with_variant_header(tmp_path, monkeypatch):
     )
     for v in variants:
         monkeypatch.setattr(
-            graph, "_run_mode_turn", lambda state, mode, queue, _v=v: _await(_v)
+            graph, "_run_mode_turn", lambda state, mode, queue, _v=v, **kwargs: _await(_v)
         )
         state, _q = _state(root, v)
         await plan_build(state)
@@ -140,7 +140,7 @@ async def test_plan_build_logs_on_save_failure(tmp_path, monkeypatch):
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(graph.state_db, "save_plan", boom)
-    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(reply))
 
     state, _q = _state(root, reply)
     # Should not raise; returns the reply unchanged.
@@ -154,7 +154,7 @@ async def test_plan_build_handles_non_string_reply(tmp_path, monkeypatch):
     # .strip() and must return an empty plan string.
     root = str(tmp_path)
 
-    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(None))
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(None))
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: None)
 
     state, _q = _state(root, "")

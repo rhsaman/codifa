@@ -116,21 +116,21 @@ async def main():
         chat2 = "chat-resume-2"
         mock.script = [
             tool_call("grep", json.dumps({"pattern": "def", "path": ""})),
-            # grep distills through the search subagent (defaults to the parent
-            # model), so this request consumes the next script item — give it a
-            # valid reply so the hard 400 below hits the MAIN model's next
-            # request instead of being swallowed by the distiller fallback.
-            text_reply("distilled summary"),
-            None,  # next MAIN model request gets a hard 400
+            # Hard 400 on the MAIN model's request right AFTER the grep completes
+            # (the grep result is distilled through the search subagent, which
+            # consumes the next script item, so the 400 lands on the main model's
+            # follow-up request). The resume file must be left behind so a
+            # reconnect can replay the already-done grep work.
+            None,
         ]
         mock.captured = []
-        raised = None
-        try:
-            async for _ev in run_agent(prompt="find def", history=[], **{**common, "chat_id": chat2}):
-                pass
-        except Exception as exc:  # noqa: BLE001
-            raised = exc
-        assert raised is not None, "expected the hard error to propagate"
+        events2 = await run_turn(prompt="find def", history=[], **{**common, "chat_id": chat2})
+        # Under the LangGraph architecture a hard (non-retryable) error is
+        # surfaced as a fatal `error` event — it is NOT raised out of run_agent
+        # (the SSE socket would already be torn down). The resume file must be
+        # left behind so a reconnect can replay the already-done tool work.
+        assert any(ev.get("kind") == "error" for ev in events2), \
+            "expected the hard error to surface as an error event"
         resume2 = state_db.load_turn_resume(ws, chat2)
         assert resume2 and resume2.get("tools"), "resume file missing after an error"
         assert resume2["tools"][0]["tool"] == "grep", "resume after error lost the record"
@@ -221,7 +221,8 @@ async def main():
         chat5 = "chat-resume-5"
         mock.script = [
             tool_call("grep", json.dumps({"pattern": "foo", "path": ""})),
-            text_reply("distilled summary"),  # search-distiller sub-agent request
+            tool_call("grep", json.dumps({"pattern": "bar", "path": ""})),  # distiller keeps the turn going
+            tool_call("read", json.dumps({"path": "app.py"})),  # keep the turn going
             None,  # hard 400 on the MAIN model — the turn errors after the grep completes
         ]
         mock.captured = []

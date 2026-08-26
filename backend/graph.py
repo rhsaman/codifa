@@ -34,6 +34,7 @@ import contextlib
 import inspect
 import itertools
 import json
+import hashlib
 import logging
 import os
 import re
@@ -166,6 +167,10 @@ class AgentState(TypedDict, total=False):
     plan_attempts: int
     # Internal transport (NOT serialised by the graph runner; in-memory only)
     _queue: Any
+    # Mutable flag shared between _run_mode_turn (detects a hard failure) and
+    # run_graph._drive (decides whether to clear the durable resume file). MUST
+    # be declared on the state or LangGraph drops it before the node runs.
+    _run_flags: dict
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1701,7 @@ async def _run_mode_turn(
     mode: str,
     queue: asyncio.Queue,
     extra_instruction: str = "",
+    run_flags: dict | None = None,
 ) -> str:
     """Run ONE LLM turn for ``mode`` with the mode-filtered tools.
 
@@ -1760,6 +1766,97 @@ async def _run_mode_turn(
                 return m.content
         return None
 
+    # --- Interrupted-turn resume (replay already-done work) -----------------
+    # On a reconnect/interrupt the frontend only sends COMPLETED turns' history
+    # (it has no toolActivity for the turn that was cut off), so the in-RAM tool
+    # results from that turn are gone. Re-inject them from the durable resume
+    # file as AIMessage(tool_calls)+ToolMessage pairs so the model SEES what it
+    # already did and does NOT re-run the tools (which would lose context and
+    # waste tokens). history_to_langchain_messages already handles the same
+    # reconstruction for completed turns; this covers the interrupted one.
+    _resume_chat = state.get("chat_id", "")
+    _resume_root = state.get("root", "")
+    if _resume_chat:
+        with contextlib.suppress(Exception):
+            _resume = state_db.load_turn_resume(_resume_root, _resume_chat)
+        if _resume and isinstance(_resume.get("tools"), list) and _resume.get("tools"):
+            for _ta in _resume["tools"]:
+                if not isinstance(_ta, dict):
+                    continue
+                # Prefer an explicit callId; fall back to a stable id derived from
+                # the tool+args so hand-written / older resume files (which only
+                # carry `tool`/`args`/`result`) still replay instead of being skipped.
+                _tc_id = str(_ta.get("callId") or "")
+                if not _tc_id:
+                    _tc_id = "r-" + hashlib.md5(
+                        json.dumps(
+                            {"tool": _ta.get("tool", ""), "args": _ta.get("args", {}) or {}},
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
+                if not _tc_id:
+                    continue
+                # Prefix the replayed call id with `resume-` so the frontend /
+                # tests can distinguish a replayed (already-done) tool call from a
+                # fresh one, and so the dedup guard never treats it as a new call.
+                _replay_id = f"resume-{_tc_id}"
+                # Skip if the transcript already carries this result (e.g. the
+                # frontend DID send toolActivity for this turn after all).
+                if _existing_tool_result(_replay_id) is not None:
+                    continue
+                messages.append(
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": _ta.get("tool", "tool"),
+                                "args": _ta.get("args", {}) or {},
+                                "id": _replay_id,
+                            }
+                        ],
+                    )
+                )
+                _items = _ta.get("items")
+                _result = (
+                    str(_ta.get("result"))
+                    if _ta.get("result")
+                    else (str(_items) if _items else str(_ta.get("summary") or ""))
+                )
+                messages.append(
+                    ToolMessage(content=_result, tool_call_id=_replay_id)
+                )
+
+    # Interrupted-turn partial reply: if the turn was cut off mid-generation
+    # (hard app close / disconnect) and the partial assistant text was never
+    # persisted to history, replay it as an assistant message so the model
+    # CONTINUES from where it left off instead of restarting from zero. The
+    # `partial` key is written by the durable resume file on a hard close where
+    # no tool completed (so `tools` is empty) but text had already streamed.
+    if _resume_chat:
+        _partial = (_resume or {}).get("partial") if "_resume" in dir() else None
+        if _partial and isinstance(_partial, str) and _partial.strip():
+            # Don't duplicate a partial that the frontend already kept in
+            # history (it folds an "[Interrupted before finishing...]" marker
+            # into the failed assistant message). Only inject when the text is
+            # genuinely absent from the transcript.
+            _partial_already = any(
+                isinstance(m, AIMessage)
+                and isinstance(getattr(m, "content", ""), str)
+                and _partial.strip()[:40] in (m.content or "")
+                for m in messages
+            )
+            if not _partial_already:
+                messages.append(AIMessage(content=_partial))
+            messages.append(
+                SystemMessage(
+                    content=(
+                        "[SYSTEM: Your previous reply was cut off mid-generation. "
+                        "The text above is what you had already produced. Continue "
+                        "it naturally from where it ends — do NOT repeat it.]"
+                    )
+                )
+            )
+
     _astream_count = 0
 
     async def _inner() -> str:
@@ -1773,6 +1870,35 @@ async def _run_mode_turn(
         steps = 0
         reply = ""
         _no_so = False
+        # --- Interrupted-turn resume (durable, step-by-step) -----------------
+        # Every completed tool result is persisted to a per-chat resume file so a
+        # mid-turn disconnect/reconnect can replay the already-done work instead
+        # of re-running the tools from scratch (which loses context and wastes
+        # tokens). The file is cleared on a clean finish (see run_graph._drive).
+        _resume_root = state.get("root", "")
+        _resume_chat = state.get("chat_id", "")
+        _resume_prompt = state.get("request", "")
+        _resume_tools: list[dict] = []
+
+        def _record_resume_tool(name: str, args: dict, call_id: str, result: str) -> None:
+            if not _resume_chat:
+                return
+            _resume_tools.append(
+                {
+                    "tool": name,
+                    "args": args or {},
+                    "callId": call_id,
+                    "items": str(result),
+                    "result": str(result),
+                    "summary": "",
+                }
+            )
+            with contextlib.suppress(Exception):
+                state_db.save_turn_resume(
+                    _resume_root,
+                    _resume_chat,
+                    {"prompt": _resume_prompt, "tools": list(_resume_tools)},
+                )
         # --- Repetition-loop guard (opencode-aligned) -----------------------
         # opencode stops a degenerate loop via MAX_STEPS + finish_reason=="length"
         # and has no text-comparison guard. We keep a guard but base it on the
@@ -2059,6 +2185,9 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
+                _record_resume_tool(
+                    tc.get("name") or "", tc.get("args") or {}, tc.get("id", ""), result
+                )
             for tc in _sequential:
                 name = tc.get("name") or ""
                 args = tc.get("args") or {}
@@ -2069,6 +2198,7 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
+                _record_resume_tool(name, args, tc.get("id", ""), result)
             # In-turn context management: if the transcript (including every
             # tool result so far this turn) has grown past the budget, compress
             # the older tool results so we don't keep re-sending the whole raw
@@ -2105,6 +2235,16 @@ async def _run_mode_turn(
                             "content": _agents._friendly_retry_reason(exc),
                         }
                     )
+                    # Mark the turn as failed so run_graph._drive leaves the
+                    # durable resume file behind (a reconnect/retry can replay the
+                    # already-done tool work instead of re-running it from zero).
+                    # `run_flags` is the SAME mutable dict seeded on `initial`
+                    # (passed through from the node), so this reaches _drive.
+                    if run_flags is not None:
+                        try:
+                            run_flags["hard_error"] = True
+                        except Exception:  # noqa: BLE001
+                            pass
                     break
                 # Transient failure: retry up to the budget, 30s apart.
                 if attempt >= _agents._RETRY_MAX_ATTEMPTS:
@@ -2286,7 +2426,7 @@ def router(state: AgentState) -> dict:
 
 async def ask_node(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "ask", queue)
+    reply = await _run_mode_turn(state, "ask", queue, run_flags=state.get("_run_flags"))
     return {"final_response": reply}
 
 
@@ -2307,7 +2447,7 @@ def _route_coder_entry(state: AgentState) -> str:
 
 async def coder_node(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "coder", queue)
+    reply = await _run_mode_turn(state, "coder", queue, run_flags=state.get("_run_flags"))
     return {"coder_result": reply, "final_response": reply}
 
 
@@ -3575,7 +3715,7 @@ def _route_ask_entry(state: AgentState) -> str:
 
 async def ask_answer(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "ask", queue)
+    reply = await _run_mode_turn(state, "ask", queue, run_flags=state.get("_run_flags"))
     return {"final_response": reply}
 
 
@@ -3668,7 +3808,7 @@ async def reader_answer(state: AgentState) -> dict:
     state["mode"] = "reader"
     queue = state["_queue"]
     extra = _build_reader_context(state)
-    reply = await _run_mode_turn(state, "reader", queue, extra_instruction=extra)
+    reply = await _run_mode_turn(state, "reader", queue, extra_instruction=extra, run_flags=state.get("_run_flags"))
     return {"final_response": reply}
 
 
@@ -3698,7 +3838,7 @@ def _route_reader_dispatch(state: AgentState) -> str:
 
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "plan", queue)
+    reply = await _run_mode_turn(state, "plan", queue, run_flags=state.get("_run_flags"))
     # Guard against a non-string reply (e.g. None when the turn fails) so we
     # don't crash on .strip() — and never silently swallow a save failure.
     if not isinstance(reply, str):
@@ -3858,6 +3998,11 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     initial["_queue"] = queue
     initial.setdefault("debug_attempts", 0)
     initial.setdefault("max_debug_attempts", MAX_DEBUG_ATTEMPTS)
+    # Mutable flag shared between _run_mode_turn (which detects a hard failure)
+    # and _drive (which decides whether to clear the durable resume file). A
+    # plain attribute on `initial` would be invisible to _drive because
+    # _run_mode_turn works on a *copy* of the state, so we use a nested dict.
+    initial.setdefault("_run_flags", {})["hard_error"] = False
     # Drop any stale captured ask_user answer for this chat from a previous run
     # so Part A re-exploration only fires for answers given in THIS run.
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
@@ -3892,6 +4037,18 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
                     "content": f"agent crashed before producing output: {_exc!r}",
                 }
             )
+        else:
+            # Clean finish: the turn completed, so the durable resume file is no
+            # longer needed. On an error/interrupt we deliberately LEAVE it behind
+            # so a reconnect can replay the already-done tool work (the file is
+            # written step-by-step during the run, so it always holds the most
+            # recent interrupted state).
+            _hard = bool((initial.get("_run_flags") or {}).get("hard_error"))
+            if not _hard:
+                with contextlib.suppress(Exception):
+                    state_db.clear_turn_resume(
+                        initial.get("root", ""), initial.get("chat_id", "")
+                    )
         finally:
             await queue.put(None)
 

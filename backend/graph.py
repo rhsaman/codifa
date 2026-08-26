@@ -81,8 +81,14 @@ MAX_DEBUG_ATTEMPTS = 3
 # NOT increase token cost: the provider still gets exactly the same set of
 # ToolMessages either way -- only wall-clock latency changes.
 _SEQUENTIAL_TOOLS = {
-    "write_file", "edit_file", "run_terminal", "confirm_action",
-    "memory", "create_skill", "create_mcp", "ask_user",
+    "write_file",
+    "edit_file",
+    "run_terminal",
+    "confirm_action",
+    "memory",
+    "create_skill",
+    "create_mcp",
+    "ask_user",
 }
 
 # ---------------------------------------------------------------------------
@@ -190,11 +196,13 @@ def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
                 if not isinstance(ta, dict):
                     continue
                 tc_id = str(ta.get("callId") or f"ta-{len(tool_calls)}")
-                tool_calls.append({
-                    "name": ta.get("tool", "tool"),
-                    "args": ta.get("args", {}) or {},
-                    "id": tc_id,
-                })
+                tool_calls.append(
+                    {
+                        "name": ta.get("tool", "tool"),
+                        "args": ta.get("args", {}) or {},
+                        "id": tc_id,
+                    }
+                )
                 # Prefer the full tool result (items); fall back to the summary.
                 # `items` may be a plain string (e.g. "MATCHES for 'foo'") OR a
                 # list of dicts (e.g. [{"snippet": "..."}]) — flatten either into
@@ -208,8 +216,13 @@ def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
                     for _it in items:
                         if isinstance(_it, dict):
                             parts.append(
-                                str(_it.get("snippet") or _it.get("content")
-                                    or _it.get("text") or _it.get("result") or _it)
+                                str(
+                                    _it.get("snippet")
+                                    or _it.get("content")
+                                    or _it.get("text")
+                                    or _it.get("result")
+                                    or _it
+                                )
                             )
                         else:
                             parts.append(str(_it))
@@ -282,18 +295,25 @@ def filter_tools_for_mode(
             denied |= _TERM
         tools = {n: fn for n, fn in tools.items() if n not in denied}
         if "run_terminal" in tools:
-            tools["run_terminal"] = _agents._wrap_no_search_bypass(tools["run_terminal"])
+            tools["run_terminal"] = _agents._wrap_no_search_bypass(
+                tools["run_terminal"]
+            )
         if cap.get("runTerminal") and not cap.get("writeFiles"):
-            tools["run_terminal"] = _agents._wrap_readonly_terminal(tools["run_terminal"])
+            tools["run_terminal"] = _agents._wrap_readonly_terminal(
+                tools["run_terminal"]
+            )
     else:
         if mode != "coder":
             tools = {
                 n: fn
                 for n, fn in tools.items()
-                if n not in ("write_file", "edit_file", "run_terminal", "confirm_action")
+                if n
+                not in ("write_file", "edit_file", "run_terminal", "confirm_action")
             }
         if "run_terminal" in tools:
-            tools["run_terminal"] = _agents._wrap_no_search_bypass(tools["run_terminal"])
+            tools["run_terminal"] = _agents._wrap_no_search_bypass(
+                tools["run_terminal"]
+            )
 
     # Web tools (web_search / fetch_url / search_console) are exposed to the
     # model whenever the web capability is not explicitly denied. The agent may
@@ -399,21 +419,46 @@ def resolve_subagent_model(
     * bare model id -> the parent provider.
     """
     if entry is None:
-        return build_chat_model(
-            provider, parent_model_name, base_url, api_key, env_var,
-            oauth_token, temperature=0.2, timeout=timeout,
-        ) if (default_to_parent and parent_model_name) else None
+        return (
+            build_chat_model(
+                provider,
+                parent_model_name,
+                base_url,
+                api_key,
+                env_var,
+                oauth_token,
+                temperature=0.2,
+                timeout=timeout,
+            )
+            if (default_to_parent and parent_model_name)
+            else None
+        )
     if isinstance(entry, str):
         entry = entry.strip()
         if not entry:
-            return build_chat_model(
-                provider, parent_model_name, base_url, api_key, env_var,
-                oauth_token, temperature=0.2, timeout=timeout,
-            ) if (default_to_parent and parent_model_name) else None
+            return (
+                build_chat_model(
+                    provider,
+                    parent_model_name,
+                    base_url,
+                    api_key,
+                    env_var,
+                    oauth_token,
+                    temperature=0.2,
+                    timeout=timeout,
+                )
+                if (default_to_parent and parent_model_name)
+                else None
+            )
         if entry.lower() in ("main model", "main_model", "main"):
             entry = parent_model_name or entry
     target = _agents._subagent_target(
-        entry, provider, base_url, api_key, env_var, oauth_token,
+        entry,
+        provider,
+        base_url,
+        api_key,
+        env_var,
+        oauth_token,
         provider_lookup or (lambda pid: None),
     )
     if not target:
@@ -421,7 +466,9 @@ def resolve_subagent_model(
     kind, model, burl, akey, env, oauth = target
     if not model:
         return None
-    return build_chat_model(kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout)
+    return build_chat_model(
+        kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout
+    )
 
 
 async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
@@ -469,13 +516,18 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
         if time.monotonic() - _start >= _VISION_TOTAL_BUDGET:
             logger.warning(
                 "vision analyze (%s) hit the %ds total budget after %d attempt(s)",
-                model_name, int(_VISION_TOTAL_BUDGET), attempt,
+                model_name,
+                int(_VISION_TOTAL_BUDGET),
+                attempt,
             )
             break
         try:
             text, _ = await llm_generate(
-                model, system=system, user=user,
-                images=image_uris, sub=True,
+                model,
+                system=system,
+                user=user,
+                images=image_uris,
+                sub=True,
             )
             result = (text or "").strip()
             if result:
@@ -484,14 +536,17 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
             # log it so a misbehaving vision model is visible.
             logger.warning(
                 "vision analyze (%s) returned empty text on attempt %d/%d",
-                model_name, attempt + 1, _VISION_MAX_ATTEMPTS,
+                model_name,
+                attempt + 1,
+                _VISION_MAX_ATTEMPTS,
             )
             return None
         except Exception as exc:  # noqa: BLE001
             if not _is_transient_error(exc):
                 logger.warning(
                     "vision analyze (%s) failed with a non-transient error: %s",
-                    model_name, exc,
+                    model_name,
+                    exc,
                 )
                 return None
             if attempt < _VISION_MAX_ATTEMPTS - 1:
@@ -500,19 +555,26 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
                 if _remaining <= 0:
                     logger.warning(
                         "vision analyze (%s) exhausted the %ds budget before retry",
-                        model_name, int(_VISION_TOTAL_BUDGET),
+                        model_name,
+                        int(_VISION_TOTAL_BUDGET),
                     )
                     break
-                delay = min(_VISION_BACKOFF_BASE * (2 ** attempt), _remaining)
+                delay = min(_VISION_BACKOFF_BASE * (2**attempt), _remaining)
                 logger.warning(
                     "vision analyze (%s) failed (attempt %d/%d): %s — retrying in %.1fs",
-                    model_name, attempt + 1, _VISION_MAX_ATTEMPTS, exc, delay,
+                    model_name,
+                    attempt + 1,
+                    _VISION_MAX_ATTEMPTS,
+                    exc,
+                    delay,
                 )
                 await asyncio.sleep(delay)
             else:
                 logger.warning(
                     "vision analyze (%s) failed after %d attempts: %s",
-                    model_name, _VISION_MAX_ATTEMPTS, exc,
+                    model_name,
+                    _VISION_MAX_ATTEMPTS,
+                    exc,
                 )
     return None
 
@@ -530,7 +592,10 @@ def _is_transient_error(exc: Exception) -> bool:
         return status == 429 or 500 <= status < 600
     # No status code -> treat as a network/timeout blip (retryable).
     msg = str(exc).lower()
-    return any(k in msg for k in ("timeout", "timed out", "connection", "reset", "eof", "broken pipe"))
+    return any(
+        k in msg
+        for k in ("timeout", "timed out", "connection", "reset", "eof", "broken pipe")
+    )
 
 
 # Per-process cache of vision analyses, keyed by the sorted set of image URIs,
@@ -655,8 +720,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             from providers import model_context
 
             ctx = await model_context(
-                state["provider"], state["model_name"], state["base_url"],
-                state["api_key"], state["env_var"], oauth_token=state["oauth_token"],
+                state["provider"],
+                state["model_name"],
+                state["base_url"],
+                state["api_key"],
+                state["env_var"],
+                oauth_token=state["oauth_token"],
             )
         except Exception:  # noqa: BLE001
             ctx = 0
@@ -674,64 +743,111 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # that provider's OWN base URL / key. The frontend sends the full provider
     # configs (keyed by id) so we can look them up here.
     _providers = state.get("providers") or {}
-    _provider_lookup = (
-        lambda pid: (_providers.get(pid) if isinstance(_providers, dict) else None)
+    _provider_lookup = lambda pid: (
+        _providers.get(pid) if isinstance(_providers, dict) else None
     )
     web_model = resolve_subagent_model(
-        state["provider"], subagent_models.get("web"), state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
+        state["provider"],
+        subagent_models.get("web"),
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        state["model_name"],
         provider_lookup=_provider_lookup,
     )
     compact_model = resolve_subagent_model(
-        state["provider"], subagent_models.get("compact"), state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
+        state["provider"],
+        subagent_models.get("compact"),
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        state["model_name"],
         provider_lookup=_provider_lookup,
         # Bounded so an auto-compact summarizer fails fast (and is skipped)
         # instead of hanging the turn when the provider is slow/unreachable.
         timeout=50,
     )
     vision_model = resolve_subagent_model(
-        state["provider"], subagent_models.get("vision"), state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
-        default_to_parent=False, provider_lookup=_provider_lookup,
+        state["provider"],
+        subagent_models.get("vision"),
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        state["model_name"],
+        default_to_parent=False,
+        provider_lookup=_provider_lookup,
         # Bounded so a slow/unreachable vision provider fails fast (and is
         # surfaced to the user) instead of hanging the turn. The retry/backoff
         # in _vision_analyze covers transient blips within this budget.
         timeout=30,
     )
     explore_model = resolve_subagent_model(
-        state["provider"], subagent_models.get("explore"), state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"], state["model_name"],
-        default_to_parent=True, provider_lookup=_provider_lookup,
+        state["provider"],
+        subagent_models.get("explore"),
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        state["model_name"],
+        default_to_parent=True,
+        provider_lookup=_provider_lookup,
     )
 
     settings = await chat_model_settings(
-        mode, ctx, state.get("thinking_level", ""), state["provider"],
-        state["model_name"], state["base_url"], state["api_key"],
-        state["env_var"], state["oauth_token"], _agents._detect_scope(prompt),
+        mode,
+        ctx,
+        state.get("thinking_level", ""),
+        state["provider"],
+        state["model_name"],
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        _agents._detect_scope(prompt),
     )
     model = build_chat_model(
-        state["provider"], state["model_name"], state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"],
-        temperature=settings["temperature"], max_tokens=settings["max_tokens"],
+        state["provider"],
+        state["model_name"],
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
+        temperature=settings["temperature"],
+        max_tokens=settings["max_tokens"],
         thinking_level=settings["thinking_level"],
         timeout=model_timeout_for(state),
     )
 
     tools = make_tool_callbacks(
-        root, lambda ev: queue.put_nowait(ev),
-        context_window=ctx, web_model=web_model, main_model=model,
-        vision_model=vision_model, explore_model=explore_model, image_uris=image_uris,
+        root,
+        lambda ev: queue.put_nowait(ev),
+        context_window=ctx,
+        web_model=web_model,
+        main_model=model,
+        vision_model=vision_model,
+        explore_model=explore_model,
+        image_uris=image_uris,
         reserved=state.get("reserved"),
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
-        permit={"outside": allow_outside}, store=store, chat_id=chat_id,
+        permit={"outside": allow_outside},
+        store=store,
+        chat_id=chat_id,
     )
 
     scoped_paths = _agents._scoped_rels(root, attachments, nvim_file)
     filtered = filter_tools_for_mode(
-        mode, tools, cap, scoped_paths, allow_create, allow_outside,
-        prompt=prompt, root=root,
+        mode,
+        tools,
+        cap,
+        scoped_paths,
+        allow_create,
+        allow_outside,
+        prompt=prompt,
+        root=root,
     )
 
     # --- MCP bridge -------------------------------------------------------
@@ -787,8 +903,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if _att_rels:
             workspace_note += (
                 "\n\n=== ATTACHED FILES ===\nThe user attached these file(s) as their "
-                "focus: " + ", ".join("`" + f + "`" for f in _att_rels) +
-                ". They are in SCOPE — read them with the read tool when relevant."
+                "focus: "
+                + ", ".join("`" + f + "`" for f in _att_rels)
+                + ". They are in SCOPE — read them with the read tool when relevant."
             )
     if scoped_paths:
         workspace_note += (
@@ -824,7 +941,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "in your context (RAG blocks, conversation, files you already read)."
     )
     if system_extra:
-        system_final += "\n\nUser-supplied custom prompt (append to the above):\n" + system_extra
+        system_final += (
+            "\n\nUser-supplied custom prompt (append to the above):\n" + system_extra
+        )
     if image_uris:
         system_final += (
             "\n\nIMAGE ATTACHED: the user included image(s) in this conversation "
@@ -882,7 +1001,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 queue.put_nowait(
                     _agents._tool_event(
                         {
-                            "kind": "tool", "tool": "search_memory",
+                            "kind": "tool",
+                            "tool": "search_memory",
                             "args": {"query": prompt[:300], "auto": True},
                             "summary": "recalled saved memory notes from the vector store",
                         }
@@ -895,10 +1015,17 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # user turn instead.
         try:
             if rag_settings.active_kinds():
-                rag_block_for_user = _build_rag_context(
-                    store, prompt, rag_settings, max_chars=2600,
-                    per_section_chars=1200, kinds=("file", "web"),
-                ) or ""
+                rag_block_for_user = (
+                    _build_rag_context(
+                        store,
+                        prompt,
+                        rag_settings,
+                        max_chars=2600,
+                        per_section_chars=1200,
+                        kinds=("file", "web"),
+                    )
+                    or ""
+                )
         except Exception:  # noqa: BLE001
             rag_block_for_user = ""
 
@@ -927,7 +1054,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
         for _h in history:
-            for _ta in (_h.get("toolActivity") or []):
+            for _ta in _h.get("toolActivity") or []:
                 _its = _ta.get("items")
                 if isinstance(_its, list):
                     for _it in _its:
@@ -1038,7 +1165,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "image's text."
         )
     user_content: Any
-    if image_uris and (not prefetch_model or not vision_tool_available) and not _analysis:
+    if (
+        image_uris
+        and (not prefetch_model or not vision_tool_available)
+        and not _analysis
+    ):
         content_blocks = [{"type": "text", "text": "\n\n".join(user_parts)}]
         for uri in image_uris:
             content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
@@ -1055,7 +1186,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         _user_chars = (
             len(user_content)
             if isinstance(user_content, str)
-            else sum(len(str(c.get("text", ""))) for c in user_content if isinstance(c, dict))
+            else sum(
+                len(str(c.get("text", ""))) for c in user_content if isinstance(c, dict)
+            )
         )
         print(
             f"[CTX_DEBUG] sys_chars={_sys_chars} hist_chars={_hist_chars} "
@@ -1066,8 +1199,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # Convert the mode-filtered fns to LangChain StructuredTools. MCP tools are
     # already StructuredTools (built in build_mcp_tools), so they pass through.
     lc_tools = [
-        t if isinstance(t, StructuredTool) else
-        StructuredTool.from_function(func=t, name=name, description=(t.__doc__ or name))
+        (
+            t
+            if isinstance(t, StructuredTool)
+            else StructuredTool.from_function(
+                func=t, name=name, description=(t.__doc__ or name)
+            )
+        )
         for name, t in filtered.items()
     ]
 
@@ -1146,7 +1284,9 @@ def _estimate_prompt_tokens(messages: list) -> int | None:
         return None
 
 
-def _usage_event_from_ai(ai: Any, model: str, prompt_tokens: int | None = None) -> dict | None:
+def _usage_event_from_ai(
+    ai: Any, model: str, prompt_tokens: int | None = None
+) -> dict | None:
     """Build a frontend ``usage`` event from a LangChain ``AIMessage``.
 
     LangChain surfaces token counts in ``usage_metadata`` (OpenAI/Google),
@@ -1184,19 +1324,15 @@ def _usage_event_from_ai(ai: Any, model: str, prompt_tokens: int | None = None) 
         total_tokens = input_tokens + output_tokens + cache_read + cache_write
     else:
         provided_total = um.get("total_tokens") or 0
-        total_tokens = provided_total if provided_total else input_tokens + output_tokens
+        total_tokens = (
+            provided_total if provided_total else input_tokens + output_tokens
+        )
     import json as _json
 
     try:
         _um_dump = _json.dumps(um, default=str)
     except Exception:  # noqa: BLE001
         _um_dump = repr(um)
-    print(
-        f"[USAGE_DEBUG] model={model!r} in={input_tokens} out={output_tokens} "
-        f"cache_read={cache_read} cache_write={cache_write} additive={additive} "
-        f"ctx={prompt_tokens} um={_um_dump[:3000]}",
-        flush=True,
-    )
     # `context_tokens` is the LOCAL estimate of the full input prompt sent this
     # turn (system + history + current user turn + tools), independent of how
     # long the model's OUTPUT happens to be. The frontend takes a running max
@@ -1243,9 +1379,7 @@ def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
 
     # Anthropic-style (additive): input_tokens excludes the cached history.
     anthropic_read = (
-        details.get("cache_read_input_tokens")
-        or um.get("cache_read_input_tokens")
-        or 0
+        details.get("cache_read_input_tokens") or um.get("cache_read_input_tokens") or 0
     )
     anthropic_write = (
         details.get("cache_creation_input_tokens")
@@ -1274,7 +1408,9 @@ def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
     return cache_read, cache_write, key_additive
 
 
-def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
+def _strip_think_tags(
+    text: str, in_think: bool, think_buf: str
+) -> tuple[str, bool, str]:
     """Remove literal ``<think>…</think>`` reasoning from streamed text.
 
     Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
@@ -1320,7 +1456,9 @@ def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, b
     return "".join(out), in_think, think_buf
 
 
-def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3) -> bool:
+def _is_repeating(
+    text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3
+) -> bool:
     """Detect a degenerate text loop at the tail of ``text``.
 
     Models sometimes emit the same sentence/phrase dozens of times with no
@@ -1339,11 +1477,11 @@ def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: in
     # Scan candidate unit lengths from longest to shortest so we match the
     # largest repeated phrase first (e.g. a whole sentence, not one word).
     for unit in range(min(max_len, len(text) // min_reps), min_len - 1, -1):
-        tail = text[-(unit * min_reps):]
+        tail = text[-(unit * min_reps) :]
         if len(tail) < unit * min_reps:
             continue
         first = tail[:unit]
-        if all(tail[i * unit:(i + 1) * unit] == first for i in range(1, min_reps)):
+        if all(tail[i * unit : (i + 1) * unit] == first for i in range(1, min_reps)):
             return True
     return False
 
@@ -1385,7 +1523,9 @@ def _thinking_from_chunk(chunk: Any) -> str | None:
     if isinstance(content, list):
         for part in content:
             if isinstance(part, dict) and part.get("type") in ("thinking", "reasoning"):
-                txt = _coerce(part.get("text") or part.get("thinking") or part.get("reasoning"))
+                txt = _coerce(
+                    part.get("text") or part.get("thinking") or part.get("reasoning")
+                )
                 if txt:
                     return txt
     # 3) additional_kwargs / response_metadata fallbacks.
@@ -1734,7 +1874,9 @@ async def _run_mode_turn(
                         # case; we abort mid-stream instead of dumping it all.
                         _reply_buf += content
                         _chunk_idx += 1
-                        if _chunk_idx % _repeat_check_every == 0 and _is_repeating(_reply_buf):
+                        if _chunk_idx % _repeat_check_every == 0 and _is_repeating(
+                            _reply_buf
+                        ):
                             queue.put_nowait(
                                 {
                                     "kind": "warn",
@@ -1757,8 +1899,12 @@ async def _run_mode_turn(
                             if isinstance(part, dict) and part.get("type") == "text":
                                 if _thinking_active:
                                     _thinking_active = False
-                                    queue.put_nowait({"kind": "thinking", "active": False})
-                                queue.put_nowait({"kind": "text", "content": part["text"]})
+                                    queue.put_nowait(
+                                        {"kind": "thinking", "active": False}
+                                    )
+                                queue.put_nowait(
+                                    {"kind": "text", "content": part["text"]}
+                                )
                 if ai is None:
                     break
                 # Safety net for models that only reason and emit no text: make
@@ -1787,7 +1933,9 @@ async def _run_mode_turn(
                         _unit = min(200, len(dropped) // 3)
                         while _unit >= 20 and _is_repeating(dropped[: _unit * 3]):
                             _unit = max(20, _unit // 2)
-                        dropped = dropped[: _unit * 3] + " … [repetition loop truncated]"
+                        dropped = (
+                            dropped[: _unit * 3] + " … [repetition loop truncated]"
+                        )
                     if dropped:
                         queue.put_nowait({"kind": "text", "content": dropped})
                 _astream_count_local_val = _astream_count_local
@@ -1824,7 +1972,9 @@ async def _run_mode_turn(
                             ),
                         }
                     )
-                    reply = ai.content if isinstance(ai.content, str) else str(ai.content)
+                    reply = (
+                        ai.content if isinstance(ai.content, str) else str(ai.content)
+                    )
                     break
                 reply = ai.content if isinstance(ai.content, str) else str(ai.content)
                 if _is_repeating(reply if isinstance(reply, str) else ""):
@@ -1883,11 +2033,14 @@ async def _run_mode_turn(
             # در transcript هست، آن را دوباره اجرا نکن — مستقیماً reuse کن
             # (صرفه‌جویی در context و جلوگیری از اجرای تکراریِ کارهای انجام‌شده).
             _pending = [
-                tc for tc in _tcs
-                if _existing_tool_result(tc.get("id", "")) is None
+                tc for tc in _tcs if _existing_tool_result(tc.get("id", "")) is None
             ]
-            _parallel = [tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
-            _sequential = [tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
+            _parallel = [
+                tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
+            ]
+            _sequential = [
+                tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS
+            ]
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
                     *[
@@ -1945,7 +2098,10 @@ async def _run_mode_turn(
                 # Hard, non-recoverable failures: don't retry (would fail identically).
                 if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
                     queue.put_nowait(
-                        {"kind": "error", "content": _agents._friendly_retry_reason(exc)}
+                        {
+                            "kind": "error",
+                            "content": _agents._friendly_retry_reason(exc),
+                        }
                     )
                     break
                 # Transient failure: retry up to the budget, 30s apart.
@@ -2167,7 +2323,11 @@ def test_node(state: AgentState) -> dict:
         # Nothing to run — don't emit a misleading error event. The turn simply
         # proceeds to review with no test gate.
         return {
-            "test_results": {"passed": True, "errors": [], "output": "no tests configured"},
+            "test_results": {
+                "passed": True,
+                "errors": [],
+                "output": "no tests configured",
+            },
             "test_status": "pass",
         }
     from tools import run_terminal
@@ -2176,7 +2336,9 @@ def test_node(state: AgentState) -> dict:
     errors: list[str] = []
     out_parts: list[str] = []
     for cmd in cmds:
-        queue.put_nowait({"kind": "tool", "tool": "run_terminal", "args": {"command": cmd}})
+        queue.put_nowait(
+            {"kind": "tool", "tool": "run_terminal", "args": {"command": cmd}}
+        )
         result = run_terminal(root, cmd, timeout=300)
         exit_code = result.get("exit_code", 1)
         output = str(result.get("output", ""))
@@ -2187,7 +2349,8 @@ def test_node(state: AgentState) -> dict:
         out_parts.append(f"$ {cmd}\n{output[-2000:]}")
         queue.put_nowait(
             {
-                "kind": "tool_result", "tool": "run_terminal",
+                "kind": "tool_result",
+                "tool": "run_terminal",
                 "summary": f"{cmd} exit={exit_code} ({'pass' if ok else 'fail'})",
                 "status": "ok" if ok else "error",
             }
@@ -2271,12 +2434,66 @@ def done_node(state: AgentState) -> dict:
 # SKILL / MCP capabilities on demand but never glob/grep/read again.
 
 _EXTS = {
-    "py", "js", "ts", "tsx", "jsx", "go", "rs", "java", "c", "cpp", "cc",
-    "h", "hpp", "rb", "php", "cs", "swift", "kt", "kts", "md", "mdx", "json",
-    "yaml", "yml", "toml", "sh", "bash", "zsh", "sql", "html", "htm", "css",
-    "scss", "less", "vue", "svelte", "lua", "r", "m", "pl", "pm", "dart",
-    "ex", "exs", "erl", "clj", "scm", "hs", "ml", "fs", "fsx", "nim", "zig",
-    "groovy", "gradle", "xml", "ini", "cfg", "conf", "env",
+    "py",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "go",
+    "rs",
+    "java",
+    "c",
+    "cpp",
+    "cc",
+    "h",
+    "hpp",
+    "rb",
+    "php",
+    "cs",
+    "swift",
+    "kt",
+    "kts",
+    "md",
+    "mdx",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "sh",
+    "bash",
+    "zsh",
+    "sql",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "less",
+    "vue",
+    "svelte",
+    "lua",
+    "r",
+    "m",
+    "pl",
+    "pm",
+    "dart",
+    "ex",
+    "exs",
+    "erl",
+    "clj",
+    "scm",
+    "hs",
+    "ml",
+    "fs",
+    "fsx",
+    "nim",
+    "zig",
+    "groovy",
+    "gradle",
+    "xml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
 }
 
 # Files that are useless to read for comprehension: lockfiles, minified /
@@ -2284,16 +2501,62 @@ _EXTS = {
 # still match glob/grep, so we skip them at read time -- unless the user named
 # the file explicitly (then it stays in `named` and is always read).
 _SKIP_READ_NAMES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-    "gemfile.lock", "composer.lock", "cargo.lock", "go.sum", "pip.lock",
-    ".ds_store", "thumbs.db",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "gemfile.lock",
+    "composer.lock",
+    "cargo.lock",
+    "go.sum",
+    "pip.lock",
+    ".ds_store",
+    "thumbs.db",
 }
 _SKIP_READ_EXTS = {
-    "lock", "min.js", "min.css", "map", "min", "png", "jpg", "jpeg", "gif",
-    "ico", "webp", "svg", "woff", "woff2", "ttf", "eot", "otf", "pdf", "zip",
-    "gz", "tar", "tgz", "rar", "7z", "bin", "exe", "dll", "so", "dylib",
-    "wasm", "mp4", "mp3", "wav", "avi", "mov", "log", "cache", "pyc", "class",
-    "o", "obj", "jar", "war",
+    "lock",
+    "min.js",
+    "min.css",
+    "map",
+    "min",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "ico",
+    "webp",
+    "svg",
+    "woff",
+    "woff2",
+    "ttf",
+    "eot",
+    "otf",
+    "pdf",
+    "zip",
+    "gz",
+    "tar",
+    "tgz",
+    "rar",
+    "7z",
+    "bin",
+    "exe",
+    "dll",
+    "so",
+    "dylib",
+    "wasm",
+    "mp4",
+    "mp3",
+    "wav",
+    "avi",
+    "mov",
+    "log",
+    "cache",
+    "pyc",
+    "class",
+    "o",
+    "obj",
+    "jar",
+    "war",
 }
 
 
@@ -2308,7 +2571,86 @@ def _should_skip_read(rel: str) -> bool:
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     return ext in _SKIP_READ_EXTS
 
-_STOPWORDS = {"what", "where", "which", "when", "how", "does", "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "is", "it", "of", "to", "a", "an", "do", "i", "we", "they", "file", "files", "code", "function", "class", "mode", "plan", "ask", "use", "using", "need", "want", "find", "search", "show", "list", "explain", "describe", "trace", "understand", "investigate", "look", "looking", "who", "why", "can", "could", "should", "would", "may", "might", "repo", "repository", "project", "inside", "their", "our", "its", "as", "at", "by", "be", "been", "has", "have", "had", "will", "not", "no", "yes"}
+
+_STOPWORDS = {
+    "what",
+    "where",
+    "which",
+    "when",
+    "how",
+    "does",
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "your",
+    "you",
+    "are",
+    "is",
+    "it",
+    "of",
+    "to",
+    "a",
+    "an",
+    "do",
+    "i",
+    "we",
+    "they",
+    "file",
+    "files",
+    "code",
+    "function",
+    "class",
+    "mode",
+    "plan",
+    "ask",
+    "use",
+    "using",
+    "need",
+    "want",
+    "find",
+    "search",
+    "show",
+    "list",
+    "explain",
+    "describe",
+    "trace",
+    "understand",
+    "investigate",
+    "look",
+    "looking",
+    "who",
+    "why",
+    "can",
+    "could",
+    "should",
+    "would",
+    "may",
+    "might",
+    "repo",
+    "repository",
+    "project",
+    "inside",
+    "their",
+    "our",
+    "its",
+    "as",
+    "at",
+    "by",
+    "be",
+    "been",
+    "has",
+    "have",
+    "had",
+    "will",
+    "not",
+    "no",
+    "yes",
+}
 
 
 def _strip_skill_mentions(prompt: str, skills: list[str] | None) -> str:
@@ -2530,13 +2872,12 @@ def _extract_json_object(text: str) -> dict | None:
         end = t.rfind("}")
         if start == -1 or end <= start:
             return None
-        t = t[start:end + 1]
+        t = t[start : end + 1]
     try:
         obj = json.loads(t)
     except Exception:  # noqa: BLE001
         return None
     return obj if isinstance(obj, dict) else None
-
 
 
 def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
@@ -2545,8 +2886,12 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     image_uris = _agents._load_images(state.get("images"))
     ctx = int(state.get("context_window") or 0) or _agents.DEFAULT_CONTEXT_WINDOW_FLOOR
     model = build_chat_model(
-        state["provider"], state["model_name"], state["base_url"],
-        state["api_key"], state["env_var"], state["oauth_token"],
+        state["provider"],
+        state["model_name"],
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["oauth_token"],
     )
     from tools import open_vector_store
 
@@ -2554,13 +2899,18 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         root, state.get("vector_db_path", ""), state.get("vector_config")
     )
     tools = make_tool_callbacks(
-        root, lambda ev: queue.put_nowait(ev),
-        context_window=ctx, web_model=model, main_model=model,
-        vision_model=None, image_uris=image_uris,
+        root,
+        lambda ev: queue.put_nowait(ev),
+        context_window=ctx,
+        web_model=model,
+        main_model=model,
+        vision_model=None,
+        image_uris=image_uris,
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
         permit={"outside": bool(state.get("allow_outside"))},
-        store=store, chat_id=state.get("chat_id", ""),
+        store=store,
+        chat_id=state.get("chat_id", ""),
     )
     # Capture ask_user answers so a clarifying reply can re-trigger planning
     # (e.g. the planner asked "where is the current frontend?" and the user
@@ -2569,11 +2919,13 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     base_ask = tools.get("ask_user")
     if base_ask is not None:
         cid = state.get("chat_id", "")
+
         async def _ask_wrapper(question, options=None):
             answer = await base_ask(question, options)
             if answer:
                 _ASK_ANSWERS[cid] = answer
             return answer
+
         tools["ask_user"] = _ask_wrapper
     return tools
 
@@ -2597,7 +2949,9 @@ def _parse_glob_files(text: str) -> list[str]:
         line = line.strip()
         if not line or line.startswith(("GLOB MATCHES", "(")):
             continue
-        if ("/" in line or re.match(r"^[\w.\-]+\.\w+$", line)) and not _is_excluded_discovery_path(line):
+        if (
+            "/" in line or re.match(r"^[\w.\-]+\.\w+$", line)
+        ) and not _is_excluded_discovery_path(line):
             out.append(line)
     return out
 
@@ -2617,13 +2971,22 @@ def _build_tree(root: str, max_depth: int = 3, max_entries: int = 400) -> str:
     lines: list[str] = []
     count = 0
     skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
-        "build", "target", ".mypy_cache", ".pytest_cache", "skills",
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "target",
+        ".mypy_cache",
+        ".pytest_cache",
+        "skills",
         "release",
     }
     base = root.rstrip(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
-        depth = dirpath[len(base):].count(os.sep)
+        depth = dirpath[len(base) :].count(os.sep)
         if depth > max_depth:
             dirnames[:] = []
             continue
@@ -2653,14 +3016,29 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
     import os
 
     skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
-        "build", "target", ".mypy_cache", ".pytest_cache", ".next", "out",
-        "coverage", ".idea", ".vscode", ".turbo", "skills", "release",
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "target",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".next",
+        "out",
+        "coverage",
+        ".idea",
+        ".vscode",
+        ".turbo",
+        "skills",
+        "release",
     }
     out: list[str] = []
     base = root.rstrip(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
-        depth = dirpath[len(base):].count(os.sep)
+        depth = dirpath[len(base) :].count(os.sep)
         if depth > 7:
             dirnames[:] = []
             continue
@@ -2713,7 +3091,9 @@ def _is_excluded_discovery_path(path: str) -> bool:
       double-counts the whole codebase and blows the discovery budget.
 
     Test source (``backend/tests/*.py``) stays discoverable on purpose."""
-    return any(p in _EXCLUDED_DISCOVERY_DIRS for p in re.split(r"[/\\]", (path or "").strip()))
+    return any(
+        p in _EXCLUDED_DISCOVERY_DIRS for p in re.split(r"[/\\]", (path or "").strip())
+    )
 
 
 def _is_excluded_root_md(path: str, root: str) -> bool:
@@ -2754,8 +3134,7 @@ def _rank_files_by_prompt(files: list[str], prompt: str) -> list[str]:
     return [f for _, _, f in scored]
 
 
-_IMPORT_RE = re.compile(
-    r"""(?mx)
+_IMPORT_RE = re.compile(r"""(?mx)
     ^[^\S\n]*(?:
         from\s+([.\w]+)\s+import\s+([\w,\s]+)
       | import\s+([.\w]+)
@@ -2763,8 +3142,7 @@ _IMPORT_RE = re.compile(
       | require\(\s*['"]([^'"]+)['"]\s*\)
       | import\s+['"]([^'"]+)['"]
       | export[^\n'"]*?from\s+['"]([^'"]+)['"]
-    )"""
-)
+    )""")
 
 
 def _resolve_module(root: str, from_file: str, spec: str) -> str | None:
@@ -2845,7 +3223,9 @@ def _fully_read_files(read_context: str) -> set[str]:
 
     Partial reads (``--- <file>:a-b ---``) are intentionally excluded: they may
     not cover the grep-hit line, so their grep matches must stay."""
-    return {m.group(1) for m in re.finditer(r"^=== (.+?) ===$", read_context, re.MULTILINE)}
+    return {
+        m.group(1) for m in re.finditer(r"^=== (.+?) ===$", read_context, re.MULTILINE)
+    }
 
 
 def _dedup_grep_results(grep_results: list[str], fully_read: set[str]) -> list[str]:
@@ -2865,7 +3245,6 @@ def _dedup_grep_results(grep_results: list[str], fully_read: set[str]) -> list[s
         if kept:
             out.append("\n".join(kept))
     return out
-
 
 
 def _resolve_file_refs(texts, root) -> list[str]:
@@ -2990,9 +3369,22 @@ _TREE_CACHE: dict[str, tuple[str, str]] = {}
 _TREE_CACHE_MAX_ROOTS = 500
 
 _MTIME_SIG_SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
-    "build", "target", ".mypy_cache", ".pytest_cache", ".next", "out",
-    "coverage", ".idea", ".vscode", ".turbo",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    "target",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".next",
+    "out",
+    "coverage",
+    ".idea",
+    ".vscode",
+    ".turbo",
 }
 
 
@@ -3008,7 +3400,9 @@ def _repo_mtime_signature(root: str, max_entries: int = 4000) -> str:
     latest = 0.0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
-            d for d in dirnames if not d.startswith(".") and d not in _MTIME_SIG_SKIP_DIRS
+            d
+            for d in dirnames
+            if not d.startswith(".") and d not in _MTIME_SIG_SKIP_DIRS
         )
         for f in filenames:
             if f.startswith("."):
@@ -3034,7 +3428,9 @@ def _spec_keyword_signature(request: str) -> str:
     return "|".join(sorted(toks))
 
 
-def _build_tree_cached(root: str, root_sig: str, max_depth: int = 3, max_entries: int = 400) -> str:
+def _build_tree_cached(
+    root: str, root_sig: str, max_depth: int = 3, max_entries: int = 400
+) -> str:
     """Same output as `_build_tree`, skipping the walk when `root_sig` (an
     already-computed `_repo_mtime_signature`) matches the last build for this
     root — the tree walk repeats on every single repo_derive call otherwise.
@@ -3049,7 +3445,9 @@ def _build_tree_cached(root: str, root_sig: str, max_depth: int = 3, max_entries
     return tree
 
 
-def _rank_files_semantic(root: str, prompt: str, files: list[str], state: AgentState) -> list[str]:
+def _rank_files_semantic(
+    root: str, prompt: str, files: list[str], state: AgentState
+) -> list[str]:
     """Rank `files` by embedding similarity to `prompt` using the project's own
     vector store (the same index already built for RAG) instead of naive
     keyword-overlap counting — no extra LLM call, just an embedding lookup.
@@ -3220,10 +3618,14 @@ async def reader_read(state: AgentState) -> dict:
         if f in line_refs:
             for a, b in line_refs[f]:
                 end = b or a
-                ranges.append((max(1, a - READER_CONTEXT_LINES), end + READER_CONTEXT_LINES))
+                ranges.append(
+                    (max(1, a - READER_CONTEXT_LINES), end + READER_CONTEXT_LINES)
+                )
         elif patterns:
             for n in sorted(_in_file_grep(root, f, patterns)):
-                ranges.append((max(1, n - READER_CONTEXT_LINES), n + READER_CONTEXT_LINES))
+                ranges.append(
+                    (max(1, n - READER_CONTEXT_LINES), n + READER_CONTEXT_LINES)
+                )
         else:
             ranges.append((1, READER_HEAD_LINES))
         for a, b in _merge_ranges(ranges):
@@ -3302,7 +3704,10 @@ async def plan_build(state: AgentState) -> dict:
     if reply.strip():
         from tools import _self_check_plan_paths, slugify
 
-        ws = slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep))) or "workspace"
+        ws = (
+            slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep)))
+            or "workspace"
+        )
         plan_body = _normalize_plan_reply(reply)
         plan_body, check_note = _self_check_plan_paths(state["root"], plan_body)
         try:
@@ -3332,7 +3737,7 @@ def _normalize_plan_reply(reply: str) -> str:
     if not text:
         return ""
     m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
-    return text[m.start():] if m else text
+    return text[m.start() :] if m else text
 
 
 def _route_plan_build(state: AgentState) -> str:
@@ -3363,7 +3768,9 @@ def _route_test(state: AgentState) -> str:
 
 
 def _route_debug(state: AgentState) -> str:
-    if int(state.get("debug_attempts", 0)) < int(state.get("max_debug_attempts", MAX_DEBUG_ATTEMPTS)):
+    if int(state.get("debug_attempts", 0)) < int(
+        state.get("max_debug_attempts", MAX_DEBUG_ATTEMPTS)
+    ):
         return "coder"
     return "review"
 
@@ -3393,12 +3800,14 @@ def build_graph():
     g.add_node("reader_read", reader_read)
     g.add_node("reader_answer", reader_answer)
     g.add_conditional_edges(
-        "ask_entry", _route_ask_entry,
+        "ask_entry",
+        _route_ask_entry,
         {"ask_answer": "ask_answer", "reader": "reader_read"},
     )
     g.add_edge("ask_answer", "done")
     g.add_conditional_edges(
-        "reader_read", _route_reader_dispatch,
+        "reader_read",
+        _route_reader_dispatch,
         {"reader_answer": "reader_answer", "plan_build": "plan_build"},
     )
     g.add_edge("reader_answer", "done")
@@ -3406,25 +3815,34 @@ def build_graph():
     g.add_node("plan_understand", plan_understand)
     g.add_node("plan_build", plan_build)
     g.add_conditional_edges(
-        "plan_understand", _route_plan_understand,
+        "plan_understand",
+        _route_plan_understand,
         {"reader_read": "reader_read", "plan_build": "plan_build"},
     )
     g.add_conditional_edges(
-        "plan_build", _route_plan_build,
+        "plan_build",
+        _route_plan_build,
         {"plan_build": "plan_build", "coder": "coder", "done": "done"},
     )
 
     g.add_edge(START, "router")
     g.add_conditional_edges(
-        "router", _route_mode,
-        {"ask": "ask_entry", "plan": "plan_understand",
-         "coder": "coder_entry", "reader": "reader_read"},
+        "router",
+        _route_mode,
+        {
+            "ask": "ask_entry",
+            "plan": "plan_understand",
+            "coder": "coder_entry",
+            "reader": "reader_read",
+        },
     )
 
     # CODER tail.
     g.add_edge("coder", "test")
     g.add_conditional_edges("test", _route_test, {"pass": "review", "fail": "debug"})
-    g.add_conditional_edges("debug", _route_debug, {"coder": "coder", "review": "review"})
+    g.add_conditional_edges(
+        "debug", _route_debug, {"coder": "coder", "review": "review"}
+    )
     g.add_edge("review", "done")
     g.add_edge("done", END)
     return g.compile()
@@ -3451,7 +3869,10 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     # where the router would block after a few searches within a single message.
     _agents._reset_search_call_count()
     if not (initial.get("request") or "").strip():
-        yield {"kind": "error", "content": "empty or whitespace-only prompt — refusing to run"}
+        yield {
+            "kind": "error",
+            "content": "empty or whitespace-only prompt — refusing to run",
+        }
         return
     graph = build_graph()
 
@@ -3477,15 +3898,6 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-
-
-
-
-
-
-
-
-
 
 
 # Repo-discovery cue (used by `_ask_needs_repo` and follow-up routing): a strong

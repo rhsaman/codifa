@@ -46,7 +46,9 @@ from providers import (
 )
 
 
-def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
+def _strip_think_tags(
+    text: str, in_think: bool, think_buf: str
+) -> tuple[str, bool, str]:
     """Remove literal ``<think>…</think>`` reasoning from streamed text.
 
     Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
@@ -92,7 +94,9 @@ def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, b
     return "".join(out), in_think, think_buf
 
 
-def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3) -> bool:
+def _is_repeating(
+    text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3
+) -> bool:
     """Detect a degenerate text loop at the tail of ``text``.
 
     Models sometimes emit the same sentence/phrase dozens of times with no
@@ -106,11 +110,11 @@ def _is_repeating(text: str, min_len: int = 20, max_len: int = 200, min_reps: in
     if not text or len(text) < min_len * min_reps:
         return False
     for unit in range(min(max_len, len(text) // min_reps), min_len - 1, -1):
-        tail = text[-(unit * min_reps):]
+        tail = text[-(unit * min_reps) :]
         if len(tail) < unit * min_reps:
             continue
         first = tail[:unit]
-        if all(tail[i * unit:(i + 1) * unit] == first for i in range(1, min_reps)):
+        if all(tail[i * unit : (i + 1) * unit] == first for i in range(1, min_reps)):
             return True
     return False
 
@@ -215,9 +219,7 @@ def _extra_headers(provider: str, base_url: str, cache: bool) -> dict[str, str]:
     return headers
 
 
-def _thinking_kwargs(
-    provider: str, model: str, thinking_level: str
-) -> dict[str, Any]:
+def _thinking_kwargs(provider: str, model: str, thinking_level: str) -> dict[str, Any]:
     """Return ``model_kwargs`` carrying the reasoning effort, or {} when off."""
     level = _THINKING_LEVELS.get((thinking_level or "").strip())
     if level is None or level is False:
@@ -295,7 +297,6 @@ def build_chat_model(
             streaming=True,
             timeout=to if isinstance(to, (int, float)) else None,
         )
-
 
     lc_kwargs: dict[str, Any] = {
         "model": model,
@@ -466,8 +467,14 @@ from agents import (
 # tool calls run one at a time; everything else may run concurrently. See the
 # comment on graph.py's `_SEQUENTIAL_TOOLS` for the full rationale.
 _SEQUENTIAL_TOOLS = {
-    "write_file", "edit_file", "run_terminal", "confirm_action",
-    "memory", "create_skill", "create_mcp", "ask_user",
+    "write_file",
+    "edit_file",
+    "run_terminal",
+    "confirm_action",
+    "memory",
+    "create_skill",
+    "create_mcp",
+    "ask_user",
 }
 
 
@@ -509,7 +516,9 @@ async def llm_generate(
     content = getattr(res, "content", "")
     if isinstance(content, list):
         text = "".join(
-            p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
         )
         text = text or str(content)
     else:
@@ -556,9 +565,12 @@ async def langchain_tool_loop(
     tools run sequentially. See ``_SEQUENTIAL_TOOLS``.
     """
     lc_tools = [
-        StructuredTool.from_function(func=fn, name=name, description=(fn.__doc__ or name))
+        StructuredTool.from_function(
+            func=fn, name=name, description=(fn.__doc__ or name)
+        )
         for name, fn in tools.items()
     ]
+
     async def _exec(tc):
         """Execute a single tool call; never raises (errors become a result string)."""
         name = tc.get("name") or ""
@@ -626,7 +638,6 @@ async def langchain_tool_loop(
                 # guard only watches tool-call signatures, so this catches the
                 # no-tool-call case. Return only the non-repeating prefix.
                 if _is_repeating(content):
-
                     _logger.warning(
                         "sub-agent reply entered a text repetition loop; truncating"
                     )
@@ -647,21 +658,19 @@ async def langchain_tool_loop(
         # is unchanged (the provider still receives every ToolMessage, just
         # faster). ToolMessages carry their own tool_call_id, so `msgs` order
         # need not match request order.
-        _parallel = [tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
+        _parallel = [
+            tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
+        ]
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
         if len(_parallel) > 1:
             _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
         else:
             _results = [await _exec(tc) for tc in _parallel]
         for tc, result in zip(_parallel, _results):
-            msgs.append(
-                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
-            )
+            msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
         for tc in _sequential:
             result = await _exec(tc)
-            msgs.append(
-                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
-            )
+            msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
         # --- doom-loop guard (opencode's repeated-call detector) ---
         # Build a signature of THIS step's tool calls; if it matches the previous
         # step exactly N times in a row, the model is looping — inject a hard
@@ -777,9 +786,7 @@ def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
     if not isinstance(prompt_details, dict):
         prompt_details = {}
     anthropic_read = (
-        details.get("cache_read_input_tokens")
-        or um.get("cache_read_input_tokens")
-        or 0
+        details.get("cache_read_input_tokens") or um.get("cache_read_input_tokens") or 0
     )
     anthropic_write = (
         details.get("cache_creation_input_tokens")
@@ -842,17 +849,19 @@ def usage_event(
             _md_dump = _json.dumps(metadata, default=str)
         except Exception:  # noqa: BLE001
             _md_dump = repr(metadata)
-        print(
-            f"[USAGE_DEBUG] llm model={model!r} in={input_tokens} out={output_tokens} "
-            f"cache_read={cache_read} cache_write={cache_write} additive={additive} "
-            f"metadata={_md_dump[:3000]}",
-            flush=True,
-        )
         if additive:
             total = input_tokens + output_tokens + cache_read + cache_write
         else:
-            provided_total = metadata.get("total_tokens") if isinstance(metadata, dict) else getattr(metadata, "total_tokens", 0)
-            total = (provided_total or 0) if (provided_total or 0) else input_tokens + output_tokens
+            provided_total = (
+                metadata.get("total_tokens")
+                if isinstance(metadata, dict)
+                else getattr(metadata, "total_tokens", 0)
+            )
+            total = (
+                (provided_total or 0)
+                if (provided_total or 0)
+                else input_tokens + output_tokens
+            )
         if total <= 0:
             return None
         return {
@@ -868,4 +877,3 @@ def usage_event(
         }
     except Exception:  # noqa: BLE001 -- usage must never crash a run
         return None
-

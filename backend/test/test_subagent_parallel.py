@@ -24,8 +24,8 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 
 from langchain_core.messages import AIMessage
 
-from llm import langchain_tool_loop
 import tools
+from llm import langchain_tool_loop
 from tools import make_tool_callbacks
 
 

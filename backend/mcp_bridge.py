@@ -22,13 +22,12 @@ Design notes
 
 from __future__ import annotations
 
-import json
 import os
-from contextlib import AsyncExitStack
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack, suppress
+from typing import Any
 
 from langchain_core.tools import StructuredTool
-
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -69,8 +68,8 @@ async def _call_mcp_tool(
     try:
         result = await session.call_tool(tool_name, arguments=kwargs or {})
     except Exception as exc:  # noqa: BLE001
-        msg = f"ERROR calling MCP tool {name!r}: {exc}"
-        emit({"kind": "tool_result", "tool": name, "summary": msg, "status": "error"})
+        msg = f"ERROR calling MCP tool {tool_name!r}: {exc}"
+        emit({"kind": "tool_result", "tool": tool_name, "summary": msg, "status": "error"})
         return msg
 
     # MCP returns structured content; flatten it to text for the model.
@@ -157,10 +156,8 @@ async def _connect_stdio(
     tools = [_make_tool(name, t, session, emit) for t in (mlist.tools or [])]
 
     async def _cleanup() -> None:
-        try:
+        with suppress(Exception):
             await stack.aclose()
-        except Exception:  # noqa: BLE001
-            pass
 
     return tools, _cleanup
 
@@ -210,10 +207,8 @@ async def _connect_http(
     tools = [_make_tool(name, t, session, emit) for t in (mlist.tools or [])]
 
     async def _cleanup() -> None:
-        try:
+        with suppress(Exception):
             await stack.aclose()
-        except Exception:  # noqa: BLE001
-            pass
 
     return tools, _cleanup
 
@@ -271,9 +266,7 @@ async def build_mcp_tools(
 
     async def _cleanup_all() -> None:
         for c in cleanups:
-            try:
+            with suppress(Exception):
                 await c()
-            except Exception:  # noqa: BLE001
-                pass
 
     return tools, _cleanup_all

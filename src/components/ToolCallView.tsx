@@ -156,6 +156,50 @@ export const WebResultLinks = memo(function WebResultLinks({
   )
 })
 
+/** نمایش نتایج grep/glob به‌صورت لیست مسیر فایل (با شمارهٔ خط) — نه لینک وب.
+ *  آیتم‌های این ابزارها فیلد `url` ندارند، پس نباید از WebResultLinks (مخصوص
+ *  web_search/fetch_url) استفاده شوند؛ وگرنه به‌جای مسیر فایل فقط آیکون 🔗
+ *  نمایش داده می‌شد. */
+export const FileResultLinks = memo(function FileResultLinks({
+  tool,
+  items,
+}: {
+  tool: string
+  items: Array<Record<string, unknown>>
+}) {
+  if (!items || items.length === 0) return null
+  const VISIBLE = 3
+  const visible = items.slice(0, VISIBLE)
+  const extra = items.length - visible.length
+  return (
+    <ul className="file-results" dir="ltr">
+      {visible.map((it, i) => {
+        const file = String(it.file ?? it.path ?? '')
+        if (!file) return null
+        const line = it.line !== undefined && it.line !== null ? String(it.line) : ''
+        const text = String(it.text ?? '')
+        return (
+          <li key={i} className="file-result">
+            <span className="file-result-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <path d="M14 2v6h6" />
+              </svg>
+            </span>
+            <span className="file-result-path">{file}{line ? `:${line}` : ''}</span>
+            {text && <span className="file-result-text">{text}</span>}
+          </li>
+        )
+      })}
+      {extra > 0 && (
+        <li className="file-result-more" key="more">
+          +{extra} more
+        </li>
+      )}
+    </ul>
+  )
+})
+
 /** Keys already rendered as dedicated chips in the tool-card head. */
 const HEADER_SHOWN_KEYS = new Set([
   'command',
@@ -574,7 +618,7 @@ const ToolTimelineRow = memo(function ToolTimelineRow({ activity }: { activity: 
       )}
       <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
-      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
+      {activity.items && activity.items.length > 0 && (activity.tool === 'web_search' || activity.tool === 'fetch_url' ? <WebResultLinks items={activity.items} /> : <FileResultLinks tool={activity.tool} items={activity.items as unknown as Array<Record<string, unknown>>} />)}
     </div>
   )
 })
@@ -690,7 +734,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
         <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
       )}
       <span className="tool-ms">{fmtTime(ms)}</span>
-      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
+      {activity.items && activity.items.length > 0 && (activity.tool === 'web_search' || activity.tool === 'fetch_url' ? <WebResultLinks items={activity.items} /> : <FileResultLinks tool={activity.tool} items={activity.items as unknown as Array<Record<string, unknown>>} />)}
     </div>
   )
 })
@@ -747,7 +791,7 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
         )}
         <span className="tool-ms">{fmtTime(ms)}</span>
       </div>
-      {activity.items && activity.items.length > 0 && <WebResultLinks items={activity.items} />}
+      {activity.items && activity.items.length > 0 && (activity.tool === 'web_search' || activity.tool === 'fetch_url' ? <WebResultLinks items={activity.items} /> : <FileResultLinks tool={activity.tool} items={activity.items as unknown as Array<Record<string, unknown>>} />)}
     </div>
   )
 })

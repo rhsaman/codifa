@@ -230,7 +230,7 @@ async def main():
                 prompt="find foo", history=[], **{**common, "chat_id": chat5}
             ):
                 pass
-        except Exception:  # noqa: BLE001 — the hard error is expected
+        except Exception:  # noqa: BLE001, S110 — the hard error is expected
             pass
         resume5 = state_db.load_turn_resume(ws, chat5)
         assert resume5 and resume5.get("tools"), "retry: resume file missing after error"

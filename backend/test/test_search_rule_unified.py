@@ -12,15 +12,15 @@ Two bugs were fixed:
    required path, grep/glob/read only for targeted lookups).
 """
 
-import sys
 import os
+import sys
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
 for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import agents  # noqa: E402
+import agents
 
 
 def test_search_rule_makes_broad_exploration_required():
@@ -51,7 +51,7 @@ def test_no_duplicate_delegate_clause_in_mode_caps():
 def test_search_rule_is_the_single_source_of_truth():
     """No mode prompt should contradict _SEARCH_RULE by re-allowing broad
     search directly (the word 'or delegate' implied that)."""
-    for mode, prompt in agents.SYSTEM_PROMPTS.items():
+    for prompt in agents.SYSTEM_PROMPTS.values():
         # The only place 'explore' should appear in a mode prompt now is the
         # explore agent's own registry prompt, not the parent mode prompts.
         assert "delegate broad exploration" not in prompt
@@ -114,7 +114,7 @@ def test_tool_docstrings_reference_explore_delegation():
     The tool functions are nested inside make_tool_callbacks, so we assert on
     the source text of tools.py rather than importing the functions directly.
     """
-    import pathlib  # noqa: E402
+    import pathlib
 
     src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
     text = src.read_text(encoding="utf-8")
@@ -123,7 +123,7 @@ def test_tool_docstrings_reference_explore_delegation():
 
 def test_read_docstring_encourages_parallel_reads():
     """read docstring must mirror opencode: read multiple files in parallel."""
-    import pathlib  # noqa: E402
+    import pathlib
 
     src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
     text = src.read_text(encoding="utf-8")

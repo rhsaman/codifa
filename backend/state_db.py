@@ -25,7 +25,6 @@ module lock, so a crash can never corrupt a file mid-write.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -485,7 +484,7 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
                 name = line
             break
     if not slug and name:
-        slug = slugify(name)
+        slug = _slugify(name)
     return name, slug, description
 
 

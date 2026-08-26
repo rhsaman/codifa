@@ -22,11 +22,11 @@ import tempfile
 _TMP = tempfile.mkdtemp(prefix="coder-test-modelsdev-data-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
-from providers import (  # noqa: E402
+from providers import (
     _models_dev_context,
     _models_dev_keys,
-    _models_dev_reasoning,
     _models_dev_provider_key,
+    _models_dev_reasoning,
 )
 
 # A slice of the real models.dev catalog shape (keys + ids as they actually

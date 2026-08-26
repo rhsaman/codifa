@@ -50,10 +50,10 @@ from pydantic import BaseModel, model_validator
 import providers
 from agents import (
     _compact_history,
-    _prune_history,
     _drain_steer,
     _enqueue_steer,
     _is_read_timeout,
+    _prune_history,
     _remove_steer,
     normalize_mode,
     run_agent,
@@ -115,7 +115,7 @@ class ChatRequest(BaseModel):
     provider: str = "custom"
 
     @model_validator(mode="after")
-    def _normalize_mode(self) -> "ChatRequest":
+    def _normalize_mode(self) -> ChatRequest:
         # Normalize legacy/UI mode names (e.g. "chat", "codewriter") to the
         # canonical workflow modes at the API boundary, so downstream code only
         # ever sees keys that exist in SYSTEM_PROMPTS.
@@ -492,7 +492,7 @@ async def models_remove(req: ModelRemoveRequest) -> dict:
 
 @app.get("/system-prompts")
 async def system_prompts() -> dict:
-    from agents import SYSTEM_PROMPTS, MODE_ALIASES
+    from agents import MODE_ALIASES, SYSTEM_PROMPTS
 
     # The frontend requests legacy keys ("chat", "codewriter"); map them back to
     # the canonical prompts via MODE_ALIASES so this endpoint never raises
@@ -1232,7 +1232,7 @@ async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
     try:
         store.clear()
         return MemoryClearResponse(ok=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"could not clear vector store: {exc}") from exc
 
 
@@ -1262,7 +1262,7 @@ async def memory_add(req: MemoryAddRequest) -> MemoryAddResponse:
         )
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"could not save memory note: {exc}") from exc
 
 
@@ -1363,7 +1363,7 @@ async def index_run(req: IndexRunRequest) -> IndexRunResponse:
             budget=req.budget or 0,
         )
         return IndexRunResponse(ok=True, **result)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"indexing failed: {exc}") from exc
 
 
@@ -1376,7 +1376,7 @@ async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
     try:
         report = run_cleanup(store, req.root, memory_manager=_memory_manager(req.root, store))
         return CleanupRunResponse(ok=True, **report)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"cleanup failed: {exc}") from exc
 
 

@@ -229,7 +229,7 @@ def test_route_reader_dispatch_plan_vs_ask():
 # --- Helpers ---------------------------------------------------------------
 
 def test_parse_line_refs(tmp_path):
-    root = _repo(tmp_path)
+    _repo(tmp_path)
     refs = _parse_line_refs(
         "look at backend/graph.py:42 and src/App.tsx#L10-15",
         ["backend/graph.py", "src/App.tsx"],

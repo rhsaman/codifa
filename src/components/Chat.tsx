@@ -75,6 +75,7 @@ import type {
   SidecarEvent,
   ThinkingLevel,
   ToolActivity,
+  SearchResultItem,
 } from "../types";
 import { ChatMessageView, RetryBanner } from "./ChatMessage";
 import { ModeIcon } from "./ModeIcon";
@@ -1448,10 +1449,34 @@ export function ChatPanel() {
           ?.messages.find((m) => m.id === assistantMsg.id)?.toolActivity ?? []
       ).filter((a) => a.status !== "running");
       if (doneActs.length === 0) return;
-      const lines = doneActs
-        .slice(0, 20)
-        .map((a) => `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`);
-      const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${lines.join("\n")}]`;
+      const blocks: string[] = [];
+      for (const a of doneActs.slice(0, 20)) {
+        const head = `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`;
+        // Fold the REAL tool output (not just the summary) so a reconnect does
+        // not re-execute the call and waste context. `items`/`results` carry the
+        // actual rows (grep hits, glob paths, web_search links, …); fall back to
+        // the summary only when there is no structured result.
+        const rows = (a.items ?? a.results ?? []) as unknown as Array<Record<string, unknown>>;
+        const body = rows.length
+          ? rows
+              .slice(0, 50)
+              .map((r) => {
+                const line =
+                  (r.snippet as string) ||
+                  (r.content as string) ||
+                  (r.text as string) ||
+                  (r.title as string) ||
+                  (r.url as string) ||
+                  (r.path as string) ||
+                  (r.file as string) ||
+                  JSON.stringify(r);
+                return `    ${line}`;
+              })
+              .join("\n")
+          : "";
+        blocks.push(body ? `${head}\n${body}` : head);
+      }
+      const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${blocks.join("\n")}]`;
       const current = useStore
         .getState()
         .chats.find((c) => c.id === chat.id)
@@ -1922,13 +1947,11 @@ export function ChatPanel() {
           mcpServers: (() => {
             const all = s.settings.mcpServers ?? {};
             const enabled = s.settings.mcpEnabled ?? [];
-            // If the user hasn't explicitly toggled any connector on/off, send
-            // every configured connector (they added them intending to use
-            // them). This also covers connectors created via the `/mcp`
-            // command that haven't reached the UI store yet.
-            const names = enabled.length > 0 ? enabled : Object.keys(all);
+            // Only send connectors the user explicitly toggled ON in the
+            // composer chip. If none are enabled, send nothing — the chip is
+            // the per-chat toggle (on = use it, off = use none).
             const sel: Record<string, (typeof all)[string]> = {};
-            for (const n of names) if (all[n]) sel[n] = all[n];
+            for (const n of enabled) if (all[n]) sel[n] = all[n];
             return sel;
           })(),
           skills: Array.from(mentionSkills),

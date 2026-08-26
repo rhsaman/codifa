@@ -22,7 +22,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from graph import resolve_subagent_model  # noqa: E402
+from graph import resolve_subagent_model
 
 PROVIDER = "opencode"
 BASE = "https://opencode.ai/zen/v1"

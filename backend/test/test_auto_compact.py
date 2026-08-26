@@ -8,8 +8,9 @@ Covers:
 
 import asyncio
 
-import graph
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+import graph
 
 
 def test_usable_tokens_opencode_parity():
@@ -71,7 +72,7 @@ def test_auto_compact_fires_above_usable():
         graph._agents._compact_history = original
 
     assert events == ["compact_start", "compact"]
-    compact = [e for e in items if e["kind"] == "compact"][0]
+    compact = next(e for e in items if e["kind"] == "compact")
     assert compact["keep"] == 3
     assert compact["content"].startswith("[Compacted earlier context]")
 
@@ -180,10 +181,7 @@ def test_backend_context_window_manual_override(monkeypatch):
                 state["provider"], state["model_name"], state["base_url"],
                 state["api_key"], state["env_var"], oauth_token=state["oauth_token"],
             )
-        if ctx <= 0:
-            # opencode leaves the window unknown (usable=0 -> compaction off)
-            # instead of falling back to a 32k floor.
-            ctx = 0
+        ctx = max(0, ctx)
         return ctx
 
     # Manual window set -> model_context is never called, value wins.

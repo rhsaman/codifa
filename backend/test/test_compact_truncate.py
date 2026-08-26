@@ -26,7 +26,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import agents as _agents  # noqa: E402
+import agents as _agents
 
 
 def _big_history(n_turns: int = 20) -> list[dict]:

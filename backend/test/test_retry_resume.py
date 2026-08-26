@@ -15,11 +15,11 @@ Run: pytest backend/tests/test_retry_resume.py (or via run_tests.py).
 """
 import json
 
-import agents
 import pytest
-
-import state_db
 from mock_openai import mock, text_reply, tool_call
+
+import agents
+import state_db
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +224,7 @@ def test_hard_quota_exhausted_still_detected():
 # ---------------------------------------------------------------------------
 
 
-async def test_client_abort_stops_cleanly_no_error_event(mock_server, workspace):  # noqa: F811
+async def test_client_abort_stops_cleanly_no_error_event(mock_server, workspace):
     """When the client closes the stream mid-turn (abort), the backend must NOT
     treat the resulting CancelledError as a transient failure and emit an `error`
     event that would never be read (the SSE socket is already torn down). It

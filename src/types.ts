@@ -223,6 +223,10 @@ export interface ToolActivity {
   model?: string
   /** Structured result rows (e.g. web_search hits) shown in the tool card. */
   items?: SearchResultItem[]
+  /** Alias of `items` — the backend emits `results` on tool_result events, and
+   *  the UI stores them here so a reconnect can replay the tool without
+   *  re-executing it (re-execution wastes context). */
+  results?: SearchResultItem[]
   /** Which web-search provider produced these results (e.g. 'tavily'). */
   engine?: string
 }

@@ -51,7 +51,7 @@ def _trace(events, captured):
 
 
 async def test_search_plan_trace(run_events, mock_server, workspace):
-    base, _mock = mock_server
+    _base, _mock = mock_server
     # Seed a file that matches the search so the main model's grep finds it directly.
     (workspace / "ui.py").write_text(
         "def render_header(model):\n    # context capacity of the local model\n"
@@ -77,7 +77,6 @@ async def test_search_plan_trace(run_events, mock_server, workspace):
             history=[], chat_id="pytest-chat", subagent_models={},
         ):
             events.append(ev)
-        captured = []
         dt = time.perf_counter() - t0
     else:
         # In the OpenCode-style design the PLAN agent searches JUST-IN-TIME: it
@@ -97,7 +96,6 @@ async def test_search_plan_trace(run_events, mock_server, workspace):
             mode="plan",
             subagent_models={},
         )
-        captured = mock.captured
         dt = time.perf_counter() - t0
 
     # Assertions: search ran, no crash, turn finished.

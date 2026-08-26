@@ -21,9 +21,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage  # noqa: E402
+from langchain_core.messages import AIMessage
 
-from tools import make_tool_callbacks  # noqa: E402
+from tools import make_tool_callbacks
 
 
 class _FakeModel:

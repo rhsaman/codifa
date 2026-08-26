@@ -10,9 +10,7 @@ to a name heuristic. No model names are hardcoded.
 import asyncio
 from unittest import mock
 
-import pytest
-
-from providers import list_models, _model_cache
+from providers import _model_cache, list_models
 
 
 def _make_client(payload: dict):

@@ -5,12 +5,12 @@ sentence 80 times) and inline reasoning tags that some models leak into the
 visible content stream.
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from graph import _is_repeating, _strip_think_tags  # noqa: E402
+from graph import _is_repeating, _strip_think_tags
 
 
 def test_repeating_sentence_triggers():
@@ -61,7 +61,7 @@ def test_strip_think_spanning_chunks():
 
 def test_strip_think_thinking_variant():
     text = "x <thinking>hidden</think> y"
-    out, in_think, buf = _strip_think_tags(text, False, "")
+    out, _in_think, buf = _strip_think_tags(text, False, "")
     assert out == "x  y"
     assert "hidden" in buf
 

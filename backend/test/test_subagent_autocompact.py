@@ -27,16 +27,15 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import (  # noqa: E402
+from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
 
-import llm as _llm  # noqa: E402
-import agents as _agents  # noqa: E402
-from tools import make_tool_callbacks  # noqa: E402
+import agents as _agents
+import llm as _llm
+from tools import make_tool_callbacks
 
 
 async def test_auto_compact_subagent_compacts_in_place():
@@ -86,7 +85,6 @@ async def test_auto_compact_subagent_noop_below_budget():
 
     async def fake_compact(*a, **k):
         called["n"] += 1
-        return None  # noqa: unnecessary-return-none
 
     original = _llm._compact_history
     _llm._compact_history = fake_compact

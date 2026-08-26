@@ -90,8 +90,10 @@ console.log('1) persist هنگام streaming: toolActivity حفظ و تریم م
   check('summary تریم شد (4000+…)', m.toolActivity[0].summary.length === 4001, m.toolActivity[0].summary.length)
   check('args رشته بزرگ تریم شد (2000+…)', m.toolActivity[0].args.big.length === 2001, m.toolActivity[0].args.big.length)
   check('args رشته کوچک دستنخورده', m.toolActivity[0].args.cmd === 'ls')
-  check('items به 50 محدود شد', m.toolActivity[0].items.length === 50, m.toolActivity[0].items.length)
-  check('snippet تریم شد (500+…)', m.toolActivity[0].items[0].snippet.length === 501, m.toolActivity[0].items[0].snippet.length)
+  // `items` (the full tool result) is intentionally NOT truncated — trimming it
+  // would silently shrink the context sent to the provider on reconnect.
+  check('items کامل حفظ شد (60)', m.toolActivity[0].items.length === 60, m.toolActivity[0].items.length)
+  check('snippet کامل حفظ شد (800)', m.toolActivity[0].items[0].snippet.length === 800, m.toolActivity[0].items[0].snippet.length)
   check('children بازگشتی تریم شد', m.toolActivity[0].children[0].summary === 'nested')
   check('پیام کاربر flag ندارد', !msgs.find((x: any) => x.role === 'user').interrupted)
 }

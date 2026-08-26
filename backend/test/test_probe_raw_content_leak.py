@@ -5,7 +5,6 @@ as a plain string in `content` (before the real answer). This test reproduces
 that exact wire shape and asserts the backend does NOT emit it as a `text`
 event.
 """
-import pytest
 
 
 async def test_probe_raw_content_leak(run_events, mock_server, workspace):

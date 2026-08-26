@@ -14,13 +14,9 @@ import asyncio
 import base64
 import contextvars
 import functools
-import hashlib
 import json
 import os
 import re
-import tempfile
-import time
-import traceback
 import warnings
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
@@ -31,39 +27,29 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-import state_db
-from context_builder import build_context
-from providers import (
-    _expand_base,
-    _provider_meta,
-)
-from retrieval import RetrievalSettings
-from secret_utils import decrypt_secret
-from tools import (
-    _PARENT_TOOLS_CTX,
-    _SCOUT_CTX,
-    _SUB_AGENT_CTX,
-    LOG_FILENAME,
-    PathEscapeError,
-    _is_text_path,
-    _read_text,
-    _tool_event,
-    list_files,
-    make_tool_callbacks,
-    open_vector_store,
-    read_file,
-    remember,
-    resolve_safe,
-    slugify,
-    user_coder_dir,
-)
-from vector_store import KIND_MEMORY, VectorStore
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
+
+import state_db
+from providers import (
+    _expand_base,
+    _provider_meta,
+)
+from tools import (
+    _SUB_AGENT_CTX,
+    LOG_FILENAME,
+    PathEscapeError,
+    list_files,
+    read_file,
+    resolve_safe,
+    slugify,
+    user_coder_dir,
+)
+from vector_store import KIND_MEMORY, VectorStore
 
 # Steer messages injected into a RUNNING agent without interrupting it. Keyed
 # by chat_id; each entry is {"id", "prompt"}. The frontend POSTs here while the
@@ -2582,9 +2568,7 @@ def _is_code_task(prompt: str) -> bool:
     p = (prompt or "").strip().lower()
     if not p or len(p) <= 8:
         return False
-    if _TRIVIAL_TASK_RE.search(p):
-        return False
-    return True
+    return not _TRIVIAL_TASK_RE.search(p)
 
 
 def _trivial_prompt(prompt: str) -> bool:
@@ -3313,6 +3297,7 @@ def _maybe_downscale_image(data_url: str) -> str:
         return data_url
     try:
         from io import BytesIO
+
         from PIL import Image
     except Exception:  # noqa: BLE001
         return data_url

@@ -8,13 +8,13 @@ parameters, and that the transcribed text is returned verbatim.
 
 from __future__ import annotations
 
-import server
-
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+import server
 
 
 def _make_client(captured: dict):

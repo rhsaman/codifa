@@ -470,6 +470,7 @@ interface State {
   deleteChat: (id: string) => void
   deleteWorkspace: (key: string) => void
   setWorkspaceColor: (key: string, color: string) => void
+  renameWorkspace: (key: string, label: string) => void
   togglePinWorkspace: (key: string) => void
   togglePinChat: (id: string) => void
   setActiveChat: (id: string) => void
@@ -1365,6 +1366,15 @@ export const useStore = create<State>((set, get) => ({
         : [key, ...s.pinnedWorkspaces]
       return { pinnedWorkspaces }
     })
+    get().persist()
+  },
+
+  renameWorkspace: (key, label) => {
+    set((s) => ({
+      workspaces: s.workspaces.map((w) =>
+        w.key === key ? { ...w, label } : w,
+      ),
+    }))
     get().persist()
   },
 

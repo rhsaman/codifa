@@ -9,8 +9,6 @@ any network, server, or LLM.
 """
 import asyncio
 
-import pytest
-
 from server import _with_keepalive
 
 

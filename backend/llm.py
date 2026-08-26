@@ -26,11 +26,13 @@ graph or the tools.
 from __future__ import annotations
 
 import asyncio
-import httpx
+import contextlib
 import json
+import logging
 from typing import Any
 
-from langchain_core.messages import AIMessageChunk
+_logger = logging.getLogger(__name__)
+
 from langchain_openai import ChatOpenAI
 
 from providers import (
@@ -42,6 +44,7 @@ from providers import (
     normalize_base_url,
     qualify_model_id,
 )
+
 
 def _strip_think_tags(text: str, in_think: bool, think_buf: str) -> tuple[str, bool, str]:
     """Remove literal ``<think>…</think>`` reasoning from streamed text.
@@ -181,10 +184,8 @@ class ReasoningChatOpenAI(ChatOpenAI):
             # that already surfaces reasoning through additional_kwargs.
             if not ak.get("reasoning_content"):
                 ak["reasoning_content"] = raw_reasoning
-                try:
+                with contextlib.suppress(Exception):
                     message.additional_kwargs = ak
-                except Exception:  # noqa: BLE001
-                    pass
         return generation_chunk
 
 
@@ -295,19 +296,18 @@ def build_chat_model(
             timeout=to if isinstance(to, (int, float)) else None,
         )
 
-    from langchain_openai import ChatOpenAI
 
-    lc_kwargs: dict[str, Any] = dict(
-        model=model,
-        openai_api_base=base or None,
-        openai_api_key=key or "sk-noauth",
-        temperature=temperature,
-        max_tokens=max_tokens or None,
-        streaming=True,
-        timeout=lc_timeout,
-        model_kwargs=tkwargs,
-        default_headers=headers or None,
-    )
+    lc_kwargs: dict[str, Any] = {
+        "model": model,
+        "openai_api_base": base or None,
+        "openai_api_key": key or "sk-noauth",
+        "temperature": temperature,
+        "max_tokens": max_tokens or None,
+        "streaming": True,
+        "timeout": lc_timeout,
+        "model_kwargs": tkwargs,
+        "default_headers": headers or None,
+    }
     if reasoning_effort is not None:
         lc_kwargs["reasoning_effort"] = reasoning_effort
     # Use the reasoning-normalizing subclass so gateways that stream thinking
@@ -626,9 +626,10 @@ async def langchain_tool_loop(
                 # guard only watches tool-call signatures, so this catches the
                 # no-tool-call case. Return only the non-repeating prefix.
                 if _is_repeating(content):
-                    import re as _re
 
-                    _logger.warning("sub-agent reply entered a text repetition loop; truncating")
+                    _logger.warning(
+                        "sub-agent reply entered a text repetition loop; truncating"
+                    )
                     # Keep the longest non-repeating prefix.
                     _unit = min(200, len(content) // 3)
                     while _unit >= 20 and _is_repeating(content[: _unit * 3]):
@@ -692,10 +693,8 @@ async def langchain_tool_loop(
         # context_length_exceeded. Any failure degrades silently (the next step
         # simply retries with the uncompacted transcript).
         if ctx > 0:
-            try:
+            with contextlib.suppress(Exception):
                 await _auto_compact_subagent(msgs, model, ctx, reserved, emit)
-            except Exception:  # noqa: BLE001
-                pass
     # The loop ended by hitting max_steps (not by the model returning a
     # final text reply). Recover the last textual answer the sub-agent
     # produced so it never returns an empty result to the parent.
@@ -841,7 +840,7 @@ def usage_event(
 
         try:
             _md_dump = _json.dumps(metadata, default=str)
-        except Exception:
+        except Exception:  # noqa: BLE001
             _md_dump = repr(metadata)
         print(
             f"[USAGE_DEBUG] llm model={model!r} in={input_tokens} out={output_tokens} "

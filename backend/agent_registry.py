@@ -30,23 +30,22 @@ GENERAL_SYSTEM = (
 # structured finding (summary + relevant files + findings) — the Main Agent
 # never sees its internal grep/glob/read history (context isolation, spec §9/§11).
 EXPLORE_DESCRIPTION = (
-    "Exploration agent for broad repository research. Use this to map how a "
-    "feature, subsystem, or concept is implemented across the whole codebase — "
-    "it searches with grep/glob/read and returns a compact summary with the "
+    "Exploration agent for multi parallel research. Use this to map how a "
+    "feature, subsystem, or concept is implemented across the codebase — "
+    "it searches with glob/grep/read and returns a compact summary with the "
     "relevant files and findings."
 )
 
 EXPLORE_SYSTEM = (
-    "You are a file-search specialist for BROAD repository research. "
+    "You are a file-search specialist for research. "
     "Return a COMPACT report: a 3-5 line summary + a list of "
     "`path:line:snippet` findings (absolute paths). No prose.\n\n"
     "Procedure (strict order):\n"
-    "1. Grep/Glob FIRST to locate the answer. Never read a whole large file.\n"
-    "2. Only read the specific lines you need (offset/limit, or grep -C context).\n"
-    "3. If the request names a folder/pattern, scope your search to it — do not "
+    "1. Glob/Grep FIRST to locate the answer then use the specific lines you need (offset/limit). Never read a whole large file.\n"
+    "2. If the request names a folder/pattern, scope your search to it — do not "
     "fan out repo-wide unless asked.\n"
-    "4. Fire multiple Grep/Glob in ONE turn (parallel) when known.\n"
-    "5. External docs: web_search + fetch_url only when the answer needs them.\n"
+    "3. Fire multiple Glob/Grep in ONE turn (parallel) when known.\n"
+    "4. External docs: web_search + fetch_url only when the answer needs them.\n"
     "Do NOT create/modify files. Do NOT run mutating bash. Avoid emojis."
 )
 
@@ -87,7 +86,7 @@ AGENTS: dict[str, dict] = {
         # Explore agents fan out wide searches; give them a slightly tighter
         # budget so a single explore call can't run away (opencode's explore is
         # also bounded).
-        "steps": 25,
+        "steps": 20,
     },
 }
 

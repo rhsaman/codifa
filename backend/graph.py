@@ -30,6 +30,7 @@ unchanged -- only the LLM client and the orchestration changed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import itertools
 import json
@@ -127,6 +128,11 @@ class AgentState(TypedDict, total=False):
     subagent_models: dict
     providers: dict
     reserved: int | None
+    # MCP connectors the user toggled on in the composer chip. Passed through
+    # verbatim from the UI request; consumed by build_turn_context to attach
+    # live MCP tools. MUST be declared on the state or LangGraph drops it
+    # before the node runs (and the model would see no MCP tools).
+    mcp_servers: dict
     # Workflow scratch state
     web_search_results: list
     fetched_content: list
@@ -190,7 +196,26 @@ def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
                     "id": tc_id,
                 })
                 # Prefer the full tool result (items); fall back to the summary.
-                result = ta.get("items") or ta.get("summary") or ""
+                # `items` may be a plain string (e.g. "MATCHES for 'foo'") OR a
+                # list of dicts (e.g. [{"snippet": "..."}]) — flatten either into
+                # readable text so the model sees the real result and does NOT
+                # re-execute the tool on reconnect (which would waste context).
+                items = ta.get("items")
+                if isinstance(items, str):
+                    result = items
+                elif isinstance(items, list) and items:
+                    parts = []
+                    for _it in items:
+                        if isinstance(_it, dict):
+                            parts.append(
+                                str(_it.get("snippet") or _it.get("content")
+                                    or _it.get("text") or _it.get("result") or _it)
+                            )
+                        else:
+                            parts.append(str(_it))
+                    result = "\n".join(parts)
+                else:
+                    result = ta.get("summary") or ""
                 tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             if tool_calls:
                 out.append(AIMessage(content=content, tool_calls=tool_calls))
@@ -436,7 +461,6 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
         "verbatim (file paths, code, errors), then describe layout/UI."
     )
     model_name = getattr(model, "model_name", "") or "unknown"
-    last_exc: Exception | None = None
     # Retry ONLY transient provider failures (429 / 5xx / timeout / network
     # blip) so a single flaky vision request doesn't silently make the image
     # invisible. Permanent errors (e.g. 400 image-rejected) are NOT retried —
@@ -473,7 +497,6 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
                     model_name, exc,
                 )
                 return None
-            last_exc = exc
             if attempt < _VISION_MAX_ATTEMPTS - 1:
                 _elapsed = time.monotonic() - _start
                 _remaining = _VISION_TOTAL_BUDGET - _elapsed
@@ -640,12 +663,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             )
         except Exception:  # noqa: BLE001
             ctx = 0
-    if ctx <= 0:
-        # opencode leaves the window unknown (usable=0 -> compaction off) instead
-        # of falling back to a 32k floor that silently shrinks max_tokens. The
-        # output cap now comes from OUTPUT_TOKEN_MAX (llm.py), so an unknown-window
-        # model still works without a fake small window.
-        ctx = 0
+    ctx = max(0, ctx)
 
     store = open_vector_store(
         root, state.get("vector_db_path", ""), state.get("vector_config")
@@ -744,7 +762,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "stored in the app database and are given to you inline."
     )
     if nvim_file:
-        try:
+        with contextlib.suppress(Exception):
             tgt = _agents.resolve_safe(root, nvim_file)
             if tgt and os.path.isfile(tgt):
                 nvim_rel = os.path.relpath(tgt, _agents.resolve_safe(root, ""))
@@ -752,8 +770,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     f"\n\n=== NEOVIM (OPEN EDITOR) ===\nThe user currently has `{nvim_rel}` "
                     "open in Neovim -- this file is their ACTIVE FOCUS."
                 )
-        except Exception:  # noqa: BLE001
-            pass
     # Attached files are UNIFIED with Neovim: they enter the agent exactly like
     # the Neovim open file -- as a scoped path + a focus note -- so the agent
     # reads them on demand via the read/grep tools instead of force-reading
@@ -903,7 +919,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
     # design where nothing is force-read into the prompt before the model runs.
-    scouted = ""
     # opencode sends the FULL history every turn and compacts on overflow — it
     # never trims history by a char/token budget before sending (that caused
     # messages to disappear every turn and mode switches to shrink context).
@@ -911,7 +926,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # overflow, so large windows are handled without silently dropping turns.
     history = state.get("history") or []
     lc_history = history_to_langchain_messages(history)
-    try:
+    with contextlib.suppress(Exception):
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
         for _h in history:
@@ -928,8 +943,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             f"est_tokens={_hist_chars // 4} tool_items_chars={_tool_items_chars}",
             flush=True,
         )
-    except Exception:
-        pass
 
     if mode == "coder":
         reuse = _agents._plan_reuse_note(history)
@@ -1040,7 +1053,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     messages.extend(lc_history)
     messages.append(HumanMessage(content=user_content))
 
-    try:
+    with contextlib.suppress(Exception):
         _sys_chars = len(str(system_final))
         _user_chars = (
             len(user_content)
@@ -1052,8 +1065,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             f"user_chars={_user_chars} total_chars={_sys_chars + _hist_chars + _user_chars}",
             flush=True,
         )
-    except Exception:
-        pass
 
     # Convert the mode-filtered fns to LangChain StructuredTools. MCP tools are
     # already StructuredTools (built in build_mcp_tools), so they pass through.
@@ -1088,13 +1099,11 @@ def model_timeout_for(state: AgentState) -> float:
     if isinstance(mt, tuple(mt.__class__ for mt in ()) or ()):
         pass
     # httpx.Timeout (non-Google) -> use its read component as the request timeout.
-    try:
+    with contextlib.suppress(Exception):
         import httpx
 
         if isinstance(mt, httpx.Timeout):
             return float(mt.read)
-    except Exception:  # noqa: BLE001
-        pass
     return float(mt)
 
 
@@ -1136,7 +1145,7 @@ def _estimate_prompt_tokens(messages: list) -> int | None:
         for m in messages or []:
             total += _estimate_content_tokens(getattr(m, "content", ""))
         return total
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -1183,7 +1192,7 @@ def _usage_event_from_ai(ai: Any, model: str, prompt_tokens: int | None = None) 
 
     try:
         _um_dump = _json.dumps(um, default=str)
-    except Exception:
+    except Exception:  # noqa: BLE001
         _um_dump = repr(um)
     print(
         f"[USAGE_DEBUG] model={model!r} in={input_tokens} out={output_tokens} "
@@ -1486,13 +1495,6 @@ async def _maybe_auto_compact(
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
     dicts = _agents._messages_to_dicts(msgs)
-    # Diagnostic: surface the real window/threshold so we can confirm compaction
-    # only fires when the prompt genuinely nears the window (and not spuriously).
-    print(
-        f"[CTX_DEBUG] auto_compact ctx={ctx} reserved={reserved} usable={usable} "
-        f"total={total} msgs={len(msgs)}",
-        flush=True,
-    )
     # Auto-compaction fires off the SAME `input_tokens` the context meter
     # displays (tracked on `state["last_input_tokens"]` at the usage-emit site),
     # so the meter and the compaction trigger always agree. `input_tokens` is the
@@ -1509,6 +1511,13 @@ async def _maybe_auto_compact(
         # Fallback to the char estimate when the local estimate is unavailable
         # (e.g. un-tokenizable message content, or local models with no usage).
         total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    # Diagnostic: surface the real window/threshold so we can confirm compaction
+    # only fires when the prompt genuinely nears the window (and not spuriously).
+    print(
+        f"[CTX_DEBUG] auto_compact ctx={ctx} reserved={reserved} usable={usable} "
+        f"total={total} msgs={len(msgs)}",
+        flush=True,
+    )
     # opencode fires compaction when the latest turn reaches `usable`
     # (ctx - reserved). We mirror that exactly: a single setting
     # (compactHeadroom / reserved) controls when auto-compaction runs.
@@ -1602,6 +1611,15 @@ async def _run_mode_turn(
             return res
         except Exception as exc:  # noqa: BLE001
             return f"ERROR running {name}: {exc}"
+
+    def _existing_tool_result(tool_call_id: str) -> str | None:
+        """اگر نتیجهٔ این tool_call قبلاً در transcript (msgs) هست، آن را
+        برگردان تا دوباره اجرا نشود — مخصوصاً روی reconnect/interrupt که
+        هیستوری شامل ToolMessageهای بازسازی‌شده از toolActivity است."""
+        for m in messages:
+            if isinstance(m, ToolMessage) and m.tool_call_id == tool_call_id:
+                return m.content
+        return None
 
     _astream_count = 0
 
@@ -1793,7 +1811,7 @@ async def _run_mode_turn(
                     _no_so = True
                     model = _strip_stream_options(model)
                     continue
-                raise exc
+                raise
             if not getattr(ai, "tool_calls", None):
                 meta = getattr(ai, "response_metadata", {}) or {}
                 if meta.get("finish_reason") == "length":
@@ -1863,8 +1881,16 @@ async def _run_mode_turn(
             # carries its own tool_call_id, so the model matches results by id
             # regardless of position.
             _tcs = ai.tool_calls
-            _parallel = [tc for tc in _tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
-            _sequential = [tc for tc in _tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
+            # روی reconnect/interrupt، هیستوری ممکن است شامل ToolMessageهای
+            # بازسازی‌شده از toolActivity باشد. اگر نتیجهٔ یک tool_call قبلاً
+            # در transcript هست، آن را دوباره اجرا نکن — مستقیماً reuse کن
+            # (صرفه‌جویی در context و جلوگیری از اجرای تکراریِ کارهای انجام‌شده).
+            _pending = [
+                tc for tc in _tcs
+                if _existing_tool_result(tc.get("id", "")) is None
+            ]
+            _parallel = [tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS]
+            _sequential = [tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
                     *[
@@ -1954,14 +1980,12 @@ async def _run_mode_turn(
         # Close every opened MCP session so stdio subprocesses / HTTP
         # connections don't leak across turns.
         if mcp_cleanup is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await mcp_cleanup()
-            except Exception:  # noqa: BLE001
-                pass
     # opencode-style proactive auto-compaction: once the conversation reaches the
     # usable window, summarize the older turns and tell the frontend to fold.
     if reply and ctx and ctx > 0:
-        try:
+        with contextlib.suppress(Exception):
             await _maybe_auto_compact(
                 state,
                 queue,
@@ -1971,8 +1995,6 @@ async def _run_mode_turn(
                 ctx,
                 last_input_tokens=state.get("last_input_tokens"),
             )
-        except Exception:  # noqa: BLE001
-            pass
     return reply
 
 
@@ -2006,7 +2028,8 @@ def detect_test_commands(root: str) -> list[str]:
     pkg = os.path.join(root, "package.json")
     if os.path.isfile(pkg):
         try:
-            data = json.loads(open(pkg, encoding="utf-8").read())
+            with open(pkg, encoding="utf-8") as _f:
+                data = json.loads(_f.read())
         except Exception:  # noqa: BLE001
             data = {}
         scripts = (data.get("scripts") or {}) if isinstance(data, dict) else {}
@@ -2037,7 +2060,7 @@ def detect_test_commands(root: str) -> list[str]:
 
     # --- .NET ---
     try:
-        if any(f.endswith(".csproj") or f.endswith(".sln") for f in os.listdir(root)):
+        if any(f.endswith((".csproj", ".sln")) for f in os.listdir(root)):
             cmds.append("dotnet test")
     except OSError:
         pass
@@ -2288,9 +2311,7 @@ def _should_skip_read(rel: str) -> bool:
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     return ext in _SKIP_READ_EXTS
 
-_STOPWORDS = set(
-    ["what", "where", "which", "when", "how", "does", "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "is", "it", "of", "to", "a", "an", "do", "i", "we", "they", "file", "files", "code", "function", "class", "mode", "plan", "ask", "use", "using", "need", "want", "find", "search", "show", "list", "explain", "describe", "trace", "understand", "investigate", "look", "looking", "who", "why", "can", "could", "should", "would", "may", "might", "repo", "repository", "project", "inside", "their", "our", "its", "as", "at", "by", "be", "been", "has", "have", "had", "will", "would", "not", "no", "yes"]
-)
+_STOPWORDS = {"what", "where", "which", "when", "how", "does", "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "is", "it", "of", "to", "a", "an", "do", "i", "we", "they", "file", "files", "code", "function", "class", "mode", "plan", "ask", "use", "using", "need", "want", "find", "search", "show", "list", "explain", "describe", "trace", "understand", "investigate", "look", "looking", "who", "why", "can", "could", "should", "would", "may", "might", "repo", "repository", "project", "inside", "their", "our", "its", "as", "at", "by", "be", "been", "has", "have", "had", "will", "not", "no", "yes"}
 
 
 def _strip_skill_mentions(prompt: str, skills: list[str] | None) -> str:
@@ -2377,15 +2398,13 @@ def _skill_names_to_strip(state: AgentState) -> list[str]:
     locate files precisely and correctly."""
     names = [s for s in (state.get("skills") or []) if s]
     request = state.get("request") or ""
-    try:
+    with contextlib.suppress(Exception):
         for s in _agents._load_skills(state.get("root", "")):
             n = (s.get("name") or "").strip()
             if not n or n in names:
                 continue
             if _skill_name_appears_in_text(n, request):
                 names.append(n)
-    except Exception:  # noqa: BLE001
-        pass
     return names
 
 
@@ -2537,7 +2556,7 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
     store = open_vector_store(
         root, state.get("vector_db_path", ""), state.get("vector_config")
     )
-    return make_tool_callbacks(
+    tools = make_tool_callbacks(
         root, lambda ev: queue.put_nowait(ev),
         context_window=ctx, web_model=model, main_model=model,
         vision_model=None, image_uris=image_uris,
@@ -2579,11 +2598,10 @@ def _parse_glob_files(text: str) -> list[str]:
     out: list[str] = []
     for line in (text or "").splitlines():
         line = line.strip()
-        if not line or line.startswith("GLOB MATCHES") or line.startswith("("):
+        if not line or line.startswith(("GLOB MATCHES", "(")):
             continue
-        if "/" in line or re.match(r"^[\w.\-]+\.\w+$", line):
-            if not _is_excluded_discovery_path(line):
-                out.append(line)
+        if ("/" in line or re.match(r"^[\w.\-]+\.\w+$", line)) and not _is_excluded_discovery_path(line):
+            out.append(line)
     return out
 
 
@@ -2884,7 +2902,7 @@ def _resolve_file_refs(texts, root) -> list[str]:
     for c in cands:
         try:
             abs_p = _agents.resolve_safe(root, c)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112
             continue
         if not abs_p or not os.path.isfile(abs_p):
             continue
@@ -3145,7 +3163,7 @@ async def ask_entry(state: AgentState) -> dict:
 
 
 def _route_ask_entry(state: AgentState) -> str:
-    request = state.get("request", "")
+    state.get("request", "")
     # When the user explicitly points at file(s) THIS turn -- an attachment, the
     # open Neovim file, or a file named directly in the message -- the question is
     # about THOSE files, so route to the Reader agent, which reads only the needed
@@ -3292,12 +3310,10 @@ async def plan_build(state: AgentState) -> dict:
         plan_body, check_note = _self_check_plan_paths(state["root"], plan_body)
         try:
             state_db.save_plan(ws, "plan", plan_body, chat_id=state.get("chat_id", ""))
-        except Exception as exc:
+        except Exception:
             # Surface the failure instead of swallowing it: a silent drop is
             # exactly the "plan sometimes isn't saved" bug.
-            logging.getLogger(__name__).exception(
-                "plan_build: save_plan failed: %s", exc
-            )
+            logging.getLogger(__name__).exception("plan_build: save_plan failed")
         if check_note:
             queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
         reply = plan_body
@@ -3456,10 +3472,8 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
         # requests into a subsequent test's mock capture.
         if not task.done():
             task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
 
 
 

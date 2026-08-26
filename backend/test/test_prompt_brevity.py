@@ -6,7 +6,7 @@
 - _LENGTH_RULE exists and is appended ONLY for plan/coder, not for ask.
 """
 
-from agents import SYSTEM_PROMPTS, _UNIVERSAL_RULES, _LENGTH_RULE
+from agents import _LENGTH_RULE, _UNIVERSAL_RULES, SYSTEM_PROMPTS
 
 
 def test_ask_prompt_drops_explain_the_why():

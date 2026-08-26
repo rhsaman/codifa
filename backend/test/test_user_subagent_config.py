@@ -20,8 +20,8 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from agents import _subagent_target  # noqa: E402
-from llm import build_chat_model  # noqa: E402
+from agents import _subagent_target
+from llm import build_chat_model
 
 PROVIDERS = {
     "opencode": {

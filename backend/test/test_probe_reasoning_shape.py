@@ -16,7 +16,7 @@ async def test_reasoning_delta_promoted(run_events, mock_server, workspace):
          "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
     ]]
     llm = ReasoningChatOpenAI(model="mock-model", api_key="test", base_url=base, streaming=True)
-    from langchain_core.messages import SystemMessage, HumanMessage
+    from langchain_core.messages import HumanMessage, SystemMessage
     msgs = [SystemMessage(content="x"), HumanMessage(content="hi")]
     found_reasoning = False
     async for chunk in llm.astream(msgs):

@@ -23,9 +23,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage  # noqa: E402
+from langchain_core.messages import AIMessage
 
-import llm as _llm  # noqa: E402
+import llm as _llm
 
 
 class _FakeModel:
@@ -84,12 +84,6 @@ async def _run_doom():
 
 async def _run_varied():
     """A model that varies its tool call each step should NOT be stopped."""
-    calls = [
-        {"name": "grep", "args": {"pattern": "a"}},
-        {"name": "grep", "args": {"pattern": "b"}},
-        {"name": "grep", "args": {"pattern": "c"}},
-        {"name": "grep", "args": {"pattern": "d"}},
-    ]
 
     class _VariedModel:
         model_name = "fake-varied"

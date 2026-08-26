@@ -1,10 +1,12 @@
-import asyncio
-import os
 
-import pytest
 
-from agents import _load_images, _maybe_downscale_image, _MAX_VISION_DIM, _MAX_VISION_BYTES
 import graph
+from agents import (
+    _MAX_VISION_BYTES,
+    _MAX_VISION_DIM,
+    _load_images,
+    _maybe_downscale_image,
+)
 
 
 def _q():

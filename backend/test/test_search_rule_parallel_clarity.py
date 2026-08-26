@@ -9,7 +9,7 @@ already done the broad exploration and therefore skipping the explore agent.
 
 import pytest
 
-from agents import _SEARCH_RULE, _DOING_TASKS, _DISCOVERY_BLOCK
+from agents import _DISCOVERY_BLOCK, _DOING_TASKS, _SEARCH_RULE
 
 
 def test_search_rule_names_both_parallel_meanings():

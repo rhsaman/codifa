@@ -21,9 +21,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage  # noqa: E402
+from langchain_core.messages import AIMessage
 
-import llm as _llm  # noqa: E402
+import llm as _llm
 
 
 class _ToolCallLastStepModel:
@@ -101,7 +101,7 @@ async def test_never_returns_empty_when_no_text_was_ever_produced():
 
 async def main():
     await test_recovers_last_text_when_final_step_is_tool_call()
-    await test_empty_only_when_no_text_was_ever_produced()
+    await test_never_returns_empty_when_no_text_was_ever_produced()
     print("SUBAGENT-NO-EMPTY-RESULT TEST PASSED")
 
 

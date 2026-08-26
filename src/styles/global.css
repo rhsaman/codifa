@@ -416,10 +416,10 @@ textarea {
 .chat-item {
   position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 2px;
-  padding: 6px 8px 7px 13px;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 13px;
   border-radius: 12px;
   cursor: pointer;
   color: var(--text-dim);
@@ -473,6 +473,8 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: right;
+  direction: rtl;
   font-size: 13px;
   font-weight: 500;
 }
@@ -486,6 +488,9 @@ textarea {
   gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
+  direction: rtl;
+  text-align: right;
+  order: 1;
   padding-right: 28px;
 }
 
@@ -607,45 +612,50 @@ textarea {
    the .open class (click state in Sidebar.tsx) instead of :hover, so moving
    the mouse from the button to the popup never closes it mid-flight. */
 .chat-item-kebab-wrap {
-  position: absolute;
-  top: 4px;
-  right: 5px;
+  position: relative;
+  flex: 0 0 auto;
   z-index: 5;
+  order: 3;
+  margin-inline-start: 6px;
 }
 
 .chat-item-kebab {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   border: none;
-  border-radius: 7px;
+  border-radius: 6px;
   background: none;
   color: var(--text-dim);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  opacity: 0.5;
+  opacity: 1;
   transition:
     opacity 0.12s,
     color 0.12s,
     background 0.12s;
 }
 
-/* Multi-select checkbox on each chat — hidden until hover/selection so the
-   list stays clean, but always reachable for bulk delete. */
+/* Multi-select checkbox on each chat — only shown in selection mode (when the
+   workspace "Delete chats" action is active), replacing the 3-dot kebab. */
+.chat-item-select-wrap {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  order: 2;
+  margin-inline-end: 8px;
+}
 .chat-select-checkbox {
   flex: 0 0 auto;
-  width: 15px;
-  height: 15px;
-  margin: 0 2px 0 0;
+  width: 16px;
+  height: 16px;
   accent-color: var(--accent);
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s;
 }
-.chat-item:hover .chat-select-checkbox,
-.chat-item.selected .chat-select-checkbox {
-  opacity: 1;
+/* In selection mode the 3-dot kebab is replaced by the checkbox. */
+.chat-item.selecting .chat-item-kebab-wrap {
+  display: none;
 }
 .chat-item.selected {
   background: color-mix(in srgb, var(--accent) 12%, var(--bg));
@@ -656,6 +666,8 @@ textarea {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
+  gap: 8px;
+  padding-inline-start: 2px;
 }
 .group-delete-selected {
   display: inline-flex;
@@ -674,6 +686,134 @@ textarea {
 }
 .group-delete-selected:hover {
   background: color-mix(in srgb, var(--danger) 22%, var(--bg));
+}
+
+.group-cancel-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.group-cancel-select:hover {
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg));
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+/* Workspace ⋯ options menu + delete confirmation popover */
+.ws-menu-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.ws-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 168px;
+  padding: 5px;
+  border-radius: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: chat-menu-pop 0.12s ease-out;
+}
+.ws-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: start;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.ws-menu-btn svg {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.ws-menu-btn:hover {
+  background: var(--bg-hover);
+}
+.ws-menu-btn.active {
+  color: var(--accent);
+}
+.ws-menu-btn.active svg {
+  color: var(--accent);
+}
+.ws-menu-btn.danger {
+  color: var(--danger);
+}
+.ws-menu-btn.danger svg {
+  color: var(--danger);
+}
+.ws-menu-btn.danger:hover {
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg));
+}
+
+.ws-delete-menu-wrap {
+  position: fixed;
+  z-index: 1001;
+}
+.ws-delete-menu {
+  min-width: 180px;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  animation: chat-menu-pop 0.12s ease-out;
+}
+.ws-delete-menu-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  padding: 2px 6px 4px;
+}
+.ws-delete-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: start;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.ws-delete-menu-btn:hover {
+  background: var(--bg-hover);
+}
+.ws-delete-menu-btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+}
+.ws-delete-menu-btn.danger:hover {
+  background: color-mix(in srgb, var(--danger) 20%, var(--bg));
 }
 
 .chat-item:hover .chat-item-kebab,
@@ -847,8 +987,8 @@ textarea {
 }
 
 .sidebar-group-head:hover {
-  background: var(--bg-input);
-  border-color: var(--border);
+  background: transparent;
+  border-color: transparent;
 }
 
 .sidebar-group-head:focus-within {
@@ -880,39 +1020,32 @@ textarea {
 }
 
 .sidebar-group-actions {
-  /* Keep the buttons in the layout at all times (fixed 24px height) so the
-     group header doesn't grow taller on hover and shift every group below
-     it (same fixed-size reasoning as the per-chat ⋯ kebab button). */
+  /* Always visible so the workspace + and ⋯ options are discoverable without
+     hovering. Fixed size keeps the header from shifting groups below it. */
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 8px;
   flex: 0 0 auto;
-  opacity: 0;
-  transform: scale(0.85);
-  pointer-events: none;
-  transition:
-    opacity 0.12s ease,
-    transform 0.12s ease;
-}
-
-.sidebar-group-head:hover .sidebar-group-actions,
-.sidebar-group-head:focus-within .sidebar-group-actions {
   opacity: 1;
-  transform: scale(1);
+  transform: none;
   pointer-events: auto;
 }
 
 .sidebar-group-btn {
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   border-radius: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
   transition:
     background 0.12s,
-    color 0.12s;
+    color 0.12s,
+    border-color 0.12s;
 }
 
 .sidebar-group-btn svg {
@@ -923,6 +1056,7 @@ textarea {
 .sidebar-group-btn:hover {
   background: var(--bg-input);
   color: var(--text);
+  border-color: var(--border);
 }
 
 .sidebar-group-btn.active {
@@ -7264,6 +7398,67 @@ textarea {
   font-size: 12px;
   line-height: 1;
 }
+
+.file-results {
+  list-style: none;
+  margin: 6px 0 4px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.14));
+  border-radius: 8px;
+}
+
+.file-result {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.file-result-more {
+  font-size: 11px;
+  color: var(--text-dim, #8a8a8a);
+  opacity: 0.8;
+  padding-top: 2px;
+}
+
+.file-result-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--link, #7aa2f7);
+  opacity: 0.85;
+}
+
+.file-result-glyph svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.file-result-path {
+  flex: 0 0 auto;
+  color: var(--link, #7aa2f7);
+  font-family: var(--mono, monospace);
+}
+
+.file-result-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim, #8a8a8a);
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 
 .web-result-text {
   flex: 1 1 auto;

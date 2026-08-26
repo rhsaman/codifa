@@ -17,7 +17,7 @@ def _text(events):
 
 
 async def test_agent_streams_text_reply_to_user(run_events, mock_server):
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [text_reply("سلام! چطور میتونم کمک کنم؟")]
     events = await run_events("سلام")
     assert "سلام! چطور میتونم کمک کنم؟" in _text(events)
@@ -31,7 +31,7 @@ async def test_agent_streams_text_reply_to_user(run_events, mock_server):
 
 
 async def test_agent_runs_tool_and_returns_result_to_model(run_events, mock_server):
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [
         tool_call("write_file", json.dumps({
             "path": "app.py", "content": "def foo():\n    return 42\n",
@@ -53,7 +53,7 @@ async def test_agent_runs_tool_and_returns_result_to_model(run_events, mock_serv
 
 
 async def test_agent_passes_history_into_the_model_request(run_events, mock_server):
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [text_reply("ok")]
     events = await run_events("ادامه بده", history=[{"role": "user", "content": "قبلی"}])
     assert "ok" in _text(events)
@@ -72,7 +72,7 @@ async def test_agent_rejects_empty_prompt_with_error_event(run_events):
 async def test_agent_surfaces_provider_failure(run_events, mock_server):
     """A hard provider rejection must surface as an error event, not hang or
     silently succeed — the UI depends on the failure propagating."""
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [None] * 20  # every request rejected with HTTP 400
     events = await run_events("سلام")
     assert any(e.get("kind") == "error" for e in events), (
@@ -88,7 +88,7 @@ async def test_coder_does_not_force_test_run_without_terminal(run_events, mock_s
     command must NOT trigger the forced run-and-see-green follow-up: there is no
     terminal to run on, so forcing would be dead code. This locks in the new
     architecture (coder relies on Plan for verification)."""
-    base, mock = mock_server
+    _base, mock = mock_server
     # The model replies immediately and never calls run_terminal (it can't — the
     # coder toolset has no terminal). No forced test-verification follow-up may fire.
     # (coder-without-plan runs the discovery pipeline first, hence the leading
@@ -112,7 +112,7 @@ async def test_coder_does_not_force_test_run_without_terminal(run_events, mock_s
 async def test_agent_skips_test_verification_when_tests_were_run(run_events, mock_server):
     """When the agent actually ran the test command, no forced follow-up fires —
     the verification step is satisfied by the real test run."""
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [
         tool_call("run_terminal", json.dumps({"command": "python -m pytest tests/ -q"})),
         text_reply("3 passed"),
@@ -132,7 +132,7 @@ async def test_agent_emits_usage_event_with_true_counts(run_events, mock_server)
     counts the provider reported. This proves the event is emitted end-to-end and
     carries the true numbers (the mock derives usage from the real request /
     response sizes), so those UIs are fed real counts, not blanked."""
-    base, mock = mock_server
+    _base, mock = mock_server
     mock.script = [text_reply("تمام شد.")]
     events = await run_events("سلام", mode="ask")
 

@@ -1,5 +1,15 @@
 pyproject is contain backend with python and front end with electron and react in src/.
-front end tests must be in test/ and for backend must be in backend/test
-python in backend/ must use uv dont use pip, dont install new package without permission.
+dont grep and read release folder
+
+# backend
+
+backend path is backend/
+backend tests in backend/test.
+use uv dont use pip, dont install new package without permission.
+for syntax check python use ruff check.
 python pakcages is in pyproject.toml, for installing package in python must use uv add <package name>, dont use uv pip install.
-dont grep and read in release
+
+# front end
+
+The actual test is run with npm run test:frontend, which executes run-frontend.sh.
+tests must be in test/

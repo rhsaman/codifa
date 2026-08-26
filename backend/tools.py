@@ -11,8 +11,6 @@ import ast
 import asyncio
 import contextvars
 import difflib
-import functools
-import traceback
 import glob as _pyglob
 import json
 import os
@@ -24,8 +22,8 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable, Sequence
-from urllib.parse import urlparse
 from typing import Any
+from urllib.parse import urlparse
 
 import providers as _providers
 import state_db as _state_db
@@ -239,7 +237,7 @@ async def _resolve_subagent_max_tokens(model, *, narrow: bool) -> int | None:
     # providers reject max_tokens above their max output, often ~8K) while still
     # bounding runaway generation when no external timeout is in force.
     cap = min(raw, 8000, max(64, ctx - headroom))
-    return cap if cap >= 64 else 64
+    return max(cap, 64)
 
 
 async def _model_context_window(model) -> int:
@@ -269,7 +267,7 @@ async def _model_context_window(model) -> int:
         from providers import model_context as _mc
 
         return await _mc(prov, name, base_url)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 0
 
 
@@ -2570,13 +2568,9 @@ def _is_terminal_write(command: str) -> bool:
             sub = parts[1].lower() if len(parts) > 1 else ""
             # `git branch -d/-D`, `git tag -d` delete; plain `git branch`/`git tag`
             # (list) are read-only.
-            if sub in _GIT_WRITE or (sub in ("branch", "tag") and "-d" in parts):
-                return True
-            return False
-        if first in _TERMINAL_WRITE:
-            return True
+            return bool(sub in _GIT_WRITE or sub in ("branch", "tag") and "-d" in parts)
         # First meaningful command is not a write — stop here.
-        return False
+        return first in _TERMINAL_WRITE
     return False
 
 
@@ -2849,13 +2843,11 @@ def make_tool_callbacks(
     if context_window and context_window > 0:
         ctx = int(context_window)
         tool_out_chars = max(400, min((ctx // 14) - 150, 2_400))
-        listing_count = max(15, ctx // 600)
-        search_count = max(10, ctx // 500)
+        max(15, ctx // 600)
+        max(10, ctx // 500)
         terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_000, tool_out_chars * 1))
     else:
         tool_out_chars = MAX_READ_BYTES
-        listing_count = 200
-        search_count = 50
         terminal_out_chars = MAX_TERMINAL_OUTPUT
     tool_out_chars = min(tool_out_chars, MAX_READ_BYTES)
 
@@ -3411,7 +3403,7 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match as a single `path:line:match` line (the matching line only — no surrounding code blocks), so you can scan many hits quickly and then `read` only the files you need. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
@@ -3470,21 +3462,30 @@ Returns each match as a single `path:line:match` line (the matching line only �
                 }
             )
             return f"No matches for {pattern!r} under {path or '/'}"
-        # Output contract (spec §3): one `path:line:match` line per hit, NO
-        # surrounding code blocks. Capped by max_results and the context budget;
-        # when truncated, tell the agent to narrow the search or read files.
+        # Output contract (spec §3, revised): each hit shows the match line plus
+        # ±SNIPPET_CONTEXT lines of surrounding code (already computed by
+        # search_in_files above — previously discarded here, forcing an almost-
+        # mandatory follow-up `read` just to see context around every match).
+        # Capped by max_results and the context budget; when truncated, tell the
+        # agent to narrow the search or read files.
         lines: list[str] = []
         total = 0
-        shown = 0
-        for m in matches:
+        for shown, m in enumerate(matches, start=1):
             if shown >= max_results:
                 break
-            entry = f"{m['file']}:{m['line']}:{(m.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
-            if lines and total + len(entry) + 1 > tool_out_chars:
+            ctx_lines = m.get("context_lines") or []
+            if ctx_lines:
+                body = "\n".join(
+                    f"{'>' if cl['line'] == m['line'] else ' '} {cl['line']} | {(cl.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
+                    for cl in ctx_lines
+                )
+                entry = f"{m['file']}:{m['line']}:\n{body}"
+            else:
+                entry = f"{m['file']}:{m['line']}:{(m.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
+            if lines and total + len(entry) + 2 > tool_out_chars:
                 break
             lines.append(entry)
-            total += len(entry) + 1
-            shown += 1
+            total += len(entry) + 2
         if len(matches) > max_results:
             note = (
                 f"\nFound {len(matches)} matches.\n"
@@ -3493,13 +3494,21 @@ Returns each match as a single `path:line:match` line (the matching line only �
             )
         else:
             note = ""
-        raw = f"MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        raw = f"MATCHES for {pattern!r}\n" + "\n\n".join(lines) + note
         _parent_search_cache[cache_key] = raw
+        # Send the structured results too (not just the summary) so a reconnect
+        # can replay the tool without re-executing it (re-execution wastes
+        # context). `items` carries the actual rows the model needs to see.
+        ui_items = [
+            {"file": m["file"], "line": m["line"], "text": m.get("text", "")}
+            for m in matches[:max_results]
+        ]
         emit(
             {
                 "kind": "tool_result",
                 "tool": "grep",
                 "summary": f"{len(matches)} matches",
+                "results": ui_items,
                 "model": _main_name,
             }
         )
@@ -3635,27 +3644,30 @@ Returns each match as a single `path:line:match` line (the matching line only �
         )
         raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
         _parent_search_cache[cache_key] = raw
+        # Send the structured results too (not just the summary) so a reconnect
+        # can replay the tool without re-executing it (re-execution wastes
+        # context). `items` carries the actual paths the model needs to see.
+        ui_items = [{"path": p} for p in lines]
         emit(
             {
                 "kind": "tool_result",
                 "tool": "glob",
                 "summary": f"{len(matches)} matches",
+                "results": ui_items,
                 "model": _main_name,
             }
         )
         return raw
 
-    async def read_tool(filePath: str, offset: int = 1, limit: int = 2000) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself. Use the read tool to read files; read multiple independent files in parallel in a single turn when you know their paths. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region."""
-        _main_name = str(getattr(main_model, "model_name", "") or "")
-        emit(
-            {
-                "kind": "tool",
-                "tool": "read",
-                "args": {"filePath": filePath, "offset": offset, "limit": limit},
-                "model": _main_name,
-            }
-        )
+    async def _read_target(
+        filePath: str, offset: int, limit: int, _main_name: str
+    ) -> str:
+        """Read ONE file/dir path and emit its own tool_result/error event.
+        Shared by the single-path and batch branches of read_tool below so
+        both paths get identical per-file behavior (error messages, paging
+        notes, directory listing) — batch just calls this once per path
+        concurrently instead of the caller looping one read_tool call at a
+        time."""
         try:
             target = resolve_safe(root, filePath, allow_coder=True)
         except PathEscapeError as exc:
@@ -3709,6 +3721,45 @@ Returns each match as a single `path:line:match` line (the matching line only �
             }
         )
         return f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+
+    async def read_tool(
+        filePath: str,
+        offset: int = 1,
+        limit: int = 2000,
+        filePaths: list[str] | None = None,
+    ) -> str:
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
+
+BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; call read_tool again separately for a path that needs a different range. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        all_paths = [filePath] + [
+            p for p in (filePaths or []) if p and p != filePath
+        ]
+        if len(all_paths) == 1:
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "read",
+                    "args": {"filePath": filePath, "offset": offset, "limit": limit},
+                    "model": _main_name,
+                }
+            )
+            return await _read_target(filePath, offset, limit, _main_name)
+        emit(
+            {
+                "kind": "tool",
+                "tool": "read",
+                "args": {"filePaths": all_paths, "offset": offset, "limit": limit},
+                "model": _main_name,
+            }
+        )
+        # Read every target concurrently — same asyncio.gather pattern used for
+        # parallel read-only tool calls elsewhere in the graph, just applied
+        # WITHIN one tool call instead of across several parallel tool calls.
+        results = await asyncio.gather(
+            *(_read_target(p, offset, limit, _main_name) for p in all_paths)
+        )
+        return "\n\n".join(results)
 
     async def _read_dir_tool(
         target: str, filePath: str, offset: int, limit: int, _model: str = ""
@@ -4039,7 +4090,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
             _path = os.path.expanduser("~/coder_vision_error.log")
             with open(_path, "a", encoding="utf-8") as _f:
                 _f.write("\n=== vision sub-agent error ===\n" + _tb.format_exc() + "\n")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110
             pass
         return summary
 
@@ -4289,9 +4340,7 @@ Returns each match as a single `path:line:match` line (the matching line only �
         _is_local = (
             _parsed.scheme in ("", "file")
             and (
-                _u.startswith(("/", "./", "../", "~"))
-                or os.path.isabs(_u)
-                or _u.startswith("file:")
+                _u.startswith(("/", "./", "../", "~", "file:")) or os.path.isabs(_u)
             )
         )
         if _is_local:

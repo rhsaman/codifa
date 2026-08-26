@@ -5,10 +5,9 @@ become a glob/grep keyword — otherwise the deterministic/LLM explorer searches
 for skill-name files and finds nothing, which in plan mode then pushes the
 planner into looping git to "find what it wants".
 """
-import pytest
 
 import graph
-from graph import _strip_skill_mentions, _derive_explore_patterns
+from graph import _derive_explore_patterns, _strip_skill_mentions
 
 
 def test_strip_removes_at_mention_token():
@@ -219,7 +218,7 @@ def test_skill_used_but_name_excluded_from_search(monkeypatch):
     )
     # (b) skill name is excluded from search keywords
     assert "Anthropic Frontend Design" in graph._skill_names_to_strip(state)
-    from graph import _strip_skill_mentions, _derive_explore_patterns
+    from graph import _derive_explore_patterns, _strip_skill_mentions
     clean = _strip_skill_mentions(state["request"], graph._skill_names_to_strip(state))
     spec = _derive_explore_patterns(clean)
     joined = " ".join(spec["glob"] + spec["grep"]).lower()

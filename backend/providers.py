@@ -10,11 +10,10 @@ Model lists are fetched live from the provider and cached for a short TTL.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
-import sys
 import time
-from collections.abc import Sequence
 
 import httpx
 
@@ -590,14 +589,12 @@ async def _lmstudio_context(root: str, model_id: str = "") -> int | None:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             if model_id:
-                try:
+                with contextlib.suppress(Exception):
                     r = await client.get(root + "/api/v1/model")
                     if r.status_code == 200:
                         n = _extract(r.json())
                         if n:
                             return n
-                except Exception:  # noqa: BLE001
-                    pass
             r = await client.get(root + "/api/v1/models")
             if r.status_code == 200:
                 data = r.json()

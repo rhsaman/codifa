@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore, workspaceKey } from "../lib/store";
+export { useStore };
 import { themeById } from "../lib/themes";
 import type { Chat, ChatMessage, ProviderConfig, Workspace } from "../types";
 import { api } from "../lib/fs";
@@ -136,6 +137,7 @@ function buildGroups(
 
 export function Sidebar() {
   const chats = useStore((s) => s.chats);
+  if (typeof console !== "undefined") console.log("DBG sidebar chats:", chats.length, "ws:", useStore.getState().workspaces.length);
   const workspaces = useStore((s) => s.workspaces);
   const activeChatId = useStore((s) => s.activeChatId);
   const workspaceColors = useStore((s) => s.workspaceColors);
@@ -190,6 +192,38 @@ export function Sidebar() {
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [menuOpenId]);
+
+  // Workspace 3-dot menu, delete-confirm popup, and chat-selection mode.
+  const [wsMenuOpenKey, setWsMenuOpenKey] = useState<string | null>(null);
+  const [wsMenuPos, setWsMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [deleteMenuKey, setDeleteMenuKey] = useState<string | null>(null);
+  const [deleteMenuPos, setDeleteMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [selectingWsKey, setSelectingWsKey] = useState<string | null>(null);
+  const [renamingWsKey, setRenamingWsKey] = useState<string | null>(null);
+  const [wsRenameValue, setWsRenameValue] = useState("");
+  const commitWsRename = () => {
+    if (renamingWsKey) {
+      const v = wsRenameValue.trim();
+      if (v) useStore.getState().renameWorkspace(renamingWsKey, v);
+    }
+    setRenamingWsKey(null);
+    setWsRenameValue("");
+  };
+  useEffect(() => {
+    if (!wsMenuOpenKey && !deleteMenuKey) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (
+        !(t instanceof Element) ||
+        (!t.closest(".ws-menu-wrap") && !t.closest(".ws-delete-menu-wrap"))
+      ) {
+        setWsMenuOpenKey(null);
+        setDeleteMenuKey(null);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [wsMenuOpenKey, deleteMenuKey]);
 
   // ⌘K / Ctrl+K focuses the chat search — the natural "find my chat" shortcut.
   useEffect(() => {
@@ -732,9 +766,6 @@ export function Sidebar() {
           const isCollapsed = collapsed.has(g.key) && !searching;
           const color = workspaceColors[g.key] || "var(--accent)";
           const isPinned = pinnedWorkspaces.includes(g.key);
-          const pendingCount = g.chats.filter(
-            (c) => c.pendingAsk || c.pendingPermission,
-          ).length;
           const selectedInGroup = g.chats.filter((c) =>
             selectedChats.has(c.id),
           ).length;
@@ -777,110 +808,135 @@ export function Sidebar() {
                     )}
                   </svg>
                   <span className="sidebar-group-label">{g.label}</span>
-                  <span
-                    className="sidebar-group-count"
-                    data-selected={selectedInGroup > 0}
-                  >
-                    {selectedInGroup > 0 ? selectedInGroup : g.chats.length}
-                  </span>
-                  {pendingCount > 0 && (
-                    <span
-                      className="sidebar-group-pending"
-                      title={`${pendingCount} chat${pendingCount > 1 ? "s" : ""} waiting for you`}
-                    >
-                      {pendingCount}
-                    </span>
-                  )}
                 </button>
                 <div className="sidebar-group-actions">
                   <button
-                    className={`sidebar-group-btn${isPinned ? " active" : ""}`}
-                    title={isPinned ? "Unpin workspace" : "Pin to top"}
-                    onClick={() =>
-                      useStore.getState().togglePinWorkspace(g.key)
-                    }
-                  >
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 24 24"
-                      fill={isPinned ? "currentColor" : "none"}
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
-                    </svg>
-                  </button>
-                  <button
-                    className="sidebar-group-btn color"
-                    title="Workspace color"
-                    onClick={() =>
-                      setColorOpen(colorOpen === g.key ? null : g.key)
-                    }
-                  >
-                    <svg
-                      width="15"
-                      height="15"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" />
-                      <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" />
-                      <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" />
-                      <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" />
-                      <path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.7 1.7-1.7H17a3 3 0 0 0 3-3c0-4.4-4-8-8-8z" />
-                    </svg>
-                  </button>
-                  <button
                     className="sidebar-group-btn"
                     title="New chat in this workspace"
-                    onClick={() =>
-                      useStore.getState().newChatInRoot(g.root ?? "")
-                    }
-                  >
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.4"
-                      strokeLinecap="round"
-                    >
-                      <path d="M12 5v14M5 12h14" />
-                    </svg>
-                  </button>
-                  <button
-                    className="sidebar-group-btn danger"
-                    title="Delete workspace"
-                    onClick={() => {
-                      if (
-                        window.confirm(
-                          `Delete the "${g.label}" workspace and all ${g.chats.length} conversations?`,
-                        )
-                      )
-                        useStore.getState().deleteWorkspace(g.key);
+                    aria-label="New chat in this workspace"
+                    style={selectingWsKey === g.key ? { display: "none" } : undefined}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      useStore.getState().newChatInRoot(g.root ?? g.key);
                     }}
                   >
                     <svg
-                      width="12"
-                      height="12"
+                      width="16"
+                      height="16"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
                       strokeWidth="2.2"
                       strokeLinecap="round"
-                      strokeLinejoin="round"
                     >
-                      <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+                      <path d="M12 5v14M5 12h14" />
                     </svg>
                   </button>
+                  <div className="ws-menu-wrap" style={selectingWsKey === g.key ? { display: "none" } : undefined}>
+                    <button
+                      className="sidebar-group-btn"
+                      title="Workspace options"
+                      aria-label="Workspace options"
+                      aria-expanded={wsMenuOpenKey === g.key}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const next = wsMenuOpenKey === g.key ? null : g.key;
+                        setWsMenuOpenKey(next);
+                        if (next) {
+                          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                          setWsMenuPos({ top: r.bottom + 6, left: r.right - 168 });
+                        } else {
+                          setWsMenuPos(null);
+                        }
+                      }}
+                    >
+                      <svg
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                      >
+                        <circle cx="12" cy="5" r="1.6" />
+                        <circle cx="12" cy="12" r="1.6" />
+                        <circle cx="12" cy="19" r="1.6" />
+                      </svg>
+                    </button>
+                    {wsMenuOpenKey === g.key && wsMenuPos && (
+                      <div
+                        className="ws-menu"
+                        role="menu"
+                        style={{
+                          position: "fixed",
+                          top: wsMenuPos.top,
+                          left: wsMenuPos.left,
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          className={`ws-menu-btn${isPinned ? " active" : ""}`}
+                          role="menuitem"
+                          onClick={() => {
+                            useStore.getState().togglePinWorkspace(g.key);
+                            setWsMenuOpenKey(null);
+                          }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+                          </svg>
+                          {isPinned ? "Unpin" : "Pin to top"}
+                        </button>
+                        <button
+                          className="ws-menu-btn"
+                          role="menuitem"
+                          onClick={() => {
+                            setRenamingWsKey(g.key);
+                            setWsRenameValue(g.label);
+                            setWsMenuOpenKey(null);
+                          }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+                          </svg>
+                          Rename
+                        </button>
+                        <button
+                          className="ws-menu-btn"
+                          role="menuitem"
+                          onClick={() => {
+                            setColorOpen(colorOpen === g.key ? null : g.key);
+                            setWsMenuOpenKey(null);
+                          }}
+                        >
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" />
+                            <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" />
+                            <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" />
+                            <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" />
+                            <path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.7 1.7-1.7H17a3 3 0 0 0 3-3c0-4.4-4-8-8-8z" />
+                          </svg>
+                          Color
+                        </button>
+                        <button
+                          className="ws-menu-btn danger"
+                          role="menuitem"
+                          onClick={(e) => {
+                            const btn = (e.currentTarget as HTMLElement)
+                              .closest(".ws-menu-wrap")
+                              ?.querySelector(".sidebar-group-btn") as HTMLElement | null;
+                            const r = (btn ?? e.currentTarget).getBoundingClientRect();
+                            setDeleteMenuPos({ top: r.bottom + 6, left: r.right - 180 });
+                            setDeleteMenuKey(g.key);
+                            setWsMenuOpenKey(null);
+                          }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+                          </svg>
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
                 {colorOpen === g.key && (
                   <div
@@ -910,7 +966,48 @@ export function Sidebar() {
                     </button>
                   </div>
                 )}
-                {selectedInGroup > 0 && (
+                {deleteMenuKey === g.key && deleteMenuPos && (
+                  <div
+                    className="ws-delete-menu-wrap"
+                    style={{
+                      position: "fixed",
+                      top: deleteMenuPos.top,
+                      left: deleteMenuPos.left,
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="ws-delete-menu" role="menu">
+                      <div className="ws-delete-menu-title">Delete…</div>
+                      <button
+                        className="ws-delete-menu-btn danger"
+                        role="menuitem"
+                        onClick={() => {
+                          useStore.getState().deleteWorkspace(g.key);
+                          setDeleteMenuKey(null);
+                        }}
+                      >
+                        Delete workspace
+                        <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
+                          ({g.chats.length})
+                        </span>
+                      </button>
+                      <button
+                        className="ws-delete-menu-btn"
+                        role="menuitem"
+                        onClick={() => {
+                          setSelectingWsKey(g.key);
+                          setDeleteMenuKey(null);
+                        }}
+                      >
+                        Delete chats
+                        <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
+                          ({g.chats.length})
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {selectingWsKey === g.key && (
                   <div className="group-bulk-actions">
                     <button
                       className="group-delete-selected"
@@ -919,20 +1016,16 @@ export function Sidebar() {
                         const ids = g.chats
                           .map((c) => c.id)
                           .filter((id) => selectedChats.has(id));
-                        if (
-                          window.confirm(
-                            `Delete ${ids.length} conversation(s)?`,
-                          )
-                        ) {
-                          ids.forEach((id) =>
-                            useStore.getState().deleteChat(id),
-                          );
-                          setSelectedChats((prev) => {
-                            const next = new Set(prev);
-                            ids.forEach((id) => next.delete(id));
-                            return next;
-                          });
-                        }
+                        if (ids.length === 0) return;
+                        ids.forEach((id) =>
+                          useStore.getState().deleteChat(id),
+                        );
+                        setSelectedChats((prev) => {
+                          const next = new Set(prev);
+                          ids.forEach((id) => next.delete(id));
+                          return next;
+                        });
+                        setSelectingWsKey(null);
                       }}
                     >
                       <svg
@@ -948,6 +1041,27 @@ export function Sidebar() {
                         <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
                       </svg>
                       {selectedInGroup}
+                    </button>
+                    <button
+                      className="group-cancel-select"
+                      title="Cancel selection"
+                      aria-label="Cancel selection"
+                      onClick={() => {
+                        setSelectingWsKey(null);
+                        clearSelected();
+                      }}
+                    >
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                      >
+                        <path d="M6 6l12 12M18 6L6 18" />
+                      </svg>
                     </button>
                   </div>
                 )}
@@ -971,13 +1085,25 @@ export function Sidebar() {
                     return (
                       <div
                         key={c.id}
-                        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}`}
+                        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === g.key ? " selecting" : ""}`}
                         onClick={() => useStore.getState().setActiveChat(c.id)}
                         title={prepareContent(titleOf(c), dir)}
                       >
-                        <div
-                          className={`chat-item-kebab-wrap${menuOpenId === c.id ? " open" : ""}`}
-                        >
+                        {selectingWsKey === g.key ? (
+                          <div className="chat-item-select-wrap">
+                            <input
+                              type="checkbox"
+                              className="chat-select-checkbox"
+                              checked={selectedChats.has(c.id)}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={() => toggleChatSelected(c.id)}
+                              title="Select this chat"
+                            />
+                          </div>
+                        ) : (
+                          <div
+                            className={`chat-item-kebab-wrap${menuOpenId === c.id ? " open" : ""}`}
+                          >
                           <button
                             className="chat-item-kebab"
                             title="Chat actions"
@@ -1052,8 +1178,8 @@ export function Sidebar() {
                               className="chat-item-menu-btn danger"
                               role="menuitem"
                               onClick={() => {
-                                if (window.confirm("Delete this conversation?"))
-                                  useStore.getState().deleteChat(c.id);
+                                setSelectingWsKey(g.key);
+                                setSelectedChats(new Set([c.id]));
                                 setMenuOpenId(null);
                               }}
                             >
@@ -1073,6 +1199,7 @@ export function Sidebar() {
                             </button>
                           </div>
                         </div>
+                        )}
                         {renamingId === c.id ? (
                           <input
                             className="chat-rename-input"
@@ -1089,14 +1216,6 @@ export function Sidebar() {
                           />
                         ) : (
                           <span className="chat-item-title-row" dir={dir}>
-                            <input
-                              type="checkbox"
-                              className="chat-select-checkbox"
-                              checked={selectedChats.has(c.id)}
-                              onClick={(e) => e.stopPropagation()}
-                              onChange={() => toggleChatSelected(c.id)}
-                              title="Select this chat"
-                            />
                             <span
                               className="chat-item-title"
                               onDoubleClick={(e) => {

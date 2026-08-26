@@ -23,10 +23,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from agent_registry import EXPLORE_SYSTEM  # noqa: E402
-import tools as tools_mod  # noqa: E402
-from tools import _explore_fail_note, make_tool_callbacks  # noqa: E402
-import llm as llm_mod  # noqa: E402
+import llm as llm_mod
+from agent_registry import EXPLORE_SYSTEM
+from tools import _explore_fail_note, make_tool_callbacks
 
 
 async def test_explore_system_prompt_is_compact_and_grep_first():

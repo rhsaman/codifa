@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Compare our agent (coder) with opencode on:
 1. Token usage
@@ -12,18 +11,16 @@ import asyncio
 import json
 import os
 import sys
-import time
 import tempfile
-import shutil
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional
 
 # Add backend to path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from agents import run_agent
-from providers import env_key, is_opencode
+from providers import env_key
 
 
 @dataclass
@@ -38,7 +35,7 @@ class AgentResult:
     tool_calls: int
     files_created: int
     files_modified: int
-    error: Optional[str] = None
+    error: str | None = None
     output_preview: str = ""
 
 
@@ -144,7 +141,7 @@ async def run_our_agent(
         success = error is None
         output_text = "".join(output_chunks)
         
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         error = str(e)
         output_text = ""
         success = False
@@ -162,10 +159,10 @@ async def run_our_agent(
         try:
             if f.stat().st_mtime > start_time:
                 files_modified += 1
-        except:
+        except Exception:  # noqa: BLE001, S110
             pass
     
-    print(f"\n\n--- RESULTS ---")
+    print("\n\n--- RESULTS ---")
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Tokens: {total_tokens} (in: {input_tokens}, out: {output_tokens})")
     print(f"  Tool calls: {tool_calls}")
@@ -248,7 +245,7 @@ async def run_opencode_agent(
             if "tokens" in line.lower() or "usage" in line.lower():
                 print(f"[TOKEN LINE] {line}")
         
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         elapsed = time.time() - start_time
         stdout_text = ""
         stderr_text = str(e)
@@ -270,10 +267,10 @@ async def run_opencode_agent(
         try:
             if f.stat().st_mtime > start_time:
                 files_modified += 1
-        except:
+        except Exception:  # noqa: BLE001, S110
             pass
     
-    print(f"\n--- RESULTS ---")
+    print("\n--- RESULTS ---")
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Tokens: {total_tokens} (in: {input_tokens}, out: {output_tokens})")
     print(f"  Tool calls: {tool_calls}")
@@ -343,7 +340,7 @@ def print_comparison(results: list[AgentResult]):
     # Success
     our_success = next((r.success for r in results if r.agent_name.startswith("our")), False)
     oc_success = next((r.success for r in results if r.agent_name == "opencode"), False)
-    print(f"{'Success':<25} {str(our_success):<20} {str(oc_success):<20} {'':<15}")
+    print(f"{'Success':<25} {our_success!s:<20} {oc_success!s:<20} {'':<15}")
     
     print("-" * 80)
     
@@ -411,7 +408,7 @@ async def main():
         
         # Save results
         output_file = Path("agent_comparison_results.json")
-        with open(output_file, "w") as f:
+        with open(output_file, "w") as f:  # noqa: ASYNC230
             json.dump([asdict(r) for r in all_results], f, indent=2)
         print(f"\nResults saved to {output_file}")
 

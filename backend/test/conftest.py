@@ -33,8 +33,9 @@ for _p in (_HERE, os.path.dirname(_HERE)):
 # Hermetic data root BEFORE importing anything that binds state_db.
 os.environ.setdefault("CODER_DATA_DIR", tempfile.mkdtemp(prefix="coder-pytest-data-"))
 
-from mock_openai import mock, start_server, stop_server  # noqa: E402
-from agents import run_agent  # noqa: E402
+from mock_openai import mock, start_server, stop_server
+
+from agents import run_agent
 
 
 @pytest.fixture(scope="session")
@@ -75,7 +76,7 @@ def _no_retry(monkeypatch):
     unaffected."""
     try:
         from openai import AsyncOpenAI, OpenAI
-    except Exception:
+    except ImportError:
         return
 
     def _patch(cls):

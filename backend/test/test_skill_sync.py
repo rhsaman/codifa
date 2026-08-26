@@ -2,8 +2,8 @@ import os
 
 import pytest
 
-import tools
 import state_db
+import tools
 
 BUILTIN_V1 = """---
 name: Test Skill
@@ -75,7 +75,8 @@ def test_shipped_anthropic_skill_is_clean():
     path = os.path.join(
         os.path.dirname(tools.__file__), "skills", "anthropic-frontend-design.md"
     )
-    raw = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as _f:
+        raw = _f.read()
     name, _desc, body = tools._parse_skill_markdown(raw)
     assert name == "Anthropic Frontend Design"
     assert "---name: frontend-design" not in body, "stray frontmatter leaked into body"

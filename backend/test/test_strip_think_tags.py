@@ -1,7 +1,7 @@
 """Tests for literal <think>…</think> tag stripping from streamed content."""
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,7 +25,7 @@ def test_complete_tag():
 
 def test_thinking_variant():
     text = "answer<thinking>secret</think>more"
-    out, in_think, buf = _strip_think_tags(text, False, "")
+    out, _in_think, buf = _strip_think_tags(text, False, "")
     assert out == "answermore"
     assert buf == "secret"
 
@@ -45,12 +45,12 @@ def test_unterminated_tag_spans_chunks():
 
 def test_multiple_tags():
     text = "a<think>r1</think>b<think>r2</think>c"
-    out, in_think, buf = _strip_think_tags(text, False, "")
+    out, _in_think, buf = _strip_think_tags(text, False, "")
     assert out == "abc"
     assert buf == "r1r2"
 
 
 def test_empty():
-    out, in_think, buf = _strip_think_tags("", False, "")
+    out, in_think, _buf = _strip_think_tags("", False, "")
     assert out == ""
     assert not in_think

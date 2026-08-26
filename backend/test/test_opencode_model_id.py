@@ -13,7 +13,7 @@ import tempfile
 _TMP = tempfile.mkdtemp(prefix="coder-test-opencode-id-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
-from providers import qualify_model_id  # noqa: E402
+from providers import qualify_model_id
 
 
 def test_opencode_bare_id_is_passed_through():

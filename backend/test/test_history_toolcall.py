@@ -8,10 +8,10 @@ model sees the prior work and does NOT re-run the tool calls.
 
 Run: uv run pytest backend/test/test_history_toolcall.py
 """
-import pytest
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from graph import history_to_langchain_messages
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 
 def test_assistant_with_tool_activity_reconstructs_tool_calls():

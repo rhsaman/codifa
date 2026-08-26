@@ -12,16 +12,15 @@ Guards:
    python/node, git commit/push/checkout/branch -d, file writes via >) -> True.
 """
 
-import sys
 import os
+import sys
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
 for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools import _is_terminal_write  # noqa: E402
-
+from tools import _is_terminal_write
 
 _READ_ONLY = [
     "ls -la",

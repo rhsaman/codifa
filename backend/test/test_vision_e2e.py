@@ -1,9 +1,8 @@
-import json
 
 import pytest
+from mock_openai import mock, text_reply
 
 import graph
-from mock_openai import mock, text_reply, tool_call
 
 
 @pytest.fixture(autouse=True)

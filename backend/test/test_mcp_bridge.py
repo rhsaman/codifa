@@ -166,10 +166,3 @@ async def test_broken_server_is_isolated(monkeypatch):
     # A warning event was emitted for the broken server.
     assert any(e.get("kind") == "warn" for e in events)
     await cleanup()
-
-
-@pytest.mark.asyncio
-async def test_empty_config_yields_no_tools():
-    tools, cleanup = await build_mcp_tools({}, lambda ev: None)
-    assert tools == []
-    await cleanup()

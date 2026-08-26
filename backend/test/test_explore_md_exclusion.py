@@ -5,7 +5,6 @@ Top-level docs are noise next to the code and bloat the context budget;
 ``AGENTS.md`` stays readable, and nested ``.md`` (e.g. ``docs/foo.md``) is
 unaffected. Attached files bypass this via the Reader, not explore.
 """
-import graph
 from graph import _is_excluded_root_md, _repo_source_files
 
 

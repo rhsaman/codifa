@@ -27,9 +27,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
+from langchain_core.messages import AIMessage, HumanMessage
 
-import graph as _graph  # noqa: E402
+import graph as _graph
 
 
 class _LoopModel:

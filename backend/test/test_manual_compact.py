@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 from fastapi.testclient import TestClient
 
-import llm
 import agents
+import llm
 import server
 from server import app
 

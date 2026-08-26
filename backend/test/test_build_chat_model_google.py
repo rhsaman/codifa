@@ -2,7 +2,6 @@
 ``default_headers`` to ``ChatGoogleGenerativeAI`` (that class rejects the
 argument and emits a warning)."""
 
-import pytest
 
 from llm import build_chat_model
 

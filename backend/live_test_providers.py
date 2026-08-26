@@ -3,9 +3,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from llm import build_chat_model, llm_complete
-
 import providers
+from llm import build_chat_model, llm_complete
 
 CANDIDATES = {
     "nvidia": ["nvidia/nemotron-mini-4b-instruct", "nvidia/nvidia-nemotron-nano-9b-v2"],
@@ -21,19 +20,20 @@ async def m(kind: str) -> bool:
         print(f"  list_models: {len(ids)} models; sample {ids[:3]}")
         key = providers.env_key(kind)
         print(f"  base_url: {providers.normalize_base_url(kind, '')}")
-            for model in CANDIDATES.get(kind, []):
-                mo = build_chat_model(kind, model, "", key)
-                r = await asyncio.wait_for(
-                    llm_complete(mo, user="Say OK"), timeout=40
-                )
-                print(f"  completion OK [{model}] -> {r!r}")
-                return True
-            except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
-                print(f"  model {model} failed: {type(e).__name__}: {str(e)[:100]}")
-        return False
     except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
         print(f"  !! {type(e).__name__}: {e}")
         return False
+    for model in CANDIDATES.get(kind, []):
+        try:
+            mo = build_chat_model(kind, model, "", key)
+            r = await asyncio.wait_for(
+                llm_complete(mo, user="Say OK"), timeout=40
+            )
+            print(f"  completion OK [{model}] -> {r!r}")
+            return True
+        except Exception as e:  # noqa: BLE001 — a failing provider is the test subject
+            print(f"  model {model} failed: {type(e).__name__}: {str(e)[:100]}")
+    return False
 
 async def main() -> None:
     ok = {kind: await m(kind) for kind in ("nvidia", "cloudflare", "tokenrouter")}

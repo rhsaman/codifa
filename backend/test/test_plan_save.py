@@ -34,7 +34,7 @@ async def test_plan_build_saves_once(tmp_path, monkeypatch):
     monkeypatch.setattr(graph.state_db, "save_plan", fake_save_plan)
     monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
 
-    state, q = _state(root, reply)
+    state, _q = _state(root, reply)
     result = await plan_build(state)
 
     assert result["plan"] == reply
@@ -110,7 +110,7 @@ async def test_plan_build_skips_save_when_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
 
-    state, q = _state(root, reply)
+    state, _q = _state(root, reply)
     await plan_build(state)
     assert len(calls) == 0
 
@@ -139,11 +139,13 @@ async def test_plan_build_saves_with_variant_header(tmp_path, monkeypatch):
     root = str(tmp_path)
     saved = {}
     monkeypatch.setattr(
-        graph.state_db, "save_plan", lambda *a, **k: saved.update(dict(workspace=a[0], content=a[2]))
+        graph.state_db, "save_plan", lambda *a, **k: saved.update({"workspace": a[0], "content": a[2]})
     )
     for v in variants:
-        monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(v))
-        state, q = _state(root, v)
+        monkeypatch.setattr(
+            graph, "_run_mode_turn", lambda state, mode, queue, _v=v: _await(_v)
+        )
+        state, _q = _state(root, v)
         await plan_build(state)
         assert saved.get("content", "").strip(), v
 
@@ -197,7 +199,7 @@ async def test_plan_build_logs_on_save_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(graph.state_db, "save_plan", boom)
     monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(reply))
 
-    state, q = _state(root, reply)
+    state, _q = _state(root, reply)
     # Should not raise; returns the reply unchanged.
     result = await plan_build(state)
     assert result["plan"] == reply
@@ -212,7 +214,7 @@ async def test_plan_build_handles_non_string_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue: _await(None))
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: None)
 
-    state, q = _state(root, "")
+    state, _q = _state(root, "")
     result = await plan_build(state)
     assert result["plan"] == ""
 

@@ -237,8 +237,10 @@ export interface StreamParams {
     toolActivity?: Array<{
       tool: string
       args?: Record<string, unknown>
+      callId?: number | string
       summary?: string
       status: string
+      items?: Array<Record<string, unknown>>
     }>
   }>
   attachments?: string[]

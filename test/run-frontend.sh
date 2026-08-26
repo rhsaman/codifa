@@ -154,7 +154,6 @@ echo "── تست ۲۶: Sidebar (هدر یکپارچه: سرچ بالا + دک
 npx esbuild test/sidebar.ssr.test.tsx --bundle --platform=node --format=esm \
   --jsx=automatic --packages=external \
   --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \
-  --alias:../src/lib/store=./test/sidebar-store-stub.ts \
   --outfile=test/.tmp-sb.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-sb.mjs
 

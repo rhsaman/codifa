@@ -718,7 +718,7 @@ export function Sidebar() {
         )}
         {visibleGroups.map((g) => {
           const isCollapsed = collapsed.has(g.key) && !searching;
-          const color = workspaceColors[g.key];
+          const color = workspaceColors[g.key] || "var(--accent)";
           const isPinned = pinnedWorkspaces.includes(g.key);
           const pendingCount = g.chats.filter(
             (c) => c.pendingAsk || c.pendingPermission,
@@ -726,10 +726,8 @@ export function Sidebar() {
           return (
             <div
               key={g.key}
-              className={`sidebar-group${isPinned ? " pinned" : ""}${color ? " ws-colored" : ""}${dragKey === g.key ? " dragging" : ""}${dragOverKey === g.key && dragKey && dragKey !== g.key ? " drop-target" : ""}`}
-              style={
-                color ? ({ "--ws": color } as React.CSSProperties) : undefined
-              }
+              className={`sidebar-group${isPinned ? " pinned" : ""} ws-colored${dragKey === g.key ? " dragging" : ""}${dragOverKey === g.key && dragKey && dragKey !== g.key ? " drop-target" : ""}`}
+              style={{ "--ws": color } as React.CSSProperties}
               draggable
               onDragStart={(e) => onDragStart(e, g.key)}
               onDragOver={(e) => onDragOver(e, g.key)}
@@ -743,39 +741,25 @@ export function Sidebar() {
                   title={g.root || g.label}
                 >
                   <svg
-                    className="sidebar-group-chevron"
-                    width="12"
-                    height="12"
+                    className={`sidebar-group-icon${isCollapsed ? " collapsed" : ""}`}
+                    style={{ color }}
+                    width="17"
+                    height="17"
                     viewBox="0 0 24 24"
-                    fill="none"
+                    fill={isCollapsed ? "currentColor" : "none"}
                     stroke="currentColor"
-                    strokeWidth="2.2"
+                    strokeWidth={isCollapsed ? 0 : 1.9}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   >
-                    <path
-                      d={isCollapsed ? "M6 9l6 6 6-6" : "M18 15l-6-6-6 6"}
-                    />
-                  </svg>
-                  {color && (
-                    <span
-                      className="sidebar-ws-dot"
-                      style={{ background: color, color }}
-                      title="Workspace color"
-                    />
-                  )}
-                  <svg
-                    className="sidebar-group-icon"
-                    width="13"
-                    height="13"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    {isCollapsed ? (
+                      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                    ) : (
+                      <>
+                        <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                        <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
+                      </>
+                    )}
                   </svg>
                   <span className="sidebar-group-label">{g.label}</span>
                   <span className="sidebar-group-count">{g.chats.length}</span>
@@ -816,13 +800,22 @@ export function Sidebar() {
                       setColorOpen(colorOpen === g.key ? null : g.key)
                     }
                   >
-                    <span
-                      className="sidebar-ws-dot"
-                      style={{
-                        background: color || "transparent",
-                        borderColor: color || "currentColor",
-                      }}
-                    />
+                    <svg
+                      width="15"
+                      height="15"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" />
+                      <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" />
+                      <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" />
+                      <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" />
+                      <path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.7 1.7-1.7H17a3 3 0 0 0 3-3c0-4.4-4-8-8-8z" />
+                    </svg>
                   </button>
                   <button
                     className="sidebar-group-btn"

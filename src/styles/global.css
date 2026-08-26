@@ -773,16 +773,41 @@ textarea {
   display: flex;
   align-items: center;
   width: 100%;
-  padding: 5px 6px 5px 8px;
+  padding: 6px 6px 6px 10px;
   border-radius: 10px;
   background: transparent;
+  border: 1px solid transparent;
   transition:
     background 0.12s,
-    color 0.12s;
+    color 0.12s,
+    border-color 0.12s;
+}
+
+/* نوار اکسنت رنگی در سمت چپ — هویت بصری ورک‌اسپیس بدون زمینهٔ سنگین */
+.sidebar-group.ws-colored .sidebar-group-head {
+  padding-left: 8px;
+}
+
+.sidebar-group.ws-colored .sidebar-group-head::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  border-radius: 3px;
+  background: var(--ws);
+  box-shadow: 0 0 8px 0 color-mix(in srgb, var(--ws) 55%, transparent);
 }
 
 .sidebar-group-head:hover {
   background: var(--bg-input);
+  border-color: var(--border);
+}
+
+.sidebar-group-head:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
 .sidebar-group-toggle {
@@ -864,14 +889,17 @@ textarea {
   color: #fff;
 }
 
-.sidebar-group-chevron {
-  flex: 0 0 auto;
-  opacity: 0.7;
-}
-
 .sidebar-group-icon {
   flex: 0 0 auto;
-  opacity: 0.7;
+  align-self: center;
+  line-height: 0;
+  opacity: 0.9;
+}
+
+/* وقتی گروه بسته (کلپس) است، آیکون پررنگ‌تر و واضح‌تر باشد */
+.sidebar-group-icon.collapsed {
+  opacity: 1;
+  color: color-mix(in srgb, var(--ws) 80%, var(--text));
 }
 
 .sidebar-group-label {
@@ -882,23 +910,26 @@ textarea {
   white-space: nowrap;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  font-size: 11.5px;
+  line-height: 1;
+  align-self: center;
+}
+
+/* نام ورک‌اسپیس به رنگ خودش — تفکیک بصری سریع‌تر */
+.sidebar-group.ws-colored .sidebar-group-label {
+  color: var(--ws);
 }
 
 .sidebar-group-count {
   flex: 0 0 auto;
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 10.5px;
+  font-weight: 600;
   color: var(--text-dim);
-  opacity: 0.8;
-}
-
-.sidebar-ws-dot {
-  flex: 0 0 auto;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 1px solid transparent;
-  box-shadow: 0 0 6px 0 color-mix(in srgb, currentColor 35%, transparent);
+  background: var(--bg-input);
+  border-radius: 999px;
+  padding: 1px 7px;
+  min-width: 20px;
+  text-align: center;
 }
 
 .color-backdrop {

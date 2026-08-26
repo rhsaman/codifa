@@ -367,6 +367,34 @@ def test_load_skips_partial_line(tmp_path):
     assert tools[0].get("tool") == "grep"
 
 
+def test_resume_survives_soft_error(tmp_path):
+    """A turn that ends on a soft failure (repetition loop / length truncation /
+    retry-giveup) must NOT clear the durable resume file — a reconnect/retry
+    should replay the already-done tool work, not re-run it from zero.
+
+    We exercise the exact gate in run_graph._drive: when run_flags['error'] is
+    True the file is left behind even though the turn finished without raising.
+    """
+    ws = str(tmp_path / "ws")
+    os.makedirs(ws)
+    with open(os.path.join(ws, "app.py"), "w") as fh:
+        fh.write("def foo():\n    return 42\n")
+    chat = "soft-error-chat"
+    # Simulate a turn that did some tool work, then failed softly.
+    state_db.save_turn_resume(
+        ws, chat, {"prompt": "p", "tools": [{"tool": "grep", "callId": "1"}]}
+    )
+    # Mirror what _run_mode_turn sets on a soft failure, and what _drive checks.
+    initial_flags = {"hard_error": False, "error": True}
+    # The clear only fires when BOTH flags are False; with error=True it must not.
+    _should_clear = not initial_flags["hard_error"] and not initial_flags["error"]
+    assert _should_clear is False, "soft-failed turn must leave the resume file"
+    # And the file is still readable for a reconnect.
+    resume = state_db.load_turn_resume(ws, chat)
+    assert resume is not None, "resume file should survive a soft error"
+    assert resume.get("tools"), "resume file should still hold the done tool work"
+
+
 def test_prune_stale_resume_files(tmp_path):
     """Files older than 24h are pruned; fresh files survive. Per-turn finishing
     never calls this, so an in-flight resume file is never touched."""

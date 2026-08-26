@@ -548,7 +548,11 @@ _SEARCH_CALL_COUNT_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
 # across the whole user-message sequence (reset only at run_graph start), so a
 # single message that greps many times still trips the router instead of being
 # reset on every model turn.
-_AUTO_EXPLORE_THRESHOLD = 2
+# Raised from 2 to 8: lets the main agent fire a SINGLE-TURN BATCH of targeted
+# searches (grep/glob/read) before the router forces delegation — so it can
+# narrow toward the answer in one pass instead of serially tripping the router
+# after the 2nd call. Broad searches are still hard-blocked by _is_broad_search.
+_AUTO_EXPLORE_THRESHOLD = 8
 # Web lookups are expensive (network + context); allow fewer before routing.
 _AUTO_EXPLORE_WEB_THRESHOLD = 1
 
@@ -914,11 +918,18 @@ _SEARCH_RULE = (
     "whole file into context.\n"
     "NOTE: the system enforces this automatically — a broad glob (e.g. '**/*.py' "
     "with no include), a repo-wide grep (no path AND no include), or repeated "
-    "search calls piling up in one turn are auto-routed to explore. You do NOT "
+    "search calls piling up across your response to this task are auto-routed to "
+    "explore. You do NOT "
     "need to trigger explore manually for those; just keep using the direct "
     "tools for targeted lookups.\n"
     "NEVER search or read project files with run_terminal or scripts — only "
-    "the file tools (grep / glob / read)."
+    "the file tools (grep / glob / read).\n"
+    "6. PROGRESSIVE BATCHING: in every turn, fire ALL the targeted searches you "
+    "need (each with explicit scope: path + include) as a SINGLE BATCH of parallel "
+    "tool calls. Each batch must narrow toward the answer (progressive) — use the "
+    "results of one batch to make the next batch tighter. Goal: reach the answer "
+    "in UNDER 10 total grep/glob/read calls per task. Never fire one search at a "
+    "time when you already know several you need."
 )
 
 # The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict

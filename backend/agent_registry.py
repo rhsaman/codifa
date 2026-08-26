@@ -46,7 +46,12 @@ EXPLORE_SYSTEM = (
     "fan out repo-wide unless asked.\n"
     "3. Fire multiple Glob/Grep in ONE turn (parallel) when known.\n"
     "4. External docs: web_search + fetch_url only when the answer needs them.\n"
-    "Do NOT create/modify files. Do NOT run mutating bash. Avoid emojis."
+    "Do NOT create/modify files. Do NOT run mutating bash. Avoid emojis.\n\n"
+    # Progressive batching (mirrors _SEARCH_RULE so explore also batches):
+    "PROGRESSIVE BATCHING: fire ALL targeted searches you need (each with explicit "
+    "scope: path + include) as a SINGLE BATCH of parallel tool calls each turn. "
+    "Each batch must narrow toward the answer (progressive). Goal: UNDER 10 total "
+    "grep/glob/read calls per task."
 )
 
 # The registry. ``tools`` is the sub-agent's tool set:
@@ -64,7 +69,7 @@ AGENTS: dict[str, dict] = {
         "system": GENERAL_SYSTEM,
         # Hard step budget for this sub-agent (mirrors opencode's `agent.steps`).
         # None -> fall back to the caller's default max_steps.
-        "steps": 15,
+        "steps": 8,   # was 15: tighter budget so a general sub-agent can't run away
     },
     "explore": {
         "name": "explore",
@@ -86,7 +91,7 @@ AGENTS: dict[str, dict] = {
         # Explore agents fan out wide searches; give them a slightly tighter
         # budget so a single explore call can't run away (opencode's explore is
         # also bounded).
-        "steps": 20,
+        "steps": 10,   # was 20: tighter budget so one explore can't run away
     },
 }
 

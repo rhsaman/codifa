@@ -2100,6 +2100,11 @@ async def _run_mode_turn(
                             ),
                         }
                     )
+                    # The turn did not complete cleanly (output was cut off), so
+                    # leave the durable resume file behind for a reconnect/retry.
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["error"] = True
                     reply = (
                         ai.content if isinstance(ai.content, str) else str(ai.content)
                     )
@@ -2144,6 +2149,12 @@ async def _run_mode_turn(
                         ),
                     }
                 )
+                # Mark the turn as failed so run_graph._drive leaves the durable
+                # resume file behind (a reconnect/retry can replay the already-done
+                # tool work instead of re-running it from zero).
+                if run_flags is not None:
+                    with contextlib.suppress(Exception):
+                        run_flags["error"] = True
                 break
             msgs.append(ai)
             # Partition this step's tool calls: read-only ones (grep/glob/read/
@@ -2256,6 +2267,12 @@ async def _run_mode_turn(
                             "reason": _agents._friendly_retry_reason(exc),
                         }
                     )
+                    # Mark the turn as failed so run_graph._drive leaves the
+                    # durable resume file behind (a reconnect/retry can replay the
+                    # already-done tool work instead of re-running it from zero).
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["error"] = True
                     break
                 delay = _agents._RETRY_BASE_SECONDS
                 if not isinstance(delay, (int, float)) or delay < 0:
@@ -4003,6 +4020,7 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     # plain attribute on `initial` would be invisible to _drive because
     # _run_mode_turn works on a *copy* of the state, so we use a nested dict.
     initial.setdefault("_run_flags", {})["hard_error"] = False
+    initial["_run_flags"]["error"] = False
     # Drop any stale captured ask_user answer for this chat from a previous run
     # so Part A re-exploration only fires for answers given in THIS run.
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
@@ -4062,8 +4080,16 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
             # written step-by-step during the run, so it always holds the most
             # recent interrupted state).
             if _clean:
-                _hard = bool((initial.get("_run_flags") or {}).get("hard_error"))
-                if not _hard:
+                _flags = initial.get("_run_flags") or {}
+                _hard = bool(_flags.get("hard_error"))
+                _errored = bool(_flags.get("error"))
+                # Only clear the durable resume file on a GENUINE clean finish:
+                # no cancellation, no hard error, AND no soft failure (repetition
+                # loop / length truncation / retry-giveup / any turn that broke
+                # out without completing). On any of those we LEAVE the file
+                # behind so a reconnect/retry can replay the already-done tool
+                # work instead of re-running it from zero.
+                if not _hard and not _errored:
                     with contextlib.suppress(Exception):
                         state_db.clear_turn_resume(
                             initial.get("root", ""), initial.get("chat_id", "")

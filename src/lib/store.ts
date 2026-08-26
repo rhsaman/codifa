@@ -1802,8 +1802,9 @@ export const useStore = create<State>((set, get) => ({
         }
         // Append the summary at the END of the conversation so it renders AFTER
         // the agent's message (the user wants the checkpoint below the reply, not
-        // above it). The model still receives it first on the next request because
-        // the backend sends the FULL history system-first regardless of array order.
+        // above it). Array order here is fine: the backend normalizes history order
+        // itself (moving system summaries to the head) before compacting, so it
+        // always finds and merges a prior summary regardless of where it sits.
         messages.push(summaryMsg)
         return {
           ...c,

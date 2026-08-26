@@ -1878,26 +1878,26 @@ async def _run_mode_turn(
         _resume_root = state.get("root", "")
         _resume_chat = state.get("chat_id", "")
         _resume_prompt = state.get("request", "")
-        _resume_tools: list[dict] = []
 
         def _record_resume_tool(name: str, args: dict, call_id: str, result: str) -> None:
             if not _resume_chat:
                 return
-            _resume_tools.append(
-                {
-                    "tool": name,
-                    "args": args or {},
-                    "callId": call_id,
-                    "items": str(result),
-                    "result": str(result),
-                    "summary": "",
-                }
-            )
+            # Append ONLY the new record (save_turn_resume writes it as one JSONL
+            # line). We no longer keep a growing in-memory list and rewrite the
+            # whole file — that made an interrupt mid-write wipe the resume state.
+            rec = {
+                "tool": name,
+                "args": args or {},
+                "callId": call_id,
+                "items": str(result),
+                "result": str(result),
+                "summary": "",
+            }
             with contextlib.suppress(Exception):
                 state_db.save_turn_resume(
                     _resume_root,
                     _resume_chat,
-                    {"prompt": _resume_prompt, "tools": list(_resume_tools)},
+                    {"prompt": _resume_prompt, "tools": [rec]},
                 )
         # --- Repetition-loop guard (opencode-aligned) -----------------------
         # opencode stops a degenerate loop via MAX_STEPS + finish_reason=="length"
@@ -4021,15 +4021,33 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     graph = build_graph()
 
     async def _drive() -> None:
+        # Tracks whether the run ended cleanly (no error AND no cancellation).
+        # A user abort / client disconnect cancels this task, which surfaces as
+        # a BaseException (CancelledError / GeneratorExit) — NOT an Exception —
+        # so it would otherwise slip past the `except Exception` and fall into
+        # the `else` branch below, wiping the durable resume file on an
+        # *interrupted* turn. We must only clear the file on a genuine clean
+        # finish, so we gate the `else` on this flag.
+        _clean = True
         try:
             async for _ in graph.astream(initial, stream_mode="updates"):
                 pass
+        except asyncio.CancelledError:
+            # User aborted / client disconnected mid-turn: LEAVE the resume file
+            # behind so a reconnect can replay the already-done tool work.
+            _clean = False
+            return
+        except GeneratorExit:
+            # Consumer (run_graph generator) closed early — same as a disconnect.
+            _clean = False
+            return
         except Exception as _exc:  # noqa: BLE001 — surface the real failure
             # Never swallow the error silently: a bare `queue.put(None)` would
             # end the stream with NO error event, so the frontend sees a sudden
             # "disconnect" (the message just cuts off) instead of a real error
             # it can show as a Retry banner. This is the root cause of the
             # intermittent "first/any message disconnects instantly" reports.
+            _clean = False
             traceback.print_exc()
             await queue.put(
                 {
@@ -4043,12 +4061,13 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
             # so a reconnect can replay the already-done tool work (the file is
             # written step-by-step during the run, so it always holds the most
             # recent interrupted state).
-            _hard = bool((initial.get("_run_flags") or {}).get("hard_error"))
-            if not _hard:
-                with contextlib.suppress(Exception):
-                    state_db.clear_turn_resume(
-                        initial.get("root", ""), initial.get("chat_id", "")
-                    )
+            if _clean:
+                _hard = bool((initial.get("_run_flags") or {}).get("hard_error"))
+                if not _hard:
+                    with contextlib.suppress(Exception):
+                        state_db.clear_turn_resume(
+                            initial.get("root", ""), initial.get("chat_id", "")
+                        )
         finally:
             await queue.put(None)
 

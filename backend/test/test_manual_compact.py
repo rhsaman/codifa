@@ -121,6 +121,51 @@ def test_compact_history_merges_prior_summary(monkeypatch):
     assert new_history[-keep]["role"] == "user"
 
 
+def test_compact_history_merges_prior_summary_at_tail(monkeypatch):
+    # Regression for the "compact loop": the frontend appends the compact summary
+    # at the END of the array (so it renders below the reply), not the head. The
+    # backend must normalize order and still find/merge that prior summary instead
+    # of swallowing it into the recent tail and re-counting it every turn.
+    captured = {}
+
+    async def fake_llm(m, system="", user=""):
+        captured["system"] = system
+        captured["user"] = user
+        return "MERGED", None
+
+    monkeypatch.setattr(llm, "llm_complete", fake_llm)
+    import importlib
+
+    importlib.reload(agents)
+
+    class DummyModel:
+        pass
+
+    # Build the same large history but place the prior summary at the TAIL.
+    history = []
+    for i in range(8):
+        history.append({"role": "user", "content": f"u{i} " + "x" * 1000})
+        history.append({"role": "assistant", "content": f"a{i} " + "y" * 1000})
+    history.append(
+        {"role": "system", "content": "[Compacted earlier context]\nOLD SUMMARY"}
+    )
+
+    new_history, keep, _usage = asyncio.run(
+        agents._compact_history(
+            DummyModel(), history, ctx=10000, reserved=20000
+        )
+    )
+    # Exactly ONE summary at the head, and it carries the merged content.
+    summaries = [m for m in new_history if m.get("role") == "system"]
+    assert len(summaries) == 1, f"expected 1 summary, got {len(summaries)}"
+    assert new_history[0]["content"] == "[Compacted earlier context]\nMERGED"
+    # The prior summary was found and folded into the new one (not re-counted).
+    assert "OLD SUMMARY" in captured["user"]
+    # The recent tail is preserved verbatim and reported via `keep`.
+    assert keep >= 1
+    assert new_history[-keep]["role"] == "user"
+
+
 def test_compact_history_fresh_no_prior(monkeypatch):
     captured = {}
 

@@ -1446,6 +1446,18 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110
         pass
 
+    # Prune orphaned resume files (older than 24h) only on shutdown — never
+    # per-turn — so finishing one chat never touches another chat's in-flight
+    # resume file.
+    try:
+        import atexit
+
+        import state_db as _state_db
+
+        atexit.register(lambda: _state_db.prune_stale_resume_files())
+    except Exception:  # noqa: BLE001, S110
+        pass
+
     global _SIDECAR_PORT
     _SIDECAR_PORT = args.port
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

@@ -329,5 +329,64 @@ async def main():
         await stop_server(task)
 
 
+# --- Unit tests for the durable resume file format (JSONL append) ------------
+
+
+def test_save_load_appends_not_overwrites(tmp_path):
+    """Two saves must accumulate records (JSONL), not overwrite the file."""
+    ws = str(tmp_path / "ws")
+    os.makedirs(ws)
+    with open(os.path.join(ws, "app.py"), "w") as fh:
+        fh.write("def foo():\n    return 42\n")
+    chat = "append-chat"
+    state_db.save_turn_resume(ws, chat, {"prompt": "p", "tools": [{"tool": "grep", "callId": "1"}]})
+    state_db.save_turn_resume(ws, chat, {"prompt": "p", "tools": [{"tool": "read", "callId": "2"}]})
+    data = state_db.load_turn_resume(ws, chat)
+    assert data is not None, "resume file should exist after saves"
+    tools = data.get("tools", [])
+    assert len(tools) == 2, f"expected 2 accumulated records, got {len(tools)}"
+    assert {t.get("tool") for t in tools} == {"grep", "read"}
+
+
+def test_load_skips_partial_line(tmp_path):
+    """A half-written line from an interrupted write must be ignored."""
+    ws = str(tmp_path / "ws")
+    os.makedirs(ws)
+    with open(os.path.join(ws, "app.py"), "w") as fh:
+        fh.write("def foo():\n    return 42\n")
+    chat = "partial-chat"
+    path = state_db._resume_file(ws, chat)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tool": "grep", "callId": "1"}) + "\n")
+        fh.write('{"tool": "read", "callId": "2", "items": "brok')  # truncated mid-write
+    data = state_db.load_turn_resume(ws, chat)
+    assert data is not None, "valid records should still load"
+    tools = data.get("tools", [])
+    assert len(tools) == 1, f"partial line should be skipped, got {len(tools)}"
+    assert tools[0].get("tool") == "grep"
+
+
+def test_prune_stale_resume_files(tmp_path):
+    """Files older than 24h are pruned; fresh files survive. Per-turn finishing
+    never calls this, so an in-flight resume file is never touched."""
+    ws = str(tmp_path / "ws")
+    os.makedirs(ws)
+    with open(os.path.join(ws, "app.py"), "w") as fh:
+        fh.write("def foo():\n    return 42\n")
+    chat_old, chat_new = "old-chat", "new-chat"
+    state_db.save_turn_resume(ws, chat_old, {"prompt": "x", "tools": [{"tool": "grep"}]})
+    old_path = state_db._resume_file(ws, chat_old)
+    # Backdate the old file beyond the 24h TTL.
+    old_ts = time.time() - 48 * 3600
+    os.utime(old_path, (old_ts, old_ts))
+    state_db.save_turn_resume(ws, chat_new, {"prompt": "y", "tools": [{"tool": "read"}]})
+    new_path = state_db._resume_file(ws, chat_new)
+    # Trigger pruning directly (in production this only runs on app shutdown).
+    state_db.prune_stale_resume_files()
+    assert not os.path.exists(old_path), "stale resume file should have been pruned"
+    assert os.path.exists(new_path), "fresh resume file must survive pruning"
+
+
 if __name__ == "__main__":
     asyncio.run(main())

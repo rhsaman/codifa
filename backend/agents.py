@@ -2981,6 +2981,23 @@ def _prune_history(history: list[dict], enabled: bool = True) -> list[dict]:
     return history
 
 
+def _normalize_history_order(history: list[dict]) -> list[dict]:
+    """Move system messages (e.g. the '[Compacted earlier context]' summary) to
+    the FRONT of the array.
+
+    The frontend appends the compact summary at the END of the conversation so it
+    renders below the agent's reply. But ``_compact_history`` walks the history
+    backwards from the tail to pick the recent turns to keep verbatim, and only
+    looks for a prior summary in the head. If the summary sits at the tail it gets
+    swallowed into the recent tail (and counted in ``keep``), so the next compact
+    never finds/merges it and the history grows every turn — the "compact loop".
+    Normalizing here makes the backend independent of array order from the client.
+    """
+    system = [m for m in history if m.get("role") == "system"]
+    rest = [m for m in history if m.get("role") != "system"]
+    return system + rest
+
+
 async def _compact_history(
     model: Any,
     history: list[dict],
@@ -3021,6 +3038,12 @@ async def _compact_history(
     if ctx <= 0:
         ctx = 8192  # opencode assumes a window is always known; fall back sensibly
     tail_budget = _recent_tail_budget(ctx, max_output, reserved)
+
+    # ROOT FIX for the compact loop: ensure any prior compact summary sits at the
+    # head, not wherever the frontend appended it. Without this the reversed tail
+    # walk below swallows the summary into `recent`, so the next compact never
+    # finds/merges it and the history grows every turn.
+    history = _normalize_history_order(history)
 
     # --- select the recent tail (kept verbatim) -------------------------------
     # Walk backward keeping whole messages until the token budget is hit

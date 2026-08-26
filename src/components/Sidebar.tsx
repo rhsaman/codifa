@@ -51,7 +51,7 @@ interface SidebarUiState {
  * Workspace order is user-controlled — only the chats INSIDE each workspace
  * sort by recency. Pinned workspaces float to the very top (in pin order).
  */
-function buildGroups(
+export function buildGroups(
   chats: Chat[],
   workspaces: Workspace[],
   pinnedWorkspaces: string[],
@@ -807,12 +807,6 @@ export function Sidebar() {
                     )}
                   </svg>
                   <span className="sidebar-group-label">{g.label}</span>
-                  <span
-                    className="sidebar-group-count"
-                    data-selected={selectedInGroup > 0}
-                  >
-                    {selectedInGroup > 0 ? selectedInGroup : g.chats.length}
-                  </span>
                 </button>
                 <div className="sidebar-group-actions">
                   <button

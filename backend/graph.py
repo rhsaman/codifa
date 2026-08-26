@@ -3703,22 +3703,19 @@ async def plan_build(state: AgentState) -> dict:
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
     if reply.strip():
-        from tools import _self_check_plan_paths, slugify
+        from tools import slugify
 
         ws = (
             slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep)))
             or "workspace"
         )
         plan_body = _normalize_plan_reply(reply)
-        plan_body, check_note = _self_check_plan_paths(state["root"], plan_body)
         try:
             state_db.save_plan(ws, "plan", plan_body, chat_id=state.get("chat_id", ""))
         except Exception:
             # Surface the failure instead of swallowing it: a silent drop is
             # exactly the "plan sometimes isn't saved" bug.
             logging.getLogger(__name__).exception("plan_build: save_plan failed")
-        if check_note:
-            queue.put_nowait({"kind": "text", "content": "⚠️ self-check: " + check_note})
         reply = plan_body
     return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}
 

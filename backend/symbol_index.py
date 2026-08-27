@@ -1,14 +1,22 @@
-"""نقشه‌ی نماد لحظه‌ای (Code Map) — استخراج سبک نمادها از روی فایل‌های فعلی.
+"""نقشه‌ی نماد لحظه‌ای (Code Map) — استخراج غنی نمادها به سبک aider.
 
 هدف: کاهش واقعی تعداد فراخوانی‌های ابزار (grep/glob/read) با دادن یک نمای
 کلی از محل توابع/کلاس‌ها به مدل، قبل از اولین نوبت. مدل به‌جای جستجوی کورکورانه
 در کل پروژه، مستقیماً می‌ره سراغ فایل و خط مشخص (۱ call به‌جای ~۱۲ call).
 
-طراحی:
-* برای فایل‌های ``.py`` از ``ast`` استفاده می‌کنیم (دقیق، بدون اجرای کد).
-* برای فایل‌های ``.ts/.tsx/.js/.jsx`` از regex ساده (سریع، بدون پارسر کامل).
-* **بدون embedding** — فقط اسم + خط + نوع. سبک و آنی.
-* کش ۱۰ ثانیه‌ای (مثل ``_walk_files``) برای جلوگیری از rebuild در هر نوبت.
+طراحی (مشابه aider.repomap):
+* برای همه‌ی زبان‌های پشتیبانی‌شده از tree-sitter استفاده می‌کنیم تا هم
+  تعاریف (def) و هم ارجاعات (ref) رو استخراج کنیم.
+* گراف ارجاع می‌سازیم (نود = فایل، یال = ref → def) و با PageRank + personalization
+  رتبه‌بندی می‌کنیم — فایل‌هایی که توی چت/تاریخچه ذکر شدن یا بیشترین ارجاع رو
+  دارن بالاتر میان (بدون اینکه فایلی کلاً حذف بشه).
+* بودجه توکنی پویا (مثل --map-tokens در aider): با binary search روی تعداد
+  تگ‌ها، نقشه رو تا نزدیک سقف توکن باز می‌کنیم.
+* نمایش غنی با TreeContext: فقط اسم نیست، خطوط حیاتیِ بدنه هم نشون داده می‌شه.
+* کش سبک بر اساس mtime+file_count برای جلوگیری از rebuild در هر نوبت.
+
+تفاوت با aider: به‌جای main_model.token_count از تقریب ارزان len//4 استفاده
+می‌کنیم (مدل توی این ماژول در دسترس نیست؛ برای binary search بودجه کافیه).
 """
 
 from __future__ import annotations
@@ -18,6 +26,14 @@ import os
 import re
 import threading
 import time
+from collections import defaultdict, namedtuple
+
+import networkx as nx
+
+# پکیج‌های aider-style (نصب‌شده در backend/pyproject.toml).
+from grep_ast import TreeContext, filename_to_lang
+from grep_ast.tsl import get_language, get_parser
+from tree_sitter import Query, QueryCursor
 
 # لیست پسوندهای متنی که نماد استخراج می‌کنیم (مطابق با ابزارهای فایل).
 _TEXT_EXTENSIONS = {
@@ -27,7 +43,6 @@ _TEXT_EXTENSIONS = {
 }
 
 # پوشه‌هایی که نباید پیمایش بشن (مطابق با ابزارهای فایل).
-# دسته‌بندی‌شده برای پوشه‌های خروجی/وابستگی همه‌ی زبان‌های رایج.
 _SKIP_DIRS = {
     # کنترل نسخه / سیستم
     ".git", ".svn", ".hg", ".bzr",
@@ -46,7 +61,6 @@ _SKIP_DIRS = {
     # Go (گولنگ)
     "vendor",
     # Rust
-    # (target بالا پوشه‌ده)
     ".cargo", "zig-cache", ".zig-cache", "zig-out",
     # C / C++
     "cmake-build-debug", "cmake-build-release", "obj",
@@ -73,36 +87,151 @@ _SKIP_DIRS = {
     "coverage", ".nyc_output", "logs", "log", "temp",
 }
 
-# الگوهای regex برای زبان‌های غیرپایتون (نام + نوع).
-_TS_JS_PATTERNS = [
-    (re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"), "function"),
-    (re.compile(r"^(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)"), "class"),
-    (re.compile(r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|\w+\s*=>)"), "function"),
-    (re.compile(r"^(?:export\s+)?(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)"), "type"),
-]
+# الگوهای regex برای زبان‌هایی که tree-sitter برای‌شون tags.scm نداره
+# (مثل c_sharp/bash/sql/vue) — فقط تعاریف سطح‌بالا.
 _GENERIC_PATTERNS = [
     (re.compile(r"^(?:func|fn)\s+([A-Za-z_]\w*)"), "function"),
     (re.compile(r"^(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)"), "function"),
     (re.compile(r"^(?:class|struct|interface|enum|trait|type|object|impl|extension)\s+([A-Za-z_]\w*)"), "type"),
+    (re.compile(r"^(?:CREATE\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\[]?([A-Za-z_]\w*))", re.IGNORECASE), "type"),
     (re.compile(r"^\s*(?:[\w<>\[\],\s]+?)\s+([A-Za-z_]\w*)\s*\("), "function"),
 ]
 
 # کش: root -> (timestamp, map, signature)
-# signature = (mtime کل درخت, تعداد فایل) — وقتی فایلی واقعاً تغییر کنه
-# عوض می‌شه، پس نقشه رو فقط در این صورت rebuild می‌کنیم (نه هر ۱۰ ثانیه).
-_CACHE: dict[str, tuple[float, dict[str, list[tuple[str, int, str]]], tuple[float, int]]] = {}
+_CACHE: dict[str, tuple[float, dict, tuple[float, int]]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 10.0
 
+# نام نماد + مکان (مشابه aider.Tag).
+Tag = namedtuple("Tag", ["rel_fname", "fname", "line", "name", "kind"])
+
+
+# --------------------------------------------------------------------------
+# استخراج def + ref با tree-sitter
+# --------------------------------------------------------------------------
+
+# کش queryهای زبان (get_tags_query کنده — برای هر زبان یه بار).
+_SCM_CACHE: dict[str, str | None] = {}
+_SCM_CACHE_LOCK = threading.Lock()
+
+
+def _get_scm_fname(lang: str):
+    """مسیر فایل tags.scm برای یه زبان (مثل aider.get_scm_fname).
+
+    چون tree-sitter-language-pack فایل‌های scm رو مستقیماً نمی‌ده، از
+    تابع get_tags_query خودش استفاده می‌کنیم (رشتهٔ scm رو برمی‌گردونه).
+    نتیجه کش می‌شه چون get_tags_query برای هر زبان کنده.
+    """
+    with _SCM_CACHE_LOCK:
+        if lang in _SCM_CACHE:
+            return _SCM_CACHE[lang]
+    try:
+        from tree_sitter_language_pack import get_tags_query
+
+        scm = get_tags_query(lang)
+    except Exception:  # noqa: BLE001 — زبان پشتیبانی‌نشده → None
+        scm = None
+    with _SCM_CACHE_LOCK:
+        _SCM_CACHE[lang] = scm
+    return scm
+
+
+def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
+    """استخراج def + ref با tree-sitter (مشابه aider.get_tags_raw).
+
+    برمی‌گردونه لیستی از Tag. برای زبان‌هایی که tags.scm ندارن به [] برمی‌گرده
+    (فراخوان‌کننده به regex/AST فعلی برمی‌گرده). ``code`` متن فایل هست — اگه
+    خالی باشه از دیسک خونده می‌شه.
+    """
+    lang = filename_to_lang(fname)
+    if not lang:
+        return []
+    try:
+        language = get_language(lang)
+        parser = get_parser(lang)
+    except Exception:  # noqa: BLE001 — گرامر لود نشد
+        return []
+
+    scm = _get_scm_fname(lang)
+    if not scm:
+        return []
+
+    if not code:
+        try:
+            with open(fname, "r", encoding="utf-8", errors="replace") as fh:
+                code = fh.read(200_000)
+        except OSError:
+            return []
+
+    try:
+        tree = parser.parse(bytes(code, "utf-8"))
+        query = Query(language, scm)
+    except Exception:  # noqa: BLE001 — query نامعتبر
+        return []
+
+    # tree-sitter 0.26: QueryCursor(query).captures(node) مستقیماً dict[name] -> [nodes]
+    # برمی‌گردونه. فرمت queryهای tree-sitter-language-pack:
+    #   (identifier) @name  +  @definition.class / @definition.function / @definition.constant
+    #   (call ...) @reference.call
+    # یعنی نام و نوع تعریف روی دو capture جدا (ولی روی همون نود) میاد.
+    defs = []
+    refs = []
+    try:
+        captures = QueryCursor(query).captures(tree.root_node)
+    except Exception:  # noqa: BLE001
+        captures = {}
+
+    # ابتدا نام‌ها رو جمع‌آوری می‌کنیم (نود -> نام)
+    node_name: dict[int, str] = {}
+    for tag, nodes in captures.items():
+        if tag == "name":
+            for node in nodes:
+                node_name[id(node)] = node.text.decode("utf-8", "replace")
+
+    for tag, nodes in captures.items():
+        if tag.startswith("definition."):
+            kind = tag.split(".")[-1]
+            for node in nodes:
+                # نود definition معمولاً بچهٔ identifier داره که نام رو می‌ده
+                name = node_name.get(id(node), "")
+                if not name:
+                    ident = node.child_by_field_name("name")
+                    if ident is None and node.child_count:
+                        ident = node.children[0]
+                    if ident is not None:
+                        name = ident.text.decode("utf-8", "replace")
+                if name:
+                    defs.append((node.start_point[0], name, kind))
+        elif tag.startswith("reference."):
+            for node in nodes:
+                # نود reference معمولاً خودش بچهٔ identifier داره که نام رو می‌ده
+                name = node_name.get(id(node), "")
+                if not name:
+                    ident = node.child_by_field_name("function")
+                    if ident is None and node.child_count:
+                        ident = node.children[0]
+                    if ident is not None:
+                        name = ident.text.decode("utf-8", "replace")
+                if name:
+                    refs.append((node.start_point[0], name))
+
+    tags = []
+    for line, name, kind in defs:
+        tags.append(Tag(rel_fname, fname, line, name, kind))
+    # ارجاعات رو به‌عنوان تگ‌های جداگانه (با kind=reference) برمی‌گردونیم تا
+    # توی ساخت گراف ارجاع استفاده بشن.
+    for line, name in refs:
+        tags.append(Tag(rel_fname, fname, line, name, "reference"))
+    return tags
+
 
 def _extract_python(text: str) -> list[tuple[str, int, str]]:
-    """استخراج توابع/کلاس‌ها از کد پایتون با AST."""
+    """استخراج توابع/کلاس‌ها از کد پایتون با AST (fallback برای .py)."""
     out: list[tuple[str, int, str]] = []
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
         return out
-    # فقط فرزندان مستقیم ماژول (نمادهای سطح‌بالا) — توابع/کلاس‌های تودرتو نه.
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.append((node.name, node.lineno, "function"))
@@ -112,10 +241,9 @@ def _extract_python(text: str) -> list[tuple[str, int, str]]:
 
 
 def _extract_regex(text: str, patterns: list[tuple[re.Pattern, str]]) -> list[tuple[str, int, str]]:
-    """استخراج نماد با regex (برای زبان‌های غیرپایتون)."""
+    """استخراج نماد با regex (برای زبان‌های بدون tags.scm)."""
     out: list[tuple[str, int, str]] = []
     for i, line in enumerate(text.split("\n"), 1):
-        # فقط خطوط با indentation صفر = نمادهای سطح‌بالا (توابع/کلاس‌های تودرتو نه).
         if line[:1] in (" ", "\t"):
             continue
         stripped = line.lstrip()
@@ -130,14 +258,217 @@ def _extract_regex(text: str, patterns: list[tuple[re.Pattern, str]]) -> list[tu
 
 
 def _extract_symbols(rel_path: str, text: str) -> list[tuple[str, int, str]]:
-    """انتخاب روش استخراج بر اساس پسوند فایل."""
+    """انتخاب روش استخراج: tree-sitter اول، بعد AST/regex (fallback)."""
     ext = os.path.splitext(rel_path)[1].lower()
+    # تلاش با tree-sitter (def + ref) — فقط defها رو برمی‌گردونیم.
+    try:
+        tags = _get_tags_raw(rel_path, rel_path, text)
+        defs = [(t.name, t.line + 1, t.kind) for t in tags if t.kind != "reference" and t.name]
+        if defs:
+            return defs
+    except Exception:  # noqa: BLE001, S110 - tree-sitter may fail on odd syntax; fall back to AST/regex
+        pass
+    # fallback
     if ext == ".py":
         return _extract_python(text)
-    if ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"):
-        return _extract_regex(text, _TS_JS_PATTERNS)
     return _extract_regex(text, _GENERIC_PATTERNS)
 
+
+# --------------------------------------------------------------------------
+# گراف ارجاع + PageRank (مشابه aider.get_ranked_tags)
+# --------------------------------------------------------------------------
+
+def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real: str = ""):
+    """رتبه‌بندی تگ‌ها با PageRank + personalization (مثل aider)."""
+    defines = defaultdict(set)
+    references = defaultdict(list)
+    definitions = defaultdict(set)
+
+    for fname in list(chat_fnames) + list(other_fnames):
+        # tags واقعی رو از فایل می‌خونیم (توی build_symbol_map کش شدن)
+        file_tags = _read_file_tags(fname)
+        for t in file_tags:
+            if t.kind == "reference":
+                references[t.name].append(t.rel_fname)
+            else:
+                defines[t.name].add(t.rel_fname)
+                definitions[t.rel_fname].add(t)
+
+    # گراف چندگانه جهت‌دار
+    G = nx.MultiDiGraph()
+    for ident, referencing_fnames in references.items():
+        for referencing_fname in referencing_fnames:
+            for defining_fname in defines[ident]:
+                if referencing_fname == defining_fname:
+                    continue
+                G.add_edge(referencing_fname, defining_fname, ident=ident)
+
+    # personalization: فایل‌های چت + mentioned وزن بالا
+    personalization = {}
+    fnames = list(chat_fnames) + list(other_fnames)
+    if fnames:
+        chat_weight = 100 / len(fnames)
+        for f in chat_fnames:
+            personalization[f] = chat_weight
+        for f in mentioned_fnames:
+            if f in fnames:
+                personalization[f] = chat_weight
+    if not personalization and fnames:
+        personalization = {f: 1 / len(fnames) for f in fnames}
+
+    try:
+        ranked = nx.pagerank(G, weight=None, personalization=personalization)
+    except Exception:  # noqa: BLE001
+        ranked = {f: 1.0 for f in fnames}
+
+    # وقتی گراف خالیه (هیچ ارجاعی بین فایل‌ها نیست)، pagerank هم خالیه —
+    # پس مستقیماً از personalization برای رتبه‌بندی استفاده می‌کنیم.
+    if not ranked and personalization:
+        ranked = dict(personalization)
+
+    # توزیع رتبه روی یال‌های خروجی → رتبهٔ تعاریف
+    ranked_definitions = defaultdict(float)
+    for src, dst, data in G.edges(data=True):
+        ident = data["ident"]
+        mul = 1.0
+        if ident in mentioned_idents:
+            mul *= 10
+        if len(ident) >= 8 and ("_" in ident or "-" in ident or ident != ident.lower()):
+            mul *= 10
+        if ident.startswith("_"):
+            mul *= 0.1
+        if src in chat_fnames:
+            mul *= 50
+        ranked_definitions[(dst, ident)] += ranked.get(src, 0) * mul
+
+    # وقتی گراف خالیه (هیچ ارجاعی نیست)، مستقیماً از personalization
+    # برای رتبه‌بندی فایل‌های mentioned/chat استفاده می‌کنیم.
+    if not G.edges:
+        # mentioned_fnames/chat_fnames مطلقه، definitions با rel_fname کلید می‌شه
+        rel_mentioned = {os.path.relpath(f, root_real) for f in mentioned_fnames} if root_real else set()
+        rel_chat = {os.path.relpath(f, root_real) for f in chat_fnames} if root_real else set()
+        for f in rel_mentioned:
+            if f in definitions:
+                for t in definitions[f]:
+                    ranked_definitions[(f, t.name)] += personalization.get(os.path.join(root_real, f), 0) if root_real else 0
+        for f in rel_chat:
+            if f in definitions:
+                for t in definitions[f]:
+                    ranked_definitions[(f, t.name)] += personalization.get(os.path.join(root_real, f), 0) if root_real else 0
+
+    # مرتب‌سازی نهایی تگ‌ها: همهٔ defها رو نگه می‌داریم، فقط رتبه‌شون رو
+    # بر اساس گراف ارجاع تنظیم می‌کنیم (تگ‌های بدون ref رتبهٔ پایه می‌گیرن).
+    ranked_tags = []
+    for fname, tags in definitions.items():
+        for t in tags:
+            rank = ranked_definitions.get((fname, t.name), 0.0)
+            ranked_tags.append((rank, t))
+    ranked_tags.sort(key=lambda x: -x[0])
+    return [t for _, t in ranked_tags]
+
+
+def _read_file_tags(fname: str) -> list[Tag]:
+    """خوندن تگ‌های یه فایل از کش یا دیسک (برای گراف ارجاع)."""
+    cached = _CACHE.get(fname)
+    if cached is not None and cached[1] is not None:
+        return cached[1]
+    return []
+
+
+# --------------------------------------------------------------------------
+# نمایش غنی با TreeContext (مشابه aider.render_tree / to_tree)
+# --------------------------------------------------------------------------
+
+def _render_tree(abs_fname: str, rel_fname: str, lois) -> str:
+    """رندر درخت کد با TreeContext (خطوط حیاتی بدنه هم نشون داده می‌شه)."""
+    try:
+        with open(abs_fname, "r", encoding="utf-8", errors="replace") as fh:
+            code = fh.read()
+    except OSError:
+        return ""
+    try:
+        context = TreeContext(
+            rel_fname,
+            code,
+            color=False,
+            line_number=False,
+            child_context=True,
+            last_line=False,
+            margin=0,
+            mark_lois=False,
+            loi_pad=0,
+            show_top_of_file_parent_scope=True,
+        )
+        context.lines_of_interest = set(lois)
+        context.add_context()
+        return context.format()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
+    """ساخت نمایش درختی از تگ‌های رتبه‌بندی‌شده (مثل aider.to_tree)."""
+    if not tags:
+        return ""
+    # گروه‌بندی بر اساس فایل — ترتیب رو از tags (که قبلاً رتبه‌بندی شد) حفظ می‌کنیم
+    by_file: dict[str, list[Tag]] = defaultdict(list)
+    file_order: list[str] = []
+    for t in tags:
+        if t.rel_fname not in by_file:
+            file_order.append(t.rel_fname)
+        by_file[t.rel_fname].append(t)
+
+    lines = []
+    for fname in file_order:
+        if fname in chat_rel_fnames:
+            continue  # فایل‌های چت رو رد می‌کنیم (aider همین‌کار رو می‌کنه)
+        tags_in_file = by_file[fname]
+        # TreeContext خطوط رو ۱-based می‌خواد (تگ ما ۰-based ذخیره شده)
+        lois = [t.line + 1 for t in tags_in_file if t.line is not None and t.line >= 0]
+        # abs_path رو از تگ می‌گیریم (فیلد fname = abs_path) یا با root_real می‌سازیم
+        abs_fname = tags_in_file[0].fname
+        if not os.path.isfile(abs_fname) and root_real:
+            abs_fname = os.path.join(root_real, fname)
+        rendered = _render_tree(abs_fname, fname, lois)
+        if rendered:
+            lines.append(f"📄 {fname}")
+            lines.append(rendered)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# بودجه توکنی پویا (مشابه aider.get_ranked_tags_map_uncached)
+# --------------------------------------------------------------------------
+
+def _token_count(text: str) -> int:
+    """تقریب ارزان توکن (بدون مدل): len//4."""
+    return len(text) // 4
+
+
+def _get_ranked_tags_map(chat_fnames, other_fnames, max_map_tokens, mentioned_fnames, mentioned_idents, root_real: str = "") -> str:
+    """ساخت نقشه با بودجه توکنی پویا (binary search روی تعداد تگ‌ها)."""
+    ranked_tags = _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real)
+    if not ranked_tags:
+        return ""
+
+    # binary search: چند تا از بالاترین تگ‌ها رو بگیریم تا نزدیک max_map_tokens بشیم
+    lo, hi = 1, len(ranked_tags)
+    best = ranked_tags[:1]
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = ranked_tags[:mid]
+        tree = _to_tree(candidate, set(), root_real)
+        if _token_count(tree) <= max_map_tokens:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return _to_tree(best, set(), root_real)
+
+
+# --------------------------------------------------------------------------
+# API عمومی (سازگار با تست‌های موجود)
+# --------------------------------------------------------------------------
 
 def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     """بساز نقشه‌ی نمادها برای کل درخت ``root``.
@@ -146,8 +477,6 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     کوچک (زیر ۲۰۰ کیلوبایت) رو می‌خونه تا سریع بمونه. نتیجه ۱۰ ثانیه کش می‌شه.
     """
     root_real = os.path.realpath(os.path.abspath(root))
-    # امضای سبک درخت: (جدیدترین mtime، تعداد کل فایل). فقط وقتی اینا عوض بشن
-    # نقشه رو rebuild می‌کنیم — نه صرفاً به‌خاطر گذشت زمان.
     tree_mtime = 0.0
     file_count = 0
     for dirpath, dirnames, filenames in os.walk(root_real):
@@ -173,12 +502,11 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     for dirpath, dirnames, filenames in os.walk(root_real):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
-            if name.startswith("."):  # فایل‌های مخفی مثل .tmp-*.mjs
+            if name.startswith("."):
                 continue
             ext = os.path.splitext(name)[1].lower()
             if ext not in _TEXT_EXTENSIONS:
                 continue
-            # رد کردن build artifacts (مثل dump-ssr.out.mjs که خروجی bundler هست).
             if ".out." in name or name.endswith((".min.js", ".min.mjs")):
                 continue
             abs_path = os.path.join(dirpath, name)
@@ -188,66 +516,110 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
                     text = fh.read(200_000)
             except OSError:
                 continue
-            # رد کردن فایل‌های minify‌شده: یه خط خیلی طولانی با فاصله‌ی کم
-            # (مثل main.js که توابع q/D/Le داره) — نمادش برای agent بی‌فایده‌ست.
             first = text.split("\n", 1)[0]
             if len(first) > 600 and " " not in first[:300]:
                 continue
             syms = _extract_symbols(rel, text)
             if syms:
                 result[rel] = syms
+                # کش تگ‌های کامل (با ref) برای گراف ارجاع
+                with _CACHE_LOCK:
+                    _CACHE[abs_path] = (time.time(), _tags_for_file(rel, abs_path, text), signature)
 
     with _CACHE_LOCK:
         _CACHE[root_real] = (time.time(), result, signature)
     return result
 
 
+def _tags_for_file(rel: str, abs_path: str, text: str) -> list[Tag]:
+    """ساخت تگ‌های کامل (def + ref) برای یه فایل — برای گراف ارجاع."""
+    try:
+        raw = _get_tags_raw(abs_path, rel, text)
+        if raw:
+            return raw
+    except Exception:  # noqa: BLE001, S110 - tree-sitter may fail on odd syntax; fall back to AST/regex
+        pass
+    # fallback: فقط defها رو به‌عنوان تگ برمی‌گردونیم
+    tags = []
+    syms = _extract_symbols(rel, text)
+    for name, line, kind in syms:
+        tags.append(Tag(rel, abs_path, line - 1, name, kind))
+    return tags
+
+
 def format_symbol_map(
     root: str,
-    max_files: int = 30,
-    max_symbols_per_file: int = 20,
-    max_folders: int | None = None,
+    max_map_tokens: int = 1024,
+    chat_files: list[str] | None = None,
+    mentioned_fnames: set[str] | None = None,
+    mentioned_idents: set[str] | None = None,
 ) -> str:
-    """فرمت‌بندی نقشه به متن درختی فشرده برای الصاق به پرامپت.
+    """فرمت‌بندی نقشه به متن درختی فشرده برای الصاق به پرامپت (مثل aider.get_repo_map).
 
-    فایل‌ها رو بر اساس پوشهٔ بالا گروه‌بندی می‌کنه (structure → folder → file →
-    symbol) تا مدل سریع‌تر ساختار رو بفهمه. فقط فایل‌هایی که نماد دارن نشون
-    داده می‌شن (با سقف برای جلوگیری از باد کردن context).
+    نقشه با PageRank + personalization رتبه‌بندی می‌شه (فایل‌های چت/ذکرشده
+    بالاتر میان) و با بودجه توکنی پویا محدود می‌شه. فایل‌ها کلاً حذف نمی‌شن —
+    فقط اولویت‌بندی می‌شن (برخلاف فیلتر سخت قبلی که باعث گم‌شدن فایل و tool call
+    بیشتر می‌شد).
 
-    نقشه همیشه **کامل** فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
-    نقشه باعث می‌شد ایجنت فایل موردنظرش رو توی نقشه نبینه و مجبور بشه با
-    grep/read دنبالش بگرده → tool call بیشتر. کاهش توکنِ تورن‌های تکراری از
-    طریق کش هش نقشه (در graph.py) انجام می‌شه، نه فیلتر کردن محتوا.
+    پارامترها:
+        root: ریشهٔ پروژه
+        max_map_tokens: سقف توکن نقشه (پیش‌فرض ۱۰۲۴، مثل aider)
+        chat_files: فایل‌های الان توی چت (وزن بالا در رتبه‌بندی)
+        mentioned_fnames: فایل‌های ذکرشده در تاریخچه (وزن بالا)
+        mentioned_idents: شناسه‌های ذکرشده در تاریخچه (وزن بالا)
     """
+    chat_files = chat_files or []
+    mentioned_fnames = mentioned_fnames or set()
+    mentioned_idents = mentioned_idents or set()
+
     try:
         sym_map = build_symbol_map(root)
-    except Exception:  # noqa: BLE001 — هرگز نباید اجرای اصلی رو متوقف کنه
+    except Exception:  # noqa: BLE001
         return ""
     if not sym_map:
         return ""
-    # گروه‌بندی بر اساس پوشهٔ بالا (توی پروژه‌های تخت = ".").
-    folders: dict[str, list[str]] = {}
-    for rel in sym_map:
-        top = rel.split("/", 1)[0] if "/" in rel else "."
-        folders.setdefault(top, []).append(rel)
 
-    lines: list[str] = []
-    for folder in sorted(folders)[:max_folders]:
-        lines.append(f"📁 {folder}/")
-        for rel in sorted(folders[folder])[:max_files]:
-            syms = sym_map[rel][:max_symbols_per_file]
-            if not syms:
-                continue
-            lines.append(f"  📄 {rel}")
-            for name, line, typ in syms:
-                lines.append(f"    ├─ {typ} {name} (L{line})")
-    if not lines:
+    # تبدیل به مسیرهای مطلق برای گراف ارجاع (sorted برای رتبه‌بندی پایدار)
+    root_real = os.path.realpath(os.path.abspath(root))
+    all_fnames = sorted({os.path.join(root_real, rel) for rel in sym_map})
+    chat_fnames = {os.path.realpath(f) for f in chat_files if os.path.isabs(f)}
+    chat_fnames |= {os.path.join(root_real, f) for f in chat_files if not os.path.isabs(f)}
+    other_fnames = sorted(set(all_fnames) - chat_fnames)
+    mentioned_abs = {
+        os.path.realpath(f) if os.path.isabs(f) else os.path.join(root_real, f)
+        for f in mentioned_fnames
+    }
+
+    try:
+        tree = _get_ranked_tags_map(
+            chat_fnames, other_fnames, max_map_tokens, mentioned_abs, mentioned_idents, root_real
+        )
+    except Exception:  # noqa: BLE001
+        tree = ""
+
+    if not tree:
+        # fallback: اگه رتبه‌بندی خالی شد، نقشهٔ ساده رو بده (مثل aider)
+        tree = _simple_tree(sym_map)
+
+    if not tree:
         return ""
-    body = "\n".join(lines)
     return (
         "\n\n===== CODE MAP (live symbol index — go straight to read, no grep needed) =====\n"
-        + body
+        + tree
     )
+
+
+def _simple_tree(sym_map: dict[str, list[tuple[str, int, str]]]) -> str:
+    """نمایش سادهٔ درختی (fallback وقتی رتبه‌بندی خالی شد)."""
+    lines = []
+    for rel in sorted(sym_map):
+        syms = sym_map[rel][:20]
+        if not syms:
+            continue
+        lines.append(f"📄 {rel}")
+        for name, line, typ in syms:
+            lines.append(f"  ├─ {typ} {name} (L{line})")
+    return "\n".join(lines)
 
 
 def clear_symbol_cache(root: str | None = None) -> None:

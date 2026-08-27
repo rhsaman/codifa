@@ -190,11 +190,12 @@ def history_to_langchain_messages(
     (no synthetic "you already did X" injection) carries the prior work forward.
 
     When ``current_mode`` is supplied, any turn whose own ``mode`` differs from it
-    is wrapped in a ``[Mode: X]`` / ``[/Mode]`` marker. This keeps the model from
-    blending a previous mode's behavior into the current turn after a mid-chat
-    mode switch (e.g. a Coder turn following Plan history must not look like the
-    model was already implementing). The marker is purely a readability hint for
-    the model -- the system prompt already declares the authoritative mode.
+    is wrapped in a ``<!-- mode:x -->`` metadata comment (prefix only). This keeps
+    the model from blending a previous mode's behavior into the current turn after
+    a mid-chat mode switch (e.g. a Coder turn following Plan history must not look
+    like the model was already implementing). The comment is metadata ONLY -- the
+    model must NEVER echo it at the start of its own reply; the system prompt
+    already declares the authoritative mode.
     """
     out: list[BaseMessage] = []
     for turn in history or []:
@@ -205,8 +206,7 @@ def history_to_langchain_messages(
         # one, so the model can tell past-mode behavior apart from this turn.
         turn_mode = turn.get("mode")
         if current_mode and turn_mode and turn_mode != current_mode:
-            _label = (turn_mode or "ask").capitalize()
-            content = f"[Mode: {_label}]\n{content}\n[/Mode]"
+            content = f"<!-- mode:{turn_mode} -->\n{content}"
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
         if role == "assistant" and tool_activity:
@@ -675,6 +675,38 @@ def _build_skills_section(picked_names: list[str], root: str) -> str:
     return section
 
 
+def _dedup_code_map(
+    code_map_block: str,
+    map_hash: str,
+    chat_id: str,
+    lc_history: list,
+) -> str:
+    """اگه نقشهٔ CODE MAP نسبت به turn قبلی تغییر نکرده، به‌جای ارسال کامل فقط
+    یه marker کوتاه می‌فرسته — مگر اینکه نقشهٔ کاملِ قبلی دیگه تو recent tail
+    (lc_history) نباشه (مثلاً به‌خاطر historyLimit یا auto-compact حذف/خلاصه
+    شده باشه) که اون‌وقت نقشهٔ کامل رو دوباره می‌فرستیم تا مدل با marker
+    بی‌محتوا گمراه نشه. کش هش per-chat هست (chat_id کلید dict)."""
+    try:
+        _cache = getattr(build_turn_context, "_code_map_hash_cache", None)
+        if not isinstance(_cache, dict):
+            _cache = {}
+        _prev = _cache.get(chat_id)
+        _full_still_in_history = any(
+            isinstance(m, HumanMessage) and "CODE MAP" in str(getattr(m, "content", ""))
+            for m in lc_history
+        )
+        if _prev == map_hash and _full_still_in_history:
+            return (
+                "\n\n===== CODE MAP (live symbol index — unchanged since last turn) =====\n"
+                "[see previous turn's CODE MAP — no files changed]"
+            )
+        _cache[chat_id] = map_hash
+        build_turn_context._code_map_hash_cache = _cache
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return code_map_block
+
+
 async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     """Assemble everything one mode-turn needs: system prompt, history messages,
     the mode-filtered tool set, and the LangChain chat model.
@@ -840,6 +872,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         ask_gates=state.get("ask_gates"),
         permit={"outside": allow_outside},
         chat_id=chat_id,
+        history=state.get("history") or [],
     )
 
     scoped_paths = _agents._scoped_rels(root, attachments, nvim_file)
@@ -995,33 +1028,52 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         try:
             from symbol_index import format_symbol_map
 
-            # ask توکن‌حساس‌تره → فقط ۱۰ فایل (درختی) نشون می‌دیم.
-            max_files = 10 if mode == "ask" else 30
+            # استخراج فایل‌های ذکرشده از تاریخچه (مثل aider.get_repo_map که از
+            # پیام فعلی می‌گیره — ما از کل تاریخچه می‌گیریم چون context کامل‌تره).
+            # این باعث می‌شه نقشه بر اساس سوال/چت رتبه‌بندی بشه (PageRank با
+            # personalization) بدون اینکه فایلی کلاً حذف بشه.
+            _mentioned_fnames: set[str] = set()
+            _mentioned_idents: set[str] = set()
+            _hist_for_map = state.get("history") or []
+            for _turn in _hist_for_map:
+                for _ta in (_turn.get("toolActivity") or []):
+                    _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get("filePath")
+                    if _p:
+                        _mentioned_fnames.add(os.path.relpath(_p, root))
+                _content = _turn.get("content") or ""
+                if isinstance(_content, str):
+                    for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
+                        _mentioned_idents.add(_m)
+
+            # ask توکن‌حساس‌تره → بودجه کمتر.
+            max_map_tokens = 512 if mode == "ask" else 1024
             # نقشه کامل فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
             # نقشه باعث می‌شد ایجنت فایل موردنظرش رو توی نقشه نبینه و مجبور بشه
             # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
             # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
             # تکراری کم بشه.
-            code_map_block = format_symbol_map(root, max_files=max_files) if root else ""
+            code_map_block = (
+                format_symbol_map(
+                    root,
+                    max_map_tokens=max_map_tokens,
+                    mentioned_fnames=_mentioned_fnames,
+                    mentioned_idents=_mentioned_idents,
+                )
+                if root
+                else ""
+            )
         except Exception:  # noqa: BLE001
             code_map_block = ""
 
     # کش هش نقشه: اگه نقشه نسبت به تورن قبلی عوض نشده، کل نقشه رو نمی‌فرستیم
     # بلکه یه marker کوتاه می‌فرستیم (توکن کمتر، چون محتوای یکسانه). این با
     # prefix-cache هم تداخل نداره چون نقشه توی user turn هست نه سیستم‌پرامپت.
+    _map_hash = ""
     if code_map_block:
         try:
             import hashlib
 
             _map_hash = hashlib.md5(code_map_block.encode("utf-8", "ignore")).hexdigest()[:12]
-            _prev_hash = getattr(build_turn_context, "_last_code_map_hash", None)
-            if _prev_hash == _map_hash:
-                code_map_block = (
-                    "\n\n===== CODE MAP (live symbol index — unchanged since last turn) =====\n"
-                    "[see previous turn's CODE MAP — no files changed]"
-                )
-            else:
-                build_turn_context._last_code_map_hash = _map_hash
         except Exception:  # noqa: BLE001, S110
             pass
 
@@ -1049,8 +1101,23 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         _summary = await _summarize_history_head(compact_model, _older, root)
         lc_history = history_to_langchain_messages(_recent, current_mode=mode)
         lc_history.insert(0, SystemMessage(content=_summary))
+        # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
+        # از context افتاده. کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل بفرسته
+        # نه marker بی‌محتوای «see previous turn».
+        _code_map_hash_cache = getattr(build_turn_context, "_code_map_hash_cache", None)
+        if isinstance(_code_map_hash_cache, dict) and chat_id in _code_map_hash_cache:
+            _code_map_hash_cache.pop(chat_id, None)
     else:
         lc_history = history_to_langchain_messages(history, current_mode=mode)
+    # CODE MAP dedup: فقط وقتی marker "unchanged" بفرست که نقشهٔ کامل هنوز
+    # تو recent tail (lc_history) هست — وگرنه (اگه historyLimit یا auto-compact
+    # turn حاوی نقشه رو حذف/خلاصه کرده باشه) نقشهٔ کامل رو دوباره می‌فرستیم تا
+    # مدل با یه marker بی‌محتوا ("see previous turn") که به هیچی اشاره نمی‌کنه
+    # گمراه نشه. کش هش per-chat هست (chat_id کلید dict) نه یه scalar global.
+    if code_map_block and mode in ("coder", "plan", "ask") and _map_hash:
+        code_map_block = _dedup_code_map(
+            code_map_block, _map_hash, chat_id, lc_history
+        )
     with contextlib.suppress(Exception):
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
@@ -1093,6 +1160,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # must write/update and run tests before finishing, even on ordinary
         # code work. The pure-logic predicates live in agents.py.
         if _agents._is_code_task(prompt):
+            stack = detect_frontend_stack(root)
+            fw_note = ""
+            if stack:
+                fw_note = (
+                    f" This workspace is a {stack} frontend — write component tests "
+                    f"with @testing-library/react (or that framework's testing library) "
+                    f"and run the project's frontend command (npm run test:frontend / "
+                    f"npx vitest run / npx jest). "
+                )
             lc_history.insert(
                 0,
                 SystemMessage(
@@ -1100,9 +1176,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "TEST VERIFICATION RULE: this is code-changing work. "
                         "Write/update the relevant test(s) for the language(s) you "
                         "touched and run them (uv run pytest / npm test / cargo test / "
-                        "go test / mvn test / dotnet test / ...). Do NOT finish with "
-                        "red tests — the system re-runs you on failure and feeds the "
-                        "error back, so keep fixing until all tests pass."
+                        "go test / mvn test / dotnet test / flutter test / dart test / "
+                        "..." + fw_note + "). Do NOT finish with red tests — the system "
+                        "re-runs you on failure and feeds the error back, so keep "
+                        "fixing until all tests pass."
                     )
                 ),
             )
@@ -1774,6 +1851,13 @@ async def _maybe_auto_compact(
     # kept receiving the un-compacted `msgs` — so the context never actually
     # shrank and the turn still overflowed. Mirrors llm._auto_compact_subagent.
     _apply_compaction_in_place(msgs, new_history)
+    # compaction واقعی انجام شد → نقشهٔ کامل ممکنه از context افتاده باشه.
+    # کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل بفرسته نه marker بی‌محتوا.
+    _code_map_hash_cache = getattr(build_turn_context, "_code_map_hash_cache", None)
+    if isinstance(_code_map_hash_cache, dict):
+        _cid = state.get("chat_id", "")
+        if _cid in _code_map_hash_cache:
+            _code_map_hash_cache.pop(_cid, None)
 
 
 async def _run_mode_turn(
@@ -2432,7 +2516,7 @@ def detect_test_commands(root: str) -> list[str]:
     ):
         cmds.append("python -m pytest")
 
-    # --- Node / JS / TS ---
+    # --- Node / JS / TS (framework-aware) ---
     pkg = os.path.join(root, "package.json")
     if os.path.isfile(pkg):
         try:
@@ -2440,15 +2524,34 @@ def detect_test_commands(root: str) -> list[str]:
                 data = json.loads(_f.read())
         except Exception:  # noqa: BLE001
             data = {}
-        scripts = (data.get("scripts") or {}) if isinstance(data, dict) else {}
-        test = str(scripts.get("test", ""))
-        if test:
-            if "vitest" in test:
+        if isinstance(data, dict):
+            scripts = data.get("scripts") or {}
+            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            has = lambda n: n in deps
+            # Avoid double-running a Python suite that a node script merely delegates to.
+            python_cmd_added = any(
+                c.startswith(("uv run pytest", "python -m pytest")) for c in cmds
+            )
+            for key in scripts:
+                if not re.match(r"^test(\b|:)", key):
+                    continue
+                val = str(scripts[key])
+                if python_cmd_added and ("pytest" in val or "python -m unittest" in val):
+                    continue
+                cmds.append(f"npm run {key}")
+            test_script = str(scripts.get("test", ""))
+            if test_script:
+                # The `test` script is already covered by the loop above; only
+                # infer a runner-specific command when there is no `test` script.
+                pass
+            elif has("vitest"):
                 cmds.append("npx vitest run")
-            elif "jest" in test:
+            elif has("jest") or has("react-scripts"):
                 cmds.append("npx jest")
-            else:
-                cmds.append("npm test")
+            elif has("@playwright/test"):
+                cmds.append("npx playwright test")
+            elif has("cypress"):
+                cmds.append("npx cypress run")
 
     # --- Rust ---
     if os.path.isfile(os.path.join(root, "Cargo.toml")):
@@ -2508,6 +2611,54 @@ def detect_test_commands(root: str) -> list[str]:
     # empty so test_node reports "no tests configured" instead of a false pass.
 
     return cmds
+
+
+def detect_frontend_stack(root: str) -> str:
+    """Best-effort label like 'React + Vite (vitest)' or '' if no frontend.
+
+    Reads package.json deps to identify the framework (React/Vue/Svelte/
+    Next/Angular) and the test runner (vitest/jest/playwright/cypress) so the
+    agent can be told exactly which testing library and command to use.
+    """
+    import json
+    import os
+
+    pkg = os.path.join(root, "package.json")
+    if not os.path.isfile(pkg):
+        return ""
+    try:
+        with open(pkg, encoding="utf-8") as _f:
+            data = json.loads(_f.read())
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+    has = lambda n: n in deps
+    runner = (
+        "vitest"
+        if has("vitest")
+        else "jest"
+        if has("jest") or has("react-scripts")
+        else "playwright"
+        if has("@playwright/test")
+        else "cypress"
+        if has("cypress")
+        else ""
+    )
+    if has("next"):
+        fw = "Next.js"
+    elif has("vue"):
+        fw = "Vue"
+    elif has("svelte") or has("@sveltejs/kit"):
+        fw = "Svelte"
+    elif has("@angular/core"):
+        fw = "Angular"
+    elif has("react"):
+        fw = "React"
+    else:
+        return ""
+    return f"{fw} ({runner})" if runner else f"{fw}"
 
 
 # ---------------------------------------------------------------------------
@@ -3160,6 +3311,7 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         ask_gates=state.get("ask_gates"),
         permit={"outside": bool(state.get("allow_outside"))},
         chat_id=state.get("chat_id", ""),
+        history=state.get("history") or [],
     )
     # Capture ask_user answers so a clarifying reply can re-trigger planning
     # (e.g. the planner asked "where is the current frontend?" and the user

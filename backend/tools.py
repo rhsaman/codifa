@@ -973,7 +973,7 @@ def _get_web_store(root: str) -> VectorStore | None:
         return None
 
 
-def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str = "") -> str | None:
+async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str = "") -> str | None:
     """اگه قبلاً نتیجه‌ی این وب‌سرچ/fetch توی RAG ذخیره شده بود، برگردون.
 
     فقط وقتی مدل embedding در دسترس باشه (RAG فعال) کار می‌کنه؛ وگرنه
@@ -983,11 +983,13 @@ def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str = "") 
     if not _rag_web_enabled():
         return None
     if store is None:
-        store = _get_web_store(root)
+        # مسیر fallback نادر: باز کردن sqlite رو هم offload می‌کنیم تا
+        # event loop اصلاً بلاک نشه (معمولاً store از قبل پاس داده می‌شه).
+        store = await asyncio.to_thread(_get_web_store, root)
     if store is None:
         return None
     try:
-        hits = store.search(key, KIND_WEB, top_k=3, min_score=0.6)
+        hits = await asyncio.to_thread(store.search, key, KIND_WEB, 3, 0.6)
         if not hits:
             return None
         parts = []
@@ -2471,11 +2473,17 @@ def make_tool_callbacks(
     permit: dict | None = None,
     store: VectorStore | None = None,
     chat_id: str = "",
+    history: list[dict] | None = None,
 ) -> dict[str, Callable]:
     # Bind chat_id into the closure so tools (e.g. update_plan) can persist
     # per-chat state to disk via state_db. Previously chat_id was accepted but
     # never captured, so update_plan could only emit to the UI — never save.
     _chat_id = chat_id
+    # تاریخچهٔ چت از حافظه (از graph.py پاس داده می‌شه) — برای استخراج
+    # mentioned_fnames/idents جهت رتبه‌بندی CODE MAP در explore. از خوندن
+    # دیسک (get_state) اجتناب می‌کنیم تا event loop بلاک نشه و کل چت‌ها اسکن
+    # نشن.
+    _history_for_map: list[dict] = list(history or [])
     """Build the agent tools bound to ``root`` with an emit callback.
 
     ``emit`` receives a dict like ``{"kind": "tool"|"tool_result", "tool": name,
@@ -3338,9 +3346,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline.
-
-When you need to find files by name patterns, delegate to the explore sub-agent (task with subagent_type='explore') for an open-ended search instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
@@ -3757,6 +3763,9 @@ When you need to read several files, read multiple independent files in parallel
         _ctx = int(context_window) if context_window and context_window > 0 else 0
         _attempts = 0
         _last_exc: Exception | None = None
+        # تاریخچه از حافظه (از graph.py پاس داده شد) — نه از دیسک. فقط برای
+        # استخراج mentioned_fnames/idents جهت رتبه‌بندی CODE MAP کافیه.
+        _hist_for_map: list[dict] = _history_for_map
         while _attempts < _SUBAGENT_MAX_ATTEMPTS:
             _attempts += 1
             try:
@@ -3771,18 +3780,45 @@ When you need to read several files, read multiple independent files in parallel
                 if subagent_type == "explore":
                     try:
                         from symbol_index import format_symbol_map
-                        _code_map = format_symbol_map(root) if root else ""
+
+                        # استخراج فایل‌های ذکرشده از تاریخچه (مثل graph.py)
+                        _mentioned_fnames: set[str] = set()
+                        _mentioned_idents: set[str] = set()
+                        for _turn in _hist_for_map:
+                            for _ta in (_turn.get("toolActivity") or []):
+                                _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get("filePath")
+                                if _p:
+                                    _mentioned_fnames.add(os.path.relpath(_p, root))
+                            _content = _turn.get("content") or ""
+                            if isinstance(_content, str):
+                                for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
+                                    _mentioned_idents.add(_m)
+
+                        _code_map = (
+                            format_symbol_map(
+                                root,
+                                max_map_tokens=1024,
+                                mentioned_fnames=_mentioned_fnames,
+                                mentioned_idents=_mentioned_idents,
+                            )
+                            if root
+                            else ""
+                        )
                     except Exception:  # noqa: BLE001
                         _code_map = ""
                     if _code_map:
-                        _sys = (
-                            _sys
-                            + "\n\n===== CODE MAP (live symbol index) =====\n"
+                        _code_map_block = (
+                            "\n\n===== CODE MAP (live symbol index) =====\n"
                             + _code_map
                             + "\n===== END CODE MAP =====\n"
                             "Use this map to locate symbols/files before reading. "
                             "Go straight to read() with the file:line from the map."
                         )
+                        # نقشه رو به user turn اضافه می‌کنیم (نه system prompt) —
+                        # چون محتوایش هر بار بر اساس mentioned_fnames/idents عوض
+                        # می‌شه؛ اگه بره تو system، prefix cache هیچ‌وقت hit
+                        # نمی‌خورد. این دقیقاً همون الگوی main agent تو graph.py هست.
+                        prompt = prompt + _code_map_block
                 _output = await langchain_tool_loop(
                     _model,
                     system=_sys,
@@ -4004,7 +4040,7 @@ When you need to read several files, read multiple independent files in parallel
         # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
         # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
         _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
-        rag_hit = _rag_web_lookup(query, _ws_for_lookup, root)
+        rag_hit = await _rag_web_lookup(query, _ws_for_lookup, root)
         if rag_hit:
             emit(
                 {
@@ -4224,7 +4260,7 @@ When you need to read several files, read multiple independent files in parallel
         # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
         # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
         _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
-        rag_hit = _rag_web_lookup(url, _ws_for_lookup, root)
+        rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
         if rag_hit:
             emit(
                 {

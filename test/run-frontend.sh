@@ -122,6 +122,13 @@ npx esbuild test/webResults.ssr.test.tsx --bundle --platform=node --format=esm \
 node test/.tmp-wr.mjs
 
 echo ""
+echo "── تست ۲۱ب: engine badge (badge تم‌محور نام پروایدر وب‌سرچ) ──"
+npx esbuild test/engineBadge.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --outfile=test/.tmp-eb.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-eb.mjs
+
+echo ""
 echo "── تست ۲۲: RetryBanner (نوتیفیکیشن خطای یکدست: stalled + rate-limit + gave-up) ──"
 npx esbuild test/retryBanner.ssr.test.tsx --bundle --platform=node --format=esm \
   --jsx=automatic --packages=external \
@@ -184,6 +191,6 @@ npx esbuild test/settingsStorage.ssr.test.tsx --bundle --platform=node --format=
   --outfile=test/.tmp-set.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-set.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs test/.tmp-sb.mjs test/.tmp-cc.mjs test/.tmp-set.mjs
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-eb.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs test/.tmp-sb.mjs test/.tmp-cc.mjs test/.tmp-set.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

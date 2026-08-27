@@ -24,11 +24,10 @@ def test_history_tags_turns_from_other_modes():
     msgs = graph.history_to_langchain_messages(history, current_mode="coder")
     contents = [getattr(m, "content", "") for m in msgs]
     joined = "\n".join(contents)
-    assert "[Mode: Plan]" in joined, "plan turn must be tagged when current mode is coder"
-    assert "[/Mode]" in joined
+    assert "<!-- mode:plan -->" in joined, "plan turn must be tagged when current mode is coder"
     # The current-mode (coder) turn must NOT be wrapped.
     assert "now implement it" in joined
-    assert "[Mode: Coder]" not in joined
+    assert "<!-- mode:coder -->" not in joined
 
 
 def test_history_no_tag_when_mode_matches():
@@ -38,7 +37,7 @@ def test_history_no_tag_when_mode_matches():
     ]
     msgs = graph.history_to_langchain_messages(history, current_mode="ask")
     joined = "\n".join(getattr(m, "content", "") for m in msgs)
-    assert "[Mode:" not in joined, "same-mode turns must not be tagged"
+    assert "<!-- mode:" not in joined, "same-mode turns must not be tagged"
 
 
 def test_history_no_tag_without_current_mode():
@@ -48,14 +47,14 @@ def test_history_no_tag_without_current_mode():
     ]
     msgs = graph.history_to_langchain_messages(history)
     joined = "\n".join(getattr(m, "content", "") for m in msgs)
-    assert "[Mode:" not in joined, "no current_mode => no tagging (backward compatible)"
+    assert "<!-- mode:" not in joined, "no current_mode => no tagging (backward compatible)"
 
 
 def test_mode_declare_explains_history_tags():
     note = agents._mode_declare("coder")
     assert "CURRENT MODE: Coder" in note
     assert "HISTORY MODE TAGS" in note
-    assert "[Mode: X]" in note
+    assert "<!-- mode:x -->" in note
     # The directive must tell the model NOT to copy a differently-tagged turn.
     assert "PAST work" in note
 

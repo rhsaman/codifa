@@ -744,7 +744,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
       <StatusIcon status={activity.status} />
       <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
       {activity.tool === 'web_search' && activity.engine && (
-        <span className="tool-badge">{activity.engine}</span>
+        <span className="tool-badge tool-engine-badge">{activity.engine}</span>
       )}
       {detail && (
         <span className="tool-single-detail" title={detail}>
@@ -800,7 +800,7 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
         <StatusIcon status={activity.status} />
         <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
         {activity.tool === 'web_search' && activity.engine && (
-          <span className="tool-badge">{activity.engine}</span>
+          <span className="tool-badge tool-engine-badge">{activity.engine}</span>
         )}
         {detail && (
           <span className="tool-single-detail" title={detail}>
@@ -901,7 +901,7 @@ export const ToolCallView = memo(function ToolCallView({
           <span className="tool-badge">{String(activity.args.subagent_type)}</span>
         )}
         {activity.tool === 'web_search' && activity.engine && (
-          <span className="tool-badge">{activity.engine}</span>
+          <span className="tool-badge tool-engine-badge">{activity.engine}</span>
         )}
         {activity.args && activity.args.command !== undefined && (
           <span className="tool-cmd">{String(activity.args.command)}</span>

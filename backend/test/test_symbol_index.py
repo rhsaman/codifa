@@ -49,7 +49,7 @@ def test_format_symbol_map_includes_line_numbers():
         out = format_symbol_map(d)
         assert "a.py" in out
         assert "x" in out
-        assert "L1" in out  # خط ۱
+        assert "def x()" in out  # امضای تابع با خط حیاتی (TreeContext)
 
 
 def test_skip_dirs_and_binary():
@@ -65,3 +65,27 @@ def test_empty_project():
     with tempfile.TemporaryDirectory() as d:
         assert build_symbol_map(d) == {}
         assert format_symbol_map(d) == ""
+
+
+def test_format_symbol_map_ranks_mentioned_files():
+    """فایل ذکرشده (mentioned) باید بالاتر از فایل‌های دیگه بیاد."""
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    pass\n")
+        out = format_symbol_map(d, mentioned_fnames={"b.py"})
+        idx_a = out.find("a.py")
+        idx_b = out.find("b.py")
+        assert idx_a != -1 and idx_b != -1
+        assert idx_b < idx_a  # b.py بالاتر (mentioned)
+
+
+def test_format_symbol_map_ranks_referenced_files():
+    """فایل تعریف‌کننده (referenced) باید بالاتر از فایل ارجاع‌دهنده بیاد."""
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    return foo()\n")  # b.py ارجاع به foo (توی a.py)
+        out = format_symbol_map(d)
+        idx_a = out.find("a.py")
+        idx_b = out.find("b.py")
+        assert idx_a != -1 and idx_b != -1
+        assert idx_a < idx_b  # a.py بالاتر (foo تعریف شده اینجا، b.py ارجاع می‌ده)

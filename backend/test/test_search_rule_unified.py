@@ -85,6 +85,8 @@ def test_mode_caps_reference_explore_delegation():
     """_MODE_CAPS must not invite inline grep floods: broad/multi-file search is
     delegated to explore, grep/glob/read only for targeted lookups."""
     for mode, caps in agents._MODE_CAPS.items():
+        if mode == "reader":
+            continue  # reader is a scoped file reader, not a repo explorer
         assert "subagent_type='explore'" in caps or "task explore" in caps, (
             f"{mode} caps do not reference explore delegation"
         )

@@ -87,9 +87,13 @@ async def _remove_steer(chat_id: str, steer_id: str) -> None:
 _READONLY_TERMINAL_PATTERNS = [
     r"^\s*git\s+(status|diff)\b",  # git status + plain git diff (working-tree review)
     r"^\s*pwd\b",
-    r"^\s*(node|python(3)?|python3|ruby|php|go|cargo|npm|npx|pnpm|yarn|deno)\s+(-\w+\s+)?(--?version|-v)\b",
-    r"^\s*(npm|pnpm|yarn)\s+(test|run\s+\S*(test|lint|build)|lint|build)\b",
-    r"^\s*(pytest|mypy|ruff\s+check|flake8|eslint|tsc\s+--noEmit|vitest|jest|ava|xo)\b",
+    r"^\s*(node|python(3)?|python3|ruby|php|go|cargo|npm|npx|pnpm|yarn|deno|flutter|dart)\s+(-\w+\s+)?(--?version|-v)\b",
+    r"^\s*(npm|pnpm|yarn)\s+(run\s+)?\S*test\S*\b",  # test, test:frontend, test:e2e
+    r"^\s*(npm|pnpm|yarn)\s+(run\s+)?(lint|build)\b",
+    (
+        r"^\s*(pytest|mypy|ruff\s+check|flake8|eslint|tsc\s+--noEmit|vitest|jest|"
+        r"vitest run|jest run|ava|xo|playwright test|cypress run|flutter test|dart test)\b"
+    ),
 ]
 
 # ANY match on the FULL command string makes it unsafe for a read-only terminal.
@@ -782,7 +786,13 @@ _DOING_TASKS = (
     "explore sub-agents in parallel instead of reading files yourself.\n"
     "2. Implement the solution using all tools available to you.\n"
     "3. Verify the solution if possible with tests. NEVER assume a specific "
-    "test framework or script — check the project's setup first.\n"
+    "test framework or script — detect the project's stack first (read "
+    "package.json deps + config for React/Vue/Svelte/Next/Angular and the "
+    "runner vitest/jest/playwright/cypress; or pubspec.yaml for Flutter/Dart). "
+    "For frontend, write component tests with the framework's testing library "
+    "and run the project's test command (npm run test:* / npx vitest run / "
+    "npx jest). For Flutter/Dart run `flutter test` / `dart test`. For backend, "
+    "use the language's runner (uv run pytest / cargo test / go test / ...).\n"
     "4. The pipeline auto-checks syntax/typecheck after each write/edit — trust "
     "it; do not re-run verification yourself unless a test fails or the user "
     "asks.\n"
@@ -2426,9 +2436,11 @@ _TEST_TASK_RE = re.compile(
 # call matching this satisfies the test-verification step.
 _TEST_CMD_RE = re.compile(
     r"(pytest|vitest|jest|node --test|node:test|npm test|npm run test|"
-    r"yarn test|pnpm test|bun test|cargo test|go test|mvn test|gradle test|"
-    r"\./gradlew test|ant test|dotnet test|flutter test|mix test|rake test|"
-    r"rspec|phpunit|tox|nox|python -m unittest|run_tests|test\.py|test\.ts|test\.js)",
+    r"npm run test:|pnpm test|pnpm run test|yarn test|yarn run test|"
+    r"bun test|deno test|nx test|cargo test|go test|mvn test|gradle test|"
+    r"\./gradlew test|ant test|dotnet test|flutter test|dart test|mix test|"
+    r"rake test|rspec|phpunit|tox|nox|python -m unittest|playwright test|"
+    r"cypress run|mocha|ava|run_tests|test\.py|test\.ts|test\.js)",
     re.IGNORECASE,
 )
 
@@ -3415,11 +3427,13 @@ def _mode_declare(mode: str) -> str:
         f"currently {label}) and tell them to use the mode button; their NEXT message then runs in the "
         "new mode. Never claim the mode is fixed for the whole conversation or that the mode button "
         "only affects new chats.\n"
-        "HISTORY MODE TAGS: earlier turns in this conversation may be wrapped in [Mode: X] ... [/Mode] "
-        "markers. Those markers mean that turn was produced under a DIFFERENT mode than this one — treat "
-        "its behavior (e.g. a plan, or code it wrote) as PAST work from another mode, NOT as something "
-        "you are doing now. Your job for THIS message is defined ONLY by the CURRENT MODE above; do not "
-        "copy the style, length, or actions of a differently-tagged past turn."
+        "HISTORY MODE TAGS: earlier turns may carry a ``<!-- mode:x -->`` metadata comment "
+        "(prefix only). That comment means the turn was produced under a DIFFERENT mode than "
+        "this one — treat its behavior as PAST work from another mode, NOT something you are "
+        "doing now. It is metadata ONLY; you MUST NEVER write ``<!-- mode:… -->`` or "
+        "``[Mode: …]`` at the start of your own reply. Your job for THIS message is defined "
+        "ONLY by the CURRENT MODE above; do not copy the style, length, or actions of a "
+        "differently-tagged past turn."
     )
     output = _MODE_OUTPUT.get(mode, "")
     if output:

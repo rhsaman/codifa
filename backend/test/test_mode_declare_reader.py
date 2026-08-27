@@ -36,7 +36,7 @@ def test_reader_declares_scoped_output_contract():
 def test_reader_note_includes_history_mode_tags_guidance():
     note = _mode_declare("reader")
     assert "HISTORY MODE TAGS" in note
-    assert "[Mode: X]" in note
+    assert "<!-- mode:x -->" in note
 
 
 def test_all_four_modes_declare_distinct_caps():

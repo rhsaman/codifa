@@ -6,6 +6,7 @@
 - اگه embedding در دسترس نبود، _rag_web_lookup برمی‌گردونه None (ارور نمی‌ده).
 """
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -47,7 +48,7 @@ def test_rag_web_lookup_returns_hits_when_enabled(monkeypatch):
     # store توی _rag_web_lookup از closure میاد؛ چون مستقیم نمی‌تونیم setش کنیم،
     # تابع رو با store mock بازسازی می‌کنیم.
 
-    def fake_lookup(key, store=None):
+    async def fake_lookup(key, store=None):
         if store is None or not tools_mod._rag_web_enabled():
             return None
         try:
@@ -60,7 +61,7 @@ def test_rag_web_lookup_returns_hits_when_enabled(monkeypatch):
             return None
 
     monkeypatch.setattr(tools_mod, "_rag_web_lookup", fake_lookup)
-    out = tools_mod._rag_web_lookup("query about X", store)
+    out = asyncio.run(tools_mod._rag_web_lookup("query about X", store))
     assert out == "saved web result about X"
     store.search.assert_called_once_with("query about X", KIND_WEB, top_k=3, min_score=0.6)
 
@@ -68,12 +69,15 @@ def test_rag_web_lookup_returns_hits_when_enabled(monkeypatch):
 def test_rag_web_lookup_returns_none_when_disabled(monkeypatch):
     store = MagicMock()
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: False)
+    async def _disabled_lookup(key, s=None):
+        return None if not tools_mod._rag_web_enabled() else "x"
+
     monkeypatch.setattr(
         tools_mod,
         "_rag_web_lookup",
-        lambda key, s=None: None if not tools_mod._rag_web_enabled() else "x",
+        _disabled_lookup,
     )
-    assert tools_mod._rag_web_lookup("anything", store) is None
+    assert asyncio.run(tools_mod._rag_web_lookup("anything", store)) is None
     store.search.assert_not_called()
 
 
@@ -81,14 +85,14 @@ def test_rag_web_lookup_returns_none_on_empty_hits(monkeypatch):
     store = _make_store_with_hits([])
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: True)
 
-    def fake_lookup(key, store=None):
+    async def fake_lookup(key, store=None):
         if not tools_mod._rag_web_enabled():
             return None
         h = store.search(key, KIND_WEB, top_k=3, min_score=0.6)
         return "\n\n".join(x["txt"] for x in h if x.get("txt")) if h else None
 
     monkeypatch.setattr(tools_mod, "_rag_web_lookup", fake_lookup)
-    assert tools_mod._rag_web_lookup("anything", store) is None
+    assert asyncio.run(tools_mod._rag_web_lookup("anything", store)) is None
 
 
 def test_web_search_tool_uses_rag_when_available(monkeypatch):
@@ -99,7 +103,7 @@ def test_web_search_tool_uses_rag_when_available(monkeypatch):
     # open_vector_store رو mock می‌کنیم چون توی محیط تست embedding نداریم
     monkeypatch.setattr(tools_mod, "open_vector_store", lambda *a, **k: store)
 
-    def patched(key, store=None, root=""):
+    async def patched(key, store=None, root=""):
         if store is None or not tools_mod._rag_web_enabled():
             return None
         h = store.search(key, KIND_WEB, top_k=3, min_score=0.6)
@@ -120,7 +124,7 @@ def test_fetch_url_tool_uses_rag_when_available(monkeypatch):
     monkeypatch.setattr(tools_mod, "fetch_url", lambda u, mc=100000: {"error": "should not be called"})
     monkeypatch.setattr(tools_mod, "open_vector_store", lambda *a, **k: store)
 
-    def patched(key, store=None, root=""):
+    async def patched(key, store=None, root=""):
         if store is None or not tools_mod._rag_web_enabled():
             return None
         h = store.search(key, KIND_WEB, top_k=3, min_score=0.6)

@@ -1273,6 +1273,11 @@ export function ChatPanel() {
         content: text,
         attachments: atts,
         images: imgs,
+        // Capture the CURRENT chat mode on the user bubble so the transcript
+        // stays consistent: every user message records which mode it ran in.
+        // This also guarantees a retry (which re-sends via send()) inherits the
+        // mode the user is IN now, never the mode of the old message it replaces.
+        mode: chat.mode,
       });
     }
     const assistantMsg = s.addMessage(chat.id, {

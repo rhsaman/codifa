@@ -12,6 +12,7 @@ import {
   computeUsageCost,
   computeUsageCostBreakdown,
 } from "../lib/context";
+import { normalizeUsageEntry } from "../lib/usage";
 
 function titleOf(chat: Chat): string {
   if (chat.title && chat.title !== "New chat") return chat.title;
@@ -411,84 +412,12 @@ export function Sidebar() {
   }
 
   // Per-model token usage + cost for the active chat (session totals), grouped
-  // by provider and sorted by most-recently-used first. Each used model is
-  // attributed to a provider by matching its id/current model; ids that match
-  // no provider (e.g. an old model after the user switched provider) land in a
-  // dedicated "Unknown" group instead of being silently merged into the ACTIVE
-  // provider — so a previous main model/provider always stays visible.
-  // Gemini's API reports model ids with a literal "models/" prefix
-  // ("models/gemini-3.7-flash"), which the backend strips before recording
-  // usage (so usage keys are bare "gemini-3.7-flash"). Normalize the prefix
-  // away on BOTH sides so a provider always matches the usage it actually ran
-  // with the strong exact match instead of tying with openrouter's bare-name
-  // match (its list carries "google/gemini-...") and losing on array order.
-  const norm = (m: string): string => (m || "").replace(/^models\//, "");
-  const bareId = (m: string): string => norm(m).split("/").pop() || m;
-  const providerForModel = (model: string): ProviderConfig | undefined => {
-    if (!model || model === "main") return undefined;
-    const key = norm(model);
-    const bare = bareId(model);
-    const lower = key.toLowerCase();
-    // The ALL-in-one `find` (bare-id first) misattributes a model to whichever
-    // provider happens to be first in the array when two providers share a model
-    // with the same last path segment (e.g. openrouter/free vs myprovider/free).
-    // Resolve by decreasing specificity instead so the RIGHT provider wins.
-    //
-    // Many models are ALSO advertised by the opencode gateway's /models list
-    // (it mirrors nearly every model), so a bare list match is too weak to
-    // distinguish "ran via Google" from "listed by the opencode gateway". A
-    // provider whose CURRENT configured model is the used one, or that the app
-    // recently recorded actually running this model (recentModels), is a much
-    // stronger signal and must outrank a plain list hit.
-    const scoredBy = new Map<string, number>();
-    const scoreOf = (p: ProviderConfig): number => {
-      const cached = scoredBy.get(p.id);
-      if (cached !== undefined) return cached;
-      const pModel = norm(p.model || "");
-      const pModels = (p.models ?? []).map(norm);
-      const pId = (p.id || "").toLowerCase();
-      const pName = (p.name || "").toLowerCase();
-      let s = 0;
-      // Recorded use: the app recently ran this exact model on this provider.
-      if (
-        recentModels.some((r) => r.providerId === p.id && norm(r.model) === key)
-      )
-        s = Math.max(s, 5);
-      // Current configured model matches the used model.
-      if (pModel === key) s = Math.max(s, 4);
-      // Exact full model id in this provider's model list.
-      if (pModels.includes(key)) s = Math.max(s, 3);
-      // Provider id/name is a prefix of the model id.
-      if (
-        (pId && lower.startsWith(pId + "/")) ||
-        (pName && lower.startsWith(pName + "/"))
-      )
-        s = Math.max(s, 2);
-      // Weakest: bare-name match (last path segment) — only as a last resort.
-      if (
-        pModel === bare ||
-        bareId(pModel) === bare ||
-        pModels.some((m) => m === bare || bareId(m) === bare)
-      )
-        s = Math.max(s, 1);
-      scoredBy.set(p.id, s);
-      return s;
-    };
-    let best: ProviderConfig | undefined;
-    let bestScore = 0;
-    for (const p of allProviders) {
-      const s = scoreOf(p);
-      if (s < bestScore) continue;
-      // Among equal scores prefer the ACTIVE provider (the one the user has
-      // selected) over plain array order, so genuinely ambiguous ties land on
-      // what the user currently sees rather than the first configured row.
-      if (s > bestScore || (best && p.id === provider?.id)) {
-        bestScore = s;
-        best = p;
-      }
-    }
-    return best;
-  };
+  // by provider and sorted by most-recently-used first. Each usage key is stored
+  // as "providerId/model" (see Chat.tsx) — the provider that ACTUALLY ran the
+  // chat — so it is resolved by a direct split, with no scoring or heuristics.
+  // Legacy bare keys (recorded before this scheme) that match no provider land
+  // in a group named after the model id itself, never silently merged into the
+  // ACTIVE provider — so a previous main model/provider always stays visible.
   const usageGroups = new Map<
     string,
     Array<{
@@ -504,15 +433,15 @@ export function Sidebar() {
     }>
   >();
   if (activeChat?.usage) {
-    for (const [model, u] of Object.entries(activeChat.usage)) {
+    for (const u of activeChat.usage.entries) {
       if (u.input + u.output <= 0) continue;
-      const p = providerForModel(model);
-      // Unmatched models (e.g. an old provider after the user switched) are
-      // grouped under a name derived from the model id itself — never silently
-      // merged into the ACTIVE provider and never hidden as a single "Unknown".
-      const derived = (model.split("/")[0] || "unknown").trim() || "unknown";
-      const key = p?.id ?? derived;
-      const price = priceForModel(p?.pricingMap, model);
+      // providerId + model are stored EXPLICITLY on the entry (see Chat.tsx /
+      // store.ts) — read them directly, no key parsing, no guessing. Any future
+      // provider/model displays correctly. Legacy chats (pre-change) are
+      // migrated to this shape on load (see normalizeUsageEntry).
+      const p = allProviders.find((x) => x.id === u.providerId) ?? null;
+      const key = u.providerId;
+      const price = priceForModel(p?.pricingMap, u.model);
       // Cost bills cache-read/cache-write tokens at their own (cheaper) rate
       // when the provider advertises one — input_tokens already includes the
       // cache portion, so it must be split out before charging full input.
@@ -536,7 +465,7 @@ export function Sidebar() {
       const costCached = breakdown?.cached ?? null;
       if (!usageGroups.has(key)) usageGroups.set(key, []);
       usageGroups.get(key)!.push({
-        model,
+        model: u.model,
         input: u.input,
         output: u.output,
         cacheRead,

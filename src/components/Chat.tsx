@@ -1132,8 +1132,9 @@ export function ChatPanel() {
   // model is priced with its OWN advertised rate when the provider publishes
   // one — never the parent model's rate (would silently misprice old models).
   const sessionUsage = useMemo(() => {
-    const usage = chat?.usage ?? {};
+    const usage = chat?.usage;
     const out: Array<{
+      providerId: string;
       model: string;
       input: number;
       output: number;
@@ -1141,16 +1142,17 @@ export function ChatPanel() {
       cacheWrite: number;
       cost: number | null;
     }> = [];
-    for (const [model, u] of Object.entries(usage)) {
+    for (const u of usage?.entries ?? []) {
       if (u.input + u.output <= 0) continue;
-      const price = priceForModel(provider.pricingMap, model);
+      const price = priceForModel(provider.pricingMap, u.model);
       // input_tokens already includes the cache-read/write portion; bill the
       // cache lines at their own cheaper rate when advertised, else full input.
       const cacheRead = u.cacheRead ?? 0;
       const cacheWrite = u.cacheWrite ?? 0;
       const cost = computeUsageCost(price, { input: u.input, output: u.output, cacheRead, cacheWrite });
       out.push({
-        model,
+        providerId: u.providerId,
+        model: u.model,
         input: u.input,
         output: u.output,
         cacheRead,
@@ -1884,7 +1886,13 @@ export function ChatPanel() {
         // Attribute to THIS panel's chat (captured at render via chatIdRef),
         // never s.activeChatId — a turn finished while the user is viewing
         // another chat must still post to the chat the stream belongs to.
-        store.accrueChatUsage(chat.id, model, {
+        // The key is "providerId/model" (the provider that ACTUALLY ran this
+        // chat, from getChatProvider) so the sidebar resolves the provider by a
+        // direct split instead of guessing — no scoring, no misattribution.
+        const providerId = getChatProvider(chat.id).id ?? "unknown";
+        // Store the provider + model EXPLICITLY (no key string, no guessing) so
+        // the sidebar shows the exact provider/model that ran this chat.
+        store.accrueChatUsage(chat.id, providerId, model, {
           input: inputTokens,
           output: outputTokens,
           cacheRead: event.cache_read_tokens ?? 0,

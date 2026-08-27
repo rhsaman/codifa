@@ -39,10 +39,11 @@
     "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:backend:live": "cd backend && .venv/bin/python tests/run_tests.py",
     "test:frontend": "bash test/run-frontend.sh",
-    "dist": "npm run build && npm run setup && electron-builder",
-    "dist:mac": "npm run build && npm run setup && electron-builder --mac",
-    "dist:win": "npm run build && npm run setup && electron-builder --win",
-    "dist:linux": "npm run build && npm run setup && electron-builder --linux"
+    "clean": "node -e \"require('fs').rmSync('release',{recursive:true,force:true})\"",
+    "dist": "npm run build && npm run setup && npm run clean && electron-builder",
+    "dist:mac": "npm run build && npm run setup && npm run clean && electron-builder --mac",
+    "dist:win": "npm run build && npm run setup && npm run clean && electron-builder --win",
+    "dist:linux": "npm run build && npm run setup && npm run clean && electron-builder --linux"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
@@ -72,6 +73,7 @@
   "build": {
     "appId": "com.codifa.app",
     "productName": "Codifa",
+    "electronDist": "node_modules/electron/dist",
     "icon": "build/icon.png",
     "afterSign": "scripts/ad-hoc-sign.mjs",
     "afterPack": "scripts/after-pack.mjs",

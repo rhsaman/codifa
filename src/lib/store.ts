@@ -25,6 +25,7 @@ import { BUILTIN_IDS, normalizeMode } from './modes'
 import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
+import { normalizeUsageEntry } from './usage'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -513,11 +514,14 @@ interface State {
   clearQueue: (chatId: string) => void
   /** Mark a queued message as consumed (steered into the running agent). */
   markQueuedSent: (chatId: string, id: string) => void
-  /** Add a model's token deltas to the chat-wide cumulative usage (survives
-   *  compacts, unlike a single message's per-turn usage). */
+  /** Add a (provider, model) token delta to the chat-wide cumulative usage
+   *  (survives compacts, unlike a single message's per-turn usage). The
+   *  provider and model are stored EXPLICITLY so the sidebar shows the exact
+   *  provider/model with no parsing or guessing. */
   accrueChatUsage: (
     chatId: string,
-    modelId: string,
+    providerId: string,
+    model: string,
     delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
   ) => void
   /** Zero the cumulative per-model usage of a chat (sidebar "reset" button). */
@@ -689,6 +693,7 @@ export const useStore = create<State>((set, get) => ({
       /* keep the persisted value */
     }
     const loadedChats0 = chats && chats.length > 0 ? chats : []
+    const providerIds = (settings?.providers ?? []).map((p) => p.id)
     const loadedChats = loadedChats0.map((c) => {
       // Transient compact/command/stall banners must never survive a reload —
       // no request is running after a restart, so a persisted `compacting` or
@@ -699,7 +704,16 @@ export const useStore = create<State>((set, get) => ({
       delete clean.compactError
       delete clean.cmdError
       delete clean.stalled
-      return clean.mode ? { ...clean, mode: normalizeMode(clean.mode) } : clean
+      // Migrate legacy keyed usage → explicit (providerId, model) entries once,
+      // on load. New usage is written directly as entries, so the live path
+      // never parses or guesses.
+      const migrated = normalizeUsageEntry(
+        clean.usage,
+        c.providerId ?? settings?.activeProviderId ?? "",
+        providerIds,
+      )
+      const next = migrated ? { ...clean, usage: migrated } : clean
+      return next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
     }) as Chat[]
     const activeId = loadedChats[loadedChats.length - 1]?.id ?? ''
     // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
@@ -1599,25 +1613,41 @@ export const useStore = create<State>((set, get) => ({
     maybePersistMidStream()
   },
 
-  accrueChatUsage: (chatId, modelId, delta) => {
+  accrueChatUsage: (chatId, providerId, model, delta) => {
     if ((delta.input || 0) <= 0 && (delta.output || 0) <= 0) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== chatId) return c
-        const usage = { ...(c.usage ?? {}) }
-        const prev = usage[modelId] ?? { input: 0, output: 0 }
-        usage[modelId] = {
-          input: prev.input + (delta.input || 0),
-          output: prev.output + (delta.output || 0),
-          cacheRead: (prev.cacheRead ?? 0) + (delta.cacheRead ?? 0),
-          cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
-          lastUsed: Date.now(),
+        const entries = [...(c.usage?.entries ?? [])]
+        const idx = entries.findIndex(
+          (e) => e.providerId === providerId && e.model === model,
+        )
+        if (idx >= 0) {
+          const prev = entries[idx]
+          entries[idx] = {
+            ...prev,
+            input: prev.input + (delta.input || 0),
+            output: prev.output + (delta.output || 0),
+            cacheRead: (prev.cacheRead ?? 0) + (delta.cacheRead ?? 0),
+            cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
+            lastUsed: Date.now(),
+          }
+        } else {
+          entries.push({
+            providerId,
+            model,
+            input: delta.input || 0,
+            output: delta.output || 0,
+            cacheRead: delta.cacheRead ?? 0,
+            cacheWrite: delta.cacheWrite ?? 0,
+            lastUsed: Date.now(),
+          })
         }
         // Usage fires once per model call INSIDE a run — don't reorder the
         // sidebar mid-turn. The turn-completion bump in updateMessage handles
         // reordering when the agent finishes.
         const working = c.messages.some((m) => m.streaming)
-        return { ...c, usage, updatedAt: working ? c.updatedAt : Date.now() }
+        return { ...c, usage: { entries }, updatedAt: working ? c.updatedAt : Date.now() }
       }),
     }))
     // Usage events fire once per completed model call (not per token), and

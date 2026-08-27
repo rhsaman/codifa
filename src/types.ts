@@ -240,21 +240,31 @@ export interface TokenUsage {
   cacheWriteTokens?: number
 }
 
-/** Per-chat cumulative token usage, keyed by model id ("" = main model). These
- *  session totals survive compacts and reloads and only ever grow, unlike a
- *  single message's `TokenUsage` which is per-turn: compacted messages keep
- *  theirs (badge stays visible) while the preserved tail is cleared on compact
- *  so the context meter resets to the estimate. */
+/** One cumulative usage entry for a single (provider, model) pair used by a
+ *  chat. `providerId` and `model` are stored EXPLICITLY (not encoded in a key
+ *  string) so the sidebar shows the exact provider/model with no parsing or
+ *  guessing — and any future provider/model displays correctly. */
+export interface ChatUsageEntry {
+  /** The provider that ACTUALLY ran this model (its id). */
+  providerId: string
+  /** The model id as reported by the backend (may itself carry a namespace,
+   *  e.g. "anthropic/claude-3.5-sonnet" — that is part of the model, NOT a
+   *  provider). */
+  model: string
+  input: number
+  output: number
+  cacheRead?: number
+  cacheWrite?: number
+  /** Epoch ms of the last token accrual for this model — used to sort "most
+   *  recently used" first in the sidebar usage panel. */
+  lastUsed?: number
+}
+
+/** Per-chat cumulative token usage (session totals). A flat list of explicit
+ *  (provider, model) entries — survives compacts and reloads and only ever
+ *  grows, unlike a single message's `TokenUsage` which is per-turn. */
 export interface ChatUsage {
-  [modelId: string]: {
-    input: number
-    output: number
-    cacheRead?: number
-    cacheWrite?: number
-    /** Epoch ms of the last token accrual for this model — used to sort "most
-     *  recently used" first in the sidebar usage panel. */
-    lastUsed?: number
-  }
+  entries: ChatUsageEntry[]
 }
 
 /** One Language-Server diagnostic reported by Neovim for the active buffer.

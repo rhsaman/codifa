@@ -61,28 +61,29 @@ console.log('۲) contextPercent — درصد مصرف کانتکست عدد وا
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۳) فروشگاه — accrueChatUsage مصرف واقعی هر مدل را (تجمعی) نگه میدارد (ستون کناری):')
+console.log('۳) فروشگاه — accrueChatUsage مصرف واقعی هر (پرووایدر، مدل) را (تجمعی) نگه میدارد (ستون کناری):')
 {
   const st = useStore.getState()
   const chatId = st.newChat('ask')
   // Simulate two real `usage` events for the same model across turns.
-  useStore.getState().accrueChatUsage(chatId, 'gpt-4o', { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 })
-  useStore.getState().accrueChatUsage(chatId, 'gpt-4o', { input: 50, output: 5, cacheRead: 0, cacheWrite: 0 })
-  const u1 = useStore.getState().chats.find((c) => c.id === chatId)!.usage!['gpt-4o']
+  useStore.getState().accrueChatUsage(chatId, 'openai', 'gpt-4o', { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 })
+  useStore.getState().accrueChatUsage(chatId, 'openai', 'gpt-4o', { input: 50, output: 5, cacheRead: 0, cacheWrite: 0 })
+  const entries = useStore.getState().chats.find((c) => c.id === chatId)!.usage!.entries
+  const u1 = entries.find((e) => e.providerId === 'openai' && e.model === 'gpt-4o')!
   check('مجموع تجمعیِ input درست است (۱۵۰)', u1?.input === 150, u1)
   check('مجموع تجمعیِ output درست است (۱۵)', u1?.output === 15, u1)
 
-  // A different model accrues into its own bucket (sidebar lists per-model).
-  useStore.getState().accrueChatUsage(chatId, 'claude-3-5-sonnet', { input: 200, output: 20, cacheRead: 100, cacheWrite: 0 })
+  // A different model accrues into its own entry (sidebar lists per-model).
+  useStore.getState().accrueChatUsage(chatId, 'anthropic', 'claude-3-5-sonnet', { input: 200, output: 20, cacheRead: 100, cacheWrite: 0 })
   const ch = useStore.getState().chats.find((c) => c.id === chatId)!
-  check('مدل دوم دانهی جداگانه دارد', ch.usage!['claude-3-5-sonnet']?.input === 200, ch.usage)
-  check('مدل اول تغییر نکرده', ch.usage!['gpt-4o']?.input === 150, ch.usage)
-  check('cache read واقعی ثبت شده', ch.usage!['claude-3-5-sonnet']?.cacheRead === 100, ch.usage)
+  check('مدل دوم دانهی جداگانه دارد', ch.usage!.entries.find((e) => e.providerId === 'anthropic' && e.model === 'claude-3-5-sonnet')?.input === 200, ch.usage)
+  check('مدل اول تغییر نکرده', ch.usage!.entries.find((e) => e.providerId === 'openai' && e.model === 'gpt-4o')?.input === 150, ch.usage)
+  check('cache read واقعی ثبت شده', ch.usage!.entries.find((e) => e.providerId === 'anthropic' && e.model === 'claude-3-5-sonnet')?.cacheRead === 100, ch.usage)
 
   // resetChatUsage clears the sidebar counters.
   useStore.getState().resetChatUsage(chatId)
   const cleared = useStore.getState().chats.find((c) => c.id === chatId)!.usage
-  check('resetChatUsage همه را پاک میکند', cleared == null || Object.keys(cleared).length === 0, cleared)
+  check('resetChatUsage همه را پاک میکند', cleared == null || cleared.entries.length === 0, cleared)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

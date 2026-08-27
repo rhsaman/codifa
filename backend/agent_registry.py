@@ -51,7 +51,15 @@ EXPLORE_SYSTEM = (
     "PROGRESSIVE BATCHING: fire ALL targeted searches you need (each with explicit "
     "scope: path + include) as a SINGLE BATCH of parallel tool calls each turn. "
     "Each batch must narrow toward the answer (progressive). Goal: UNDER 10 total "
-    "grep/glob/read calls per task."
+    "grep/glob/read calls per task.\n"
+    # When you already know the files you need, read them ALL in ONE call using
+    # filePaths=[...] — never read one file per call (that multiplies turns).
+    "When you know multiple files, read them ALL in ONE call using filePaths=[...]. "
+    "Never read one-by-one.\n"
+    # search_memory is NOT useful for exploration — the CODE MAP above already
+    # gives you the symbol layout, and web/fetch recall is handled by the main
+    # agent. Do not call search_memory.
+    "Do NOT call search_memory — the CODE MAP above is your structure reference."
 )
 
 # The registry. ``tools`` is the sub-agent's tool set:
@@ -69,7 +77,7 @@ AGENTS: dict[str, dict] = {
         "system": GENERAL_SYSTEM,
         # Hard step budget for this sub-agent (mirrors opencode's `agent.steps`).
         # None -> fall back to the caller's default max_steps.
-        "steps": 8,   # was 15: tighter budget so a general sub-agent can't run away
+        "steps": 15,   # general sub-agent step budget
     },
     "explore": {
         "name": "explore",
@@ -86,12 +94,15 @@ AGENTS: dict[str, dict] = {
             "fetch_url",
             "search_console",
             "vision",
+            # search_memory removed: exploration uses the CODE MAP (injected into
+            # the system prompt) for structure, and web/fetch recall is the main
+            # agent's job. Calling search_memory inside explore just wastes a turn.
         ],
         "system": EXPLORE_SYSTEM,
         # Explore agents fan out wide searches; give them a slightly tighter
         # budget so a single explore call can't run away (opencode's explore is
         # also bounded).
-        "steps": 10,   # was 20: tighter budget so one explore can't run away
+        "steps": 20,   # explore sub-agent step budget
     },
 }
 

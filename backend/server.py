@@ -1194,20 +1194,6 @@ class MemoryRequest(BaseModel):
     vector_db_path: str = ""
 
 
-class MemoryAddRequest(MemoryRequest):
-    """Write a memory note to the workspace RAG store (Best-effort). `memory_type`
-    gives the retention class: "short_term" (~24h) or "long_term" (default)."""
-
-    text: str = ""
-    memory_type: str = "short_term"
-
-
-class MemoryAddResponse(BaseModel):
-    ok: bool = False
-    error: str = ""
-    skipped: str = ""
-
-
 class MemoryStatsResponse(BaseModel):
     available: bool = False
     db: str = ""
@@ -1256,36 +1242,6 @@ async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
         return MemoryClearResponse(ok=True)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"could not clear vector store: {exc}") from exc
-
-
-@app.post("/memory/add")
-async def memory_add(req: MemoryAddRequest) -> MemoryAddResponse:
-    from tools import open_vector_store, remember
-
-    if not req.root or not os.path.isdir(req.root):
-        raise HTTPException(status_code=400, detail="invalid project root")
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="empty text")
-    store = open_vector_store(req.root, req.vector_db_path)
-    if store is None:
-        raise HTTPException(status_code=503, detail="could not open vector store")
-    try:
-        res = remember(
-            req.root,
-            req.text.strip(),
-            store,
-            memory_type=req.memory_type if req.memory_type in ("short_term", "long_term") else "short_term",
-        )
-        if res.get("error"):
-            raise HTTPException(status_code=400, detail=str(res["error"]))
-        return MemoryAddResponse(
-            ok=True,
-            skipped=res.get("skipped", ""),
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"could not save memory note: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1392,11 +1348,10 @@ async def index_run(req: IndexRunRequest) -> IndexRunResponse:
 @app.post("/cleanup/run")
 async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
     from cleanup import run_cleanup
-    from tools import _memory_manager
 
     store = _open_store(req.root, req.vector_db_path)
     try:
-        report = run_cleanup(store, req.root, memory_manager=_memory_manager(req.root, store))
+        report = run_cleanup(store, req.root)
         return CleanupRunResponse(ok=True, **report)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"cleanup failed: {exc}") from exc

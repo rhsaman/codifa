@@ -48,6 +48,10 @@ KIND_FILE = "file"
 # so stale vectors are rebuilt rather than silently mixed.
 EMBEDDING_VERSION = 1
 
+# TTL پیش‌فرض برای اسناد وب/fetch در RAG (روز). کش وبِ فرانت‌اند/بک‌اند جداگونه
+# از طریق webSearchTtlDays / fetchUrlTtlDays در settings تنظیم می‌شه.
+RAG_WEB_TTL_DAYS = 90
+
 _DB_LOCK = threading.RLock()
 
 _DEFAULTS = {
@@ -823,19 +827,34 @@ class VectorStore:
 
     def evict(self) -> int:
         """Apply caps + TTL: evict least-recently-fetched docs beyond limits and
-        expired web/memory docs. Returns how many docs were removed."""
+        expired web/memory docs. Returns how many docs were removed.
+
+        TTL برای KIND_WEB از RAG_WEB_TTL_DAYS میاد (پیش‌فرض ۹۰ روز)، بقیه از
+        config.ttl_days (پیش‌فرض ۱۸۰ روز برای memory).
+        """
         removed = 0
         with _DB_LOCK, self._conn:
-            cutoff = self._now() - self.config.ttl_days * 86400
-            for kind in (KIND_WEB, KIND_MEMORY):
-                rows = self._conn.execute(
-                    "SELECT id, key FROM docs WHERE kind = ? AND fetched_at < ?",
-                    (kind, cutoff),
-                ).fetchall()
-                for r in rows:
-                    self._purge_doc_chunks(int(r[0]))
-                    self._conn.execute("DELETE FROM docs WHERE id = ?", (r[0],))
-                    removed += 1
+            # KIND_WEB: TTL جداگانه (۹۰ روز)
+            web_cutoff = self._now() - RAG_WEB_TTL_DAYS * 86400
+            rows = self._conn.execute(
+                "SELECT id, key FROM docs WHERE kind = ? AND fetched_at < ?",
+                (KIND_WEB, web_cutoff),
+            ).fetchall()
+            for r in rows:
+                self._purge_doc_chunks(int(r[0]))
+                self._conn.execute("DELETE FROM docs WHERE id = ?", (r[0],))
+                removed += 1
+            # KIND_MEMORY: TTL از تنظیمات (پیش‌فرض ۱۸۰ روز)
+            mem_cutoff = self._now() - self.config.ttl_days * 86400
+            rows = self._conn.execute(
+                "SELECT id, key FROM docs WHERE kind = ? AND fetched_at < ?",
+                (KIND_MEMORY, mem_cutoff),
+            ).fetchall()
+            for r in rows:
+                self._purge_doc_chunks(int(r[0]))
+                self._conn.execute("DELETE FROM docs WHERE id = ?", (r[0],))
+                removed += 1
+            # سقف تعداد برای هر دو نوع
             for kind in (KIND_WEB, KIND_MEMORY):
                 over = self._conn.execute(
                     "SELECT id FROM docs WHERE kind = ? ORDER BY fetched_at "

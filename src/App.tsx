@@ -4,9 +4,7 @@ import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
-import { DownloadModelGate } from './components/DownloadModelGate'
 import { LoadingScreen } from './components/LoadingScreen'
-import { getModelsStatus } from './lib/api'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
@@ -21,7 +19,6 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const [searchOpen, setSearchOpen] = useState(false)
-  const [embeddingGate, setEmbeddingGate] = useState<'unknown' | 'ready' | 'missing'>('unknown')
   const [loadError, setLoadError] = useState<string | null>(null)
 
   // Loads persisted state. On failure we surface the error on the loading
@@ -61,44 +58,6 @@ export default function App() {
     useStore.getState().setTheme(saved)
     runLoad()
   }, [load, runLoad])
-
-  // First-run "download essential model" gate: RAG memory needs the on-device
-  // embedding model. Until a ready embedding build exists, the app is fully
-  // blocked behind a download page. Re-checks every few seconds so it clears
-  // automatically the moment a download finishes (and never appears once one
-  // is installed). A transient fetch failure stays 'unknown' and retries;
-  // after a few failures it falls through to the app so a sidecar hiccup
-  // never traps
-  // the user (the gate reappears on the next launch).
-  useEffect(() => {
-    if (!loaded || embeddingGate === 'ready') return
-    let cancelled = false
-    let failures = 0
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const check = () => {
-      getModelsStatus()
-        .then((st) => {
-          if (cancelled) return
-          const ready = (st.embedding?.dirs ?? []).some((d) => d.ready)
-          setEmbeddingGate(ready ? 'ready' : 'missing')
-        })
-        .catch(() => {
-          failures++
-          if (failures > 3) {
-            setEmbeddingGate('ready')
-            return
-          }
-          timer = setTimeout(check, 2500)
-        })
-    }
-    check()
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [loaded, embeddingGate])
-
-  const recheckEmbedding = () => setEmbeddingGate('unknown')
 
   useEffect(() => {
     const cancelPrefix = () => {
@@ -192,12 +151,8 @@ export default function App() {
     return <LoadingScreen error={loadError} onRetry={runLoad} />
   }
 
-  if (!loaded || embeddingGate === 'unknown') {
+  if (!loaded) {
     return <LoadingScreen />
-  }
-
-  if (embeddingGate === 'missing') {
-    return <DownloadModelGate onReady={recheckEmbedding} />
   }
 
   return (

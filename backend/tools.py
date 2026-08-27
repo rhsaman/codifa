@@ -29,11 +29,8 @@ import providers as _providers
 import state_db as _state_db
 from agent_registry import AGENTS, agent_system, agent_tools
 from cache import Cache, cache_path_for
-from embeddings import EmbedderUnavailableError
-from memory_manager import MEM_SHORT_TERM, MemoryConfig, MemoryManager
 from secret_utils import decrypt_secret
 from vector_store import (
-    KIND_MEMORY,
     KIND_WEB,
     StoreConfig,
     VectorStore,
@@ -931,6 +928,80 @@ def _get_result_cache() -> Cache:
     return _cache
 
 
+def _web_cache_ttl() -> int:
+    """TTL کش وب‌سرچ (ثانیه) از تنظیمات — پیش‌فرض ۷ روز."""
+    try:
+        s = (_state_db.get_settings() or {})
+        days = int(s.get("webSearchTtlDays", 7))
+        days = max(1, days)
+    except (TypeError, ValueError):
+        days = 7
+    return days * 86400
+
+
+def _fetch_cache_ttl() -> int:
+    """TTL کش fetch_url (ثانیه) از تنظیمات — پیش‌فرض ۷ روز."""
+    try:
+        s = (_state_db.get_settings() or {})
+        days = int(s.get("fetchUrlTtlDays", 7))
+        days = max(1, days)
+    except (TypeError, ValueError):
+        days = 7
+    return days * 86400
+
+
+def _rag_web_enabled() -> bool:
+    """آیا RAG برای وب/fetch فعاله؟ (مدل embedding دانلود شده باشه)."""
+    try:
+        from embeddings import embedder_available
+
+        return embedder_available()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _get_web_store(root: str) -> VectorStore | None:
+    """باز کردن lazy vector store فقط وقتی واقعاً لازمه (وب/fetch).
+
+    اینطوری بدون embedding هیچ پوشه‌ای ساخته نمی‌شه — چون open_vector_store
+    فقط توی این تابع صدا زده می‌شه که خودش توی web_search_tool/fetch_url_tool
+    فراخوانی می‌شه (نه اول چت).
+    """
+    try:
+        return open_vector_store(root, "", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str = "") -> str | None:
+    """اگه قبلاً نتیجه‌ی این وب‌سرچ/fetch توی RAG ذخیره شده بود، برگردون.
+
+    فقط وقتی مدل embedding در دسترس باشه (RAG فعال) کار می‌کنه؛ وگرنه
+    ``None`` برمی‌گردونه تا مدل بره سراغ وب/فچ واقعی. هیت‌ها رو به هم
+    می‌چسبونه و برمی‌گردونه. اگه چیزی نبود یا خطا داد، ``None``.
+    """
+    if not _rag_web_enabled():
+        return None
+    if store is None:
+        store = _get_web_store(root)
+    if store is None:
+        return None
+    try:
+        hits = store.search(key, KIND_WEB, top_k=3, min_score=0.6)
+        if not hits:
+            return None
+        parts = []
+        for h in hits:
+            text = (h.get("txt") or "").strip()
+            if text:
+                parts.append(text)
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+    except Exception:  # noqa: BLE001 — RAG lookup must never break the tool
+        return None
+
+
 def _is_workspace_coder_dir(root: str, target: str) -> bool:
     """True if ``target`` resolves inside ``<root>/.coder``.
 
@@ -1173,184 +1244,6 @@ def _project_slug(root: str) -> str:
         return slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
     except Exception:  # noqa: BLE001
         return "workspace"
-
-
-def _memory_manager(root: str, store: VectorStore | None = None) -> MemoryManager:
-    """Shared memory manager bound to the workspace vector store (if any)."""
-    try:
-        mm = MemoryManager(
-            data_root=user_coder_dir(), config=MemoryConfig.from_settings(None)
-        )
-        if store is not None:
-            mm.bind_store(store)
-        return mm
-    except Exception:  # noqa: BLE001 — never let memory setup break the tool
-        return MemoryManager(data_root=user_coder_dir())
-
-
-def remember(
-    root: str,
-    note: str,
-    store: VectorStore | None = None,
-    memory_type: str = "long_term",
-) -> dict:
-    """Save a short, durable note to the project's RAG memory.
-
-    Notes are stored in ``<data>/memory/memories.jsonl`` (source of truth),
-    indexed in FTS5, and written through to the workspace vector store
-    (``memory`` kind) for semantic recall. Deduped two ways: an exact
-    substring match (cheap, catches identical restatements) and — when the
-    embedder is available — a semantic near-duplicate check via cosine
-    similarity (catches the SAME fact reworded in different words, which the
-    substring check misses).
-
-    ``memory_type`` selects the retention class; pass ``"short_term"`` for
-    ~24h ephemeral notes (e.g. compact summaries) so they don't pollute the
-    durable long-term memory.
-    """
-    note = (note or "").strip()
-    if not note:
-        return {"error": "empty note"}
-    if len(note) > 4000:
-        note = note[:4000] + "…"
-    if store is None:
-        return {"error": "memory store not available"}
-    project = _project_slug(root)
-    near = []
-    try:
-        # Always reach the nearest existing note (low bar) so we can judge it.
-        near = store.search(note, KIND_MEMORY, top_k=1, min_score=0.5)
-    except EmbedderUnavailableError:
-        near = []  # no semantic dedup possible — save anyway
-    except Exception:  # noqa: BLE001
-        near = []
-    dup = None
-    if near:
-        cand = near[0]
-        score = float(cand.get("score") or 0)
-        title = str(cand.get("title") or "")
-        shared = _longest_shared_substring(note.lower(), title.lower())
-        if score >= _MEMORY_DEDUP_THRESHOLD or shared >= _MEMORY_DEDUP_SUBSTR_MIN:
-            dup = cand
-    if dup is not None:
-        return {
-            "path": KIND_MEMORY,
-            "ok": True,
-            "skipped": "duplicate",
-            "matched": dup["key"],
-        }
-    mm = _memory_manager(root, store)
-    if memory_type == "short_term":
-        memory_type = MEM_SHORT_TERM
-    res = mm.add(note, memory_type=memory_type, project_id=project)
-    if "error" in res:
-        return {"path": KIND_MEMORY, "error": res["error"]}
-    return {"path": KIND_MEMORY, "ok": True}
-
-
-def _longest_shared_substring(a: str, b: str) -> int:
-    """Length of the longest common substring (space-insensitive)."""
-    a = " ".join(a.split())
-    b = " ".join(b.split())
-    if not a or not b:
-        return 0
-    n, m = len(a), len(b)
-    best = 0
-    prev = [0] * (m + 1)
-    cur = [0] * (m + 1)
-    for i in range(1, n + 1):
-        prev, cur = cur, [0] * (m + 1)
-        for j in range(1, m + 1):
-            if a[i - 1] == b[j - 1]:
-                cur[j] = prev[j - 1] + 1
-                best = max(best, cur[j])
-            else:
-                cur[j] = 0
-    return best
-
-
-def replace_memory(
-    root: str, subject: str, new_text: str, store: VectorStore | None = None
-) -> dict:
-    """Hermes-style ``replace``: update the stored note that contains ``subject``
-    so it now reads ``new_text``. If nothing matches, it appends ``new_text`` as
-    an add instead, so ``replace`` is always safe to call.
-    """
-    subject = (subject or "").strip()
-    new_text = (new_text or "").strip()
-    if not subject:
-        return {"error": "empty subject"}
-    if not new_text:
-        return {"error": "empty replacement text"}
-    if len(new_text) > 500:
-        new_text = new_text[:500] + "…"
-    if store is None:
-        return {"error": "memory store not available"}
-
-    mm = _memory_manager(root, store)
-    res = mm.replace(subject, new_text, project_id=_project_slug(root))
-    if "error" in res:
-        return {"path": KIND_MEMORY, "error": res["error"]}
-    return {"path": KIND_MEMORY, "ok": True}
-
-
-def remove_memory(root: str, subject: str, store: VectorStore | None = None) -> dict:
-    """Hermes-style ``remove``: delete the stored note that contains ``subject``.
-    Returns ok (as a no-op) if nothing matches.
-    """
-    subject = (subject or "").strip()
-    if not subject:
-        return {"error": "empty subject"}
-    if store is None:
-        return {"error": "memory store not available"}
-
-    mm = _memory_manager(root, store)
-    res = mm.remove(subject, project_id=_project_slug(root))
-    if "error" in res:
-        return {"path": KIND_MEMORY, "error": res["error"]}
-    return {
-        "path": KIND_MEMORY,
-        "ok": True,
-        "skip": "not found" if not res.get("removed") else False,
-    }
-
-
-def search_memory(
-    root: str,
-    query: str,
-    max_results: int = MEMORY_SEARCH_MAX_RESULTS,
-    store: VectorStore | None = None,
-) -> dict:
-    """Search the project's RAG memory for notes relevant to ``query``.
-
-    Notes are retrieved via a cascade (FTS5 lexical + vector semantic, with
-    sliding TTL on matched notes). An empty query returns the most recently
-    added notes instead.
-    """
-    query = (query or "").strip()
-    if store is None:
-        return {
-            "query": query,
-            "notes": [],
-            "total": 0,
-            "error": "memory store not available",
-        }
-    mm = _memory_manager(root, store)
-    project = _project_slug(root)
-    total = len(mm.list(project_id=project))
-    if not query:
-        notes = [m["content"] for m in mm.list(project_id=project)[:max_results]]
-        return {"query": query, "notes": notes, "total": total}
-    try:
-        results = mm.search(query, project_id=project, top_k=max_results, min_score=0.2)
-    except EmbedderUnavailableError as exc:
-        return {"query": query, "notes": [], "total": total, "error": str(exc)}
-    return {
-        "query": query,
-        "notes": [m["content"] for m in results],
-        "total": total,
-        "matched": len(results),
-    }
 
 
 def search_web_docs(
@@ -2891,90 +2784,6 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
-    async def memory_tool(action: str, subject: str, text: str = "") -> str:
-        """Curate the project's durable memory (RAG notes, loaded every future session). If the user asks to remember/keep something (any language), call with action='add' THIS SAME turn — the tool call IS the save; saying "I'll remember" saves nothing. action: 'add' (text), 'replace' (subject= find, text= new wording), 'remove' (subject= in the note). Also remember durable facts yourself (conventions, gotchas, build quirks, stated preferences). ENGLISH. No secrets, personal data, one-offs, or AGENTS.md content. Near cap prefer replace/remove."""
-        emit(
-            {
-                "kind": "tool",
-                "tool": "memory",
-                "args": {"action": action, "subject": subject, "text": text},
-            }
-        )
-        action = (action or "").strip().lower()
-        try:
-            if action == "replace":
-                result = replace_memory(root, subject, text, store)
-            elif action == "remove":
-                result = remove_memory(root, subject, store)
-            elif action in ("add", "remember", ""):
-                result = remember(root, text or subject, store)
-            else:
-                msg = f"unknown action {action!r} (use add|replace|remove)"
-                emit(_error_result("memory", msg))
-                return f"ERROR: {msg}"
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit(_error_result("memory", msg))
-            return f"ERROR updating memory: {msg}"
-        if "error" in result:
-            msg = result["error"]
-            emit(_error_result("memory", msg))
-            return f"ERROR updating memory: {msg}"
-        if result.get("skipped") == "duplicate":
-            emit({"kind": "tool_result", "tool": "memory", "summary": "already known"})
-            return "Already remembered — a matching note already exists, nothing new was saved."
-        if result.get("skip") == "not found":
-            emit({"kind": "tool_result", "tool": "memory", "summary": "not found"})
-            return "No matching memory found to remove; nothing changed."
-        emit({"kind": "tool_result", "tool": "memory", "summary": f"ok ({action})"})
-        return f"Memory updated ({action}). It will be loaded automatically in future sessions for this project."
-
-    async def search_memory_tool(
-        query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS
-    ) -> str:
-        """Search this project's durable memory (RAG notes) for notes relevant to `query`. Saved notes are auto-recalled ONLY on the FIRST message of a chat, and when the user explicitly asks to look at memory (e.g. "از مموری ببین") — NOT on every run, to keep token cost down. So if the user asks about memory or you need MORE context (a different angle, older notes, or a mid-task check like a recurring error), call this. Pass a few keywords (e.g. "port config", "auth flow"); leave query empty for the most recently added notes."""
-        emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
-        try:
-            result = search_memory(root, query, max_results, store)
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit(_error_result("search_memory", msg))
-            return f"ERROR searching memory: {msg}"
-        if "error" in result:
-            msg = result["error"]
-            emit(_error_result("search_memory", msg))
-            return f"ERROR searching memory: {msg}"
-        notes = result.get("notes", [])
-        total = result.get("total", 0)
-        if total == 0:
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "search_memory",
-                    "summary": "no notes yet",
-                }
-            )
-            return "No memory notes saved yet for this project."
-        if not notes:
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "search_memory",
-                    "summary": "no matches",
-                }
-            )
-            return f"No saved notes matched {query!r} (out of {total} total notes). Proceed without them."
-        emit(
-            {
-                "kind": "tool_result",
-                "tool": "search_memory",
-                "summary": f"{len(notes)}/{total} notes",
-            }
-        )
-        body = "\n".join(notes)
-        label = f"matching {query!r}" if query else "most recent"
-        return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
-
     async def update_plan(items: list[dict]) -> str:
         """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
@@ -3351,7 +3160,7 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("grep", pattern, path, include)
@@ -3529,7 +3338,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
     async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline.
+
+When you need to find files by name patterns, delegate to the explore sub-agent (task with subagent_type='explore') for an open-ended search instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
         cache_key = ("glob", pattern, path, "")
@@ -3699,7 +3510,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; call read_tool again separately for a path that needs a different range. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region."""
+BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; call read_tool again separately for a path that needs a different range. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
+
+When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         all_paths = [filePath] + [
             p for p in (filePaths or []) if p and p != filePath
@@ -3947,12 +3760,32 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
         while _attempts < _SUBAGENT_MAX_ATTEMPTS:
             _attempts += 1
             try:
+                # Inject the live CODE MAP into the explore agent's system
+                # prompt so it knows the symbol layout up front and can go
+                # straight to read() instead of blind grep/glob sweeps.
+                _sys = agent_system(subagent_type) or (
+                    "You are a sub-agent. Work through the task independently with "
+                    "your tools, then reply with a concise final result. Do not ask the "
+                    "user questions; do not call the task tool."
+                )
+                if subagent_type == "explore":
+                    try:
+                        from symbol_index import format_symbol_map
+                        _code_map = format_symbol_map(root) if root else ""
+                    except Exception:  # noqa: BLE001
+                        _code_map = ""
+                    if _code_map:
+                        _sys = (
+                            _sys
+                            + "\n\n===== CODE MAP (live symbol index) =====\n"
+                            + _code_map
+                            + "\n===== END CODE MAP =====\n"
+                            "Use this map to locate symbols/files before reading. "
+                            "Go straight to read() with the file:line from the map."
+                        )
                 _output = await langchain_tool_loop(
                     _model,
-                    system=agent_system(subagent_type)
-                    or "You are a sub-agent. Work through the task independently with "
-                    "your tools, then reply with a concise final result. Do not ask the "
-                    "user questions; do not call the task tool.",
+                    system=_sys,
                     user=prompt,
                     tools=_sub_tools,
                     max_steps=_agent_steps if _agent_steps else 24,
@@ -4167,6 +4000,20 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
                 "model": _web_runner_name,
             }
         )
+        # اول توی RAG چک کن — اگه قبلاً ذخیره شده بود، از همون برگردون
+        # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
+        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
+        _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+        rag_hit = _rag_web_lookup(query, _ws_for_lookup, root)
+        if rag_hit:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "web_search",
+                    "summary": "rag recall",
+                }
+            )
+            return f"WEB RESULTS for {query!r} (from saved RAG)\n{rag_hit}"
         cache = _get_result_cache()
         ck = f"web:{query}"
         cached = cache.get(ck)
@@ -4199,9 +4046,11 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
             ui_items.append({"title": r["title"], "url": r["url"], "snippet": snippet})
             # Persist each hit into the workspace vector store (KIND_WEB) so
             # later retrieval can recall it without re-fetching the web.
-            if store is not None:
+            # اختیاری: فقط اگه مدل embedding در دسترس باشه (RAG فعال).
+            _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+            if _ws is not None and _rag_web_enabled():
                 try:
-                    store.upsert_doc(
+                    _ws.upsert_doc(
                         f"web:{r['url']}",
                         KIND_WEB,
                         r.get("title", r["url"]),
@@ -4249,7 +4098,7 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
                         }
                     )
                     _result = f"WEB RESULTS for {query!r} (distilled)\n{distilled}"
-                    cache.set(ck, _result, 86400)
+                    cache.set(ck, _result, _web_cache_ttl())
                     return _result
             except Exception as exc:  # noqa: BLE001 — fall back to raw results
                 # Both the web subagent AND the main model failed — tell the user
@@ -4286,7 +4135,7 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
                 "model": _web_runner_name,
             }
         )
-        cache.set(ck, raw_results, 86400)
+        cache.set(ck, raw_results, _web_cache_ttl())
         return raw_results
 
     async def fetch_url_tool(url: str, full: bool = False) -> str:
@@ -4371,6 +4220,20 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
         }
         if effective_full or _ext in _ext_full or _probe.startswith(_raw_hosts):
             effective_full = True
+        # اول توی RAG چک کن — اگه قبلاً ذخیره شده بود، از همون برگردون
+        # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
+        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
+        _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+        rag_hit = _rag_web_lookup(url, _ws_for_lookup, root)
+        if rag_hit:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "fetch_url",
+                    "summary": f"{len(rag_hit)} chars (rag recall)",
+                }
+            )
+            return f"FETCHED {url} (from saved RAG)\n{rag_hit}"
         cache = _get_result_cache()
         cache_key = f"fetch:{url}"
         # Return cached page if fresh (TTL: 24h).
@@ -4404,21 +4267,23 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
             return f"ERROR fetching {url}: {msg}"
         body = result.get("content", "")
         title = result.get("title", "")
-        # Cache the fetch result (24h TTL)
+        # Cache the fetch result (TTL از تنظیمات — پیش‌فرض ۷ روز)
         if body:
             try:
                 cache.set(
                     cache_key,
                     json.dumps({"content": body, "title": title}, ensure_ascii=False),
-                    86400,
+                    _fetch_cache_ttl(),
                 )
             except Exception:  # noqa: BLE001, S110
                 pass
         # Persist the fetched page into the workspace vector store (KIND_WEB)
         # so later retrieval can recall it without re-fetching the web.
-        if store is not None and body:
+        # اختیاری: فقط اگه مدل embedding در دسترس باشه (RAG فعال).
+        _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+        if _ws is not None and body and _rag_web_enabled():
             try:
-                store.upsert_doc(
+                _ws.upsert_doc(
                     f"web:{url}",
                     KIND_WEB,
                     title or url,
@@ -4926,8 +4791,6 @@ BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read 
         "ask_user": ask_user_tool,
         "write_file": write_file_tool,
         "edit_file": edit_file_tool,
-        "memory": memory_tool,
-        "search_memory": search_memory_tool,
         "update_plan": update_plan,
         "create_skill": create_skill_tool,
         "create_mcp": create_mcp_tool,

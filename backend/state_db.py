@@ -61,7 +61,7 @@ def bootstrap() -> None:
     missing a directory.
     """
     data_root()
-    for d in (skills_dir(), mcp_dir(), plans_dir(), memory_dir(), models_dir(), resume_dir()):
+    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir(), resume_dir()):
         os.makedirs(d, exist_ok=True)
     os.makedirs(vector_db_dir(), exist_ok=True)
     sp = settings_path()
@@ -249,7 +249,35 @@ def models_dir() -> str:
 
 
 def memory_dir() -> str:
+    """Legacy agent-memory directory (removed feature).
+
+    Kept only so existing installs can migrate their old ``memory/`` folder
+    out of the data root via :func:`migrate_memory_dir`. New installs no
+    longer create this directory.
+    """
     return os.path.join(data_root(), "memory")
+
+
+def migrate_memory_dir(target_root: str) -> bool:
+    """Move any legacy ``memory/`` folder into ``target_root`` (best-effort).
+
+    Returns True if a migration happened. The source is removed after a
+    successful move so the data root stays clean. Never raises.
+    """
+    try:
+        src = memory_dir()
+        if not os.path.isdir(src):
+            return False
+        dst = os.path.join(target_root, "memory")
+        if os.path.abspath(src) == os.path.abspath(dst):
+            return False
+        os.makedirs(target_root, exist_ok=True)
+        import shutil
+
+        shutil.move(src, dst)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def cache_path() -> str:
@@ -368,6 +396,9 @@ _DEFAULT_SETTINGS_KEYS = frozenset(
         "whisperBaseUrl",
         "embeddingModel",
         "embeddingBaseUrl",
+        "webSearchTtlDays",
+        "fetchUrlTtlDays",
+        "ragWebTtlDays",
         "subagentModels",
         "memory",
         "memoryTtlDays",

@@ -1,5 +1,5 @@
 import './_globals.ts'
-import { normalizeUsageEntry, providerForUsageEntry } from '../src/lib/usage.ts'
+import { normalizeUsageEntry, providerForUsageEntry, normalizeUsageModel } from '../src/lib/usage.ts'
 import type { ChatUsage, ChatUsageEntry, ProviderConfig } from '../src/types.ts'
 
 function check(name: string, cond: any, extra?: any) {
@@ -71,6 +71,30 @@ console.log('۶) سناریوی دو پرووایدر با مدل یکسان (م
   const pb = providerForUsageEntry(b!.entries[0], providers)
   check('هر دو entry به پرووایدر واقعی خودشان نسبت داده می‌شوند', pa?.id === 'myprovider' && pb?.id === 'openrouter', { a: pa?.id, b: pb?.id })
   check('پرووایدرها یکسان نیستند (گروه‌بندی جدا)', pa?.id !== pb?.id, { a: pa?.id, b: pb?.id })
+}
+
+console.log('۷) normalizeUsageModel پیشوند provider تکراری را حذف می‌کند (توکن‌ها روی یک entry جمع می‌شوند):')
+{
+  check('مدل با پیشوند provider == providerId -> بدون پیشوند', normalizeUsageModel('openrouter', 'openrouter/claude-3.5-sonnet') === 'claude-3.5-sonnet', normalizeUsageModel('openrouter', 'openrouter/claude-3.5-sonnet'))
+  check('مدل بدون پیشوند دست‌نخورده می‌ماند', normalizeUsageModel('openrouter', 'claude-3.5-sonnet') === 'claude-3.5-sonnet', normalizeUsageModel('openrouter', 'claude-3.5-sonnet'))
+  check('namespace مدل (anthropic/...) حفظ می‌شود', normalizeUsageModel('openrouter', 'anthropic/claude-3.5-sonnet') === 'anthropic/claude-3.5-sonnet', normalizeUsageModel('openrouter', 'anthropic/claude-3.5-sonnet'))
+  check('مدل خالی -> main', normalizeUsageModel('openrouter', '') === 'main', normalizeUsageModel('openrouter', ''))
+}
+
+console.log('۸) رویداد فقط-کش‌محور نباید حذف شود (توکن‌های cached از دست نمی‌روند):')
+{
+  // شبیه‌سازی منطق accrueChatUsage: رویدادی که فقط cacheRead دارد نباید رد شود.
+  const delta = { input: 0, output: 0, cacheRead: 1200, cacheWrite: 0 }
+  const hasTokens =
+    (delta.input || 0) > 0 ||
+    (delta.output || 0) > 0 ||
+    (delta.cacheRead || 0) > 0 ||
+    (delta.cacheWrite || 0) > 0
+  check('رویداد cache-only دارای توکن محسوب می‌شود', hasTokens === true, delta)
+  // و رویداد کاملاً خالی باید رد شود
+  const empty = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const emptyHas = (empty.input || 0) > 0 || (empty.output || 0) > 0 || (empty.cacheRead || 0) > 0 || (empty.cacheWrite || 0) > 0
+  check('رویداد کاملاً خالی رد می‌شود', emptyHas === false, empty)
 }
 
 if ((globalThis as any).__FAILED) {

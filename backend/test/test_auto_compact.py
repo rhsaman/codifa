@@ -424,3 +424,89 @@ def test_prune_disabled_is_noop():
     ]
     pruned = graph._agents._prune_history(history, enabled=False)
     assert not any(m.get("compacted") for m in pruned)
+
+
+def test_auto_compact_applies_result_in_place():
+    # The whole point of auto-compact is that the LIVE transcript (`msgs`) is
+    # actually shrunk — otherwise the model keeps receiving the full history and
+    # the turn still overflows. This proves `_maybe_auto_compact` rewrites `msgs`
+    # in place (keeping the leading system prompt) when compaction fires.
+    async def fake_compact(*a, **k):
+        return (
+            [
+                {"role": "system", "content": "[Compacted earlier context]\nSUMMARY"},
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+            ],
+            2,
+            None,
+        )
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        msgs = [
+            SystemMessage(content="system prompt"),
+            HumanMessage(content="old q1"),
+            AIMessage(content="old a1"),
+            HumanMessage(content="old q2"),
+            AIMessage(content="old a2"),
+            HumanMessage(content="recent question"),
+            AIMessage(content="recent answer"),
+        ]
+        q = _Queue()
+        asyncio.run(
+            graph._maybe_auto_compact(
+                {"reserved": 20_000}, q, None, None, msgs, 200_000,
+                last_input_tokens=190_000,
+            )
+        )
+    finally:
+        graph._agents._compact_history = original
+
+    # The leading system prompt is preserved verbatim.
+    assert isinstance(msgs[0], SystemMessage)
+    assert msgs[0].content == "system prompt"
+    # The compacted head (a "[Compacted earlier context]" system note) is folded
+    # into the existing system slot, NOT appended as a second system message.
+    assert sum(1 for m in msgs if isinstance(m, SystemMessage)) == 1
+    # The old turns are gone; only the summary + recent tail remain.
+    assert len(msgs) == 3
+    assert any(
+        isinstance(m, HumanMessage) and m.content == "recent question" for m in msgs
+    )
+    assert any(
+        isinstance(m, AIMessage) and m.content == "recent answer" for m in msgs
+    )
+    # The `compact` event still fires so the frontend can fold the old turns.
+    assert any(e["kind"] == "compact" for e in q.items)
+
+
+def test_auto_compact_in_place_noop_below_threshold():
+    # Below the usable threshold nothing is compacted, so `msgs` must be left
+    # completely untouched (no rebuild, no dropped messages).
+    original = graph._agents._compact_history
+    graph._agents._compact_history = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("compact must not be called below threshold")
+    )
+    try:
+        msgs = [
+            SystemMessage(content="system prompt"),
+            HumanMessage(content="hi"),
+            AIMessage(content="answer"),
+        ]
+        q = _Queue()
+        asyncio.run(
+            graph._maybe_auto_compact(
+                {"reserved": 20_000}, q, None, None, msgs, 200_000,
+                last_input_tokens=10_000,
+            )
+        )
+    finally:
+        graph._agents._compact_history = original
+    # Untouched: same objects, same length.
+    assert len(msgs) == 3
+    assert isinstance(msgs[0], SystemMessage)
+    assert msgs[1].content == "hi"
+    assert msgs[2].content == "answer"
+    assert q.items == []

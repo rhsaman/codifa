@@ -42,7 +42,7 @@ export function normalizeUsageEntry(
     }
     entries.push({
       providerId,
-      model,
+      model: normalizeUsageModel(providerId, model),
       input: v.input ?? 0,
       output: v.output ?? 0,
       cacheRead: v.cacheRead ?? 0,
@@ -59,4 +59,20 @@ export function providerForUsageEntry(
   allProviders: ProviderConfig[],
 ): ProviderConfig | undefined {
   return allProviders.find((p) => p.id === entry.providerId);
+}
+
+/**
+ * Normalize a model id so the SAME model (with/without a provider prefix) always
+ * maps to ONE usage entry. The provider is already stored explicitly in
+ * `providerId`, so strip any "providerId/" prefix from the model — but keep a
+ * model namespace (e.g. "anthropic/claude-...") intact, since that is part of the
+ * model name, not a provider routing prefix.
+ */
+export function normalizeUsageModel(providerId: string, model: string): string {
+  const m = (model || "").trim() || "main";
+  if (m.includes("/")) {
+    const prefix = m.slice(0, m.indexOf("/"));
+    if (prefix === providerId) return m.slice(m.indexOf("/") + 1);
+  }
+  return m;
 }

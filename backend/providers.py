@@ -444,26 +444,55 @@ def _models_endpoint(provider: str, base_url: str) -> tuple[str, str]:
     return base + "/models" + query, "openai"
 
 
-def _entry_context(entry: dict) -> int | None:
-    """Best-effort context-window (tokens) from a /models entry.
+def _first_int(obj: dict, keys: list[str]) -> int | None:
+    """Return the first truthy integer-valued field among ``keys`` in ``obj``.
 
-    Tries the field names used by the various OpenAI-compatible gateways
-    (openrouter ``context_length``, vLLM/LM Studio ``max_model_len``, ...).
+    Tolerant of string/number values; non-integers are skipped. Returns None
+    when none of the keys hold a usable integer.
     """
-    for key in (
-        "context_length",
-        "max_context_length",
-        "context_window",
-        "max_model_len",
-        "context_len",
-    ):
-        val = entry.get(key)
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        val = obj.get(key)
         if val:
             try:
                 return int(val)
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _first_bool(obj: dict, keys: list[str]) -> bool | None:
+    """Return the first boolean-valued field among ``keys`` in ``obj``.
+
+    Returns None when none of the keys hold a real bool, so callers can fall
+    back to another source instead of guessing.
+    """
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        val = obj.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
+
+
+def _entry_context(entry: dict) -> int | None:
+    """Best-effort context-window (tokens) from a /models entry.
+
+    Tries the field names used by the various OpenAI-compatible gateways
+    (openrouter ``context_length``, vLLM/LM Studio ``max_model_len``, ...).
+    """
+    return _first_int(
+        entry,
+        (
+            "context_length",
+            "max_context_length",
+            "context_window",
+            "max_model_len",
+            "context_len",
+        ),
+    )
 
 
 def _entry_max_output(entry: dict) -> int | None:
@@ -472,21 +501,10 @@ def _entry_max_output(entry: dict) -> int | None:
     OpenRouter advertises ``max_completion_tokens`` (top-level or under
     ``top_provider``); some gateways use ``max_output_tokens``.
     """
-    for key in ("max_completion_tokens", "max_output_tokens", "output_tokens"):
-        val = entry.get(key)
-        if val:
-            try:
-                return int(val)
-            except (TypeError, ValueError):
-                continue
-    top = entry.get("top_provider") or {}
-    val = top.get("max_completion_tokens")
-    if val:
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            pass
-    return None
+    n = _first_int(entry, ("max_completion_tokens", "max_output_tokens", "output_tokens"))
+    if n is not None:
+        return n
+    return _first_int(entry.get("top_provider") or {}, ("max_completion_tokens",))
 
 
 def _entry_pricing(entry: dict) -> dict | None:
@@ -534,11 +552,7 @@ def _entry_reasoning(entry: dict) -> bool | None:
     the payload doesn't say — callers then fall back to the models.dev catalog
     or a name-based heuristic.
     """
-    for key in ("reasoning", "supports_reasoning", "reasoning_supported"):
-        val = entry.get(key)
-        if isinstance(val, bool):
-            return val
-    return None
+    return _first_bool(entry, ("reasoning", "supports_reasoning", "reasoning_supported"))
 
 
 def _server_root(base_url: str) -> str:
@@ -563,28 +577,17 @@ async def _llamacpp_default_ctx(base_url: str) -> int | None:
 
 async def _lmstudio_context(root: str, model_id: str = "") -> int | None:
     """Real context window for a local LM Studio model via its native API."""
+    _CTX_KEYS = ("context_length", "max_seq_len", "n_ctx")
+
     def _extract(obj):
         if not isinstance(obj, dict):
             return None
         if isinstance(obj.get("data"), dict):
             obj = obj["data"]
-        for key in ("context_length", "max_seq_len", "n_ctx"):
-            v = obj.get(key)
-            if v:
-                try:
-                    return int(v)
-                except (TypeError, ValueError):
-                    pass
-        info = obj.get("model_info") or {}
-        if isinstance(info, dict):
-            for key in ("context_length", "max_seq_len", "n_ctx"):
-                v = info.get(key)
-                if v:
-                    try:
-                        return int(v)
-                    except (TypeError, ValueError):
-                        pass
-        return None
+        n = _first_int(obj, _CTX_KEYS)
+        if n is not None:
+            return n
+        return _first_int(obj.get("model_info") or {}, _CTX_KEYS)
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -932,26 +935,27 @@ def _models_dev_entry(catalog: dict, provider_keys: list[str], model_id: str) ->
     return {}
 
 
+def _models_dev_limit_int(
+    catalog: dict, provider_keys: list[str], model_id: str, field: str
+) -> int | None:
+    """Look up an integer ``limit.<field>`` (e.g. ``context`` / ``output``) for
+    ``model_id`` under ``provider_keys`` in a models.dev catalog already fetched
+    via ``_models_dev_catalog``."""
+    entry = _models_dev_entry(catalog, provider_keys, model_id)
+    val = (entry.get("limit") or {}).get(field)
+    return _first_int({field: val}, [field])
+
+
 def _models_dev_context(catalog: dict, provider_keys: list[str], model_id: str) -> int | None:
     """Look up ``model_id``'s context window under ``provider_keys`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    entry = _models_dev_entry(catalog, provider_keys, model_id)
-    ctx = (entry.get("limit") or {}).get("context")
-    try:
-        return int(ctx) if ctx else None
-    except (TypeError, ValueError):
-        return None
+    return _models_dev_limit_int(catalog, provider_keys, model_id, "context")
 
 
 def _models_dev_max_output(catalog: dict, provider_keys: list[str], model_id: str) -> int | None:
     """Look up ``model_id``'s max output tokens under ``provider_keys`` in a
     models.dev catalog already fetched via ``_models_dev_catalog``."""
-    entry = _models_dev_entry(catalog, provider_keys, model_id)
-    out = (entry.get("limit") or {}).get("output")
-    try:
-        return int(out) if out else None
-    except (TypeError, ValueError):
-        return None
+    return _models_dev_limit_int(catalog, provider_keys, model_id, "output")
 
 
 def _models_dev_reasoning(catalog: dict, provider_keys: list[str], model_id: str) -> bool | None:

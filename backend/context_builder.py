@@ -95,6 +95,9 @@ def build_context(
     parts: list[str] = []
     used = 0
     for kind in order:
+        # RAG فقط برای وب/fetch — کد پروژه از طریق CODE MAP تزریق می‌شه.
+        if kind == KIND_FILE:
+            continue
         if kind not in settings.active_kinds():
             continue
         try:

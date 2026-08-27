@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextvars
-import functools
 import json
 import os
 import re
@@ -40,10 +38,8 @@ from providers import (
     _provider_meta,
 )
 from tools import (
-    _SUB_AGENT_CTX,
     LOG_FILENAME,
     PathEscapeError,
-    _walk_files,
     list_files,
     read_file,
     resolve_safe,
@@ -539,126 +535,21 @@ def _wrap_no_search_bypass(fn: Callable):
 # adds HARD logic: a per-turn counter plus objective "broadness" signals. When
 # a search is genuinely wide (open glob pattern, repo-wide grep, or repeated
 # calls piling up) the wrapper refuses to run inline and tells the model to
-# delegate to `task(subagent_type='explore')` instead. Targeted lookups still
-# run directly — so the agent does NOT always explore, only when it truly needs to.
-_SEARCH_CALL_COUNT_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "search_call_count", default=0
-)
-# Number of search/web calls in one user message after which the router treats
-# the agent as "flailing" and forces delegation to explore. Tunable. Measured
-# across the whole user-message sequence (reset only at run_graph start), so a
-# single message that greps many times still trips the router instead of being
-# reset on every model turn.
-# Raised from 2 to 8: lets the main agent fire a SINGLE-TURN BATCH of targeted
-# searches (grep/glob/read) before the router forces delegation — so it can
-# narrow toward the answer in one pass instead of serially tripping the router
-# after the 2nd call. Broad searches are still hard-blocked by _is_broad_search.
-_AUTO_EXPLORE_THRESHOLD = 8
-# Web lookups are expensive (network + context); allow fewer before routing.
-_AUTO_EXPLORE_WEB_THRESHOLD = 1
-# A scope whose file count exceeds this is treated as broad even when `path`
-# is given (catches "path=src" wrapping a huge tree). _walk_files is cached
-# (10s TTL), so counting is essentially free.
+# محدودیت step روی grep/glob/read کاملاً برداشته شد: agent می‌تونه به تعداد
+# دلخواه جستجو کنه و هرگز به خاطر تعداد callها به explore نمی‌ره. روتر هم
+# غیرفعاله و _is_broad_search هم همیشه False
+# برمی‌گردونه — پس هیچ جستجویی مسدود نمی‌شه. agent خودش تصمیم می‌گیره کی
+# بخواد broad search رو به explore sub-agent بده (طبق SEARCH STRATEGY prompt).
 _BROAD_FILE_COUNT = 100
-
-# Tools covered by the auto-router (repo search + web/document lookups).
 _AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
 
 
-def _reset_search_call_count() -> None:
-    """Reset the search counter at the START of each user message (run_graph),
-    so the auto-router's "repeated calls" threshold is measured across the
-    whole user-message sequence, not reset on every model turn."""
-    _SEARCH_CALL_COUNT_CTX.set(0)
-
-
 def _is_broad_search(tool_name: str, kwargs: dict) -> bool:
-    """Return True when a single call is objectively a BROAD / expensive search
-    that belongs in the isolated explore context rather than inline.
-
-    A bare grep/glob (no path/include) is always broad. Additionally, even when
-    a `path` is given, if the scope actually contains more than
-    ``_BROAD_FILE_COUNT`` files we treat it as broad — this catches models
-    wrapping a huge tree in a token `path="src"` to dodge detection. File
-    counting reuses the cached ``_walk_files`` so it costs almost nothing.
+    """Always False — the auto-router is disabled, so no single search call is
+    treated as broad/blocked. The agent decides for itself (via the SEARCH
+    STRATEGY prompt) when to delegate a wide search to the explore sub-agent.
     """
-    if tool_name == "glob":
-        pattern = str(kwargs.get("pattern") or "")
-        include = str(kwargs.get("include") or kwargs.get("path") or "")
-        # An open `**` pattern with no narrowing include -> whole-repo fan-out.
-        return ("**" in pattern) and not include.strip()
-    if tool_name == "grep":
-        path = str(kwargs.get("path") or "").strip()
-        include = str(kwargs.get("include") or "").strip()
-        # Repo-wide grep (no path AND no include) scans everything -> broad.
-        if not path and not include:
-            return True
-        if path:
-            try:
-                if len(_walk_files(path)) > _BROAD_FILE_COUNT:
-                    return True
-            except OSError:
-                # Unreadable/invalid path: fall back to the conservative rule
-                # (don't block a possibly-valid scoped search).
-                return False
-        return False
-    # read / web_search / fetch_url are targeted by nature; broadness is judged
-    # by repetition (handled by the counter), not by a single call's shape.
     return False
-
-
-def _auto_explore_hint(tool_name: str) -> str:
-    """Message returned instead of running a broad/repeated search inline.
-    It nudges the model to delegate to the explore sub-agent (which has the
-    same tools, including web_search/fetch_url for reading documentation)."""
-    return (
-        "AUTO-ROUTER: this search is too broad / repeated to run inline — it "
-        "would flood your context. Delegate it to the explore sub-agent instead: "
-        "call task(subagent_type='explore') with a clear description of what to "
-        "find. The explore agent runs grep/glob/read in an ISOLATED context and "
-        "returns a compact report (it also has web_search / fetch_url to read "
-        "external docs when the answer needs documentation). Use it for wide or "
-        "multi-step searches; keep grep/glob/read/web_search/fetch_url for "
-        "targeted, single-shot lookups only."
-    )
-
-
-def _wrap_auto_explore_router(fn: Callable):
-    """Wrap a search/web tool so BROAD or REPEATED calls are routed to the
-    explore sub-agent instead of running inline.
-
-    Targeted calls (a known file/symbol/keyword, or a narrow glob/grep) run
-    normally. Only when the call is objectively broad (open glob, repo-wide
-    grep) or the agent has already made several search calls this turn does the
-    wrapper refuse and return an explore hint. This is the hard logic that
-    enforces the SEARCH STRATEGY rule even for weak models — without forcing
-    explore on every search.
-    """
-
-    tool_name = getattr(fn, "__name__", "") or ""
-
-    @functools.wraps(fn)
-    async def wrapped(*args, **kwargs):
-        # The explore sub-agent already runs in an isolated context — it must
-        # never route its own searches back to itself (that deadlocks it with
-        # "explore is blocked" hints and zero real tool calls). Only the MAIN
-        # agent's search/web tools are routed; sub-agent tools run directly.
-        if _SUB_AGENT_CTX.get():
-            return await fn(*args, **kwargs)
-        _SEARCH_CALL_COUNT_CTX.set(_SEARCH_CALL_COUNT_CTX.get() + 1)
-        count = _SEARCH_CALL_COUNT_CTX.get()
-        threshold = (
-            _AUTO_EXPLORE_WEB_THRESHOLD
-            if tool_name in ("web_search", "fetch_url")
-            else _AUTO_EXPLORE_THRESHOLD
-        )
-        repeated = count > threshold
-        broad = _is_broad_search(tool_name, kwargs)
-        if broad or repeated:
-            return _auto_explore_hint(tool_name)
-        return await fn(*args, **kwargs)
-
-    return wrapped
 
 
 # OpenRouter requires "vendor/model" ids, so a bare "free" shortcut in a
@@ -946,6 +837,10 @@ _SEARCH_RULE = (
     "tools for targeted lookups.\n"
     "NEVER search or read project files with run_terminal or scripts — only "
     "the file tools (grep / glob / read).\n"
+    "5b. CODE MAP: a live symbol index (CODE MAP above) lists every function/"
+    "class with its file and line. Before grepping, check the CODE MAP — if you "
+    "see the symbol/file you need, go straight to read (1 call). Only grep when "
+    "the map doesn't cover it (e.g. a string/comment, or a symbol not indexed).\n"
     "6. PROGRESSIVE BATCHING: in every turn, fire ALL the targeted searches you "
     "need (each with explicit scope: path + include) as a SINGLE BATCH of parallel "
     "tool calls. Each batch must narrow toward the answer (progressive) — use the "

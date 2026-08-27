@@ -9,7 +9,6 @@ gateways, ``thinking_budget`` for Google/Gemini).
 
 from llm import _thinking_kwargs, build_chat_model
 
-
 # --- _thinking_kwargs: the central gate -------------------------------------
 
 

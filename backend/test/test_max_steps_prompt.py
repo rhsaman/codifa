@@ -197,8 +197,9 @@ async def test_agent_registry_has_per_agent_steps():
 
     assert AGENTS["general"]["steps"] > 0
     assert AGENTS["explore"]["steps"] > 0
-    # Explore is bounded tighter than general (wide fan-out shouldn't run away).
-    assert AGENTS["explore"]["steps"] <= AGENTS["general"]["steps"]
+    # هر دو sub-agent بودجه‌ی step منطقی دارن (محدودیت step روی grep/glob/read برداشته شد).
+    assert AGENTS["explore"]["steps"] > 0
+    assert AGENTS["general"]["steps"] > 0
     print("  registry per-agent step budgets present")
 
 

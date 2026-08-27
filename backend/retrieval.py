@@ -204,22 +204,30 @@ def retrieve(
         logger.debug("retrieval: fts_search failed: %s", exc)
 
     # 3. semantic — ANN cosine; only when the embedder is usable.
+    # اگه embedding در دسترس نباشه، semantic جستجو نمی‌کنیم (RAG اختیاری).
     try:
-        for row in store.search(query, kind=None, top_k=_DEFAULT_PER_BACKEND, min_score=floor):
-            if kinds and row.get("kind") not in kinds:
-                continue
-            hits.append(
-                Hit(
-                    key=str(row.get("key", "")),
-                    kind=str(row.get("kind", "")),
-                    title=str(row.get("title", "") or ""),
-                    text=str(row.get("text", "") or ""),
-                    score=float(row.get("score", 0.0)),
-                    source="semantic",
+        from embeddings import embedder_available
+
+        _embedder_ok = embedder_available()
+    except Exception:  # noqa: BLE001
+        _embedder_ok = False
+    if _embedder_ok:
+        try:
+            for row in store.search(query, kind=None, top_k=_DEFAULT_PER_BACKEND, min_score=floor):
+                if kinds and row.get("kind") not in kinds:
+                    continue
+                hits.append(
+                    Hit(
+                        key=str(row.get("key", "")),
+                        kind=str(row.get("kind", "")),
+                        title=str(row.get("title", "") or ""),
+                        text=str(row.get("text", "") or ""),
+                        score=float(row.get("score", 0.0)),
+                        source="semantic",
+                    )
                 )
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("retrieval: semantic search failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("retrieval: semantic search failed: %s", exc)
 
     hits = _dedupe(hits)
     # Final ranking: source rank first, then score, then title.

@@ -50,12 +50,13 @@ async def test_grep_returns_path_line_text():
     )
     out = await tools["grep"]("TARGET")
     assert out.startswith("MATCHES for 'TARGET'"), out
-    # Compact `path:line:text` form: the matching line only, no surrounding code.
+    # Compact `path:line:text` form with a few lines of surrounding context
+    # (SNIPPET_CONTEXT) so a `read` is usually unnecessary.
     assert "app.py:4:" in out
     assert "return compute()  # TARGET" in out
-    # Surrounding lines are intentionally NOT bundled (the model reads on demand).
-    assert "setup_one()" not in out
-    assert "def gamma(self):" not in out
+    # Surrounding context is bundled (helps the model avoid extra reads).
+    # نکته: grep فقط ±SNIPPET_CONTEXT (3) خط اطراف match برمی‌گردونه،
+    # پس خط ۲ (setup_one) نمایش داده نمی‌شه — این رفتار درسته.
 
 
 async def test_grep_snippet_stays_bounded():

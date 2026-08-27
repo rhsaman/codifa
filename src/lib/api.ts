@@ -132,36 +132,6 @@ export async function transcribeAudio(
   }
 }
 
-/**
- * Best-effort write of a short-term (~24h) memory note into the workspace RAG
- * store. Used after /compact so the summary stays recallable. Resolves without
- * throwing when the store isn't available.
- */
-export async function addMemoryNote(
-  root: string,
-  text: string,
-  vectorDbPath?: string,
-): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url || !root || !text) return
-  try {
-    const res = await fetch(`${url}/memory/add`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        root,
-        text,
-        vector_db_path: vectorDbPath ?? '',
-        memory_type: 'short_term',
-      }),
-      signal: AbortSignal.timeout(30_000),
-    })
-    await res.json().catch(() => ({}))
-  } catch {
-    // Silent: compaction must never fail because a note couldn't be saved.
-  }
-}
-
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {  const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const params = new URLSearchParams({

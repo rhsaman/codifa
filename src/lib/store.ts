@@ -223,9 +223,9 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, memoryMaxNotes, memorySlidingTtl, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
-  const memory = { taskTtlHours, shortTermTtlHours, longTermTtlHours, cacheTtlMinutes, maxNotes: memoryMaxNotes, slidingTtl: memorySlidingTtl }
+  const memory = { cacheTtlMinutes }
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
   ]
@@ -237,7 +237,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, memoryTtlDays, memoryMaxDocs, memoryMaxChunks, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -428,11 +428,15 @@ interface State {
   /** Directory for the per-workspace RAG vector store; "" = default. */
   vectorDbPath: string
   setVectorDbPath: (p: string) => void
-  /** RAG store bounds: TTL (days), max docs, max chunks. */
-  memoryTtlDays: number
-  memoryMaxDocs: number
-  memoryMaxChunks: number
-  setMemoryConfig: (c: { ttlDays?: number; maxDocs?: number; maxChunks?: number }) => void
+  /** RAG web/fetch storage TTL (days). */
+  /** TTL for web search / fetch cache (days). */
+  webSearchTtlDays: number
+  fetchUrlTtlDays: number
+  setWebSearchTtlDays: (d: number) => void
+  setFetchUrlTtlDays: (d: number) => void
+  /** TTL for RAG web/fetch storage (days). */
+  ragWebTtlDays: number
+  setRagWebTtlDays: (d: number) => void
   /** User-level data root (app DB + skills/plans/mcp + vector stores). */
   dataPath: string
   setDataPath: (p: string) => void
@@ -448,14 +452,9 @@ interface State {
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
-  /** Memory-type TTLs (configurable from Settings → Memory). */
-  taskTtlHours: number
-  shortTermTtlHours: number
-  longTermTtlHours: number
+  /** Tool result cache TTL (minutes). */
   cacheTtlMinutes: number
-  memoryMaxNotes: number
-  memorySlidingTtl: boolean
-  setMemoryTtlConfig: (c: { task?: number; shortTerm?: number; longTerm?: number; cache?: number; maxNotes?: number; sliding?: boolean }) => void
+  setMemoryTtlConfig: (c: { cache?: number }) => void
 
   /** Web-search engines for web_search (Settings → Plugins). */
   searchPlugins: SearchPluginConfig[]
@@ -625,21 +624,16 @@ export const useStore = create<State>((set, get) => ({
   dir: 'rtl',
   fontSize: 14,
   vectorDbPath: '',
-  memoryTtlDays: 180,
-  memoryMaxDocs: 500,
-  memoryMaxChunks: 4000,
+  webSearchTtlDays: 7,
+  fetchUrlTtlDays: 7,
+  ragWebTtlDays: 90,
   whisperModel: 'Systran/faster-whisper-medium',
   whisperBaseUrl: '',
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
   recentModels: [],
   subagentModels: {},
-  taskTtlHours: 6,
-  shortTermTtlHours: 24,
-  longTermTtlHours: 8760,
   cacheTtlMinutes: 60,
-  memoryMaxNotes: 500,
-  memorySlidingTtl: true,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
@@ -854,9 +848,6 @@ export const useStore = create<State>((set, get) => ({
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       fontSize,
       vectorDbPath: typeof raw.vectorDbPath === 'string' ? raw.vectorDbPath : '',
-      memoryTtlDays: typeof raw.memoryTtlDays === 'number' && raw.memoryTtlDays > 0 ? raw.memoryTtlDays : 180,
-      memoryMaxDocs: typeof raw.memoryMaxDocs === 'number' && raw.memoryMaxDocs >= 10 ? raw.memoryMaxDocs : 500,
-      memoryMaxChunks: typeof raw.memoryMaxChunks === 'number' && raw.memoryMaxChunks >= 50 ? raw.memoryMaxChunks : 4000,
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
       whisperModel: typeof raw.whisperModel === 'string' && raw.whisperModel.trim() ? raw.whisperModel : 'Systran/faster-whisper-medium',
       whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
@@ -865,12 +856,7 @@ export const useStore = create<State>((set, get) => ({
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
         ? { ...(raw.subagentModels as Record<string, string>) }
         : {},
-      taskTtlHours: typeof raw.memory?.taskTtlHours === 'number' && raw.memory.taskTtlHours > 0 ? raw.memory.taskTtlHours : 6,
-      shortTermTtlHours: typeof raw.memory?.shortTermTtlHours === 'number' && raw.memory.shortTermTtlHours > 0 ? raw.memory.shortTermTtlHours : 24,
-      longTermTtlHours: typeof raw.memory?.longTermTtlHours === 'number' && raw.memory.longTermTtlHours > 0 ? raw.memory.longTermTtlHours : 8760,
-      cacheTtlMinutes: typeof raw.memory?.cacheTtlMinutes === 'number' && raw.memory.cacheTtlMinutes > 0 ? raw.memory.cacheTtlMinutes : 60,
-      memoryMaxNotes: typeof raw.memory?.maxNotes === 'number' && raw.memory.maxNotes >= 20 ? raw.memory.maxNotes : 500,
-      memorySlidingTtl: typeof raw.memory?.slidingTtl === 'boolean' ? raw.memory.slidingTtl : true,
+      cacheTtlMinutes: typeof raw.cacheTtlMinutes === 'number' && raw.cacheTtlMinutes > 0 ? raw.cacheTtlMinutes : 60,
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
       // are dropped here so they disappear from Settings → Plugins on reload.
       searchPlugins: searchPlugins.length > 0
@@ -1160,14 +1146,6 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  setMemoryConfig: ({ ttlDays, maxDocs, maxChunks }) => {
-    set({
-      memoryTtlDays: typeof ttlDays === 'number' && ttlDays > 0 ? Math.round(ttlDays) : get().memoryTtlDays,
-      memoryMaxDocs: typeof maxDocs === 'number' && maxDocs >= 10 ? Math.round(maxDocs) : get().memoryMaxDocs,
-      memoryMaxChunks: typeof maxChunks === 'number' && maxChunks >= 50 ? Math.round(maxChunks) : get().memoryMaxChunks,
-    })
-    get().persist()
-  },
 
   setDataPath: (dataPath) => {
     set({ dataPath: (dataPath ?? '').trim() })
@@ -1190,6 +1168,18 @@ export const useStore = create<State>((set, get) => ({
     set({ embeddingBaseUrl: (u ?? '').trim() })
     get().persist()
   },
+  setWebSearchTtlDays: (d) => {
+    set({ webSearchTtlDays: Math.max(1, Math.round(d) || 7) })
+    get().persist()
+  },
+  setFetchUrlTtlDays: (d) => {
+    set({ fetchUrlTtlDays: Math.max(1, Math.round(d) || 7) })
+    get().persist()
+  },
+  setRagWebTtlDays: (d) => {
+    set({ ragWebTtlDays: Math.max(1, Math.round(d) || 90) })
+    get().persist()
+  },
 
   setSubagentModel: (agent, model) => {
     set((s) => {
@@ -1203,12 +1193,7 @@ export const useStore = create<State>((set, get) => ({
 
   setMemoryTtlConfig: (c) => {
     set({
-      taskTtlHours: typeof c.task === 'number' && c.task > 0 ? Math.round(c.task) : get().taskTtlHours,
-      shortTermTtlHours: typeof c.shortTerm === 'number' && c.shortTerm > 0 ? Math.round(c.shortTerm) : get().shortTermTtlHours,
-      longTermTtlHours: typeof c.longTerm === 'number' && c.longTerm > 0 ? Math.round(c.longTerm) : get().longTermTtlHours,
       cacheTtlMinutes: typeof c.cache === 'number' && c.cache > 0 ? Math.round(c.cache) : get().cacheTtlMinutes,
-      memoryMaxNotes: typeof c.maxNotes === 'number' && c.maxNotes >= 20 ? Math.round(c.maxNotes) : get().memoryMaxNotes,
-      memorySlidingTtl: typeof c.sliding === 'boolean' ? c.sliding : get().memorySlidingTtl,
     })
     get().persist()
   },
@@ -1614,7 +1599,15 @@ export const useStore = create<State>((set, get) => ({
   },
 
   accrueChatUsage: (chatId, providerId, model, delta) => {
-    if ((delta.input || 0) <= 0 && (delta.output || 0) <= 0) return
+    // Keep cache-only events (input=0, output=0, but cacheRead/cacheWrite>0):
+    // those are real billed tokens and must not be dropped, otherwise the
+    // cached portion silently disappears from the totals.
+    const hasTokens =
+      (delta.input || 0) > 0 ||
+      (delta.output || 0) > 0 ||
+      (delta.cacheRead || 0) > 0 ||
+      (delta.cacheWrite || 0) > 0;
+    if (!hasTokens) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== chatId) return c

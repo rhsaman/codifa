@@ -83,6 +83,8 @@ def model_dir() -> str:
         base = os.path.dirname(os.path.abspath(__file__))
     preferred: list[str] = []
     rest: list[str] = []
+    if not os.path.isdir(base):
+        return ""
     for name in sorted(os.listdir(base)):
         if not name.startswith("models--"):
             continue

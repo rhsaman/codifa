@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import itertools
 import json
-import hashlib
 import logging
 import os
 import re
@@ -58,7 +58,6 @@ from langgraph.graph import END, START, StateGraph
 import agents as _agents
 import state_db
 from agents import normalize_mode
-from context_builder import build_context as _build_rag_context
 from llm import (
     _is_stream_options_error,
     _strip_stream_options,
@@ -67,7 +66,7 @@ from llm import (
     llm_generate,
 )
 from mcp_bridge import build_mcp_tools
-from tools import _PARENT_TOOLS_CTX, make_tool_callbacks, _tool_event
+from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
 MAX_DEBUG_ATTEMPTS = 3
 
@@ -342,8 +341,6 @@ def filter_tools_for_mode(
     if mode == "ask" and _agents._trivial_prompt(prompt):
         for n in (
             "update_plan",
-            "memory",
-            "search_memory",
             "ask_user",
             "request_permission",
         ):
@@ -370,17 +367,9 @@ def filter_tools_for_mode(
                 tools["run_terminal"], root, scoped_paths
             )
     # Auto-router: steer BROAD / repeated searches to the explore sub-agent.
-    # Applied to the search/web tools in the NON-scoped case (in scoped mode
-    # glob/task are already stripped, and grep/read are wrapped for scope). The
-    # router only intercepts genuinely broad or repeated calls — targeted
-    # grep/glob/read/web_search/fetch_url still run directly, before AND after
-    # any explore call, so the model keeps full direct access for precise
-    # lookups. The explore sub-agent itself also has web_search/fetch_url/glob/
-    # grep/read, so wide searches (and the docs they need) run in isolation.
-    if not scoped:
-        for n in ("grep", "glob", "read", "web_search", "fetch_url"):
-            if n in tools:
-                tools[n] = _agents._wrap_auto_explore_router(tools[n])
+    # محدودیت step روی grep/glob/read برداشته شد — روتر auto-explore غیرفعاله،
+# پس جستجوها مستقیم اجرا می‌شن و هیچ‌کدوم مسدود نمی‌شن. agent خودش تصمیم می‌گیره
+# کی یه broad search رو به explore sub-agent بده (طبق SEARCH STRATEGY prompt).
 
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
@@ -680,8 +669,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     """
     import os
 
-    from tools import open_vector_store
-
     root = state["root"]
     mode = state["mode"]
     prompt = (state.get("request") or "").strip()
@@ -736,10 +723,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001
             ctx = 0
     ctx = max(0, ctx)
-
-    store = open_vector_store(
-        root, state.get("vector_db_path", ""), state.get("vector_config")
-    )
 
     cap = state.get("cap")
     # All sub-agents (search / web / explore / vision / compact distills) and the
@@ -841,7 +824,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
         permit={"outside": allow_outside},
-        store=store,
         chat_id=chat_id,
     )
 
@@ -978,64 +960,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if project_memory:
         system_final += project_memory
 
-    # RAG auto-recall (learned memory + project-file/web context).
-    try:
-        from retrieval import RetrievalSettings
-
-        rag_settings = RetrievalSettings.from_dict(state.get("retrieval_config"))
-    except Exception:  # noqa: BLE001
-        rag_settings = None
-    learned_memory = ""
-    rag_block_for_user = ""
-    if rag_settings and getattr(rag_settings, "auto_recall", False):
-        # Recall the saved memory (learned notes) automatically ONLY on the
-        # FIRST message of a chat, or when the user EXPLICITLY asks to look at
-        # memory (e.g. "از مموری ببین"). Every recall re-sends the whole context
-        # to the provider, so injecting memory on every turn quietly multiplies
-        # token cost — it must not happen automatically after the first message.
-        # An explicit request recalls exactly that one turn (it is re-evaluated
-        # per message, so it does not flip on a persistent "always recall" flag).
-        _history = state.get("history") or []
-        _first_msg = len(_history) == 0
-        _explicit_recall = bool(_MEMORY_RECALL_CUES.search(prompt or ""))
-        if _first_msg or _explicit_recall:
-            try:
-                learned_memory = _agents._load_learned_memory(store, prompt)
-            except Exception:  # noqa: BLE001
-                learned_memory = ""
-            if learned_memory:
-                system_final += learned_memory
-                queue.put_nowait(
-                    _tool_event(
-                        {
-                            "kind": "tool",
-                            "tool": "search_memory",
-                            "args": {"query": prompt[:300], "auto": True},
-                            "summary": "recalled saved memory notes from the vector store",
-                        }
-                    )
-                )
-        # Project file/web RAG context is a SEPARATE mechanism from the learned
-        # memory recall above and continues to be injected when enabled. It
-        # depends on the CURRENT prompt, so keep it OUT of the system prompt
-        # (it would break the cache prefix every turn) and inject it into the
-        # user turn instead.
-        try:
-            if rag_settings.active_kinds():
-                rag_block_for_user = (
-                    _build_rag_context(
-                        store,
-                        prompt,
-                        rag_settings,
-                        max_chars=2600,
-                        per_section_chars=1200,
-                        kinds=("file", "web"),
-                    )
-                    or ""
-                )
-        except Exception:  # noqa: BLE001
-            rag_block_for_user = ""
-
     # Skills.
     system_final += _build_skills_section(skills or [], root)
 
@@ -1046,6 +970,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             saved = ""
         if saved:
             system_final += saved
+
+    # نقشه‌ی نماد لحظه‌ای (CODE MAP) — مدل مستقیماً می‌ره سراغ read،
+    # بدون نیاز به grep/glob کورکورانه. جایگزین ایندکس کد در RAG.
+    # فقط برای مودهای کد تزریق می‌شه (ask/reader/chat نماد نمی‌خوان) و
+    # به user turn اضافه می‌شه (نه سیستم‌پرامپت) تا کشِ پیشوند نشکنه.
+    code_map_block = ""
+    if mode in ("coder", "plan", "ask"):
+        try:
+            from symbol_index import format_symbol_map
+
+            # ask توکن‌حساس‌تره → فقط ۱۰ فایل (درختی) نشون می‌دیم.
+            max_files = 10 if mode == "ask" else 30
+            code_map_block = format_symbol_map(root, max_files=max_files) if root else ""
+        except Exception:  # noqa: BLE001
+            code_map_block = ""
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -1131,8 +1070,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # spikes and unstable input_tokens).
     if lang_directive:
         user_parts.append(lang_directive)
-    if rag_block_for_user:
-        user_parts.append(rag_block_for_user)
+    if code_map_block:
+        user_parts.append(code_map_block)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
     # vision model, but FALL BACK to the main model (mirroring the `vision`
     # tool's own fallback) so an attached image is ALWAYS analyzed
@@ -1224,7 +1163,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "system_final": system_final,
         "ctx": ctx,
         "scoped_paths": scoped_paths,
-        "store": store,
         "web_model": web_model,
         "compact_model": compact_model,
         "vision_model": vision_model,
@@ -1616,6 +1554,37 @@ async def _compact_tool_history(
     return True
 
 
+def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
+    """Rebuild ``msgs`` in place from a compacted history dict list.
+
+    Keeps the original leading ``SystemMessage`` (the assembled system prompt)
+    and converts each compacted dict back to a LangChain message, mirroring
+    ``llm._auto_compact_subagent``. Tool/assistant turns lose their structured
+    ``tool_calls`` (they become plain text), which is exactly what a compacted
+    summary tail should be — the model only needs the distilled context, not
+    the original callable tool signatures.
+    """
+    rebuilt: list[BaseMessage] = []
+    had_system = bool(msgs) and isinstance(msgs[0], SystemMessage)
+    if had_system:
+        rebuilt.append(msgs[0])
+    for d in new_history:
+        role = d.get("role")
+        content = str(d.get("content") or "")
+        if role == "system" and had_system:
+            # The compacted head is itself a "[Compacted earlier context]"
+            # system note; fold it into the existing system prompt slot rather
+            # than appending a second system message.
+            continue
+        if role == "assistant":
+            rebuilt.append(AIMessage(content=content))
+        elif role == "tool":
+            rebuilt.append(HumanMessage(content=f"[tool result]\n{content}"))
+        else:
+            rebuilt.append(HumanMessage(content=content))
+    msgs[:] = rebuilt
+
+
 async def _maybe_auto_compact(
     state: AgentState,
     queue: asyncio.Queue,
@@ -1694,6 +1663,12 @@ async def _maybe_auto_compact(
     # (the "Model usage" sidebar) is complete.
     if compact_usage:
         queue.put_nowait(compact_usage)
+    # Apply the compaction IN PLACE on the live transcript so the very next step
+    # (and the next turn) sends the compressed history instead of the full one.
+    # Without this the function only emitted a `compact` event while the model
+    # kept receiving the un-compacted `msgs` — so the context never actually
+    # shrank and the turn still overflowed. Mirrors llm._auto_compact_subagent.
+    _apply_compaction_in_place(msgs, new_history)
 
 
 async def _run_mode_turn(
@@ -2217,6 +2192,22 @@ async def _run_mode_turn(
             await _compact_tool_history(
                 msgs, compact_model, max(30_000, int(ctx or 0) * 3)
             )
+            # Bounded context auto-compact: once the assembled prompt reaches the
+            # usable window (ctx - reserved), summarize the older turns in place
+            # so a long-running turn never overflows the model's context. Driven
+            # by the SAME input_tokens the context meter displays
+            # (state["last_input_tokens"], set at the usage-emit site above), so
+            # the meter and the trigger always agree. No-op below the threshold.
+            if ctx > 0:
+                await _maybe_auto_compact(
+                    state,
+                    queue,
+                    model,
+                    compact_model,
+                    msgs,
+                    ctx,
+                    last_input_tokens=state.get("last_input_tokens"),
+                )
         return reply
 
     # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
@@ -2254,7 +2245,7 @@ async def _run_mode_turn(
                     if run_flags is not None:
                         try:
                             run_flags["hard_error"] = True
-                        except Exception:  # noqa: BLE001
+                        except Exception:  # noqa: BLE001, S110
                             pass
                     break
                 # Transient failure: retry up to the budget, 30s apart.
@@ -3052,11 +3043,6 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         state["env_var"],
         state["oauth_token"],
     )
-    from tools import open_vector_store
-
-    store = open_vector_store(
-        root, state.get("vector_db_path", ""), state.get("vector_config")
-    )
     tools = make_tool_callbacks(
         root,
         lambda ev: queue.put_nowait(ev),
@@ -3068,7 +3054,6 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
         permit={"outside": bool(state.get("allow_outside"))},
-        store=store,
         chat_id=state.get("chat_id", ""),
     )
     # Capture ask_user answers so a clarifying reply can re-trigger planning
@@ -3614,28 +3599,8 @@ def _rank_files_semantic(
     appended after the semantic hits. Falls back to pure keyword ranking on
     any failure or an empty/missing index — never raises.
     """
-    try:
-        from tools import open_vector_store
-        from vector_store import KIND_FILE
-
-        store = open_vector_store(
-            root, state.get("vector_db_path", ""), state.get("vector_config")
-        )
-        if store is None or store.count_docs(KIND_FILE) == 0:
-            return _rank_files_by_prompt(files, prompt)
-        hits = store.search(prompt, KIND_FILE, top_k=40, min_score=0.25)
-        fileset = set(files)
-        seen: set[str] = set()
-        order: list[str] = []
-        for h in hits:
-            rel = str((h.get("meta") or {}).get("file_path") or "")
-            if rel in fileset and rel not in seen:
-                order.append(rel)
-                seen.add(rel)
-        rest = [f for f in _rank_files_by_prompt(files, prompt) if f not in seen]
-        return order + rest
-    except Exception:  # noqa: BLE001
-        return _rank_files_by_prompt(files, prompt)
+    # کد پروژه دیگه ایندکس نمی‌شه (KIND_FILE حذف شد) — فقط keyword ranking.
+    return _rank_files_by_prompt(files, prompt)
 
 
 _GREP_HIT_FILE_RE = re.compile(r"^([^\s:]+):\d+:")
@@ -4026,10 +3991,7 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
     # Reset the cross-turn search counter at the START of each user message
     # (not per model-turn), so the auto-router's "repeated calls" threshold is
-    # measured across the whole user-message sequence (coder→test→debug→coder),
-    # not reset on every _run_mode_turn. Fixes the "wait one-by-one" pattern
-    # where the router would block after a few searches within a single message.
-    _agents._reset_search_call_count()
+    # (auto-router disabled — search call counting removed)
     if not (initial.get("request") or "").strip():
         yield {
             "kind": "error",

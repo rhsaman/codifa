@@ -15,6 +15,7 @@ import {
 } from "../lib/store";
 import { api } from "../lib/fs";
 import { PROVIDER_META } from "../lib/provider-meta";
+import { normalizeUsageModel } from "../lib/usage";
 import {
   contextPercent,
   computeContextUsed,
@@ -29,7 +30,6 @@ import {
   computeUsageCost,
 } from "../lib/context";
 import {
-  addMemoryNote,
   steerChat,
   streamChat,
   fetchModels,
@@ -1879,17 +1879,13 @@ export function ChatPanel() {
         const inputTokens = event.input_tokens ?? 0;
         const outputTokens = event.output_tokens ?? 0;
         const total = event.total_tokens ?? inputTokens + outputTokens;
-        const model = (event.model || "").trim() || activeModel || "main";
-        // Accrue into the chat-wide cumulative usage (survives compacts and
-        // chat switches) so the titlebar can show main + sub-agent session
-        // totals and cost separately from the shrinkable current context.
-        // Attribute to THIS panel's chat (captured at render via chatIdRef),
-        // never s.activeChatId — a turn finished while the user is viewing
-        // another chat must still post to the chat the stream belongs to.
-        // The key is "providerId/model" (the provider that ACTUALLY ran this
-        // chat, from getChatProvider) so the sidebar resolves the provider by a
-        // direct split instead of guessing — no scoring, no misattribution.
+        // The provider that ACTUALLY ran this chat (from getChatProvider) — the
+        // authoritative source, no guessing. Stored explicitly on the entry.
         const providerId = getChatProvider(chat.id).id ?? "unknown";
+        const model = normalizeUsageModel(
+          providerId,
+          (event.model || "").trim() || activeModel || "main",
+        );
         // Store the provider + model EXPLICITLY (no key string, no guessing) so
         // the sidebar shows the exact provider/model that ran this chat.
         store.accrueChatUsage(chat.id, providerId, model, {
@@ -1977,9 +1973,9 @@ export function ChatPanel() {
           nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
           vectorDbPath: s.vectorDbPath,
           vectorConfig: {
-            ttl_days: s.memoryTtlDays,
-            max_docs: s.memoryMaxDocs,
-            max_chunks: s.memoryMaxChunks,
+            ttl_days: s.ragWebTtlDays,
+            max_docs: 500,
+            max_chunks: 4000,
           },
           subagentModels: s.subagentModels,
           providers: Object.fromEntries(
@@ -2212,9 +2208,6 @@ export function ChatPanel() {
     // summary and the token-budgeted tail (`keep`) to preserve verbatim — no
     // extra wrapper, and no hardcoded keep=1.
     s.compactChat(ch.id, result.summary, result.keep);
-    // Best-effort: stash the summary in short-term RAG (~24h) so the compressed
-    // history stays recallable via memory later. Never blocks or throws.
-    addMemoryNote(rootDir, result.summary).catch(() => { });
     useStore
       .getState()
       .setChatCompactNotice(

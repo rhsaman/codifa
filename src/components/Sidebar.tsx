@@ -434,7 +434,13 @@ export function Sidebar() {
   >();
   if (activeChat?.usage) {
     for (const u of activeChat.usage.entries) {
-      if (u.input + u.output <= 0) continue;
+      // Keep cache-only entries (input=0, output=0, but cacheRead/cacheWrite>0)
+      // so the cached portion is never silently dropped from the totals.
+      if (
+        (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) <=
+        0
+      )
+        continue;
       // providerId + model are stored EXPLICITLY on the entry (see Chat.tsx /
       // store.ts) — read them directly, no key parsing, no guessing. Any future
       // provider/model displays correctly. Legacy chats (pre-change) are
@@ -1308,6 +1314,10 @@ export function Sidebar() {
                 usageCollapsed ? "Expand Model usage" : "Collapse Model usage"
               }
             >
+              <span className="sidebar-panel-chevron">
+                {usageCollapsed ? "▸" : "▾"}
+              </span>
+              <span className="sidebar-panel-title">Model usage</span>
               <span
                 className="sidebar-usage-grand-total"
                 title={[

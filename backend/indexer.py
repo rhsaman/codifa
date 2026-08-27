@@ -162,6 +162,14 @@ def _chunk_text(text: str, size: int = INDEX_CHUNK_CHARS,
 # are stored (the "code map" design): the file is the source of truth, the
 # index records what-is-where, and content_hash invalidates stale pointers
 # when the code changes.
+#
+# توجه: auto-index کد خاموش شده (نگاه کن به پایین `AUTO_INDEX_CODE`). کد
+# پروژه از طریق CODE MAP (نقشه نماد لحظه‌ای در symbol_index.py) به مدل داده
+# می‌شه، نه از طریق ایندکس RAG. این باعث می‌شه context سبک‌تر بمونه و مدل
+# مستقیماً بره سراغ read.
+
+# آیا ایندکس خودکار کد فعال باشه؟ (خاموش — کد از طریق CODE MAP تزریق می‌شه)
+AUTO_INDEX_CODE = False
 _CODE_LANGUAGES = {
     "python", "javascript", "typescript", "jsx", "tsx", "vue", "svelte",
     "go", "rust", "java", "kotlin", "swift", "ruby", "php", "c", "cpp",
@@ -325,8 +333,26 @@ def index_workspace(
     documents this run (new/changed first, rest next time). Returns a stats
     dict ``{"total": int, "indexed": int, "pruned": int, "skipped": int,
     "unchanged": int}``. Never raises.
+
+    وقتی ``AUTO_INDEX_CODE`` خاموش باشه (پیش‌فرض فعلی)، فقط اسناد قدیمی
+    KIND_FILE رو پاک‌سازی می‌کنه و ایندکس جدیدی نمی‌سازه — چون کد از طریق
+    CODE MAP تزریق می‌شه.
     """
     stats = {"total": 0, "indexed": 0, "pruned": 0, "skipped": 0, "unchanged": 0}
+    if not AUTO_INDEX_CODE:
+        # فقط پاک‌سازی اسناد KIND_FILE قدیمی (اگه موجود باشن)
+        try:
+            existing = store.all_doc_meta(KIND_FILE)
+        except Exception:  # noqa: BLE001
+            return stats
+        for key in existing:
+            if key.startswith("file:"):
+                try:
+                    store.remove(key)
+                    stats["pruned"] += 1
+                except Exception:  # noqa: BLE001, S110
+                    pass
+        return stats
     try:
         scan = scan_workspace(root, max_files)
     except Exception:  # noqa: BLE001

@@ -418,7 +418,7 @@ textarea {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   padding: 7px 8px 7px 13px;
   border-radius: 12px;
   cursor: pointer;
@@ -475,13 +475,13 @@ textarea {
   white-space: nowrap;
   text-align: right;
   direction: rtl;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 500;
 }
 
 /* Row that keeps the streaming dot inline with the chat title instead of a
-   full-width flex child below it (.chat-item is a column layout). Right
-   padding keeps long titles from running under the ⋯ kebab button. */
+   full-width flex child below it (.chat-item is a column layout). The gap on
+   .chat-item keeps long titles from running under the ⋯ kebab button. */
 .chat-item-title-row {
   display: flex;
   align-items: center;
@@ -491,7 +491,6 @@ textarea {
   direction: rtl;
   text-align: right;
   order: 1;
-  padding-right: 28px;
 }
 
 /* Pinned chats tint their title with the accent color. */
@@ -616,7 +615,6 @@ textarea {
   flex: 0 0 auto;
   z-index: 5;
   order: 3;
-  margin-inline-start: 6px;
 }
 
 .chat-item-kebab {
@@ -1350,7 +1348,7 @@ textarea {
   gap: 2px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
@@ -1359,8 +1357,14 @@ textarea {
   letter-spacing: 0;
 }
 
+.sidebar-usage-grand-cache {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
 .sidebar-usage-grand-cost {
   color: var(--success);
+  font-weight: 700;
 }
 
 .sidebar-usage-reset {

@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
-import { clearMemory, downloadModel, fetchModels, getMemoryStats, getModelsStatus, listSkills, removeModel, syncSkill, type MemoryStats, type ModelsStatus } from '../lib/api'
+import { downloadModel, fetchModels, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
@@ -434,7 +434,7 @@ function PluginEditor() {
   )
 }
 
-export function SettingsModal({ onClose }: { onClose: () => void }) {
+export function SettingsModal({ onClose, initialTab }: { onClose: () => void; initialTab?: string }) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
   const addProvider = useStore((s) => s.addProvider)
@@ -448,27 +448,22 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const setFontSize = useStore((s) => s.setFontSize)
   const dataPath = useStore((s) => s.dataPath)
   const setDataPath = useStore((s) => s.setDataPath)
-  const memoryTtlDays = useStore((s) => s.memoryTtlDays)
-  const memoryMaxDocs = useStore((s) => s.memoryMaxDocs)
-  const memoryMaxChunks = useStore((s) => s.memoryMaxChunks)
-  const setMemoryConfig = useStore((s) => s.setMemoryConfig)
   const whisperModel = useStore((s) => s.whisperModel)
   const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
-  const embeddingModel = useStore((s) => s.embeddingModel)
-  const embeddingBaseUrl = useStore((s) => s.embeddingBaseUrl)
   const setWhisperModel = useStore((s) => s.setWhisperModel)
   const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
-  const setEmbeddingModel = useStore((s) => s.setEmbeddingModel)
-  const setEmbeddingBaseUrl = useStore((s) => s.setEmbeddingBaseUrl)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
-  const taskTtlHours = useStore((s) => s.taskTtlHours)
-  const shortTermTtlHours = useStore((s) => s.shortTermTtlHours)
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
-  const memorySlidingTtl = useStore((s) => s.memorySlidingTtl)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
   const compactHeadroom = useStore((s) => s.settings.compactHeadroom ?? 20000)
   const setCompactHeadroom = useStore((s) => s.setCompactHeadroom)
+  const webSearchTtlDays = useStore((s) => s.webSearchTtlDays ?? 7)
+  const setWebSearchTtlDays = useStore((s) => s.setWebSearchTtlDays)
+  const fetchUrlTtlDays = useStore((s) => s.fetchUrlTtlDays ?? 7)
+  const setFetchUrlTtlDays = useStore((s) => s.setFetchUrlTtlDays)
+  const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
+  const setRagWebTtlDays = useStore((s) => s.setRagWebTtlDays)
   const root = useStore((s) => s.root)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
@@ -505,7 +500,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'memory' | 'tools' | 'models' | 'general'>('providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
     clientId: googleProvider?.oauthClientId ?? '',
@@ -571,77 +566,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  // ---- Memory TTL / caps + clear (Settings → Memory) ----
-  const [ttlInput, setTtlInput] = useState(String(memoryTtlDays))
-  const [maxDocsInput, setMaxDocsInput] = useState(String(memoryMaxDocs))
-  const [maxChunksInput, setMaxChunksInput] = useState(String(memoryMaxChunks))
-  const [taskTtlInput, setTaskTtlInput] = useState(String(taskTtlHours))
-  const [shortTermTtlInput, setShortTermTtlInput] = useState(String(shortTermTtlHours))
+  // ---- Storage settings (Settings → Storage) ----
   const [cacheTtlInput, setCacheTtlInput] = useState(String(cacheTtlMinutes))
-  const [slidingInput, setSlidingInput] = useState(memorySlidingTtl)
   const [memMsg, setMemMsg] = useState('')
-  const [memStats, setMemStats] = useState<MemoryStats | null>(null)
-  const [clearing, setClearing] = useState(false)
-
-  useEffect(() => {
-    setTtlInput(String(memoryTtlDays))
-    setMaxDocsInput(String(memoryMaxDocs))
-    setMaxChunksInput(String(memoryMaxChunks))
-  }, [memoryTtlDays, memoryMaxDocs, memoryMaxChunks])
-
-  const refreshMemStats = useCallback(async () => {
-    if (!root) {
-      setMemStats(null)
-      return
-    }
-    setMemStats(await getMemoryStats(root))
-  }, [root])
-
-  useEffect(() => {
-    if (tab !== 'memory') return
-    void refreshMemStats()
-  }, [tab, refreshMemStats])
-
-  const applyMemoryConfig = () => {
-    setMemMsg('')
-    const ttl = parseInt(ttlInput, 10)
-    const maxDocs = parseInt(maxDocsInput, 10)
-    const maxChunks = parseInt(maxChunksInput, 10)
-    if (!Number.isFinite(ttl) || ttl < 1) {
-      setMemMsg('TTL must be at least 1 day.')
-      return
-    }
-    if (!Number.isFinite(maxDocs) || maxDocs < 10) {
-      setMemMsg('Max documents must be at least 10.')
-      return
-    }
-    if (!Number.isFinite(maxChunks) || maxChunks < 50) {
-      setMemMsg('Max chunks must be at least 50.')
-      return
-    }
-    setMemoryConfig({ ttlDays: ttl, maxDocs, maxChunks })
-    setMemMsg(`Saved: TTL ${ttl} days, max ${maxDocs} docs, max ${maxChunks} chunks. Applied on the next run.`)
-    void refreshMemStats()
-  }
-
-  const doClearMemory = async () => {
-    if (!root) {
-      setMemMsg('No active workspace to clear.')
-      return
-    }
-    if (!window.confirm('Clear all RAG memory for this workspace? Memory notes and saved web pages will be permanently deleted.')) return
-    setClearing(true)
-    setMemMsg('')
-    try {
-      const res = await clearMemory(root)
-      setMemMsg(res.ok ? 'RAG memory cleared.' : `Could not clear: ${res.error ?? 'unknown error'}`)
-    } catch (err) {
-      setMemMsg(`Could not clear: ${(err as Error).message}`)
-    } finally {
-      setClearing(false)
-      void refreshMemStats()
-    }
-  }
 
   const refreshModels = useCallback(async () => {
     setMStatus(await getModelsStatus())
@@ -659,8 +586,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     'downloading'
 
   const actDownload = async (kind: 'whisper' | 'embedding') => {
-    const repo = kind === 'whisper' ? whisperModel : embeddingModel
-    const base = kind === 'whisper' ? whisperBaseUrl : embeddingBaseUrl
+    const repo = kind === 'whisper' ? whisperModel : 'intfloat/multilingual-e5-base'
+    const base = kind === 'whisper' ? whisperBaseUrl : ''
     setModelsMsg('')
     try {
       await downloadModel(kind, repo, base)
@@ -1051,12 +978,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       ),
     },
     {
-      id: 'memory',
-      label: 'Memory',
+      id: 'storage',
+      label: 'Storage',
       group: 'Knowledge',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M9 4a3 3 0 0 0-3 3v.2A3 3 0 0 0 4 10v1a3 3 0 0 0 1 2.24V15a3 3 0 0 0 3 3h1M15 4a3 3 0 0 1 3 3v.2a3 3 0 0 1 2 2.8v1a3 3 0 0 1-1 2.24V15a3 3 0 0 1-3 3h-1M9 4v16M15 4v16" />
+          <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+          <path d="m3.3 7 8.7 5 8.7-5M12 22V12" />
         </svg>
       ),
     },
@@ -1823,38 +1751,37 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </>
         )}
 
-        {tab === 'memory' && (
+        {tab === 'storage' && (
         <>
-          {/* ===== RAG memory (vector store) ===== */}
+          {/* ===== Web & Fetch cache TTL (separate) ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
-              <span className="settings-group-icon">🧠</span>
+              <span className="settings-group-icon">🌐</span>
               <div>
-                <div className="settings-group-title">RAG memory</div>
+                <div className="settings-group-title">Web &amp; Fetch cache</div>
                 <div className="settings-group-desc">
-                  Long-term recall: memory notes and saved web pages are embedded into a local
-                  vector store and auto-injected into future sessions.
+                  How long web search results and fetched pages stay cached before a re-fetch.
+                  Set each separately — web results change faster than fetched docs.
                 </div>
               </div>
             </div>
 
             <div className="settings-row">
               <div className="settings-row-label">
-                <div className="settings-row-title">Retention (TTL)</div>
+                <div className="settings-row-title">Web search cache TTL</div>
                 <div className="settings-row-desc">
-                  How long <b>memory notes</b> and <b>saved web pages (from fetch tool)</b> stay in
-                  the vector store before expiring. Set high (e.g. <code>3650</code> = 10 years) to
-                  keep everything indefinitely. <b>Unit: days</b> (unlike short-term notes which use hours).
+                  How long <b>web search results</b> stay cached. Default: <code>7</code> days.
                 </div>
               </div>
               <div className="settings-row-control">
                 <input
                   type="number"
                   min={1}
-                  value={ttlInput}
-                  onChange={(e) => setTtlInput(e.target.value)}
+                  max={365}
+                  value={webSearchTtlDays}
+                  onChange={(e) => setWebSearchTtlDays(Number(e.target.value))}
                   dir="ltr"
-                  aria-label="RAG memory retention TTL in days"
+                  aria-label="Web search cache TTL in days"
                 />
                 <span className="field-unit">days</span>
               </div>
@@ -1862,133 +1789,59 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
             <div className="settings-row">
               <div className="settings-row-label">
-                <div className="settings-row-title">Max documents / Max chunks</div>
+                <div className="settings-row-title">Fetch URL cache TTL</div>
                 <div className="settings-row-desc">
-                  Hard caps on total stored documents and chunks per workspace. When limits are
-                  reached, the oldest entries are evicted first (FIFO).
+                  How long <b>fetched pages</b> stay cached. Default: <code>7</code> days.
                 </div>
               </div>
               <div className="settings-row-control">
                 <input
                   type="number"
-                  min={10}
-                  value={maxDocsInput}
-                  onChange={(e) => setMaxDocsInput(e.target.value)}
-                  placeholder="500"
+                  min={1}
+                  max={365}
+                  value={fetchUrlTtlDays}
+                  onChange={(e) => setFetchUrlTtlDays(Number(e.target.value))}
                   dir="ltr"
-                  aria-label="Max documents"
+                  aria-label="Fetch URL cache TTL in days"
                 />
-                <span className="field-unit" style={{opacity: 0.5}}>/</span>
-                <input
-                  type="number"
-                  min={50}
-                  value={maxChunksInput}
-                  onChange={(e) => setMaxChunksInput(e.target.value)}
-                  placeholder="4000"
-                  dir="ltr"
-                  aria-label="Max chunks"
-                />
-                <button className="btn tiny" onClick={applyMemoryConfig}>Save</button>
+                <span className="field-unit">days</span>
               </div>
             </div>
           </div>
 
-          {/* ===== Agent memory notes ===== */}
+          {/* ===== RAG web/fetch storage TTL ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
-              <span className="settings-group-icon">📝</span>
+              <span className="settings-group-icon">🗄️</span>
               <div>
-                <div className="settings-group-title">Agent memory notes</div>
+                <div className="settings-group-title">RAG storage (web/fetch)</div>
                 <div className="settings-group-desc">
-                  Short notes the agent saves about your project while working. Each note type has
-                  its own lifetime; expired notes are purged automatically. <b>Sliding TTL</b> (below)
-                  extends the lifetime on every read/use so active notes don't vanish mid-task.
+                  When an embedding model is available, web/fetch results are also stored in the
+                  local vector store for semantic recall. This is <b>optional</b> — without an
+                  embedding model, web search and fetch still work (just no RAG recall).
                 </div>
               </div>
             </div>
 
             <div className="settings-row">
               <div className="settings-row-label">
-                <div className="settings-row-title">Task notes TTL</div>
+                <div className="settings-row-title">RAG web/fetch storage TTL</div>
                 <div className="settings-row-desc">
-                  <b>For: In-flight work notes</b> — e.g. "currently refactoring X", "fixing bug in Y",
-                  "next step is Z". Temporary scratchpad for active tasks.
-                  Expires after this many hours of inactivity. Default: <code>6h</code>.
+                  How long stored web/fetch chunks remain in the vector store before expiring.
+                  Default: <code>90</code> days.
                 </div>
               </div>
               <div className="settings-row-control">
                 <input
                   type="number"
                   min={1}
-                  value={taskTtlInput}
-                  onChange={(e) => setTaskTtlInput(e.target.value)}
+                  max={3650}
+                  value={ragWebTtlDays}
+                  onChange={(e) => setRagWebTtlDays(Number(e.target.value))}
                   dir="ltr"
-                  aria-label="Task notes TTL in hours"
+                  aria-label="RAG web/fetch storage TTL in days"
                 />
-                <span className="field-unit">hours</span>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Short-term notes TTL</div>
-                <div className="settings-row-desc">
-                  <b>For: Transient observations & session context</b> — e.g. "user prefers tabs",
-                  "API key is in .env.local", "project uses pnpm". Longer-lived than task notes.
-                  Expires after this many hours of inactivity. Default: <code>24h</code>.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={1}
-                  value={shortTermTtlInput}
-                  onChange={(e) => setShortTermTtlInput(e.target.value)}
-                  dir="ltr"
-                  aria-label="Short-term notes TTL in hours"
-                />
-                <span className="field-unit">hours</span>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Sliding TTL</div>
-                <div className="settings-row-desc">
-                  When <b>enabled</b>, every read or use of a note <b>resets its expiry timer</b>.
-                  Active notes stay alive indefinitely; only truly unused notes expire. Applies to
-                  both Task and Short-term notes. Default: <code>on</code>.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <label className="switch" title="Enable sliding TTL (reset expiry on read/use)">
-                  <input type="checkbox" checked={slidingInput} onChange={(e) => setSlidingInput(e.target.checked)} />
-                  <span className="switch-slider" />
-                </label>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Save TTL config</div>
-                <div className="settings-row-desc">
-                  Persists Task, Short-term, Cache TTLs and Sliding TTL to settings. Changes take
-                  effect immediately for <b>new notes</b>; existing notes keep their original expiry.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <button className="btn tiny" onClick={() => {
-                  const t = parseInt(taskTtlInput, 10)
-                  const s = parseInt(shortTermTtlInput, 10)
-                  const c = parseInt(cacheTtlInput, 10)
-                  setMemoryTtlConfig({
-                    task: Number.isFinite(t) ? t : 6,
-                    shortTerm: Number.isFinite(s) ? s : 24,
-                    cache: Number.isFinite(c) ? c : 60,
-                    sliding: slidingInput,
-                  })
-                  setMemMsg('Memory TTL config saved.')
-                }}>Save TTL config</button>
+                <span className="field-unit">days</span>
               </div>
             </div>
           </div>
@@ -1998,10 +1851,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <div className="settings-group-head">
               <span className="settings-group-icon">⚡</span>
               <div>
-                <div className="settings-group-title">Result cache</div>
+                <div className="settings-group-title">Tool result cache</div>
                 <div className="settings-group-desc">
-                  Speeds up repeated work by caching tool outputs. Cached results are reused
-                  within the TTL window, avoiding redundant fetches/searches.
+                  Speeds up repeated work by caching tool outputs (searches, reads, runs) in memory.
+                  Cached results are reused within the TTL window.
                 </div>
               </div>
             </div>
@@ -2010,8 +1863,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <div className="settings-row-label">
                 <div className="settings-row-title">Cache TTL</div>
                 <div className="settings-row-desc">
-                  How long <b>fetched web pages (fetch tool)</b>, <b>search results</b>, and
-                  <b>tool outputs</b> stay cached before being re-fetched. Default: <code>60min</code>.
+                  How long <b>tool outputs</b> stay cached before re-running. Default: <code>60min</code>.
                 </div>
               </div>
               <div className="settings-row-control">
@@ -2061,7 +1913,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 <div className="settings-row-title">Data path</div>
                 <div className="settings-row-desc">
                   All app data lives under this path: settings (<code>settings.json</code>), chats,
-                  vector stores, models, memory, skills, MCP connectors, and plans. Moving the path
+                  vector stores, models, skills, MCP connectors, and plans. Moving the path
                   copies every file to the new location and empties the old one. The default{' '}
                   <code>~/.codifa</code> works the same on macOS, Linux, and Windows
                   (<code>~/</code> = your home directory).
@@ -2088,63 +1940,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 </div>
               )}
               {dataMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{dataMsg}</div>}
-            </div>
-          </div>
-
-          {memStats && memStats.available && (
-            <div className="settings-group">
-              <div className="settings-group-head">
-                <span className="settings-group-icon">📊</span>
-                <div>
-                  <div className="settings-group-title">Current usage</div>
-                  <div className="settings-group-desc">
-                    Live stats for this workspace's vector store.
-                  </div>
-                </div>
-              </div>
-              <div className="settings-row">
-                <div className="settings-row-label">
-                  <div className="settings-row-title">Documents / Chunks</div>
-                  <div className="settings-row-desc">
-                    <code>{memStats.docs}</code> docs / <code>{memStats.chunks}</code> chunks in
-                    <code>{memStats.db || 'workspace store'}</code>.
-                  </div>
-                </div>
-              </div>
-              <div className="settings-row">
-                <div className="settings-row-label">
-                  <div className="settings-row-title">Active limits</div>
-                  <div className="settings-row-desc">
-                    TTL: <code>{memStats.ttl_days}d</code> · Max docs: <code>{memStats.max_docs}</code> · Max chunks: <code>{memStats.max_chunks}</code>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div className="settings-group">
-            <div className="settings-group-head">
-              <span className="settings-group-icon">🗑️</span>
-              <div>
-                <div className="settings-group-title">Danger zone</div>
-                <div className="settings-group-desc">
-                  Irreversible actions. Use with caution.
-                </div>
-              </div>
-            </div>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Clear RAG memory</div>
-                <div className="settings-row-desc">
-                  Permanently deletes <b>all memory notes</b> and <b>saved web pages</b> for this
-                  workspace. This cannot be undone.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <button className="btn tiny danger" onClick={doClearMemory} disabled={clearing}>
-                  {clearing ? 'Clearing…' : 'Clear RAG memory'}
-                </button>
-              </div>
             </div>
           </div>
 
@@ -2240,13 +2035,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <span className={`status-dot ${(mStatus?.embedding?.dirs ?? []).some((d) => d.ready) ? 'ok' : ''}`} />
                 </div>
                 <div className="mcp-fields">
-                  <label className="field-label">Model (repo id)</label>
-                  <input value={embeddingModel} onChange={(e) => setEmbeddingModel(e.target.value)} dir="ltr" placeholder="intfloat/multilingual-e5-base" />
-                  <label className="field-label">Mirror base URL (optional)</label>
-                  <input value={embeddingBaseUrl} onChange={(e) => setEmbeddingBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
                   <div className="hint">
-                    A custom model may have a different vector width — existing memory notes might not
-                    match; after switching, consider removing the old build.
+                    The embedding model downloads automatically in the background (default:
+                    <code> intfloat/multilingual-e5-base</code>). RAG for web/fetch is optional —
+                    if the model isn't downloaded yet, web search and fetch still work without it.
                   </div>
                   <ModelStatusCard status={mStatus?.embedding} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
                   <div className="skill-actions">

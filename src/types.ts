@@ -123,11 +123,6 @@ export interface Settings {
   /** Directory for the per-workspace RAG vector store (memory + web chunks).
    *  Empty string = default ({dataPath}/vector-db). */
   vectorDbPath?: string
-  /** RAG store bounds: notes/pages expire after memoryTtlDays (from last
-   *  update), capped at memoryMaxDocs docs / memoryMaxChunks chunks. */
-  memoryTtlDays?: number
-  memoryMaxDocs?: number
-  memoryMaxChunks?: number
   /** User-level data root: app DB (coder.db), skills/plans/mcp files and the
    *  vector store all live under this folder. Default: ~/.codifa. */
   dataPath?: string
@@ -137,6 +132,11 @@ export interface Settings {
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
+  /** TTL for web search / fetch cache (days). Default: 7. */
+  webSearchTtlDays?: number
+  fetchUrlTtlDays?: number
+  /** TTL for RAG web/fetch storage (days). Default: 90. */
+  ragWebTtlDays?: number
   /** Web-search engines for the web_search tool (Settings → Plugins). Order
    *  decides primary vs fallback. Empty = DuckDuckGo only (backward compat). */
   searchPlugins?: SearchPluginConfig[]
@@ -160,21 +160,8 @@ export interface Settings {
    *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`
    *  (opencode's `usable`). Default 20_000. */
   compactHeadroom?: number
-  /** Memory TTL / cache config — configurable from Settings → Memory. */
-  memory?: {
-    /** TASK memory lifetime in hours (default 6). */
-    taskTtlHours?: number
-    /** SHORT_TERM memory lifetime in hours (default 24). */
-    shortTermTtlHours?: number
-    /** LONG_TERM memory lifetime in hours (default 8760 = 1 year). */
-    longTermTtlHours?: number
-    /** Cache TTL for search/web/tool results in minutes (default 60). */
-    cacheTtlMinutes?: number
-    /** Max memory notes (default 500). */
-    maxNotes?: number
-    /** Whether to extend TTL on access (sliding TTL, default true). */
-    slidingTtl?: boolean
-  }
+  /** Tool result cache TTL in minutes (default 60). */
+  cacheTtlMinutes?: number
 }
 
 /** A first-class workspace in the sidebar. ``root`` is the project folder; may

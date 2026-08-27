@@ -11,5 +11,5 @@ python pakcages is in pyproject.toml, for installing package in python must use 
 
 # front end
 
-The actual test is run with npm run test:frontend, which executes run-frontend.sh.
+The actual test is run with npm run test:frontend.
 tests must be in test/

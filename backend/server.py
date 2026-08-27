@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1022,21 +1023,42 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
     goes silent for `timeout` seconds so idle sockets survive proxy/OS/TCP
     timeouts mid-stream. The frontend forwards `: `-prefixed lines as a
     `keepalive` event and refreshes its stall watchdog, so a long-running tool is
-    never mistaken for a dead connection."""
+    never mistaken for a dead connection.
+
+    IMPORTANT: `shield` only protects `pending` from the keepalive timeout —
+    it does NOT mean a real outer cancellation (client disconnect / aborted
+    fetch) should leave the agent running. If this generator itself gets
+    cancelled (or closed) while `pending` is in flight, we must explicitly
+    cancel `pending` too, otherwise the underlying run_graph/_drive task keeps
+    running orphaned in the background with nobody consuming its events. Left
+    alone, it eventually reaches a "clean finish" and clears the durable
+    turn-resume file even though the user never saw the result — the bug
+    behind "interrupts with no log/error and the resume file is gone"."""
     pending = None
-    while True:
-        if pending is None:
-            pending = asyncio.ensure_future(agent_iter.__anext__())
-        try:
-            # shield keeps the in-flight __anext__() alive across timeouts so a
-            # slow event isn't dropped — we just keep waiting and emit sentinels.
-            event = await asyncio.wait_for(asyncio.shield(pending), timeout=timeout)
-            pending = None
-            yield event
-        except asyncio.TimeoutError:
-            yield {"kind": "_keepalive"}
-        except StopAsyncIteration:
-            return
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(agent_iter.__anext__())
+            try:
+                # shield keeps the in-flight __anext__() alive across the
+                # keepalive TIMEOUT specifically — we just keep waiting and
+                # emit sentinels. A genuine outer cancellation is handled by
+                # the try/except CancelledError wrapping the whole loop below.
+                event = await asyncio.wait_for(asyncio.shield(pending), timeout=timeout)
+                pending = None
+                yield event
+            except asyncio.TimeoutError:
+                yield {"kind": "_keepalive"}
+            except StopAsyncIteration:
+                return
+    except asyncio.CancelledError:
+        # Real disconnect/abort (not a keepalive timeout): cancel the shielded
+        # agent task instead of letting it run orphaned to completion.
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pending
+        raise
 
 
 @app.post("/chat/stream")

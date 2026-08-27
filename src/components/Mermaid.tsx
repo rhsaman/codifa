@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from 'react'
 import mermaid from 'mermaid'
 import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
+import { applyRtlToSvgText } from '../lib/bidi'
 
 // Read the app's theme colors from CSS variables so the diagram matches the
 // rest of the UI (and adapts automatically if a light theme is ever added).
@@ -95,7 +96,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
     mermaid
       .render(id, chart, container)
       .then((r) => {
-        setSvg(r.svg)
+        setSvg(applyRtlToSvgText(r.svg))
         return r
       })
       .catch(() => {
@@ -110,7 +111,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
         return mermaid.render(`${id}-retry`, chart, container)
       })
       .then((r) => {
-        if (r) setSvg(r.svg)
+        if (r) setSvg(applyRtlToSvgText(r.svg))
       })
       .catch(() => setFailed(true))
       .finally(cleanup)

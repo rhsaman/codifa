@@ -1850,6 +1850,7 @@ textarea {
   color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
+  unicode-bidi: plaintext;
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-x: auto;
@@ -7563,30 +7564,50 @@ textarea {
   border-radius: 8px;
   max-height: 360px;
   overflow: auto;
-  /* Unified grid (not one grid per row) so "before"/"after" code columns are
-     sized consistently by their WIDEST line across every row — see the
-     `display: contents` rule below for how row/head wrappers plug into it.
-     Code columns are at least as wide as their widest line (so long lines
-     never overlap the neighbouring column) but stretch to fill the card when
-     the content is shorter — that's what makes a full-width diff actually
-     use the width instead of leaving a dead empty area. */
-  display: grid;
-  grid-template-columns: 2.5em minmax(max-content, 1fr) 2.5em minmax(max-content,
-      1fr);
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-dim) transparent;
+  /* Two independent columns (before | after) laid out side-by-side with flex.
+     Each column is its own block context, so selecting text in one can never
+     drag the other along. `min-width: max-content` lets a column grow to fit
+     long code lines so they scroll horizontally instead of overlapping. */
+  display: flex;
+  align-items: flex-start;
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-.diff-side-row,
-.diff-side-head {
-  /* Makes the wrapper invisible to layout: its children become direct items
-     of the `.diff-side` grid above instead of a nested grid of their own —
-     that's what keeps every row's columns aligned to one shared width. */
-  display: contents;
+/* اسکرول‌بار دیف توی چت: رنگ پررنگ‌تر تا روی بک‌گراند دیده بشه */
+.diff-side::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.diff-side::-webkit-scrollbar-track {
+  background: transparent;
+}
+.diff-side::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
+  border-radius: 5px;
+  border: 2px solid var(--bg-raised);
+}
+.diff-side::-webkit-scrollbar-thumb:hover {
+  background: var(--text);
 }
 
-.diff-side-head>span {
+/* Each column is a flex child: its rows stack vertically (one per line) and
+   stay aligned with the other column by identical line-height. The rows
+   themselves are grids (num | code). `min-width: max-content` lets the column
+   grow to its longest line so long lines scroll horizontally instead of
+   overflowing into the other column. */
+.diff-col {
+  flex: 1 1 0;
+  min-width: max-content;
+}
+.diff-col-before {
+  border-right: 1px solid var(--hairline);
+}
+
+.diff-side-head {
   position: sticky;
   top: 0;
   z-index: 1;
@@ -7595,33 +7616,30 @@ textarea {
   font-weight: 600;
   color: var(--text-dim);
   font-size: 10.5px;
-}
-
-.diff-side-head>span:nth-child(1) {
-  grid-column: 1 / 3;
   padding: 3px 10px;
+}
+.diff-col-before > .diff-side-head {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 12%, var(--bg-panel));
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
 }
-
-.diff-side-head>span:nth-child(2) {
-  grid-column: 3 / 5;
-  padding: 3px 10px;
+.diff-col-after > .diff-side-head {
   color: var(--success);
   background: color-mix(in srgb, var(--success) 12%, var(--bg-panel));
   border-bottom: 1px solid color-mix(in srgb, var(--success) 24%, transparent);
 }
 
 .diff-side-num {
-  color: color-mix(in srgb, var(--text-dim) 55%, transparent);
-  background: color-mix(in srgb, var(--text-dim) 6%, transparent);
+  color: color-mix(in srgb, var(--text-dim) 85%, transparent);
+  background: color-mix(in srgb, var(--text-dim) 12%, transparent);
   text-align: right;
   padding: 0 6px;
   font-size: 10px;
   user-select: none;
   white-space: nowrap;
   min-width: 0;
+  /* Wider gutter so 4–5 digit line numbers are fully visible. */
+  width: 4.5em;
 }
 
 .diff-side-cell {
@@ -7635,56 +7653,58 @@ textarea {
   min-width: 0;
 }
 
-.diff-side-row>.diff-side-num:first-child {
-  border-right: 1px solid var(--hairline);
+.diff-side-row {
+  display: grid;
+  grid-template-columns: 4.5em minmax(max-content, 1fr);
+  min-width: max-content;
 }
-
-.diff-side-row>.diff-side-num:nth-child(3) {
-  border-left: 1px solid var(--hairline);
+.diff-side-row>.diff-side-num:first-child {
   border-right: 1px solid var(--hairline);
 }
 
 .diff-side-row.del>.diff-side-num:first-child,
 .diff-side-row.mod>.diff-side-num:first-child {
   color: var(--danger);
-  background: color-mix(in srgb, var(--bg-raised) 82%, var(--danger) 18%);
+  background: color-mix(in srgb, var(--danger) 75%, var(--bg));
 }
 
-.diff-side-row.add>.diff-side-num:nth-child(3),
-.diff-side-row.mod>.diff-side-num:nth-child(3) {
+.diff-side-row.add>.diff-side-num:first-child,
+.diff-side-row.mod>.diff-side-num:first-child {
   color: var(--success);
-  background: color-mix(in srgb, var(--bg-raised) 82%, var(--success) 18%);
+  background: color-mix(in srgb, var(--success) 75%, var(--bg));
 }
 
 .diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--bg-raised) 86%, var(--danger) 14%);
-  color: var(--danger);
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 65%, transparent);
+  background: color-mix(in srgb, var(--danger) 85%, var(--bg));
+  color: var(--on-accent);
+  box-shadow: inset 2px 0 0 var(--danger);
 }
 
 .diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--bg-raised) 86%, var(--success) 14%);
-  color: var(--success);
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--success) 65%, transparent);
+  background: color-mix(in srgb, var(--success) 85%, var(--bg));
+  color: var(--on-accent);
+  box-shadow: inset 2px 0 0 var(--success);
 }
 
 .diff-side-cell.diff-context {
   color: var(--text-dim);
-  opacity: 0.75;
+  opacity: 0.85;
 }
 
 .diff-side-row.mod>.diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--bg-raised) 92%, var(--danger) 8%);
+  background: color-mix(in srgb, var(--danger) 65%, var(--bg));
 }
 
 .diff-side-row.mod>.diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--bg-raised) 92%, var(--success) 8%);
+  background: color-mix(in srgb, var(--success) 65%, var(--bg));
 }
 
 .diff-side-meta {
   padding: 0 10px;
-  grid-column: 1 / -1;
   white-space: pre;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 4.5em minmax(max-content, 1fr);
 }
 
 .diff-side-meta.hunk {
@@ -10679,7 +10699,7 @@ textarea {
 
 .fullscreen-close {
   flex: none;
-  background: var(--bg-raised);
+  background: transparent;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -10688,10 +10708,12 @@ textarea {
   cursor: pointer;
   font-size: 14px;
   line-height: 1;
+  transition: background 0.13s, color 0.13s;
 }
 
 .fullscreen-close:hover {
-  background: var(--bg-hover);
+  background: var(--bg-input);
+  color: var(--text);
 }
 
 .fullscreen-modal-body {
@@ -10709,6 +10731,13 @@ textarea {
   min-height: 0;
   overflow: hidden;
   padding: 0;
+}
+
+/* Mermaid (non-scrollable) keeps text unselectable so a plain drag pans the
+   diagram instead of selecting SVG text, and shows a grab cursor. The
+   scrollable (diff) mode leaves selection free — a plain drag selects text
+   (default cursor) and only Cmd/Ctrl+drag scrolls (grabbing cursor). */
+.fullscreen-pan-viewport:not(.scrollable) {
   cursor: grab;
   user-select: none;
   -webkit-user-select: none;
@@ -10764,6 +10793,39 @@ textarea {
 
 .diff-fullscreen-body {
   padding: 0;
+}
+
+/* Scrollable mode (edit_file/write_file diffs): dragging scrolls the content
+   natively (horizontal + vertical) instead of panning the whole content. */
+.fullscreen-pan-viewport.scrollable {
+  overflow: auto;
+}
+
+/* The content must grow to its real (possibly huge) size so the viewport
+   actually overflows and becomes scrollable. `min-width/height: 100%` keeps it
+   from collapsing when the diff is short. */
+.fullscreen-pan-viewport.scrollable .fullscreen-pan-content {
+  transform: none;
+  min-height: 100%;
+  min-width: 100%;
+  width: max-content;
+  height: max-content;
+}
+
+/* In full-screen, the diff must NOT scroll itself — let the outer
+   `.fullscreen-pan-viewport` (which has `overflow: auto` in scrollable mode)
+   own the scroll so dragging scrolls the content. If `.diff-side` kept its own
+   `overflow: auto` + `height: 100%`, the viewport would never overflow and the
+   drag-to-scroll handler (which sets viewport.scrollLeft/Top) would do nothing.
+   `width: max-content` lets long code lines push the content wider than the
+   viewport so horizontal scrolling works. */
+.diff-fullscreen-body .diff-side {
+  max-height: none;
+  height: auto;
+  width: max-content;
+  min-width: 100%;
+  overflow: visible;
+  border-radius: 0;
 }
 
 .fullscreen-empty {

@@ -816,7 +816,10 @@ _SEARCH_RULE = (
     "4. For TARGETED lookups ONLY: fire the searches you already know you need in "
     "the SAME turn (parallel tool calls) instead of one at a time. This is "
     "parallelism of DIRECT tools, NOT a substitute for explore — never use this "
-    "to avoid delegating a BROAD search.\n"
+    "to avoid delegating a BROAD search. When you need to READ several known files, "
+    "pass them ALL in ONE read call via the filePaths list (e.g. "
+    "filePath='a.ts', filePaths=['b.ts','c.ts']) — never fire one read per file "
+    "when you already know several you need.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
     "tools (read/grep/glob) in one turn for TARGETED lookups (clause 4), and "
     "(b) launching several explore SUB-AGENTS in parallel for BROAD / multi-file "
@@ -846,7 +849,8 @@ _SEARCH_RULE = (
     "tool calls. Each batch must narrow toward the answer (progressive) — use the "
     "results of one batch to make the next batch tighter. Goal: reach the answer "
     "in UNDER 10 total grep/glob/read calls per task. Never fire one search at a "
-    "time when you already know several you need."
+    "time when you already know several you need. When reading multiple known "
+    "files, batch them into ONE read call via filePaths (not N separate reads)."
 )
 
 # The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict

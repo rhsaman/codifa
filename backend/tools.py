@@ -4454,24 +4454,115 @@ When you need to read several files, read multiple independent files in parallel
         )
         return f"USER ANSWERED: {answer}"
 
+    async def _list_sites(headers: dict) -> list[dict] | str:
+        """لیست سایت‌های حساب متصل؛ در صورت خطا رشتهٔ پیام خطا برمی‌گرداند."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(
+                "https://www.googleapis.com/webmasters/v3/sites",
+                headers=headers,
+            )
+        if r.status_code >= 400:
+            try:
+                data = r.json()
+                msg = data.get("error", {}).get("message", r.text[:200])
+            except Exception:  # noqa: BLE001
+                msg = r.text[:200]
+            return f"Search Console sites error {r.status_code}: {msg}"
+        return r.json().get("siteEntry") or []
+
+    async def _resolve_site(
+        site: str, sc_cfg: dict, headers: dict
+    ) -> tuple[list[str], str | None]:
+        """انتخاب کاندیدای سایت با اولویت: ۱) site گفته‌شده، ۲) siteUrl تنظیمات، ۳) auto-discover.
+
+        خروجی: (candidates, error). اگر error پر باشد فراخواننده همان را برگرداند."""
+        site_url = (sc_cfg.get("siteUrl") or "").strip()
+        if site.strip():
+            rows = await _list_sites(headers)
+            if isinstance(rows, str):
+                return [], rows
+            if not rows:
+                return (
+                    [],
+                    "No sites accessible with this account — add a verified property in Google Search Console first.",
+                )
+            matched = _match_site(site, rows)
+            if not matched:
+                available = "\n".join(f"- {s.get('siteUrl', '')}" for s in rows)
+                return (
+                    [],
+                    (
+                        f"Site '{site}' was not found among the sites this "
+                        f"Google account can access. Available sites:\n{available}"
+                    ),
+                )
+            return [matched], None
+        if site_url:
+            return [site_url], None
+        rows = await _list_sites(headers)
+        if isinstance(rows, str):
+            return [], rows
+        if not rows:
+            return (
+                [],
+                "No sites accessible with this account — add a verified property in Google Search Console first.",
+            )
+        candidates = sorted(
+            (str(s.get("siteUrl", "")).strip() for s in rows if s.get("siteUrl")),
+            key=lambda u: (not u.startswith("https://"), u),
+        )
+        if not candidates:
+            return [], "Could not determine a site URL from the connected account."
+        return candidates, None
+
     async def _search_console_impl(
         action: str = "sites",
         start_date: str = "",
         end_date: str = "",
         row_limit: int = 10,
         url: str = "",
+        site: str = "",
+        feedpath: str = "",
     ) -> str:
-        """Query the user's Google Search Console data. ``action``:
-          - "sites": list the sites the connected Google account can access;
-          - "query": search analytics for ``site_url`` from ``start_date`` to
-            ``end_date`` (YYYY-MM-DD, default = last 28 days), top queries;
-          - "inspect": URL Inspection check for ``url`` — index status, coverage
-            state (why a page is/isn't indexed: noindex, robots.txt block, 404,
-            soft-404, duplicate canonical, crawl errors), last crawl time.
+        """Query the user's Google Search Console data.
+
+        ACTIONS:
+          - "query": search analytics (top queries, clicks, impressions, CTR,
+            position) for a site over [start_date, end_date] (YYYY-MM-DD; default
+            = last 28 days).
+          - "inspect": URL Inspection for ``url`` — index/coverage state and WHY
+            a page is/isn't indexed (noindex, robots.txt block, 404, soft-404,
+            duplicate canonical, crawl errors), last crawl time.
+          - "sites": ONLY when the user explicitly asks to LIST their sites, or
+            you do not yet know which site to use.
+          - "sitemaps": list the sitemaps submitted for a site (path, status,
+            submitted/indexed URL counts).
+          - "sitemap": details of ONE sitemap — pass its path via ``feedpath``
+            (e.g. "https://example.com/sitemap.xml"); reports per-type submitted
+            vs indexed counts, last download/submission, and any warnings/errors.
+
+        HOW TO PICK THE SITE (IMPORTANT — read before calling):
+          When the user names a domain in chat (e.g. "check the SEO of
+          hamemigan.com", "inspect hamemigan.com/about", "show me queries for
+          healerglobal.com"), call "query" or "inspect" DIRECTLY with
+          ``site="hamemigan.com"`` — do NOT call "sites" first. The tool matches
+          that domain against the connected account's verified properties
+          automatically, so you never need to pre-set the site in Settings.
+          ``site`` accepts "hamemigan.com", "sc-domain:hamemigan.com", or a full
+          URL like "https://www.hamemigan.com/".
+          Only fall back to "sites" if the user never names a site and you must
+          discover which properties the account can access.
+
+        Examples (call these directly, no "sites" step first):
+          - "سئوی hamemigan.com رو ببین"  -> action="query",  site="hamemigan.com"
+          - "inspect hamemigan.com/about" -> action="inspect", url="https://hamemigan.com/about", site="hamemigan.com"
+          - "چه سایت‌هایی وصله؟"          -> action="sites"
+
         Uses the Google account signed in under Settings → Auth (the same OAuth
-        client as the Gemini model). No site URL is needed — when none is set,
-        the tool lists the account's sites and picks the first one automatically.
-        Without a signed-in account this returns a setup hint instead of failing."""
+        client as the Gemini model). Without a signed-in account this returns a
+        setup hint instead of failing."""
         client_id = ""
         client_secret = ""
         refresh = ""
@@ -4549,41 +4640,9 @@ When you need to read several files, read multiple independent files in parallel
                     )
                 except ValueError:
                     return "Invalid start_date — use YYYY-MM-DD."
-                site_url = (sc_cfg.get("siteUrl") or "").strip()
-                candidates: list[str] = []
-                if not site_url:
-                    # Auto-discover: list the account's sites. GSC returns them in
-                    # a non-deterministic order, so sort URL-prefix properties
-                    # (https://…) before domain properties (sc-domain:…) and try
-                    # them in order — skipping any the account can't query.
-                    async with httpx.AsyncClient(timeout=20.0) as client:
-                        r = await client.get(
-                            "https://www.googleapis.com/webmasters/v3/sites",
-                            headers=headers,
-                        )
-                    if r.status_code >= 400:
-                        data = r.json()
-                        return (
-                            f"Search Console sites error {r.status_code}: "
-                            f"{data.get('error', {}).get('message', r.text[:200])}"
-                        )
-                    rows = r.json().get("siteEntry") or []
-                    if not rows:
-                        return "No sites accessible with this account — add a verified property in Google Search Console first."
-                    candidates = sorted(
-                        (
-                            str(s.get("siteUrl", "")).strip()
-                            for s in rows
-                            if s.get("siteUrl")
-                        ),
-                        key=lambda u: (not u.startswith("https://"), u),
-                    )
-                    if not candidates:
-                        return (
-                            "Could not determine a site URL from the connected account."
-                        )
-                else:
-                    candidates = [site_url]
+                candidates, site_err = await _resolve_site(site, sc_cfg, headers)
+                if site_err:
+                    return site_err
                 body = {
                     "startDate": s.isoformat(),
                     "endDate": e.isoformat(),
@@ -4595,8 +4654,8 @@ When you need to read several files, read multiple independent files in parallel
                 # whose `:` and `/` must be percent-encoded in the path.
                 errors: list[str] = []
                 rows: list[dict] = []
-                for site in candidates:
-                    site_url_enc = urllib.parse.quote(site, safe="")
+                for cand in candidates:
+                    site_url_enc = urllib.parse.quote(cand, safe="")
                     async with httpx.AsyncClient(timeout=20.0) as client:
                         r = await client.post(
                             f"https://www.googleapis.com/webmasters/v3/sites/{site_url_enc}/searchAnalytics/query",
@@ -4609,11 +4668,11 @@ When you need to read several files, read multiple independent files in parallel
                             msg = data.get("error", {}).get("message", r.text[:200])
                         except Exception:  # noqa: BLE001
                             msg = r.text[:200]
-                        errors.append(f"{site}: {msg}")
+                        errors.append(f"{cand}: {msg}")
                         continue
                     rows = r.json().get("rows") or []
                     if rows:
-                        site_url = site
+                        site_url = cand
                         break
                 if not rows and len(errors) == len(candidates):
                     return "Search Console query error:\n" + "\n".join(errors)
@@ -4633,48 +4692,17 @@ When you need to read several files, read multiple independent files in parallel
                 target_url = (url or "").strip()
                 if not target_url:
                     return "Invalid url — the 'inspect' action needs a full page URL (e.g. https://example.com/page)."
-                site_url = (sc_cfg.get("siteUrl") or "").strip()
-                candidates: list[str] = []
-                if not site_url:
-                    # Auto-discover like the query action: list the account's
-                    # sites, preferring URL-prefix properties, and try them in
-                    # order until one accepts the inspection.
-                    async with httpx.AsyncClient(timeout=20.0) as client:
-                        r = await client.get(
-                            "https://www.googleapis.com/webmasters/v3/sites",
-                            headers=headers,
-                        )
-                    if r.status_code >= 400:
-                        data = r.json()
-                        return (
-                            f"Search Console sites error {r.status_code}: "
-                            f"{data.get('error', {}).get('message', r.text[:200])}"
-                        )
-                    rows = r.json().get("siteEntry") or []
-                    if not rows:
-                        return "No sites accessible with this account — add a verified property in Google Search Console first."
-                    candidates = sorted(
-                        (
-                            str(s.get("siteUrl", "")).strip()
-                            for s in rows
-                            if s.get("siteUrl")
-                        ),
-                        key=lambda u: (not u.startswith("https://"), u),
-                    )
-                    if not candidates:
-                        return (
-                            "Could not determine a site URL from the connected account."
-                        )
-                else:
-                    candidates = [site_url]
+                candidates, site_err = await _resolve_site(site, sc_cfg, headers)
+                if site_err:
+                    return site_err
                 errors: list[str] = []
-                for site in candidates:
-                    site_url_enc = urllib.parse.quote(site, safe="")
+                for cand in candidates:
+                    site_url_enc = urllib.parse.quote(cand, safe="")
                     async with httpx.AsyncClient(timeout=20.0) as client:
                         r = await client.post(
                             "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect",
                             headers=headers,
-                            json={"inspectionUrl": target_url, "siteUrl": site},
+                            json={"inspectionUrl": target_url, "siteUrl": cand},
                         )
                     if r.status_code >= 400:
                         try:
@@ -4682,7 +4710,7 @@ When you need to read several files, read multiple independent files in parallel
                             msg = data.get("error", {}).get("message", r.text[:200])
                         except Exception:  # noqa: BLE001
                             msg = r.text[:200]
-                        errors.append(f"{site}: {msg}")
+                        errors.append(f"{cand}: {msg}")
                         continue
                     data = r.json()
                     insp = data.get("inspectionResult") or {}
@@ -4733,7 +4761,75 @@ When you need to read several files, read multiple independent files in parallel
                         lines.append("not-indexed reasons: " + ", ".join(reasons))
                     return "\n".join(lines)
                 return "Search Console inspect error:\n" + "\n".join(errors)
-            return f"Unknown search_console action {action!r} — use 'sites', 'query' or 'inspect'."
+            if action in ("sitemaps", "sitemap"):
+                import urllib.parse
+
+                candidates, site_err = await _resolve_site(site, sc_cfg, headers)
+                if site_err:
+                    return site_err
+                errors: list[str] = []
+                for cand in candidates:
+                    site_url_enc = urllib.parse.quote(cand, safe="")
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        r = await client.get(
+                            f"https://www.googleapis.com/webmasters/v3/sites/{site_url_enc}/sitemaps",
+                            headers=headers,
+                        )
+                    if r.status_code >= 400:
+                        try:
+                            data = r.json()
+                            msg = data.get("error", {}).get("message", r.text[:200])
+                        except Exception:  # noqa: BLE001
+                            msg = r.text[:200]
+                        errors.append(f"{cand}: {msg}")
+                        continue
+                    feeds = r.json().get("sitemap") or []
+                    if action == "sitemap":
+                        want = (feedpath or "").strip()
+                        if not want:
+                            return "Invalid feedpath — the 'sitemap' action needs the sitemap path (e.g. https://example.com/sitemap.xml)."
+                        feed = next(
+                            (f for f in feeds if str(f.get("path", "")).strip() == want),
+                            None,
+                        )
+                        if not feed:
+                            paths = (
+                                "\n".join(f"- {f.get('path', '')}" for f in feeds)
+                                or "(none)"
+                            )
+                            return f"Sitemap '{want}' not found for {cand}. Submitted sitemaps:\n{paths}"
+                        types = feed.get("contents") or []
+                        type_lines = [
+                            f"    - {t.get('type', '')}: {t.get('submitted', 0)} submitted, {t.get('indexed', 0)} indexed"
+                            for t in types
+                        ]
+                        lines = [
+                            f"Sitemap: {feed.get('path', '')}",
+                            f"(site: {cand})",
+                            f"status: {feed.get('status', '')}",
+                            f"submitted: {feed.get('submitted', 0)}",
+                            f"indexed (parsed): {feed.get('indexed', 0)}",
+                            f"last downloaded: {feed.get('lastDownloaded', '') or 'n/a'}",
+                            f"last submitted: {feed.get('lastSubmitted', '') or 'n/a'}",
+                            f"warnings: {feed.get('warnings', '') or 'n/a'}",
+                            f"errors: {feed.get('errors', '') or 'n/a'}",
+                        ]
+                        if type_lines:
+                            lines.append("per-type URL counts:")
+                            lines.extend(type_lines)
+                        return "\n".join(lines)
+                    # action == "sitemaps"
+                    if not feeds:
+                        return f"No sitemaps submitted for {cand}."
+                    lines = [f"Sitemaps for {cand} ({len(feeds)}):"]
+                    for f in feeds:
+                        lines.append(
+                            f"- {f.get('path', '')}: status={f.get('status', '')}, "
+                            f"{f.get('submitted', 0)} submitted, {f.get('indexed', 0)} indexed"
+                        )
+                    return "\n".join(lines)
+                return "Search Console sitemaps error:\n" + "\n".join(errors)
+            return f"Unknown search_console action {action!r} — use 'sites', 'query', 'inspect', 'sitemaps' or 'sitemap'."
         except Exception as exc:  # noqa: BLE001
             return f"Search Console request failed: {exc}"
 
@@ -4743,6 +4839,8 @@ When you need to read several files, read multiple independent files in parallel
         end_date: str = "",
         row_limit: int = 10,
         url: str = "",
+        site: str = "",
+        feedpath: str = "",
     ) -> str:
         """Query the user's Google Search Console data (see ``_search_console_impl``)."""
         emit(
@@ -4754,6 +4852,8 @@ When you need to read several files, read multiple independent files in parallel
                     "start_date": start_date,
                     "end_date": end_date,
                     "url": url,
+                    "site": site,
+                    "feedpath": feedpath,
                 },
             }
         )
@@ -4763,6 +4863,8 @@ When you need to read several files, read multiple independent files in parallel
             end_date=end_date,
             row_limit=row_limit,
             url=url,
+            site=site,
+            feedpath=feedpath,
         )
         is_err = result.startswith(
             (
@@ -4771,6 +4873,7 @@ When you need to read several files, read multiple independent files in parallel
                 "Search Console sites error",
                 "Search Console query error",
                 "Search Console request failed",
+                "Search Console sitemaps error",
                 "Invalid ",
                 "Unknown search_console",
             )
@@ -4814,3 +4917,37 @@ When you need to read several files, read multiple independent files in parallel
     # order. Sub-agent internal tools are separate `_Tool` instances, so only
     # these first-class tools are threaded per-invocation.
     return {name: _invoke(fn) for name, fn in _tools.items()}
+
+
+def _normalize_site_key(value: str) -> str:
+    """پاک‌سازی یک نشانی سایت/دامنه برای تطبیق یکسان.
+
+    هر دو فرم ``sc-domain:hamemigan.com`` و ``https://www.hamemigan.com/``
+    را به ``hamemigan.com`` تقلیل می‌دهد تا مقایسهٔ دامنه‌ها نیازمند تطابق
+    دقیق رشته نباشد."""
+    v = value.strip().lower()
+    v = v.removeprefix("sc-domain:")
+    v = v.removeprefix("https://").removeprefix("http://")
+    v = v.removesuffix("/")
+    v = v.removeprefix("www.")
+    return v
+
+
+def _match_site(site: str, rows: list[dict]) -> str | None:
+    """تطبیق دامنهٔ خواسته‌شده با لیست سایت‌های حساب متصل.
+
+    ``site`` می‌تواند دامنهٔ خام (``hamemigan.com``)، فرم دامنه‌ای
+    (``sc-domain:hamemigan.com``) یا نشانی کامل (``https://hamemigan.com/``)
+    باشد. اگر تطبیقی یافت شود، ``siteUrl`` دقیقِ ثبت‌شده در GSC را برمی‌گرداند
+    (مثلاً ``sc-domain:hamemigan.com``) وگرنه ``None``."""
+    want = _normalize_site_key(site)
+    if not want:
+        return None
+    for s in rows:
+        u = str(s.get("siteUrl", "")).strip()
+        if not u:
+            continue
+        key = _normalize_site_key(u)
+        if key == want or key.endswith("." + want) or want.endswith("." + key):
+            return u
+    return None

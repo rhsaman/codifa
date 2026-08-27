@@ -178,12 +178,20 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
             ext = os.path.splitext(name)[1].lower()
             if ext not in _TEXT_EXTENSIONS:
                 continue
+            # رد کردن build artifacts (مثل dump-ssr.out.mjs که خروجی bundler هست).
+            if ".out." in name or name.endswith((".min.js", ".min.mjs")):
+                continue
             abs_path = os.path.join(dirpath, name)
             rel = os.path.relpath(abs_path, root_real).replace(os.sep, "/")
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                     text = fh.read(200_000)
             except OSError:
+                continue
+            # رد کردن فایل‌های minify‌شده: یه خط خیلی طولانی با فاصله‌ی کم
+            # (مثل main.js که توابع q/D/Le داره) — نمادش برای agent بی‌فایده‌ست.
+            first = text.split("\n", 1)[0]
+            if len(first) > 600 and " " not in first[:300]:
                 continue
             syms = _extract_symbols(rel, text)
             if syms:

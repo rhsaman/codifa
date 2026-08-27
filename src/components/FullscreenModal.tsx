@@ -28,23 +28,30 @@ export function FullscreenModal({
   title,
   children,
   bodyClass,
+  scrollable = false,
 }: {
   open: boolean
   onClose: () => void
   title?: string
   children: ReactNode
   bodyClass?: string
+  /** When true, dragging scrolls the content (native overflow) instead of
+   *  panning/marquee-zooming it. Used for file diffs so long code lines scroll
+   *  horizontally/vertically. Mermaid keeps the default pan/zoom behavior. */
+  scrollable?: boolean
 }) {
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [sel, setSel] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
   const [cursor, setCursor] = useState<'grab' | 'crosshair' | 'grabbing'>('grab')
   const dragRef = useRef<{
-    mode: 'pan' | 'marquee'
+    mode: 'pan' | 'marquee' | 'scroll'
     sx: number
     sy: number
     panX: number
     panY: number
+    scrollX: number
+    scrollY: number
   } | null>(null)
   const selRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -76,8 +83,10 @@ export function FullscreenModal({
   }, [zoom, pan])
 
   // Ctrl/⌘ + wheel zoom. A native non-passive listener is required so the
-  // browser's own page-zoom can be prevented.
+  // browser's own page-zoom can be prevented. In `scrollable` mode we skip this
+  // entirely and let the browser scroll the content natively.
   useEffect(() => {
+    if (scrollable) return
     const el = viewportRef.current
     if (!el) return
     const onWheel = (e: WheelEvent) => {
@@ -127,19 +136,45 @@ export function FullscreenModal({
   }
 
   const onMouseDown = (e: React.MouseEvent) => {
-    e.preventDefault()
     const el = viewportRef.current
     if (!el) return
     const rect = el.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
+    if (scrollable) {
+      // Cmd/Ctrl + drag scrolls the content natively (no pan/marquee/zoom).
+      // A plain drag is left free for text selection, so we must NOT call
+      // preventDefault here — doing so would stop the browser from starting a
+      // text selection on mousedown.
+      if (!(e.metaKey || e.ctrlKey)) return
+      e.preventDefault()
+      dragRef.current = {
+        mode: 'scroll',
+        sx: e.clientX,
+        sy: e.clientY,
+        panX: 0,
+        panY: 0,
+        scrollX: el.scrollLeft,
+        scrollY: el.scrollTop,
+      }
+      // Only block text selection while actually drag-scrolling; a plain drag
+      // stays free for selecting/copying text.
+      el.style.userSelect = 'none'
+      el.style.webkitUserSelect = 'none'
+      setCursor('grabbing')
+      return
+    }
     const marquee = e.metaKey || e.ctrlKey
+    // Mermaid: a drag pans/marquees the diagram, so prevent text selection.
+    e.preventDefault()
     dragRef.current = {
       mode: marquee ? 'marquee' : 'pan',
       sx: x,
       sy: y,
       panX: panRef.current.x,
       panY: panRef.current.y,
+      scrollX: 0,
+      scrollY: 0,
     }
     if (marquee) {
       selRef.current = { x, y, w: 0, h: 0 }
@@ -153,6 +188,11 @@ export function FullscreenModal({
     const d = dragRef.current
     const el = viewportRef.current
     if (!d || !el) return
+    if (d.mode === 'scroll') {
+      el.scrollLeft = d.scrollX - (e.clientX - d.sx)
+      el.scrollTop = d.scrollY - (e.clientY - d.sy)
+      return
+    }
     const rect = el.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
@@ -178,7 +218,14 @@ export function FullscreenModal({
       zoomTo(s.x, s.y, s.w, s.h)
     }
     setSel(null)
-    setCursor('grab')
+    if (d?.mode === 'scroll') {
+      const el = viewportRef.current
+      if (el) {
+        el.style.userSelect = ''
+        el.style.webkitUserSelect = ''
+      }
+      setCursor('grab')
+    }
   }
 
   return createPortal(
@@ -203,9 +250,9 @@ export function FullscreenModal({
         </div>
         <div className={`fullscreen-modal-body ${bodyClass ?? ''}`}>
           <div
-            className="fullscreen-pan-viewport"
+            className={`fullscreen-pan-viewport${scrollable ? ' scrollable' : ''}`}
             ref={viewportRef}
-            style={{ cursor }}
+            style={scrollable ? (cursor === 'grabbing' ? { cursor: 'grabbing' } : undefined) : { cursor }}
             onMouseDown={onMouseDown}
             onMouseMove={onMouseMove}
             onMouseUp={onMouseUp}
@@ -213,11 +260,11 @@ export function FullscreenModal({
           >
             <div
               className="fullscreen-pan-content"
-              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+              style={scrollable ? undefined : { transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
             >
               {children}
             </div>
-            {sel && (
+            {!scrollable && sel && (
               <div
                 className="fullscreen-marquee"
                 style={{
@@ -229,11 +276,13 @@ export function FullscreenModal({
               />
             )}
           </div>
-          <div className="fullscreen-zoom-bar">
-            <button onClick={reset} aria-label="Reset zoom" title="Reset zoom (100%)">
-              ⟳
-            </button>
-          </div>
+          {!scrollable && (
+            <div className="fullscreen-zoom-bar">
+              <button onClick={reset} aria-label="Reset zoom" title="Reset zoom (100%)">
+                ⟳
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>,

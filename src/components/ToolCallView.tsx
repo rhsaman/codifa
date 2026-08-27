@@ -6,6 +6,7 @@ import { fixZwsp } from '../lib/bidi'
 import { handleLinkClick } from '../lib/link'
 import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
+import { useDragScroll } from '../lib/useDragScroll'
 
 const TOOL_LABEL: Record<string, string> = {
   write_file: 'write_file',
@@ -329,41 +330,61 @@ function parseSideBySide(diff: string): DiffRow[] {
 function DiffView({ diff }: { diff: string }) {
   const rows = parseSideBySide(diff)
   if (rows.length === 0) return null
+  const drag = useDragScroll<HTMLDivElement>()
   return (
-    <div className="diff-side" dir="ltr">
-      <div className="diff-side-head">
-        <span>Before</span>
-        <span>After</span>
-      </div>
-      {rows.map((row, i) => {
-        if ('text' in row) {
+    <div className="diff-side" dir="ltr" {...drag}>
+      {/* Two INDEPENDENT columns (before | after). Each column is its own grid
+          context, so selecting text in "after" can never drag "before" along
+          (and vice-versa). Row heights stay identical (fixed line-height, one
+          line per row) so the two columns remain line-aligned. */}
+      <div className="diff-col diff-col-before">
+        <div className="diff-side-head">Before</div>
+        {rows.map((row, i) => {
+          if ('text' in row) {
+            return (
+              <div key={i} className={`diff-side-meta ${row.type}`}>
+                {row.text}
+              </div>
+            )
+          }
+          const beforeCls =
+            row.type === 'same'
+              ? 'diff-context'
+              : row.type === 'del' || row.type === 'mod'
+                ? 'diff-del'
+                : ''
           return (
-            <div key={i} className={`diff-side-meta ${row.type}`}>
-              {row.text}
+            <div key={i} className={`diff-side-row ${row.type}`}>
+              <span className="diff-side-num">{row.bLine >= 0 ? row.bLine : ''}</span>
+              <div className={`diff-side-cell ${beforeCls}`}>{row.before}</div>
             </div>
           )
-        }
-        const beforeCls =
-          row.type === 'same'
-            ? 'diff-context'
-            : row.type === 'del' || row.type === 'mod'
-              ? 'diff-del'
-              : ''
-        const afterCls =
-          row.type === 'same'
-            ? 'diff-context'
-            : row.type === 'add' || row.type === 'mod'
-              ? 'diff-add'
-              : ''
-        return (
-          <div key={i} className={`diff-side-row ${row.type}`}>
-            <span className="diff-side-num">{row.bLine >= 0 ? row.bLine : ''}</span>
-            <div className={`diff-side-cell ${beforeCls}`}>{row.before}</div>
-            <span className="diff-side-num">{row.aLine >= 0 ? row.aLine : ''}</span>
-            <div className={`diff-side-cell ${afterCls}`}>{row.after}</div>
-          </div>
-        )
-      })}
+        })}
+      </div>
+      <div className="diff-col diff-col-after">
+        <div className="diff-side-head">After</div>
+        {rows.map((row, i) => {
+          if ('text' in row) {
+            return (
+              <div key={i} className={`diff-side-meta ${row.type}`}>
+                {row.text}
+              </div>
+            )
+          }
+          const afterCls =
+            row.type === 'same'
+              ? 'diff-context'
+              : row.type === 'add' || row.type === 'mod'
+                ? 'diff-add'
+                : ''
+          return (
+            <div key={i} className={`diff-side-row ${row.type}`}>
+              <span className="diff-side-num">{row.aLine >= 0 ? row.aLine : ''}</span>
+              <div className={`diff-side-cell ${afterCls}`}>{row.after}</div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
@@ -841,7 +862,7 @@ export const ToolCallView = memo(function ToolCallView({
     if (!activity.diff || !root) return
     setReverting(true)
     try {
-      const path = String(activity.args?.path ?? '')
+      const path = String(activity.args?.path ?? activity.args?.filePath ?? '')
       const { content: current } = await api.fsRead(root, path)
       const oldContent = applyReverseDiff(activity.diff, current ?? '')
       const ok = await api.fsWrite(root, path, oldContent)
@@ -1003,6 +1024,7 @@ export const ToolCallView = memo(function ToolCallView({
         onClose={closeFs}
         title={String(activity.args?.path ?? activity.args?.filePath ?? 'File')}
         bodyClass="diff-fullscreen-body"
+        scrollable
       >
           {activity.diff ? (
             <DiffView diff={activity.diff} />

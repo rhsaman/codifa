@@ -169,7 +169,11 @@ echo "── تست ۲۸: usage key (کلید صریح providerId/model + است
 node test/usage.test.ts
 
 echo ""
-echo "── تست ۲۹: Settings → Storage (Data & maintenance + TTL وب/fetch جداگانه) ──"
+echo "── تست ۲۹: bidi (ایزوله‌کردن برچسب‌های فارسی/انگلیسی مخلوط در نمودار Mermaid) ──"
+node test/bidi.test.ts
+
+echo ""
+echo "── تست ۳۰: Settings → Storage (Data & maintenance + TTL وب/fetch جداگانه) ──"
 npx esbuild test/settingsStorage.ssr.test.tsx --bundle --platform=node --format=esm \
   --jsx=automatic --packages=external \
   --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \

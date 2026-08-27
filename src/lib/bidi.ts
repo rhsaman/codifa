@@ -3,6 +3,10 @@
 export const PERSIAN_RANGE =
   "\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF"
 
+// Any Persian/Arabic character. Exported so callers (e.g. Mermaid) can decide
+// whether a string needs RTL isolation without re-declaring the range.
+export const RTL_CHAR_RE = new RegExp(`[${PERSIAN_RANGE}]`)
+
 // Bidi ISOLATE / EMBEDDING control characters that models commonly inject into
 // their own output (FSI⁦/PDI⁩, LRI/RLI, LRE/RLE/PDF/LRO/RLO). Left in place they
 // fight the browser's native bidi resolution: inside an RTL paragraph FSI/PDI
@@ -75,6 +79,50 @@ export function fixZwsp(text: string): string {
 // system prompt (backend/agents.py, _UNIVERSAL_RULES) instructs the model to
 // emit ZWNJ correctly. Do not re-add per-pattern regexes here.
 
+// Mark runs that contain Persian/Arabic characters as `dir="rtl"`.
+//
+// Mermaid lays out node/edge labels with absolute x/y coordinates, so the
+// browser's bidi algorithm can't reorder a mixed run correctly on its own —
+// `unicode-bidi: plaintext` is not enough because the glyph positions are
+// fixed. Setting dir="rtl" on the text element itself tells the renderer to
+// treat that run as RTL (reordering its characters) while leaving the node's
+// x/y placement untouched. We only flip runs that actually contain Persian, so
+// purely-English labels stay LTR.
+//
+// Mermaid renders labels two ways depending on `htmlLabels`:
+//   * htmlLabels:false → SVG <text>/<tspan> (processed innermost-first so a
+//     nested RTL mark isn't overridden by an outer container).
+//   * htmlLabels:true (the default) → HTML inside <foreignObject> (a <div> or
+//     <p>/<span>). We flip those too, otherwise the container's dir="ltr"
+//     makes Persian labels render LTR ("سنوی" ends up at the end).
+// We never add a second dir= attribute.
+export function applyRtlToSvgText(svg: string): string {
+  const markSvg = (s: string, tag: 'tspan' | 'text') => {
+    const re = new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)<\\/${tag}>`, 'g')
+    return s.replace(re, (m, attrs: string, content: string) => {
+      if (RTL_CHAR_RE.test(content) && !/\bdir\s*=/.test(attrs)) {
+        return `<${tag} dir="rtl"${attrs}>${content}</${tag}>`
+      }
+      return m
+    })
+  }
+  let out = markSvg(markSvg(svg, 'tspan'), 'text')
+
+  // HTML labels inside <foreignObject> (mermaid's default htmlLabels:true).
+  // Flip only elements that wrap Persian text, so English labels stay LTR.
+  out = out.replace(/<foreignObject\b[^>]*>([\s\S]*?)<\/foreignObject>/g, (fo) => {
+    return fo.replace(
+      /<(div|p|span|label|td|li)\b([^>]*)>([\s\S]*?)<\/\1>/g,
+      (m, tag: string, attrs: string, content: string) => {
+        if (/\bdir\s*=/.test(attrs)) return m
+        if (!RTL_CHAR_RE.test(content)) return m
+        return `<${tag} dir="rtl"${attrs}>${content}</${tag}>`
+      }
+    )
+  })
+  return out
+}
+
 // Direction for UI containers that must line up with the app's RTL/LTR toggle
 // (ask cards, steer/queue bubbles, composer). dir="auto" alone resolves from
 // the FIRST strong character, so a mostly-Persian message that opens with a
@@ -82,7 +130,6 @@ export function fixZwsp(text: string): string {
 // flips sides between the composer (which forces the app-wide dir) and the
 // bubble. Any Persian/Arabic character in the text means the user expects RTL
 // layout — decide from the whole text, not the first char.
-const RTL_CHAR_RE = new RegExp(`[${PERSIAN_RANGE}]`)
 export function detectDir(text: string): 'rtl' | 'ltr' {
   return RTL_CHAR_RE.test(text) ? 'rtl' : 'ltr'
 }
@@ -105,3 +152,4 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   })
   return fixed.join('```')
 }
+

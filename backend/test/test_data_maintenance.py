@@ -87,3 +87,80 @@ def test_migrate_memory_dir_noop_when_absent(monkeypatch):
         target = os.path.join(tmp, "moved")
         os.makedirs(target, exist_ok=True)
         assert state_db.migrate_memory_dir(target) is False
+
+
+def test_delete_chat_cascades_plan(monkeypatch):
+    """Deleting a chat also removes its plan folder (no orphan left on disk)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("CODER_DATA_DIR", tmp)
+        monkeypatch.setattr(state_db, "_root_cache", None, raising=False)
+        state_db.bootstrap()
+
+        root = os.path.join(tmp, "proj")
+        os.makedirs(root, exist_ok=True)
+        chat = {
+            "id": "chat-1",
+            "root": root,
+            "updatedAt": 1.0,
+            "messages": [],
+        }
+        state_db._write_chat(chat)
+        state_db.save_plan(state_db._chat_workspace(chat), "plan", "## Plan\nstep", chat_id="chat-1")
+
+        plan_dir = state_db._plan_dir(state_db._chat_workspace(chat), "chat-1")
+        assert os.path.isdir(plan_dir)
+
+        state_db._delete_chat_by_id("chat-1")
+        assert not os.path.isdir(plan_dir)
+
+
+def test_remove_workspace_vectors_cascades_plan(monkeypatch):
+    """Removing a workspace also drops its whole plan folder."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("CODER_DATA_DIR", tmp)
+        monkeypatch.setattr(state_db, "_root_cache", None, raising=False)
+        state_db.bootstrap()
+
+        root = os.path.join(tmp, "proj")
+        os.makedirs(root, exist_ok=True)
+        chat = {"id": "chat-1", "root": root, "updatedAt": 1.0, "messages": []}
+        state_db._write_chat(chat)
+        ws = state_db._chat_workspace(chat)
+        state_db.save_plan(ws, "plan", "## Plan\nstep", chat_id="chat-1")
+
+        plan_ws = os.path.join(state_db.plans_dir(), ws)
+        assert os.path.isdir(plan_ws)
+
+        state_db.remove_workspace_vectors([root])
+        assert not os.path.isdir(plan_ws)
+
+
+def test_prune_orphan_plans_removes_stale_folders(monkeypatch):
+    """prune_orphan_plans() deletes plan folders with no matching live chat."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("CODER_DATA_DIR", tmp)
+        monkeypatch.setattr(state_db, "_root_cache", None, raising=False)
+        state_db.bootstrap()
+
+        root = os.path.join(tmp, "proj")
+        os.makedirs(root, exist_ok=True)
+        chat = {"id": "chat-1", "root": root, "updatedAt": 1.0, "messages": []}
+        state_db._write_chat(chat)
+        ws = state_db._chat_workspace(chat)
+
+        # live chat plan — must survive
+        state_db.save_plan(ws, "plan", "## Plan\nlive", chat_id="chat-1")
+        # orphaned chat plan (no matching chat) — must be pruned
+        orphan_dir = state_db._plan_dir(ws, "ghost-chat")
+        os.makedirs(orphan_dir, exist_ok=True)
+        (Path(orphan_dir) / "plan.md").write_text("## Plan\nghost", encoding="utf-8")
+        # whole-workspace plan folder with no live chat — must be pruned
+        dead_ws = os.path.join(state_db.plans_dir(), "dead-workspace")
+        os.makedirs(dead_ws, exist_ok=True)
+        (Path(dead_ws) / "plan.md").write_text("## Plan\ndead", encoding="utf-8")
+
+        removed = state_db.prune_orphan_plans()
+        assert removed == 2
+        assert os.path.isdir(state_db._plan_dir(ws, "chat-1"))
+        assert not os.path.isdir(orphan_dir)
+        assert not os.path.isdir(dead_ws)

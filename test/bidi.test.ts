@@ -44,30 +44,37 @@ console.log('5) prepareContent: پاکسازی متن آمادهٔ نمایش:')
   check('کنترل‌کاراکترها حذف شدند', out === 'کاربرX گفت', out)
 }
 
-console.log('6) applyRtlToSvgText: نود فارسی → dir="rtl"، نود انگلیسی دست‌نخورده:')
+console.log('6) applyRtlToSvgText: نود فارسی → dir="auto"، نود انگلیسی دست‌نخورده:')
 {
   const fa = '<text x="10" y="20">کاربر: سئوی hamemigan.com</text>'
   const out = applyRtlToSvgText(fa)
-  check('نود فارسی dir=rtl می‌گیره', out.includes('dir="rtl"') && out.includes('>کاربر: سئوی hamemigan.com</text>'), out)
+  check('نود فارسی dir=auto می‌گیره', out.includes('dir="auto"') && out.includes('>کاربر: سئوی hamemigan.com</text>'), out)
 
   const en = '<text x="10" y="20">just english</text>'
   check('نود انگلیسی دست‌نخورده می‌ماند', applyRtlToSvgText(en) === en, applyRtlToSvgText(en))
 
   const nested = '<text x="1" y="2">a<tspan>متن فارسی</tspan>b</text>'
   const nout = applyRtlToSvgText(nested)
-  check('محتوای فارسی کل text رو dir=rtl می‌کند', nout.includes('<text dir="rtl" x="1" y="2">') && nout.includes('<tspan dir="rtl">متن فارسی</tspan>'), nout)
+  check('محتوای فارسی کل text رو dir=auto می‌کند', nout.includes('<text dir="auto" x="1" y="2">') && nout.includes('<tspan dir="auto">متن فارسی</tspan>'), nout)
 
   const dup = '<text dir="ltr" x="1" y="2">متن فارسی</text>'
   check('dir موجود بازنویسی نمی‌شود', applyRtlToSvgText(dup) === dup, applyRtlToSvgText(dup))
+
+  // برچسب مختلطی که با لاتین شروع می‌شود نباید کلش RTL بازترتیب شود (وایران شدن
+  // بخش لاتین). dir=auto جهت را از اولین کاراکتر قوی تشخیص می‌دهد → LTR می‌ماند
+  // و فقط بخش فارسی انتهایی درست نمایش داده می‌شود.
+  const mixed = '<text x="10" y="20">shutdown ... .پایان کار شما</text>'
+  const mout = applyRtlToSvgText(mixed)
+  check('برچسب مختلط با لاتین dir=auto می‌گیرد (نه rtl)', mout.includes('dir="auto"') && !mout.includes('dir="rtl"'), mout)
 }
 
 console.log('7) applyRtlToSvgText: برچسب‌های HTML درون foreignObject (htmlLabels پیش‌فرض mermaid):')
 {
   // mermaid با htmlLabels:true برچسب نود را به‌صورت <div> درون <foreignObject>
-  // رندر می‌کند؛ کانتینر dir="ltr" است پس متن فارسی باید خودش dir="rtl" بگیرد.
+  // رندر می‌کند؛ کانتینر dir="ltr" است پس متن فارسی باید خودش dir="auto" بگیرد.
   const fo = '<foreignObject x="0" y="0" width="100" height="40"><div>کاربر: سنوی hamemigan.com</div></foreignObject>'
   const out = applyRtlToSvgText(fo)
-  check('div فارسی درون foreignObject dir=rtl می‌گیرد', out.includes('<div dir="rtl">کاربر: سنوی hamemigan.com</div>'), out)
+  check('div فارسی درون foreignObject dir=auto می‌گیرد', out.includes('<div dir="auto">کاربر: سنوی hamemigan.com</div>'), out)
 
   const enFo = '<foreignObject x="0" y="0" width="100" height="40"><div>just english</div></foreignObject>'
   check('div انگلیسی دست‌نخورده می‌ماند', applyRtlToSvgText(enFo) === enFo, applyRtlToSvgText(enFo))

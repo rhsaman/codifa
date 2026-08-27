@@ -1432,6 +1432,7 @@ def main() -> None:
         import state_db as _state_db
 
         atexit.register(lambda: _state_db.prune_stale_resume_files())
+        atexit.register(lambda: _state_db.prune_orphan_plans())
     except Exception:  # noqa: BLE001, S110
         pass
 

@@ -79,19 +79,27 @@ export function fixZwsp(text: string): string {
 // system prompt (backend/agents.py, _UNIVERSAL_RULES) instructs the model to
 // emit ZWNJ correctly. Do not re-add per-pattern regexes here.
 
-// Mark runs that contain Persian/Arabic characters as `dir="rtl"`.
+// Mark runs that contain Persian/Arabic characters as `dir="auto"`.
 //
 // Mermaid lays out node/edge labels with absolute x/y coordinates, so the
 // browser's bidi algorithm can't reorder a mixed run correctly on its own —
 // `unicode-bidi: plaintext` is not enough because the glyph positions are
-// fixed. Setting dir="rtl" on the text element itself tells the renderer to
-// treat that run as RTL (reordering its characters) while leaving the node's
-// x/y placement untouched. We only flip runs that actually contain Persian, so
-// purely-English labels stay LTR.
+// fixed. Setting dir="auto" on the text element itself tells the renderer to
+// resolve direction from the FIRST strong character while leaving the node's
+// x/y placement untouched.
+//
+// We use `auto` (NOT `rtl`) on purpose: a mixed label like
+// `shutdown ... .پایان کار شما` starts with Latin, so `auto` keeps the whole
+// run LTR and only the trailing Persian part renders RTL — the Latin text is
+// NOT mirrored/reversed. Forcing `rtl` on such a label would reorder the
+// entire string as RTL and mirror the Latin portion ("sometimes reversed").
+// A purely-Persian label still resolves to RTL via `auto`, so nothing regresses.
+// We only touch runs that actually contain Persian, so purely-English labels
+// stay LTR.
 //
 // Mermaid renders labels two ways depending on `htmlLabels`:
 //   * htmlLabels:false → SVG <text>/<tspan> (processed innermost-first so a
-//     nested RTL mark isn't overridden by an outer container).
+//     nested mark isn't overridden by an outer container).
 //   * htmlLabels:true (the default) → HTML inside <foreignObject> (a <div> or
 //     <p>/<span>). We flip those too, otherwise the container's dir="ltr"
 //     makes Persian labels render LTR ("سنوی" ends up at the end).
@@ -101,7 +109,7 @@ export function applyRtlToSvgText(svg: string): string {
     const re = new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)<\\/${tag}>`, 'g')
     return s.replace(re, (m, attrs: string, content: string) => {
       if (RTL_CHAR_RE.test(content) && !/\bdir\s*=/.test(attrs)) {
-        return `<${tag} dir="rtl"${attrs}>${content}</${tag}>`
+        return `<${tag} dir="auto"${attrs}>${content}</${tag}>`
       }
       return m
     })
@@ -109,14 +117,14 @@ export function applyRtlToSvgText(svg: string): string {
   let out = markSvg(markSvg(svg, 'tspan'), 'text')
 
   // HTML labels inside <foreignObject> (mermaid's default htmlLabels:true).
-  // Flip only elements that wrap Persian text, so English labels stay LTR.
+  // Mark only elements that wrap Persian text, so English labels stay LTR.
   out = out.replace(/<foreignObject\b[^>]*>([\s\S]*?)<\/foreignObject>/g, (fo) => {
     return fo.replace(
       /<(div|p|span|label|td|li)\b([^>]*)>([\s\S]*?)<\/\1>/g,
       (m, tag: string, attrs: string, content: string) => {
         if (/\bdir\s*=/.test(attrs)) return m
         if (!RTL_CHAR_RE.test(content)) return m
-        return `<${tag} dir="rtl"${attrs}>${content}</${tag}>`
+        return `<${tag} dir="auto"${attrs}>${content}</${tag}>`
       }
     )
   })

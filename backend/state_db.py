@@ -511,6 +511,11 @@ def _delete_chat_by_id(cid: str) -> None:
                 os.remove(_chat_file(obj))
             except OSError:
                 pass
+            # cascade: drop this chat's plan folder so it doesn't orphan on disk
+            try:
+                delete_plan(_chat_workspace(obj), chat_id=str(obj.get("id")))
+            except OSError:
+                pass
             return
 
 
@@ -536,6 +541,10 @@ def remove_workspace_vectors(roots: list) -> None:
                 os.remove(os.path.join(vdir, f"{slug}{suffix}"))
             except OSError:
                 pass
+        # cascade: drop the whole workspace plan folder so it doesn't orphan
+        plan_ws = os.path.join(plans_dir(), slug)
+        if os.path.isdir(plan_ws):
+            shutil.rmtree(plan_ws, ignore_errors=True)
     try:
         if os.path.isdir(vdir) and not os.listdir(vdir):
             shutil.rmtree(vdir, ignore_errors=True)
@@ -878,6 +887,58 @@ def delete_plan(workspace: str, chat_id: str = "") -> bool:
             return True
         except OSError:
             return False
+
+
+def prune_orphan_plans() -> int:
+    """Delete plan folders whose chat (or whole workspace) no longer exists.
+
+    Plans live under ``plan/<ws>/<chat-id>/``; when a chat or workspace is
+    removed without its plan folder being cleaned up (e.g. older builds, or a
+    crash mid-delete) those folders are orphaned on disk. This walks every plan
+    folder and removes any whose ``<chat-id>`` does not match a live chat in the
+    same workspace, plus any whole-workspace plan folder whose workspace slug
+    matches no live chat. Returns the number of folders removed. Best-effort:
+    never raises.
+    """
+    import shutil
+
+    try:
+        base = plans_dir()
+        if not os.path.isdir(base):
+            return 0
+        # map: workspace-slug -> set(chat-id slugs) that still exist on disk
+        live: dict[str, set[str]] = {}
+        for chat in _iter_chat_files():
+            ws = _safe_file(_chat_workspace(chat), "workspace")
+            cid = _safe_file(str(chat.get("id") or "chat"), "chat")
+            live.setdefault(ws, set()).add(cid)
+        removed = 0
+        for ws in sorted(os.listdir(base)):
+            ws_dir = os.path.join(base, ws)
+            if not os.path.isdir(ws_dir):
+                continue
+            live_cids = live.get(ws)
+            if not live_cids:
+                # whole workspace is gone — drop its plan folder entirely
+                try:
+                    shutil.rmtree(ws_dir, ignore_errors=True)
+                    removed += 1
+                except OSError:
+                    pass
+                continue
+            for cid in sorted(os.listdir(ws_dir)):
+                d = os.path.join(ws_dir, cid)
+                if not os.path.isdir(d):
+                    continue
+                if cid not in live_cids:
+                    try:
+                        shutil.rmtree(d, ignore_errors=True)
+                        removed += 1
+                    except OSError:
+                        pass
+        return removed
+    except OSError:
+        return 0
 
 
 # -- whole-state snapshot --------------------------------------------------- #

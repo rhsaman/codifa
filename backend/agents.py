@@ -3348,11 +3348,12 @@ def _load_images(items: list | None) -> list[str]:
 # makes it claim "nothing changed". Telling it the mode for THIS message (and
 # that the user can switch it per message via the UI) fixes both the false
 # refusal and the misreporting.
-_MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder"}
+_MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder", "reader": "Reader"}
 _MODE_CAPS = {
     "ask": "You are a read-only MENTOR: for project questions, explore the codebase JUST-IN-TIME following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) and answer from the real code. You NEVER write, edit or delete files or run commands.",
     "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files. Discover the codebase following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) and inspect state with the read-only terminal (git status/diff/build/lint/test).",
     "coder": "You are an implementation agent: create/edit files from the plan, doing just-in-time discovery following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) right before you edit. You also have the read-only terminal for build/test/lint.",
+    "reader": "You are a FOCUSED CODE READER: the user pointed you at specific file(s) — read them and explain with file:line references. Stay scoped to those files; do not scout the whole repo or run discovery commands.",
 }
 
 # Per-mode output contract appended to the CURRENT-MODE note every turn, so a
@@ -3372,6 +3373,10 @@ _MODE_OUTPUT = {
         "as the rest of the plan (e.g. '## خلاصه' if the plan is in Persian, '## Summary' if in English, etc.)."
     ),
     "coder": "",
+    "reader": (
+        "Your reply MUST explain the pointed-at code with exact file:line references and the WHY — "
+        "concise, scoped to the referenced files, never a full rewrite."
+    ),
 }
 
 
@@ -3409,7 +3414,12 @@ def _mode_declare(mode: str) -> str:
         "If asked whether your mode changed or to switch modes, state the current mode (per this note — "
         f"currently {label}) and tell them to use the mode button; their NEXT message then runs in the "
         "new mode. Never claim the mode is fixed for the whole conversation or that the mode button "
-        "only affects new chats."
+        "only affects new chats.\n"
+        "HISTORY MODE TAGS: earlier turns in this conversation may be wrapped in [Mode: X] ... [/Mode] "
+        "markers. Those markers mean that turn was produced under a DIFFERENT mode than this one — treat "
+        "its behavior (e.g. a plan, or code it wrote) as PAST work from another mode, NOT as something "
+        "you are doing now. Your job for THIS message is defined ONLY by the CURRENT MODE above; do not "
+        "copy the style, length, or actions of a differently-tagged past turn."
     )
     output = _MODE_OUTPUT.get(mode, "")
     if output:

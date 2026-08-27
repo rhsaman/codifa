@@ -173,7 +173,11 @@ echo "── تست ۲۹: bidi (ایزوله‌کردن برچسب‌های فا
 node test/bidi.test.ts
 
 echo ""
-echo "── تست ۳۰: Settings → Storage (Data & maintenance + TTL وب/fetch جداگانه) ──"
+echo "── تست ۳۰: کنتراست هایلایت diff (متن هایلایت نباید به --on-accent فال‌بک دهد) ──"
+node test/diffContrast.test.ts
+
+echo ""
+echo "── تست ۳۱: Settings → Storage (Data & maintenance + TTL وب/fetch جداگانه) ──"
 npx esbuild test/settingsStorage.ssr.test.tsx --bundle --platform=node --format=esm \
   --jsx=automatic --packages=external \
   --alias:highlight.js/styles/github-dark.min.css=./test/css-stub.js \

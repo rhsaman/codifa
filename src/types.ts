@@ -160,6 +160,10 @@ export interface Settings {
    *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`
    *  (opencode's `usable`). Default 20_000. */
   compactHeadroom?: number
+  /** History turn limit sent to the model. 0 = full history (default). N > 0 =
+   *  last N turns verbatim + a compact summary of the rest. Works with
+   *  auto-compact (summary is merged, not re-expanded). */
+  historyLimit?: number
   /** Tool result cache TTL in minutes (default 60). */
   cacheTtlMinutes?: number
 }

@@ -7559,7 +7559,9 @@ textarea {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.5;
-  background: var(--bg-raised);
+  /* Diff surface follows the theme background (--bg) so it matches every
+     theme instead of a hardcoded dark color. */
+  background: var(--bg);
   border: none;
   border-radius: 8px;
   max-height: 360px;
@@ -7631,7 +7633,7 @@ textarea {
 
 .diff-side-num {
   color: color-mix(in srgb, var(--text-dim) 85%, transparent);
-  background: color-mix(in srgb, var(--text-dim) 12%, transparent);
+  background: color-mix(in srgb, var(--text-dim) 12%, var(--bg));
   text-align: right;
   padding: 0 6px;
   font-size: 10px;
@@ -7665,24 +7667,27 @@ textarea {
 .diff-side-row.del>.diff-side-num:first-child,
 .diff-side-row.mod>.diff-side-num:first-child {
   color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 75%, var(--bg));
+  background: color-mix(in srgb, var(--danger) 22%, var(--bg));
 }
 
 .diff-side-row.add>.diff-side-num:first-child,
 .diff-side-row.mod>.diff-side-num:first-child {
   color: var(--success);
-  background: color-mix(in srgb, var(--success) 75%, var(--bg));
+  background: color-mix(in srgb, var(--success) 22%, var(--bg));
 }
 
 .diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--danger) 85%, var(--bg));
-  color: var(--on-accent);
+  background: color-mix(in srgb, var(--danger) 22%, var(--bg));
+  /* Fall back to --text (always tuned for contrast on --bg) so highlighted
+     diff lines stay readable in every theme — --on-accent is dark in dark
+     themes and would vanish against the --bg-based highlight background. */
+  color: var(--diff-text, var(--text));
   box-shadow: inset 2px 0 0 var(--danger);
 }
 
 .diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--success) 85%, var(--bg));
-  color: var(--on-accent);
+  background: color-mix(in srgb, var(--success) 22%, var(--bg));
+  color: var(--diff-text, var(--text));
   box-shadow: inset 2px 0 0 var(--success);
 }
 
@@ -7692,11 +7697,11 @@ textarea {
 }
 
 .diff-side-row.mod>.diff-side-cell.diff-del {
-  background: color-mix(in srgb, var(--danger) 65%, var(--bg));
+  background: color-mix(in srgb, var(--danger) 22%, var(--bg));
 }
 
 .diff-side-row.mod>.diff-side-cell.diff-add {
-  background: color-mix(in srgb, var(--success) 65%, var(--bg));
+  background: color-mix(in srgb, var(--success) 22%, var(--bg));
 }
 
 .diff-side-meta {

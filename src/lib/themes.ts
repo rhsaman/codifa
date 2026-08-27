@@ -189,6 +189,9 @@ export const THEMES: Theme[] = [
       '--on-accent': '#f4f6fb',
       '--danger': '#d20f39',
       '--success': '#2c7d1a',
+      /* Diff highlight text stays dark in the light theme (the highlight
+         background is a light tint of --danger/--success over --bg). */
+      '--diff-text': '#3d4057',
       '--link': '#1a5cd6',
       '--thinking': '#8f6200',
     },

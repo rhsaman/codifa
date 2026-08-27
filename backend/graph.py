@@ -177,7 +177,9 @@ class AgentState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 
-def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
+def history_to_langchain_messages(
+    history: list[dict], current_mode: str | None = None
+) -> list[BaseMessage]:
     """Convert plain ``{role, content}`` turns to LangChain messages.
 
     Assistant turns may carry a ``toolActivity`` array (the frontend sends it on
@@ -186,12 +188,25 @@ def history_to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
     ``ToolMessage`` pairs so the model SEES what it already did and does NOT
     re-run the tool calls after a reconnect/interrupt -- the transcript alone
     (no synthetic "you already did X" injection) carries the prior work forward.
+
+    When ``current_mode`` is supplied, any turn whose own ``mode`` differs from it
+    is wrapped in a ``[Mode: X]`` / ``[/Mode]`` marker. This keeps the model from
+    blending a previous mode's behavior into the current turn after a mid-chat
+    mode switch (e.g. a Coder turn following Plan history must not look like the
+    model was already implementing). The marker is purely a readability hint for
+    the model -- the system prompt already declares the authoritative mode.
     """
     out: list[BaseMessage] = []
     for turn in history or []:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
         tool_activity = turn.get("toolActivity") or []
+        # Tag turns that were produced under a different mode than the current
+        # one, so the model can tell past-mode behavior apart from this turn.
+        turn_mode = turn.get("mode")
+        if current_mode and turn_mode and turn_mode != current_mode:
+            _label = (turn_mode or "ask").capitalize()
+            content = f"[Mode: {_label}]\n{content}\n[/Mode]"
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
         if role == "assistant" and tool_activity:
@@ -982,9 +997,33 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
 
             # ask توکن‌حساس‌تره → فقط ۱۰ فایل (درختی) نشون می‌دیم.
             max_files = 10 if mode == "ask" else 30
+            # نقشه کامل فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
+            # نقشه باعث می‌شد ایجنت فایل موردنظرش رو توی نقشه نبینه و مجبور بشه
+            # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
+            # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
+            # تکراری کم بشه.
             code_map_block = format_symbol_map(root, max_files=max_files) if root else ""
         except Exception:  # noqa: BLE001
             code_map_block = ""
+
+    # کش هش نقشه: اگه نقشه نسبت به تورن قبلی عوض نشده، کل نقشه رو نمی‌فرستیم
+    # بلکه یه marker کوتاه می‌فرستیم (توکن کمتر، چون محتوای یکسانه). این با
+    # prefix-cache هم تداخل نداره چون نقشه توی user turn هست نه سیستم‌پرامپت.
+    if code_map_block:
+        try:
+            import hashlib
+
+            _map_hash = hashlib.md5(code_map_block.encode("utf-8", "ignore")).hexdigest()[:12]
+            _prev_hash = getattr(build_turn_context, "_last_code_map_hash", None)
+            if _prev_hash == _map_hash:
+                code_map_block = (
+                    "\n\n===== CODE MAP (live symbol index — unchanged since last turn) =====\n"
+                    "[see previous turn's CODE MAP — no files changed]"
+                )
+            else:
+                build_turn_context._last_code_map_hash = _map_hash
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -995,7 +1034,23 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # The backend's auto-compact (_maybe_auto_compact) still fires on real
     # overflow, so large windows are handled without silently dropping turns.
     history = state.get("history") or []
-    lc_history = history_to_langchain_messages(history)
+    # historyLimit (General setting): 0 = full history (default, unchanged
+    # behaviour); N > 0 = send only the last N turns verbatim + a compact
+    # summary of the older turns. The summary is prefixed with
+    # "[Compacted earlier context]" so the auto-compactor (_maybe_auto_compact
+    # -> _compact_history) MERGES it on a later overflow instead of
+    # re-expanding it — keeping historyLimit and auto-compact compatible.
+    _history_limit = 0
+    with contextlib.suppress(Exception):
+        _history_limit = int((state_db.get_settings() or {}).get("historyLimit", 0) or 0)
+    if _history_limit > 0 and len(history) > _history_limit:
+        _recent = history[-_history_limit:]
+        _older = history[:-_history_limit]
+        _summary = await _summarize_history_head(compact_model, _older, root)
+        lc_history = history_to_langchain_messages(_recent, current_mode=mode)
+        lc_history.insert(0, SystemMessage(content=_summary))
+    else:
+        lc_history = history_to_langchain_messages(history, current_mode=mode)
     with contextlib.suppress(Exception):
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
@@ -1485,6 +1540,56 @@ def _thinking_from_chunk(chunk: Any) -> str | None:
             if out:
                 return out
     return None
+
+
+_HISTORY_SUMMARY_CACHE: dict = {}  # key=(root, hash) -> summary text
+
+
+async def _summarize_history_head(compact_model: Any, older: list, root: str) -> str:
+    """Summarize the OLDER turns (dropped by historyLimit) into one block.
+
+    The block is prefixed with "[Compacted earlier context]" so the
+    auto-compactor merges it on a later overflow instead of re-expanding it
+    (see agents.py _compact_history). Cached per (root, content-hash) so we
+    don't re-summarize identical older history every turn (only new turns are
+    appended, so the older slice is stable across turns).
+    """
+    _key = (
+        root,
+        hashlib.md5(
+            json.dumps(older, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:16],
+    )
+    if _key in _HISTORY_SUMMARY_CACHE:
+        return _HISTORY_SUMMARY_CACHE[_key]
+    if compact_model is None:
+        # Fallback without an LLM: keep the last few user messages + first line
+        # of each assistant reply so the model still has the gist.
+        _parts = [
+            f"{t.get('role')}: {str(t.get('content', ''))[:200]}"
+            for t in older[-12:]
+        ]
+        _summary = "[Compacted earlier context]\n" + "\n".join(_parts)
+    else:
+        try:
+            _serialized = "\n\n".join(
+                f"{t.get('role')}: {t.get('content', '')}" for t in older
+            )
+            _summary, _ = await llm_generate(
+                compact_model,
+                system=(
+                    "Summarize this coding-agent conversation history into ONE "
+                    "concise block preserving user requests, file paths, decisions, "
+                    "and errors. Prefix the summary with '[Compacted earlier context]'."
+                ),
+                user=_serialized[:20000],
+            )
+            if not str(_summary).startswith("[Compacted earlier context]"):
+                _summary = "[Compacted earlier context]\n" + str(_summary)
+        except Exception:  # noqa: BLE001 — degrade to a plain omission note
+            _summary = "[Compacted earlier context]\n[history omitted by historyLimit]"
+    _HISTORY_SUMMARY_CACHE[_key] = _summary
+    return _summary
 
 
 async def _compact_tool_history(

@@ -458,6 +458,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
   const compactHeadroom = useStore((s) => s.settings.compactHeadroom ?? 20000)
   const setCompactHeadroom = useStore((s) => s.setCompactHeadroom)
+  const historyLimit = useStore((s) => s.historyLimit ?? 0)
+  const setHistoryLimit = useStore((s) => s.setHistoryLimit)
   const webSearchTtlDays = useStore((s) => s.webSearchTtlDays ?? 7)
   const setWebSearchTtlDays = useStore((s) => s.setWebSearchTtlDays)
   const fetchUrlTtlDays = useStore((s) => s.fetchUrlTtlDays ?? 7)
@@ -2081,6 +2083,34 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <span className="font-size-value">{compactHeadroom.toLocaleString()}</span>
               </div>
               <div className="hint">Applies on the next message. Default: 20,000 tokens.</div>
+            </div>
+
+            <div className="field">
+              <div className="field-head">
+                <label>History turn limit</label>
+              </div>
+              <div className="hint">
+                How many recent conversation turns are sent to the model in full each
+                turn. 0 = the entire chat history (default, unchanged behaviour). N &gt; 0
+                = only the last N turns verbatim, plus a compact summary of the earlier
+                turns. The summary is merged by auto-compaction (not re-expanded), so it
+                stays compatible with the context window. Lower = less token usage; higher
+                = more prior context kept. Applies on the next message.
+              </div>
+              <div className="font-size-row">
+                <span className="font-size-label">0</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={200}
+                  step={1}
+                  value={historyLimit}
+                  onChange={(e) => setHistoryLimit(Number(e.target.value))}
+                />
+                <span className="font-size-label">200</span>
+                <span className="font-size-value">{historyLimit.toLocaleString()}</span>
+              </div>
+              <div className="hint">Default: 0 (full history).</div>
             </div>
         </>
         )}

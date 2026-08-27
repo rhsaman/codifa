@@ -223,9 +223,9 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
-  const memory = { cacheTtlMinutes }
+  const memory = { cacheTtlMinutes, historyLimit }
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
   ]
@@ -455,6 +455,9 @@ interface State {
   /** Tool result cache TTL (minutes). */
   cacheTtlMinutes: number
   setMemoryTtlConfig: (c: { cache?: number }) => void
+  /** History turn limit sent to the model. 0 = full history (default). */
+  historyLimit: number
+  setHistoryLimit: (n: number) => void
 
   /** Web-search engines for web_search (Settings → Plugins). */
   searchPlugins: SearchPluginConfig[]
@@ -634,6 +637,7 @@ export const useStore = create<State>((set, get) => ({
   recentModels: [],
   subagentModels: {},
   cacheTtlMinutes: 60,
+  historyLimit: 0,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
@@ -857,6 +861,7 @@ export const useStore = create<State>((set, get) => ({
         ? { ...(raw.subagentModels as Record<string, string>) }
         : {},
       cacheTtlMinutes: typeof raw.cacheTtlMinutes === 'number' && raw.cacheTtlMinutes > 0 ? raw.cacheTtlMinutes : 60,
+      historyLimit: typeof raw.historyLimit === 'number' && raw.historyLimit >= 0 ? Math.round(raw.historyLimit) : 0,
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
       // are dropped here so they disappear from Settings → Plugins on reload.
       searchPlugins: searchPlugins.length > 0
@@ -1195,6 +1200,11 @@ export const useStore = create<State>((set, get) => ({
     set({
       cacheTtlMinutes: typeof c.cache === 'number' && c.cache > 0 ? Math.round(c.cache) : get().cacheTtlMinutes,
     })
+    get().persist()
+  },
+
+  setHistoryLimit: (n) => {
+    set({ historyLimit: Math.max(0, Math.round(n) || 0) })
     get().persist()
   },
 

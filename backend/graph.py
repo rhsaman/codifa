@@ -2184,6 +2184,11 @@ async def _run_mode_turn(
         _last_tool_sig = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
+        # Auto-continue guard for max-output truncation (mirrors opencode, which
+        # treats finish_reason=="length" as a normal partial stop and keeps
+        # generating until the answer is complete instead of ending the turn).
+        _auto_cont = 0
+        _MAX_AUTO_CONT = 5
         while steps < MAX_STEPS:
             steps += 1
             # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -2361,10 +2366,29 @@ async def _run_mode_turn(
                 raise
             if not getattr(ai, "tool_calls", None):
                 meta = getattr(ai, "response_metadata", {}) or {}
-                if meta.get("finish_reason") == "length":
-                    # opencode treats length-truncation as a normal (partial) stop,
-                    # not an error. Return the partial reply so the user still gets
-                    # output instead of a fatal "context length exceeded" error.
+                fr = meta.get("finish_reason") or meta.get("finishReason")
+                if not fr and isinstance(getattr(ai, "additional_kwargs", None), dict):
+                    fr = ai.additional_kwargs.get("finish_reason") or ai.additional_kwargs.get(
+                        "finishReason"
+                    )
+                _partial = ai.content if isinstance(ai.content, str) else str(ai.content)
+                if fr == "length":
+                    # opencode treats length-truncation as a normal (partial) stop
+                    # and AUTO-CONTINUES the generation so the answer completes
+                    # seamlessly. Mirror that: append the partial reply and loop
+                    # again so the model resumes where it left off, instead of
+                    # ending the turn and forcing a manual resend.
+                    if _auto_cont < _MAX_AUTO_CONT:
+                        _auto_cont += 1
+                        reply = (reply or "") + _partial
+                        msgs.append(AIMessage(content=_partial))
+                        continue
+                    # Exhausted the auto-continues (the model keeps hitting the
+                    # cap): end the turn with a clear note and leave the resume
+                    # checkpoint behind so the user can pick up where it stopped.
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["error"] = True
                     queue.put_nowait(
                         {
                             "kind": "warn",
@@ -2374,17 +2398,9 @@ async def _run_mode_turn(
                             ),
                         }
                     )
-                    # The turn did not complete cleanly (output was cut off), so
-                    # leave the durable resume file behind for a reconnect/retry.
-                    if run_flags is not None:
-                        with contextlib.suppress(Exception):
-                            run_flags["error"] = True
-                    reply = (
-                        ai.content if isinstance(ai.content, str) else str(ai.content)
-                    )
+                    reply = (reply or "") + _partial
                     break
-                reply = ai.content if isinstance(ai.content, str) else str(ai.content)
-                if _is_repeating(reply if isinstance(reply, str) else ""):
+                if _is_repeating(_partial):
                     queue.put_nowait(
                         {
                             "kind": "warn",
@@ -2394,6 +2410,7 @@ async def _run_mode_turn(
                             ),
                         }
                     )
+                reply = (reply or "") + _partial
                 break
             # --- Repetition-loop detection (tool-call signature) -------------
             # A real loop repeats the SAME tool call with IDENTICAL arguments on

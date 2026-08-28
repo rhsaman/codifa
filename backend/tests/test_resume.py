@@ -205,6 +205,36 @@ async def main():
             "deleted chat's resume checkpoint must be removed"
         print("  resume/del OK: deleting a chat clears its resume checkpoint")
 
+        # ==== Max-output truncation (finish_reason=="length") auto-continues ====
+        # like opencode, instead of ending the turn and forcing a manual resend.
+        chat3 = "chat-length-continue"
+        partial = "This is a long answer that got cut off"
+        continuation = " and here is the rest of it."
+        mock.script = [
+            text_reply(partial, finish="length"),
+            text_reply(continuation, finish="stop"),
+        ]
+        mock.captured = []
+        ev3 = await run_turn(
+            prompt="write a long answer", history=[], **{**common, "chat_id": chat3}
+        )
+        # The full answer must stream across BOTH requests, seamlessly.
+        full = "".join(e.get("content", "") for e in ev3 if e.get("kind") == "text")
+        assert full == partial + continuation, (
+            f"expected seamless continuation, got: {full!r}"
+        )
+        # No "truncated" warning should be surfaced (auto-continue is silent).
+        assert not any(
+            e.get("kind") == "warn" and "truncated" in str(e.get("content", ""))
+            for e in ev3
+        ), "length truncation must auto-continue, not warn"
+        # Clean finish: a done event arrives and no checkpoint is left behind.
+        assert any(e.get("kind") == "done" for e in ev3), \
+            "auto-continued turn must finish with a done event"
+        assert await _load_turn_checkpoint(_resume_thread_id({"chat_id": chat3})) is None, \
+            "auto-continued turn must finish cleanly (no leftover checkpoint)"
+        print("  resume/len OK: max-output truncation auto-continues seamlessly")
+
         print("RESUME TEST PASSED")
     finally:
         await stop_server(task)

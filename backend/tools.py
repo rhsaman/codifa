@@ -837,10 +837,13 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
                     continue
                 text = raw.rstrip("\n")
                 if len(text) > MAX_LINE_LENGTH:
-                    text = (
-                        text[:MAX_LINE_LENGTH]
-                        + f"… (line truncated to {MAX_LINE_LENGTH} chars)"
-                    )
+                    # opencode-style MIDDLE truncation: keep the line's head and
+                    # tail (so leading indent/keyword and the closing bracket/paren
+                    # survive) and replace the middle with a single ellipsis.
+                    _keep = MAX_LINE_LENGTH - 1
+                    _head = _keep // 2
+                    _tail = _keep - _head
+                    text = text[:_head] + "…" + text[-_tail:]
                 # opencode-style byte cap: stop once the accumulated output
                 # reaches MAX_READ_EXCERPT_BYTES so a huge file can't flood the
                 # context even when `limit` is large.
@@ -980,12 +983,14 @@ async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str 
     ``None`` برمی‌گردونه تا مدل بره سراغ وب/فچ واقعی. هیت‌ها رو به هم
     می‌چسبونه و برمی‌گردونه. اگه چیزی نبود یا خطا داد، ``None``.
     """
-    if not _rag_web_enabled():
-        return None
+    _local = False
     if store is None:
+        if not _rag_web_enabled():
+            return None
         # مسیر fallback نادر: باز کردن sqlite رو هم offload می‌کنیم تا
         # event loop اصلاً بلاک نشه (معمولاً store از قبل پاس داده می‌شه).
         store = await asyncio.to_thread(_get_web_store, root)
+        _local = store is not None
     if store is None:
         return None
     try:
@@ -1002,6 +1007,12 @@ async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str 
         return "\n\n".join(parts)
     except Exception:  # noqa: BLE001 — RAG lookup must never break the tool
         return None
+    finally:
+        # فقط وقتی خودمان store رو باز کردیم ببندیم؛ اگه از بیرون پاس داده
+        # شده باشه مالکیتش با فراخواننده‌ست و نباید اینجا بسته بشه (نشت
+        # connection sqlite + sqlite_vec توی RAM می‌مونه تا آخر عمر پروسه).
+        if _local:
+            store.close()
 
 
 def _is_workspace_coder_dir(root: str, target: str) -> bool:
@@ -4127,9 +4138,16 @@ When you need to read several files, read multiple independent files in parallel
         )
         # اول توی RAG چک کن — اگه قبلاً ذخیره شده بود، از همون برگردون
         # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
-        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
-        _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
-        rag_hit = await _rag_web_lookup(query, _ws_for_lookup, root)
+        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی) — و خودمان بستنش
+        # رو هم به عهده بگیریم تا connection sqlite + sqlite_vec نشت نکنه.
+        _ws_for_lookup = store
+        if _ws_for_lookup is None and _rag_web_enabled():
+            _ws_for_lookup = _get_web_store(root)
+        try:
+            rag_hit = await _rag_web_lookup(query, _ws_for_lookup, root)
+        finally:
+            if store is None and _ws_for_lookup is not None:
+                _ws_for_lookup.close()
         if rag_hit:
             emit(
                 {
@@ -4172,7 +4190,9 @@ When you need to read several files, read multiple independent files in parallel
             # Persist each hit into the workspace vector store (KIND_WEB) so
             # later retrieval can recall it without re-fetching the web.
             # اختیاری: فقط اگه مدل embedding در دسترس باشه (RAG فعال).
-            _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+            _ws = store
+            if _ws is None and _rag_web_enabled():
+                _ws = _get_web_store(root)
             if _ws is not None and _rag_web_enabled():
                 try:
                     # upsert_doc → upsert_many → embed_passages (blocking inference)
@@ -4188,6 +4208,10 @@ When you need to read several files, read multiple independent files in parallel
                     )
                 except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
                     pass
+                finally:
+                    # فقط وقتی خودمان بازش کردیم ببندیم (نشت connection).
+                    if store is None:
+                        _ws.close()
         summary = f"{len(results)} results"
         fallbacks = result.get("fallbacks") or []
         engine = result.get("engine") or ""
@@ -4351,9 +4375,16 @@ When you need to read several files, read multiple independent files in parallel
             effective_full = True
         # اول توی RAG چک کن — اگه قبلاً ذخیره شده بود، از همون برگردون
         # (بدون صدا زدن وب). وگرنه ادامه بده و بعدش ذخیره کن.
-        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی).
-        _ws_for_lookup = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
-        rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
+        # فقط وقتی RAG فعاله store رو باز کن (lazy واقعی) — و خودمان بستنش
+        # رو هم به عهده بگیریم تا connection sqlite + sqlite_vec نشت نکنه.
+        _ws_for_lookup = store
+        if _ws_for_lookup is None and _rag_web_enabled():
+            _ws_for_lookup = _get_web_store(root)
+        try:
+            rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
+        finally:
+            if store is None and _ws_for_lookup is not None:
+                _ws_for_lookup.close()
         if rag_hit:
             emit(
                 {
@@ -4409,7 +4440,9 @@ When you need to read several files, read multiple independent files in parallel
         # Persist the fetched page into the workspace vector store (KIND_WEB)
         # so later retrieval can recall it without re-fetching the web.
         # اختیاری: فقط اگه مدل embedding در دسترس باشه (RAG فعال).
-        _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
+        _ws = store
+        if _ws is None and _rag_web_enabled():
+            _ws = _get_web_store(root)
         if _ws is not None and body and _rag_web_enabled():
             try:
                 # upsert_doc → upsert_many → embed_passages (blocking inference)
@@ -4425,6 +4458,10 @@ When you need to read several files, read multiple independent files in parallel
                 )
             except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
                 pass
+            finally:
+                # فقط وقتی خودمان بازش کردیم ببندیم (نشت connection).
+                if store is None:
+                    _ws.close()
 
         # Return the FULL page verbatim — no summarizer, no excerpt. This is the
         # opencode/codex behavior: the tool returns raw content and the model

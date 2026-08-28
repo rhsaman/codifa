@@ -33,10 +33,11 @@ def test_reader_declares_scoped_output_contract():
     assert "scoped to the referenced files" in note
 
 
-def test_reader_note_includes_history_mode_tags_guidance():
+def test_reader_note_includes_output_contract_scoping():
     note = _mode_declare("reader")
-    assert "HISTORY MODE TAGS" in note
-    assert "<!-- mode:x -->" in note
+    # reader باید قرارداد خروجیِ محدود به فایل‌های ارجاع‌شده رو صریحاً اعلام کنه
+    assert "OUTPUT CONTRACT FOR THIS MODE" in note
+    assert "scoped to the referenced files" in note
 
 
 def test_all_four_modes_declare_distinct_caps():

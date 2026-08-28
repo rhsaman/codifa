@@ -172,13 +172,20 @@ def _load() -> None:
             raise EmbedderUnavailableError(
                 "embedding model incomplete (need tokenizer.json + onnx/model.onnx)"
             )
-        _CACHE["tokenizer"] = Tokenizer.from_file(tok_path)
-        _CACHE["session"] = onnxruntime.InferenceSession(
-            onnx_path, providers=["CPUExecutionProvider"]
-        )
-        # Detect the real vector width from the model itself.
-        dim: np.ndarray = _embed(["fallback"], _PASSAGE_PREFIX)
-        _CACHE["dim"] = int(dim.shape[1])
+        try:
+            _CACHE["tokenizer"] = Tokenizer.from_file(tok_path)
+            _CACHE["session"] = onnxruntime.InferenceSession(
+                onnx_path, providers=["CPUExecutionProvider"]
+            )
+            # Detect the real vector width from the model itself.
+            dim: np.ndarray = _embed(["fallback"], _PASSAGE_PREFIX)
+            _CACHE["dim"] = int(dim.shape[1])
+        except Exception:
+            # Leave the cache empty so a later call retries cleanly instead of
+            # short-circuiting on a half-initialized (tokenizer/session set, no
+            # dim) model that would crash on every subsequent embed call.
+            _CACHE.clear()
+            raise
 
 
 def _embed(texts: Sequence[str], prefix: str) -> np.ndarray:

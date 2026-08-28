@@ -1,9 +1,23 @@
 """تست: کارت task باید branch داشته باشه تا sub-eventها (grep/glob/read) توی
 children نِست بشن — حتی وقتی کارت task قبلاً done شده باشه."""
 
-import pytest
-
 from tools import make_tool_callbacks
+
+
+class _FakeModel:
+    """مدل تستی حداقلی: فقط برای اینکه task_tool مسیر اجرای زیرعامل رو
+    طی کنه (در غیر این صورت با main_model=None کارت task با خطای
+    'unavailable' برمی‌گرده و langchain_tool_loop هرگز صدا زده نمی‌شه)."""
+
+    model_name = "fake"
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, msgs):
+        from langchain_core.messages import AIMessage
+
+        return AIMessage(content="ok")
 
 
 def _make_cbs():
@@ -15,7 +29,7 @@ def _make_cbs():
     cbs = make_tool_callbacks(
         root="/tmp",
         emit=emit,
-        main_model=None,
+        main_model=_FakeModel(),
         explore_model=None,
     )
     return cbs, events

@@ -60,6 +60,11 @@ from langgraph.graph import END, START, StateGraph
 
 import agents as _agents
 import state_db
+from _common import (
+    _extract_cache_tokens,
+    _is_repeating,
+    _strip_think_tags,
+)
 from agents import normalize_mode
 from llm import (
     _is_stream_options_error,
@@ -540,15 +545,6 @@ def filter_tools_for_mode(
             tools["run_terminal"] = _agents._wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
-    # Auto-router: steer BROAD / repeated searches to the explore sub-agent.
-    # وقتی تعداد callهای grep/glob/read/web_search/fetch_url از _AUTO_EXPLORE_THRESHOLD
-    # (cross-turn) رد شد، یا یه جستجوی broad شناسایی شد، wrapper اجازه نمی‌ده
-    # مستقیم اجرا بشه و مدل رو می‌فرسته سمت explore sub-agent. فقط توی حالت
-    # coder اعمال می‌شه — توی plan/ask/reader مدل فقط ۱-۲ بار جستجو می‌زنه و
-    # نباید مسدود بشه.
-    if mode == "coder":
-        tools = _agents._wrap_auto_explore_router(tools)
-
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
     # what closes the read-only bypass: an explore/plan-mode `task` call can no
@@ -1235,8 +1231,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     _map_hash = ""
     if code_map_block:
         try:
-            import hashlib
-
             _map_hash = hashlib.md5(code_map_block.encode("utf-8", "ignore")).hexdigest()[:12]
         except Exception:  # noqa: BLE001, S110
             pass
@@ -1485,8 +1479,6 @@ def model_timeout_for(state: AgentState) -> float:
     from providers import model_timeout
 
     mt = model_timeout(provider=state["provider"], total=300)
-    if isinstance(mt, tuple(mt.__class__ for mt in ()) or ()):
-        pass
     # httpx.Timeout (non-Google) -> use its read component as the request timeout.
     with contextlib.suppress(Exception):
         import httpx
@@ -1606,138 +1598,10 @@ def _usage_event_from_ai(
     }
 
 
-def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
-    """Extract cache read/write token counts from ANY provider's usage metadata.
-
-    Provider conventions handled (read-side / write-side):
-
-    * Anthropic (LangChain): ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
-      at top level OR nested under ``input_token_details`` — ADDITIVE with
-      ``input_tokens`` (the cached history is sent separately each turn).
-    * OpenRouter-style ``input_token_details.cache_read`` / ``cache_creation`` and
-      OpenAI / Google ``input_token_details.cached_tokens`` (or ``cache_read_tokens``)
-      — a SUBSET of ``input_tokens``; the provider's ``total_tokens`` already
-      includes them, so they must NOT be added back.
-    * OpenAI raw: ``prompt_tokens_details.cached_tokens``.
-
-    Returns ``(cache_read, cache_write, additive)`` where ``additive`` is True when
-    the cache is reported separately from ``input_tokens`` and must be summed in.
-    Any unrecognised ``cache*`` key falls through to the generic scan below.
-    """
-    details = um.get("input_token_details") or {}
-    if not isinstance(details, dict):
-        details = {}
-    prompt_details = um.get("prompt_tokens_details") or {}
-    if not isinstance(prompt_details, dict):
-        prompt_details = {}
-
-    # Anthropic-style (additive): input_tokens excludes the cached history.
-    anthropic_read = (
-        details.get("cache_read_input_tokens") or um.get("cache_read_input_tokens") or 0
-    )
-    anthropic_write = (
-        details.get("cache_creation_input_tokens")
-        or um.get("cache_creation_input_tokens")
-        or 0
-    )
-    # OpenAI / Google-style (subset of input_tokens; total already counts it).
-    openai_read = (
-        details.get("cached_tokens")
-        or details.get("cache_read")
-        or details.get("cache_read_tokens")
-        or prompt_details.get("cached_tokens")
-        or um.get("cache_read_tokens")
-        or 0
-    )
-    openai_write = (
-        details.get("cache_creation")
-        or details.get("cache_creation_tokens")
-        or details.get("cache_write_tokens")
-        or um.get("cache_write_tokens")
-        or 0
-    )
-    cache_read = int(anthropic_read or openai_read or 0)
-    cache_write = int(anthropic_write or openai_write or 0)
-    key_additive = bool(anthropic_read or anthropic_write)
-    return cache_read, cache_write, key_additive
+# _extract_cache_tokens از _common import می‌شود (single source of truth).
 
 
-def _strip_think_tags(
-    text: str, in_think: bool, think_buf: str
-) -> tuple[str, bool, str]:
-    """Remove literal ``<think>…</think>`` reasoning from streamed text.
-
-    Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
-    emit their chain-of-thought as a literal ``<think>…</think>`` block inside
-    the ``content`` stream instead of using a dedicated reasoning field. We drop
-    it from the visible text so it never leaks to the frontend. The tag may span
-    multiple streamed deltas, so the ``in_think`` / ``think_buf`` state is
-    preserved across calls.
-    """
-    if not text:
-        return text, in_think, think_buf
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if not in_think:
-            start = text.find("<think", i)
-            if start == -1:
-                out.append(text[i:])
-                break
-            out.append(text[i:start])
-            in_think = True
-            i = start + len("<think")
-            # Consume the optional 'i' of the <thinking> variant, then skip to
-            # the closing '>' of the opening tag.
-            if i < n and text[i] == "i":
-                i += 1
-            gt = text.find(">", i)
-            if gt == -1:
-                think_buf += text[i:]
-                i = n
-            else:
-                i = gt + 1
-        else:
-            end = text.find("</think>", i)
-            if end == -1:
-                think_buf += text[i:]
-                i = n
-            else:
-                think_buf += text[i:end]
-                in_think = False
-                i = end + len("</think>")
-    return "".join(out), in_think, think_buf
-
-
-def _is_repeating(
-    text: str, min_len: int = 20, max_len: int = 200, min_reps: int = 3
-) -> bool:
-    """Detect a degenerate text loop at the tail of ``text``.
-
-    Models sometimes emit the same sentence/phrase dozens of times with no
-    tool call (e.g. "Let me check that. Let me check that. …"). The existing
-    guards only watch the tool-call signature, so this text-only check catches
-    it. It only flags *exact* back-to-back repetition of a bounded-length unit,
-    so normal prose that happens to reuse a phrase (or even a sentence) a couple
-    of times never trips it.
-
-    ``min_len``/``max_len`` bound the repeated unit so a single repeated
-    character or a huge block can't false-positive. ``min_reps`` is how many
-    consecutive copies we need to call it a loop.
-    """
-    if not text or len(text) < min_len * min_reps:
-        return False
-    # Scan candidate unit lengths from longest to shortest so we match the
-    # largest repeated phrase first (e.g. a whole sentence, not one word).
-    for unit in range(min(max_len, len(text) // min_reps), min_len - 1, -1):
-        tail = text[-(unit * min_reps) :]
-        if len(tail) < unit * min_reps:
-            continue
-        first = tail[:unit]
-        if all(tail[i * unit : (i + 1) * unit] == first for i in range(1, min_reps)):
-            return True
-    return False
+# _strip_think_tags و _is_repeating از _common import می‌شوند (single source of truth).
 
 
 def _thinking_from_chunk(chunk: Any) -> str | None:
@@ -1959,7 +1823,7 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
         if role == "assistant":
             rebuilt.append(AIMessage(content=content))
         elif role == "tool":
-            rebuilt.append(HumanMessage(content=f"[tool result]\n{content}"))
+            rebuilt.append(ToolMessage(content=content, tool_call_id="__compacted__"))
         else:
             rebuilt.append(HumanMessage(content=content))
     msgs[:] = rebuilt
@@ -2029,10 +1893,10 @@ async def _maybe_auto_compact(
         total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
     # Diagnostic: surface the real window/threshold so we can confirm compaction
     # only fires when the prompt genuinely nears the window (and not spuriously).
-    print(
-        f"[CTX_DEBUG] auto_compact ctx={ctx} reserved={reserved} usable={usable} "
-        f"trigger_fraction={_frac} threshold={threshold} total={total} msgs={len(msgs)}",
-        flush=True,
+    logger.debug(
+        "[CTX_DEBUG] auto_compact ctx=%s reserved=%s usable=%s "
+        "trigger_fraction=%s threshold=%s total=%s msgs=%s",
+        ctx, reserved, usable, _frac, threshold, total, len(msgs),
     )
     # opencode fires compaction when the latest turn reaches `usable`
     # (ctx - reserved). For mid-turn compaction we fire earlier — at
@@ -4071,7 +3935,6 @@ async def ask_entry(state: AgentState) -> dict:
 
 
 def _route_ask_entry(state: AgentState) -> str:
-    state.get("request", "")
     # When the user explicitly points at file(s) THIS turn -- an attachment, the
     # open Neovim file, or a file named directly in the message -- the question is
     # about THOSE files, so route to the Reader agent, which reads only the needed
@@ -4366,10 +4229,6 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     # Drop any stale captured ask_user answer for this chat from a previous run
     # so Part A re-exploration only fires for answers given in THIS run.
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
-    # Reset the cross-turn search counter at the START of each user message
-    # (not per model-turn), so the auto-router's "repeated calls" threshold is
-    # measured across the whole conversation, not reset every model turn.
-    _agents.reset_auto_explore_counter()
     if not (initial.get("request") or "").strip():
         yield {
             "kind": "error",

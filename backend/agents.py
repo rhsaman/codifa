@@ -13,11 +13,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import warnings
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings(
     "ignore",
@@ -548,86 +551,11 @@ def _wrap_no_search_bypass(fn: Callable):
 
 
 # ---------------------------------------------------------------------------
-# Auto-router: steer BROAD / repeated searches to the explore sub-agent.
+# NOTE: there is intentionally NO auto-router. The explore sub-agent is ONLY
+# triggered when the agent explicitly calls task(subagent_type='explore').
+# The model is free to use grep/glob/read/web_search/fetch_url directly for
+# any search — broad or targeted — without being steered/blocked.
 # ---------------------------------------------------------------------------
-# The SEARCH STRATEGY rule is only text in the prompt — weak models ignore it
-# and hammer grep/glob/read directly until they run out of context. This layer
-# adds HARD logic: a cross-turn counter plus objective "broadness" signals.
-# When a search is genuinely wide (open glob pattern, repo-wide grep, or
-# repeated calls piling up past _AUTO_EXPLORE_THRESHOLD) the wrapper refuses to
-# run inline and tells the model to delegate to the explore sub-agent instead.
-_BROAD_FILE_COUNT = 100
-_AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
-_AUTO_EXPLORE_THRESHOLD = 100  # cross-turn cap on search calls before steering
-
-# Cross-turn counter for the auto-router. Reset at the START of each user
-# message (not per model-turn) so the threshold is measured across the whole
-# conversation, not reset every model turn.
-_auto_explore_count: dict[str, int] = {"count": 0}
-
-
-def reset_auto_explore_counter() -> None:
-    """Reset the cross-turn search counter at the start of each user message."""
-    _auto_explore_count["count"] = 0
-
-
-def _is_broad_search(tool_name: str, kwargs: dict) -> bool:
-    """Objective "broadness" signal: is this single call wide enough to steer?
-
-    Returns True for genuinely wide searches (open glob pattern, repo-wide
-    grep with no path, or a read of a very large file) so the wrapper can
-    refuse to run them inline and point the model at the explore sub-agent.
-    """
-    if tool_name not in _AUTO_EXPLORE_TOOLS:
-        return False
-    # glob with an open pattern (e.g. **/*.py or a bare *.ts with no path)
-    if tool_name == "glob":
-        pattern = str(kwargs.get("pattern", ""))
-        if pattern.startswith("**") or ("*" in pattern and "/" not in pattern):
-            return True
-    # grep with no path → repo-wide search
-    if tool_name == "grep":
-        path = kwargs.get("path", "")
-        if not path:
-            return True
-    # read of a very large window (>= _BROAD_FILE_COUNT lines)
-    if tool_name == "read":
-        limit = kwargs.get("limit", 2000)
-        if limit and int(limit) >= _BROAD_FILE_COUNT:
-            return True
-    return False
-
-
-def _wrap_auto_explore_router(tools: dict) -> dict:
-    """Wrap search tools so BROAD / repeated calls steer to the explore agent.
-
-    For each tool in _AUTO_EXPLORE_TOOLS still present in ``tools``, the wrapper
-    increments the cross-turn counter and, if the call is broad or the counter
-    exceeds _AUTO_EXPLORE_THRESHOLD, refuses to run inline — returning a hint to
-    delegate via the task tool (subagent_type='explore') instead.
-    """
-    for name in _AUTO_EXPLORE_TOOLS:
-        if name not in tools:
-            continue
-        fn = tools[name]
-
-        async def wrapped(*args, _fn=fn, _name=name, **kwargs):
-            _auto_explore_count["count"] += 1
-            if (
-                _is_broad_search(_name, kwargs)
-                or _auto_explore_count["count"] > _AUTO_EXPLORE_THRESHOLD
-            ):
-                return (
-                    f"ERROR: too many {_name} calls "
-                    f"({_auto_explore_count['count']}) or this is a broad search. "
-                    "Delegate to the explore sub-agent instead: use the task tool "
-                    "with subagent_type='explore' to find and read the relevant "
-                    "code in one isolated pass."
-                )
-            return await _fn(*args, **kwargs)
-
-        tools[name] = wrapped
-    return tools
 
 
 # OpenRouter requires "vendor/model" ids, so a bare "free" shortcut in a
@@ -739,8 +667,8 @@ def _subagent_target(
 
 SYSTEM_PROMPTS: dict[str, str] = {
     "ask": "You are a mentor inside a desktop IDE. For a question that references the codebase (behavior, styling, logic, bugs, file structure, dependencies), explore JUST-IN-TIME following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) to find and read the relevant code. Never answer about the real project from general knowledge when the code is a grep/read away -- but do not search when the answer is already in front of you (memory, conversation, attached files, earlier tool results). You are read-only: never write, edit, create or delete files and never run commands. Structure answers: open with a one-sentence goal, then numbered steps naming the exact file path and, when useful, the function/line target. Keep answers short (1-3 lines) unless the user explicitly asks for details. For current or external info (versions, docs, APIs, error fixes), use web_search / fetch_url ONLY when the user explicitly asks to search the web -- never on your own initiative. Skip search for questions unrelated to the project (greetings, general knowledge, or pasted errors from OTHER apps/OS). If the user @mentions or attaches a file, it is in SCOPE and already noted for you -- read it with the read tool rather than re-searching. Match the user's language (Persian -> Persian, English -> English). If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: teach with steps and references -- name exact file paths, functions and line targets -- never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. If you can answer from the context already in front of you, answer directly -- do NOT call a tool. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax -- never as ASCII art or a plain list. Match the answer length to the question: be terse for quick questions, but go deep with full steps and snippets when the task demands it. Never pad with filler or restate what was asked. Keep replies concise.",
-    "coder": "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it, doing just-in-time discovery on your own following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read): when you need a file's contents, symbols, or a calling convention, grep/glob/read it first -- you are NOT handed a pre-read context, so look things up right before you edit. You have edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Always include a 'write and run tests' step in the checklist for any code change. Tick off each step the moment its implementation is finished -- call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list (the finished checklist is cleared). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command -- file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Batch related edits into one change where one suffices; do not repeatedly edit the same code. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions -- small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself. TEST DISCIPLINE: after any code change, write/update the relevant test for that language and ensure it passes (uv run pytest / npm test / cargo test / go test / mvn test / dotnet test / ...). Never finish with red tests — the system will re-run you on failure and feed the error back, so fix the code until all tests pass.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN -- you never implement it. Discover the codebase yourself, JUST-IN-TIME following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) to find the files, functions and lines your plan will touch. You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). Stop scouting the moment every file, function and line your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); the checklist must always include a 'write and run tests' step for any code change; do not call it while scouting. your finished plan is saved automatically by the pipeline (one per workspace). Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code -- it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
+    "coder": "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it, doing just-in-time discovery on your own following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read): when you need a file's contents, symbols, or a calling convention, grep/glob/read it first -- you are NOT handed a pre-read context, so look things up right before you edit. You have edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools. MANDATORY READ RULE: whenever you know MORE THAN ONE file to read, read them ALL in a SINGLE read call using the filePaths list (e.g. filePath='a.ts', filePaths=['b.ts','c.ts']) -- NEVER fire separate read calls per file. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Always include a 'write and run tests' step in the checklist for any code change. Tick off each step the moment its implementation is finished -- call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list (the finished checklist is cleared). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command -- file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Batch related edits into one change where one suffices; do not repeatedly edit the same code. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions -- small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. Match the user's language (Persian -> Persian, English -> English). REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself. TEST DISCIPLINE: after any code change, write/update the relevant test for that language and ensure it passes (uv run pytest / npm test / cargo test / go test / mvn test / dotnet test / ...). Never finish with red tests — the system will re-run you on failure and feed the error back, so fix the code until all tests pass.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a concrete IMPLEMENTATION PLAN -- you never implement it. Discover the codebase yourself, JUST-IN-TIME following the SEARCH STRATEGY rule (broad/multi-file → task explore; targeted → grep/glob/read) to find the files, functions and lines your plan will touch. You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). MANDATORY READ RULE: whenever you know MORE THAN ONE file to read, read them ALL in a SINGLE read call using the filePaths list (e.g. filePath='a.ts', filePaths=['b.ts','c.ts']) -- NEVER fire separate read calls per file. Stop scouting the moment every file, function and line your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT. Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending'); the checklist must always include a 'write and run tests' step for any code change; do not call it while scouting. your finished plan is saved automatically by the pipeline (one per workspace). Open your final reply with '## Plan' covering: (1) one-paragraph goal; (2) ordered steps naming exact file paths and line/function targets; (3) any new files; (4) paste-ready snippets (never full files); (5) verification commands. Skills/MCP: only if the user explicitly asks to create/install them may you call create_skill/create_mcp; otherwise plan them for Coder. Match the user's language (Persian -> Persian). End by offering to switch to Coder mode. OUTPUT DISCIPLINE: the plan references code -- it never restates it. Use targeted snippets (a few lines max), never full file contents; keep the plan scannable. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths). SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
 }
 
 SYSTEM_PROMPTS["reader"] = (
@@ -781,8 +709,6 @@ def normalize_mode(mode: str, fallback: str = "ask") -> str:
     mode = (mode or "").strip().lower()
     mode = MODE_ALIASES.get(mode, mode)
     return mode if mode in _VALID_MODES else fallback
-
-    # Universal rules appended to EVERY mode's system prompt (ask/plan/coder).
 
 
 # 1) The agent never leaves dead code in the work it does. 2) Dead code or bugs
@@ -900,10 +826,11 @@ _SEARCH_RULE = (
     "4. For TARGETED lookups ONLY: fire the searches you already know you need in "
     "the SAME turn (parallel tool calls) instead of one at a time. This is "
     "parallelism of DIRECT tools, NOT a substitute for explore — never use this "
-    "to avoid delegating a BROAD search. When you need to READ several known files, "
-    "pass them ALL in ONE read call via the filePaths list (e.g. "
-    "filePath='a.ts', filePaths=['b.ts','c.ts']) — never fire one read per file "
-    "when you already know several you need.\n"
+    "to avoid delegating a BROAD search. MANDATORY: when you need to READ more "
+    "than ONE known file, pass them ALL in a SINGLE read call via the filePaths "
+    "list (e.g. filePath='a.ts', filePaths=['b.ts','c.ts']) — NEVER fire one read "
+    "per file when you already know several you need. Reading N files in N separate "
+    "read calls is a HARD violation of this rule.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
     "tools (read/grep/glob) in one turn for TARGETED lookups (clause 4), and "
     "(b) launching several explore SUB-AGENTS in parallel for BROAD / multi-file "
@@ -916,12 +843,10 @@ _SEARCH_RULE = (
     "a subagent instead of reading many files yourself. When you DO read a large "
     "file, page it with read offset/limit (e.g. limit=300) instead of dumping the "
     "whole file into context.\n"
-    "NOTE: the system enforces this automatically — a broad glob (e.g. '**/*.py' "
-    "with no include), a repo-wide grep (no path AND no include), or repeated "
-    "search calls piling up across your response to this task are auto-routed to "
-    "explore. You do NOT "
-    "need to trigger explore manually for those; just keep using the direct "
-    "tools for targeted lookups.\n"
+    "NOTE: explore is ONLY triggered when YOU explicitly call "
+    "task(subagent_type='explore') — the system does NOT auto-route. If you need a "
+    "broad / multi-file search, delegate to explore yourself; for targeted lookups "
+    "keep using the direct tools (read with filePaths to read several files at once).\n"
     "NEVER search or read project files with run_terminal or scripts — only "
     "the file tools (grep / glob / read).\n"
     "5b. CODE MAP: a live symbol index (CODE MAP above) lists every function/"
@@ -934,7 +859,8 @@ _SEARCH_RULE = (
     "results of one batch to make the next batch tighter. Goal: reach the answer "
     "in UNDER 10 total grep/glob/read calls per task. Never fire one search at a "
     "time when you already know several you need. When reading multiple known "
-    "files, batch them into ONE read call via filePaths (not N separate reads)."
+    "files, batch them into ONE read call via filePaths (not N separate reads) — "
+    "this is MANDATORY, not a suggestion.\n"
 )
 
 # The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict
@@ -1665,7 +1591,7 @@ def _usage_event(usage, model: str = "") -> dict | None:
         }
     except Exception as e:  # noqa: BLE001 — usage parse must never crash the run
         # در صورت بروز هرگونه خطا، برای جلوگیری از کرش کردن برنامه، مقدار صفر برگردانده می‌شود
-        print(f"Error parsing usage in agents.py: {e}")
+        logger.warning("Error parsing usage: %s", e)
         return None
 
 

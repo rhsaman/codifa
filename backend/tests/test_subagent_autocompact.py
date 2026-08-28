@@ -63,7 +63,7 @@ async def test_auto_compact_subagent_compacts_in_place():
     try:
         did = await _llm._auto_compact_subagent(big, None, ctx=4_000, reserved=20_000)
     finally:
-        _agents._compact_history = original
+        _llm._compact_history = original
 
     assert did is True
     # The system message is preserved; the rest is the compacted history.
@@ -91,7 +91,7 @@ async def test_auto_compact_subagent_noop_below_budget():
     try:
         did = await _llm._auto_compact_subagent(small, None, ctx=200_000, reserved=20_000)
     finally:
-        _agents._compact_history = original
+        _llm._compact_history = original
 
     assert did is False
     assert called["n"] == 0
@@ -169,7 +169,7 @@ async def test_langchain_tool_loop_autocompacts_with_ctx():
             reserved=20_000,
         )
     finally:
-        _agents._compact_history = original
+        _llm._compact_history = original
 
     assert out.strip(), f"sub-agent returned empty result: {out!r}"
     assert "FINISHED" in out, out

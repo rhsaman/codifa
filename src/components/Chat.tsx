@@ -344,8 +344,17 @@ export function ChatPanel() {
   // message-level streaming flag is the source of truth — the global
   // isStreaming flag stays in the store only as the persist gate.
   const chatHasStreaming = chat?.messages.some((m) => m.streaming) ?? false;
+  // While the client is self-healing a dropped stream (reconnecting from the
+  // on-disk checkpoint), the backend keeps producing tokens but the `streaming`
+  // flag may already be false (it is cleared the moment the SSE socket drops,
+  // before the `retry`/`reconnecting` event arrives). Treat a live reconnect as
+  // busy too, so the Stop button stays up and the user can see the turn is
+  // still running instead of the Send button appearing mid-reconnect.
+  const chatReconnecting = chat?.messages.some(
+    (m) => m.retry?.reconnecting === true,
+  ) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
-  const busy = busyLocal || chatHasStreaming;
+  const busy = busyLocal || chatHasStreaming || chatReconnecting;
   /** The assistant message currently being rate-limited/retried by the provider,
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
@@ -735,15 +744,20 @@ export function ChatPanel() {
       return;
     }
     let total = 0;
+    let cancelled = false;
     attachments.forEach((a) => {
       void api
         .fsRead(wroot, a)
         .then((r) => {
+          if (cancelled) return;
           total += r.content.length;
           setAttLen(total);
         })
         .catch(() => undefined);
     });
+    return () => {
+      cancelled = true;
+    };
   }, [wroot, attachments]);
 
   /** Snapshot the current viewport as a message-anchored scroll position. */
@@ -2085,7 +2099,7 @@ export function ChatPanel() {
 
     // Re-read state after the wait — messages may have changed while streaming.
     s = useStore.getState();
-    ch = s.chats.find((c) => c.id === s.activeChatId);
+    ch = s.chats.find((c) => c.id === chatId);
     if (!ch) return;
     const msgs = ch.messages.filter(
       (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
@@ -2359,7 +2373,7 @@ export function ChatPanel() {
         0,
       );
     },
-    [busy, send],
+    [],
   );
 
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
@@ -2722,7 +2736,9 @@ export function ChatPanel() {
   // Wire the shared skill cache to the backend fetcher (src/lib/api). Done
   // once at module init so the cache can be invalidated from anywhere
   // (e.g. after a skill is saved in Settings) without re-importing.
-  setSkillsFetcher(listSkills);
+  useEffect(() => {
+    setSkillsFetcher(listSkills);
+  }, []);
 
   // Load the skill list up-front (once) so manual @mentions typed/pasted
   // before the picker ever opens — or sent before the async fetch resolves —

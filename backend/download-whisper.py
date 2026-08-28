@@ -46,7 +46,11 @@ def main() -> int:
     import time
 
     print(f"Downloading {args.model} -> {model_download.whisper_dir()} ...")
+    deadline = time.time() + 3600
     while True:
+        if time.time() > deadline:
+            print("Download timed out after 3600s")
+            return 1
         state = model_download.download_state(model_download.KIND_WHISPER) or {}
         if not state:
             break

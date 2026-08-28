@@ -1011,7 +1011,15 @@ export function Sidebar() {
                 >
                   {g.chats.map((c) => {
                     const isPinnedChat = pinnedChats.includes(c.id);
-                    const hasStreaming = c.messages.some((m) => m.streaming);
+                    // A chat is "live" (agent working) when it has a streaming
+                    // message OR is mid-reconnect (the SSE socket dropped and the
+                    // client is self-healing from the checkpoint — `streaming`
+                    // flips to false the instant the socket drops, before the
+                    // `retry`/`reconnecting` event lands, so we must count both).
+                    const hasStreaming =
+                      c.messages.some(
+                        (m) => m.streaming || m.retry?.reconnecting === true,
+                      ) ?? false;
                     const hasUnread =
                       !hasStreaming &&
                       c.id !== activeChatId &&

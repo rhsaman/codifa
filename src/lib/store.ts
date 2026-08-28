@@ -225,7 +225,6 @@ let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
   const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
-  const memory = { cacheTtlMinutes, historyLimit }
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
   ]
@@ -237,7 +236,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, memory, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -570,6 +569,27 @@ interface State {
   setNvimDiagnostics: (diagnostics: import('../types').NvimDiagnostic[]) => void
 }
 
+/**
+ * Drop chats that share an `id`, keeping the LAST occurrence (it carries the
+ * most recent data). Two chats with the same `id` would otherwise both render
+ * in the sidebar, and because the 3-dot menu is keyed on chat id, opening it
+ * for one row would open it for BOTH. The backend already de-duplicates on
+ * disk; this is the final defensive guard on the loaded payload.
+ */
+export function dedupeChats(chats: Chat[]): Chat[] {
+  const seen = new Set<string>()
+  const out: Chat[] = []
+  for (let i = chats.length - 1; i >= 0; i--) {
+    const c = chats[i]
+    if (!c?.id || seen.has(c.id)) continue
+    seen.add(c.id)
+    out.push(c)
+  }
+  // Restore original order (first occurrence position of each kept id).
+  out.reverse()
+  return out
+}
+
 function makeChat(mode: AgentMode = 'ask'): Chat {
   const now = Date.now()
   const s = useStore.getState()
@@ -588,8 +608,13 @@ function makeChat(mode: AgentMode = 'ask'): Chat {
     : undefined
   const providerId = recentProvider?.id ?? activeProvider?.id
   const model = recentProvider && recent ? recent.model : activeProvider?.model
+  // Guard against an (astronomically unlikely) uid() collision: never hand out
+  // an id that already exists in the store, so two chats can never share an id
+  // and make the 3-dot menu open for both.
+  let id = uid()
+  while (s.chats.some((c) => c.id === id)) id = uid()
   return {
-    id: uid(),
+    id,
     title: 'New chat',
     mode,
     thinkingLevel: 'medium',
@@ -693,8 +718,13 @@ export const useStore = create<State>((set, get) => ({
       /* keep the persisted value */
     }
     const loadedChats0 = chats && chats.length > 0 ? chats : []
+    // Drop any duplicate chat ids (last occurrence wins) so two chats sharing an
+    // id can never both render — that would make the 3-dot menu open for BOTH
+    // rows, since the menu is keyed on chat id. The backend already de-duplicates
+    // on disk, but this is the final defensive guard on the loaded payload.
+    const dedupedChats = dedupeChats(loadedChats0)
     const providerIds = (settings?.providers ?? []).map((p) => p.id)
-    const loadedChats = loadedChats0.map((c) => {
+    const loadedChats = dedupedChats.map((c) => {
       // Transient compact/command/stall banners must never survive a reload —
       // no request is running after a restart, so a persisted `compacting` or
       // `stalled` would show a stale loading banner forever.

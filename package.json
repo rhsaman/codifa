@@ -38,7 +38,7 @@
     "preview": "vite preview",
     "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:frontend": "bash tests/run-frontend.sh",
-    "clean": "node -e \"require('fs').rmSync('release',{recursive:true,force:true})\"",
+    "clean": "node -e \"import('fs').then(f=>f.rmSync('release',{recursive:true,force:true}))\"",
     "dist": "npm run build && npm run setup && npm run clean && electron-builder",
     "dist:mac": "npm run build && npm run setup && npm run clean && electron-builder --mac",
     "dist:win": "npm run build && npm run setup && npm run clean && electron-builder --win",

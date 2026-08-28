@@ -234,7 +234,7 @@ def _extract_symbols(text: str, language: str) -> list[dict]:
             (re.compile(r"^\s*(?:class|struct|interface|enum|trait|type|object|impl|extension)\s+([A-Za-z_]\w*)"), "type"),
         ]
     else:
-        patterns = [(re.compile(r"^[A-Za-z_][\w$]*\s*\("), "function")]
+        patterns = [(re.compile(r"^([A-Za-z_][\w$]*)\s*\("), "function")]
 
     syms: list[dict] = []
     for i, line in enumerate(lines, 1):
@@ -250,7 +250,7 @@ def _extract_symbols(text: str, language: str) -> list[dict]:
                 continue
             # C-like / generic patterns: only accept definition-looking lines
             # (a call like "return foo(x);" ends with ';' and is not a def).
-            if typ == "function" and language in ("java", "kotlin", "c", "cpp", "csharp", "swift", "php", "ruby", ""):
+            if typ == "function" and language in ("java", "kotlin", "c", "cpp", "csharp", "swift", "php", "ruby"):
                 tail = line.rstrip()
                 if not tail.endswith(("{", ")", "(")):
                     continue

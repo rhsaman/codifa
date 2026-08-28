@@ -202,9 +202,18 @@ def _read_text(path: str) -> str:
 
 
 def _iter_chat_files():
+    """Yield every chat object on disk, de-duplicated by ``id``.
+
+    Two chat files can share an ``id`` (e.g. an orphaned copy left behind by a
+    failed rename or a partial write). Without de-duplication both would load
+    into the UI, and two sidebar rows with the same ``id`` make the 3-dot menu
+    open for BOTH rows. When a duplicate ``id`` is seen, the file with the
+    newer ``updatedAt`` (falling back to the latest filesystem mtime) wins.
+    """
     base = chats_dir()
     if not os.path.isdir(base):
         return
+    best: dict[str, dict] = {}
     for ws in sorted(os.listdir(base)):
         ws_dir = os.path.join(base, ws)
         if not os.path.isdir(ws_dir):
@@ -214,8 +223,22 @@ def _iter_chat_files():
                 continue
             p = os.path.join(ws_dir, fn)
             obj = _read_json(p)
-            if isinstance(obj, dict) and obj.get("id"):
-                yield obj
+            if not isinstance(obj, dict):
+                continue
+            cid = obj.get("id")
+            if not cid:
+                continue
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                mtime = 0.0
+            updated = float(obj.get("updatedAt") or 0) or mtime
+            existing = best.get(cid)
+            if existing is None or updated >= existing["_updated"]:
+                best[cid] = {**obj, "_updated": updated}
+    for obj in best.values():
+        obj.pop("_updated", None)
+        yield obj
 
 
 # -- settings --------------------------------------------------------------- #

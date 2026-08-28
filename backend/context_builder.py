@@ -137,7 +137,7 @@ def build_context_with_memory(
     (which also touches their TTL) aren't fetched twice through different
     paths.
     """
-    rag = build_context(store, prompt, settings, max_chars=max_chars)
+    rag = build_context(store, prompt, settings, max_chars=max_chars, kinds=(KIND_WEB,))
     memory_block = (memory_block or "").strip()
     if not memory_block:
         return rag

@@ -38,7 +38,37 @@ def test_web_cache_ttl_from_settings(monkeypatch):
         importlib.reload(tools_mod)
 
 
-def test_rag_web_ttl_constant():
-    from vector_store import RAG_WEB_TTL_DAYS
+def test_rag_web_ttl_uses_config_not_constant(tmp_path):
+    """TTL وب باید از config.ttl_days (تنظیمات کاربر) بیاد، نه ثابت hardcode.
 
-    assert RAG_WEB_TTL_DAYS == 90
+    چون upsert_doc embedding می‌خواد (که توی محیط تست دانلود نشده)،
+    ردیف‌های doc رو مستقیماً با SQL درج می‌کنیم تا فقط evict() رو تست کنیم.
+    """
+    import time
+
+    from vector_store import KIND_WEB, StoreConfig, VectorStore
+
+    cfg = StoreConfig.from_dict({"ttl_days": 30, "max_docs": 500, "max_chunks": 4000})
+    store = VectorStore(str(tmp_path / "ws.sqlite"), cfg)
+    now = int(time.time())
+    old_ts = now - 60 * 86400
+    new_ts = now - 86400
+    # درج مستقیم دو doc وب (بدون نیاز به embedding)
+    store._conn.execute(
+        "INSERT INTO docs (key, kind, title, fetched_at, created_at, updated_at, chunk_count) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+        ("web:http://x", KIND_WEB, "X", old_ts, old_ts, old_ts),
+    )
+    store._conn.execute(
+        "INSERT INTO docs (key, kind, title, fetched_at, created_at, updated_at, chunk_count) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+        ("web:http://y", KIND_WEB, "Y", new_ts, new_ts, new_ts),
+    )
+    store._conn.commit()
+
+    removed = store.evict()
+    # فقط doc قدیمی (۶۰ روزه) باید پاک بشه، نه جدید
+    assert removed == 1
+    remaining = store.all_doc_meta(KIND_WEB)
+    assert "web:http://y" in remaining
+    assert "web:http://x" not in remaining

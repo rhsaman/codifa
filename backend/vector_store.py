@@ -48,10 +48,6 @@ KIND_FILE = "file"
 # so stale vectors are rebuilt rather than silently mixed.
 EMBEDDING_VERSION = 1
 
-# TTL پیش‌فرض برای اسناد وب/fetch در RAG (روز). کش وبِ فرانت‌اند/بک‌اند جداگونه
-# از طریق webSearchTtlDays / fetchUrlTtlDays در settings تنظیم می‌شه.
-RAG_WEB_TTL_DAYS = 90
-
 _DB_LOCK = threading.RLock()
 
 _DEFAULTS = {
@@ -829,13 +825,13 @@ class VectorStore:
         """Apply caps + TTL: evict least-recently-fetched docs beyond limits and
         expired web/memory docs. Returns how many docs were removed.
 
-        TTL برای KIND_WEB از RAG_WEB_TTL_DAYS میاد (پیش‌فرض ۹۰ روز)، بقیه از
-        config.ttl_days (پیش‌فرض ۱۸۰ روز برای memory).
+        TTL برای همهٔ kindها از config.ttl_days میاد (همون مقداری که
+        کاربر تو Settings → ragWebTtlDays تنظیم کرده). پیش‌فرض ۱۸۰ روز.
         """
         removed = 0
         with _DB_LOCK, self._conn:
-            # KIND_WEB: TTL جداگانه (۹۰ روز)
-            web_cutoff = self._now() - RAG_WEB_TTL_DAYS * 86400
+            # KIND_WEB: TTL از تنظیمات کاربر (ragWebTtlDays)
+            web_cutoff = self._now() - self.config.ttl_days * 86400
             rows = self._conn.execute(
                 "SELECT id, key FROM docs WHERE kind = ? AND fetched_at < ?",
                 (KIND_WEB, web_cutoff),

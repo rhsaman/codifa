@@ -12,7 +12,8 @@
   دارن بالاتر میان (بدون اینکه فایلی کلاً حذف بشه).
 * بودجه توکنی پویا (مثل --map-tokens در aider): با binary search روی تعداد
   تگ‌ها، نقشه رو تا نزدیک سقف توکن باز می‌کنیم.
-* نمایش غنی با TreeContext: فقط اسم نیست، خطوط حیاتیِ بدنه هم نشون داده می‌شه.
+* نمایش فشردهٔ امضا (نام + خط + نوع): بدنهٔ تابع رو نشون نمی‌ده تا بودجهٔ
+  توکنی شامل صدها فایل بشه، نه فقط ۱-۲ فایل.
 * کش سبک بر اساس mtime+file_count برای جلوگیری از rebuild در هر نوبت.
 
 تفاوت با aider: به‌جای main_model.token_count از تقریب ارزان len//4 استفاده
@@ -31,7 +32,7 @@ from collections import defaultdict, namedtuple
 import networkx as nx
 
 # پکیج‌های aider-style (نصب‌شده در backend/pyproject.toml).
-from grep_ast import TreeContext, filename_to_lang
+from grep_ast import filename_to_lang
 from grep_ast.tsl import get_language, get_parser
 from tree_sitter import Query, QueryCursor
 
@@ -40,6 +41,21 @@ _TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".swift", ".rb", ".php", ".c", ".cc",
     ".cpp", ".h", ".hpp", ".cs", ".sql", ".sh", ".bash", ".vue", ".svelte",
+}
+
+# نگاشت پسوند → زبانِ پشتیبانی‌شده توسط tree-sitter-language-pack.
+# filename_to_lang برای .tsx/.jsx ممکنه "tsx"/"jsx" برگردونه که گرامرش
+# توی language-pack نصب نیست (فقط "typescript"/"javascript" هست)؛ پس صریحاً
+# نگاشت می‌کنیم تا parser/tags.query پیدا بشه.
+_LANG_ALIASES = {
+    ".tsx": "typescript",
+    ".jsx": "javascript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".vue": "html",
+    ".svelte": "html",
 }
 
 # پوشه‌هایی که نباید پیمایش بشن (مطابق با ابزارهای فایل).
@@ -88,13 +104,26 @@ _SKIP_DIRS = {
 }
 
 # الگوهای regex برای زبان‌هایی که tree-sitter برای‌شون tags.scm نداره
-# (مثل c_sharp/bash/sql/vue) — فقط تعاریف سطح‌بالا.
+# (مثل c_sharp/bash/sql/vue) یا وقتی parser/query در دسترس نیست — فقط تعاریف سطح‌بالا.
 _GENERIC_PATTERNS = [
     (re.compile(r"^(?:func|fn)\s+([A-Za-z_]\w*)"), "function"),
     (re.compile(r"^(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)"), "function"),
     (re.compile(r"^(?:class|struct|interface|enum|trait|type|object|impl|extension)\s+([A-Za-z_]\w*)"), "type"),
     (re.compile(r"^(?:CREATE\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE)\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\[]?([A-Za-z_]\w*))", re.IGNORECASE), "type"),
-    (re.compile(r"^\s*(?:[\w<>\[\],\s]+?)\s+([A-Za-z_]\w*)\s*\("), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_]\w*)"), "class"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_]\w*)\s*\("), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*[:=]"), "variable"),
+    (re.compile(r"^\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*\{"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?interface\s+([A-Za-z_]\w*)"), "interface"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_]\w*)"), "class"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_]\w*)\s*\("), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*[:=]"), "variable"),
+    (re.compile(r"^\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*\{"), "function"),
+    (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?interface\s+([A-Za-z_]\w*)"), "interface"),
 ]
 
 # کش: root -> (timestamp, map, signature)
@@ -146,14 +175,22 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
     lang = filename_to_lang(fname)
     if not lang:
         return []
+    # نگاشت صریح پسوند → زبانِ پشتیبانی‌شده (مثل .tsx → typescript) تا
+    # گرامر/tags.query پیدا بشه. اگه filename_to_lang زبان نصب‌نشده برگردونده
+    # بود، اینجا اصلاح می‌شه.
+    ext = os.path.splitext(fname)[1].lower()
+    if ext in _LANG_ALIASES:
+        lang = _LANG_ALIASES[ext]
     try:
         language = get_language(lang)
         parser = get_parser(lang)
     except Exception:  # noqa: BLE001 — گرامر لود نشد
+        # به‌جای قطع کامل، اجازه می‌دیم فراخوان‌کننده به fallback regex برگرده.
         return []
 
     scm = _get_scm_fname(lang)
     if not scm:
+        # tags.scm نداریم → فراخوان‌کننده به regex/AST فعلی برمی‌گرده.
         return []
 
     if not code:
@@ -268,7 +305,8 @@ def _extract_symbols(rel_path: str, text: str) -> list[tuple[str, int, str]]:
             return defs
     except Exception:  # noqa: BLE001, S110 - tree-sitter may fail on odd syntax; fall back to AST/regex
         pass
-    # fallback
+    # fallback: وقتی tree-sitter هیچ تگی نداد (زبان پشتیبانی‌نشده یا tags.scm
+    # نداشت) یا exception داد، با AST (برای .py) یا regex عمومی ادامه می‌دیم.
     if ext == ".py":
         return _extract_python(text)
     return _extract_regex(text, _GENERIC_PATTERNS)
@@ -376,38 +414,18 @@ def _read_file_tags(fname: str) -> list[Tag]:
 
 
 # --------------------------------------------------------------------------
-# نمایش غنی با TreeContext (مشابه aider.render_tree / to_tree)
+# نمایش فشردهٔ امضا (مشابه aider.to_tree — بدون بدنهٔ تابع)
 # --------------------------------------------------------------------------
 
-def _render_tree(abs_fname: str, rel_fname: str, lois) -> str:
-    """رندر درخت کد با TreeContext (خطوط حیاتی بدنه هم نشون داده می‌شه)."""
-    try:
-        with open(abs_fname, "r", encoding="utf-8", errors="replace") as fh:
-            code = fh.read()
-    except OSError:
-        return ""
-    try:
-        context = TreeContext(
-            rel_fname,
-            code,
-            color=False,
-            line_number=False,
-            child_context=True,
-            last_line=False,
-            margin=0,
-            mark_lois=False,
-            loi_pad=0,
-            show_top_of_file_parent_scope=True,
-        )
-        context.lines_of_interest = set(lois)
-        context.add_context()
-        return context.format()
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
-    """ساخت نمایش درختی از تگ‌های رتبه‌بندی‌شده (مثل aider.to_tree)."""
+    """ساخت نمایش درختی از تگ‌های رتبه‌بندی‌شده (مثل aider.to_tree).
+
+    فقط امضا (نام + خط + نوع) رو نشون می‌ده — نه بدنهٔ تابع. aider همین‌کار
+    رو می‌کنه: نقشه قراره «کجا چی هست» رو سریع نشون بده تا مدل مستقیم بره سراغ
+    read(file:line)، نه اینکه خودش کد رو اینجا پیچ کنه. رندر کردن بدنه باعث
+    می‌شد بودجهٔ ۱۰۲۴ توکن فقط برای ۱-۲ فایل تموم بشه و بقیهٔ پروژه از نقشه
+    حذف بشه → مدل مجبور بود با read تکی دنبال فایل‌ها بگرده.
+    """
     if not tags:
         return ""
     # گروه‌بندی بر اساس فایل — ترتیب رو از tags (که قبلاً رتبه‌بندی شد) حفظ می‌کنیم
@@ -423,16 +441,16 @@ def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
         if fname in chat_rel_fnames:
             continue  # فایل‌های چت رو رد می‌کنیم (aider همین‌کار رو می‌کنه)
         tags_in_file = by_file[fname]
-        # TreeContext خطوط رو ۱-based می‌خواد (تگ ما ۰-based ذخیره شده)
-        lois = [t.line + 1 for t in tags_in_file if t.line is not None and t.line >= 0]
-        # abs_path رو از تگ می‌گیریم (فیلد fname = abs_path) یا با root_real می‌سازیم
-        abs_fname = tags_in_file[0].fname
-        if not os.path.isfile(abs_fname) and root_real:
-            abs_fname = os.path.join(root_real, fname)
-        rendered = _render_tree(abs_fname, fname, lois)
-        if rendered:
-            lines.append(f"📄 {fname}")
-            lines.append(rendered)
+        # محدودیت تگ در فایل: مثل aider و _simple_tree، فقط ۲۰ تا اول رو نشون میدیم
+        # تا بودجه توکنی روی فایل‌های بیشتری توزیع بشه
+        MAX_TAGS_PER_FILE = 20
+        lines.append(f"📄 {fname}")
+        for t in tags_in_file[:MAX_TAGS_PER_FILE]:
+            line = (t.line + 1) if t.line is not None and t.line >= 0 else 0
+            kind = t.kind if t.kind else "def"
+            lines.append(f"  ├─ {kind} {t.name} (L{line})")
+        if len(tags_in_file) > MAX_TAGS_PER_FILE:
+            lines.append(f"  └─ ... و {len(tags_in_file) - MAX_TAGS_PER_FILE} نماد دیگر")
     return "\n".join(lines)
 
 

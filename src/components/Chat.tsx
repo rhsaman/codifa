@@ -1176,7 +1176,9 @@ export function ChatPanel() {
     // Use THIS panel's chat (captured at render), never s.activeChatId: a
     // queued turn drained while the user is viewing ANOTHER chat must still
     // target this chat's messages/usage.
-    const chat = s.chats.find((c) => c.id === chatIdRef.current) ?? null;
+    // Read fresh from store using the chat ID from render scope to avoid stale chatIdRef closure.
+    const chatId = chatIdRef.current;
+    const chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
     // Messages that ask to create/install skills or MCP connectors also grant
     // the create_skill/create_mcp tools — in EVERY mode (ask, plan, coder).

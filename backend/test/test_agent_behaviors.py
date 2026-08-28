@@ -272,8 +272,9 @@ def test_plan_output_contract_requires_summary():
 
 
 async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace):
-    """The test-verification gate must actually run the frontend test command
-    (e.g. `npm run test:frontend`) for a JS/TS workspace, not just Python."""
+    """The Coder must be told the exact frontend test command (e.g.
+    `npm run test:frontend`) for a JS/TS workspace so it runs the tests itself —
+    the graph no longer runs an automatic test gate."""
     (workspace / "package.json").write_text(
         json.dumps({"scripts": {"test:frontend": "echo frontend-ok"}}),
         encoding="utf-8",
@@ -281,29 +282,27 @@ async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace)
     _base, mock = mock_server
     mock.script = [text_reply("done")]
     events = await run_events("یک کامپوننت بنویس", mode="coder")
-    term = [
-        e for e in events
-        if e.get("kind") == "tool" and e.get("tool") == "run_terminal"
-    ]
-    assert any(
-        "test:frontend" in (e.get("args", {}) or {}).get("command", "")
-        for e in term
-    ), term
+    # The test command must appear in the messages sent to the model (injected
+    # by detect_test_commands() into the Coder's test-verification prompt).
+    all_messages = [m for body in mock.captured for m in body.get("messages", [])]
+    joined = json.dumps(all_messages, ensure_ascii=False)
+    assert "test:frontend" in joined, (
+        "coder must be instructed to run the frontend test command; "
+        f"messages did not contain it: {joined[:500]}"
+    )
 
 
 async def test_agent_runs_flutter_test_gate(run_events, mock_server, workspace):
-    """The test-verification gate must run `flutter test` for a Flutter project."""
+    """The Coder must be told to run `flutter test` for a Flutter project."""
     (workspace / "pubspec.yaml").write_text(
         "name: demo\ndependencies:\n  flutter:\n", encoding="utf-8"
     )
     _base, mock = mock_server
     mock.script = [text_reply("done")]
     events = await run_events("یک ویجت بنویس", mode="coder")
-    term = [
-        e for e in events
-        if e.get("kind") == "tool" and e.get("tool") == "run_terminal"
-    ]
-    assert any(
-        "flutter test" in (e.get("args", {}) or {}).get("command", "")
-        for e in term
-    ), term
+    all_messages = [m for body in mock.captured for m in body.get("messages", [])]
+    joined = json.dumps(all_messages, ensure_ascii=False)
+    assert "flutter test" in joined, (
+        "coder must be instructed to run flutter test; "
+        f"messages did not contain it: {joined[:500]}"
+    )

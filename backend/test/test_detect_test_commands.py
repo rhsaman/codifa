@@ -36,8 +36,8 @@ def test_c_cpp_with_makefile_uses_make_test(tmp_path):
 
 def test_c_cpp_without_runner_returns_no_commands(tmp_path):
     # A C/C++ project with no CMake/Make must NOT emit a no-op echo that would
-    # falsely report a passing test (exit 0). It should leave cmds empty so
-    # test_node reports "no tests configured".
+    # falsely report a passing test (exit 0). It should leave cmds empty so the
+    # Coder is told there are no project tests to run.
     _mk(str(tmp_path), "main.c", "int main(){return 0;}\n")
     assert detect_test_commands(str(tmp_path)) == []
 

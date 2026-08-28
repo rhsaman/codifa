@@ -1187,7 +1187,7 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
 # failure recovers automatically — up to this many attempts, 30s apart — instead
 # of giving up on the first blip. Configurable so tests can zero the backoff.
 _RETRY_MAX_ATTEMPTS = 10
-_RETRY_BASE_SECONDS = 30
+_RETRY_BASE_SECONDS = 15
 
 
 def _is_image_rejection(exc: BaseException) -> bool:
@@ -2916,12 +2916,17 @@ def _prune_history(history: list[dict], enabled: bool = True) -> list[dict]:
         and m.get("tool") not in _PRUNE_PROTECTED_TOOLS
     ]
     old_tokens = sum(
-        _estimate_tokens(str(m.get("content", ""))) for m in (history[i] for i in candidates)
+        _estimate_tokens(str(m.get("content", "")))
+        for m in (history[i] for i in candidates)
     )
     if old_tokens < _PRUNE_PROTECT_TOKENS:
         return history
     for i in candidates:
-        history[i] = {**history[i], "content": "[Old tool result content cleared]", "compacted": True}
+        history[i] = {
+            **history[i],
+            "content": "[Old tool result content cleared]",
+            "compacted": True,
+        }
     return history
 
 

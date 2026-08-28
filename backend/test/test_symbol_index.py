@@ -49,7 +49,7 @@ def test_format_symbol_map_includes_line_numbers():
         out = format_symbol_map(d)
         assert "a.py" in out
         assert "x" in out
-        assert "def x()" in out  # امضای تابع با خط حیاتی (TreeContext)
+        assert "function x (L1)" in out  # امضا: نام + خط (بدون بدنه)
 
 
 def test_skip_dirs_and_binary():

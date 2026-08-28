@@ -4086,7 +4086,11 @@ When you need to read several files, read multiple independent files in parallel
             _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
             if _ws is not None and _rag_web_enabled():
                 try:
-                    _ws.upsert_doc(
+                    # upsert_doc → upsert_many → embed_passages (blocking inference)
+                    # + sqlite writes. Offload to a thread so the event loop never
+                    # blocks on embedding (same pattern as _rag_web_lookup).
+                    await asyncio.to_thread(
+                        _ws.upsert_doc,
                         f"web:{r['url']}",
                         KIND_WEB,
                         r.get("title", r["url"]),
@@ -4319,7 +4323,11 @@ When you need to read several files, read multiple independent files in parallel
         _ws = store if store is not None else (_get_web_store(root) if _rag_web_enabled() else None)
         if _ws is not None and body and _rag_web_enabled():
             try:
-                _ws.upsert_doc(
+                # upsert_doc → upsert_many → embed_passages (blocking inference)
+                # + sqlite writes. Offload to a thread so the event loop never
+                # blocks on embedding (same pattern as _rag_web_lookup).
+                await asyncio.to_thread(
+                    _ws.upsert_doc,
                     f"web:{url}",
                     KIND_WEB,
                     title or url,

@@ -7,12 +7,14 @@ explicit LangGraph state machine:
     +-- Ask   (web_search / fetch_url / vision / read / grep / glob)
     +-- Plan  (web_search / fetch_url / vision / glob / grep / read / terminal)
     +-- Coder (edit_file / write_file / create / delete)
-              -> Test (existing project test/build/type-check)
-                  -- pass -> Review -> Done
-                  -- fail -> Debug -> Coder -> ...  (bounded, MAX_DEBUG_ATTEMPTS)
+              -> Review -> Done
 
-The graph controls the *high-level* flow (routing, the test/debug/review loop,
-the tool-permission boundaries). Each node runs ONE LLM turn for its mode via a
+The Coder runs the project's tests itself (via run_terminal) before finishing —
+there is NO automatic test/debug loop in the graph. The graph only routes
+Coder -> Review -> Done.
+
+The graph controls the *high-level* flow (routing, the tool-permission
+boundaries). Each node runs ONE LLM turn for its mode via a
 shared LangChain tool-loop runner (``_run_mode_turn``). That runner:
 
 * builds the system prompt / history / RAG / skills using the SAME helpers the
@@ -67,8 +69,6 @@ from llm import (
 )
 from mcp_bridge import build_mcp_tools
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
-
-MAX_DEBUG_ATTEMPTS = 3
 
 # Tool calls in this set mutate persistent state (files, terminal, saved
 # memory/skills/connectors) or block on a real human (ask_user) -- they run
@@ -150,13 +150,8 @@ class AgentState(TypedDict, total=False):
     plan: str
     coder_result: str
     changed_files: list[str]
-    test_results: dict
-    test_status: str
-    debug_info: str
-    debug_attempts: int
     review_result: str
     final_response: str
-    max_debug_attempts: int
     # Explore (deterministic repo-discovery) scratch state
     search_spec: dict
     explore_glob: list[str]
@@ -1143,17 +1138,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         disc = _agents._plan_discovery_note(history)
         if disc:
             lc_history.insert(0, SystemMessage(content=disc))
-        # Feed the previous test failure back to Coder so the retry loop is not
-        # blind: without this, coder->test->debug->coder repeats without knowing
-        # what broke, and the user can end up with buggy code after MAX attempts.
-        dbg = state.get("debug_info")
-        if dbg:
-            lc_history.insert(
-                0,
-                SystemMessage(
-                    content=f"PREVIOUS TEST FAILURE — fix this before finishing:\n{dbg[:3000]}"
-                ),
-            )
         # Enforce the test-verification rule at runtime for any code-changing
         # coder task (feature/bugfix/refactor), not only when the prompt
         # literally says "test". This closes the gap the user reported: coder
@@ -1169,17 +1153,26 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     f"and run the project's frontend command (npm run test:frontend / "
                     f"npx vitest run / npx jest). "
                 )
+            # Tell the Coder the EXACT commands to run so it runs the project's
+            # tests itself (there is no automatic test gate in the graph). This
+            # also keeps detect_test_commands() in active use instead of dead code.
+            cmds = detect_test_commands(root)
+            cmd_note = ""
+            if cmds:
+                cmd_note = (
+                    " Run these project test command(s) yourself via run_terminal "
+                    "before finishing: " + "; ".join(cmds) + ". "
+                )
             lc_history.insert(
                 0,
                 SystemMessage(
                     content=(
                         "TEST VERIFICATION RULE: this is code-changing work. "
                         "Write/update the relevant test(s) for the language(s) you "
-                        "touched and run them (uv run pytest / npm test / cargo test / "
-                        "go test / mvn test / dotnet test / flutter test / dart test / "
-                        "..." + fw_note + "). Do NOT finish with red tests — the system "
-                        "re-runs you on failure and feeds the error back, so keep "
-                        "fixing until all tests pass."
+                        "touched and run them yourself (uv run pytest / npm test / "
+                        "cargo test / go test / mvn test / dotnet test / flutter test / "
+                        "dart test / ..." + fw_note + ")." + cmd_note + "Do NOT finish "
+                        "with red tests — keep fixing until all tests pass."
                     )
                 ),
             )
@@ -2608,7 +2601,7 @@ def detect_test_commands(root: str) -> list[str]:
     elif os.path.isfile(os.path.join(root, "Makefile")):
         cmds.append("make test")
     # C/C++ files without CMake/Make have no standard test runner; leave cmds
-    # empty so test_node reports "no tests configured" instead of a false pass.
+    # empty so the Coder is told there are no project tests to run.
 
     return cmds
 
@@ -2715,100 +2708,23 @@ async def coder_node(state: AgentState) -> dict:
     return {"coder_result": reply, "final_response": reply}
 
 
-def test_node(state: AgentState) -> dict:
-    """Run every language's test/build/type-check tooling in the workspace.
-
-    Uses ``tools.run_terminal`` (the same tool the agent uses) so each command
-    is sandboxed to the workspace root. All detected commands are run; if any
-    fails the whole gate fails and the coder->debug->coder loop retries.
-    """
-    queue = state["_queue"]
-    root = state["root"]
-    cmds = detect_test_commands(root)
-    if not cmds:
-        # Nothing to run — don't emit a misleading error event. The turn simply
-        # proceeds to review with no test gate.
-        return {
-            "test_results": {
-                "passed": True,
-                "errors": [],
-                "output": "no tests configured",
-            },
-            "test_status": "pass",
-        }
-    from tools import run_terminal
-
-    all_ok = True
-    errors: list[str] = []
-    out_parts: list[str] = []
-    for cmd in cmds:
-        queue.put_nowait(
-            {"kind": "tool", "tool": "run_terminal", "args": {"command": cmd}}
-        )
-        result = run_terminal(root, cmd, timeout=300)
-        exit_code = result.get("exit_code", 1)
-        output = str(result.get("output", ""))
-        ok = exit_code == 0
-        all_ok = all_ok and ok
-        if not ok:
-            errors.append(f"[{cmd}] {output[-2000:]}")
-        out_parts.append(f"$ {cmd}\n{output[-2000:]}")
-        queue.put_nowait(
-            {
-                "kind": "tool_result",
-                "tool": "run_terminal",
-                "summary": f"{cmd} exit={exit_code} ({'pass' if ok else 'fail'})",
-                "status": "ok" if ok else "error",
-            }
-        )
-    return {
-        "test_results": {
-            "passed": all_ok,
-            "failed": not all_ok,
-            "errors": errors,
-            "output": "\n".join(out_parts)[-4000:],
-        },
-        "test_status": "pass" if all_ok else "fail",
-    }
-
-
-def debug_node(state: AgentState) -> dict:
-    """Analyze the test failure and produce instructions for Coder.
-
-    DEBUG must not modify files -- it only inspects the failure and increments
-    the bounded attempt counter.
-    """
-    queue = state["_queue"]
-    attempts = int(state.get("debug_attempts", 0)) + 1
-    results = state.get("test_results") or {}
-    info = (
-        "TESTS FAILED. Fix the code so the project's tests pass.\n"
-        f"Exit: {'pass' if results.get('passed') else 'fail'}\n"
-        f"Output (tail):\n{str(results.get('output', ''))[-2000:]}"
-    )
-    queue.put_nowait({"kind": "debug", "attempt": attempts, "info": info[:1500]})
-    return {"debug_info": info, "debug_attempts": attempts}
-
-
 def review_node(state: AgentState) -> dict:
-    """Verify the implementation against the request / plan / tests.
+    """Verify the implementation against the request / plan.
 
-    Read-only. Produces a structured review result. When tests passed and a
-    Coder result exists, the review is marked approved.
+    Read-only. Produces a structured review result. The Coder is responsible for
+    running the project's tests itself (via run_terminal) before finishing, so
+    the graph does not run a separate test gate — the review just checks that an
+    implementation was produced.
     """
     queue = state["_queue"]
-    test_status = state.get("test_status", "pass")
     plan = state.get("plan", "")
     coder = state.get("coder_result", "")
-    approved = test_status == "pass" and bool(coder)
     notes = []
-    if test_status != "pass":
-        notes.append("tests did not pass")
     if not coder:
         notes.append("no implementation produced")
     if plan and "## Plan" not in plan and not coder:
         notes.append("no plan/implementation to review")
-    result = "APPROVED" if approved else "NEEDS WORK: " + "; ".join(notes)
+    result = "APPROVED" if not notes else "NEEDS WORK: " + "; ".join(notes)
     queue.put_nowait({"kind": "review", "result": result})
     return {"review_result": result}
 
@@ -4141,18 +4057,6 @@ def _route_mode(state: AgentState) -> str:
     return normalize_mode(state.get("mode", "ask"))
 
 
-def _route_test(state: AgentState) -> str:
-    return "pass" if state.get("test_status") == "pass" else "fail"
-
-
-def _route_debug(state: AgentState) -> str:
-    if int(state.get("debug_attempts", 0)) < int(
-        state.get("max_debug_attempts", MAX_DEBUG_ATTEMPTS)
-    ):
-        return "coder"
-    return "review"
-
-
 def build_graph():
     """Compile the LangGraph state machine for the agent workflow.
 
@@ -4167,8 +4071,6 @@ def build_graph():
     g.add_node("coder", coder_node)
     g.add_node("coder_entry", coder_entry)
     g.add_conditional_edges("coder_entry", _route_coder_entry, {"coder": "coder"})
-    g.add_node("test", test_node)
-    g.add_node("debug", debug_node)
     g.add_node("review", review_node)
     g.add_node("done", done_node)
     # ASK flow: general assistant with repo tools; answers directly, searching
@@ -4215,12 +4117,9 @@ def build_graph():
         },
     )
 
-    # CODER tail.
-    g.add_edge("coder", "test")
-    g.add_conditional_edges("test", _route_test, {"pass": "review", "fail": "debug"})
-    g.add_conditional_edges(
-        "debug", _route_debug, {"coder": "coder", "review": "review"}
-    )
+    # CODER tail: Coder runs the project's tests itself (via run_terminal) before
+    # finishing, so there is no automatic test/debug loop here — just review.
+    g.add_edge("coder", "review")
     g.add_edge("review", "done")
     g.add_edge("done", END)
     return g.compile()
@@ -4235,8 +4134,6 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     queue: asyncio.Queue = asyncio.Queue()
     initial = dict(initial)
     initial["_queue"] = queue
-    initial.setdefault("debug_attempts", 0)
-    initial.setdefault("max_debug_attempts", MAX_DEBUG_ATTEMPTS)
     # Mutable flag shared between _run_mode_turn (which detects a hard failure)
     # and _drive (which decides whether to clear the durable resume file). A
     # plain attribute on `initial` would be invisible to _drive because

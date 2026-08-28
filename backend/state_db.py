@@ -61,7 +61,7 @@ def bootstrap() -> None:
     missing a directory.
     """
     data_root()
-    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir(), resume_dir()):
+    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir()):
         os.makedirs(d, exist_ok=True)
     os.makedirs(vector_db_dir(), exist_ok=True)
     sp = settings_path()
@@ -106,134 +106,6 @@ def vector_db_dir() -> str:
 
 def plans_dir() -> str:
     return os.path.join(data_root(), "plan")
-
-
-def resume_dir() -> str:
-    """Directory for per-chat interrupted-turn resume state.
-
-    When a run is cut off (user Stop, an error, or the app closing mid-stream)
-    the backend persists the FULL results of every tool call it completed, so a
-    later run for the same chat can continue from where it stopped instead of
-    redoing the work. Files live on disk (not memory) so they survive a full
-    app restart. Keyed by workspace + chat id.
-    """
-    return os.path.join(data_root(), "resume")
-
-
-def _resume_file(root: str, chat_id: str) -> str:
-    ws = _slugify(
-        os.path.basename(os.path.realpath(root).rstrip(os.sep)) or "workspace"
-    )
-    cid = _safe_file(chat_id, fallback="chat")
-    return os.path.join(resume_dir(), ws, f"{cid}.json")
-
-
-def save_turn_resume(root: str, chat_id: str, payload: dict) -> None:
-    """Append completed-tool records to the resume file for ``chat_id`` (JSONL).
-
-    Each call appends one line per tool record instead of overwriting the whole
-    file, so an interrupt mid-write cannot destroy prior records — the file
-    stays a valid JSONL stream and resume can always replay what was done.
-    Best-effort: never raises (I/O must not fail a run).
-    """
-    if not chat_id:
-        return
-    tools = payload.get("tools") if isinstance(payload, dict) else None
-    if not isinstance(tools, list) or not tools:
-        return
-    try:
-        path = _resume_file(root, chat_id)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            for rec in tools:
-                if isinstance(rec, dict):
-                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except (OSError, TypeError, ValueError):  # best-effort
-        pass
-
-
-def load_turn_resume(root: str, chat_id: str) -> dict | None:
-    """Read the persisted resume state for ``chat_id``, or None.
-
-    The file is JSONL (one tool record per line); a partial/garbled line from
-    an interrupted write is skipped rather than failing the whole load.
-    """
-    if not chat_id:
-        return None
-    path = _resume_file(root, chat_id)
-    try:
-        if not os.path.exists(path):
-            return None
-        tools: list[dict] = []
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue  # skip a half-written line
-                if isinstance(rec, dict):
-                    tools.append(rec)
-        if not tools:
-            return None
-        return {"tools": tools}
-    except OSError:
-        return None
-
-
-def clear_turn_resume(root: str, chat_id: str) -> None:
-    """Remove the persisted resume state for ``chat_id`` (after a clean finish)."""
-    if not chat_id:
-        return
-    try:
-        os.remove(_resume_file(root, chat_id))
-    except OSError:
-        pass
-
-
-# Files older than this are considered orphaned (the chat was switched, the app
-# closed mid-turn without a clean finish, or a crash left a file behind) and get
-# pruned only on app shutdown — never per-turn, so finishing one chat never
-# touches another chat's in-flight resume file.
-_RESUME_MAX_AGE_HOURS = 24.0
-
-
-def prune_stale_resume_files(max_age_hours: float = _RESUME_MAX_AGE_HOURS) -> None:
-    """Delete orphaned resume files older than ``max_age_hours``.
-
-    Called only on app shutdown (never per-turn) so finishing one chat never
-    touches another chat's in-flight resume file. Best-effort: never raises.
-    """
-    try:
-        base = resume_dir()
-        if not os.path.isdir(base):
-            return
-        cutoff = _now() - max(0.0, float(max_age_hours)) * 3600.0
-        for ws in os.listdir(base):
-            wd = os.path.join(base, ws)
-            if not os.path.isdir(wd):
-                continue
-            try:
-                entries = os.listdir(wd)
-            except OSError:
-                continue
-            for name in entries:
-                if not name.endswith(".json"):
-                    continue
-                path = os.path.join(wd, name)
-                try:
-                    st = os.stat(path)
-                except OSError:
-                    continue
-                if st.st_mtime <= cutoff:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-    except OSError:
-        pass
 
 
 def skills_dir() -> str:

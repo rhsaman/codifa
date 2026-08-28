@@ -19,7 +19,6 @@ import pytest
 from mock_openai import mock, text_reply, tool_call
 
 import agents
-import state_db
 
 
 @pytest.fixture(autouse=True)
@@ -177,8 +176,10 @@ async def test_500_retries_then_giveup_after_budget(run_events, monkeypatch):
 
 async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspace):
     """A hard 400 after a completed read: surfaces as an `error` event (no
-    raise, no crash) and writes NO durable resume file -- the model is not
-    "taught" the interrupted work."""
+    raise, no crash) and does NOT "teach" the model the interrupted work. The
+    interrupted-turn resume checkpoint (LangGraph checkpointer) is left in place
+    on a hard error so a same-prompt retry can resume, but nothing is injected
+    back into the prompt."""
     mock.script = [
         tool_call("read", json.dumps({"filePath": "app.py"})),
         None,  # hard 400 on the main model's next request
@@ -189,13 +190,8 @@ async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspa
 
     assert any(e.get("kind") == "error" for e in events), \
         "fatal 400 must surface as an error event (no raise)"
-    # The durable resume file is KEPT on a hard error (not cleared) so a
-    # same-prompt retry can replay the already-done tool work instead of
-    # re-running it from scratch. See test_resume.py scenarios 2/5.
-    resume = state_db.load_turn_resume(str(workspace), "pytest-chat")
-    assert resume is not None, "resume file must survive a hard error for retry"
-    assert isinstance(resume.get("tools"), list) and resume["tools"], \
-        "resume file should hold the completed tool work"
+    # Nothing about the hard error teaches the model the interrupted work; the
+    # turn simply stops with an error event (no retry, no injected replay).
 
 
 def test_free_usage_limit_is_transient_not_quota():

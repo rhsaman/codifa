@@ -78,7 +78,7 @@ async def main():
             compact_model, history, fallback_model=main_model
         )
         assert compacted is not None, "empty-summary fallback must succeed"
-        new_history, _ = compacted
+        new_history, _, _usage = compacted
         assert "Fallback summary" in new_history[0]["content"], new_history[0]["content"]
         print("  OK: empty summary falls back to main model")
 

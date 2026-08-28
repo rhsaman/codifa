@@ -3024,14 +3024,15 @@ async def _compact_history(
     is bounded only by opencode's 4096-token ceiling (scaled for small windows),
     not a 250-word straitjacket — so detail is preserved instead of discarded.
 
-    Returns a tuple ``(new_history, recent_kept)`` — ``recent_kept`` is the exact
-    number of recent turns preserved verbatim after the summary, so the caller
-    can tell the frontend to fold precisely those older turns and keep the SAME
-    recent ones (otherwise the summary and the verbatim tail it renders can
-    contradict each other). Returns ``None`` if there is nothing to compact OR
-    the summarizing call fails — on failure it does NOT drop the older turns
-    (the caller surfaces a ``compact_failed`` event so the user can retry
-    manually rather than silently losing context).
+    Returns a tuple ``(new_history, recent_kept, usage)`` — ``recent_kept`` is the
+    exact number of recent turns preserved verbatim after the summary, so the
+    caller can tell the frontend to fold precisely those older turns and keep the
+    SAME recent ones (otherwise the summary and the verbatim tail it renders can
+    contradict each other); ``usage`` is the summarizer's token usage dict (or
+    ``None``). Returns ``None`` if there is nothing to compact OR the summarizing
+    call fails — on failure it does NOT drop the older turns (the caller surfaces
+    a ``compact_failed`` event so the user can retry manually rather than
+    silently losing context).
 
     If ``fallback_model`` is provided and differs from ``model``, a failed or
     empty summarizer run on ``model`` (the configured compact subagent) is

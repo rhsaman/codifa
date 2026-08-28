@@ -23,6 +23,7 @@ from mock_openai import (
 )
 
 from agents import run_agent
+from llm import _MAX_OUTPUT_TOKENS
 
 
 def system_text(captured, needle):
@@ -70,10 +71,12 @@ async def main():
         print("  issues/1a OK: OUTPUT/REPLY DISCIPLINE + plan Files: contract in system prompts")
 
         # ---- Issue 1b: narrow tasks get a tighter output budget (proportional) ----
-        ctx_floor = 32000
-        broad_budget = min(max(1_024, ctx_floor // 4), 8_192)  # = 8000 in mock ctx
-        # New proportional narrow cap: 50% with 2048 floor
-        expected_narrow = max(2048, broad_budget // 2)  # = 4000 for 8000 broad budget
+        # The broad budget for an unknown model output limit is _MAX_OUTPUT_TOKENS
+        # (the old min(max(1024, ctx//4), 8192) clamp was removed because it made
+        # models truncate on even an empty context). Narrow caps at 50% with a 2048
+        # floor (see llm._request_body).
+        broad_budget = _MAX_OUTPUT_TOKENS  # = 32000 in mock ctx
+        expected_narrow = min(broad_budget, max(2048, broad_budget // 2))
         assert expected_narrow < broad_budget  # sanity: cap is tighter than broad
 
         _, cap_narrow = await one_turn("coder", "find where foo is defined and fix it")

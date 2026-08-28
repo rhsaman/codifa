@@ -1,15 +1,20 @@
-"""Live test: interrupted-turn resume.
+"""Live + unit tests for the LangGraph-checkpointer interrupted-turn resume.
 
-Covers Stop/abort, a hard API error, an app-close (no marker folded into history),
-and a Plan→Coder style handoff with a checklist. Drives the real backend against
-the shared mock server. Run standalone (`python backend/tests/test_resume.py`) or via
-`python backend/tests/run_tests.py`.
+This replaces the old custom JSONL "resume file" with LangGraph's native
+``AsyncSqliteSaver`` checkpointer. The full in-flight transcript (every completed
+tool call + its result) is persisted to the checkpointer keyed per chat; on a
+reconnect/interrupt the transcript is reloaded so the turn CONTINUES instead of
+redoing work. Because the replayed results keep their ORIGINAL tool_call ids, the
+loop's result-dedup (by name+args signature) reuses them instead of re-running
+identical greps — which is exactly what previously caused the repetition loop.
+
+Run standalone (``python backend/tests/test_resume.py``) or via
+``python backend/tests/run_tests.py``.
 """
 import asyncio
 import json
 import os
 import tempfile
-import time
 
 # Hermetic data root BEFORE importing anything that touches state_db.
 _TMP = tempfile.mkdtemp(prefix="coder-test-resume-data-")
@@ -17,6 +22,7 @@ os.environ["CODER_DATA_DIR"] = _TMP
 
 # Import the harness FIRST — it puts the repo backend dir on sys.path so the
 # backend modules below resolve wherever the tests run from.
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from mock_openai import (
     mock,
     start_server,
@@ -25,8 +31,13 @@ from mock_openai import (
     tool_call,
 )
 
-import state_db
 from agents import run_agent
+from graph import (
+    _clear_turn_checkpoint,
+    _load_turn_checkpoint,
+    _resume_thread_id,
+    _save_turn_checkpoint,
+)
 
 
 async def run_turn(**kw):
@@ -34,14 +45,6 @@ async def run_turn(**kw):
     async for ev in run_agent(**kw):
         events.append(ev)
     return events
-
-
-def find_in_request(captured, pred):
-    for body in captured:
-        for msg in body.get("messages", []):
-            if pred(msg):
-                return body, msg
-    return None, None
 
 
 def make_workspace():
@@ -55,365 +58,106 @@ async def main():
     task, base = await start_server()
     try:
         ws = make_workspace()
-        chat_id = "chat-resume-1"
+
+        # ==== Unit: checkpointer helpers round-trip ====
+        tid = _resume_thread_id({"chat_id": "unit-chat"})
+        assert tid == "resume:unit-chat", tid
+        msgs = [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "grep", "args": {"pattern": "foo"}, "id": "c1"}],
+            ),
+            ToolMessage(content="MATCHES for 'foo'\napp.py:1: def foo():", tool_call_id="c1"),
+        ]
+        await _save_turn_checkpoint(tid, msgs)
+        loaded = await _load_turn_checkpoint(tid)
+        assert loaded and len(loaded) == 3, f"expected 3 messages, got {len(loaded) if loaded else 0}"
+        # ToolMessage content (the FULL tool result) survives the round-trip.
+        assert any(
+            getattr(m, "type", "") == "tool" and "foo" in str(m.content) for m in loaded
+        ), "tool result lost in checkpointer round-trip"
+        await _clear_turn_checkpoint(tid)
+        assert await _load_turn_checkpoint(tid) is None, "clear failed"
+        print("  resume/unit OK: checkpointer helpers round-trip")
+
+        # ==== Integration: an interrupted turn leaves a checkpoint that a resumed
+        #      run reloads (and reuses) instead of re-running the tool. ====
+        chat = "chat-resume-native"
         common = {
-            "provider": "custom", "model_name": "mock-model", "base_url": base, "api_key": "test",
-            "root": ws, "mode": "ask", "chat_id": chat_id,
+            "provider": "custom",
+            "model_name": "mock-model",
+            "base_url": base,
+            "api_key": "test",
+            "root": ws,
+            "mode": "ask",
+            "chat_id": chat,
         }
 
-        # ==== Scenario 1: Stop / abort mid-stream after a completed tool ====
-        mock.script = [tool_call("grep", json.dumps({"pattern": "foo", "path": ""}))]
-        mock.captured = []
-        events = []
-        interrupted = False
-        async for ev in run_agent(prompt="find foo", history=[], **common):
-            events.append(ev)
-            if ev.get("kind") == "tool_result":
-                interrupted = True
-                break  # simulate client abort / Stop
-        assert interrupted, "run 1 never reached a tool_result"
-
-        resume = state_db.load_turn_resume(ws, chat_id)
-        assert resume and resume.get("tools"), "resume file missing after interruption"
-        tools = [t for t in resume["tools"] if isinstance(t, dict)]
-        assert tools and tools[0]["tool"] == "grep", "resume file lost the grep record"
-        full_result = tools[0]["result"]
-        # grep now distills through the search/explore subagent (defaults to the
-        # parent model when no subagent is configured), so the stored result is
-        # the distilled summary — still the FULL tool result the resume replays.
-        assert full_result and "foo" in full_result, \
-            f"resume result is not the FULL grep output: {full_result[:200]!r}"
-        print("  resume/1 OK: interrupted; file holds full grep result")
-
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        history = [
-            {"role": "user", "content": "find foo"},
-            {"role": "assistant",
-             "content": "[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
+        # Turn 1: model calls grep TWICE with DIFFERENT args (so the loop's
+        # result-dedup doesn't collapse them) and we break after the SECOND tool
+        # result, simulating a client abort. The checkpoint written after the 2nd
+        # result holds both tool results.
+        mock.script = [
+            tool_call("grep", json.dumps({"pattern": "foo", "path": ""}), call_id="call_foo"),
+            tool_call("grep", json.dumps({"pattern": "bar", "path": ""}), call_id="call_bar"),
+            text_reply("done"),
         ]
-        await run_turn(prompt="continue", history=history, **common)
-        _, call_msg = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant" and any(
-                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
-            ),
-        )
-        assert call_msg, "continue request did not replay the resume tool call"
-        tool_calls = [tc for tc in call_msg["tool_calls"] if tc.get("id", "").startswith("resume-")]
-        assert tool_calls[0]["function"]["name"] == "grep", "resume tool call wrong name"
-        _, ret_msg = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "tool" and m.get("tool_call_id") == tool_calls[0]["id"],
-        )
-        assert ret_msg and full_result in ret_msg["content"], \
-            "resume tool return missing the FULL result"
-        assert state_db.load_turn_resume(ws, chat_id) is None, \
-            "resume file not cleared after a clean finish"
-        print("  resume/1 OK: continue replays full result; file cleared")
+        mock.captured = []
+        seen = 0
+        async for ev in run_agent(prompt="find foo", history=[], **common):
+            if ev.get("kind") == "tool_result":
+                seen += 1
+                if seen >= 2:
+                    break  # simulate client abort / Stop after the 2nd result
+        assert seen >= 2, "turn 1 never reached two tool results"
 
-        # ==== Scenario 2: run cut off by a hard 400 after tool work ====
-        chat2 = "chat-resume-2"
+        # The checkpointer must now hold the interrupted transcript (with the grep
+        # result) so a reconnect can resume from it.
+        loaded = await _load_turn_checkpoint(_resume_thread_id({"chat_id": chat}))
+        assert loaded and any(
+            getattr(m, "type", "") == "tool" for m in loaded
+        ), "interrupted turn must leave a resume checkpoint with the tool result"
+        print("  resume/int OK: interrupted turn left a checkpointer resume state")
+
+        # Turn 2: same chat, same prompt. The resumed model should RECEIVE the
+        # prior ToolMessage in its very first request (checkpoint reloaded),
+        # proving resume happened and the prior result is reused (not re-run).
+        mock.script = [text_reply("here is the summary")]
+        mock.captured = []
+        async for _ in run_agent(prompt="find foo", history=[], **common):
+            pass
+        first = mock.captured[0] if mock.captured else None
+        assert first, "expected a captured request on resume"
+        has_prior_tool = any(
+            msg.get("role") == "tool" and "foo" in str(msg.get("content", ""))
+            for msg in first.get("messages", [])
+        )
+        assert has_prior_tool, \
+            "resumed run did not reload the prior tool result from the checkpointer"
+        # Clean finish clears the checkpoint so later turns start fresh.
+        assert await _load_turn_checkpoint(_resume_thread_id({"chat_id": chat})) is None, \
+            "checkpoint must be cleared after a clean finish"
+        print("  resume/int OK: resumed run reloads prior result; clean finish clears it")
+
+        # ==== Hard error leaves the checkpoint behind (for retry) ====
+        chat2 = "chat-resume-err"
         mock.script = [
             tool_call("grep", json.dumps({"pattern": "def", "path": ""})),
-            # Hard 400 on the MAIN model's request right AFTER the grep completes
-            # (the grep result is distilled through the search subagent, which
-            # consumes the next script item, so the 400 lands on the main model's
-            # follow-up request). The resume file must be left behind so a
-            # reconnect can replay the already-done grep work.
-            None,
+            None,  # hard 400 on the main model's next request
         ]
         mock.captured = []
-        events2 = await run_turn(prompt="find def", history=[], **{**common, "chat_id": chat2})
-        # Under the LangGraph architecture a hard (non-retryable) error is
-        # surfaced as a fatal `error` event — it is NOT raised out of run_agent
-        # (the SSE socket would already be torn down). The resume file must be
-        # left behind so a reconnect can replay the already-done tool work.
-        assert any(ev.get("kind") == "error" for ev in events2), \
-            "expected the hard error to surface as an error event"
-        resume2 = state_db.load_turn_resume(ws, chat2)
-        assert resume2 and resume2.get("tools"), "resume file missing after an error"
-        assert resume2["tools"][0]["tool"] == "grep", "resume after error lost the record"
+        ev2 = await run_turn(prompt="find def", history=[], **{**common, "chat_id": chat2})
+        assert any(e.get("kind") == "error" for e in ev2), \
+            "hard error must surface as an error event"
+        assert await _load_turn_checkpoint(_resume_thread_id({"chat_id": chat2})) is not None, \
+            "checkpoint must survive a hard error so a retry can resume"
+        await _clear_turn_checkpoint(_resume_thread_id({"chat_id": chat2}))
+        print("  resume/int OK: hard error leaves checkpoint for retry")
 
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        history2 = [
-            {"role": "user", "content": "find def"},
-            {"role": "assistant", "content": "[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
-        ]
-        await run_turn(prompt="continue", history=history2, **{**common, "chat_id": chat2})
-        _, call_msg = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant" and any(
-                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
-            ),
-        )
-        assert call_msg, "error-path continue did not replay the resume tool call"
-        print("  resume/2 OK: resume file survives a hard error and replays")
-
-        # ==== Scenario 3: hard app close — no marker, recency guard must fire ====
-        chat3 = "chat-resume-3"
-        state_db.save_turn_resume(ws, chat3, {"prompt": "find foo", "tools": [
-            {"tool": "grep", "args": {"pattern": "foo", "path": ""},
-             "result": "MATCHES for 'foo'\napp.py:1: def foo():", "ts": time.time()},
-        ]})
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        history3 = [
-            {"role": "user", "content": "find foo"},
-            {"role": "assistant", "content": "Let me search for that.\nRunning grep..."},
-        ]
-        await run_turn(prompt="continue", history=history3, **{**common, "chat_id": chat3})
-        _, call_msg3 = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant" and any(
-                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
-            ),
-        )
-        assert call_msg3, "hard-close continuation did not inject resume via recency guard"
-        assert state_db.load_turn_resume(ws, chat3) is None, "hard-close continue left the file behind"
-        print("  resume/3 OK: fresh resume file injected without a marker")
-
-        # ==== Scenario 4: interrupted run had a checklist; continue preserves it ====
-        chat4 = "chat-resume-4"
-        state_db.save_turn_resume(ws, chat4, {"prompt": "implement X", "tools": [
-            {"tool": "grep", "args": {"pattern": "foo", "path": ""},
-             "result": "MATCHES for 'foo'\napp.py:1: def foo():", "ts": time.time()},
-        ]})
-        mock.script = [text_reply("Continuing.")]
-        mock.captured = []
-        history4 = [
-            {"role": "user", "content": "implement feature X"},
-            {"role": "assistant", "mode": "coder",
-             "content": "I'll break this into steps.",
-             "plan": [
-                 {"content": "Find where foo is defined", "status": "completed"},
-                 {"content": "Read the implementation", "status": "in_progress"},
-                 {"content": "Write the change", "status": "pending"},
-             ]},
-            {"role": "assistant",
-             "content": "grep ran...[Interrupted before finishing. Already done this turn — do NOT repeat these:\n- grep: 1 matches]"},
-        ]
-        # Seed a plan so coder skips the discovery pipeline and this scenario
-        # stays focused on checklist/resume preservation.
-        state_db.save_plan(ws, "plan", "## Plan\n\n1. implement X\n\nFiles: app.py", chat_id=chat4)
-        await run_turn(prompt="ادامه بده", history=history4, mode="coder",
-                       **{**{k: v for k, v in common.items() if k != "mode"}, "chat_id": chat4})
-        _, call_msg4 = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant" and any(
-                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
-            ),
-        )
-        assert call_msg4, "plan scenario continue did not replay completed tool work"
-        _, plan_note = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "system" and "Continue this checklist" in (m.get("content") or ""),
-        )
-        assert plan_note and "Read the implementation" in plan_note.get("content", ""), \
-            "checklist not preserved via _plan_reuse_note"
-        assert state_db.load_turn_resume(ws, chat4) is None, "plan scenario left the resume file behind"
-        print("  resume/4 OK: checklist preserved on continue")
-
-        # ==== Scenario 5: REAL Retry — SAME prompt re-sent with a skill suffix.
-        # No marker is present (the frontend retry re-sends only the prompt), so
-        # the normalized gate (a) must fire and NOT re-run the completed tool.
-        chat5 = "chat-resume-5"
-        mock.script = [
-            tool_call("grep", json.dumps({"pattern": "foo", "path": ""})),
-            tool_call("grep", json.dumps({"pattern": "bar", "path": ""})),  # distiller keeps the turn going
-            tool_call("read", json.dumps({"path": "app.py"})),  # keep the turn going
-            None,  # hard 400 on the MAIN model — the turn errors after the grep completes
-        ]
-        mock.captured = []
-        try:
-            async for _ev in run_agent(
-                prompt="find foo", history=[], **{**common, "chat_id": chat5}
-            ):
-                pass
-        except Exception:  # noqa: BLE001, S110 — the hard error is expected
-            pass
-        resume5 = state_db.load_turn_resume(ws, chat5)
-        assert resume5 and resume5.get("tools"), "retry: resume file missing after error"
-
-        # The frontend retry re-sends the SAME prompt, but (when skills are
-        # active) with a suffixes section appended. Normalize and assert resume.
-        from agents import _resume_prompt_key
-
-        retry_prompt = (
-            "find foo\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\nUse the X skill."
-        )
-        assert _resume_prompt_key(retry_prompt) == "find foo", "prompt normalizer failed"
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        await run_turn(prompt=retry_prompt, history=[], **{**common, "chat_id": chat5})
-        _, call_msg5 = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant" and any(
-                tc.get("id", "").startswith("resume-") for tc in (m.get("tool_calls") or [])
-            ),
-        )
-        assert call_msg5, "retry: same-prompt retry did not replay the completed tool"
-        assert state_db.load_turn_resume(ws, chat5) is None, "retry left the resume file behind"
-        print("  resume/5 OK: same-prompt retry (with skill suffix) resumes done work, no re-run")
-
-        # ==== Scenario 6: NO tool completed, but text streamed — the partial
-        # reply must be injected so the model continues instead of restarting.
-        # Simulates a hard app close where the interrupted assistant message
-        # was never persisted, so the partial text is NOT in history.
-        chat6 = "chat-resume-6"
-        state_db.save_turn_resume(ws, chat6, {
-            "prompt": "find foo",
-            "tools": [],
-            "partial": "Let me search for that.\nRunning grep...",
-            "ts": time.time(),
-        })
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        history6 = [
-            {"role": "user", "content": "find foo"},
-        ]
-        await run_turn(prompt="continue", history=history6, **{**common, "chat_id": chat6})
-        _, partial_msg = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "assistant"
-            and "Let me search for that." in (m.get("content") or ""),
-        )
-        assert partial_msg, "partial reply was not injected into the continue request"
-        _, cont_note = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "system"
-            and "cut off mid-generation" in (m.get("content") or ""),
-        )
-        assert cont_note, "continuation note missing when partial was injected"
-        assert state_db.load_turn_resume(ws, chat6) is None, \
-            "partial scenario left the resume file behind"
-        print("  resume/6 OK: partial reply injected (no completed tools)")
-
-        # ==== Scenario 6b: partial ALREADY in history (the frontend kept the
-        # failed message with the folded marker) — must NOT be duplicated; only
-        # the continuation note is added.
-        chat6b = "chat-resume-6b"
-        state_db.save_turn_resume(ws, chat6b, {
-            "prompt": "find foo",
-            "tools": [],
-            "partial": "Let me search for that.\nRunning grep...",
-            "ts": time.time(),
-        })
-        mock.script = [text_reply("Done")]
-        mock.captured = []
-        history6b = [
-            {"role": "user", "content": "find foo"},
-            {"role": "assistant",
-             "content": "Let me search for that.\nRunning grep...[Interrupted before finishing. Already done this turn — do NOT repeat these: ]"},
-        ]
-        await run_turn(prompt="continue", history=history6b, **{**common, "chat_id": chat6b})
-        partial_count = sum(
-            1 for body in mock.captured for m in body.get("messages", [])
-            if m.get("role") == "assistant"
-            and "Let me search for that." in (m.get("content") or "")
-        )
-        assert partial_count == 1, f"partial reply duplicated: {partial_count}"
-        _, cont_note6b = find_in_request(
-            mock.captured,
-            lambda m: m.get("role") == "system"
-            and "cut off mid-generation" in (m.get("content") or ""),
-        )
-        assert cont_note6b, "continuation note missing when partial already in history"
-        assert state_db.load_turn_resume(ws, chat6b) is None, \
-            "partial-in-history scenario left the resume file behind"
-        print("  resume/6b OK: partial not duplicated; continuation note added")
-
-        print("RESUME TESTS PASSED (Stop / error / hard-close / checklist / retry / partial)")
+        print("RESUME TEST PASSED")
     finally:
         await stop_server(task)
-
-
-# --- Unit tests for the durable resume file format (JSONL append) ------------
-
-
-def test_save_load_appends_not_overwrites(tmp_path):
-    """Two saves must accumulate records (JSONL), not overwrite the file."""
-    ws = str(tmp_path / "ws")
-    os.makedirs(ws)
-    with open(os.path.join(ws, "app.py"), "w") as fh:
-        fh.write("def foo():\n    return 42\n")
-    chat = "append-chat"
-    state_db.save_turn_resume(ws, chat, {"prompt": "p", "tools": [{"tool": "grep", "callId": "1"}]})
-    state_db.save_turn_resume(ws, chat, {"prompt": "p", "tools": [{"tool": "read", "callId": "2"}]})
-    data = state_db.load_turn_resume(ws, chat)
-    assert data is not None, "resume file should exist after saves"
-    tools = data.get("tools", [])
-    assert len(tools) == 2, f"expected 2 accumulated records, got {len(tools)}"
-    assert {t.get("tool") for t in tools} == {"grep", "read"}
-
-
-def test_load_skips_partial_line(tmp_path):
-    """A half-written line from an interrupted write must be ignored."""
-    ws = str(tmp_path / "ws")
-    os.makedirs(ws)
-    with open(os.path.join(ws, "app.py"), "w") as fh:
-        fh.write("def foo():\n    return 42\n")
-    chat = "partial-chat"
-    path = state_db._resume_file(ws, chat)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"tool": "grep", "callId": "1"}) + "\n")
-        fh.write('{"tool": "read", "callId": "2", "items": "brok')  # truncated mid-write
-    data = state_db.load_turn_resume(ws, chat)
-    assert data is not None, "valid records should still load"
-    tools = data.get("tools", [])
-    assert len(tools) == 1, f"partial line should be skipped, got {len(tools)}"
-    assert tools[0].get("tool") == "grep"
-
-
-def test_resume_survives_soft_error(tmp_path):
-    """A turn that ends on a soft failure (repetition loop / length truncation /
-    retry-giveup) must NOT clear the durable resume file — a reconnect/retry
-    should replay the already-done tool work, not re-run it from zero.
-
-    We exercise the exact gate in run_graph._drive: when run_flags['error'] is
-    True the file is left behind even though the turn finished without raising.
-    """
-    ws = str(tmp_path / "ws")
-    os.makedirs(ws)
-    with open(os.path.join(ws, "app.py"), "w") as fh:
-        fh.write("def foo():\n    return 42\n")
-    chat = "soft-error-chat"
-    # Simulate a turn that did some tool work, then failed softly.
-    state_db.save_turn_resume(
-        ws, chat, {"prompt": "p", "tools": [{"tool": "grep", "callId": "1"}]}
-    )
-    # Mirror what _run_mode_turn sets on a soft failure, and what _drive checks.
-    initial_flags = {"hard_error": False, "error": True}
-    # The clear only fires when BOTH flags are False; with error=True it must not.
-    _should_clear = not initial_flags["hard_error"] and not initial_flags["error"]
-    assert _should_clear is False, "soft-failed turn must leave the resume file"
-    # And the file is still readable for a reconnect.
-    resume = state_db.load_turn_resume(ws, chat)
-    assert resume is not None, "resume file should survive a soft error"
-    assert resume.get("tools"), "resume file should still hold the done tool work"
-
-
-def test_prune_stale_resume_files(tmp_path):
-    """Files older than 24h are pruned; fresh files survive. Per-turn finishing
-    never calls this, so an in-flight resume file is never touched."""
-    ws = str(tmp_path / "ws")
-    os.makedirs(ws)
-    with open(os.path.join(ws, "app.py"), "w") as fh:
-        fh.write("def foo():\n    return 42\n")
-    chat_old, chat_new = "old-chat", "new-chat"
-    state_db.save_turn_resume(ws, chat_old, {"prompt": "x", "tools": [{"tool": "grep"}]})
-    old_path = state_db._resume_file(ws, chat_old)
-    # Backdate the old file beyond the 24h TTL.
-    old_ts = time.time() - 48 * 3600
-    os.utime(old_path, (old_ts, old_ts))
-    state_db.save_turn_resume(ws, chat_new, {"prompt": "y", "tools": [{"tool": "read"}]})
-    new_path = state_db._resume_file(ws, chat_new)
-    # Trigger pruning directly (in production this only runs on app shutdown).
-    state_db.prune_stale_resume_files()
-    assert not os.path.exists(old_path), "stale resume file should have been pruned"
-    assert os.path.exists(new_path), "fresh resume file must survive pruning"
 
 
 if __name__ == "__main__":

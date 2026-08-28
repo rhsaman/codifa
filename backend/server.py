@@ -1031,9 +1031,10 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
     cancelled (or closed) while `pending` is in flight, we must explicitly
     cancel `pending` too, otherwise the underlying run_graph/_drive task keeps
     running orphaned in the background with nobody consuming its events. Left
-    alone, it eventually reaches a "clean finish" and clears the durable
-    turn-resume file even though the user never saw the result — the bug
-    behind "interrupts with no log/error and the resume file is gone"."""
+    alone, it eventually reaches a "clean finish" and clears the interrupted-turn
+    resume checkpoint (LangGraph checkpointer) even though the user never saw the
+    result — the bug behind "interrupts with no log/error and the resume state is
+    gone"."""
     pending = None
     try:
         while True:
@@ -1423,15 +1424,14 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110
         pass
 
-    # Prune orphaned resume files (older than 24h) only on shutdown — never
-    # per-turn — so finishing one chat never touches another chat's in-flight
-    # resume file.
+    # Resume state is now held in LangGraph's checkpointer (a SQLite DB under the
+    # data root), not a per-chat JSONL file, so there is no stale-resume-file prune
+    # step. Still prune orphaned plan dirs on shutdown.
     try:
         import atexit
 
         import state_db as _state_db
 
-        atexit.register(lambda: _state_db.prune_stale_resume_files())
         atexit.register(lambda: _state_db.prune_orphan_plans())
     except Exception:  # noqa: BLE001, S110
         pass

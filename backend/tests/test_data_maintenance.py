@@ -45,7 +45,6 @@ def test_bootstrap_creates_core_dirs_without_memory(monkeypatch):
         assert os.path.isdir(state_db.mcp_dir())
         assert os.path.isdir(state_db.plans_dir())
         assert os.path.isdir(state_db.models_dir())
-        assert os.path.isdir(state_db.resume_dir())
         assert os.path.isdir(state_db.vector_db_dir())
         # memory/ must NOT be auto-created anymore (feature removed)
         assert not os.path.isdir(state_db.memory_dir())

@@ -93,6 +93,87 @@ _SEQUENTIAL_TOOLS = {
 }
 
 # ---------------------------------------------------------------------------
+# Native interrupted-turn resume (LangGraph checkpointer)
+# ---------------------------------------------------------------------------
+# We no longer keep a bespoke JSONL "resume file". The full in-flight message
+# transcript is persisted through LangGraph's own ``AsyncSqliteSaver``
+# checkpointer, keyed per chat. On a reconnect/interrupt the transcript
+# (including every completed tool call + its result) is reloaded from the
+# checkpointer so the turn CONTINUES instead of redoing work. LangGraph owns
+# serialization, durability (survives a full app restart) and the schema — the
+# exact responsibilities the old custom file hand-rolled, now delegated to the
+# framework. This also fixes the repetition-loop coupling: the replayed results
+# keep their ORIGINAL tool_call ids, so the loop's result-dedup (by name+args
+# signature) reuses them instead of re-running identical greps.
+_RESUME_CHECKPOINT_PATH: str | None = None
+
+
+def _resume_checkpoint_path() -> str:
+    global _RESUME_CHECKPOINT_PATH
+    if _RESUME_CHECKPOINT_PATH is None:
+        _RESUME_CHECKPOINT_PATH = os.path.join(
+            state_db.data_root(), "resume_checkpoints.sqlite"
+        )
+    return _RESUME_CHECKPOINT_PATH
+
+
+def _resume_checkpoint_config(thread_id: str) -> dict:
+    return {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+
+
+def _resume_thread_id(state: AgentState) -> str:
+    # Keyed per chat — equivalent to the prior per-chat resume semantics and
+    # needs no frontend change. A future frontend-supplied ``run_id`` would make
+    # this per-turn (so two turns in the same chat don't share one checkpoint).
+    return f"resume:{state.get('chat_id', '')}"
+
+
+async def _save_turn_checkpoint(thread_id: str, messages: list) -> None:
+    with contextlib.suppress(Exception):
+        from langgraph.checkpoint.base import empty_checkpoint
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        ckpt = empty_checkpoint()
+        ckpt["channel_values"] = {"messages": messages}
+        ckpt["channel_versions"] = {"messages": "v1"}
+        ckpt["versions_seen"] = {}
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            await saver.aput(
+                _resume_checkpoint_config(thread_id),
+                ckpt,
+                {"step": 1, "source": "input", "writes": {}},
+                {"messages": "v1"},
+            )
+
+
+async def _load_turn_checkpoint(thread_id: str) -> list | None:
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            tup = await saver.aget_tuple(_resume_checkpoint_config(thread_id))
+        if tup is None:
+            return None
+        return tup.checkpoint.get("channel_values", {}).get("messages")
+    except Exception:  # noqa: BLE001 — best-effort: a missing/corrupt checkpoint just means "no resume"
+        return None
+
+
+async def _clear_turn_checkpoint(thread_id: str) -> None:
+    with contextlib.suppress(Exception):
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            await saver.adelete_thread(thread_id)
+
+
+# ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 
@@ -1690,10 +1771,31 @@ async def _compact_tool_history(
     old_text = "\n".join(
         f"<tool_result>\n{msgs[i].content}\n</tool_result>" for i in old_idx
     )
+    # tool_call_ids we are about to drop. An AIMessage that requested a dropped
+    # tool but receives NO ToolMessage is an INVALID transcript: the provider sees
+    # an unanswered tool request and the model re-issues the SAME call on the next
+    # step, which trips the repetition-loop guard and aborts the turn. So we also
+    # neutralize the parent assistant message(s) below.
+    _dropped_ids = {msgs[i].tool_call_id for i in old_idx}
     # Drop the old tool messages first so we always shrink, even if the
     # summarization call below fails.
     for i in reversed(old_idx):
         del msgs[i]
+    # Strip the now-dangling tool_calls from their parent assistant messages. We
+    # rebuild each affected AIMessage (model_copy) rather than mutate it in place,
+    # and drop pure tool-call steps that are left with no reasoning text so we
+    # don't leave an empty assistant stub in the transcript.
+    _rebuilt: list = []
+    for _m in msgs:
+        if isinstance(_m, AIMessage) and getattr(_m, "tool_calls", None):
+            _kept = [tc for tc in _m.tool_calls if tc.get("id") not in _dropped_ids]
+            if len(_kept) != len(_m.tool_calls):
+                if not _kept and not (getattr(_m, "content", "") or "").strip():
+                    # Pure tool-call step with no reasoning: drop the empty stub.
+                    continue
+                _m = _m.model_copy(update={"tool_calls": _kept})
+        _rebuilt.append(_m)
+    msgs[:] = _rebuilt
     if compact_model is None:
         msgs.append(
             ToolMessage(
@@ -1919,105 +2021,67 @@ async def _run_mode_turn(
         except Exception as exc:  # noqa: BLE001
             return f"ERROR running {name}: {exc}"
 
-    def _existing_tool_result(tool_call_id: str) -> str | None:
-        """اگر نتیجهٔ این tool_call قبلاً در transcript (msgs) هست، آن را
-        برگردان تا دوباره اجرا نشود — مخصوصاً روی reconnect/interrupt که
-        هیستوری شامل ToolMessageهای بازسازی‌شده از toolActivity است."""
+    def _existing_tool_result(
+        tool_call_id: str, name: str | None = None, args: dict | None = None
+    ) -> str | None:
+        """If the result of this tool call is already in the transcript (msgs),
+        return it so the tool isn't run again — this is what stops the repeated
+        identical-tool repetition loop.
+
+        Matching is by exact ``tool_call_id`` FIRST (covers the common
+        "frontend already sent this toolActivity" case), then by a
+        ``(name, args)`` signature. The signature match is what stops the loop
+        on a resumed turn: the reloaded checkpointer transcript keeps the
+        original tool_call ids, while the model re-issues the SAME call with a
+        freshly-minted id. An id-only match would miss it and the tool would
+        re-run every time — re-producing (and re-looping on) identical greps.
+        Matching on the signature reuses the prior result instead.
+        """
         for m in messages:
             if isinstance(m, ToolMessage) and m.tool_call_id == tool_call_id:
                 return m.content
+        if name:
+            _sig = json.dumps(
+                {"n": name, "a": args or {}}, sort_keys=True, ensure_ascii=False
+            )
+            for m in messages:
+                if not isinstance(m, AIMessage):
+                    continue
+                for tc in getattr(m, "tool_calls", None) or []:
+                    if json.dumps(
+                        {"n": tc.get("name"), "a": tc.get("args") or {}},
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ) == _sig:
+                        _cid = tc.get("id")
+                        for mm in messages:
+                            if (
+                                isinstance(mm, ToolMessage)
+                                and mm.tool_call_id == _cid
+                            ):
+                                return mm.content
         return None
 
-    # --- Interrupted-turn resume (replay already-done work) -----------------
-    # On a reconnect/interrupt the frontend only sends COMPLETED turns' history
-    # (it has no toolActivity for the turn that was cut off), so the in-RAM tool
-    # results from that turn are gone. Re-inject them from the durable resume
-    # file as AIMessage(tool_calls)+ToolMessage pairs so the model SEES what it
-    # already did and does NOT re-run the tools (which would lose context and
-    # waste tokens). history_to_langchain_messages already handles the same
-    # reconstruction for completed turns; this covers the interrupted one.
-    _resume_chat = state.get("chat_id", "")
-    _resume_root = state.get("root", "")
-    if _resume_chat:
-        with contextlib.suppress(Exception):
-            _resume = state_db.load_turn_resume(_resume_root, _resume_chat)
-        if _resume and isinstance(_resume.get("tools"), list) and _resume.get("tools"):
-            for _ta in _resume["tools"]:
-                if not isinstance(_ta, dict):
-                    continue
-                # Prefer an explicit callId; fall back to a stable id derived from
-                # the tool+args so hand-written / older resume files (which only
-                # carry `tool`/`args`/`result`) still replay instead of being skipped.
-                _tc_id = str(_ta.get("callId") or "")
-                if not _tc_id:
-                    _tc_id = "r-" + hashlib.md5(
-                        json.dumps(
-                            {"tool": _ta.get("tool", ""), "args": _ta.get("args", {}) or {}},
-                            sort_keys=True,
-                        ).encode("utf-8")
-                    ).hexdigest()[:12]
-                if not _tc_id:
-                    continue
-                # Prefix the replayed call id with `resume-` so the frontend /
-                # tests can distinguish a replayed (already-done) tool call from a
-                # fresh one, and so the dedup guard never treats it as a new call.
-                _replay_id = f"resume-{_tc_id}"
-                # Skip if the transcript already carries this result (e.g. the
-                # frontend DID send toolActivity for this turn after all).
-                if _existing_tool_result(_replay_id) is not None:
-                    continue
-                messages.append(
-                    AIMessage(
-                        content="",
-                        tool_calls=[
-                            {
-                                "name": _ta.get("tool", "tool"),
-                                "args": _ta.get("args", {}) or {},
-                                "id": _replay_id,
-                            }
-                        ],
-                    )
-                )
-                _items = _ta.get("items")
-                _result = (
-                    str(_ta.get("result"))
-                    if _ta.get("result")
-                    else (str(_items) if _items else str(_ta.get("summary") or ""))
-                )
-                messages.append(
-                    ToolMessage(content=_result, tool_call_id=_replay_id)
-                )
-
-    # Interrupted-turn partial reply: if the turn was cut off mid-generation
-    # (hard app close / disconnect) and the partial assistant text was never
-    # persisted to history, replay it as an assistant message so the model
-    # CONTINUES from where it left off instead of restarting from zero. The
-    # `partial` key is written by the durable resume file on a hard close where
-    # no tool completed (so `tools` is empty) but text had already streamed.
-    if _resume_chat:
-        _partial = (_resume or {}).get("partial") if "_resume" in dir() else None
-        if _partial and isinstance(_partial, str) and _partial.strip():
-            # Don't duplicate a partial that the frontend already kept in
-            # history (it folds an "[Interrupted before finishing...]" marker
-            # into the failed assistant message). Only inject when the text is
-            # genuinely absent from the transcript.
-            _partial_already = any(
-                isinstance(m, AIMessage)
-                and isinstance(getattr(m, "content", ""), str)
-                and _partial.strip()[:40] in (m.content or "")
-                for m in messages
-            )
-            if not _partial_already:
-                messages.append(AIMessage(content=_partial))
-            messages.append(
-                SystemMessage(
-                    content=(
-                        "[SYSTEM: Your previous reply was cut off mid-generation. "
-                        "The text above is what you had already produced. Continue "
-                        "it naturally from where it ends — do NOT repeat it.]"
-                    )
-                )
-            )
+    # --- Interrupted-turn resume (LangGraph checkpointer) --------------------
+    # If a previous turn for this chat was interrupted (user Stop, error, or a
+    # disconnect), the full in-flight transcript — including every completed tool
+    # call + its result — was persisted to LangGraph's checkpointer. Reload it so
+    # this turn CONTINUES from where it stopped instead of redoing the work. The
+    # transcript keeps the original tool_call ids, so the loop's result-dedup
+    # (by name+args signature) reuses those results rather than re-running them
+    # (this is what previously caused the repeated-grep repetition loop). A fresh
+    # (non-interrupted) turn has no checkpoint and simply starts from the context
+    # built by build_turn_context. We skip this for instruction-augmented turns
+    # (reader/explore) which don't interrupt mid-tool-loop.
+    _resume_thread = _resume_thread_id(state)
+    if not extra_instruction:
+        _ckpt_msgs = await _load_turn_checkpoint(_resume_thread)
+        if _ckpt_msgs:
+            messages = list(_ckpt_msgs)
+            # The checkpoint already holds the full in-flight transcript
+            # (prompt + tool calls + tool results). Don't also re-pull the
+            # frontend history, or we'd duplicate the prompt.
+            state["history"] = []
 
     _astream_count = 0
 
@@ -2033,34 +2097,10 @@ async def _run_mode_turn(
         reply = ""
         _no_so = False
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
-        # Every completed tool result is persisted to a per-chat resume file so a
-        # mid-turn disconnect/reconnect can replay the already-done work instead
-        # of re-running the tools from scratch (which loses context and wastes
-        # tokens). The file is cleared on a clean finish (see run_graph._drive).
-        _resume_root = state.get("root", "")
-        _resume_chat = state.get("chat_id", "")
-        _resume_prompt = state.get("request", "")
-
-        def _record_resume_tool(name: str, args: dict, call_id: str, result: str) -> None:
-            if not _resume_chat:
-                return
-            # Append ONLY the new record (save_turn_resume writes it as one JSONL
-            # line). We no longer keep a growing in-memory list and rewrite the
-            # whole file — that made an interrupt mid-write wipe the resume state.
-            rec = {
-                "tool": name,
-                "args": args or {},
-                "callId": call_id,
-                "items": str(result),
-                "result": str(result),
-                "summary": "",
-            }
-            with contextlib.suppress(Exception):
-                state_db.save_turn_resume(
-                    _resume_root,
-                    _resume_chat,
-                    {"prompt": _resume_prompt, "tools": [rec]},
-                )
+        # Every completed tool result is persisted to LangGraph's checkpointer
+        # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
+        # the already-done work instead of re-running the tools from scratch.
+        # The checkpoint is cleared on a clean finish (see run_graph._drive).
         # --- Repetition-loop guard (opencode-aligned) -----------------------
         # opencode stops a degenerate loop via MAX_STEPS + finish_reason=="length"
         # and has no text-comparison guard. We keep a guard but base it on the
@@ -2334,7 +2374,12 @@ async def _run_mode_turn(
             # در transcript هست، آن را دوباره اجرا نکن — مستقیماً reuse کن
             # (صرفه‌جویی در context و جلوگیری از اجرای تکراریِ کارهای انجام‌شده).
             _pending = [
-                tc for tc in _tcs if _existing_tool_result(tc.get("id", "")) is None
+                tc
+                for tc in _tcs
+                if _existing_tool_result(
+                    tc.get("id", ""), tc.get("name"), tc.get("args")
+                )
+                is None
             ]
             _parallel = [
                 tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
@@ -2358,9 +2403,11 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
-                _record_resume_tool(
-                    tc.get("name") or "", tc.get("args") or {}, tc.get("id", ""), result
-                )
+                # Persist the completed tool work to LangGraph's checkpointer so a
+                # reconnect/interrupt can resume from here (replaces the old custom
+                # JSONL resume file). Saved once per step, after both the parallel
+                # and sequential batches have run.
+                await _save_turn_checkpoint(_resume_thread, msgs)
             for tc in _sequential:
                 name = tc.get("name") or ""
                 args = tc.get("args") or {}
@@ -2371,7 +2418,8 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
-                _record_resume_tool(name, args, tc.get("id", ""), result)
+                # Persist this completed (mutating) tool result too.
+                await _save_turn_checkpoint(_resume_thread, msgs)
             # In-turn context management: if the transcript (including every
             # tool result so far this turn) has grown past the budget, compress
             # the older tool results so we don't keep re-sending the whole raw
@@ -2415,6 +2463,12 @@ async def _run_mode_turn(
                 # do NOT retry or emit an error event (it would never be read anyway,
                 # since the SSE socket is already torn down). Just stop cleanly.
                 if isinstance(exc, asyncio.CancelledError):
+                    # Flag the interruption so we LEAVE the resume checkpoint behind
+                    # (a reconnect can replay the already-done tool work). Without
+                    # this the clean-finish path below would wipe it.
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["cancelled"] = True
                     break
                 # Hard, non-recoverable failures: don't retry (would fail identically).
                 if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
@@ -2485,6 +2539,14 @@ async def _run_mode_turn(
                 ctx,
                 last_input_tokens=state.get("last_input_tokens"),
             )
+    # Clean finish: drop the interrupted-turn resume checkpoint so a LATER turn for
+    # this chat starts fresh instead of mistakenly resuming this completed one. We
+    # only clear on a GENUINE clean finish — no error, no hard failure, and no
+    # cancellation. On any of those we LEAVE the checkpoint behind so a
+    # reconnect/retry resumes the already-done tool work from the checkpointer.
+    _rf = run_flags or {}
+    if not (_rf.get("error") or _rf.get("hard_error") or _rf.get("cancelled")):
+        await _clear_turn_checkpoint(_resume_thread)
     return reply
 
 
@@ -4196,26 +4258,11 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
                 }
             )
         else:
-            # Clean finish: the turn completed, so the durable resume file is no
-            # longer needed. On an error/interrupt we deliberately LEAVE it behind
-            # so a reconnect can replay the already-done tool work (the file is
-            # written step-by-step during the run, so it always holds the most
-            # recent interrupted state).
-            if _clean:
-                _flags = initial.get("_run_flags") or {}
-                _hard = bool(_flags.get("hard_error"))
-                _errored = bool(_flags.get("error"))
-                # Only clear the durable resume file on a GENUINE clean finish:
-                # no cancellation, no hard error, AND no soft failure (repetition
-                # loop / length truncation / retry-giveup / any turn that broke
-                # out without completing). On any of those we LEAVE the file
-                # behind so a reconnect/retry can replay the already-done tool
-                # work instead of re-running it from zero.
-                if not _hard and not _errored:
-                    with contextlib.suppress(Exception):
-                        state_db.clear_turn_resume(
-                            initial.get("root", ""), initial.get("chat_id", "")
-                        )
+            # Clean finish. The interrupted-turn resume checkpoint (LangGraph
+            # checkpointer) is cleared by _run_mode_turn itself on a genuine clean
+            # finish; on an error/interrupt it is deliberately LEFT behind so a
+            # reconnect can resume the already-done tool work.
+            pass
         finally:
             await queue.put(None)
 

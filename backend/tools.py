@@ -2704,6 +2704,56 @@ def make_tool_callbacks(
     # even a single-tool-call task gets reminded before the model's final reply.
     _PLAN_NUDGE_EVERY = 1
 
+    # Narrow-read guard: stop line-by-line probing of one file. A proactive floor
+    # widens tiny first reads so the pattern never starts; a reactive hint
+    # backstops the case where the model keeps asking for small adjacent windows
+    # anyway. Both live for this run only, reset each time make_tool_callbacks
+    # is called (same lifetime as _plan_nudge_state above).
+    _NARROW_READ_FLOOR = 60          # اگه limit خیلی کوچیک بود، به این گرد می‌کنیم
+    _NARROW_READ_HINT_LIMIT = 30     # زیر این حد، مشمول floor می‌شه
+    _narrow_read_state = {"last_target": None, "small_adjacent": 0}
+
+    def _narrow_read_floor(target: str, offset: int, limit: int, total: int = 0) -> tuple[int, str | None]:
+        """پهنای خواندن رو proactive تنظیم می‌کنه تا probe خط‌به‌خط شروع نشه.
+
+        - فقط برای فایل‌ها و فقط اولین read (offset=1) اعمال می‌شه — نه دایرکتوری‌ها
+          (که pagination معنادار دارن) و نه ادامهٔ pagination (offset>1).
+        - اگه limit خیلی کوچیکه (< _NARROW_READ_HINT_LIMIT) و این اولین read روی
+          این فایل تو این taskـه و فایل بزرگ‌تر از floorـه → به _NARROW_READ_FLOOR
+          گرد می‌کنیم (floor)؛ الگو اصلاً شروع نمی‌شه و مدل کل ناحیه رو یه‌جا می‌بینه.
+        - اگه باز هم روی همون فایل بازهٔ کوچیک/مجاور زده شد → hint قاطع برمی‌گردونه.
+        برمی‌گردونه: (limitِ اصلاح‌شده، hint یا None)
+        """
+        st = _narrow_read_state
+        is_small = 0 < limit < _NARROW_READ_HINT_LIMIT
+        is_same = st["last_target"] == target
+        if is_small and is_same:
+            st["small_adjacent"] += 1
+        else:
+            st["small_adjacent"] = 0
+        st["last_target"] = target
+        effective = limit
+        hint = None
+        # فقط فایل + اولین read (offset=1) + فایل بزرگ‌تر از floor: دایرکتوری،
+        # pagination، و فایل‌های کوچیک مستثنی‌اند (برای اونا limit کوچیک بی‌ضرره).
+        if (
+            is_small
+            and st["small_adjacent"] == 0
+            and not os.path.isdir(target)
+            and offset == 1
+            and total > _NARROW_READ_FLOOR
+        ):
+            # اولین read کوچیک روی این فایل بزرگ → floor بزن (الگو اصلاً شروع نشه)
+            effective = _NARROW_READ_FLOOR
+        elif st["small_adjacent"] >= 1:
+            # دومین/بعدیِ کوچیکِ مجاور → hint قاطع
+            hint = (
+                "HINT: stop reading tiny adjacent slices of this file. "
+                "Read one wide window (limit=100+) covering the whole target "
+                "region instead of paging 20-30 lines at a time."
+            )
+        return effective, hint
+
     def _plan_nudge_due() -> bool:
         """Call once per mutating tool call. Returns True (and resets the counter)
         once every `_PLAN_NUDGE_EVERY` calls made while the plan still has a step
@@ -3477,6 +3527,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         lines = excerpt["lines"]
         start = excerpt["start"]
         total = excerpt["total"]
+        # Narrow-read guard: widen tiny first reads (proactive floor) and hint
+        # if the model keeps probing small adjacent windows on the same file.
+        # Applied AFTER we know `total` so small files keep their exact limit
+        # (pagination still works) and only large files get widened.
+        offset = int(offset or 1)
+        limit = int(limit or 2000)
+        limit, _narrow_hint = _narrow_read_floor(target, offset, limit, total)
         if not lines:
             msg = f"line offset {start} is past the end of the file ({total} lines)"
             emit(_error_result("read", msg))
@@ -3505,6 +3562,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             }
         )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+        if _narrow_hint:
+            raw += f"\n\n{_narrow_hint}"
         _parent_search_cache[cache_key] = raw
         return raw
 
@@ -3517,6 +3576,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
 BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; call read_tool again separately for a path that needs a different range. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
+
+NOTE: very small limits (<30 lines) on a first read of a file are auto-widened to ~60 lines to avoid line-by-line probing — ask for a wide window (limit=100+) if you need more context around a region. Repeated tiny adjacent reads of the same file trigger a hint telling you to read one wide window instead.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")

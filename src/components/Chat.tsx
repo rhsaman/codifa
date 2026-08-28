@@ -14,8 +14,10 @@ import {
   useStore,
 } from "../lib/store";
 import { api } from "../lib/fs";
+import { resetStreamForRetry } from "../lib/retry";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { normalizeUsageModel } from "../lib/usage";
+import { stripLeadingModeTag } from "../lib/modeTag";
 import {
   contextPercent,
   computeContextUsed,
@@ -1524,7 +1526,7 @@ export function ChatPanel() {
         // cancel the composer glow while the model is still reasoning.
         useStore.getState().setStreaming(true, useStore.getState().isThinking);
         const prev = findMsg()?.content ?? "";
-        const chunk = event.content ?? "";
+        const chunk = stripLeadingModeTag(event.content ?? "", prev);
         store.updateMessage(assistantMsg.id, {
           content: prev + chunk,
           segments: appendTextSegment(findMsg()?.segments, chunk),
@@ -1627,6 +1629,8 @@ export function ChatPanel() {
           });
         }
       } else if (event.kind === "retry") {
+        const cur = findMsg();
+        const reset = resetStreamForRetry(cur?.content ?? "", cur?.segments);
         store.updateMessage(assistantMsg.id, {
           retry: {
             attempt: event.attempt ?? 1,
@@ -1637,6 +1641,8 @@ export function ChatPanel() {
             agent: event.agent ?? "",
             fallback: event.fallback,
           },
+          content: reset.content,
+          segments: reset.segments,
         });
       } else if (event.kind === "retry_giveup") {
         store.updateMessage(assistantMsg.id, {

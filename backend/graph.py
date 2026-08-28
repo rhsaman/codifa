@@ -1052,7 +1052,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
             # تکراری کم بشه.
             code_map_block = (
-                format_symbol_map(
+                await asyncio.to_thread(
+                    format_symbol_map,
                     root,
                     max_map_tokens=max_map_tokens,
                     mentioned_fnames=_mentioned_fnames,

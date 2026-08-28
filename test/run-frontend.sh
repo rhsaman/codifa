@@ -43,6 +43,12 @@ npx esbuild test/retryStore.test.ts --bundle --platform=node --format=esm \
 node test/.tmp-retry.mjs
 
 echo ""
+echo "── تست ۷ب: resetStreamForRetry (پاک‌کردن متن نیمه‌کاره روی retry، حفظ tool/user) ──"
+npx esbuild test/retryStream.test.ts --bundle --platform=node --format=esm \
+  --packages=external --outfile=test/.tmp-rs.mjs --external:electron >/dev/null 2>&1
+node test/.tmp-rs.mjs
+
+echo ""
 echo "── تست ۸: context_window (پنجرهٔ مخصوص مدل به بکاند، نه پنجرهٔ کلی پرووایدر) ──"
 npx esbuild test/contextWindow.test.ts --bundle --platform=node --format=esm \
   --packages=external --outfile=test/.tmp-cw.mjs --external:electron >/dev/null 2>&1
@@ -191,6 +197,6 @@ npx esbuild test/settingsStorage.ssr.test.tsx --bundle --platform=node --format=
   --outfile=test/.tmp-set.mjs --external:electron >/dev/null 2>&1
 node test/.tmp-set.mjs
 
-rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-eb.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs test/.tmp-sb.mjs test/.tmp-cc.mjs test/.tmp-set.mjs
+rm -f test/.tmp-fork.mjs test/.tmp-es.mjs test/.tmp-rm.mjs test/.tmp-ls.mjs test/.tmp-retry.mjs test/.tmp-cw.mjs test/.tmp-hb.mjs test/.tmp-scroll.mjs test/.tmp-sp.mjs test/.tmp-uc.mjs test/.tmp-cu.mjs test/.tmp-skills.mjs test/.tmp-skillsCache.mjs test/.tmp-tr.mjs test/.tmp-wr.mjs test/.tmp-eb.mjs test/.tmp-rb.mjs test/.tmp-sc.mjs test/.tmp-ti.mjs test/.tmp-cb.mjs test/.tmp-sb.mjs test/.tmp-cc.mjs test/.tmp-set.mjs test/.tmp-rs.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

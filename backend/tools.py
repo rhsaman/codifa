@@ -3856,7 +3856,8 @@ When you need to read several files, read multiple independent files in parallel
                                     _mentioned_idents.add(_m)
 
                         _code_map = (
-                            format_symbol_map(
+                            await asyncio.to_thread(
+                                format_symbol_map,
                                 root,
                                 max_map_tokens=1024,
                                 mentioned_fnames=_mentioned_fnames,

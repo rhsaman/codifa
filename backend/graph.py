@@ -1984,8 +1984,12 @@ async def _maybe_auto_compact(
     ctx: int,
     last_input_tokens: int | None = None,
     trigger_fraction: float = 1.0,
-) -> None:
+) -> int:
     """opencode `isOverflow` -> auto-compaction.
+
+    Returns the number of compaction operations performed (1 if it fired, 0 if
+    it was a no-op), so the caller can throttle per-turn fire count without
+    inspecting the event queue.
 
     Once the assembled transcript reaches the usable window (``ctx - reserved``),
     summarize the older turns — keeping a recent tail verbatim — and emit the
@@ -1994,7 +1998,7 @@ async def _maybe_auto_compact(
     back to the main model (mirrors opencode's compaction agent + retry).
     """
     if ctx <= 0:
-        return
+        return 0
     max_output = _agents._model_max_output(model)
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
@@ -2036,7 +2040,7 @@ async def _maybe_auto_compact(
     # limit. A single setting (compactHeadroom / reserved) controls the limit;
     # compactTriggerFraction controls how early we start.
     if total < threshold:
-        return
+        return 0
     # opencode prune: clear old tool outputs (not the whole turn) before the
     # heavier summarization pass, so a large-but-not-overflowing transcript
     # still sheds context. Runs in place on the serialized history.
@@ -2056,7 +2060,7 @@ async def _maybe_auto_compact(
         result = None
     if result is None:
         queue.put_nowait({"kind": "compact_failed"})
-        return
+        return 1
     new_history, keep, compact_usage = result
     summary = new_history[0]["content"] if new_history else ""
     queue.put_nowait({"kind": "compact", "content": summary, "keep": int(keep)})
@@ -2077,6 +2081,7 @@ async def _maybe_auto_compact(
         _cid = state.get("chat_id", "")
         if _cid in _code_map_hash_cache:
             _code_map_hash_cache.pop(_cid, None)
+    return 1
 
 
 async def _run_mode_turn(
@@ -2574,8 +2579,10 @@ async def _run_mode_turn(
             # limit) so the agent keeps working on a compacted transcript instead
             # of running out of context mid-task.
             if ctx > 0 and _compact_count < _MAX_COMPACT_PER_TURN:
-                _before = len(queue.items)
-                await _maybe_auto_compact(
+                # `_maybe_auto_compact` returns the number of compactions it
+                # actually performed (0 = under threshold / 1 = fired), so we can
+                # throttle per-turn fire count without inspecting the event queue.
+                _compact_count += await _maybe_auto_compact(
                     state,
                     queue,
                     model,
@@ -2584,11 +2591,6 @@ async def _run_mode_turn(
                     ctx,
                     last_input_tokens=state.get("last_input_tokens"),
                     trigger_fraction=state.get("compact_trigger_fraction", _COMPACT_TRIGGER_FRACTION),
-                )
-                # Only count an actual firing (a compact_start event) so a normal
-                # turn that stays under threshold is never penalized.
-                _compact_count += sum(
-                    1 for e in queue.items[_before:] if e.get("kind") == "compact_start"
                 )
         return reply
 

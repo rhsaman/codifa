@@ -377,9 +377,13 @@ def filter_tools_for_mode(
                 tools["run_terminal"], root, scoped_paths
             )
     # Auto-router: steer BROAD / repeated searches to the explore sub-agent.
-    # محدودیت step روی grep/glob/read برداشته شد — روتر auto-explore غیرفعاله،
-# پس جستجوها مستقیم اجرا می‌شن و هیچ‌کدوم مسدود نمی‌شن. agent خودش تصمیم می‌گیره
-# کی یه broad search رو به explore sub-agent بده (طبق SEARCH STRATEGY prompt).
+    # وقتی تعداد callهای grep/glob/read/web_search/fetch_url از _AUTO_EXPLORE_THRESHOLD
+    # (cross-turn) رد شد، یا یه جستجوی broad شناسایی شد، wrapper اجازه نمی‌ده
+    # مستقیم اجرا بشه و مدل رو می‌فرسته سمت explore sub-agent. فقط توی حالت
+    # coder اعمال می‌شه — توی plan/ask/reader مدل فقط ۱-۲ بار جستجو می‌زنه و
+    # نباید مسدود بشه.
+    if mode == "coder":
+        tools = _agents._wrap_auto_explore_router(tools)
 
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
@@ -4145,7 +4149,8 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
     # Reset the cross-turn search counter at the START of each user message
     # (not per model-turn), so the auto-router's "repeated calls" threshold is
-    # (auto-router disabled — search call counting removed)
+    # measured across the whole conversation, not reset every model turn.
+    _agents.reset_auto_explore_counter()
     if not (initial.get("request") or "").strip():
         yield {
             "kind": "error",

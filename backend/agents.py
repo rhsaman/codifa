@@ -536,24 +536,79 @@ def _wrap_no_search_bypass(fn: Callable):
 # ---------------------------------------------------------------------------
 # The SEARCH STRATEGY rule is only text in the prompt — weak models ignore it
 # and hammer grep/glob/read directly until they run out of context. This layer
-# adds HARD logic: a per-turn counter plus objective "broadness" signals. When
-# a search is genuinely wide (open glob pattern, repo-wide grep, or repeated
-# calls piling up) the wrapper refuses to run inline and tells the model to
-# محدودیت step روی grep/glob/read کاملاً برداشته شد: agent می‌تونه به تعداد
-# دلخواه جستجو کنه و هرگز به خاطر تعداد callها به explore نمی‌ره. روتر هم
-# غیرفعاله و _is_broad_search هم همیشه False
-# برمی‌گردونه — پس هیچ جستجویی مسدود نمی‌شه. agent خودش تصمیم می‌گیره کی
-# بخواد broad search رو به explore sub-agent بده (طبق SEARCH STRATEGY prompt).
+# adds HARD logic: a cross-turn counter plus objective "broadness" signals.
+# When a search is genuinely wide (open glob pattern, repo-wide grep, or
+# repeated calls piling up past _AUTO_EXPLORE_THRESHOLD) the wrapper refuses to
+# run inline and tells the model to delegate to the explore sub-agent instead.
 _BROAD_FILE_COUNT = 100
 _AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
+_AUTO_EXPLORE_THRESHOLD = 10  # cross-turn cap on search calls before steering
+
+# Cross-turn counter for the auto-router. Reset at the START of each user
+# message (not per model-turn) so the threshold is measured across the whole
+# conversation, not reset every model turn.
+_auto_explore_count: dict[str, int] = {"count": 0}
+
+
+def reset_auto_explore_counter() -> None:
+    """Reset the cross-turn search counter at the start of each user message."""
+    _auto_explore_count["count"] = 0
 
 
 def _is_broad_search(tool_name: str, kwargs: dict) -> bool:
-    """Always False — the auto-router is disabled, so no single search call is
-    treated as broad/blocked. The agent decides for itself (via the SEARCH
-    STRATEGY prompt) when to delegate a wide search to the explore sub-agent.
+    """Objective "broadness" signal: is this single call wide enough to steer?
+
+    Returns True for genuinely wide searches (open glob pattern, repo-wide
+    grep with no path, or a read of a very large file) so the wrapper can
+    refuse to run them inline and point the model at the explore sub-agent.
     """
+    if tool_name not in _AUTO_EXPLORE_TOOLS:
+        return False
+    # glob with an open pattern (e.g. **/*.py or a bare *.ts with no path)
+    if tool_name == "glob":
+        pattern = str(kwargs.get("pattern", ""))
+        if pattern.startswith("**") or ("*" in pattern and "/" not in pattern):
+            return True
+    # grep with no path → repo-wide search
+    if tool_name == "grep":
+        path = kwargs.get("path", "")
+        if not path:
+            return True
+    # read of a very large window (>= _BROAD_FILE_COUNT lines)
+    if tool_name == "read":
+        limit = kwargs.get("limit", 2000)
+        if limit and int(limit) >= _BROAD_FILE_COUNT:
+            return True
     return False
+
+
+def _wrap_auto_explore_router(tools: dict) -> dict:
+    """Wrap search tools so BROAD / repeated calls steer to the explore agent.
+
+    For each tool in _AUTO_EXPLORE_TOOLS still present in ``tools``, the wrapper
+    increments the cross-turn counter and, if the call is broad or the counter
+    exceeds _AUTO_EXPLORE_THRESHOLD, refuses to run inline — returning a hint to
+    delegate via the task tool (subagent_type='explore') instead.
+    """
+    for name in _AUTO_EXPLORE_TOOLS:
+        if name not in tools:
+            continue
+        fn = tools[name]
+
+        async def wrapped(*args, _fn=fn, _name=name, **kwargs):
+            _auto_explore_count["count"] += 1
+            if _is_broad_search(_name, kwargs) or _auto_explore_count["count"] > _AUTO_EXPLORE_THRESHOLD:
+                return (
+                    f"ERROR: too many {_name} calls "
+                    f"({_auto_explore_count['count']}) or this is a broad search. "
+                    "Delegate to the explore sub-agent instead: use the task tool "
+                    "with subagent_type='explore' to find and read the relevant "
+                    "code in one isolated pass."
+                )
+            return await _fn(*args, **kwargs)
+
+        tools[name] = wrapped
+    return tools
 
 
 # OpenRouter requires "vendor/model" ids, so a bare "free" shortcut in a

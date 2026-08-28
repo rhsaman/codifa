@@ -164,6 +164,23 @@ async def _load_turn_checkpoint(thread_id: str) -> list | None:
         return None
 
 
+async def _load_prev_mode(thread_id: str) -> str | None:
+    """Read the persisted mode of the previous turn (BEFORE this run's input
+    merges in) so we can detect a user mode switch and re-orient the agent."""
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            tup = await saver.aget_tuple(_resume_checkpoint_config(thread_id))
+        if tup is not None:
+            return (tup.checkpoint.get("channel_values", {}) or {}).get("mode")
+    except Exception:  # noqa: BLE001 — best-effort; a missing checkpoint just means "no prior mode"
+        return None
+    return None
+
+
 async def _clear_turn_checkpoint(thread_id: str) -> None:
     with contextlib.suppress(Exception):
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -1347,6 +1364,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # spikes and unstable input_tokens).
     if lang_directive:
         user_parts.append(lang_directive)
+    # Always-on mode anchor (recency): re-stamp the current mode in the user turn
+    # every message so the agent can never "forget" or misread it from the
+    # un-labelled, possibly other-mode history. On a user switch, flag it loudly.
+    _mode_changed = state.get("_mode_changed")
+    _prev_mode = state.get("_prev_mode")
+    _mode_label = _agents._MODE_LABELS.get(mode, (mode or "Ask").capitalize())
+    _mode_caps = _agents._MODE_CAPS.get(mode, "")
+    user_parts.append(f"MODE: {_mode_label} — {_mode_caps}")
+    if _mode_changed and _prev_mode:
+        _prev_label = _agents._MODE_LABELS.get(_prev_mode, (_prev_mode or "Ask").capitalize())
+        user_parts.append(
+            f"⚠ MODE SWITCHED: the previous turn ran in {_prev_label}; this turn runs in "
+            f"{_mode_label}. Fully re-orient to {_mode_label} NOW — ignore the style, length, "
+            f"format and constraints of any earlier turns; they are only history."
+        )
     if code_map_block:
         user_parts.append(code_map_block)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
@@ -4322,6 +4354,13 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     # _run_mode_turn works on a *copy* of the state, so we use a nested dict.
     initial.setdefault("_run_flags", {})["hard_error"] = False
     initial["_run_flags"]["error"] = False
+    # Detect a user mode switch so the agent re-orients immediately. The previous
+    # turn's mode is persisted in the LangGraph checkpointer; read it BEFORE this
+    # run's input merges in (the input would otherwise overwrite it).
+    _cur_mode = initial.get("mode") or "ask"
+    _prev_mode = await _load_prev_mode(_resume_thread_id(initial))
+    initial["_prev_mode"] = _prev_mode
+    initial["_mode_changed"] = bool(_prev_mode) and _prev_mode != _cur_mode
     # Drop any stale captured ask_user answer for this chat from a previous run
     # so Part A re-exploration only fires for answers given in THIS run.
     _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)

@@ -3537,7 +3537,10 @@ def _mode_declare(mode: str) -> str:
         "NEVER write a mode tag (e.g. ``<!-- mode:… -->`` or ``[Mode: …]``) at the start of your "
         "reply — the mode for THIS message is already declared above by ``=== CURRENT MODE: … ===``. "
         "Do not copy the style, length, or actions of any past turn; your job is defined ONLY by the "
-        "CURRENT MODE above."
+        "CURRENT MODE above. The conversation history may contain turns produced in a DIFFERENT mode "
+        "(the user may have switched modes between messages). Those earlier turns are historical "
+        "CONTEXT only — never infer your current mode from them, never imitate their style/format, and "
+        "never carry their mode's constraints into THIS message; your mode is the one declared above."
     )
     output = _MODE_OUTPUT.get(mode, "")
     if output:

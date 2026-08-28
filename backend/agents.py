@@ -1750,6 +1750,8 @@ _COMPACTION_SYSTEM_PROMPT = (
     "You are a context summarization agent. You are given a conversation between a user and an agent. "
     "Your goal is to produce a structured summary matching the format specified so another coding agent "
     "can continue the work.\n\n"
+    "The older turns you summarize may describe work that was ALREADY completed — put it in Completed, "
+    "and put ONLY still-remaining work in Next Move. Never relist finished work as pending.\n\n"
     "Always follow the exact output structure requested by the user prompt. Keep every section, preserve "
     "exact file paths and identifiers when known, and prefer terse bullets over paragraphs.\n\n"
     "Do not continue the conversation. Do not respond to any questions in the conversation. Only output the "
@@ -1784,7 +1786,49 @@ _SUMMARY_TEMPLATE = (
     "- Keep every section, even when empty.\n"
     "- Use terse bullets, not prose paragraphs.\n"
     "- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.\n"
-    "- Do not mention the summary process or that context was compacted."
+    "- Do not mention the summary process or that context was compacted.\n"
+    "- Completed = work ALREADY finished/verified in the conversation. Active = work CURRENTLY in "
+    "flight. Next Move = work NOT yet started.\n"
+    "- Next Move MUST list ONLY remaining work. Before writing any step, confirm it is absent from "
+    "Completed and Active. Never repeat finished or in-progress work in Next Move.\n"
+    "- If a step could fit in both Completed and Next Move, put it in Completed (with a '(verify)' "
+    "note if unsure) and OMIT it from Next Move.\n"
+    "- Only state that code was added/removed/changed if the conversation explicitly shows the edit "
+    "applied AND verified (e.g. ruff/tests passed). Otherwise mark it '(intended, not yet applied to "
+    "code)' and do not list acting on it as a pending step.\n"
+    )
+
+
+# Worked example shown to the summarizer so it learns the Completed-vs-Next-Move
+# separation by imitation (few-shot), not just from the rules above. The retry and
+# logging work is FINISHED, so it lives in Completed; only the still-open timeout task
+# appears in Next Move.
+_SUMMARY_EXAMPLE = (
+    "Example of a correct summary (finished work stays in Completed; only the open task is in Next Move):\n"
+    "<conversation>\n"
+    "User: add a retry to the uploader\n"
+    "Agent: added a retry loop in upload.py; ran pytest, all green\n"
+    "Agent: also added logging\n"
+    "User: now also handle timeouts\n"
+    "</conversation>\n"
+    "-> Summary:\n"
+    "## Objective\n"
+    "- Add resilience to the uploader (retry + timeout handling)\n"
+    "## Important Details\n"
+    "- upload.py holds the uploader\n"
+    "## Work State\n"
+    "### Completed\n"
+    "- retry loop added in upload.py; pytest green\n"
+    "- logging added\n"
+    "### Active\n"
+    "- (none)\n"
+    "### Blocked\n"
+    "- (none)\n"
+    "## Next Move\n"
+    "1. add timeout handling to the uploader in upload.py\n"
+    "## Relevant Files\n"
+    "- upload.py: uploader logic\n"
+    "\n"
 )
 
 
@@ -3138,6 +3182,7 @@ async def _compact_history(
                 f"<prior-summary>\n{existing_summary}\n</prior-summary>\n\n"
                 + _SUMMARY_UPDATE_INSTRUCTIONS
                 + "\n\n"
+                + _SUMMARY_EXAMPLE
                 + _SUMMARY_TEMPLATE
             )
         else:
@@ -3146,6 +3191,7 @@ async def _compact_history(
                 f"<conversation>\n{head_text}\n</conversation>\n\n"
                 "Create a new anchored summary from the conversation history in the "
                 "<conversation> tags above so another coding agent can continue the work.\n\n"
+                + _SUMMARY_EXAMPLE
                 + _SUMMARY_TEMPLATE
             )
         try:

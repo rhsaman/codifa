@@ -1612,30 +1612,36 @@ export const useStore = create<State>((set, get) => ({
   },
 
   updateMessage: (id, patch) => {
-    let completedChatId: string | null = null
     set((s) => {
-      const chats = s.chats.map((c) => {
-        const msg = c.messages.find((m) => m.id === id)
-        if (!msg) return c
-        // Only the turn-completion transition (streaming true -> false) moves
-        // the chat in the sidebar; per-token content/thinking/tool deltas must
-        // not reorder it, or two concurrent chats trade places constantly.
-        const completes =
-          msg.streaming === true && patch.streaming === false
-        if (completes) completedChatId = c.id
-        return {
-          ...c,
-          messages: c.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
-          updatedAt: completes ? Date.now() : c.updatedAt,
-        }
-      })
+      // Only the chat that actually contains the message needs rebuilding, so
+      // we find it once and map just its messages instead of mapping every chat
+      // (and every message inside each) on every SSE token. This keeps the
+      // other chat references stable so subscribers that don't depend on the
+      // edited message don't re-render.
+      const targetChat = s.chats.find((c) => c.messages.some((m) => m.id === id))
+      if (!targetChat) return {}
+      const msg = targetChat.messages.find((m) => m.id === id)!
+      // Only the turn-completion transition (streaming true -> false) moves the
+      // chat in the sidebar; per-token content/thinking/tool deltas must not
+      // reorder it, or two concurrent chats trade places constantly.
+      const completes = msg.streaming === true && patch.streaming === false
+      const updatedChat = {
+        ...targetChat,
+        messages: targetChat.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
+        updatedAt: completes ? Date.now() : targetChat.updatedAt,
+      }
       // A turn finishing in a chat the user is NOT looking at = new message in
       // the background → steady green dot in the sidebar until the user opens it.
       const unreadChats =
-        completedChatId && completedChatId !== s.activeChatId && !s.unreadChats.includes(completedChatId)
-          ? [...s.unreadChats, completedChatId]
+        completes &&
+        targetChat.id !== s.activeChatId &&
+        !s.unreadChats.includes(targetChat.id)
+          ? [...s.unreadChats, targetChat.id]
           : s.unreadChats
-      return { chats, unreadChats }
+      return {
+        chats: s.chats.map((c) => (c.id === targetChat.id ? updatedChat : c)),
+        unreadChats,
+      }
     })
     // updateMessage fires on every SSE token while streaming — persisting the
     // whole chats array each time is what hammers coder.db / app-state-cache.json.

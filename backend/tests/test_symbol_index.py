@@ -89,3 +89,23 @@ def test_format_symbol_map_ranks_referenced_files():
         idx_b = out.find("b.py")
         assert idx_a != -1 and idx_b != -1
         assert idx_a < idx_b  # a.py بالاتر (foo تعریف شده اینجا، b.py ارجاع می‌ده)
+
+
+def test_looks_like_code_ident_filter():
+    """فیلتر استخراج mentioned_idents نباید کلمات ساده‌ی انگلیسی رو
+    به‌عنوان identifier کد قبول کنه (نویز) — فقط snake/camel/Pascal واقعی."""
+    from symbol_index import _looks_like_code_ident
+
+    # کلمات ساده انگلیسی نباید قبول بشن (نویز)
+    assert not _looks_like_code_ident("data")
+    assert not _looks_like_code_ident("state")
+    assert not _looks_like_code_ident("path")
+    assert not _looks_like_code_ident("read")
+    assert not _looks_like_code_ident("result")
+    assert not _looks_like_code_ident("content")
+
+    # identifierهای واقعی (snake/camel/Pascal + طول >= 8)
+    assert _looks_like_code_ident("user_service")
+    assert _looks_like_code_ident("buildSymbolMap")
+    assert _looks_like_code_ident("HttpRequest")
+    assert _looks_like_code_ident("cache_manager")

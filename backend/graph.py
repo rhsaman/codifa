@@ -1185,7 +1185,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     code_map_block = ""
     if mode in ("coder", "plan", "ask"):
         try:
-            from symbol_index import format_symbol_map
+            from symbol_index import _looks_like_code_ident, format_symbol_map
 
             # استخراج فایل‌های ذکرشده از تاریخچه (مثل aider.get_repo_map که از
             # پیام فعلی می‌گیره — ما از کل تاریخچه می‌گیریم چون context کامل‌تره).
@@ -1202,7 +1202,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 _content = _turn.get("content") or ""
                 if isinstance(_content, str):
                     for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
-                        _mentioned_idents.add(_m)
+                        if _looks_like_code_ident(_m):
+                            _mentioned_idents.add(_m)
 
             # ask توکن‌حساس‌تره → بودجه کمتر.
             max_map_tokens = 512 if mode == "ask" else 1024

@@ -36,6 +36,14 @@ from grep_ast import filename_to_lang
 from grep_ast.tsl import get_language, get_parser
 from tree_sitter import Query, QueryCursor
 
+
+def _looks_like_code_ident(ident: str) -> bool:
+    """فیلتر «شبیه identifier کد بودن» — دقیقاً همون معیاری که توی رتبه‌بندی
+    PageRank (_get_ranked_tags) استفاده می‌شه، تا استخراج mentioned_idents هم
+    سیگنال رو رقیق نکنه (فقط snake_case / camelCase / PascalCase واقعی)."""
+    return len(ident) >= 8 and ("_" in ident or "-" in ident or ident != ident.lower())
+
+
 # لیست پسوندهای متنی که نماد استخراج می‌کنیم (مطابق با ابزارهای فایل).
 _TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -129,7 +137,8 @@ _GENERIC_PATTERNS = [
 # کش: root -> (timestamp, map, signature)
 _CACHE: dict[str, tuple[float, dict, tuple[float, int]]] = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_TTL = 10.0
+_CACHE_TTL = 60.0  # بودن ۱۰ ثانیه باعث miss مدام توی مکالمه‌های عادی می‌شد؛
+                   # invalidation بر اساس signature هست پس بالا بردنش امنه.
 
 # نام نماد + مکان (مشابه aider.Tag).
 Tag = namedtuple("Tag", ["rel_fname", "fname", "line", "name", "kind"])
@@ -371,7 +380,7 @@ def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_iden
         mul = 1.0
         if ident in mentioned_idents:
             mul *= 10
-        if len(ident) >= 8 and ("_" in ident or "-" in ident or ident != ident.lower()):
+        if _looks_like_code_ident(ident):
             mul *= 10
         if ident.startswith("_"):
             mul *= 0.1

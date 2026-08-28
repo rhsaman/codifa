@@ -3878,7 +3878,10 @@ When you need to read several files, read multiple independent files in parallel
                 )
                 if subagent_type == "explore":
                     try:
-                        from symbol_index import format_symbol_map
+                        from symbol_index import (
+                            _looks_like_code_ident,
+                            format_symbol_map,
+                        )
 
                         # استخراج فایل‌های ذکرشده از تاریخچه (مثل graph.py)
                         _mentioned_fnames: set[str] = set()
@@ -3891,7 +3894,8 @@ When you need to read several files, read multiple independent files in parallel
                             _content = _turn.get("content") or ""
                             if isinstance(_content, str):
                                 for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
-                                    _mentioned_idents.add(_m)
+                                    if _looks_like_code_ident(_m):
+                                        _mentioned_idents.add(_m)
 
                         _code_map = (
                             await asyncio.to_thread(

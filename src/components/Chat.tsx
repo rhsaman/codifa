@@ -16,6 +16,7 @@ import {
 import { api } from "../lib/fs";
 import { resetStreamForRetry } from "../lib/retry";
 import { applyToolEvent, makeToolActivity, resolveToolResult } from "../lib/toolActivity";
+import { bumpToolRunning, dropToolRunning, isToolRunning } from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { normalizeUsageModel } from "../lib/usage";
 import { stripLeadingModeTag } from "../lib/modeTag";
@@ -497,7 +498,7 @@ export function ChatPanel() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
   const lastEventAt = useRef(0);
-  const toolRunningRef = useRef(false);
+  const toolRunningRef = useRef(0);
   /** When the stall hint first turned on (see the watchdog in `send`); null
    *  while not stalled. Used to escalate a passive hint into a forced abort
    *  after a further grace period. */
@@ -1187,6 +1188,7 @@ export function ChatPanel() {
     imgs: Array<{ path: string; name: string; dataUrl?: string }> = [],
     allowCreate = false,
     reuseMsgId?: string,
+    continueAssistantId?: string,
     forceScroll = false,
   ) => {
     const s = useStore.getState();
@@ -1299,14 +1301,34 @@ export function ChatPanel() {
         mode: chat.mode,
       });
     }
-    const assistantMsg = s.addMessage(chat.id, {
-      role: "assistant",
-      content: "",
-      mode: chat.mode,
-      toolActivity: [],
-      segments: [],
-      streaming: true,
-    });
+    let assistantMsg: ChatMessage;
+    if (continueAssistantId) {
+      // Auto-retry / watchdog continuation: keep the SAME assistant bubble and
+      // resume streaming into it instead of spawning a second, half-finished one.
+      const existing = chat.messages.find((m) => m.id === continueAssistantId);
+      if (existing) {
+        assistantMsg = existing;
+        s.updateMessage(existing.id, { streaming: true, retry: null });
+      } else {
+        assistantMsg = s.addMessage(chat.id, {
+          role: "assistant",
+          content: "",
+          mode: chat.mode,
+          toolActivity: [],
+          segments: [],
+          streaming: true,
+        });
+      }
+    } else {
+      assistantMsg = s.addMessage(chat.id, {
+        role: "assistant",
+        content: "",
+        mode: chat.mode,
+        toolActivity: [],
+        segments: [],
+        streaming: true,
+      });
+    }
     // User-initiated sends jump to the bottom even if they scrolled up (the
     // auto-drain path passes forceScroll=false so it never yanks the user away
     // from history they are reading).
@@ -1317,6 +1339,7 @@ export function ChatPanel() {
     // left an assistant message with streaming:true; without this cleanup the new
     // turn would add a second streaming message and show two "Thinking" indicators.
     for (const m of chat.messages) {
+      if (m.id === assistantMsg.id) continue;
       if (m.retry) s.updateMessage(m.id, { retry: null });
       if (m.streaming) s.updateMessage(m.id, { streaming: false });
     }
@@ -1403,7 +1426,7 @@ export function ChatPanel() {
       }
       // A tool that's still running gets a much longer leash — it's doing real
       // work, not stalled on the provider.
-      const limit = toolRunningRef.current ? 900_000 : 300_000;
+      const limit = isToolRunning(toolRunningRef) ? 900_000 : 300_000;
       const elapsed = Date.now() - lastEventAt.current;
       if (elapsed <= limit) {
         stalledSinceRef.current = null;
@@ -1447,6 +1470,7 @@ export function ChatPanel() {
                 lastUser.images ?? [],
                 false,
                 lastUser.id,
+                assistantMsg.id,
               ),
             0,
           );
@@ -1613,7 +1637,7 @@ export function ChatPanel() {
           );
         }
       } else if (event.kind === "tool") {
-        toolRunningRef.current = true;
+        bumpToolRunning(toolRunningRef);
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
         // the running task card, not as top-level cards — so a task turn shows
@@ -1673,7 +1697,7 @@ export function ChatPanel() {
           },
         });
       } else if (event.kind === "tool_result") {
-        toolRunningRef.current = false;
+        dropToolRunning(toolRunningRef);
         // `resolveToolResult` resolves sub-agent results by branch/call_id even
         // when the parent branch card (or its nested child) is already "done",
         // so late sub-results are never dropped.
@@ -1999,7 +2023,7 @@ export function ChatPanel() {
       // has actually ended.
       lastEventAt.current = Date.now();
       stalledSinceRef.current = null;
-      toolRunningRef.current = false;
+      toolRunningRef.current = 0;
       useStore.getState().setChatStalled(chat.id, false);
       setBusy(false);
       useStore.getState().setChatCompacting(chat.id, false);
@@ -2486,7 +2510,7 @@ export function ChatPanel() {
     }
     setInput("");
     setCmdOpen(null);
-    void send(v, atts, imgs, false, undefined, true);
+    void send(v, atts, imgs, false, undefined, undefined, true);
   };
 
   const queueForLater = () => {

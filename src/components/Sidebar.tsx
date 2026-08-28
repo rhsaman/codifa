@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useStore, workspaceKey } from "../lib/store";
 export { useStore };
 import { themeById } from "../lib/themes";
@@ -373,8 +374,24 @@ export function Sidebar() {
 
   const allProviders = useStore((s) => s.settings.providers);
   const recentModels = useStore((s) => s.recentModels);
+  // Subscribe to the active chat's `usage` object by reference. `updateMessage`
+  // leaves `usage` untouched on per-token content deltas (it only rewrites
+  // `content`), so this reference is stable across the whole stream — meaning
+  // the expensive usage computation below does NOT re-run on every token. It
+  // only changes when `accrueChatUsage` rebuilds the entries array (turn end).
+  const activeUsage = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.usage,
+  );
 
-  const groups = buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats);
+  // `buildGroups` walks every chat + sorts; memoize it so it only re-runs when
+  // the underlying data actually changes (not on every unrelated re-render such
+  // as hover/scroll state). `chats` is rebuilt by the store on each streamed
+  // token, so this still recomputes during streaming — but the heavy usage
+  // computation below is now fully memoized and no longer the bottleneck.
+  const groups = useMemo(
+    () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats),
+    [chats, workspaces, pinnedWorkspaces, pinnedChats],
+  );
 
   // Sidebar search: match chat title or any message content (case-insensitive).
   // While searching, groups keep their workspace context but only matching
@@ -418,117 +435,150 @@ export function Sidebar() {
   // Legacy bare keys (recorded before this scheme) that match no provider land
   // in a group named after the model id itself, never silently merged into the
   // ACTIVE provider — so a previous main model/provider always stays visible.
-  const usageGroups = new Map<
-    string,
-    Array<{
-      model: string;
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      cost: number | null;
-      costFresh: number | null;
-      costCached: number | null;
-      lastUsed: number;
-    }>
-  >();
-  if (activeChat?.usage) {
-    for (const u of activeChat.usage.entries) {
-      // Keep cache-only entries (input=0, output=0, but cacheRead/cacheWrite>0)
-      // so the cached portion is never silently dropped from the totals.
-      if (
-        (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) <=
-        0
-      )
-        continue;
-      // providerId + model are stored EXPLICITLY on the entry (see Chat.tsx /
-      // store.ts) — read them directly, no key parsing, no guessing. Any future
-      // provider/model displays correctly. Legacy chats (pre-change) are
-      // migrated to this shape on load (see normalizeUsageEntry).
-      const p = allProviders.find((x) => x.id === u.providerId) ?? null;
-      const key = u.providerId;
-      const price = priceForModel(p?.pricingMap, u.model);
-      // Cost bills cache-read/cache-write tokens at their own (cheaper) rate
-      // when the provider advertises one — input_tokens already includes the
-      // cache portion, so it must be split out before charging full input.
-      const cacheRead = u.cacheRead ?? 0;
-      const cacheWrite = u.cacheWrite ?? 0;
-      const breakdown = computeUsageCostBreakdown(price, {
-        input: u.input,
-        output: u.output,
-        cacheRead,
-        cacheWrite,
-      });
-      const cost =
-        breakdown?.total ??
-        computeUsageCost(price, {
+  //
+  // Memoized on `activeUsage` (the active chat's `usage` object by reference)
+  // and `allProviders`: this is the heavy loop + cost breakdown + multi-stage
+  // sort that was previously recomputed on EVERY render — i.e. on every
+  // streamed token, because `updateMessage` rebuilds the whole `chats` array
+  // and the sidebar subscribed to it. Since `updateMessage` leaves `usage`
+  // untouched on per-token content deltas, `activeUsage` stays referentially
+  // stable across the stream, so this now runs only when usage actually
+  // changes (turn end), eliminating the per-token recompute that caused the
+  // sidebar lag during streaming.
+  const {
+    usageGroups,
+    usageGroupOrder,
+    usageGrandTokens,
+    usageGrandCached,
+    usageGrandCost,
+    usageGrandCostFresh,
+    usageGrandCostCached,
+    usageGrandTotal,
+    usageGrandFresh,
+  } = useMemo(() => {
+    const usageGroups = new Map<
+      string,
+      Array<{
+        model: string;
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        cost: number | null;
+        costFresh: number | null;
+        costCached: number | null;
+        lastUsed: number;
+      }>
+    >();
+    if (activeUsage) {
+      for (const u of activeUsage.entries) {
+        // Keep cache-only entries (input=0, output=0, but cacheRead/cacheWrite>0)
+        // so the cached portion is never silently dropped from the totals.
+        if (
+          (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) <=
+          0
+        )
+          continue;
+        // providerId + model are stored EXPLICITLY on the entry (see Chat.tsx /
+        // store.ts) — read them directly, no key parsing, no guessing. Any future
+        // provider/model displays correctly. Legacy chats (pre-change) are
+        // migrated to this shape on load (see normalizeUsageEntry).
+        const p = allProviders.find((x) => x.id === u.providerId) ?? null;
+        const key = u.providerId;
+        const price = priceForModel(p?.pricingMap, u.model);
+        // Cost bills cache-read/cache-write tokens at their own (cheaper) rate
+        // when the provider advertises one — input_tokens already includes the
+        // cache portion, so it must be split out before charging full input.
+        const cacheRead = u.cacheRead ?? 0;
+        const cacheWrite = u.cacheWrite ?? 0;
+        const breakdown = computeUsageCostBreakdown(price, {
           input: u.input,
           output: u.output,
           cacheRead,
           cacheWrite,
         });
-      const costFresh = breakdown?.fresh ?? null;
-      const costCached = breakdown?.cached ?? null;
-      if (!usageGroups.has(key)) usageGroups.set(key, []);
-      usageGroups.get(key)!.push({
-        model: u.model,
-        input: u.input,
-        output: u.output,
-        cacheRead,
-        cacheWrite,
-        cost,
-        costFresh,
-        costCached,
-        lastUsed: u.lastUsed ?? 0,
+        const cost =
+          breakdown?.total ??
+          computeUsageCost(price, {
+            input: u.input,
+            output: u.output,
+            cacheRead,
+            cacheWrite,
+          });
+        const costFresh = breakdown?.fresh ?? null;
+        const costCached = breakdown?.cached ?? null;
+        if (!usageGroups.has(key)) usageGroups.set(key, []);
+        usageGroups.get(key)!.push({
+          model: u.model,
+          input: u.input,
+          output: u.output,
+          cacheRead,
+          cacheWrite,
+          cost,
+          costFresh,
+          costCached,
+          lastUsed: u.lastUsed ?? 0,
+        });
+      }
+    }
+    // Sort each provider group by total usage (heaviest first); ties by most
+    // recently used so the freshest model wins when token counts are equal.
+    for (const entries of usageGroups.values()) {
+      entries.sort((a, b) => {
+        const d = b.input + b.output - (a.input + a.output);
+        if (d !== 0) return d;
+        return (b.lastUsed ?? 0) - (a.lastUsed ?? 0);
       });
     }
-  }
-  // Sort each provider group by total usage (heaviest first); ties by most
-  // recently used so the freshest model wins when token counts are equal.
-  for (const entries of usageGroups.values()) {
-    entries.sort((a, b) => {
-      const d = b.input + b.output - (a.input + a.output);
-      if (d !== 0) return d;
-      return (b.lastUsed ?? 0) - (a.lastUsed ?? 0);
+    // Provider groups ordered by total usage (the biggest consumer on top);
+    // ties by the group's most recently used model.
+    const usageGroupOrder = [...usageGroups.entries()].sort((a, b) => {
+      const aTotal = a[1].reduce((s, e) => s + e.input + e.output, 0);
+      const bTotal = b[1].reduce((s, e) => s + e.input + e.output, 0);
+      if (aTotal !== bTotal) return bTotal - aTotal;
+      const aLast = Math.max(...a[1].map((e) => e.lastUsed ?? 0), 0);
+      const bLast = Math.max(...b[1].map((e) => e.lastUsed ?? 0), 0);
+      return bLast - aLast;
     });
-  }
-  // Provider groups ordered by total usage (the biggest consumer on top);
-  // ties by the group's most recently used model.
-  const usageGroupOrder = [...usageGroups.entries()].sort((a, b) => {
-    const aTotal = a[1].reduce((s, e) => s + e.input + e.output, 0);
-    const bTotal = b[1].reduce((s, e) => s + e.input + e.output, 0);
-    if (aTotal !== bTotal) return bTotal - aTotal;
-    const aLast = Math.max(...a[1].map((e) => e.lastUsed ?? 0), 0);
-    const bLast = Math.max(...b[1].map((e) => e.lastUsed ?? 0), 0);
-    return bLast - aLast;
-  });
-  // Grand total across every provider group, shown right in the panel header
-  // so the full session usage/cost is visible without expanding each group.
-  let usageGrandTokens = 0;
-  let usageGrandCached = 0;
-  let usageGrandCost: number | null = null;
-  let usageGrandCostFresh: number | null = null;
-  let usageGrandCostCached: number | null = null;
-  for (const [, entries] of usageGroupOrder) {
-    for (const e of entries) {
-      usageGrandTokens += e.input + e.output;
-      usageGrandCached += e.cacheRead + e.cacheWrite;
-      if (e.cost !== null) usageGrandCost = (usageGrandCost ?? 0) + e.cost;
-      if (e.costFresh !== null)
-        usageGrandCostFresh = (usageGrandCostFresh ?? 0) + e.costFresh;
-      if (e.costCached !== null)
-        usageGrandCostCached = (usageGrandCostCached ?? 0) + e.costCached;
+    // Grand total across every provider group, shown right in the panel header
+    // so the full session usage/cost is visible without expanding each group.
+    let usageGrandTokens = 0;
+    let usageGrandCached = 0;
+    let usageGrandCost: number | null = null;
+    let usageGrandCostFresh: number | null = null;
+    let usageGrandCostCached: number | null = null;
+    for (const [, entries] of usageGroupOrder) {
+      for (const e of entries) {
+        usageGrandTokens += e.input + e.output;
+        usageGrandCached += e.cacheRead + e.cacheWrite;
+        if (e.cost !== null) usageGrandCost = (usageGrandCost ?? 0) + e.cost;
+        if (e.costFresh !== null)
+          usageGrandCostFresh = (usageGrandCostFresh ?? 0) + e.costFresh;
+        if (e.costCached !== null)
+          usageGrandCostCached = (usageGrandCostCached ?? 0) + e.costCached;
+      }
     }
-  }
-  // Header shows TOTAL billed tokens (input + output) — the whole amount the
-  // provider processed this session — with the cached portion called out
-  // separately via the ⚡ badge. (Many sessions are cache-heavy, so showing
-  // only the non-cached remainder as the main number read as "under-counted".)
-  const usageGrandTotal = usageGrandTokens;
-  // Tokens NOT served from the provider's prompt cache this turn/session —
-  // the portion that was actually freshly processed (billed at the full,
-  // non-cache rate). Shown next to the ⚡ cached badge as 🔥.
-  const usageGrandFresh = Math.max(0, usageGrandTokens - usageGrandCached);
+    // Header shows TOTAL billed tokens (input + output) — the whole amount the
+    // provider processed this session — with the cached portion called out
+    // separately via the ⚡ badge. (Many sessions are cache-heavy, so showing
+    // only the non-cached remainder as the main number read as "under-counted".)
+    const usageGrandTotal = usageGrandTokens;
+    // Tokens NOT served from the provider's prompt cache this turn/session —
+    // the portion that was actually freshly processed (billed at the full,
+    // non-cache rate). Shown next to the ⚡ cached badge as 🔥.
+    const usageGrandFresh = Math.max(0, usageGrandTokens - usageGrandCached);
+    return {
+      usageGroups,
+      usageGroupOrder,
+      usageGrandTokens,
+      usageGrandCached,
+      usageGrandCost,
+      usageGrandCostFresh,
+      usageGrandCostCached,
+      usageGrandTotal,
+      usageGrandFresh,
+    };
+  }, [activeUsage, allProviders]);
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();

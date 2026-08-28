@@ -1771,11 +1771,11 @@ _SUMMARY_TEMPLATE = (
     "### Completed\n"
     '- [finished work, verified facts, or changes made; otherwise "(none)"]\n\n'
     "### Active\n"
-    '- [current work, partial changes, or investigation state; otherwise "(none)"]\n\n'
+    '- [current work IN PROGRESS, including the exact tool call / step being executed right now (so another agent resumes without re-running everything), partial changes, or investigation state; otherwise "(none)"]\n\n'
     "### Blocked\n"
     '- [blockers, failing commands, or unknowns; otherwise "(none)"]\n\n'
     "## Next Move\n"
-    '1. [immediate concrete action, or "(none)"]\n'
+    '1. [immediate concrete action — the specific next tool call to make, or "(none)"]\n'
     '2. [next action if known, or "(none)"]\n\n'
     "## Relevant Files\n"
     '- [file or directory path: why it matters, or "(none)"]\n'
@@ -3488,13 +3488,10 @@ def _mode_declare(mode: str) -> str:
         f"currently {label}) and tell them to use the mode button; their NEXT message then runs in the "
         "new mode. Never claim the mode is fixed for the whole conversation or that the mode button "
         "only affects new chats.\n"
-        "HISTORY MODE TAGS: earlier turns may carry a ``<!-- mode:x -->`` metadata comment "
-        "(prefix only). That comment means the turn was produced under a DIFFERENT mode than "
-        "this one — treat its behavior as PAST work from another mode, NOT something you are "
-        "doing now. It is metadata ONLY; you MUST NEVER write ``<!-- mode:… -->`` or "
-        "``[Mode: …]`` at the start of your own reply. Your job for THIS message is defined "
-        "ONLY by the CURRENT MODE above; do not copy the style, length, or actions of a "
-        "differently-tagged past turn."
+        "NEVER write a mode tag (e.g. ``<!-- mode:… -->`` or ``[Mode: …]``) at the start of your "
+        "reply — the mode for THIS message is already declared above by ``=== CURRENT MODE: … ===``. "
+        "Do not copy the style, length, or actions of any past turn; your job is defined ONLY by the "
+        "CURRENT MODE above."
     )
     output = _MODE_OUTPUT.get(mode, "")
     if output:
@@ -3548,6 +3545,7 @@ async def run_agent(
     chat_id: str = "",
     reserved: int | None = None,
     providers: dict | None = None,
+    compact_trigger_fraction: float = 0.8,
 ) -> AsyncIterator[dict]:
     """Run the agent via the LangGraph workflow and yield SSE events.
 
@@ -3597,6 +3595,7 @@ async def run_agent(
         "subagent_models": dict(subagent_models or {}),
         "chat_id": chat_id,
         "reserved": reserved,
+        "compact_trigger_fraction": compact_trigger_fraction,
         "providers": providers or {},
         # Mutable flag shared between graph._run_mode_turn (detects a hard
         # failure) and graph.run_graph._drive (decides whether to clear the

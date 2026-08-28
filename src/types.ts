@@ -160,6 +160,10 @@ export interface Settings {
    *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`
    *  (opencode's `usable`). Default 20_000. */
   compactHeadroom?: number
+  /** Fraction of the usable window at which mid-turn auto-compaction fires
+   *  (0.1–0.95). 0.5 = compact once a turn uses half the usable window, well
+   *  before the hard overflow limit. Default 0.5. */
+  compactTriggerFraction?: number
   /** History turn limit sent to the model. 0 = full history (default). N > 0 =
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */

@@ -251,6 +251,9 @@ export interface StreamParams {
   /** Compaction headroom (tokens) reserved below the context window — opencode's
    *  `reserved`. Auto-compaction fires at `ctx - reserved`. */
   reserved?: number
+  /** Fraction of the usable window at which mid-turn auto-compaction fires
+   *  (0.1–0.95). Compact once a turn reaches this fraction, before the limit. */
+  compactTriggerFraction?: number
   signal?: AbortSignal
 }
 
@@ -258,7 +261,7 @@ export async function streamChat(
   params: StreamParams,
   onEvent: (event: SidecarEvent) => void,
 ): Promise<void> {
-  const url = await ensureSidecar()
+  let url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
 
   // Self-healing reconnect: if the network drops mid-stream (a fetch/reader
@@ -270,6 +273,18 @@ export async function streamChat(
   const MAX_RECONNECT_ATTEMPTS = 5
   const BASE_BACKOFF_MS = 1000
 
+  // A healthy turn ALWAYS ends with a terminal `done` event (the server emits it
+  // in its finally block). If the stream closes WITHOUT one, the sidecar died
+  // mid-turn (segfault/OOM) and the OS tore down the socket. We must treat that
+  // as a drop — not a clean completion — so the self-healing reconnect below
+  // respawns the sidecar and resumes from the on-disk checkpointer, instead of
+  // silently stranding the user on a manual resend.
+  let gotDone = false
+  const wrappedOnEvent = (e: SidecarEvent) => {
+    if (e?.kind === 'done') gotDone = true
+    onEvent(e)
+  }
+
   const parseFrame = (frame: string) => {
     for (const line of frame.split('\n')) {
       // SSE comments (": keepalive") are the backend's heartbeat — it sends one
@@ -279,7 +294,7 @@ export async function streamChat(
       // mistaken for a dead connection. A genuinely dead socket stops emitting
       // these, which is exactly what the watchdog needs to detect.
       if (line.startsWith(': ')) {
-        onEvent({ kind: 'keepalive' } as SidecarEvent)
+        wrappedOnEvent({ kind: 'keepalive' } as SidecarEvent)
         continue
       }
       if (!line.startsWith('data: ')) continue
@@ -287,7 +302,7 @@ export async function streamChat(
       if (!raw) continue
       try {
         const event = JSON.parse(raw) as SidecarEvent
-        onEvent(event)
+        wrappedOnEvent(event)
       } catch {
         /* skip malformed frame */
       }
@@ -298,6 +313,15 @@ export async function streamChat(
   while (true) {
     // A manual stop must never trigger a reconnect — bail before any work.
     if (params.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+
+    // On a reconnect (any attempt after the first), re-resolve the sidecar URL
+    // so we pick up the freshly-respawned process instead of the dead port we
+    // cached at the start. The first attempt uses the cached URL as before (no
+    // extra health probe per turn).
+    if (attempt > 0) {
+      url = await ensureSidecar()
+      if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+    }
 
     // Phase 1: connect. A network failure to even reach the sidecar is
     // retryable; an HTTP error response is not.
@@ -345,6 +369,7 @@ export async function streamChat(
             modelContextWindow(params.provider, params.provider.model) ?? 0,
             params.reserved ?? 20000,
           ),
+          compact_trigger_fraction: params.compactTriggerFraction ?? 0.8,
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })
@@ -389,6 +414,14 @@ export async function streamChat(
       // flush any pending multi-byte UTF-8 tail (decoder.decode() with no args).
       buffer += decoder.decode()
       if (buffer.trim()) parseFrame(buffer)
+      if (!gotDone) {
+        // The sidecar died mid-stream (segfault/OOM) and the socket closed
+        // without a graceful `done`. Surface it as a drop so the self-healing
+        // reconnect (below) respawns the sidecar and resumes from the on-disk
+        // checkpointer, rather than silently completing and stranding the user
+        // on a manual resend. A normal completion always receives `done`.
+        throw new Error("SSE stream ended without a terminal 'done' event (sidecar drop)")
+      }
       return // clean completion — no reconnect needed
     } catch (err) {
       // A manual abort must propagate immediately, not trigger a reconnect.

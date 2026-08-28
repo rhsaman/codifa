@@ -203,6 +203,24 @@ async function run() {
     check('۶) event های data همچنان رسیدند', received.filter((e) => e.kind !== 'keepalive').length === 2, received)
   }
 
+  // 7) Stream ends WITHOUT a terminal `done` (sidecar crashed mid-turn) →
+  //    treated as a drop, reconnects and resumes (instead of silently stopping).
+  {
+    let streamCalls = 0
+    const received: any[] = []
+    ;(globalThis as any).fetch = async (url: string) => {
+      if (url.endsWith('/health')) return new Response(null, { status: 200 })
+      if (url.endsWith('/chat/stream')) streamCalls++
+      // First attempt closes at EOF with NO `done` (simulates a sidecar crash);
+      // second attempt is a normal, complete stream.
+      if (streamCalls === 1) return makeStreamResponse([{ kind: 'text', content: 'partial' }])
+      return makeStreamResponse([{ kind: 'text', content: 'rest' }, { kind: 'done' }])
+    }
+    await streamChat(baseParams, (e) => received.push(e))
+    check('۷) استریم بدون done باعث reconnect می‌شود', streamCalls === 2, streamCalls)
+    check('۷) پس از reconnect استریم کامل رسید', received.some((e) => e.kind === 'done'), received)
+  }
+
   if (failed > 0) {
     console.error(`\n${failed} تست شکست خورد ❌`)
     process.exit(1)

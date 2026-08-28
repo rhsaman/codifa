@@ -184,7 +184,16 @@ async function doStart(): Promise<SidecarHandle> {
       console.log(`[sidecar] stopped (${signal || 'exit'})`)
       stopping = false
     } else if (code === null) {
-      console.error(`[sidecar] exited unexpectedly (signal ${signal})`)
+      // A crash (not a clean stop) leaves the renderer with a stale cached URL.
+      // Make the log actionable: hint at the two most common silent causes so a
+      // "no error, no log" report becomes diagnosable.
+      const hint =
+        signal === 'SIGKILL'
+          ? ' (likely OOM — the sidecar ran out of memory on a large context)'
+          : signal === 'SIGSEGV'
+            ? ' (segfault — see the [sidecar] traceback above / faulthandler output in codifa.log)'
+            : ''
+      console.error(`[sidecar] exited unexpectedly (signal ${signal})${hint}`)
     } else {
       console.error(`[sidecar] exited with code ${code}`)
     }

@@ -23,6 +23,24 @@ from urllib.parse import quote
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+logger = logging.getLogger("codifa.server")
+
+
+def _rss_mb() -> float | None:
+    """Peak resident memory in MB, best-effort (unix only). Helpful for spotting
+    the OOM crashes that manifest as a silent sidecar drop mid-turn."""
+    try:
+        import resource
+        import sys
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes; Linux reports KB.
+        if sys.platform == "darwin":
+            return rss / (1024 * 1024)
+        return rss / 1024
+    except Exception:  # noqa: BLE001 — RSS is best-effort diagnostics only
+        return None
+
 # Pending permission requests: id -> asyncio.Future. Resolved by the
 # /permission/respond endpoint and awaited by the agent's request_permission /
 # confirm_action tools.
@@ -197,6 +215,10 @@ class ChatRequest(BaseModel):
     # `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires when the conversation
     # reaches `ctx - reserved` (opencode's `usable`). Default 20_000.
     reserved: int = 20_000
+    # Fraction of the usable window at which mid-turn auto-compaction fires
+    # (user-tunable in Settings). 0.5 = compact once the turn uses half the
+    # usable window, well before the hard overflow limit. Clamped in graph.py.
+    compact_trigger_fraction: float = 0.8
 
 
 class CompactRequest(BaseModel):
@@ -1093,6 +1115,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def event_gen():
         try:
+            logger.warning(
+                "agent run start chat_id=%s rss_mb=%.1f",
+                req.chat_id,
+                _rss_mb() or 0.0,
+            )
             async for event in _with_keepalive(
                 run_agent(
                 provider=req.provider,
@@ -1126,6 +1153,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 chat_id=req.chat_id,
                 reserved=req.reserved,
                 providers=req.providers,
+                compact_trigger_fraction=req.compact_trigger_fraction,
                 )
             ):
                 if event.get("kind") == "_keepalive":
@@ -1138,6 +1166,13 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # and its background producer task are unwound inside run_agent's
             # finally block, so just stop iterating cleanly — do NOT emit a
             # trailing "done" event, since the user closed the stream themselves.
+            # Log the drop with peak RSS so a recurring silent interrupt (crash /
+            # OOM) becomes visible in codifa.log instead of going unnoticed.
+            logger.warning(
+                "stream DISCONNECTED (client/sidecar drop) chat_id=%s rss_mb=%.1f",
+                req.chat_id,
+                _rss_mb() or 0.0,
+            )
             return
         except Exception as exc:  # noqa: BLE001 — must always surface an SSE error
             # Full traceback to the sidecar stderr so an opaque upstream message
@@ -1371,6 +1406,16 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+
+    # Dump a C-level traceback to stderr on segfault/abort so a hard crash (e.g.
+    # in onnxruntime/CTranslate2) is diagnosable instead of silent. The Electron
+    # sidecar pipes this stderr to the app logs.
+    try:
+        import faulthandler
+
+        faulthandler.enable()
+    except Exception:  # noqa: BLE001, S110
+        pass
 
     # Central file logging: every Python logger (retrieval, vector_store, and any
     # future module) appends WARNING+ to <data root>/codifa.log so a packaged app

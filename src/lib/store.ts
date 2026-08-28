@@ -413,6 +413,8 @@ interface State {
   setSystemPrompt: (mode: AgentMode, text: string) => void
   /** Compaction headroom (tokens) reserved below the context window. */
   setCompactHeadroom: (tokens: number) => void
+  /** Fraction of the usable window at which mid-turn auto-compaction fires. */
+  setCompactTriggerFraction: (frac: number) => void
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
@@ -620,7 +622,7 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactHeadroom: 20000 },
+  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactHeadroom: 20000, compactTriggerFraction: 0.8 },
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
@@ -774,6 +776,12 @@ export const useStore = create<State>((set, get) => ({
         raw.compactHeadroom <= 200_000
           ? Math.round(raw.compactHeadroom)
           : 20000,
+      compactTriggerFraction:
+        typeof raw.compactTriggerFraction === 'number' &&
+        raw.compactTriggerFraction >= 0.1 &&
+        raw.compactTriggerFraction <= 0.95
+          ? raw.compactTriggerFraction
+          : 0.8,
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
@@ -1905,6 +1913,10 @@ export const useStore = create<State>((set, get) => ({
 
   setCompactHeadroom: (tokens: number) => {
     set((s) => ({ settings: { ...s.settings, compactHeadroom: tokens } }))
+    get().persist()
+  },
+  setCompactTriggerFraction: (frac: number) => {
+    set((s) => ({ settings: { ...s.settings, compactTriggerFraction: frac } }))
     get().persist()
   },
   setNvimFile: (abs) => set({ nvimFile: abs }),

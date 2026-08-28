@@ -1995,6 +1995,7 @@ export function ChatPanel() {
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
           reserved: s.settings.compactHeadroom ?? 20000,
+          compactTriggerFraction: s.settings.compactTriggerFraction ?? 0.8,
           signal: abort.signal,
         },
         handleEvent,

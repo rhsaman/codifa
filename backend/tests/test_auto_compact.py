@@ -86,6 +86,24 @@ async def _run_trigger_with_input(messages, last_input_tokens, reserved=20_000, 
     return [e["kind"] for e in q.items], q.items
 
 
+async def _run_trigger_with_input_frac(
+    messages, last_input_tokens, trigger_fraction, reserved=20_000, ctx=200_000
+):
+    state = {"reserved": reserved, "compact_trigger_fraction": trigger_fraction}
+    q = _Queue()
+    await graph._maybe_auto_compact(
+        state,
+        q,
+        None,
+        None,
+        messages,
+        ctx,
+        last_input_tokens=last_input_tokens,
+        trigger_fraction=trigger_fraction,
+    )
+    return [e["kind"] for e in q.items], q.items
+
+
 def test_auto_compact_uses_last_input_tokens():
     # A small transcript (local estimate below usable) but a reported
     # last_input_tokens above usable must still fire compaction — proving
@@ -118,6 +136,40 @@ def test_auto_compact_low_last_input_tokens_stays_silent():
             last_input_tokens=10_000,
         )
     )
+    assert events == []
+
+
+def test_auto_compact_fires_early_at_fraction():
+    # Mid-turn compaction: total=120k against usable=180k. At trigger_fraction=0.5
+    # the threshold is 90k, so a turn that has used 120k compacts BEFORE reaching
+    # the limit. The post-turn backstop (trigger_fraction=1.0, threshold 180k)
+    # would leave the same 120k silent — proving the fraction makes it fire early.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[c]"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        msgs = [HumanMessage(content="hi")]
+        early, _ = asyncio.run(_run_trigger_with_input_frac(msgs, 120_000, 0.5))
+        late, _ = asyncio.run(_run_trigger_with_input_frac(msgs, 120_000, 1.0))
+    finally:
+        graph._agents._compact_history = original
+    assert early == ["compact_start", "compact"]
+    assert late == []
+
+
+def test_auto_compact_silent_below_fraction():
+    # total=80k, usable=180k, trigger_fraction=0.5 -> threshold 90k -> silent.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[c]"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        events, _ = asyncio.run(_run_trigger_with_input_frac([HumanMessage(content="hi")], 80_000, 0.5))
+    finally:
+        graph._agents._compact_history = original
     assert events == []
 
 

@@ -337,24 +337,18 @@ def history_to_langchain_messages(
     re-run the tool calls after a reconnect/interrupt -- the transcript alone
     (no synthetic "you already did X" injection) carries the prior work forward.
 
-    When ``current_mode`` is supplied, any turn whose own ``mode`` differs from it
-    is wrapped in a ``<!-- mode:x -->`` metadata comment (prefix only). This keeps
-    the model from blending a previous mode's behavior into the current turn after
-    a mid-chat mode switch (e.g. a Coder turn following Plan history must not look
-    like the model was already implementing). The comment is metadata ONLY -- the
-    model must NEVER echo it at the start of its own reply; the system prompt
-    already declares the authoritative mode.
+    The authoritative mode for THIS turn is declared by the system prompt (via
+    ``_mode_declare``), so we deliberately do NOT inject any per-turn mode tag into
+    the history here: a past-mode marker in the transcript only teaches the model
+    to echo it back at the start of its reply (e.g. writing ``<!-- mode:ask -->``
+    while the button says Plan). Mode re-orientation is handled entirely by the
+    system prompt, not by history tagging.
     """
     out: list[BaseMessage] = []
     for turn in history or []:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
         tool_activity = turn.get("toolActivity") or []
-        # Tag turns that were produced under a different mode than the current
-        # one, so the model can tell past-mode behavior apart from this turn.
-        turn_mode = turn.get("mode")
-        if current_mode and turn_mode and turn_mode != current_mode:
-            content = f"<!-- mode:{turn_mode} -->\n{content}"
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
         if role == "assistant" and tool_activity:
@@ -1939,6 +1933,16 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
     msgs[:] = rebuilt
 
 
+# Fraction of the usable window at which mid-turn auto-compaction fires. Kept
+# well below 1.0 so a long-running turn compacts BEFORE it nears the limit
+# (the user tunes this in Settings -> compactTriggerFraction).
+_COMPACT_TRIGGER_FRACTION = 0.8
+# Cap on how many times mid-turn compaction may actually FIRE within a single
+# turn, so a pathological transcript can never spin in a compact loop. The
+# post-turn backstop still runs once at the end.
+_MAX_COMPACT_PER_TURN = 6
+
+
 async def _maybe_auto_compact(
     state: AgentState,
     queue: asyncio.Queue,
@@ -1947,6 +1951,7 @@ async def _maybe_auto_compact(
     msgs: list,
     ctx: int,
     last_input_tokens: int | None = None,
+    trigger_fraction: float = 1.0,
 ) -> None:
     """opencode `isOverflow` -> auto-compaction.
 
@@ -1961,6 +1966,14 @@ async def _maybe_auto_compact(
     max_output = _agents._model_max_output(model)
     reserved = state.get("reserved")
     usable = _agents._usable_tokens(ctx, max_output, reserved)
+    # Mid-turn auto-compaction fires at a FRACTION of the usable window (user-
+    # tunable, default _COMPACT_TRIGGER_FRACTION) so a long-running turn compacts
+    # BEFORE it nears the limit, instead of only at the hard overflow boundary.
+    # The post-turn backstop still passes trigger_fraction=1.0. Clamp defensively
+    # so a mis-set value can never disable compaction (>=0.1) or fire on every
+    # step (<=0.95).
+    _frac = max(0.1, min(0.95, trigger_fraction))
+    threshold = int(usable * _frac)
     dicts = _agents._messages_to_dicts(msgs)
     # Auto-compaction fires off the SAME `input_tokens` the context meter
     # displays (tracked on `state["last_input_tokens"]` at the usage-emit site),
@@ -1982,13 +1995,15 @@ async def _maybe_auto_compact(
     # only fires when the prompt genuinely nears the window (and not spuriously).
     print(
         f"[CTX_DEBUG] auto_compact ctx={ctx} reserved={reserved} usable={usable} "
-        f"total={total} msgs={len(msgs)}",
+        f"trigger_fraction={_frac} threshold={threshold} total={total} msgs={len(msgs)}",
         flush=True,
     )
     # opencode fires compaction when the latest turn reaches `usable`
-    # (ctx - reserved). We mirror that exactly: a single setting
-    # (compactHeadroom / reserved) controls when auto-compaction runs.
-    if total < usable:
+    # (ctx - reserved). For mid-turn compaction we fire earlier — at
+    # `usable * trigger_fraction` — so the turn sheds context BEFORE it nears the
+    # limit. A single setting (compactHeadroom / reserved) controls the limit;
+    # compactTriggerFraction controls how early we start.
+    if total < threshold:
         return
     # opencode prune: clear old tool outputs (not the whole turn) before the
     # heavier summarization pass, so a large-but-not-overflowing transcript
@@ -2189,6 +2204,7 @@ async def _run_mode_turn(
         # generating until the answer is complete instead of ending the turn).
         _auto_cont = 0
         _MAX_AUTO_CONT = 5
+        _compact_count = 0
         while steps < MAX_STEPS:
             steps += 1
             # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -2522,7 +2538,11 @@ async def _run_mode_turn(
             # by the SAME input_tokens the context meter displays
             # (state["last_input_tokens"], set at the usage-emit site above), so
             # the meter and the trigger always agree. No-op below the threshold.
-            if ctx > 0:
+            # Fires at `usable * compact_trigger_fraction` (mid-turn, before the
+            # limit) so the agent keeps working on a compacted transcript instead
+            # of running out of context mid-task.
+            if ctx > 0 and _compact_count < _MAX_COMPACT_PER_TURN:
+                _before = len(queue.items)
                 await _maybe_auto_compact(
                     state,
                     queue,
@@ -2531,6 +2551,12 @@ async def _run_mode_turn(
                     msgs,
                     ctx,
                     last_input_tokens=state.get("last_input_tokens"),
+                    trigger_fraction=state.get("compact_trigger_fraction", _COMPACT_TRIGGER_FRACTION),
+                )
+                # Only count an actual firing (a compact_start event) so a normal
+                # turn that stays under threshold is never penalized.
+                _compact_count += sum(
+                    1 for e in queue.items[_before:] if e.get("kind") == "compact_start"
                 )
         return reply
 

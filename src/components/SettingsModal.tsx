@@ -9,6 +9,7 @@ import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { THEMES } from '../lib/themes'
+import { RangeSlider } from './RangeSlider'
 
 const KIND_LABELS: Record<ProviderKind, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -458,6 +459,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
   const compactHeadroom = useStore((s) => s.settings.compactHeadroom ?? 20000)
   const setCompactHeadroom = useStore((s) => s.setCompactHeadroom)
+  const compactTriggerFraction = useStore((s) => s.settings.compactTriggerFraction ?? 0.8)
+  const setCompactTriggerFraction = useStore((s) => s.setCompactTriggerFraction)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
   const webSearchTtlDays = useStore((s) => s.webSearchTtlDays ?? 7)
@@ -2061,6 +2064,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             <div className="field">
               <div className="field-head">
                 <label>Compaction headroom (tokens)</label>
+                <span className="field-value-badge">{compactHeadroom.toLocaleString()}</span>
               </div>
               <div className="hint">
                 Tokens reserved below the model's context window before auto-compaction
@@ -2071,23 +2075,50 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
               <div className="font-size-row">
                 <span className="font-size-label">0</span>
-                <input
-                  type="range"
+                <RangeSlider
                   min={0}
                   max={64000}
                   step={1000}
                   value={compactHeadroom}
-                  onChange={(e) => setCompactHeadroom(Number(e.target.value))}
+                  onChange={setCompactHeadroom}
+                  ariaLabel="Compaction headroom (tokens)"
                 />
                 <span className="font-size-label">64k</span>
-                <span className="font-size-value">{compactHeadroom.toLocaleString()}</span>
               </div>
               <div className="hint">Applies on the next message. Default: 20,000 tokens.</div>
             </div>
 
             <div className="field">
               <div className="field-head">
+                <label>Mid-turn compaction trigger</label>
+                <span className="field-value-badge">{compactTriggerFraction.toFixed(2)}</span>
+              </div>
+              <div className="hint">
+                Fraction of the usable window at which auto-compaction runs <b>during</b> a
+                turn — before the context limit is reached (opencode only compacts at the
+                hard limit). 0.8 = compact once a turn uses 80% of the window, so the agent
+                keeps working on a compacted transcript instead of running out of context
+                mid-task. Lower = compact sooner (safer for huge contexts); higher = compact
+                later. Range 0.1–0.95. Applies on the next message. Default: 0.8.
+              </div>
+              <div className="font-size-row">
+                <span className="font-size-label">0.1</span>
+                <RangeSlider
+                  min={0.1}
+                  max={0.95}
+                  step={0.05}
+                  value={compactTriggerFraction}
+                  onChange={setCompactTriggerFraction}
+                  ariaLabel="Mid-turn compaction trigger"
+                />
+                <span className="font-size-label">0.95</span>
+              </div>
+            </div>
+
+            <div className="field">
+              <div className="field-head">
                 <label>History turn limit</label>
+                <span className="field-value-badge">{historyLimit === 0 ? 'Off' : historyLimit}</span>
               </div>
               <div className="hint">
                 How many recent conversation turns are sent to the model in full each
@@ -2099,16 +2130,15 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
               <div className="font-size-row">
                 <span className="font-size-label">0</span>
-                <input
-                  type="number"
+                <RangeSlider
                   min={0}
                   max={200}
                   step={1}
                   value={historyLimit}
-                  onChange={(e) => setHistoryLimit(Number(e.target.value))}
+                  onChange={setHistoryLimit}
+                  ariaLabel="History turn limit"
                 />
                 <span className="font-size-label">200</span>
-                <span className="font-size-value">{historyLimit.toLocaleString()}</span>
               </div>
               <div className="hint">Default: 0 (full history).</div>
             </div>

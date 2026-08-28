@@ -40,6 +40,7 @@ from providers import (
 from tools import (
     LOG_FILENAME,
     PathEscapeError,
+    _is_terminal_search,
     list_files,
     read_file,
     resolve_safe,
@@ -526,6 +527,21 @@ def _wrap_no_search_bypass(fn: Callable):
         reason = _search_bypass_reject(command)
         if reason:
             return reason
+        # Block ANY code-search/inspection command run through run_terminal.
+        # The dedicated search tools (grep/glob/read) and the explore sub-agent
+        # are the only sanctioned ways to search the codebase — running searches
+        # through run_terminal is slow, token-heavy, and bypasses the search path.
+        # git working-tree inspection (status/diff/log/show/blame) stays allowed
+        # because it is a sanctioned read-only inspection command (and the
+        # history-search variants are already rejected by _search_bypass_reject).
+        _first = command.strip().split()[0].lower() if command.strip().split() else ""
+        if _first != "git" and _is_terminal_search(command):
+            return (
+                "ERROR: code search/inspection via run_terminal is not allowed — "
+                "it is slow and wastes tokens. Use grep/glob/read for targeted "
+                "lookups, or delegate broad/multi-file work to the explore "
+                "sub-agent via task(subagent_type='explore')."
+            )
         return await fn(command)
 
     return wrapped
@@ -542,7 +558,7 @@ def _wrap_no_search_bypass(fn: Callable):
 # run inline and tells the model to delegate to the explore sub-agent instead.
 _BROAD_FILE_COUNT = 100
 _AUTO_EXPLORE_TOOLS = ("grep", "glob", "read", "web_search", "fetch_url")
-_AUTO_EXPLORE_THRESHOLD = 10  # cross-turn cap on search calls before steering
+_AUTO_EXPLORE_THRESHOLD = 100  # cross-turn cap on search calls before steering
 
 # Cross-turn counter for the auto-router. Reset at the START of each user
 # message (not per model-turn) so the threshold is measured across the whole
@@ -597,7 +613,10 @@ def _wrap_auto_explore_router(tools: dict) -> dict:
 
         async def wrapped(*args, _fn=fn, _name=name, **kwargs):
             _auto_explore_count["count"] += 1
-            if _is_broad_search(_name, kwargs) or _auto_explore_count["count"] > _AUTO_EXPLORE_THRESHOLD:
+            if (
+                _is_broad_search(_name, kwargs)
+                or _auto_explore_count["count"] > _AUTO_EXPLORE_THRESHOLD
+            ):
                 return (
                     f"ERROR: too many {_name} calls "
                     f"({_auto_explore_count['count']}) or this is a broad search. "
@@ -1796,7 +1815,7 @@ _SUMMARY_TEMPLATE = (
     "- Only state that code was added/removed/changed if the conversation explicitly shows the edit "
     "applied AND verified (e.g. ruff/tests passed). Otherwise mark it '(intended, not yet applied to "
     "code)' and do not list acting on it as a pending step.\n"
-    )
+)
 
 
 # Worked example shown to the summarizer so it learns the Completed-vs-Next-Move

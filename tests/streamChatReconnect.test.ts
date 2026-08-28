@@ -115,7 +115,11 @@ async function run() {
     }
     await streamChat(baseParams, (e) => received.push(e))
     check('۲) روی خطای اتصال دوباره تلاش می‌کند', calls >= 3, calls)
-    check('۲) در نهایت event ها رسید', received.length === 2, received)
+    // The self-healing layer surfaces a `reconnecting` retry event to the UI
+    // (so the "Connection lost — reconnecting…" pill shows), then resumes and
+    // delivers the two data events.
+    check('۲) اطلاع‌رسانی reconnect فرستاده شد', received.some((e) => e.kind === 'retry' && e.reconnecting === true), received)
+    check('۲) در نهایت event های داده رسید', received.filter((e) => e.kind !== 'retry').length === 2, received)
   }
 
   // 3) Mid-stream drop → retry and resume.

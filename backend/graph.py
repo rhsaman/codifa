@@ -4394,10 +4394,18 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
             # User aborted / client disconnected mid-turn: LEAVE the resume file
             # behind so a reconnect can replay the already-done tool work.
             _clean = False
+            logger.warning(
+                "[run_graph] run cancelled (client/sidecar disconnect) chat_id=%s",
+                initial.get("chat_id", ""),
+            )
             return
         except GeneratorExit:
             # Consumer (run_graph generator) closed early — same as a disconnect.
             _clean = False
+            logger.warning(
+                "[run_graph] run generator closed (downstream teardown) chat_id=%s",
+                initial.get("chat_id", ""),
+            )
             return
         except Exception as _exc:  # noqa: BLE001 — surface the real failure
             # Never swallow the error silently: a bare `queue.put(None)` would
@@ -4413,6 +4421,17 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
                     "content": f"agent crashed before producing output: {_exc!r}",
                 }
             )
+        except BaseException as _exc:  # exotic non-Exception death
+            # A BaseException other than CancelledError/GeneratorExit (e.g. a
+            # custom BaseException from a library) would otherwise escape _drive,
+            # leaving the queue without its terminal None so run_graph hangs and
+            # the SSE socket silently drops. Surface it as a visible error.
+            _clean = False
+            logger.exception(
+                "[run_graph] run terminated by non-Exception chat_id=%s",
+                initial.get("chat_id", ""),
+            )
+            await queue.put({"kind": "error", "content": f"agent crashed: {_exc!r}"})
         else:
             # Clean finish. The interrupted-turn resume checkpoint (LangGraph
             # checkpointer) is cleared by _run_mode_turn itself on a genuine clean

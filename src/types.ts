@@ -321,7 +321,7 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -423,6 +423,10 @@ export interface SidecarEvent {
   manual?: boolean
   /** Informational note on a 'skill' event with an empty skills list (e.g. an attached skill wasn't found). */
   note?: string
+  /** True on a 'retry' event emitted by the client's self-healing reconnect:
+   * the stream dropped and is being resumed from the on-disk checkpoint. The
+   * frontend shows a transient "reconnecting" pill WITHOUT wiping streamed text. */
+  reconnecting?: boolean
   /** MCP connector names active for this turn (the 'mcp' event kind). */
   servers?: string[]
   /** Per-subagent model routing (the 'subagent_models' event kind): which model actually ran for explore/search/web/compact/vision. */

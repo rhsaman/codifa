@@ -77,7 +77,7 @@ AGENTS: dict[str, dict] = {
         "system": GENERAL_SYSTEM,
         # Hard step budget for this sub-agent (mirrors opencode's `agent.steps`).
         # None -> fall back to the caller's default max_steps.
-        "steps": 15,   # general sub-agent step budget
+        "steps": 100,  # general sub-agent step budget
     },
     "explore": {
         "name": "explore",
@@ -102,7 +102,7 @@ AGENTS: dict[str, dict] = {
         # Explore agents fan out wide searches; give them a slightly tighter
         # budget so a single explore call can't run away (opencode's explore is
         # also bounded).
-        "steps": 20,   # explore sub-agent step budget
+        "steps": 30,  # explore sub-agent step budget
     },
 }
 

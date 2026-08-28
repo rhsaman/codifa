@@ -15,6 +15,7 @@ import {
 } from "../lib/store";
 import { api } from "../lib/fs";
 import { resetStreamForRetry } from "../lib/retry";
+import { applyToolEvent, makeToolActivity, resolveToolResult } from "../lib/toolActivity";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { normalizeUsageModel } from "../lib/usage";
 import { stripLeadingModeTag } from "../lib/modeTag";
@@ -1388,7 +1389,7 @@ export function ChatPanel() {
       }
       // A tool that's still running gets a much longer leash — it's doing real
       // work, not stalled on the provider.
-      const limit = toolRunningRef.current ? 900_000 : 180_000;
+      const limit = toolRunningRef.current ? 900_000 : 300_000;
       const elapsed = Date.now() - lastEventAt.current;
       if (elapsed <= limit) {
         stalledSinceRef.current = null;
@@ -1405,6 +1406,18 @@ export function ChatPanel() {
         const msgs = chat?.messages ?? [];
         const lastUser = [...msgs].reverse().find((m) => m.role === "user");
         if (lastUser) {
+          // Show a visible "stalled — retrying" pill instead of a silent
+          // interrupt, so the user understands the pause (the backend resumes
+          // from its checkpoint rather than starting over).
+          useStore.getState().updateMessage(assistantMsg.id, {
+            retry: {
+              attempt: watchdogAutoRetriedRef.current,
+              maxAttempts: WATCHDOG_MAX_RETRIES,
+              delay: 0,
+              reason: "Connection stalled — the model is taking a while; auto-retrying…",
+              reconnecting: true,
+            },
+          });
           // RESUME the same user turn WITHOUT truncating: retryMessage() would
           // call truncateTo() here because the stalled assistant turn isn't
           // flagged failed/error yet (the stream is still alive, just silent),
@@ -1587,37 +1600,17 @@ export function ChatPanel() {
         }
       } else if (event.kind === "tool") {
         toolRunningRef.current = true;
-        const act: ToolActivity = {
-          tool: event.tool ?? "tool",
-          args: event.args,
-          status: "running",
-          startedAt: Date.now(),
-          callId: typeof event.call_id === "number" ? event.call_id : undefined,
-          sub: event.sub,
-          branch: typeof event.branch === "number" ? event.branch : undefined,
-          model: event.model || undefined,
-        };
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
         // the running task card, not as top-level cards — so a task turn shows
         // one collapsible parent with its details, never a stack of collapsed
-        // fragments.
+        // fragments. `applyToolEvent` nests sub-events by branch even when the
+        // parent card is already "done".
         if (event.sub) {
-          const prev = findMsg()?.toolActivity ?? [];
-          const branch =
-            typeof event.branch === "number" ? event.branch : undefined;
-          const next = prev.map((a): ToolActivity => {
-            if (a.tool === "task" && a.status === "running") {
-              // Parallel fan-out: nest each branch's sub-events under ITS OWN
-              // task card (matched by branch id). Legacy single-branch events
-              // (no branch id) still nest into the running task card.
-              if (branch !== undefined && a.branch !== branch) return a;
-              return { ...a, children: [...(a.children ?? []), act] };
-            }
-            return a;
-          });
+          const next = applyToolEvent(findMsg()?.toolActivity ?? [], event);
           store.updateMessage(assistantMsg.id, { toolActivity: next });
         } else {
+          const act = makeToolActivity(event);
           const current = findMsg()?.toolActivity ?? [];
           store.updateMessage(assistantMsg.id, {
             toolActivity: [...current, act],
@@ -1629,21 +1622,29 @@ export function ChatPanel() {
           });
         }
       } else if (event.kind === "retry") {
-        const cur = findMsg();
-        const reset = resetStreamForRetry(cur?.content ?? "", cur?.segments);
-        store.updateMessage(assistantMsg.id, {
-          retry: {
-            attempt: event.attempt ?? 1,
-            maxAttempts: event.max_attempts ?? 3,
-            delay: event.delay ?? 0,
-            reason: event.reason ?? "",
-            model: event.model ?? "",
-            agent: event.agent ?? "",
-            fallback: event.fallback,
-          },
-          content: reset.content,
-          segments: reset.segments,
-        });
+        const info = {
+          attempt: event.attempt ?? 1,
+          maxAttempts: event.max_attempts ?? 3,
+          delay: event.delay ?? 0,
+          reason: event.reason ?? "",
+          model: event.model ?? "",
+          agent: event.agent ?? "",
+          fallback: event.fallback,
+          reconnecting: event.reconnecting,
+        };
+        if (event.reconnecting) {
+          // Client self-heal: keep the already-streamed text; just show a
+          // transient "reconnecting" pill so the user understands the restart.
+          store.updateMessage(assistantMsg.id, { retry: info });
+        } else {
+          const cur = findMsg();
+          const reset = resetStreamForRetry(cur?.content ?? "", cur?.segments);
+          store.updateMessage(assistantMsg.id, {
+            retry: info,
+            content: reset.content,
+            segments: reset.segments,
+          });
+        }
       } else if (event.kind === "retry_giveup") {
         store.updateMessage(assistantMsg.id, {
           retry: {
@@ -1659,70 +1660,10 @@ export function ChatPanel() {
         });
       } else if (event.kind === "tool_result") {
         toolRunningRef.current = false;
-        const current = findMsg()?.toolActivity ?? [];
-        const now = Date.now();
-        const gotId = typeof event.call_id === "number";
-        const gotBranch = typeof event.branch === "number";
-        const resolved = (act: ToolActivity, isTop: boolean): ToolActivity => {
-          // Sub-agent results resolve a child INSIDE the running explore card,
-          // never a top-level card (sub calls are nested, not standalone). A
-          // sub-result shares the branch id with its parent card, so matching
-          // it against the top level would mark the branch card "done" on its
-          // FIRST sub-search — children stay stuck "running" and every later
-          // sub-event is dropped (nesting only targets running explore cards).
-          // That is exactly the "parallel explores freeze / only one comes"
-          // symptom. So for sub-results, skip the top-level match entirely and
-          // only recurse into children.
-          if (event.sub && isTop) {
-            if (act.children && act.children.length > 0) {
-              const children = act.children.map((c) => resolved(c, false));
-              if (children.some((c, i) => c !== act.children![i])) {
-                return { ...act, children };
-              }
-            }
-            return act;
-          }
-          // Match by per-call correlation id first (precise — the same tool
-          // can run many times, and explore sub-agent events share tool names);
-          // then by parallel fan-out branch id (each branch's explore card gets
-          // its own result); fall back to tool-name+status matching when the
-          // result has neither id nor branch.
-          const target =
-            gotId && act.status === "running" && act.callId === event.call_id;
-          const branchMatch =
-            gotBranch &&
-            act.status === "running" &&
-            act.branch === event.branch;
-          const fallback =
-            !gotId &&
-            !gotBranch &&
-            act.tool === event.tool &&
-            act.status === "running";
-          if (target || branchMatch || fallback) {
-            return {
-              ...act,
-              status:
-                event.status === "error"
-                  ? "error"
-                  : event.status === "denied"
-                    ? "denied"
-                    : "done",
-              summary: event.summary,
-              engine: event.engine,
-              items: event.results,
-              model: event.model || act.model,
-              elapsedMs: now - (act.startedAt ?? now),
-            };
-          }
-          if (act.children && act.children.length > 0) {
-            const children = act.children.map((c) => resolved(c, false));
-            if (children.some((c, i) => c !== act.children![i])) {
-              return { ...act, children };
-            }
-          }
-          return act;
-        };
-        const next = current.map((a) => resolved(a, true));
+        // `resolveToolResult` resolves sub-agent results by branch/call_id even
+        // when the parent branch card (or its nested child) is already "done",
+        // so late sub-results are never dropped.
+        const next = resolveToolResult(findMsg()?.toolActivity ?? [], event);
         store.updateMessage(assistantMsg.id, { toolActivity: next });
       } else if (event.kind === "diff") {
         const current = findMsg()?.toolActivity ?? [];
@@ -1937,6 +1878,11 @@ export function ChatPanel() {
         useStore.getState().setChatStalled(chat.id, false);
         lastEventAt.current = Date.now();
         resolveStuckCards();
+        // A successful completion clears any transient "reconnecting" pill.
+        const curMsg = findMsg();
+        if (curMsg?.retry?.reconnecting) {
+          useStore.getState().updateMessage(assistantMsg.id, { retry: null });
+        }
       }
     };
 
@@ -2105,6 +2051,13 @@ export function ChatPanel() {
     let ch = s.chats.find((c) => c.id === s.activeChatId);
     if (!ch) return;
 
+    // How long the manual /compact call may run before we give up. Slow/free
+    // models can take minutes to summarize a large history, so this is generous
+    // — the backend streams no progress for this JSON call, and aborting early
+    // just discards a compaction that would otherwise succeed (the backend keeps
+    // running and logs "[compact] success").
+    const COMPACT_TIMEOUT_MS = 300_000;
+
     // Queue behind any in-flight stream on THIS chat: running the summarizer
     // concurrently with the agent interleaves two model streams (usage events,
     // text deltas), and the summarizer's completion then folds messages under
@@ -2181,7 +2134,7 @@ export function ChatPanel() {
     // call; the backend itself retries the compact subagent on the active
     // model before giving up.
     const ctr = new AbortController();
-    const timeout = setTimeout(() => ctr.abort(), 60_000);
+    const timeout = setTimeout(() => ctr.abort(), COMPACT_TIMEOUT_MS);
     let result: CompactResult | null = null;
     let errMsg = "";
     try {
@@ -2197,7 +2150,7 @@ export function ChatPanel() {
     } catch (err) {
       errMsg =
         (err as Error).name === "AbortError"
-          ? "timed out after 60s"
+          ? `timed out after ${Math.round(COMPACT_TIMEOUT_MS / 1000)}s`
           : (err as Error).message;
     } finally {
       clearTimeout(timeout);

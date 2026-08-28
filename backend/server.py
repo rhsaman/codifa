@@ -927,7 +927,7 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
 
 
 @app.post("/chat/compact")
-async def chat_compact(req: CompactRequest):
+async def chat_compact(req: CompactRequest, request: Request):
     """Manual ``/compact`` — opencode-style compaction of the supplied history.
 
     Returns ``{"summary": <text>, "keep": <n>}`` on success, or
@@ -1020,8 +1020,8 @@ async def chat_compact(req: CompactRequest):
     # opencode prune: clear old tool outputs before the summarization pass.
     history = list(req.history)
     _prune_history(history)
-    try:
-        result = await _compact_history(
+    compact_task = asyncio.ensure_future(
+        _compact_history(
             model,
             history,
             ctx=ctx,
@@ -1030,6 +1030,26 @@ async def chat_compact(req: CompactRequest):
             last_error=last_error,
             force=True,
         )
+    )
+    try:
+        # Cancel the (potentially long, token-burning) summarization if the client
+        # disconnects — e.g. the client timeout fired, or the user navigated away.
+        # Without this the backend keeps running after the client is gone and logs
+        # "[compact] success" for a result nobody receives.
+        while not compact_task.done():
+            if await request.is_disconnected():
+                compact_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await compact_task
+                _log("client disconnected — compact aborted", level=logging.WARNING)
+                return {"summary": None, "keep": 0, "error": "client disconnected"}
+            await asyncio.sleep(1.0)
+        result = compact_task.result()
+    except asyncio.CancelledError:
+        compact_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await compact_task
+        raise
     except Exception as exc:  # noqa: BLE001
         _log(f"_compact_history raised: {exc!r}", level=logging.ERROR)
         return {"summary": None, "keep": 0, "error": str(exc)}
@@ -1120,6 +1140,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 req.chat_id,
                 _rss_mb() or 0.0,
             )
+            ka_count = 0
             async for event in _with_keepalive(
                 run_agent(
                 provider=req.provider,
@@ -1157,6 +1178,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 )
             ):
                 if event.get("kind") == "_keepalive":
+                    ka_count += 1
                     yield ": keepalive\n\n"
                 else:
                     yield _sse(event)
@@ -1169,9 +1191,10 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # Log the drop with peak RSS so a recurring silent interrupt (crash /
             # OOM) becomes visible in codifa.log instead of going unnoticed.
             logger.warning(
-                "stream DISCONNECTED (client/sidecar drop) chat_id=%s rss_mb=%.1f",
+                "stream DISCONNECTED (client/sidecar drop) chat_id=%s rss_mb=%.1f keepalives_sent=%d",
                 req.chat_id,
                 _rss_mb() or 0.0,
+                ka_count,
             )
             return
         except Exception as exc:  # noqa: BLE001 — must always surface an SSE error
@@ -1180,6 +1203,24 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # trigger; the user still sees a readable error over SSE.
             traceback.print_exc()
             yield _sse({"kind": "error", "content": _friendly_error(exc, req.model, req.base_url)})
+        except BaseException as exc:  # non-Exception death (KeyboardInterrupt/SystemExit/custom)
+            # Anything that is NOT a normal Exception (e.g. a BaseException raised
+            # deep in the model SDK or checkpointer) would otherwise tear down the
+            # SSE socket with NO event, so the frontend sees a silent "disconnect"
+            # and self-heals with no explanation. Log it loudly and surface a
+            # visible error so the real trigger is captured in codifa.log instead
+            # of going unnoticed.
+            if isinstance(exc, GeneratorExit):
+                raise
+            logger.exception(
+                "agent run terminated by non-Exception (silent-interrupt source) chat_id=%s rss_mb=%.1f",
+                req.chat_id,
+                _rss_mb() or 0.0,
+            )
+            try:
+                yield _sse({"kind": "error", "content": f"agent crashed: {exc!r}"})
+            except Exception:  # noqa: BLE001, S110 — best-effort: the stream is already dying
+                pass
         finally:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
             # Clear any unconsumed steers for this chat so they don't leak into

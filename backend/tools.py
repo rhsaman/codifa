@@ -3655,6 +3655,15 @@ When you need to read several files, read multiple independent files in parallel
     ) -> str:
         """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks) or 'explore' (broad, read-only repository research that returns a compact summary of relevant files + findings). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
+        # Assign the branch id up-front so the task card itself carries it; the
+        # sub-agent's internal grep/glob/read events are tagged with the same
+        # branch (via _SUB_AGENT_BRANCH_CTX) and the frontend nests them under
+        # THIS card. Without it the card has branch=undefined while its children
+        # carry branch=1, so the frontend drops them and the explore card shows
+        # nothing but "N chars".
+        nonlocal _task_call_seq
+        _ecall = _task_call_seq + 1
+        _task_call_seq = _ecall
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
         if subagent_type not in AGENTS:
@@ -3666,6 +3675,7 @@ When you need to read several files, read multiple independent files in parallel
                         "description": description,
                         "subagent_type": subagent_type,
                     },
+                    "branch": _ecall,
                     "model": "",
                 }
             )
@@ -3689,6 +3699,7 @@ When you need to read several files, read multiple independent files in parallel
                         "description": description,
                         "subagent_type": subagent_type,
                     },
+                    "branch": _ecall,
                     "model": "",
                 }
             )
@@ -3701,7 +3712,7 @@ When you need to read several files, read multiple independent files in parallel
         # are the two opencode-style sub-agents; the runner pulls each one's
         # system prompt + tool set from the registry.
         if subagent_type in AGENTS:
-            return await _run_subagent_task(description, prompt, task_id, subagent_type)
+            return await _run_subagent_task(description, prompt, task_id, subagent_type, _ecall)
         # No other subagent types supported
         emit(
             {
@@ -3711,6 +3722,7 @@ When you need to read several files, read multiple independent files in parallel
                     "description": description,
                     "subagent_type": subagent_type,
                 },
+                "branch": _ecall,
                 "model": "",
             }
         )
@@ -3725,7 +3737,7 @@ When you need to read several files, read multiple independent files in parallel
         )
 
     async def _run_subagent_task(
-        description: str, prompt: str, task_id: str, subagent_type: str
+        description: str, prompt: str, task_id: str, subagent_type: str, branch: int = 0
     ) -> str:
         """Run a registered sub-agent (opencode's `task` + agent registry).
 
@@ -3751,15 +3763,16 @@ When you need to read several files, read multiple independent files in parallel
                     "kind": "tool",
                     "tool": "task",
                     "args": {"description": description, "subagent_type": subagent_type},
+                    "branch": branch,
                     "model": "",
                 }
             )
             emit(_error_result("task", "unavailable"))
             return "ERROR: the sub-agent is unavailable (no model configured for this session)."
         _model_name = str(getattr(_model, "model_name", "") or "")
-        nonlocal _task_call_seq
-        _ecall = _task_call_seq + 1
-        _task_call_seq = _ecall
+        # `branch` (the branch id assigned up-front in task_tool) is passed in so
+        # the task card and its sub-events share the same branch; the frontend
+        # nests the sub-events under THIS card.
         _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
         emit(
             {
@@ -3767,7 +3780,7 @@ When you need to read several files, read multiple independent files in parallel
                 "tool": "task",
                 "args": {"description": description, "subagent_type": subagent_type},
                 "model": _model_name,
-                "branch": _ecall,
+                "branch": branch,
             }
         )
         # Inherit the PARENT's actual (mode-filtered) toolset — set by agents.py
@@ -3807,11 +3820,25 @@ When you need to read several files, read multiple independent files in parallel
                         "inspection, or delegate mutating work to the main agent "
                         "via the task tool."
                     )
+                # The explore agent must search via grep/glob/read, not by
+                # shelling out through run_terminal (slow + token-heavy).
+                # git working-tree inspection stays allowed (read-only).
+                _first = (
+                    command.strip().split()[0].lower()
+                    if command.strip().split()
+                    else ""
+                )
+                if _first != "git" and _is_terminal_search(command):
+                    return (
+                        "ERROR: code search/inspection via run_terminal is not "
+                        "allowed in the explore agent — use grep/glob/read for "
+                        "targeted lookups, or fan out parallel explore calls."
+                    )
                 return await _orig_terminal(command=command, timeout=timeout)
 
             _sub_tools["run_terminal"] = _readonly_terminal
         _token = _SUB_AGENT_CTX.set(True)
-        _branch_token = _SUB_AGENT_BRANCH_CTX.set(_ecall)
+        _branch_token = _SUB_AGENT_BRANCH_CTX.set(branch)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
         # Per-agent hard step budget (opencode's `agent.steps`). Falls back to
         # the loop's default when the registry entry omits it.
@@ -3948,7 +3975,7 @@ When you need to read several files, read multiple independent files in parallel
                 "tool": "task",
                 "summary": f"{len(_output)} chars",
                 "model": _model_name,
-                "branch": _ecall,
+                "branch": branch,
             }
         )
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'

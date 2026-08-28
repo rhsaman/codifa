@@ -376,6 +376,15 @@ export async function streamChat(
     } catch (err) {
       // fetch() threw (connection refused / DNS / dropped socket) — retryable.
       if (params.signal?.aborted) throw err
+      // Surface the self-heal so the user isn't left wondering why the turn
+      // restarted on its own (the "interrupted itself" confusion).
+      wrappedOnEvent({
+        kind: 'retry',
+        attempt: attempt + 1,
+        max_attempts: MAX_RECONNECT_ATTEMPTS,
+        reason: 'Connection lost — reconnecting from checkpoint…',
+        reconnecting: true,
+      } as SidecarEvent)
       attempt++
       if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
       await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))
@@ -426,6 +435,15 @@ export async function streamChat(
     } catch (err) {
       // A manual abort must propagate immediately, not trigger a reconnect.
       if (params.signal?.aborted || (err as Error).name === 'AbortError') throw err
+      // Surface the self-heal so the user isn't left wondering why the turn
+      // restarted on its own (the "interrupted itself" confusion).
+      wrappedOnEvent({
+        kind: 'retry',
+        attempt: attempt + 1,
+        max_attempts: MAX_RECONNECT_ATTEMPTS,
+        reason: 'Connection lost — reconnecting from checkpoint…',
+        reconnecting: true,
+      } as SidecarEvent)
       attempt++
       if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
       await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))

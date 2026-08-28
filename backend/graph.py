@@ -43,6 +43,7 @@ import re
 import time
 import traceback
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,77 @@ async def _clear_turn_checkpoint(thread_id: str) -> None:
             _resume_checkpoint_path()
         ) as saver:
             await saver.adelete_thread(thread_id)
+
+
+def _parse_checkpoint_ts(ts_raw) -> float | None:
+    if ts_raw is None:
+        return None
+    if isinstance(ts_raw, datetime):
+        return ts_raw.timestamp()
+    if isinstance(ts_raw, str):
+        try:
+            return datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+async def clear_chat_resume_checkpoint(chat_id: str) -> None:
+    """Drop the resume checkpoint for a deleted chat so it doesn't orphan on disk."""
+    with contextlib.suppress(Exception):
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            await saver.adelete_thread(_resume_thread_id({"chat_id": chat_id}))
+
+
+async def prune_stale_resume_checkpoints(ttl_hours: int = 24) -> None:
+    """Reclaim orphaned resume checkpoints.
+
+    A resume checkpoint is transient: it only exists for an in-flight turn that
+    was interrupted (error/cancel/disconnect) and may be resumed. A turn that
+    finishes cleanly deletes its own thread (see ``_run_mode_turn``), so any
+    thread left behind is from a failure/crash that was never retried. Pruning by
+    age on startup drops that state. A genuinely in-flight turn always has a
+    recent checkpoint timestamp, so it is never pruned.
+    """
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    cutoff = datetime.now(timezone.utc).timestamp() - ttl_hours * 3600
+    try:
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            await saver.setup()
+            # Enumerate threads directly. We avoid ``alist()`` here: with
+            # from_conn_string it intermittently sees the connection as already
+            # closed (a known lifecycle quirk), whereas aget_tuple/adelete_thread
+            # are reliable on this handle.
+            tids: list[str] = []
+            async with saver.conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints"
+            ) as cur:
+                async for row in cur:
+                    tids.append(row[0])
+            for tid in tids:
+                try:
+                    tup = await saver.aget_tuple(
+                        {"configurable": {"thread_id": tid, "checkpoint_ns": ""}}
+                    )
+                except Exception:  # noqa: BLE001, S112
+                    continue
+                if tup is None:
+                    continue
+                ts = _parse_checkpoint_ts(
+                    (tup.checkpoint or {}).get("ts") if tup.checkpoint else None
+                )
+                if ts is not None and ts < cutoff:
+                    with contextlib.suppress(Exception):
+                        await saver.adelete_thread(tid)
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        return
 
 
 # ---------------------------------------------------------------------------

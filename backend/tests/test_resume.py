@@ -35,8 +35,11 @@ from agents import run_agent
 from graph import (
     _clear_turn_checkpoint,
     _load_turn_checkpoint,
+    _resume_checkpoint_path,
     _resume_thread_id,
     _save_turn_checkpoint,
+    clear_chat_resume_checkpoint,
+    prune_stale_resume_checkpoints,
 )
 
 
@@ -52,6 +55,26 @@ def make_workspace():
     with open(os.path.join(ws, "app.py"), "w") as fh:
         fh.write("def foo():\n    return 42\n")
     return ws
+
+
+async def _save_ckpt_with_ts(thread_id: str, ts_iso: str, content: str = "x") -> None:
+    """Save a checkpoint with a caller-controlled ``ts`` (to simulate age)."""
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.base import empty_checkpoint
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    ckpt = empty_checkpoint()
+    ckpt["ts"] = ts_iso
+    ckpt["channel_values"] = {"messages": [HumanMessage(content=content)]}
+    ckpt["channel_versions"] = {"messages": "v1"}
+    ckpt["versions_seen"] = {}
+    async with AsyncSqliteSaver.from_conn_string(_resume_checkpoint_path()) as saver:
+        await saver.aput(
+            {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+            ckpt,
+            {"step": 1, "source": "input", "writes": {}},
+            {"messages": "v1"},
+        )
 
 
 async def main():
@@ -154,6 +177,33 @@ async def main():
             "checkpoint must survive a hard error so a retry can resume"
         await _clear_turn_checkpoint(_resume_thread_id({"chat_id": chat2}))
         print("  resume/int OK: hard error leaves checkpoint for retry")
+
+        # ==== Stale prune: old checkpoints reclaimed, recent ones kept ====
+        from datetime import datetime, timedelta, timezone
+
+        old_tid = _resume_thread_id({"chat_id": "prune-old"})
+        new_tid = _resume_thread_id({"chat_id": "prune-new"})
+        old_iso = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        new_iso = datetime.now(timezone.utc).isoformat()
+        await _save_ckpt_with_ts(old_tid, old_iso)
+        await _save_ckpt_with_ts(new_tid, new_iso)
+        await prune_stale_resume_checkpoints(ttl_hours=24)
+        assert await _load_turn_checkpoint(old_tid) is None, \
+            "old checkpoint must be pruned"
+        assert await _load_turn_checkpoint(new_tid) is not None, \
+            "recent checkpoint must survive the prune"
+        await _clear_turn_checkpoint(new_tid)
+        print("  resume/prune OK: stale checkpoint reclaimed, recent kept")
+
+        # ==== Deleting a chat drops its resume checkpoint ====
+        del_tid = _resume_thread_id({"chat_id": "chat-to-delete"})
+        await _save_turn_checkpoint(del_tid, [HumanMessage(content="y")])
+        assert await _load_turn_checkpoint(del_tid) is not None, \
+            "checkpoint should exist before chat deletion"
+        await clear_chat_resume_checkpoint("chat-to-delete")
+        assert await _load_turn_checkpoint(del_tid) is None, \
+            "deleted chat's resume checkpoint must be removed"
+        print("  resume/del OK: deleting a chat clears its resume checkpoint")
 
         print("RESUME TEST PASSED")
     finally:

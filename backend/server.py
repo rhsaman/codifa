@@ -59,6 +59,10 @@ from agents import (
     normalize_mode,
     run_agent,
 )
+from graph import (
+    clear_chat_resume_checkpoint,
+    prune_stale_resume_checkpoints,
+)
 from llm import build_chat_model
 
 
@@ -311,6 +315,10 @@ async def app_save(req: StateRequest) -> dict:
         state_db.save_settings(req.settings)
     if req.chats is not None or req.deleted_chats is not None:
         state_db.save_chats(req.chats or [], deleted_ids=req.deleted_chats)
+        # A deleted chat's resume checkpoint is now orphaned — drop it so it
+        # doesn't linger in the checkpointer SQLite file.
+        for cid in req.deleted_chats or []:
+            await clear_chat_resume_checkpoint(str(cid))
     if req.deleted_workspaces:
         state_db.remove_workspace_vectors(req.deleted_workspaces)
     return {"ok": True}
@@ -1424,9 +1432,15 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110
         pass
 
-    # Resume state is now held in LangGraph's checkpointer (a SQLite DB under the
-    # data root), not a per-chat JSONL file, so there is no stale-resume-file prune
-    # step. Still prune orphaned plan dirs on shutdown.
+    # Resume state is held in LangGraph's checkpointer (a SQLite DB under the
+    # data root). On startup, reclaim any checkpoint left behind by an
+    # interrupted turn that was never resumed (errors/crashes), keyed by age.
+    try:
+        asyncio.run(prune_stale_resume_checkpoints())
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    # Still prune orphaned plan dirs on shutdown.
     try:
         import atexit
 

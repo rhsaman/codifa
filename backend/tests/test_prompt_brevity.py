@@ -6,7 +6,12 @@
 - _LENGTH_RULE exists and is appended ONLY for plan/coder, not for ask.
 """
 
-from agents import _LENGTH_RULE, _UNIVERSAL_RULES, SYSTEM_PROMPTS
+from agents import (
+    _DISCOVERY_BLOCK,
+    _LENGTH_RULE,
+    _UNIVERSAL_RULES,
+    SYSTEM_PROMPTS,
+)
 
 
 def test_ask_prompt_drops_explain_the_why():
@@ -38,8 +43,30 @@ def test_length_rule_present_and_only_for_plan_coder():
         assert "MATCH LENGTH TO NEED" in base, f"{mode} must keep full length rule"
 
 
+def test_no_duplicate_read_rule():
+    # MANDATORY READ RULE lives only in _SEARCH_RULE, not duplicated in mode prompts.
+    assert "MANDATORY READ RULE" not in SYSTEM_PROMPTS["coder"]
+    assert "MANDATORY READ RULE" not in SYSTEM_PROMPTS["plan"]
+
+
+def test_no_duplicate_language_rule():
+    # The language directive is injected dynamically per turn (_language_directive),
+    # so it must not be baked into any static SYSTEM_PROMPTS entry.
+    for mode, prompt in SYSTEM_PROMPTS.items():
+        assert "Match the user's language" not in prompt, f"{mode} must not repeat language rule"
+
+
+def test_discovery_block_compact():
+    # _DISCOVERY_BLOCK must not re-expand the full explore-subagent mechanics
+    # (that is the job of _SEARCH_RULE); it only references the strategy.
+    assert "compact report" not in _DISCOVERY_BLOCK
+
+
 if __name__ == "__main__":
     test_ask_prompt_drops_explain_the_why()
     test_universal_rules_no_longer_match_length_to_need()
     test_length_rule_present_and_only_for_plan_coder()
+    test_no_duplicate_read_rule()
+    test_no_duplicate_language_rule()
+    test_discovery_block_compact()
     print("PROMPT BREVITY TESTS PASSED")

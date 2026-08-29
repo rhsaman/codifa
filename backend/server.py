@@ -998,6 +998,7 @@ async def chat_compact(req: CompactRequest, request: Request):
                 # Bounded so a slow/unreachable provider fails fast with a clear
                 # error instead of hanging until the client disconnects.
                 timeout=50,
+                cache=True,
             )
         except Exception as exc:  # noqa: BLE001
             _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}", level=logging.WARNING)

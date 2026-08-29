@@ -600,6 +600,7 @@ def resolve_subagent_model(
                 oauth_token,
                 temperature=0.2,
                 timeout=timeout,
+                cache=True,
             )
             if (default_to_parent and parent_model_name)
             else None
@@ -617,6 +618,7 @@ def resolve_subagent_model(
                     oauth_token,
                     temperature=0.2,
                     timeout=timeout,
+                    cache=True,
                 )
                 if (default_to_parent and parent_model_name)
                 else None
@@ -638,7 +640,7 @@ def resolve_subagent_model(
     if not model:
         return None
     return build_chat_model(
-        kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout
+        kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout, cache=True
     )
 
 
@@ -1017,6 +1019,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         thinking_level=settings["thinking_level"],
         model_reasoning=state.get("model_reasoning", False),
         timeout=model_timeout_for(state),
+        cache=settings.get("cache", False),
     )
 
     tools = make_tool_callbacks(
@@ -3382,6 +3385,7 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         state["api_key"],
         state["env_var"],
         state["oauth_token"],
+        cache=True,
     )
     tools = make_tool_callbacks(
         root,

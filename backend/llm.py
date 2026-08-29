@@ -184,6 +184,7 @@ def build_chat_model(
     thinking_level: str = "",
     model_reasoning: bool = False,
     timeout: float = 0,
+    cache: bool = False,
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
 
@@ -210,7 +211,7 @@ def build_chat_model(
         )
 
     model_class = meta.get("model_class") or "openai"
-    headers = _extra_headers(provider, base_url, False)
+    headers = _extra_headers(provider, base_url, cache)
     to = model_timeout(provider=provider, total=timeout or 900)
     # LangChain's ChatOpenAI only accepts a SCALAR `timeout` (total seconds);
     # passing an `httpx.Timeout` object is silently ignored, leaving the request

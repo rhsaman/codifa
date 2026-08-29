@@ -60,9 +60,9 @@ OPENCODE_UA = "opencode/1.18.15 (npm:@opencode-ai/opencode)"
 def model_timeout(
     model: object | None = None,
     provider: str = "",
-    total: float = 300,
+    total: float = 900,
     connect: float = 15,
-    read: float = 300,
+    read: float = 900,
 ) -> int | float | httpx.Timeout:
     """Return a ModelSettings-compatible ``timeout`` for a model/provider.
 
@@ -72,6 +72,13 @@ def model_timeout(
     httpx.Timeout')`` and kills every request. Detect Google by provider name or
     by model type, and return the scalar. All other providers accept the
     granular ``httpx.Timeout`` (connect vs read).
+
+    The default is a generous 900s (15 min) of *idle* read time. A streaming
+    call only trips ``read`` when the model is SILENT for that long (deep
+    reasoning, a slow provider, or a huge prompt) — a 300s ceiling used to cut
+    such steps off mid-turn (surfacing as SSE `retry`/`retry_giveup` events
+    with no backend traceback). 900s gives heavy steps room to complete; the
+    short `connect` timeout still fails fast on unreachable endpoints.
     """
     is_google = _provider_meta(provider).get("model_class") == "google"
     if is_google:

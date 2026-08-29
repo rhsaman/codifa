@@ -195,29 +195,53 @@ export function computeContextUsed(
     estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN,
   )
 
-  // The title-bar meter reflects the CURRENT turn's backend-reported
-  // `input_tokens` — the provider's (langgraph's) authoritative count of how
-  // many tokens were actually sent in the prompt this turn (`in` in the
-  // backend's `[USAGE_DEBUG]`). That is the true "context used": it excludes the
-  // model's OUTPUT (which is not context) and is cache-stable (a cache hit does
-  // not change it), so the meter neither exceeds the real input nor gets "stuck"
-  // at an old peak. It tracks the live conversation and may only drop when the
-  // context genuinely shrinks (e.g. after auto-compaction), which is the correct,
-  // opencode-faithful behaviour. Backend auto-compaction is driven by this same
-  // `input_tokens`, so the meter and the compaction trigger always agree.
+  // The title-bar meter reflects the CURRENT turn's backend-reported token
+  // breakdown, summed exactly like opencode's session `Tokens()`:
+  //
+  //   used = input + output + reasoning + cache.read + cache.write
+  //
+  // opencode's TUI shows `tokens.total / limit.context`, and its `total` is the
+  // hand-summed breakdown above (NOT the provider's native `total_tokens`, which
+  // double-counts cache under AI-SDK-v6-style input accounting). We mirror that
+  // here so the meter is faithful to opencode: reasoning/thinking tokens are
+  // billable output that occupy the window, and cache read/write are part of the
+  // real footprint. The meter tracks the live conversation and may only drop
+  // when the context genuinely shrinks (e.g. after auto-compaction).
   //
   // Before the first usage event arrives (a brand-new chat) there is no
-  // `input_tokens` yet, so we fall back to the local history estimate.
+  // breakdown yet, so we fall back to the local history estimate.
   let last: TokenUsage | null = null
   for (const m of active) {
     const u = m.usage
     if (u && m.role === "assistant") last = u
   }
-  if (last && last.inputTokens != null && last.inputTokens > 0) return last.inputTokens
-  // No `total_tokens` on the latest main turn yet (only happens before the first
-  // usage event, or a fixture that omits it — the real app always sets it):
-  // fall back to the local history estimate, which reflects the true context
-  // window size rather than just the last message's raw token count.
+  // Only trust the provider breakdown when it actually reports the input
+  // context (inputTokens > 0). Some providers only surface billable
+  // (non-cached) output tokens, or omit input_tokens entirely — in those
+  // cases the breakdown under-reports the real context, so the local
+  // history estimate wins (it reflects the true window size).
+  if (last && (last.inputTokens ?? 0) > 0) {
+    // Prefer the provider's `totalTokens` (the backend's `total_tokens`): it
+    // already encodes whether cache is additive (Anthropic: total = input +
+    // output + reasoning + cache) or a SUBSET of input (OpenAI / OpenRouter /
+    // Google: total = input + output, cache already folded into input). Using
+    // it directly avoids double-counting cache for subset providers. We only
+    // fall back to the opencode hand-sum (input + output + reasoning +
+    // cache.read + cache.write) when the provider omits total_tokens entirely.
+    const providerTotal = last.totalTokens ?? 0
+    if (providerTotal > 0) return providerTotal
+    const used =
+      (last.inputTokens ?? 0) +
+      (last.outputTokens ?? 0) +
+      (last.reasoningTokens ?? 0) +
+      (last.cacheReadTokens ?? 0) +
+      (last.cacheWriteTokens ?? 0)
+    if (used > 0) return used
+  }
+  // No usage breakdown on the latest main turn yet (only happens before the
+  // first usage event, or a fixture that omits it — the real app always sets
+  // it): fall back to the local history estimate, which reflects the true
+  // context window size rather than just the last message's raw token count.
   return estimated
 }
 
@@ -350,21 +374,4 @@ export function computeUsageCostBreakdown(
     (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
     (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input)
   return { total: fresh + cached, fresh, cached }
-}
-
-/**
- * Scale the compaction headroom (reserved tokens) to the model's context window.
- *
- * opencode clamps its `COMPACTION_BUFFER` to `maxOutputTokens`, so the reserved
- * buffer never dominates a small window. We mirror that: keep the UI's default
- * headroom (usually 20k) for large windows, but clamp it down for small windows
- * so auto-compaction never fires near the start of a conversation.
- *
- * - `cw <= 0` (unknown window): pass the headroom through unchanged.
- * - otherwise: `min(headroom, max(2000, 10% of cw))`.
- */
-export function scaleReserved(cw: number, headroom: number): number {
-  if (cw <= 0) return headroom
-  const cap = Math.max(2000, Math.round(cw * 0.1))
-  return Math.min(headroom, cap)
 }

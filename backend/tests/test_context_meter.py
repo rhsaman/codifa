@@ -2,7 +2,7 @@
 
 Covers the backend side that the frontend meter must mirror:
 - `_usable_tokens` (opencode's `usable()`) used by auto-compaction.
-- `CompactRequest.reserved` default now matches the auto-compact / UI default.
+- `CompactRequest.compact_at_percent` default now matches the auto-compact / UI default.
 """
 
 import graph
@@ -20,12 +20,12 @@ def test_usable_tokens_opencode_parity():
     assert graph._agents._usable_tokens(8000, 0, 200_000) == 0
 
 
-def test_compact_request_reserved_default_matches_auto_compact():
-    # The manual /compact default must equal the auto-compact / UI headroom
-    # default (20_000), so a manual compact without an explicit headroom behaves
+def test_compact_request_percent_default_matches_auto_compact():
+    # The manual /compact default must equal the auto-compact / UI threshold
+    # default (80), so a manual compact without an explicit percent behaves
     # identically to auto-compaction. The frontend always sends the user's
-    # actual compactHeadroom, so this is only a fallback.
+    # actual compactAtPercent, so this is only a fallback.
     req = server.CompactRequest()
-    assert req.reserved == 20_000
+    assert req.compact_at_percent == 80
     # context_window still defaults to 0 (resolved from the active model).
     assert req.context_window == 0

@@ -1,6 +1,6 @@
 import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, SidecarEvent } from '../types'
 import { api } from './fs'
-import { modelContextWindow, scaleReserved } from './context'
+import { modelContextWindow } from './context'
 
 let sidecarUrl: string | null = null
 
@@ -248,12 +248,9 @@ export interface StreamParams {
   /** Full provider configs keyed by provider id, so a "providerId/model"
    *  subagent entry is routed to that provider's own base URL / key. */
   providers?: Record<string, ProviderConfig>
-  /** Compaction headroom (tokens) reserved below the context window — opencode's
-   *  `reserved`. Auto-compaction fires at `ctx - reserved`. */
-  reserved?: number
-  /** Fraction of the usable window at which mid-turn auto-compaction fires
-   *  (0.1–0.95). Compact once a turn reaches this fraction, before the limit. */
-  compactTriggerFraction?: number
+  /** Auto-compaction threshold as a percentage of the raw context window.
+   *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`. */
+  compactAtPercent?: number
   signal?: AbortSignal
 }
 
@@ -362,14 +359,8 @@ export async function streamChat(
           vector_config: params.vectorConfig ?? null,
           subagent_models: params.subagentModels ?? {},
           providers: params.providers ?? {},
-          // Scale the compaction headroom to the window: keep the 20k default for
-          // large models, but clamp it down for small windows so compaction never
-          // fires near the start (opencode clamps reserved to maxOutputTokens).
-          reserved: scaleReserved(
-            modelContextWindow(params.provider, params.provider.model) ?? 0,
-            params.reserved ?? 20000,
-          ),
-          compact_trigger_fraction: params.compactTriggerFraction ?? 0.8,
+          // Single auto-compaction threshold as a percentage of the raw window.
+          compact_at_percent: params.compactAtPercent ?? 80,
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })
@@ -476,7 +467,7 @@ export async function triggerCompact(params: {
   fallback: CompactProvider
   history: Array<{ role: string; content: string }>
   contextWindow?: number
-  reserved?: number
+  compactAtPercent?: number
   signal?: AbortSignal
 }): Promise<CompactResult> {
   const url = await ensureSidecar()
@@ -500,7 +491,7 @@ export async function triggerCompact(params: {
       fallback_oauth_token: params.fallback.oauthToken ?? '',
       history: params.history,
       context_window: params.contextWindow ?? 0,
-      reserved: params.reserved ?? 20000,
+      compact_at_percent: params.compactAtPercent ?? 80,
     }),
   })
   if (!res.ok) {

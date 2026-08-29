@@ -3,7 +3,9 @@
 Covers:
 - `_usable_tokens` / `_recent_tail_budget` match opencode's `usable` / `preserveRecentBudget`.
 - `_maybe_auto_compact` fires the `compact_start` -> `compact` event pair once the
-  transcript reaches `usable`, and stays silent below it.
+  transcript reaches `compact_at_percent%` of the RAW context window, and stays
+  silent below it. The context meter shows `total_tokens / ctx` (the same
+  percentage), so the meter and the trigger always agree.
 """
 
 import asyncio
@@ -40,14 +42,14 @@ class _Queue:
         self.items.append(x)
 
 
-async def _run_trigger(messages, reserved=20_000, ctx=200_000):
-    state = {"reserved": reserved}
+async def _run_trigger(messages, compact_at_percent=80, ctx=200_000):
+    state = {"compact_at_percent": compact_at_percent}
     q = _Queue()
     await graph._maybe_auto_compact(state, q, None, None, messages, ctx)
     return [e["kind"] for e in q.items], q.items
 
 
-def test_auto_compact_silent_below_usable():
+def test_auto_compact_silent_below_threshold():
     events, _ = asyncio.run(
         _run_trigger(
             [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="hello")],
@@ -56,7 +58,7 @@ def test_auto_compact_silent_below_usable():
     assert events == []
 
 
-def test_auto_compact_fires_above_usable():
+def test_auto_compact_fires_above_threshold():
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
@@ -77,19 +79,19 @@ def test_auto_compact_fires_above_usable():
     assert compact["content"].startswith("[Compacted earlier context]")
 
 
-async def _run_trigger_with_input(messages, last_input_tokens, reserved=20_000, ctx=200_000):
-    state = {"reserved": reserved}
+async def _run_trigger_with_input(messages, last_context_tokens, compact_at_percent=80, ctx=200_000):
+    state = {"compact_at_percent": compact_at_percent}
     q = _Queue()
     await graph._maybe_auto_compact(
-        state, q, None, None, messages, ctx, last_input_tokens=last_input_tokens
+        state, q, None, None, messages, ctx, last_context_tokens=last_context_tokens
     )
     return [e["kind"] for e in q.items], q.items
 
 
-async def _run_trigger_with_input_frac(
-    messages, last_input_tokens, trigger_fraction, reserved=20_000, ctx=200_000
+async def _run_trigger_with_input_pct(
+    messages, last_context_tokens, compact_at_percent, ctx=200_000
 ):
-    state = {"reserved": reserved, "compact_trigger_fraction": trigger_fraction}
+    state = {"compact_at_percent": compact_at_percent}
     q = _Queue()
     await graph._maybe_auto_compact(
         state,
@@ -98,16 +100,16 @@ async def _run_trigger_with_input_frac(
         None,
         messages,
         ctx,
-        last_input_tokens=last_input_tokens,
-        trigger_fraction=trigger_fraction,
+        last_context_tokens=last_context_tokens,
+        compact_at_percent=compact_at_percent,
     )
     return [e["kind"] for e in q.items], q.items
 
 
 def test_auto_compact_uses_last_input_tokens():
-    # A small transcript (local estimate below usable) but a reported
-    # last_input_tokens above usable must still fire compaction — proving
-    # auto-compaction is driven by the same input_tokens the context meter
+    # A small transcript (local estimate below threshold) but a reported
+    # last_context_tokens above threshold must still fire compaction — proving
+    # auto-compaction is driven by the same total_tokens the context meter
     # displays, not just the local estimate.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[c]"}], 3, None)
@@ -116,34 +118,43 @@ def test_auto_compact_uses_last_input_tokens():
     graph._agents._compact_history = fake_compact
     try:
         small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="hello")]
-        events, _ = asyncio.run(_run_trigger_with_input(small, last_input_tokens=190_000))
+        events, _ = asyncio.run(_run_trigger_with_input(small, last_context_tokens=190_000))
     finally:
         graph._agents._compact_history = original
     assert events == ["compact_start", "compact"]
 
 
-def test_auto_compact_low_last_input_tokens_stays_silent():
-    # A large transcript whose local estimate would fire compaction, but a low
-    # reported last_input_tokens keeps it silent — proving last_input_tokens
-    # overrides the estimate.
-    events, _ = asyncio.run(
-        _run_trigger_with_input(
-            [
-                SystemMessage(content="x" * 1000),
-                HumanMessage(content="y" * 800_000),
-                AIMessage(content="z" * 800_000),
-            ],
-            last_input_tokens=10_000,
+def test_auto_compact_fires_on_large_transcript_despite_low_usage():
+    # A genuinely huge transcript (live estimate well above threshold) must
+    # compact even when the reported last_context_tokens is low/stale — otherwise
+    # the next model call would overflow. The live transcript estimate is used as
+    # a floor under the reported usage, so compaction never lags a real overflow.
+    async def fake_compact(*a, **k):
+        return ([{"role": "system", "content": "[c]"}], 3, None)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        events, _ = asyncio.run(
+            _run_trigger_with_input(
+                [
+                    SystemMessage(content="x" * 1000),
+                    HumanMessage(content="y" * 800_000),
+                    AIMessage(content="z" * 800_000),
+                ],
+                last_context_tokens=10_000,
+            )
         )
-    )
-    assert events == []
+    finally:
+        graph._agents._compact_history = original
+    assert events == ["compact_start", "compact"]
 
 
-def test_auto_compact_fires_early_at_fraction():
-    # Mid-turn compaction: total=120k against usable=180k. At trigger_fraction=0.5
-    # the threshold is 90k, so a turn that has used 120k compacts BEFORE reaching
-    # the limit. The post-turn backstop (trigger_fraction=1.0, threshold 180k)
-    # would leave the same 120k silent — proving the fraction makes it fire early.
+def test_auto_compact_fires_early_at_percent():
+    # Mid-turn compaction: total=120k against a 200k window. At compact_at_percent=50
+    # the threshold is 100k, so a turn that has used 120k compacts BEFORE reaching
+    # the limit. The post-turn backstop (compact_at_percent=100, threshold 200k)
+    # would leave the same 120k silent — proving the percent makes it fire early.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[c]"}], 3, None)
 
@@ -151,23 +162,23 @@ def test_auto_compact_fires_early_at_fraction():
     graph._agents._compact_history = fake_compact
     try:
         msgs = [HumanMessage(content="hi")]
-        early, _ = asyncio.run(_run_trigger_with_input_frac(msgs, 120_000, 0.5))
-        late, _ = asyncio.run(_run_trigger_with_input_frac(msgs, 120_000, 1.0))
+        early, _ = asyncio.run(_run_trigger_with_input_pct(msgs, 120_000, 50))
+        late, _ = asyncio.run(_run_trigger_with_input_pct(msgs, 120_000, 100))
     finally:
         graph._agents._compact_history = original
     assert early == ["compact_start", "compact"]
     assert late == []
 
 
-def test_auto_compact_silent_below_fraction():
-    # total=80k, usable=180k, trigger_fraction=0.5 -> threshold 90k -> silent.
+def test_auto_compact_silent_below_percent():
+    # total=80k, window=200k, compact_at_percent=50 -> threshold 100k -> silent.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[c]"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
     try:
-        events, _ = asyncio.run(_run_trigger_with_input_frac([HumanMessage(content="hi")], 80_000, 0.5))
+        events, _ = asyncio.run(_run_trigger_with_input_pct([HumanMessage(content="hi")], 80_000, 50))
     finally:
         graph._agents._compact_history = original
     assert events == []
@@ -186,30 +197,10 @@ def test_messages_to_dicts_roles():
     assert all("content" in d for d in dicts)
 
 
-def test_small_window_reserved_scales_down():
-    # 40k window, UI headroom 20000 -> clamped to 10% = 4000.
-    assert graph._agents._usable_tokens(40_000, 0, 4_000) == 36_000
-    # Mirror the frontend scaleReserved() (src/lib/context.ts) so the clamp is
-    # pinned here too: min(headroom, max(2000, 10% of cw)), unchanged when cw=0.
-    def scale_reserved(cw: int, headroom: int) -> int:
-        if cw <= 0:
-            return headroom
-        return min(headroom, max(2000, round(cw * 0.1)))
-
-    assert scale_reserved(40_000, 20_000) == 4_000
-    # 190k window: 10% = 19k, which is below the 20k default, so it clamps to
-    # 19k (still ~10% of the window — no premature compaction near the start).
-    assert scale_reserved(190_000, 20_000) == 19_000
-    # A genuinely huge window keeps the full 20k headroom.
-    assert scale_reserved(300_000, 20_000) == 20_000
-    # Unknown window (0) passes the headroom through unchanged.
-    assert scale_reserved(0, 20_000) == 20_000
-
-
 def test_large_window_no_early_compaction_parity():
-    # 190k window with the default 20k headroom: usable is 170k, so a 20k
+    # 190k window with the default 80% threshold: threshold is 152k, so a 20k
     # conversation must NOT trigger compaction (the original bug report).
-    assert graph._agents._usable_tokens(190_000, 0, 20_000) == 170_000
+    assert int(190_000 * 80 / 100) == 152_000
 
 
 def test_backend_context_window_manual_override(monkeypatch):
@@ -308,44 +299,44 @@ def test_auto_compact_uses_local_transcript_estimate():
         ai_small = AIMessage(content="answer")
         ai_small.usage_metadata = {"input_tokens": 9_000_000, "output_tokens": 9_000_000}
         small = [SystemMessage(content="sys"), HumanMessage(content="hi"), ai_small]
-        events_small, _ = asyncio.run(_run_trigger(small, reserved=20_000, ctx=200_000))
+        events_small, _ = asyncio.run(_run_trigger(small, compact_at_percent=80, ctx=200_000))
         assert events_small == []
 
-        # Large content -> local estimate exceeds usable (180k) -> fires.
+        # Large content -> local estimate exceeds threshold (160k for 80% of 200k) -> fires.
         big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
-        events_big, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        events_big, _ = asyncio.run(_run_trigger(big, compact_at_percent=80, ctx=200_000))
         assert events_big == ["compact_start", "compact"]
     finally:
         graph._agents._compact_history = original
 
 
-def test_auto_compact_fires_at_usable_like_opencode():
-    # opencode fires compaction when the local transcript estimate >= usable
-    # (ctx - reserved), with no extra proactive buffer. Above usable must
-    # compact; below must not.
+def test_auto_compact_fires_at_threshold_like_opencode():
+    # Auto-compaction fires when the local transcript estimate >= threshold
+    # (compact_at_percent% of the raw window). Above threshold must compact;
+    # below must not.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
     try:
-        # Above usable (180k for 200k ctx, 20k reserved): big content fires.
+        # Above threshold (160k for 80% of 200k): big content fires.
         big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
-        events, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        events, _ = asyncio.run(_run_trigger(big, compact_at_percent=80, ctx=200_000))
         assert events == ["compact_start", "compact"]
 
-        # Well below usable: small content -> silent.
+        # Well below threshold: small content -> silent.
         small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="hello")]
-        events_small, _ = asyncio.run(_run_trigger(small, reserved=20_000, ctx=200_000))
+        events_small, _ = asyncio.run(_run_trigger(small, compact_at_percent=80, ctx=200_000))
         assert events_small == []
     finally:
         graph._agents._compact_history = original
 
 
-def test_auto_compact_fires_on_usable_threshold():
-    # opencode fires compaction when the transcript estimate reaches `usable`
-    # (ctx - reserved). With reserved=20k on a 200k window, usable=180k. A large
-    # transcript (>= usable) must compact.
+def test_auto_compact_fires_on_threshold():
+    # Auto-compaction fires when the transcript estimate reaches the threshold
+    # (compact_at_percent% of the raw window). With 80% on a 200k window,
+    # threshold=160k. A large transcript (>= threshold) must compact.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
@@ -353,7 +344,7 @@ def test_auto_compact_fires_on_usable_threshold():
     graph._agents._compact_history = fake_compact
     try:
         big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
-        state = {"reserved": 20_000}
+        state = {"compact_at_percent": 80}
         q = _Queue()
         asyncio.run(graph._maybe_auto_compact(state, q, None, None, big, 200_000))
         events = [e["kind"] for e in q.items]
@@ -363,26 +354,26 @@ def test_auto_compact_fires_on_usable_threshold():
     assert events == ["compact_start", "compact"]
 
 
-def test_auto_compact_respects_reserved_setting():
-    # The single "Compaction headroom (tokens)" setting (reserved) controls the
-    # threshold. A larger reserved (40k) lowers usable to 160k: a large transcript
-    # must compact, while a tiny one must NOT.
+def test_auto_compact_respects_percent_setting():
+    # The single "Auto-compaction threshold" setting (compact_at_percent) controls
+    # the threshold. A lower percent (60%) lowers the threshold to 120k: a large
+    # transcript must compact, while a tiny one must NOT.
     async def fake_compact(*a, **k):
         return ([{"role": "system", "content": "[Compacted earlier context]\nSUMMARY"}], 3, None)
 
     original = graph._agents._compact_history
     graph._agents._compact_history = fake_compact
     try:
-        # Large transcript with reserved=40k -> usable 160k -> fires.
+        # Large transcript with compact_at_percent=60 -> threshold 120k -> fires.
         big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
         q = _Queue()
-        asyncio.run(graph._maybe_auto_compact({"reserved": 40_000}, q, None, None, big, 200_000))
+        asyncio.run(graph._maybe_auto_compact({"compact_at_percent": 60}, q, None, None, big, 200_000))
         assert [e["kind"] for e in q.items] == ["compact_start", "compact"]
 
-        # Tiny content with the larger reserved -> still silent.
+        # Tiny content with the lower percent -> still silent.
         small = [SystemMessage(content="sys"), HumanMessage(content="hi"), AIMessage(content="answer")]
         q2 = _Queue()
-        asyncio.run(graph._maybe_auto_compact({"reserved": 40_000}, q2, None, None, small, 200_000))
+        asyncio.run(graph._maybe_auto_compact({"compact_at_percent": 60}, q2, None, None, small, 200_000))
         assert [e["kind"] for e in q2.items] == []
     finally:
         graph._agents._compact_history = original
@@ -400,7 +391,7 @@ def test_auto_compact_falls_back_when_estimate_missing():
     graph._agents._compact_history = fake_compact
     try:
         big = [SystemMessage(content="x" * 750_000), HumanMessage(content="hi"), AIMessage(content="y" * 750_000)]
-        events, _ = asyncio.run(_run_trigger(big, reserved=20_000, ctx=200_000))
+        events, _ = asyncio.run(_run_trigger(big, compact_at_percent=80, ctx=200_000))
         assert events == ["compact_start", "compact"]
     finally:
         graph._agents._compact_history = original_compact
@@ -509,8 +500,8 @@ def test_auto_compact_applies_result_in_place():
         q = _Queue()
         asyncio.run(
             graph._maybe_auto_compact(
-                {"reserved": 20_000}, q, None, None, msgs, 200_000,
-                last_input_tokens=190_000,
+                {"compact_at_percent": 80}, q, None, None, msgs, 200_000,
+                last_context_tokens=190_000,
             )
         )
     finally:
@@ -534,6 +525,74 @@ def test_auto_compact_applies_result_in_place():
     assert any(e["kind"] == "compact" for e in q.items)
 
 
+def test_auto_compact_keeps_in_flight_step_verbatim():
+    # Mid-turn auto-compact must NOT summarize the step currently in flight
+    # (the trailing assistant tool_calls + their tool results). If it did, the
+    # assistant's tool_calls would be dropped while the tool results remain,
+    # leaving a dangling tool_call_id -> the model re-issues the same call next
+    # step -> the repetition-loop guard STOPS the turn. Prove the in-flight step
+    # survives verbatim so the turn keeps going after compaction.
+    async def fake_compact(*a, **k):
+        # Delegate to the REAL compaction so the in-flight protection logic runs,
+        # but stub the summarizer call so no live model is needed.
+        return await graph._agents._compact_history(*a, **k)
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    # Stub the summarizer so the test needs no live model.
+    import llm as _llm_mod
+    _orig_complete = _llm_mod.llm_complete
+    async def _fake_complete(*a, **k):
+        return "[Compacted earlier context]\nSUMMARY", None
+    _llm_mod.llm_complete = _fake_complete
+    try:
+        # A huge older turn (must be summarized) + a current in-flight step whose
+        # assistant tool_call + tool result are each large enough to exceed the
+        # recent tail budget on their own.
+        msgs = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="x" * 800_000),  # old turn, should be summarized
+            AIMessage(content="y" * 800_000),     # old turn, should be summarized
+            HumanMessage(content="do the thing"),
+            AIMessage(
+                content="calling tool now",
+                tool_calls=[{"id": "abc", "name": "read", "args": {"path": "a"}}],
+            ),  # in-flight assistant w/ real tool_call
+            ToolMessage(content="z" * 800_000, tool_call_id="abc"),  # live result
+        ]
+        q = _Queue()
+        asyncio.run(
+            graph._maybe_auto_compact(
+                {"compact_at_percent": 80}, q, None, None, msgs, 200_000,
+                last_context_tokens=190_000,
+            )
+        )
+    finally:
+        graph._agents._compact_history = original
+        _llm_mod.llm_complete = _orig_complete
+
+    # The live tool result must remain verbatim (not summarized away) AND keep its
+    # ORIGINAL tool_call_id so it still links to the assistant's tool_calls.
+    assert any(
+        isinstance(m, ToolMessage)
+        and m.content == "z" * 800_000
+        and m.tool_call_id == "abc"
+        for m in msgs
+    ), "in-flight tool result was dropped / lost its tool_call_id"
+    # The in-flight assistant message must remain (content intact) AND keep its
+    # tool_calls; otherwise the next model call gets a dangling tool result and the
+    # turn cannot continue after compaction.
+    kept = [
+        m for m in msgs
+        if isinstance(m, AIMessage) and m.content == "calling tool now"
+    ]
+    assert kept, "in-flight assistant step was summarized away"
+    assert kept[0].tool_calls, "in-flight assistant lost its tool_calls"
+    assert (
+        kept[0].tool_calls[0].get("id") == "abc"
+    ), "in-flight tool_call id mismatch"
+
+
 def test_auto_compact_in_place_noop_below_threshold():
     # Below the usable threshold nothing is compacted, so `msgs` must be left
     # completely untouched (no rebuild, no dropped messages).
@@ -550,8 +609,8 @@ def test_auto_compact_in_place_noop_below_threshold():
         q = _Queue()
         asyncio.run(
             graph._maybe_auto_compact(
-                {"reserved": 20_000}, q, None, None, msgs, 200_000,
-                last_input_tokens=10_000,
+                {"compact_at_percent": 80}, q, None, None, msgs, 200_000,
+                last_context_tokens=10_000,
             )
         )
     finally:

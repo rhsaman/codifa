@@ -133,6 +133,32 @@ def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:
     return cache_read, cache_write, key_additive
 
 
+def _extract_reasoning_tokens(um: dict) -> int:
+    """Extract reasoning/chain-of-thought token counts from ANY provider's usage.
+
+    Reasoning-capable models (OpenAI o-series, Anthropic extended thinking,
+    DeepSeek reasoner, Gemini thinking, …) report their thinking tokens in
+    different places: ``output_token_details.reasoning_tokens`` (OpenAI/Anthropic
+    native), ``completion_tokens_details.reasoning_tokens`` (OpenAI raw / DeepSeek),
+    or a bare ``reasoning_tokens`` key. Returns the integer count (0 when absent).
+    """
+    if not isinstance(um, dict):
+        return 0
+    details = um.get("output_token_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    completion_details = um.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    reasoning = (
+        details.get("reasoning_tokens")
+        or completion_details.get("reasoning_tokens")
+        or um.get("reasoning_tokens")
+        or 0
+    )
+    return int(reasoning or 0)
+
+
 # Thinking level -> the downstream "reasoning effort" token. '' / 'none' mean
 # reasoning is disabled. LangChain forwards these through model_kwargs to the
 # provider. Kept here so graph.py / llm.py / agents.py share one definition.

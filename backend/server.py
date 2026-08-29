@@ -211,14 +211,11 @@ class ChatRequest(BaseModel):
     # "providerId/model" subagent entry can be run on that provider's own base
     # URL / key (not the parent provider's).
     providers: dict = {}
-    # Compaction headroom (tokens) reserved below the context window — opencode's
-    # `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires when the conversation
-    # reaches `ctx - reserved` (opencode's `usable`). Default 20_000.
-    reserved: int = 20_000
-    # Fraction of the usable window at which mid-turn auto-compaction fires
-    # (user-tunable in Settings). 0.5 = compact once the turn uses half the
-    # usable window, well before the hard overflow limit. Clamped in graph.py.
-    compact_trigger_fraction: float = 0.8
+    # Single auto-compaction threshold as a percentage of the RAW context window.
+    # Auto-compaction fires once `total_tokens >= ctx * compact_at_percent / 100`.
+    # The reserved headroom is implicit: `(100 - compact_at_percent)%` of the
+    # window is left free. Range 1-99. Default 80.
+    compact_at_percent: int = 80
 
 
 class CompactRequest(BaseModel):
@@ -243,11 +240,11 @@ class CompactRequest(BaseModel):
     # Conversation history to compact, as plain {role, content} turns.
     history: list[dict] = []
     context_window: int = 0
-    # Default matches the auto-compact `reserved` (20_000) and the UI's
-    # `compactHeadroom` default, so a manual /compact without an explicit
-    # headroom behaves identically to auto-compaction. The frontend always
-    # sends the user's actual `compactHeadroom` here, so this is only a fallback.
-    reserved: int = 20_000
+    # Default matches the auto-compact `compact_at_percent` (80) and the UI's
+    # default, so a manual /compact without an explicit percent behaves
+    # identically to auto-compaction. The frontend always sends the user's
+    # actual `compactAtPercent` here, so this is only a fallback.
+    compact_at_percent: int = 80
 
 
 class ModelsRequest(BaseModel):
@@ -978,7 +975,7 @@ async def chat_compact(req: CompactRequest, request: Request):
     _log(
         f"request: provider={req.provider!r} model={req.model!r} "
         f"fallback={req.fallback_provider!r}/{req.fallback_model!r} "
-        f"history={len(req.history or [])} ctx={req.context_window} reserved={req.reserved}"
+        f"history={len(req.history or [])} ctx={req.context_window} pct={req.compact_at_percent}"
     )
     if not req.history:
         _log("empty history -> nothing to do", level=logging.WARNING)
@@ -1025,7 +1022,7 @@ async def chat_compact(req: CompactRequest, request: Request):
             model,
             history,
             ctx=ctx,
-            reserved=req.reserved,
+            reserved=None,
             fallback_model=fallback,
             last_error=last_error,
             force=True,
@@ -1172,9 +1169,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 retrieval_config=req.retrieval_config,
                 subagent_models=req.subagent_models,
                 chat_id=req.chat_id,
-                reserved=req.reserved,
                 providers=req.providers,
-                compact_trigger_fraction=req.compact_trigger_fraction,
+                compact_at_percent=req.compact_at_percent,
                 )
             ):
                 if event.get("kind") == "_keepalive":
@@ -1477,7 +1473,13 @@ def main() -> None:
             )
         )
         _root = logging.getLogger()
-        _root.setLevel(logging.WARNING)
+        # Allow raising the file-log verbosity via CODFA_LOG_LEVEL (e.g. "DEBUG")
+        # so diagnostic lines like graph.py's "[CTX_DEBUG] auto_compact ..." reach
+        # the persistent log. Defaults to WARNING to keep the file quiet in normal
+        # use. The value is validated against logging's known levels, falling back
+        # to WARNING on anything unrecognized.
+        _level_name = os.environ.get("CODFA_LOG_LEVEL", "WARNING").upper()
+        _root.setLevel(getattr(logging, _level_name, logging.WARNING))
         _root.addHandler(_handler)
     except Exception:  # noqa: BLE001, S110 — logging must never kill the sidecar
         pass

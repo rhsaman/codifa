@@ -156,14 +156,14 @@ export interface Settings {
    *  Each key maps to a model from the active provider, or empty = use the
    *  parent model. */
   subagentModels?: Record<string, string>
-  /** Compaction headroom (tokens) reserved below the context window — opencode's
-   *  `reserved`/`COMPACTION_BUFFER`. Auto-compaction fires at `ctx - reserved`
-   *  (opencode's `usable`). Default 20_000. */
-  compactHeadroom?: number
-  /** Fraction of the usable window at which mid-turn auto-compaction fires
-   *  (0.1–0.95). 0.5 = compact once a turn uses half the usable window, well
-   *  before the hard overflow limit. Default 0.5. */
-  compactTriggerFraction?: number
+  /** Single auto-compaction threshold as a percentage of the RAW context window.
+   *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`.
+   *  The reserved headroom is implicit: `(100 - compactAtPercent)%` of the window
+   *  is left free. 80 = compact at 80% of the window (20% headroom). Range 1–99.
+   *  Default 80. The context meter shows `total_tokens`, so the meter and the
+   *  trigger always agree (the bar hits the threshold exactly when compaction
+   *  fires). */
+  compactAtPercent?: number
   /** History turn limit sent to the model. 0 = full history (default). N > 0 =
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */
@@ -465,6 +465,7 @@ export interface SidecarEvent {
   context_tokens?: number
   cache_read_tokens?: number
   cache_write_tokens?: number
+  reasoning_tokens?: number
   /** Overflow events are REJECTED (unbilled) requests — never counted in billed totals. */
   unbilled?: boolean
   attempt?: number

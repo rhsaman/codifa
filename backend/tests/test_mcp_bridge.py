@@ -109,10 +109,28 @@ async def test_real_docker_mcp_connects(monkeypatch):
     Skipped automatically when ``docker`` is unavailable (CI without Docker), so
     it never turns the suite red on machines that can't run the gateway.
     """
+    import asyncio
     import shutil
+    import subprocess
 
     if shutil.which("docker") is None:
         pytest.skip("docker CLI not installed")
+
+    # The CLI may be installed but the daemon (Docker Desktop) not running — the
+    # gateway then fails to connect and returns zero tools instead of raising,
+    # which would otherwise turn the suite red on machines without Docker.
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["docker", "info"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.skip("docker daemon not running")
+    except Exception:  # noqa: BLE001
+        pytest.skip("docker daemon not reachable")
 
     servers = {"docker": {"command": "docker", "args": ["mcp", "gateway", "run"]}}
     try:

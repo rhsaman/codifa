@@ -170,3 +170,158 @@ def test_usage_event_returns_none_on_zero_tokens():
     # or the frontend context meter would drop to a misleading 0%.
     ai = AIMessage(content="hi", usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
     assert _usage_event_from_ai(ai, "m") is None
+
+
+def test_usage_event_surfaces_reasoning_tokens():
+    # Reasoning/thinking tokens (OpenAI o-series / Anthropic extended thinking /
+    # DeepSeek reasoner) occupy the context window and must be surfaced so the
+    # frontend context meter can sum them in (opencode's tokens.total includes
+    # reasoning). OpenAI/Anthropic-native reports them under
+    # output_token_details.reasoning_tokens.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "total_tokens": 1300,
+            "output_token_details": {"reasoning_tokens": 500},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "openai/o3")
+    assert ev["reasoning_tokens"] == 500
+
+
+def test_usage_event_surfaces_reasoning_tokens_completion_details():
+    # OpenAI raw / DeepSeek surfaces reasoning under
+    # completion_tokens_details.reasoning_tokens.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "total_tokens": 1300,
+            "completion_tokens_details": {"reasoning_tokens": 333},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "deepseek/reasoner")
+    assert ev["reasoning_tokens"] == 333
+
+
+def test_usage_event_reasoning_added_to_total_subset_fallback():
+    # When the provider does NOT report its own total_tokens (subset convention),
+    # the fallback hand-sum MUST include reasoning_tokens so the context meter is
+    # opencode-faithful (total = input + output + reasoning). Here cache is a
+    # subset of input (no cache key), so only input+output+reasoning is summed.
+    # AIMessage validation requires total_tokens, so we set usage_metadata after
+    # construction to exercise the fallback (provided_total == 0) path.
+    ai = AIMessage(content="x")
+    ai.usage_metadata = {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        # no total_tokens -> fallback path
+        "output_token_details": {"reasoning_tokens": 500},
+    }
+    ev = _usage_event_from_ai(ai, "openai/o3")
+    assert ev["reasoning_tokens"] == 500
+    # 1000 + 200 + 500 = 1700 (reasoning folded into the total).
+    assert ev["total_tokens"] == 1700
+
+
+def test_usage_event_reasoning_added_to_total_additive():
+    # Anthropic-native (additive) convention: cache is separate from input, so the
+    # true total is input + output + reasoning + cache_read + cache_write. Reasoning
+    # must be included in that sum.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 40,
+            "total_tokens": 999,  # ignored by additive branch (hand-sum wins)
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 150,
+            "output_token_details": {"reasoning_tokens": 60},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "anthropic/claude")
+    assert ev["reasoning_tokens"] == 60
+    # 500 + 40 + 60 + 300 + 150 = 1050 (not the bogus 999).
+    assert ev["total_tokens"] == 1050
+
+
+def test_usage_event_reasoning_tokens_default_zero():
+    # A non-reasoning model reports no reasoning tokens -> default to 0 so the
+    # frontend sum stays correct without special-casing.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "total_tokens": 1200,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "openai/gpt-4o")
+    assert ev["reasoning_tokens"] == 0
+
+
+def test_context_tokens_is_provider_total():
+    # `context_tokens` (what the frontend context meter displays) must equal the
+    # provider's `total_tokens` verbatim — NOT `total - output`. The meter and the
+    # auto-compaction trigger both compare against the RAW window (compact_at_percent
+    # of ctx), so they must use the SAME number (opencode's `tokens.total`). Reporting
+    # `total - output` would make the meter disagree with the trigger and under-report
+    # the true context footprint (output/reasoning/cache all occupy the window).
+    # Subset provider: in=6286, cache_read=6144 (inside input), out=164,
+    # provider total=6450 -> context_tokens = 6450 (the full total).
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 6286,
+            "output_tokens": 164,
+            "total_tokens": 6450,
+            "input_token_details": {"cache_read": 6144},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "openrouter/hy3-free")
+    assert ev["context_tokens"] == 6450
+
+    # Additive provider (Anthropic): total = in + out + reasoning + cache_read
+    # + cache_write = 500 + 40 + 60 + 300 + 150 = 1050 -> context = 1050 (full total).
+    ai2 = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 500,
+            "output_tokens": 40,
+            "total_tokens": 999,  # ignored by additive branch
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 150,
+            "output_token_details": {"reasoning_tokens": 60},
+        },
+    )
+    ev2 = _usage_event_from_ai(ai2, "anthropic/claude")
+    assert ev2["context_tokens"] == 1050
+
+
+def test_last_context_tokens_uses_provider_total_not_hand_sum():
+    # Regression: `state["last_context_tokens"]` (the value auto-compaction fires
+    # off) must use the provider-aware `total_tokens` from the usage event, NOT a
+    # hand-sum of the breakdown. For subset providers (OpenAI/OpenRouter/hy3-free)
+    # cache_read/write is already folded into input_tokens, so a hand-sum would
+    # double-count the cache (~2x the real context). The usage event's
+    # total_tokens already respects the additive/subset convention.
+    from graph import _usage_event_from_ai
+
+    # Subset provider: in=6286, cache_read=6144 (already inside input), out=164.
+    # Provider total = 6450. A hand-sum would give ~12430 (double-count).
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 6286,
+            "output_tokens": 164,
+            "total_tokens": 6450,
+            "input_token_details": {"cache_read": 6144},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "openrouter/hy3-free")
+    assert ev["total_tokens"] == 6450
+    # The compaction trigger must see the provider total, never the double-count.
+    assert ev["total_tokens"] < 6286 + 164 + 6144

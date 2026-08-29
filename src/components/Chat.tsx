@@ -27,7 +27,6 @@ import {
   formatTokens,
   formatTokensK,
   modelContextWindow,
-  scaleReserved,
   contextWarn,
   modelReasoning,
   priceForModel,
@@ -1132,17 +1131,17 @@ export function ChatPanel() {
   );
 
   // opencode's meter compares the latest turn's total against the RAW window
-  // (`limit.context`), NOT `usable = window - reserved`. The reserved headroom is
-  // still used by the backend to trigger auto-compaction, but the meter itself
-  // is raw — so we pass no `reserved` here.
+  // (`limit.context`). The backend auto-compaction threshold is a percentage of
+  // this same raw window (compactAtPercent), so the meter and the trigger agree:
+  // the bar hits the threshold exactly when compaction fires.
   const ctxPct = contextPercent(contextUsed, ctxWindow);
 
-  // Warn (yellow) when used context reaches the usable window
-  // (`window - reserved`) — the same point where backend auto-compaction fires
-  // — not at a fixed percentage of the raw window.
-  const reserved =
-    ctxWindow != null ? scaleReserved(ctxWindow, settings.compactHeadroom ?? 20000) : 0
-  const usable = ctxWindow != null ? Math.max(0, ctxWindow - reserved) : null
+  // Warn (yellow) when used context reaches the auto-compaction threshold
+  // (compactAtPercent% of the raw window) — the same point where backend
+  // auto-compaction fires.
+  const compactAtPercent = settings.compactAtPercent ?? 80
+  const usable =
+    ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -1373,7 +1372,6 @@ export function ChatPanel() {
     abortRef.current = abort;
     useStore.getState().setChatAbort(chat.id, abort);
     setBusy(true);
-    useStore.getState().setChatStalled(chat.id, false);
     lastEventAt.current = Date.now();
     stalledSinceRef.current = null;
     watchdogAbortedRef.current = false;
@@ -1414,6 +1412,7 @@ export function ChatPanel() {
     const HARD_STALL_GRACE_MS = 120_000;
     const WATCHDOG_MAX_RETRIES = 5;
     const WATCHDOG_BASE_BACKOFF_MS = 30_000;
+    const STALL_CHECK_INTERVAL_MS = 10_000;
     const stallTimer = setInterval(() => {
       // While the agent is waiting for the user to answer a permission /
       // confirm / ask request, it is legitimately paused — never treat that
@@ -1421,7 +1420,6 @@ export function ChatPanel() {
       const chatState = useStore.getState().chats.find((c) => c.id === chat.id);
       if (chatState?.pendingPermission || chatState?.pendingAsk) {
         stalledSinceRef.current = null;
-        useStore.getState().setChatStalled(chat.id, false);
         return;
       }
       // A tool that's still running gets a much longer leash — it's doing real
@@ -1432,7 +1430,6 @@ export function ChatPanel() {
         stalledSinceRef.current = null;
         return;
       }
-      useStore.getState().setChatStalled(chat.id, true);
       if (stalledSinceRef.current == null) stalledSinceRef.current = Date.now();
       // Auto-retry on a loop with exponential backoff. Each retry re-sends the
       // last user turn; the backend's own retry loop handles transient failures.
@@ -1566,7 +1563,6 @@ export function ChatPanel() {
         return;
       }
       lastEventAt.current = Date.now();
-      useStore.getState().setChatStalled(chat.id, false);
       const store = useStore.getState();
       const findMsg = () =>
         store.chats
@@ -1717,6 +1713,10 @@ export function ChatPanel() {
         // banner under the messages until the compact/compact_failed event lands.
         // Stored per-chat so it survives a chat switch mid-compact; clear any
         // stale notice/error so the loading banner replaces them.
+        // Treat the compaction like a running tool so the watchdog grants the
+        // 900s leash (not the 300s non-tool limit) — a slow mid-turn compact
+        // must not be mistaken for a stalled stream and force-aborted.
+        bumpToolRunning(toolRunningRef);
         useStore.getState().setChatCompacting(chat.id, true);
         useStore.getState().setChatCompactNotice(chat.id, null);
         useStore.getState().setChatCompactError(chat.id, null);
@@ -1729,6 +1729,7 @@ export function ChatPanel() {
         // the summary mid-stream (previously via scrollIntoView) is exactly
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
+        dropToolRunning(toolRunningRef);
         useStore.getState().setChatCompacting(chat.id, false);
         const chatId = chat.id;
         if (chatId) {
@@ -1758,6 +1759,7 @@ export function ChatPanel() {
         // the retry banner so the user can compact manually (the manual path
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
+        dropToolRunning(toolRunningRef);
         useStore.getState().setChatCompacting(chat.id, false);
         useStore
           .getState()
@@ -1904,6 +1906,7 @@ export function ChatPanel() {
               outputTokens,
               totalTokens: total,
               contextTokens: event.context_tokens ?? undefined,
+              reasoningTokens: event.reasoning_tokens ?? 0,
               cacheReadTokens: event.cache_read_tokens ?? 0,
               cacheWriteTokens: event.cache_write_tokens ?? 0,
             },
@@ -1911,9 +1914,8 @@ export function ChatPanel() {
         }
       } else if (event.kind === "done") {
         // The backend signals the end of the stream with a "done" event.
-        // Clear the stall hint immediately and refresh the watchdog clock so a
-        // queued stall-timer callback can't re-set it after the stream closes.
-        useStore.getState().setChatStalled(chat.id, false);
+        // Refresh the watchdog clock so a queued stall-timer callback can't
+        // re-set it after the stream closes.
         lastEventAt.current = Date.now();
         resolveStuckCards();
         // A successful completion clears any transient "reconnecting" pill.
@@ -1978,8 +1980,7 @@ export function ChatPanel() {
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
-          reserved: s.settings.compactHeadroom ?? 20000,
-          compactTriggerFraction: s.settings.compactTriggerFraction ?? 0.8,
+          compactAtPercent: s.settings.compactAtPercent ?? 80,
           signal: abort.signal,
         },
         handleEvent,
@@ -2024,7 +2025,6 @@ export function ChatPanel() {
       lastEventAt.current = Date.now();
       stalledSinceRef.current = null;
       toolRunningRef.current = 0;
-      useStore.getState().setChatStalled(chat.id, false);
       setBusy(false);
       useStore.getState().setChatCompacting(chat.id, false);
       useStore.getState().setChatPendingAsk(chat.id, null);
@@ -2093,8 +2093,9 @@ export function ChatPanel() {
     // models can take minutes to summarize a large history, so this is generous
     // — the backend streams no progress for this JSON call, and aborting early
     // just discards a compaction that would otherwise succeed (the backend keeps
-    // running and logs "[compact] success").
-    const COMPACT_TIMEOUT_MS = 300_000;
+    // running and logs "[compact] success"). 600s gives even a heavy summarizer
+    // room; raising it further only delays the failure banner.
+    const COMPACT_TIMEOUT_MS = 600_000;
 
     // Queue behind any in-flight stream on THIS chat: running the summarizer
     // concurrently with the agent interleaves two model streams (usage events,
@@ -2182,7 +2183,7 @@ export function ChatPanel() {
         history,
         contextWindow:
           modelContextWindow(activeProvider, activeProvider.model) ?? 0,
-        reserved: useStore.getState().settings.compactHeadroom ?? 20000,
+        compactAtPercent: useStore.getState().settings.compactAtPercent ?? 80,
         signal: ctr.signal,
       });
     } catch (err) {
@@ -3068,7 +3069,7 @@ export function ChatPanel() {
               className={`badge context-meter${contextWarn(contextUsed, usable) ? " warn" : ""}`}
               title={
                 ctxWindow != null
-                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the usable window (${formatTokens(usable ?? 0)} tokens = window minus the ${formatTokens(reserved)}-token compaction headroom) — the same point where auto-compaction fires.`
+                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the auto-compaction threshold (${formatTokens(usable ?? 0)} tokens = ${compactAtPercent}% of the window) — the same point where auto-compaction fires.`
                   : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
               }
               dir="ltr"

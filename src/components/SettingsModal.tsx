@@ -457,10 +457,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
-  const compactHeadroom = useStore((s) => s.settings.compactHeadroom ?? 20000)
-  const setCompactHeadroom = useStore((s) => s.setCompactHeadroom)
-  const compactTriggerFraction = useStore((s) => s.settings.compactTriggerFraction ?? 0.8)
-  const setCompactTriggerFraction = useStore((s) => s.setCompactTriggerFraction)
+  const compactAtPercent = useStore((s) => s.settings.compactAtPercent ?? 80)
+  const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
   const webSearchTtlDays = useStore((s) => s.webSearchTtlDays ?? 7)
@@ -2063,55 +2061,28 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         <>
             <div className="field">
               <div className="field-head">
-                <label>Compaction headroom (tokens)</label>
-                <span className="field-value-badge">{compactHeadroom.toLocaleString()}</span>
+                <label>Auto-compaction threshold</label>
+                <span className="field-value-badge">{compactAtPercent}%</span>
               </div>
               <div className="hint">
-                Tokens reserved below the model's context window before auto-compaction
-                fires (opencode's <code>reserved</code>/<code>COMPACTION_BUFFER</code>).
-                The conversation is summarized once it reaches <code>window − headroom</code>.
-                Lower = compact sooner (roomier window); higher = compact later (more
-                recent turns kept in full). 0 means compaction only at the hard limit.
+                Auto-compaction fires once the conversation reaches this percentage of the
+                model's raw context window (measured by <code>total_tokens</code>, the same
+                number the context meter shows). The remaining <code>{100 - compactAtPercent}%</code> is
+                left as headroom. 80 = compact at 80% of the window. Lower = compact sooner
+                (safer for huge contexts); higher = compact later (more recent turns kept in
+                full). Range 1–99. Applies on the next message. Default: 80.
               </div>
               <div className="font-size-row">
-                <span className="font-size-label">0</span>
+                <span className="font-size-label">1%</span>
                 <RangeSlider
-                  min={0}
-                  max={64000}
-                  step={1000}
-                  value={compactHeadroom}
-                  onChange={setCompactHeadroom}
-                  ariaLabel="Compaction headroom (tokens)"
+                  min={1}
+                  max={99}
+                  step={1}
+                  value={compactAtPercent}
+                  onChange={setCompactAtPercent}
+                  ariaLabel="Auto-compaction threshold (%)"
                 />
-                <span className="font-size-label">64k</span>
-              </div>
-              <div className="hint">Applies on the next message. Default: 20,000 tokens.</div>
-            </div>
-
-            <div className="field">
-              <div className="field-head">
-                <label>Mid-turn compaction trigger</label>
-                <span className="field-value-badge">{compactTriggerFraction.toFixed(2)}</span>
-              </div>
-              <div className="hint">
-                Fraction of the usable window at which auto-compaction runs <b>during</b> a
-                turn — before the context limit is reached (opencode only compacts at the
-                hard limit). 0.8 = compact once a turn uses 80% of the window, so the agent
-                keeps working on a compacted transcript instead of running out of context
-                mid-task. Lower = compact sooner (safer for huge contexts); higher = compact
-                later. Range 0.1–0.95. Applies on the next message. Default: 0.8.
-              </div>
-              <div className="font-size-row">
-                <span className="font-size-label">0.1</span>
-                <RangeSlider
-                  min={0.1}
-                  max={0.95}
-                  step={0.05}
-                  value={compactTriggerFraction}
-                  onChange={setCompactTriggerFraction}
-                  ariaLabel="Mid-turn compaction trigger"
-                />
-                <span className="font-size-label">0.95</span>
+                <span className="font-size-label">99%</span>
               </div>
             </div>
 

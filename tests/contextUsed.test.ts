@@ -19,24 +19,46 @@ const est = (chat: any, sp = 'sys') =>
   Math.round(estimateContextChars(chat, sp, 200000) / CHARS_PER_TOKEN)
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۱) meter = latest turn input_tokens (from langgraph):')
+console.log('۱) meter = opencode sum of the latest turn (input+output+reasoning+cache):')
 {
-  // subset: total_tokens == input + output
+  // subset: total_tokens == input + output, but the meter uses the hand-summed
+  // breakdown (opencode parity), NOT the provider's native total_tokens.
   const chat = mkChat([
     { role: 'user', content: 'hi' },
     { role: 'assistant', content: 'ok', usage: { inputTokens: 5000, outputTokens: 900, totalTokens: 5900 } },
   ])
-  check('used = latest input_tokens (5000)', computeContextUsed(chat, 'sys', 200000) === 5000, computeContextUsed(chat, 'sys', 200000))
+  // 5000 + 900 = 5900 (no reasoning/cache here)
+  check('used = input+output (5900)', computeContextUsed(chat, 'sys', 200000) === 5900, computeContextUsed(chat, 'sys', 200000))
 
-  // additive: input_tokens excludes cache; the meter shows the reported
+  // additive: input_tokens excludes cache; the meter adds cache read/write back.
   const chat2 = mkChat([
     { role: 'user', content: 'hi' },
     { role: 'assistant', content: 'ok', usage: { inputTokens: 5000, outputTokens: 900, totalTokens: 7100, cacheReadTokens: 1200, cacheWriteTokens: 0 } },
   ])
+  // 5000 + 900 + 1200 = 7100
   check(
-    'used = input_tokens (5000)',
-    computeContextUsed(chat2, 'sys', 200000) === 5000,
+    'used = input+output+cacheRead (7100)',
+    computeContextUsed(chat2, 'sys', 200000) === 7100,
     computeContextUsed(chat2, 'sys', 200000),
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('۱ب) reasoning tokens are included in the meter (opencode parity):')
+{
+  const chat = mkChat([
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: 'ok',
+      usage: { inputTokens: 5000, outputTokens: 900, reasoningTokens: 1500, cacheReadTokens: 1200, cacheWriteTokens: 300, totalTokens: 8900 },
+    },
+  ])
+  // 5000 + 900 + 1500 + 1200 + 300 = 8900
+  check(
+    'used = input+output+reasoning+cacheRead+cacheWrite (8900)',
+    computeContextUsed(chat, 'sys', 200000) === 8900,
+    computeContextUsed(chat, 'sys', 200000),
   )
 }
 
@@ -49,9 +71,9 @@ console.log('۲) meter follows the LATEST turn, not a historical peak (no "stuck
     { role: 'user', content: 'small follow-up' },
     { role: 'assistant', content: 'small', usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
   ])
-  // The meter mirrors the latest turn's input_tokens (2000) — the same value
-  // that drives auto-compaction — rather than the earlier peak (999999).
-  check('used = latest turn input_tokens (2000)', computeContextUsed(chat, 'sys', 200000) === 2000, computeContextUsed(chat, 'sys', 200000))
+  // The meter mirrors the latest turn's breakdown (2000 + 10 = 2010) — the same
+  // value that drives auto-compaction — rather than the earlier peak (999999).
+  check('used = latest turn sum (2010)', computeContextUsed(chat, 'sys', 200000) === 2010, computeContextUsed(chat, 'sys', 200000))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,15 +86,15 @@ console.log('۲ب) compacted turns are excluded from the meter:')
     { role: 'assistant', content: 'small', usage: { inputTokens: 2000, outputTokens: 10, totalTokens: 2010 } },
   ])
   const used = computeContextUsed(chat, 'sys', 200000)
-  check('used = latest non-compacted input_tokens (2000)', used === 2000, { used })
+  check('used = latest non-compacted sum (2010)', used === 2010, { used })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۳) usage parts but no total_tokens yet → falls back to the history estimate:')
+console.log('۳) usage parts but no input_tokens yet → falls back to the history estimate:')
 {
   // The backend always sends input_tokens in practice; if it is absent (or 0)
   // the meter must reflect the TRUE context (history), not collapse to the bare
-  // last message's 100 tokens.
+  // last message's 50 output tokens.
   const chat = mkChat([
     { role: 'user', content: 'x'.repeat(2000) },
     { role: 'assistant', content: 'ok', usage: { outputTokens: 50 } },
@@ -93,20 +115,24 @@ console.log('۴) no usage yet → returns a positive estimate (no 0% collapse):'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('۵) subset provider: input_tokens already includes cache_read (no separate add):')
+console.log('۵) subset provider: backend sends real cache_read but total_tokens already folds it into input:')
 {
   // For subset-convention providers (OpenAI / OpenRouter / Google) cache_read is
-  // a SUBSET of input_tokens, so the reported input_tokens (100) already counts
-  // the cached portion. The meter uses input_tokens directly.
+  // a SUBSET of input_tokens, so the backend surfaces the real cache_read (for
+  // cost math) but keeps total_tokens == input + output (cache already counted).
+  // The meter uses total_tokens directly (100 + 50 = 150) without double-counting
+  // the cache — it only hand-sums (input+output+reasoning+cache) when total_tokens
+  // is absent.
   const chat = mkChat([
     { role: 'user', content: 'hi' },
     {
       role: 'assistant',
       content: 'ok',
-      usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 5000, cacheWriteTokens: 200, totalTokens: 5350 },
+      usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 40, cacheWriteTokens: 0, totalTokens: 150 },
     },
   ])
-  check('used = input_tokens (100, cache already folded into input for subset)', computeContextUsed(chat, 'sys', 200000) === 100, computeContextUsed(chat, 'sys', 200000))
+  // total_tokens (150) wins — cache is NOT added back (would be 190 if it were).
+  check('used = total_tokens (150, cache NOT double-counted for subset)', computeContextUsed(chat, 'sys', 200000) === 150, computeContextUsed(chat, 'sys', 200000))
 }
 
 console.log((globalThis as any).__FAILED ? '\n✗ برخی تستها شکست خوردند' : '\n✓ همه تستها پاس شدند')

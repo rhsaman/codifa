@@ -52,7 +52,7 @@ def test_manual_compact_success(client):
             "fallback_api_key": "k",
             "history": history,
             "context_window": 100000,
-            "reserved": 2000,
+            "compact_at_percent": 80,
         },
     )
     assert res.status_code == 200
@@ -211,7 +211,7 @@ def test_compact_logs_info_to_stdout_not_stderr(client, capsys):
             "fallback_api_key": "k",
             "history": history,
             "context_window": 100000,
-            "reserved": 2000,
+            "compact_at_percent": 80,
         },
     )
     assert res.status_code == 200

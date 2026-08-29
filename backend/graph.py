@@ -62,6 +62,7 @@ import agents as _agents
 import state_db
 from _common import (
     _extract_cache_tokens,
+    _extract_reasoning_tokens,
     _is_repeating,
     _strip_think_tags,
 )
@@ -310,6 +311,7 @@ class AgentState(TypedDict, total=False):
     subagent_models: dict
     providers: dict
     reserved: int | None
+    compact_at_percent: int | None
     # MCP connectors the user toggled on in the composer chip. Passed through
     # verbatim from the UI request; consumed by build_turn_context to attach
     # live MCP tools. MUST be declared on the state or LangGraph drops it
@@ -1306,7 +1308,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # coder task (feature/bugfix/refactor), not only when the prompt
         # literally says "test". This closes the gap the user reported: coder
         # must write/update and run tests before finishing, even on ordinary
-        # code work. The pure-logic predicates live in agents.py.
+        # code work — but only for changes that alter behavior/logic, not pure
+        # cosmetic/refactor/doc edits. The pure-logic predicates live in agents.py.
         if _agents._is_code_task(prompt):
             stack = detect_frontend_stack(root)
             fw_note = ""
@@ -1333,10 +1336,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     content=(
                         "TEST VERIFICATION RULE: this is code-changing work. "
                         "Write/update the relevant test(s) for the language(s) you "
-                        "touched and run them yourself (uv run pytest / npm test / "
-                        "cargo test / go test / mvn test / dotnet test / flutter test / "
-                        "dart test / ..." + fw_note + ")." + cmd_note + "Do NOT finish "
-                        "with red tests — keep fixing until all tests pass."
+                        "touched — but ONLY when the change introduces or alters "
+                        "BEHAVIOR or LOGIC (new functions, branches, edge cases, bug "
+                        "fixes). Skip tests for pure cosmetic/refactor/doc changes "
+                        "unless they touch existing tested behavior; prefer extending "
+                        "existing tests over adding trivial new ones. Run them yourself "
+                        "(uv run pytest / npm test / cargo test / go test / mvn test / "
+                        "dotnet test / flutter test / dart test / ..." + fw_note + ")."
+                        + cmd_note + "Do NOT finish with red tests — keep fixing until "
+                        "all tests pass."
                     )
                 ),
             )
@@ -1479,7 +1487,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
 def model_timeout_for(state: AgentState) -> float:
     from providers import model_timeout
 
-    mt = model_timeout(provider=state["provider"], total=300)
+    mt = model_timeout(provider=state["provider"], total=900)
     # httpx.Timeout (non-Google) -> use its read component as the request timeout.
     with contextlib.suppress(Exception):
         import httpx
@@ -1531,9 +1539,7 @@ def _estimate_prompt_tokens(messages: list) -> int | None:
         return None
 
 
-def _usage_event_from_ai(
-    ai: Any, model: str, prompt_tokens: int | None = None
-) -> dict | None:
+def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
     """Build a frontend ``usage`` event from a LangChain ``AIMessage``.
 
     LangChain surfaces token counts in ``usage_metadata`` (OpenAI/Google),
@@ -1556,6 +1562,7 @@ def _usage_event_from_ai(
     if input_tokens <= 0 and output_tokens <= 0:
         return None
     cache_read, cache_write, key_additive = _extract_cache_tokens(um)
+    reasoning_tokens = _extract_reasoning_tokens(um)
     # Additive (cache must be added to input) when the cache key is Anthropic-native
     # (cache_read_input_tokens / cache_creation_input_tokens, where input excludes
     # it), OR when the cached portion is LARGER than input_tokens (proving input
@@ -1568,11 +1575,20 @@ def _usage_event_from_ai(
     )
     if additive:
         # Cache is separate from input_tokens -> add it back for the true total.
-        total_tokens = input_tokens + output_tokens + cache_read + cache_write
+        # reasoning_tokens is reported separately by the provider, so include it.
+        total_tokens = (
+            input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write
+        )
     else:
+        # Subset convention: cache_read/write is already folded into input_tokens,
+        # so total_tokens already counts the cache. If the provider reports its own
+        # total_tokens we trust it (it already includes cache + reasoning); only
+        # when absent do we hand-sum, adding reasoning_tokens back in.
         provided_total = um.get("total_tokens") or 0
         total_tokens = (
-            provided_total if provided_total else input_tokens + output_tokens
+            provided_total
+            if provided_total
+            else input_tokens + output_tokens + reasoning_tokens
         )
     import json as _json
 
@@ -1580,21 +1596,37 @@ def _usage_event_from_ai(
         _um_dump = _json.dumps(um, default=str)
     except Exception:  # noqa: BLE001
         _um_dump = repr(um)
-    # `context_tokens` is the LOCAL estimate of the full input prompt sent this
-    # turn (system + history + current user turn + tools), independent of how
-    # long the model's OUTPUT happens to be. The frontend takes a running max
-    # over the chat's assistant messages so the meter reflects the true
-    # (monotonic) context and never drops as the conversation grows — and
-    # because this estimate excludes output, a long-output turn can no longer
-    # pin the running-max to an old value and stop the meter from moving.
+    # `context_tokens` is the true context footprint of this turn — the
+    # provider's `total_tokens` (which already includes the system prompt, tool
+    # schemas, history, output, reasoning and cache, and respects the
+    # additive/subset cache convention). We report `total_tokens` verbatim (NOT
+    # `total - output`) so the meter and the auto-compaction trigger agree: both
+    # compare against the RAW window (`compact_at_percent` of `ctx`), so the bar
+    # hits the threshold exactly when compaction fires (opencode's `isOverflow`
+    # also uses the full token count). Subtracting output would make the meter
+    # disagree with the trigger and report a falsely low usage.
+    context_tokens = total_tokens
     return {
         "kind": "usage",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        # Always surface the TRUE cache counts so the sidebar can bill them at
+        # the cheaper cache rate. For subset-convention providers (OpenAI /
+        # OpenRouter / Google) cache_read/write is already folded into
+        # input_tokens, so `total_tokens` stays the provider's native total
+        # (which already counts the cache) — the frontend's opencode sum then
+        # adds cache_read back, but since input_tokens already includes it the
+        # frontend must NOT double-count. We signal this by sending the real
+        # cache counts AND keeping total_tokens == provider total; the frontend
+        # uses `total_tokens` for the meter when the provider reports it, and
+        # only hand-sums (input+output+reasoning+cache) for additive providers.
+        # For additive providers (Anthropic) the real cache counts are sent and
+        # total_tokens is the hand-sum, so the meter's opencode sum is correct.
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
-        "context_tokens": prompt_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "context_tokens": context_tokens,
         "model": model or "",
     }
 
@@ -1822,18 +1854,24 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
             # than appending a second system message.
             continue
         if role == "assistant":
-            rebuilt.append(AIMessage(content=content))
+            # Keep the structured tool_calls so a compacted in-flight step can
+            # still be continued by the model (older distilled turns carry none).
+            rebuilt.append(AIMessage(content=content, tool_calls=d.get("tool_calls") or []))
         elif role == "tool":
-            rebuilt.append(ToolMessage(content=content, tool_call_id="__compacted__"))
+            # Keep the ORIGINAL tool_call_id so it still links to the assistant's
+            # tool_calls entry. The placeholder is only a fallback for tool
+            # messages whose id was lost (summarized older turns).
+            rebuilt.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=d.get("tool_call_id") or "__compacted__",
+                )
+            )
         else:
             rebuilt.append(HumanMessage(content=content))
     msgs[:] = rebuilt
 
 
-# Fraction of the usable window at which mid-turn auto-compaction fires. Kept
-# well below 1.0 so a long-running turn compacts BEFORE it nears the limit
-# (the user tunes this in Settings -> compactTriggerFraction).
-_COMPACT_TRIGGER_FRACTION = 0.8
 # Cap on how many times mid-turn compaction may actually FIRE within a single
 # turn, so a pathological transcript can never spin in a compact loop. The
 # post-turn backstop still runs once at the end.
@@ -1847,8 +1885,8 @@ async def _maybe_auto_compact(
     compact_model: Any,
     msgs: list,
     ctx: int,
-    last_input_tokens: int | None = None,
-    trigger_fraction: float = 1.0,
+    last_context_tokens: int | None = None,
+    compact_at_percent: int | None = None,
 ) -> int:
     """opencode `isOverflow` -> auto-compaction.
 
@@ -1856,54 +1894,60 @@ async def _maybe_auto_compact(
     it was a no-op), so the caller can throttle per-turn fire count without
     inspecting the event queue.
 
-    Once the assembled transcript reaches the usable window (``ctx - reserved``),
-    summarize the older turns — keeping a recent tail verbatim — and emit the
-    ``compact_start`` / ``compact`` / ``compact_failed`` events the frontend
-    already folds on. The summarizer is the configured compact subagent, falling
-    back to the main model (mirrors opencode's compaction agent + retry).
+    Auto-compaction fires once the assembled transcript reaches
+    ``ctx * compact_at_percent / 100`` of the RAW context window — the SAME
+    percentage the context meter shows (the meter divides ``total_tokens`` by
+    the raw window). The reserved headroom is implicit: ``(100 - percent)%`` of
+    the window is left free. Summarize the older turns — keeping a recent tail
+    verbatim — and emit the ``compact_start`` / ``compact`` / ``compact_failed``
+    events the frontend already folds on. The summarizer is the configured
+    compact subagent, falling back to the main model (mirrors opencode's
+    compaction agent + retry).
     """
     if ctx <= 0:
         return 0
     max_output = _agents._model_max_output(model)
+    # `reserved` is still used internally by _compact_history to size the output
+    # buffer (opencode's COMPACTION_BUFFER). It is NOT the trigger — the trigger
+    # is the single `compact_at_percent` of the raw window. Default to None so
+    # opencode's own max-output-based reservation applies.
     reserved = state.get("reserved")
-    usable = _agents._usable_tokens(ctx, max_output, reserved)
-    # Mid-turn auto-compaction fires at a FRACTION of the usable window (user-
-    # tunable, default _COMPACT_TRIGGER_FRACTION) so a long-running turn compacts
-    # BEFORE it nears the limit, instead of only at the hard overflow boundary.
-    # The post-turn backstop still passes trigger_fraction=1.0. Clamp defensively
-    # so a mis-set value can never disable compaction (>=0.1) or fire on every
-    # step (<=0.95).
-    _frac = max(0.1, min(0.95, trigger_fraction))
-    threshold = int(usable * _frac)
+    # Single auto-compaction threshold as a percentage of the RAW context window
+    # (user-tunable, default 80). Clamp defensively so a mis-set value can never
+    # disable compaction (>=1) or fire on every step (<=99).
+    _pct = max(1, min(99, int(compact_at_percent if compact_at_percent is not None else 80)))
+    threshold = int(ctx * _pct / 100)
     dicts = _agents._messages_to_dicts(msgs)
-    # Auto-compaction fires off the SAME `input_tokens` the context meter
-    # displays (tracked on `state["last_input_tokens"]` at the usage-emit site),
-    # so the meter and the compaction trigger always agree. `input_tokens` is the
-    # provider's (langgraph's) count of tokens actually sent in the prompt this
-    # turn — the true context size (excludes output). Fall back to the stable
-    # local estimate of the whole transcript when no usage has been reported yet
-    # (e.g. the very first turn, or a provider that reports none).
-    total = (
-        last_input_tokens
-        if last_input_tokens and last_input_tokens > 0
-        else _estimate_prompt_tokens(msgs)
-    )
-    if total is None or total <= 0:
+    # Auto-compaction fires off the SAME token breakdown the context meter
+    # displays (tracked on `state["last_context_tokens"]` at the usage-emit
+    # site), so the meter and the compaction trigger always agree. The breakdown
+    # is opencode's `tokens.total` = input + output + reasoning + cache.read +
+    # cache.write — the true context footprint (output/reasoning/cache all occupy
+    # the window). Fall back to the stable local estimate of the whole transcript
+    # when no usage has been reported yet (e.g. the very first turn, or a
+    # provider that reports none).
+    # `last_context_tokens` reflects the PREVIOUS model step's usage and does NOT
+    # include the tool results appended to `msgs` since then. Triggering only off
+    # it lags one step, so a mid-turn tool result that blows past the window isn't
+    # compacted until after the next (overflowing) model call. Use a live estimate
+    # of the CURRENT transcript as a floor so compaction fires BEFORE the next call.
+    live_total = _estimate_prompt_tokens(msgs)
+    if live_total is None or live_total <= 0:
         # Fallback to the char estimate when the local estimate is unavailable
         # (e.g. un-tokenizable message content, or local models with no usage).
-        total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+        live_total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    total = max(last_context_tokens or 0, live_total or 0)
+    if total <= 0:
+        total = live_total or 0
     # Diagnostic: surface the real window/threshold so we can confirm compaction
     # only fires when the prompt genuinely nears the window (and not spuriously).
     logger.debug(
-        "[CTX_DEBUG] auto_compact ctx=%s reserved=%s usable=%s "
-        "trigger_fraction=%s threshold=%s total=%s msgs=%s",
-        ctx, reserved, usable, _frac, threshold, total, len(msgs),
+        "[CTX_DEBUG] auto_compact ctx=%s pct=%s threshold=%s total=%s msgs=%s",
+        ctx, _pct, threshold, total, len(msgs),
     )
-    # opencode fires compaction when the latest turn reaches `usable`
-    # (ctx - reserved). For mid-turn compaction we fire earlier — at
-    # `usable * trigger_fraction` — so the turn sheds context BEFORE it nears the
-    # limit. A single setting (compactHeadroom / reserved) controls the limit;
-    # compactTriggerFraction controls how early we start.
+    # opencode fires compaction when the latest turn reaches the threshold
+    # (pct% of the raw window). The meter shows the same percentage, so the bar
+    # hits the threshold exactly when compaction fires.
     if total < threshold:
         return 0
     # opencode prune: clear old tool outputs (not the whole turn) before the
@@ -2266,11 +2310,18 @@ async def _run_mode_turn(
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
-                usage_ev = _usage_event_from_ai(
-                    ai, model_id, prompt_tokens=_estimate_prompt_tokens(messages)
-                )
+                usage_ev = _usage_event_from_ai(ai, model_id)
                 if usage_ev:
-                    state["last_input_tokens"] = usage_ev["input_tokens"]
+                    # Track the SAME token breakdown the frontend context meter
+                    # shows, so auto-compaction fires off the exact value the meter
+                    # displays — they always agree. Use the provider-aware
+                    # `total_tokens` from the usage event (which already respects the
+                    # additive/subset cache convention) instead of hand-summing the
+                    # breakdown: for subset providers (OpenAI/OpenRouter/hy3-free)
+                    # cache_read/write is already folded into input_tokens, so a
+                    # hand-sum would double-count the cache and make the meter (and
+                    # the compaction trigger) report ~2x the real context.
+                    state["last_context_tokens"] = usage_ev["total_tokens"]
                     queue.put_nowait(usage_ev)
             except Exception as exc:  # surfaced to the retry wrapper
                 # A few local OpenAI-compatible servers (old llama.cpp / custom
@@ -2328,6 +2379,29 @@ async def _run_mode_turn(
                             ),
                         }
                     )
+                # --- Empty-response guard ---------------------------------
+                # A model (e.g. hy3-free) can return a step with NO tool call
+                # and NO meaningful text (finish_reason != "length"). The old
+                # code treated that as a clean finish, silently ending the turn
+                # and wiping the resume checkpoint — looking like a disconnect
+                # to the user. Mirror the length-truncation guard: auto-continue
+                # a bounded number of times so the model can actually produce
+                # output, and only warn+break if it keeps returning nothing.
+                if not _partial.strip() and not (reply or "").strip():
+                    if _auto_cont < _MAX_AUTO_CONT:
+                        _auto_cont += 1
+                        msgs.append(HumanMessage(content="ادامه بده."))
+                        continue
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                "The model returned an empty response; ending "
+                                "the turn early."
+                            ),
+                        }
+                    )
+                    break
                 reply = (reply or "") + _partial
                 break
             # --- Repetition-loop detection (tool-call signature) -------------
@@ -2454,8 +2528,8 @@ async def _run_mode_turn(
                     compact_model,
                     msgs,
                     ctx,
-                    last_input_tokens=state.get("last_input_tokens"),
-                    trigger_fraction=state.get("compact_trigger_fraction", _COMPACT_TRIGGER_FRACTION),
+                    last_context_tokens=state.get("last_context_tokens"),
+                    compact_at_percent=state.get("compact_at_percent", 80),
                 )
         return reply
 
@@ -2505,6 +2579,18 @@ async def _run_mode_turn(
                     break
                 # Transient failure: retry up to the budget, 30s apart.
                 if attempt >= _agents._RETRY_MAX_ATTEMPTS:
+                    # Surface the exhausted retry in codifa.log (not just as an SSE
+                    # event) so a cut-off turn is diagnosable without scraping the
+                    # stream. Timeouts here are the classic "turn cut off after a
+                    # long silent step" symptom.
+                    logger.warning(
+                        "[run_graph] agent run failed after %s attempts "
+                        "(chat_id=%s attempt=%s): %s",
+                        attempt,
+                        state.get("chat_id", ""),
+                        attempt,
+                        _agents._friendly_retry_reason(exc),
+                    )
                     queue.put_nowait(
                         {
                             "kind": "retry_giveup",
@@ -2551,7 +2637,8 @@ async def _run_mode_turn(
                 compact_model,
                 messages,
                 ctx,
-                last_input_tokens=state.get("last_input_tokens"),
+                last_context_tokens=state.get("last_context_tokens"),
+                compact_at_percent=state.get("compact_at_percent", 80),
             )
     # Clean finish: drop the interrupted-turn resume checkpoint so a LATER turn for
     # this chat starts fresh instead of mistakenly resuming this completed one. We

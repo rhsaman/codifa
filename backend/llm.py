@@ -39,6 +39,7 @@ from langchain_openai import ChatOpenAI
 from _common import (
     _THINKING_LEVELS,
     _extract_cache_tokens,
+    _extract_reasoning_tokens,
     _is_repeating,
     _strip_think_tags,
 )
@@ -210,11 +211,14 @@ def build_chat_model(
 
     model_class = meta.get("model_class") or "openai"
     headers = _extra_headers(provider, base_url, False)
-    to = model_timeout(provider=provider, total=timeout or 300)
+    to = model_timeout(provider=provider, total=timeout or 900)
     # LangChain's ChatOpenAI only accepts a SCALAR `timeout` (total seconds);
     # passing an `httpx.Timeout` object is silently ignored, leaving the request
     # with no timeout (it hangs until the client gives up). Use the scalar total.
-    lc_timeout = timeout or 300
+    # Default raised to 900s so a single model step that thinks silently for up
+    # to 15 min is not cut off (the old 300s ceiling killed long reasoning/slow
+    # provider steps mid-turn).
+    lc_timeout = timeout or 900
     tkwargs = _thinking_kwargs(provider, model, thinking_level, model_reasoning)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
     if meta.get("parallel_calls"):
@@ -744,12 +748,16 @@ def usage_event(
             input_tokens = int(metadata.get("input_tokens", 0) or 0)
             output_tokens = int(metadata.get("output_tokens", 0) or 0)
             cache_read, cache_write, key_additive = _extract_cache_tokens(metadata)
+            reasoning_tokens = _extract_reasoning_tokens(metadata)
         else:
             input_tokens = int(getattr(metadata, "input_tokens", 0) or 0)
             output_tokens = int(getattr(metadata, "output_tokens", 0) or 0)
             cache_read = int(getattr(metadata, "cache_read_input_tokens", 0) or 0)
             cache_write = int(getattr(metadata, "cache_creation_input_tokens", 0) or 0)
             key_additive = bool(cache_read or cache_write)
+            reasoning_tokens = _extract_reasoning_tokens(
+                getattr(metadata, "model_dump", dict)() or {}
+            )
         # Additive when Anthropic-native key, or when cached portion exceeds
         # input_tokens (input excludes the cache). Otherwise cache is a subset of
         # input_tokens and the provider total already counts it.
@@ -765,8 +773,16 @@ def usage_event(
         except Exception:  # noqa: BLE001
             _md_dump = repr(metadata)
         if additive:
-            total = input_tokens + output_tokens + cache_read + cache_write
+            # Cache is separate from input_tokens -> add it back for the true
+            # total. reasoning_tokens is reported separately, so include it.
+            total = (
+                input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write
+            )
         else:
+            # Subset convention: cache_read/write is already folded into
+            # input_tokens, so total_tokens already counts the cache. Trust the
+            # provider's own total_tokens when present; only hand-sum (adding
+            # reasoning_tokens) when it is absent.
             provided_total = (
                 metadata.get("total_tokens")
                 if isinstance(metadata, dict)
@@ -775,7 +791,7 @@ def usage_event(
             total = (
                 (provided_total or 0)
                 if (provided_total or 0)
-                else input_tokens + output_tokens
+                else input_tokens + output_tokens + reasoning_tokens
             )
         if total <= 0:
             return None
@@ -784,8 +800,18 @@ def usage_event(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total,
+            # Always surface the TRUE cache counts so the sidebar can bill them
+            # at the cheaper cache rate. For subset-convention providers (OpenAI
+            # / OpenRouter / Google) cache_read/write is already folded into
+            # input_tokens, so `total_tokens` stays the provider's native total
+            # (which already counts the cache) — the frontend's meter uses
+            # `total_tokens` directly and only hand-sums (input+output+reasoning
+            # +cache) when total_tokens is absent, so no double-count occurs. For
+            # additive providers (Anthropic) the real cache counts are sent and
+            # total_tokens is the hand-sum, so the meter's opencode sum is correct.
             "cache_read_tokens": cache_read,
             "cache_write_tokens": cache_write,
+            "reasoning_tokens": reasoning_tokens,
             "context_tokens": prompt_tokens,
             "model": model or "",
             "sub": sub,

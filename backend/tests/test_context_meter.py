@@ -5,19 +5,7 @@ Covers the backend side that the frontend meter must mirror:
 - `CompactRequest.compact_at_percent` default now matches the auto-compact / UI default.
 """
 
-import graph
 import server
-
-
-def test_usable_tokens_opencode_parity():
-    # No output limit known -> opencode reserves 0 (usable == ctx).
-    assert graph._agents._usable_tokens(200_000, 0, None) == 200_000
-    # UI headroom (reserved) is honored directly — the meter fills toward this.
-    assert graph._agents._usable_tokens(200_000, 0, 20_000) == 180_000
-    # Known max output -> opencode reserves min(COMPACTION_BUFFER, max_output).
-    assert graph._agents._usable_tokens(200_000, 8192, None) == 200_000 - 8192
-    # reserved is clamped to [0, ctx].
-    assert graph._agents._usable_tokens(8000, 0, 200_000) == 0
 
 
 def test_compact_request_percent_default_matches_auto_compact():

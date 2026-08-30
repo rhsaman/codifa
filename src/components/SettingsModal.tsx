@@ -784,10 +784,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         }
         setCfg((c) => {
           const first = res.models[0]
-          const auto = first ? res.context[first] : 0
-          // User override wins; fall back to the catalog value.
-          const contextWindow = c.contextWindow && c.contextWindow > 0 ? c.contextWindow : auto
-          return { ...c, model: c.model || first, contextWindow }
+          return { ...c, model: c.model || first }
         })
       } catch {
         /* /models may be unreachable; keep the saved list */
@@ -1347,26 +1344,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
             </div>
 
-            <div className="field">
-              <label>Context window (tokens) — optional override</label>
-              <input
-                type="number"
-                min={0}
-                step={1000}
-                value={cfg.contextWindow ?? 0}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10)
-                  setCfg({ ...cfg, contextWindow: Number.isFinite(v) && v > 0 ? v : 0 })
-                }}
-                placeholder="e.g. 190000 — leave 0 to auto-detect"
-                dir="ltr"
-              />
-              <div className="hint">
-                Overrides the model's auto-detected context window. Set this if the provider
-                reports the wrong size or the meter shows premature compaction. Leave 0 to use
-                the value fetched from the provider's /models endpoint.
-              </div>
-            </div>
           </>
         )}
         </>

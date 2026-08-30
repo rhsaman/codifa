@@ -281,7 +281,7 @@ async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace)
     )
     _base, mock = mock_server
     mock.script = [text_reply("done")]
-    events = await run_events("یک کامپوننت بنویس", mode="coder")
+    await run_events("یک کامپوننت بنویس", mode="coder")
     # The test command must appear in the messages sent to the model (injected
     # by detect_test_commands() into the Coder's test-verification prompt).
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
@@ -299,7 +299,7 @@ async def test_agent_runs_flutter_test_gate(run_events, mock_server, workspace):
     )
     _base, mock = mock_server
     mock.script = [text_reply("done")]
-    events = await run_events("یک ویجت بنویس", mode="coder")
+    await run_events("یک ویجت بنویس", mode="coder")
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
     joined = json.dumps(all_messages, ensure_ascii=False)
     assert "flutter test" in joined, (

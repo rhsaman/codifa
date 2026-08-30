@@ -313,7 +313,6 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     oauthClientId: p.oauthClientId || '',
     oauthClientSecret: p.oauthClientSecret || '',
     oauthRefreshToken: p.oauthRefreshToken || '',
-    contextWindow: p.contextWindow,
     contextMap: p.contextMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
@@ -776,7 +775,6 @@ export const useStore = create<State>((set, get) => ({
         apiKey: oldP.apiKey || '',
         baseUrl: kind === 'custom' || kind === 'ollama' ? oldP.baseUrl || '' : '',
         model: oldP.model || '',
-        contextWindow: oldP.contextWindow,
       })
       const defs = defaultProviders().filter((p) => p.id !== legacy.id)
       providers = [legacy, ...defs]

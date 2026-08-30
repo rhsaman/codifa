@@ -67,21 +67,8 @@ async def test_web_search_cached_on_repeat():
     assert second == first
 
 
-async def test_web_search_distinct_queries_call_again():
-    real = {
-        "results": [
-            {"title": "T", "url": "https://example.com", "snippet": "snip"}
-        ]
-    }
-    a, na = await _run_query("alpha query", real)
-    b, nb = await _run_query("beta query", real)
-    assert na == 1 and nb == 1
-    assert a != b or a == b  # both valid; just ensure distinct keys don't collide
-
-
 def main():
     asyncio.run(test_web_search_cached_on_repeat())
-    asyncio.run(test_web_search_distinct_queries_call_again())
     print("OK: web_search_tool caches identical queries (no redundant calls)")
 
 

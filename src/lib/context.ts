@@ -248,13 +248,13 @@ export function computeContextUsed(
 /** Resolve a model's context window from the provider's contextMap, trying
  *  both the bare id (what the picker stores) and the provider-prefixed id
  *  (NVIDIA's /models returns "nvidia/<model>" while the picker stores the
- *  bare form, so the map is keyed by the prefixed id). Falls back to the
- *  provider-wide contextWindow. */
+ *  bare form, so the map is keyed by the prefixed id). The window comes solely
+ *  from the model (reported by the provider's /models endpoint) — there is no
+ *  manual override. */
 export function modelContextWindow(
   provider: {
     id?: string
     contextMap?: Record<string, number>
-    contextWindow?: number
   } | null | undefined,
   model: string,
 ): number | null {
@@ -264,9 +264,7 @@ export function modelContextWindow(
   if (direct && direct > 0) return direct
   const prefixed = map[`${provider.id ?? ''}/${model}`]
   if (prefixed && prefixed > 0) return prefixed
-  return provider.contextWindow && provider.contextWindow > 0
-    ? provider.contextWindow
-    : null
+  return null
 }
 
 /** Resolve a model's reasoning-support flag from the provider's reasoningMap,

@@ -16,22 +16,6 @@ def test_memory_and_search_memory_tools_removed():
     assert "search_memory" not in tools, "ابزار search_memory نباید وجود داشته باشه"
 
 
-def test_open_vector_store_not_called_on_chat_start():
-    """اگه embedding نداریم، اول چت نباید vector-db ساخته بشه.
-
-    چون open_vector_store فقط توی web_search_tool/fetch_url_tool صدا زده می‌شه
-    (lazy)، پس با ساخت tools هیچ پوشه‌ای نباید ساخته بشه.
-    """
-    root = tempfile.mkdtemp()
-    # ساخت tools (بدون صدا زدن web_search)
-    make_tool_callbacks(root=root, emit=lambda e: None)
-    # چک کنیم پوشه‌ی vector-db توی root ساخته نشده
-    # (open_vector_store پیش‌فرض توی ~/.codifa/vector-db می‌سازه، ولی چون
-    #  صدا زده نشده، نباید فایلی اونجا باشه — ولی چون ممکنه قبلاً وجود داشته باشه،
-    #  این تست فقط چک می‌کنه که ابزارها ساخته شدن بدون خطا)
-    assert True  # اگه اینجا رسید، یعنی بدون خطا ساخته شد
-
-
 def test_web_search_tool_opens_store_lazily(monkeypatch):
     """web_search_tool باید store رو lazy باز کنه (نه از پارامتر بگیره)."""
     opened = []

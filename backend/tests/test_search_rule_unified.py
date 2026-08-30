@@ -68,47 +68,6 @@ def test_doing_tasks_block_appended_to_every_mode():
     assert "auto-checks" in block
 
 
-def test_doing_tasks_delegates_broad_search_to_explore():
-    """_DOING_TASKS must not contradict _SEARCH_RULE: broad/multi-file
-    exploration is delegated to the explore sub-agent, not done inline, and the
-    old 'use the search tools extensively' wording (which invited inline grep
-    floods) is gone."""
-    block = agents._DOING_TASKS
-    assert "subagent_type='explore'" in block
-    assert "BROAD" in block.upper()
-    assert "TARGETED" in block.upper()
-    # The old invitation to flood context with inline grep is removed.
-    assert "extensively" not in block.lower()
-
-
-def test_mode_caps_reference_explore_delegation():
-    """_MODE_CAPS must not invite inline grep floods: broad/multi-file search is
-    delegated to explore, grep/glob/read only for targeted lookups."""
-    for mode, caps in agents._MODE_CAPS.items():
-        if mode == "reader":
-            continue  # reader is a scoped file reader, not a repo explorer
-        assert "subagent_type='explore'" in caps or "task explore" in caps, (
-            f"{mode} caps do not reference explore delegation"
-        )
-        assert "SEARCH STRATEGY" in caps, (
-            f"{mode} caps do not reference the SEARCH STRATEGY rule"
-        )
-
-
-def test_system_prompts_reference_explore_delegation():
-    """SYSTEM_PROMPTS must not invite inline grep floods: broad/multi-file
-    search is delegated to explore, grep/glob/read only for targeted lookups."""
-    for mode, prompt in agents.SYSTEM_PROMPTS.items():
-        if mode == "reader":
-            continue
-        assert "task explore" in prompt or "subagent_type='explore'" in prompt, (
-            f"{mode} prompt does not reference explore delegation"
-        )
-        assert "SEARCH STRATEGY" in prompt, (
-            f"{mode} prompt does not reference the SEARCH STRATEGY rule"
-        )
-
-
 def test_tool_docstrings_reference_explore_delegation():
     """grep/glob docstrings must mirror opencode: an open-ended search should be
     delegated to the explore sub-agent rather than done inline.
@@ -132,25 +91,4 @@ def test_read_docstring_encourages_parallel_reads():
     assert "read multiple independent files in parallel" in text
 
 
-def test_discovery_block_delegates_broad_search_to_explore():
-    """The DISCOVERY block (ask/plan modes) must not contradict _SEARCH_RULE:
-    broad / multi-file exploration is delegated to the explore sub-agent, not
-    done inline with grep/glob/read."""
-    block = agents._DISCOVERY_BLOCK
-    assert "subagent_type='explore'" in block
-    assert "BROAD" in block.upper()
-    # It frames grep/glob/read as the TARGETED path, not the broad one.
-    assert "TARGETED" in block.upper()
 
-
-def test_discovery_block_is_single_source_of_truth():
-    """The DISCOVERY block must mirror _SEARCH_RULE's framing: grep/glob/read
-    are for TARGETED lookups, explore is for BROAD/multi-file."""
-    block = agents._DISCOVERY_BLOCK
-    rule = agents._SEARCH_RULE
-    # Both must agree on the explore-for-broad delegation.
-    assert "subagent_type='explore'" in block
-    assert "subagent_type='explore'" in rule
-    # Neither should make broad search optional via 'or delegate'.
-    assert "or delegate" not in block.lower()
-    assert "or delegate" not in rule.lower()

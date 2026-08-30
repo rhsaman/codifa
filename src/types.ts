@@ -91,7 +91,6 @@ export interface ProviderConfig {
   oauthClientId?: string
   oauthClientSecret?: string
   oauthRefreshToken?: string
-  contextWindow?: number
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */

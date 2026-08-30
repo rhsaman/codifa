@@ -142,9 +142,38 @@ function migrateModePrompts(prompts: Record<string, string>): Record<string, str
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | undefined
+// Debounce window for the main `persist` path. Kept short (100ms) so a
+// user-initiated setting change in Settings → Storage lands on disk before
+// the user can reach the quit menu / Cmd-Q — the 500ms we used previously
+// was wide enough that rapid edits + an immediate quit could drop the last
+// value on the floor (the IPC handler for `flush-persist` still does the
+// authoritative sync flush, but the sooner `storeSet('settings', ...)` is
+// called, the less work the flush has to recover from).
+// Coerce a value from a (possibly stringified) settings.json field to a
+// positive integer, falling back to `fallback` when nothing usable is on disk.
+// Settings fields may round-trip through JSON safely, but the IPC layer or
+// an older settings file can hand us string-shaped digits ("30") or null.
+// Accept anything that coerces to a valid value rather than silently
+// falling back to the default — the user did set it, so don't erase it.
+function coercePositiveInt(v: unknown, fallback: number): number {
+  const n = typeof v === 'string' ? parseInt(v, 10) : (v as number)
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback
+}
+function coerceNonNegInt(v: unknown, fallback: number): number {
+  const n = typeof v === 'string' ? parseInt(v, 10) : (v as number)
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback
+}
+function coerceBoundedInt(v: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof v === 'string' ? parseInt(v, 10) : (v as number)
+  if (!Number.isFinite(n)) return fallback
+  const r = Math.round(n)
+  return Math.max(min, Math.min(max, r))
+}
+
+const PERSIST_DEBOUNCE_MS = 100
 function persistSoon(): void {
   clearTimeout(persistTimer)
-  persistTimer = setTimeout(() => useStore.getState().persist(), 500)
+  persistTimer = setTimeout(() => useStore.getState().persist(), PERSIST_DEBOUNCE_MS)
 }
 
 // Chats-only snapshot for the mid-stream heartbeat: skips settings entirely so
@@ -891,8 +920,18 @@ export const useStore = create<State>((set, get) => ({
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
         ? { ...(raw.subagentModels as Record<string, string>) }
         : {},
-      cacheTtlMinutes: typeof raw.cacheTtlMinutes === 'number' && raw.cacheTtlMinutes > 0 ? raw.cacheTtlMinutes : 60,
-      historyLimit: typeof raw.historyLimit === 'number' && raw.historyLimit >= 0 ? Math.round(raw.historyLimit) : 0,
+      // Coerce numbers defensively: settings.json may round-trip numbers
+      // through JSON safely, but the IPC layer or an older settings file
+      // can hand us string-shaped digits ("30") or null. Accept anything that
+      // coerces to a valid value rather than silently falling back to the
+      // default — the user did set it, so don't erase their choice.
+      cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
+      historyLimit: coerceNonNegInt(raw.historyLimit, 0),
+      webSearchTtlDays: coercePositiveInt(raw.webSearchTtlDays, 7),
+      fetchUrlTtlDays: coercePositiveInt(raw.fetchUrlTtlDays, 7),
+      ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 90),
+      // 0 is a valid, deliberate value (auto-fetch disabled) — keep it.
+      webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 3, 0, 10),
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
       // are dropped here so they disappear from Settings → Plugins on reload.
       searchPlugins: searchPlugins.length > 0

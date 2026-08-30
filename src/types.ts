@@ -136,6 +136,9 @@ export interface Settings {
   fetchUrlTtlDays?: number
   /** TTL for RAG web/fetch storage (days). Default: 90. */
   ragWebTtlDays?: number
+  /** How many top web_search results get their page content auto-fetched
+   *  before answering (0 = off, snippet-only). Default: 3. */
+  webSearchAutoFetch?: number
   /** Web-search engines for the web_search tool (Settings → Plugins). Order
    *  decides primary vs fallback. Empty = DuckDuckGo only (backward compat). */
   searchPlugins?: SearchPluginConfig[]

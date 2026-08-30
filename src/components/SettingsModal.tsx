@@ -572,8 +572,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   }
 
   // ---- Storage settings (Settings → Storage) ----
+  // Keep a local string buffer so the user can type freely (e.g. an empty field
+  // or a transient "0" while editing); sync the input from the store on mount /
+  // external change so a load (or a backfill) shows the persisted value.
   const [cacheTtlInput, setCacheTtlInput] = useState(String(cacheTtlMinutes))
   const [memMsg, setMemMsg] = useState('')
+  useEffect(() => {
+    setCacheTtlInput(String(cacheTtlMinutes))
+  }, [cacheTtlMinutes])
 
   const refreshModels = useCallback(async () => {
     setMStatus(await getModelsStatus())
@@ -1869,6 +1875,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <div className="settings-row-title">Cache TTL</div>
                 <div className="settings-row-desc">
                   How long <b>tool outputs</b> stay cached before re-running. Default: <code>60min</code>.
+                  Persists automatically on every change (no Save button needed).
                 </div>
               </div>
               <div className="settings-row-control">
@@ -1876,27 +1883,23 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   type="number"
                   min={1}
                   value={cacheTtlInput}
-                  onChange={(e) => setCacheTtlInput(e.target.value)}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    setCacheTtlInput(v)
+                    // Commit on every change so the value lands on disk without a
+                    // separate Save click. Reject non-positive / non-numeric
+                    // input (the store's setter also clamps to >0); an empty
+                    // string just clears the visible buffer without persisting.
+                    const n = parseInt(v, 10)
+                    if (Number.isFinite(n) && n > 0) {
+                      setMemoryTtlConfig({ cache: n })
+                      setMemMsg('Cache TTL saved.')
+                    }
+                  }}
                   dir="ltr"
                   aria-label="Cache TTL in minutes"
                 />
                 <span className="field-unit">minutes</span>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Save cache config</div>
-                <div className="settings-row-desc">
-                  Persists the Cache TTL to settings. Takes effect immediately for new cache entries.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <button className="btn tiny" onClick={() => {
-                  const c = parseInt(cacheTtlInput, 10)
-                  setMemoryTtlConfig({ cache: Number.isFinite(c) ? c : 60 })
-                  setMemMsg('Cache TTL saved.')
-                }}>Save cache TTL</button>
               </div>
             </div>
           </div>

@@ -58,26 +58,40 @@ SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compac
 # across parallel explore agents in the same turn. This keeps tool-call counts
 # down (no redundant grep/glob) without any quality loss: the cached result is
 # byte-for-byte what a fresh scan would return. Keyed by
-# (tool, pattern, path, include).
-_parent_search_cache: dict[tuple[str, str, str, str], str] = {}
+# (tool, pattern, path, include, root) for grep/glob — root is included so two
+# different projects/workspaces sharing a pattern+path never cross-serve each
+# other's cached matches ("read" entries stay 4-tuples: they're keyed by the
+# already-root-resolved absolute path, so they can't collide across roots).
+_parent_search_cache: dict[tuple[str, ...], str] = {}
 
 
 def _invalidate_read_cache_for(path: str, root: str) -> None:
-    """Drop any cached read_tool result for ``path`` (any offset/limit).
+    """Drop cached read/grep/glob results affected by an edit under ``root``.
 
-    Called after edit_file/write_file so a re-read reflects new content
-    instead of returning stale cached bytes. Keyed by the normalized
-    absolute path ("read", target, offset, limit) — see ``_read_target`` —
-    so invalidation matches regardless of how the model spelled the path
-    (``src/main.py`` vs ``./src/main.py`` vs an absolute path under root).
+    Called after edit_file/write_file so a re-read/re-search reflects new
+    content instead of returning stale cached bytes.
+
+    - ``read`` entries are keyed by the normalized absolute path ("read",
+      target, offset, limit) — see ``_read_target`` — so only the touched
+      file's cached reads are dropped.
+    - ``grep``/``glob`` entries are keyed by pattern/path, not by which files
+      they matched, so we can't tell which cached searches this specific edit
+      would affect. Instead every grep/glob entry scoped to this ``root`` is
+      dropped — cheap (they lazily re-populate on next use) and guarantees a
+      stale match never survives an edit.
     """
     try:
         norm = resolve_safe(root, path, allow_coder=True)
     except PathEscapeError:
-        # Path escapes the sandbox: read_tool never cached it, so there is
-        # nothing to invalidate.
-        return
-    stale = [k for k in _parent_search_cache if k[0] == "read" and k[1] == norm]
+        # Path escapes the sandbox: read_tool never cached it under this path,
+        # but grep/glob entries for this root may still exist — fall through.
+        norm = None
+    stale = [
+        k
+        for k in _parent_search_cache
+        if (k[0] == "read" and norm is not None and k[1] == norm)
+        or (k[0] in ("grep", "glob") and len(k) > 4 and k[4] == root)
+    ]
     for k in stale:
         del _parent_search_cache[k]
 
@@ -3286,7 +3300,7 @@ def make_tool_callbacks(
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
-        cache_key = ("grep", pattern, path, include)
+        cache_key = ("grep", pattern, path, include, root)
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -3464,7 +3478,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache key
-        cache_key = ("glob", pattern, path, "")
+        cache_key = ("glob", pattern, path, "", root)
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(

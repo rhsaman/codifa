@@ -3850,6 +3850,12 @@ textarea {
   font-size: 11px;
   font-family: var(--font-mono);
   color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .copy-btn {
@@ -3872,6 +3878,124 @@ textarea {
   border: none;
   border-radius: 0;
   background: var(--bg) !important;
+  padding: 8px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+/* Each code line is wrapped in a `.code-line` span containing a `.code-gutter`
+   (the line number) and a `.code-text` (the highlighted source). The gutter is
+   marked `user-select: none`, so it is purely visual — selecting/copying the
+   block copies only the code, never the numbers. The trailing newline inside
+   each span preserves the line breaks. */
+.code-block pre .code-line {
+  display: block;
+  padding: 0 12px 0 52px;
+  position: relative;
+  white-space: pre;
+  font-size: 12px;
+  line-height: 1.55;
+  font-family: var(--font-mono);
+}
+
+.code-block pre .code-gutter {
+  position: absolute;
+  left: 0;
+  width: 40px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-dim);
+  opacity: 0.55;
+  user-select: none;
+  -webkit-user-select: none;
+  font-variant-numeric: tabular-nums;
+  border-right: 1px solid var(--border);
+}
+
+.code-block pre .code-text {
+  display: inline;
+}
+
+/* highlight.js token colors — the exact GitHub Dark palette, scoped to
+   `.code-block` so it never leaks into the rest of the app. We inline it
+   (instead of importing `highlight.js/styles/github-dark.min.css`) because that
+   file is not reliably bundled in the Electron renderer. */
+.code-block .hljs {
+  color: #c9d1d9;
+  background: transparent;
+}
+.code-block .hljs-doctag,
+.code-block .hljs-keyword,
+.code-block .hljs-meta .hljs-keyword,
+.code-block .hljs-template-tag,
+.code-block .hljs-template-variable,
+.code-block .hljs-type,
+.code-block .hljs-variable.language_ {
+  color: #ff7b72;
+}
+.code-block .hljs-title,
+.code-block .hljs-title.class_,
+.code-block .hljs-title.class_.inherited__,
+.code-block .hljs-title.function_ {
+  color: #d2a8ff;
+}
+.code-block .hljs-attr,
+.code-block .hljs-attribute,
+.code-block .hljs-literal,
+.code-block .hljs-meta,
+.code-block .hljs-number,
+.code-block .hljs-operator,
+.code-block .hljs-selector-attr,
+.code-block .hljs-selector-class,
+.code-block .hljs-selector-id,
+.code-block .hljs-variable {
+  color: #79c0ff;
+}
+.code-block .hljs-meta .hljs-string,
+.code-block .hljs-regexp,
+.code-block .hljs-string {
+  color: #a5d6ff;
+}
+.code-block .hljs-built_in,
+.code-block .hljs-symbol {
+  color: #ffa657;
+}
+.code-block .hljs-code,
+.code-block .hljs-comment,
+.code-block .hljs-formula {
+  color: #8b949e;
+}
+.code-block .hljs-name,
+.code-block .hljs-quote,
+.code-block .hljs-selector-pseudo,
+.code-block .hljs-selector-tag {
+  color: #7ee787;
+}
+.code-block .hljs-subst {
+  color: #c9d1d9;
+}
+.code-block .hljs-section {
+  color: #1f6feb;
+  font-weight: 700;
+}
+.code-block .hljs-bullet {
+  color: #f2cc60;
+}
+.code-block .hljs-emphasis {
+  color: #c9d1d9;
+  font-style: italic;
+}
+.code-block .hljs-strong {
+  color: #c9d1d9;
+  font-weight: 700;
+}
+.code-block .hljs-addition {
+  color: #aff5b4;
+  background-color: #033a16;
+}
+.code-block .hljs-deletion {
+  color: #ffdcd7;
+  background-color: #67060c;
 }
 
 .modal-overlay {

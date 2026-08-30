@@ -18,12 +18,20 @@ import re
 import secrets
 import time
 import traceback
+import tracemalloc
 from typing import Annotated
 from urllib.parse import quote
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 logger = logging.getLogger("codifa.server")
+
+# tracemalloc instrumentation state. Tracing is started once at sidecar boot
+# (see _maybe_start_tracemalloc) and a snapshot is taken after every agent run
+# so codifa.log can show *which* allocator is growing between runs — the key to
+# diagnosing the RSS climb flagged by the "agent run complete rss_mb=..." line.
+_TRACE_PREV_SNAPSHOT = None
+_TRACE_FRAMES = 25
 
 
 def _rss_mb() -> float | None:
@@ -40,6 +48,90 @@ def _rss_mb() -> float | None:
         return rss / 1024
     except Exception:  # noqa: BLE001 — RSS is best-effort diagnostics only
         return None
+
+
+def _maybe_start_tracemalloc() -> None:
+    """Start allocation tracing once, if enabled via env or DEBUG logging.
+
+    tracemalloc overhead is modest but non-zero, so tracing stays OFF unless the
+    operator opts in (CODFA_TRACE_MALLOC=1) or runs a DEBUG diagnostic session
+    (CODFA_LOG_LEVEL=DEBUG). Once started it is never stopped for the process
+    lifetime; snapshots are diffed run-over-run in _log_memory_snapshot.
+    """
+    global _TRACE_PREV_SNAPSHOT
+    if tracemalloc.is_tracing():
+        return
+    _enabled = os.environ.get("CODFA_TRACE_MALLOC", "").strip() in ("1", "true", "yes")
+    _debug = os.environ.get("CODFA_LOG_LEVEL", "WARNING").upper() == "DEBUG"
+    if not (_enabled or _debug):
+        return
+    try:
+        tracemalloc.start(_TRACE_FRAMES)
+        _TRACE_PREV_SNAPSHOT = None
+        logger.warning("tracemalloc tracing started (run-complete snapshots enabled)")
+    except Exception:  # noqa: BLE001, S110 — tracing must never break the sidecar
+        pass
+
+
+def _log_memory_snapshot(chat_id: str) -> None:
+    """Log the top allocation growth since the last run, and top overall holders.
+
+    Only does work when tracemalloc is actually tracing. Emits a compact,
+    grep-friendly block so the dominant allocator between runs is visible in
+    codifa.log without external tooling.
+    """
+    global _TRACE_PREV_SNAPSHOT
+    if not tracemalloc.is_tracing():
+        return
+    try:
+        # NOTE: take_snapshot() materializes every live trace (hundreds of
+        # thousands here) and can transiently spike RSS by hundreds of MB. On
+        # macOS ru_maxrss is a monotonic high-water mark, so that transient spike
+        # shows up as a fake "jump" in the next "agent run start rss_mb". Log RSS
+        # around the snapshot so the instrumentation's own cost is visible and
+        # not mistaken for a leak.
+        _rss_before = _rss_mb() or 0.0
+        _snap = tracemalloc.take_snapshot()
+        _rss_after = _rss_mb() or 0.0
+        if _rss_after - _rss_before > 50.0:
+            logger.warning(
+                "tracemalloc snapshot self-cost chat_id=%s ~%.0f MiB (transient, RSS high-water only)",
+                chat_id,
+                _rss_after - _rss_before,
+            )
+
+        def _loc_of(stat) -> str:
+            # statistics() -> Statistic (traceback attr); compare_to() ->
+            # StatisticDiff (trace attr). Normalize so both render the same.
+            _tb = getattr(stat, "traceback", None) or getattr(stat, "trace", None)
+            if not _tb:
+                return "?"
+            _frames = _tb.format()
+            return _frames[-1] if _frames else "?"
+
+        if _TRACE_PREV_SNAPSHOT is not None:
+            _top = _snap.compare_to(_TRACE_PREV_SNAPSHOT, "lineno")[:12]
+            _lines = [
+                f"MEM-GROW chat_id={chat_id} top allocators since last run (size KiB / count):"
+            ]
+            for _st in _top:
+                _lines.append(
+                    f"  +{_st.size / 1024:.0f} KiB  {_st.count} objs  {_loc_of(_st)}"
+                )
+            logger.warning("\n".join(_lines))
+        # Top overall current holders (where the memory lives right now).
+        _overall = _snap.statistics("lineno")[:12]
+        _olines = [
+            f"MEM-NOW chat_id={chat_id} top current allocations (size KiB / count):"
+        ]
+        for _st in _overall:
+            _olines.append(
+                f"  {_st.size / 1024:.0f} KiB  {_st.count} objs  {_loc_of(_st)}"
+            )
+        logger.warning("\n".join(_olines))
+        _TRACE_PREV_SNAPSHOT = _snap
+    except Exception:  # noqa: BLE001, S110 — diagnostics must never break the run
+        pass
 
 # Pending permission requests: id -> asyncio.Future. Resolved by the
 # /permission/respond endpoint and awaited by the agent's request_permission /
@@ -1179,6 +1271,20 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     yield ": keepalive\n\n"
                 else:
                     yield _sse(event)
+            # Run finished cleanly: surface the post-run RSS so a growing memory
+            # trend between runs is visible in codifa.log, and reclaim any cyclic
+            # garbage the agent graph/SDK left behind (Python's allocator often
+            # keeps RSS high even after objects die, so this only frees what it
+            # can, but it makes genuine leaks observable).
+            import gc
+
+            gc.collect()
+            logger.warning(
+                "agent run complete chat_id=%s rss_mb=%.1f",
+                req.chat_id,
+                _rss_mb() or 0.0,
+            )
+            _log_memory_snapshot(req.chat_id)
 
         except asyncio.CancelledError:
             # Client disconnected (aborted the stream): the run_agent generator
@@ -1482,6 +1588,26 @@ def main() -> None:
         _level_name = os.environ.get("CODFA_LOG_LEVEL", "WARNING").upper()
         _root.setLevel(getattr(logging, _level_name, logging.WARNING))
         _root.addHandler(_handler)
+        # Third-party libraries (httpx/httpcore transport noise, the openai SDK's
+        # request/response debug, and aiosqlite's per-statement logging) emit an
+        # enormous volume of DEBUG lines that bury the real signal and bloat the
+        # persistent log (MBs of header dumps per agent run). Keep their file-log
+        # verbosity capped at WARNING regardless of CODFA_LOG_LEVEL so a DEBUG
+        # diagnostic session still produces a readable codifa.log. Our own
+        # "codifa.*" modules are unaffected and follow CODFA_LOG_LEVEL as before.
+        for _noisy in (
+            "httpx",
+            "httpcore",
+            "openai",
+            "openai._base_client",
+            "aiosqlite",
+        ):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
+        # Start allocation tracing when asked (off by default: tracemalloc adds a
+        # small CPU/memory overhead). Enable via CODFA_TRACE_MALLOC=1, or
+        # automatically when CODFA_LOG_LEVEL=DEBUG so a diagnostic session also
+        # captures per-run allocation diffs.
+        _maybe_start_tracemalloc()
     except Exception:  # noqa: BLE001, S110 — logging must never kill the sidecar
         pass
 

@@ -277,8 +277,14 @@ export async function streamChat(
   // respawns the sidecar and resumes from the on-disk checkpointer, instead of
   // silently stranding the user on a manual resend.
   let gotDone = false
+  // Whether ANY event (incl. keepalive) was delivered on this attempt. Used to
+  // distinguish a genuine sidecar crash-before-output (no events — heal with a
+  // reconnect) from an interrupted mid-turn stream (events already flowing — do
+  // NOT auto-re-send the turn, or it would retry on an idle chat).
+  let gotAnyEvent = false
   const wrappedOnEvent = (e: SidecarEvent) => {
     if (e?.kind === 'done') gotDone = true
+    gotAnyEvent = true
     onEvent(e)
   }
 
@@ -426,6 +432,18 @@ export async function streamChat(
     } catch (err) {
       // A manual abort must propagate immediately, not trigger a reconnect.
       if (params.signal?.aborted || (err as Error).name === 'AbortError') throw err
+      // Only auto-reconnect on a genuine sidecar crash BEFORE any output (no
+      // event was delivered). If events were already flowing and the stream then
+      // dropped, it's an interruption (client disconnect / user navigated away),
+      // not a crash. Re-sending the whole turn here would retry on an idle chat —
+      // exactly the unwanted "Provider hiccup during idle" behavior. Instead,
+      // throw so the UI shows a Retry banner; clicking it resumes the backend from
+      // the LangGraph checkpoint.
+      if (gotAnyEvent) {
+        throw new Error(
+          'Connection lost mid-turn — the turn was interrupted. Click Retry to resume from the last checkpoint.',
+        )
+      }
       // Surface the self-heal so the user isn't left wondering why the turn
       // restarted on its own (the "interrupted itself" confusion).
       wrappedOnEvent({

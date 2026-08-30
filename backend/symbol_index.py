@@ -152,6 +152,35 @@ Tag = namedtuple("Tag", ["rel_fname", "fname", "line", "name", "kind"])
 _SCM_CACHE: dict[str, str | None] = {}
 _SCM_CACHE_LOCK = threading.Lock()
 
+# کش آبجکت‌های سنگین tree-sitter (language/parser/Query) — اینا به ازای هر
+# زبان ثابت‌ان و دوباره‌سازیشون در هر فراخوانیِ _get_tags_raw گرونه (لاگِ
+# MEM-GROW نشون داد Query توی هر اجرای ایجنت ~۱۳ هزار بار ساخته می‌شه).
+_LANG_OBJ_CACHE: dict[str, tuple[object, object, object | None]] = {}
+_LANG_OBJ_LOCK = threading.Lock()
+
+
+def _get_lang_objs(lang: str):
+    """برمی‌گردونه (language, parser, query) کش‌شده برای یه زبان.
+
+    language/parser/Query آبجکت‌های سنگینی هستن که فقط به lang بستگی دارن؛
+    کش شدنشون جلویِ ساختِ هزاران تا Query توی یه اجرای ایجنت رو می‌گیره.
+    هر جزء ممکنه بخاطر گرامرِ نصب‌نشده None برگرده (فراخوان‌کننده fallback می‌کنه).
+    """
+    with _LANG_OBJ_LOCK:
+        cached = _LANG_OBJ_CACHE.get(lang)
+        if cached is not None:
+            return cached
+    try:
+        language = get_language(lang)
+        parser = get_parser(lang)
+        scm = _get_scm_fname(lang)
+        query = Query(language, scm) if scm else None
+    except Exception:  # noqa: BLE001 — گرامر/query نامعتبر
+        return (None, None, None)
+    with _LANG_OBJ_LOCK:
+        _LANG_OBJ_CACHE[lang] = (language, parser, query)
+    return (language, parser, query)
+
 
 def _get_scm_fname(lang: str):
     """مسیر فایل tags.scm برای یه زبان (مثل aider.get_scm_fname).
@@ -190,15 +219,12 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
     ext = os.path.splitext(fname)[1].lower()
     if ext in _LANG_ALIASES:
         lang = _LANG_ALIASES[ext]
-    try:
-        language = get_language(lang)
-        parser = get_parser(lang)
-    except Exception:  # noqa: BLE001 — گرامر لود نشد
+    language, parser, query = _get_lang_objs(lang)
+    if language is None or parser is None:
         # به‌جای قطع کامل، اجازه می‌دیم فراخوان‌کننده به fallback regex برگرده.
         return []
 
-    scm = _get_scm_fname(lang)
-    if not scm:
+    if query is None:
         # tags.scm نداریم → فراخوان‌کننده به regex/AST فعلی برمی‌گرده.
         return []
 
@@ -211,8 +237,7 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
 
     try:
         tree = parser.parse(bytes(code, "utf-8"))
-        query = Query(language, scm)
-    except Exception:  # noqa: BLE001 — query نامعتبر
+    except Exception:  # noqa: BLE001 — متن نامعتبر
         return []
 
     # tree-sitter 0.26: QueryCursor(query).captures(node) مستقیماً dict[name] -> [nodes]

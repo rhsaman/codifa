@@ -9,7 +9,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
+import hljs from "highlight.js";
 import type { ChatMessage, ToolActivity } from "../types";
 import {
   detectDir,
@@ -32,15 +32,6 @@ import {
 import { ReadingMode } from "./ReadingMode";
 import { Mermaid } from "./Mermaid";
 import "highlight.js/styles/github-dark.min.css";
-
-// rehype-highlight throws by default on languages it doesn't know (e.g.
-// `mermaid`). `ignoreMissing` lets unknown fences pass through untouched so the
-// `language-mermaid` class survives and ChatMessage's CodeBlock can render them
-// as live diagrams instead of erroring the whole markdown block.
-const REHYPE_HIGHLIGHT = [rehypeHighlight, { ignoreMissing: true }] as [
-  typeof rehypeHighlight,
-  { ignoreMissing: boolean },
-];
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
 // (dir toggles, parent re-renders that don't recreate the message, memo
@@ -101,19 +92,99 @@ function codeLang(children: ReactNode): string {
   return "";
 }
 
+// Extract the starting line number of a fenced code block, when the info string
+// carries a `lang:start-end` range (e.g. ```go:19-20). Returns 0 when absent so
+// callers can fall back to 1-based numbering. The number is rendered as a
+// VISUAL-ONLY gutter (user-select: none) so copying the block never includes it.
+function codeStartLine(children: ReactNode): number {
+  const kids = Array.isArray(children) ? children : [children];
+  for (const k of kids) {
+    const props = (k as { props?: { className?: string; "data-meta"?: string } } | null)?.props;
+    // Prefer the full meta string that the `code` component stashes. It may be
+    // either the canonical `lang:start-end:path` (foldLineCaptions output) or the
+    // legacy `start-end:path` form, so match the `start-end` range wherever it
+    // appears after a colon, not just at the start of the string.
+    const meta = props?.["data-meta"] ?? "";
+    const m =
+      /(\d+)(?:-\d+)?(?::[\w./-]+\.\w+)?$/.exec(meta) ??
+      /:(\d+)(?:-\d+)?/.exec(meta) ??
+      (props?.className
+        ? /language-[\w-]+:(\d+)(?:-\d+)?/.exec(String(props.className))
+        : null);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (!Number.isNaN(n)) return n;
+    }
+  }
+  return 0;
+}
+
+// Minimal HTML escaper used as a fallback when highlight.js can't process a
+// snippet — keeps the raw text safe to inject via dangerouslySetInnerHTML.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Splits highlight.js output HTML into per-line HTML fragments while keeping
+// any <span> that's still open at a line boundary open across the split — so
+// a token that spans multiple lines (block comment, template literal,
+// docstring, ...) keeps its color on every line it covers, not just the
+// first. highlight.js only ever emits <span ...> / </span> tags into its
+// output (text is HTML-escaped), so a simple tag-aware scan is sufficient.
+function splitHighlightedHtml(html: string): string[] {
+  const lines: string[] = [];
+  const openTags: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < html.length) {
+    const ch = html[i];
+    if (ch === "\n") {
+      current += "</span>".repeat(openTags.length);
+      lines.push(current);
+      current = openTags.join("");
+      i++;
+      continue;
+    }
+    if (html.startsWith("<span", i)) {
+      const end = html.indexOf(">", i) + 1;
+      const tag = html.slice(i, end);
+      openTags.push(tag);
+      current += tag;
+      i = end;
+      continue;
+    }
+    if (html.startsWith("</span>", i)) {
+      openTags.pop();
+      current += "</span>";
+      i += 7;
+      continue;
+    }
+    current += ch;
+    i++;
+  }
+  lines.push(current);
+  return lines;
+}
+
 function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const [copied, setCopied] = useState(false);
-  const code = textFromChildren(props.children);
+  const code = textFromChildren(props.children).replace(/^\n+|\n+$/g, "");
   const lang = codeLang(props.children);
+  const startLine = codeStartLine(props.children);
 
   // A ```mermaid fenced block is rendered as a live diagram, not as code.
   if (lang === "mermaid") {
     return <Mermaid chart={code} />;
   }
 
+  const codeLines = code.split("\n");
+
   const copy = async () => {
     try {
-      await copyToClipboard(code);
+      await copyToClipboard(codeLines.join("\n"));
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch (err) {
@@ -121,15 +192,57 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
     }
   };
 
+  // Highlight the WHOLE block in ONE hljs pass (not line-by-line), so multi-line
+  // constructs (block comments, template literals, docstrings, ...) keep their
+  // syntax state across lines and get correct colors. The resulting HTML is then
+  // split back into per-line fragments by splitHighlightedHtml, which re-opens any
+  // <span> still open at a line boundary on the next line, so a token spanning
+  // multiple lines keeps its color on every line, not just the first. The line
+  // numbers are rendered as a VISUAL-ONLY gutter (the real file line number when
+  // the fence carries `lang:start-end`, otherwise 1-based) with `user-select:
+  // none`, so selecting/copying the block copies just the code, never the numbers.
+  let highlightedLines: string[];
+  try {
+    const whole = codeLines.join("\n");
+    const html =
+      lang && hljs.getLanguage(lang)
+        ? hljs.highlight(whole, { language: lang }).value
+        : hljs.highlightAuto(whole).value;
+    highlightedLines = splitHighlightedHtml(html);
+  } catch {
+    highlightedLines = codeLines.map(escapeHtml);
+  }
+
+  const lines = codeLines.map((_line, i) => {
+    const num = startLine > 0 ? startLine + i : i + 1;
+    const html = highlightedLines[i] ?? "";
+    return (
+      <span className="code-line" key={i}>
+        <span className="code-gutter" aria-hidden="true">
+          {num}
+        </span>
+        <span
+          className="code-text"
+          dangerouslySetInnerHTML={{ __html: html === "" ? "\n" : html }}
+        />
+        {"\n"}
+      </span>
+    );
+  });
+
   return (
     <div className="code-block">
       <div className="code-block-head">
-        <span className="code-block-lang">{lang || "code"}</span>
+        <span className="code-block-lang">
+          {lang || "code"}
+        </span>
         <button className="copy-btn" onClick={copy}>
           {copied ? "Copied ✓" : "Copy"}
         </button>
       </div>
-      <pre {...props}>{props.children}</pre>
+      <pre {...props} className="code-lines hljs">
+        {lines}
+      </pre>
     </div>
   );
 }
@@ -143,6 +256,18 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // Exported so ReadingMode.tsx can reuse the exact same overrides (including the
 // ```mermaid -> diagram rendering) without duplicating them.
 export const mdComponents = {
+  // react-markdown only puts the language in `className` and DROPS the rest of
+  // the info string (e.g. `go:19-20:Plan.go` -> className `language-go`). We
+  // stash the full meta (`19-20:Plan.go`) on `data-meta` so CodeBlock can read
+  // the real line range and file name that foldLineCaptions injected.
+  code: (props: any) => {
+    const meta = props.node?.data?.meta ?? "";
+    return (
+      <code {...props} data-meta={meta}>
+        {props.children}
+      </code>
+    );
+  },
   a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
     <a
       {...props}
@@ -694,7 +819,6 @@ function renderSegments(
       <div key={key} className="chat-message markdown-body" dir="auto">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
-          rehypePlugins={[REHYPE_HIGHLIGHT]}
           components={mdComponents}
         >
           {cachedPrepare(
@@ -977,7 +1101,6 @@ export const ChatMessageView = memo(function ChatMessageView({
               >
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[REHYPE_HIGHLIGHT]}
                   components={mdComponents}
                 >
                   {cachedPrepare(
@@ -1053,7 +1176,6 @@ export const ChatMessageView = memo(function ChatMessageView({
             <div className="chat-message markdown-body" dir="auto">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
-                rehypePlugins={[REHYPE_HIGHLIGHT]}
                 components={mdComponents}
               >
                 {cachedPrepare(message.id, message.content, dir)}

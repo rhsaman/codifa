@@ -1697,6 +1697,7 @@ def _thinking_from_chunk(chunk: Any) -> str | None:
 
 
 _HISTORY_SUMMARY_CACHE: dict = {}  # key=(root, hash) -> summary text
+_HISTORY_SUMMARY_CACHE_MAX = 200  # bound growth; summaries are stable per (root, hash)
 
 
 async def _summarize_history_head(compact_model: Any, older: list, root: str) -> str:
@@ -1743,6 +1744,10 @@ async def _summarize_history_head(compact_model: Any, older: list, root: str) ->
         except Exception:  # noqa: BLE001 — degrade to a plain omission note
             _summary = "[Compacted earlier context]\n[history omitted by historyLimit]"
     _HISTORY_SUMMARY_CACHE[_key] = _summary
+    if len(_HISTORY_SUMMARY_CACHE) > _HISTORY_SUMMARY_CACHE_MAX:
+        # Evict the oldest entry (FIFO) so the cache can't grow without bound
+        # across a long-running server with many chats/roots.
+        _HISTORY_SUMMARY_CACHE.pop(next(iter(_HISTORY_SUMMARY_CACHE)))
     return _summary
 
 
@@ -2148,6 +2153,12 @@ async def _run_mode_turn(
         _last_tool_sig = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
+        # When a recoverable repetition is detected (same tool+args, but still
+        # below the hard-stop threshold), we queue a nudge and set this flag so
+        # the HumanMessage is appended AFTER the tool results (keeping the
+        # transcript valid: a tool_calls AIMessage must be followed by its
+        # ToolMessages before any new HumanMessage).
+        _nudge_pending = False
         # Auto-continue guard for max-output truncation (mirrors opencode, which
         # treats finish_reason=="length" as a normal partial stop and keeps
         # generating until the answer is complete instead of ending the turn).
@@ -2442,6 +2453,32 @@ async def _run_mode_turn(
                     with contextlib.suppress(Exception):
                         run_flags["error"] = True
                 break
+            elif _tool_sig:
+                # Recoverable repetition: the SAME tool call with IDENTICAL
+                # arguments just repeated, but we haven't hit the hard-stop yet.
+                # Nudge the model to vary its approach instead of aborting on the
+                # first repeat. The nudge HumanMessage is appended after the tool
+                # results below (see _nudge_pending) so the transcript stays valid.
+                # The model gets (_MAX_REPEAT - 1) chances to break the loop before
+                # the hard stop fires.
+                try:
+                    _sig = json.loads(_tool_sig)
+                    _nudge_tool = _sig[0][0] if _sig else "tool"
+                except Exception:  # noqa: BLE001
+                    _nudge_tool = "tool"
+                queue.put_nowait(
+                    {
+                        "kind": "warn",
+                        "content": (
+                            f"Repetition detected: the same tool call ({_nudge_tool}) "
+                            f"was issued {_repeat_count} time(s) in a row with "
+                            f"identical arguments. Change your approach — use different "
+                            f"arguments, a different tool, or stop and report what you "
+                            f"found — instead of repeating it."
+                        ),
+                    }
+                )
+                _nudge_pending = True
             msgs.append(ai)
             # Partition this step's tool calls: read-only ones (grep/glob/read/
             # web/vision/task/...) run CONCURRENTLY via gather -- they cannot
@@ -2504,6 +2541,22 @@ async def _run_mode_turn(
                 )
                 # Persist this completed (mutating) tool result too.
                 await _save_turn_checkpoint(_resume_thread, msgs)
+            # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
+            # transcript stays valid (a tool_calls AIMessage must be followed by its
+            # ToolMessages before any new HumanMessage). Gives the model a chance to
+            # self-recover from a doom loop before the hard stop at _MAX_REPEAT.
+            if _nudge_pending:
+                _nudge_pending = False
+                msgs.append(
+                    HumanMessage(
+                        content=(
+                            "REPETITION WARNING: you called the same tool with "
+                            "identical arguments multiple times in a row. Do something "
+                            "different (new arguments, a different tool, or conclude the "
+                            "task) — do NOT repeat the same call again."
+                        )
+                    )
+                )
             # In-turn context management: if the transcript (including every
             # tool result so far this turn) has grown past the budget, compress
             # the older tool results so we don't keep re-sending the whole raw
@@ -2541,6 +2594,13 @@ async def _run_mode_turn(
     # trying to continue instead of giving up on the first blip. Hard failures
     # (bad request / quota exhausted / auth) surface as a fatal error event
     # without burning the retry budget.
+    # Subagent runs use mode "explore"/"general"; the main turn uses
+    # ask/coder/plan/reader. Tag retry events only for subagents so the UI can
+    # show "Sub-agent failed — using main model" instead of a generic hiccup.
+    def _retry_event_agent(state):
+        mode = state.get("mode")
+        return mode if mode in ("explore", "general") else ""
+
     reply = ""
     attempt = 0
     try:
@@ -2600,6 +2660,7 @@ async def _run_mode_turn(
                             "attempt": attempt,
                             "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
                             "reason": _agents._friendly_retry_reason(exc),
+                            "agent": _retry_event_agent(state),
                         }
                     )
                     # Mark the turn as failed so run_graph._drive leaves the
@@ -2619,6 +2680,7 @@ async def _run_mode_turn(
                         "max_attempts": _agents._RETRY_MAX_ATTEMPTS,
                         "delay": delay,
                         "reason": _agents._friendly_retry_reason(exc),
+                        "agent": _retry_event_agent(state),
                     }
                 )
                 await asyncio.sleep(delay)

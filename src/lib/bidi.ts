@@ -150,10 +150,153 @@ export function detectDir(text: string): 'rtl' | 'ltr' {
 // invisible word separators — both safe and direction-agnostic. (Missing
 // half-spaces in Persian are a model-output issue fixed via the system prompt,
 // not here — see the note above.)
+// Detect a "خط N: path" / "خط N-M: path" caption the model sometimes writes
+// right before a fenced code block (e.g. "کد در Plan.go خط ۲۰-۱۹ هست:" then
+// ```go ...). We fold the line range into the fence's info string as
+// `lang:start-end` so the renderer can show the REAL file line numbers (and the
+// file name) inside the code block, instead of a bare 1-based counter. The
+// caption line itself is removed so it isn't duplicated as prose.
+// Accept both Persian and Latin digits (the model may write "خط ۲" or "خط 2").
+// The path may appear before OR after the "خط N" token.
+// We ALSO accept the Western convention the model often uses: `path:line`
+// (e.g. "changePhoneConfirm.go:32") or `path:line-line` — a file reference with
+// a single line or a range, written with a colon. This is folded into the
+// following fence exactly like the "خط N" caption so the header shows the real
+// file name and line numbers.
+const FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
+const DIGITS_RE = `[0-9${FA_DIGITS}]`;
+const LINE_RANGE_RE = new RegExp(
+  `خط\\s*(${DIGITS_RE}+)(?:\\s*-\\s*(${DIGITS_RE}+))?`,
+);
+// A file path is `dir/.../name.ext` or `name.ext` (exactly one dot). A dotted
+// reference like `user.CreatedAt.After` has no `/` and multiple dots, so it is
+// NOT a path. The optional `:line` / `:line-line` suffix is captured separately
+// so we can both remember the path and fold the range into the fence.
+// A file path is `dir/.../name.ext` or `name.ext` (exactly one dot at the end).
+// An optional `:line` / `:line-line` suffix (e.g. changePhoneConfirm.go:32) is
+// captured in groups 2/3 so we can fold the range into the following fence. The
+// path itself must end right before `:`+digits or end-of-string (lookahead), so
+// a dotted reference like `user.CreatedAt.After` is NOT mistaken for a path and
+// `name.go:32` keeps `:32` OUT of the path group.
+const PATH_RE = new RegExp(
+  `((?:[\\w\\/\\\\-]+\\.)*[\\w\\/\\\\-]+\\.\\w+)(?=:?(?:${DIGITS_RE}+|$))(?::(${DIGITS_RE}+)(?:-(${DIGITS_RE}+))?)?`,
+);
+
+// Normalize Persian digits to Latin so downstream code can parse the range.
+function faToLat(n: string): string {
+  return n.replace(/[۰-۹]/g, (d) => String(FA_DIGITS.indexOf(d)));
+}
+
+// A bare fence that already carries a line range but NO path, e.g.
+// ```go:19-20 — we may still attach the most recent file path to it.
+const BARE_RANGE_FENCE_RE = /^```\s*([\w-]+):(\d+)-(\d+)\s*$/;
+
+function foldLineCaptions(text: string): string {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let i = 0
+  // The most recent file path seen in prose/captions, so we can attach it to
+  // later fences that only carry a line range (the model often writes the
+  // path once, then several ```lang:start-end fences without repeating it).
+  let lastPath = ''
+  while (i < lines.length) {
+    const rangeM = LINE_RANGE_RE.exec(lines[i])
+    const pathM = PATH_RE.exec(lines[i])
+    if (rangeM && pathM) {
+      const startN = parseInt(faToLat(rangeM[1]), 10)
+      const endN = rangeM[2] ? parseInt(faToLat(rangeM[2]), 10) : startN
+      // Normalize a reversed range the model sometimes writes (e.g. "خط ۲۰-۱۹")
+      // so the gutter shows ascending line numbers.
+      const lo = Math.min(startN, endN)
+      const hi = Math.max(startN, endN)
+      lastPath = pathM[1]
+      // Look ahead (skipping blank lines and a short connector word like "توی")
+      // for the next fenced code block.
+      let j = i + 1
+      while (j < lines.length && lines[j].trim() === '') j++
+      // Allow one short prose word between the caption and the fence.
+      if (
+        j < lines.length &&
+        lines[j].trim().length > 0 &&
+        lines[j].trim().length <= 12 &&
+        !lines[j].trim().startsWith('```')
+      ) {
+        j++
+        while (j < lines.length && lines[j].trim() === '') j++
+      }
+      const fence = j < lines.length ? /^```\s*([\w-]+)/.exec(lines[j]) : null
+      if (fence) {
+        const lang = fence[1]
+        // Carry the file path into the info string as `lang:start-end:path`
+        // so the renderer can show it next to the language name in the header.
+        lines[j] = '```' + lang + ':' + lo + '-' + hi + ':' + pathM[1]
+        // Keep the caption line (the model's prose) in the output, but advance
+        // past it so we don't re-process it (which would re-stamp the fence).
+        out.push(lines[i])
+        i = j
+        continue
+      }
+    } else if (pathM && !rangeM) {
+      // A line that is a file path, possibly with a `:line` / `:line-line`
+      // suffix (e.g. "changePhoneConfirm.go:32"). Remember the path for the
+      // following fences that omit it, and if a line range is present fold it
+      // into the NEXT fence exactly like the "خط N" caption above.
+      lastPath = pathM[1]
+      if (pathM[2]) {
+        const startN = parseInt(faToLat(pathM[2]), 10)
+        const endN = pathM[3] ? parseInt(faToLat(pathM[3]), 10) : startN
+        const lo = Math.min(startN, endN)
+        const hi = Math.max(startN, endN)
+        let j = i + 1
+        while (j < lines.length && lines[j].trim() === '') j++
+        if (
+          j < lines.length &&
+          lines[j].trim().length > 0 &&
+          lines[j].trim().length <= 12 &&
+          !lines[j].trim().startsWith('```')
+        ) {
+          j++
+          while (j < lines.length && lines[j].trim() === '') j++
+        }
+        const fence = j < lines.length ? /^```\s*([\w-]+)/.exec(lines[j]) : null
+        if (fence) {
+          const bare = BARE_RANGE_FENCE_RE.exec(lines[j])
+          if (bare) {
+            // Fence already carries its own line range — keep it, just attach
+            // the path from the caption (don't overwrite the model's range).
+            lines[j] = '```' + bare[1] + ':' + bare[2] + '-' + bare[3] + ':' + pathM[1]
+          } else {
+            lines[j] = '```' + fence[1] + ':' + lo + '-' + hi + ':' + pathM[1]
+          }
+          // Keep the caption line (prose) — only the fence is rewritten.
+          out.push(lines[i])
+          i = j
+          continue
+        }
+      }
+    } else {
+      // A bare ```lang:start-end fence with no path: attach the last seen path
+      // so the header always shows the file name next to the language.
+      const bare = BARE_RANGE_FENCE_RE.exec(lines[i])
+      if (bare && lastPath) {
+        lines[i] =
+          '```' + bare[1] + ':' + bare[2] + '-' + bare[3] + ':' + lastPath
+      }
+    }
+    out.push(lines[i])
+    i++
+  }
+  return out.join('\n')
+}
+
 export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   if (!text) return text
   const cleaned = stripBidiMarks(text)
-  const parts = cleaned.split(/```/g)
+  // Fold "خط N: path" captions into the following fence BEFORE splitting on
+  // ```, otherwise the caption lands in a non-code segment and the fence info
+  // string can't be rewritten.
+  const folded = foldLineCaptions(cleaned)
+  const parts = folded.split(/```/g)
   const fixed = parts.map((p, i) => {
     if (i % 2 === 1) return p // inside code block, don't modify
     return fixZwsp(p)

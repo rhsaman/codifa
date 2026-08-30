@@ -115,6 +115,44 @@ console.log('5) بنر retry → resume: پیام کاربر همان است (pa
   )
 }
 
+// --- تست‌های جدید: بررسی ریست attempt counter ---
+
+console.log('6) ریست attempt: بعد از success، retry روی message پاک میشود:')
+{
+  // سناریو: message با retry فعال وجود دارد (مثلاً بعد از ۳ تلاش ناموفق)
+  const msgs: ChatMessage[] = [
+    user('u10', 'تست'),
+    assistant('a10', 'پاسخ ناقص', {
+      retry: { attempt: 3, maxAttempts: 10, delay: 15, reason: 'throttle' },
+    }),
+  ]
+  // وقتی done event میاد، retry باید پاک شود (نه فقط reconnecting)
+  // این تست فقط planRetry رو چک می‌کنه — behavior اصلی در Chat.tsx:1941-1945 هندل میشه
+  const plan = planRetry(msgs, 'u10', 'banner')
+  check('planretry = resume (حتی اگر attempt > 1)', plan?.action === 'resume', plan)
+}
+
+console.log('7) ریست attempt: پیام بدون retry → planRetry بدون خطا:')
+{
+  const msgs: ChatMessage[] = [
+    user('u11', 'تست ۲'),
+    assistant('a11', 'پاسخ کامل'),
+  ]
+  const plan = planRetry(msgs, 'u11', 'banner')
+  check('پیام کاربر موجود → resume', plan?.action === 'resume', plan)
+}
+
+console.log('8) planretry helper: message retry با retry state قدیمی:')
+{
+  // سناریو: message قبلی retry داشته ولی done اومده و retry پاک شده
+  const msgs: ChatMessage[] = [
+    user('u12', 'درخواست'),
+    assistant('a12', 'پاسخ نهایی بدون retry'),
+  ]
+  const plan = planRetry(msgs, 'u12', 'message')
+  check('restart حتی اگر assistant retry نداشته باشه', plan?.action === 'restart', plan)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

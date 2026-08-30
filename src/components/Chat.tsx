@@ -1938,9 +1938,10 @@ export function ChatPanel() {
         // re-set it after the stream closes.
         lastEventAt.current = Date.now();
         resolveStuckCards();
-        // A successful completion clears any transient "reconnecting" pill.
+        // A successful completion clears ANY retry banner (not just reconnecting).
+        // This ensures the attempt counter resets to 1 on the next turn's first error.
         const curMsg = findMsg();
-        if (curMsg?.retry?.reconnecting) {
+        if (curMsg?.retry) {
           useStore.getState().updateMessage(assistantMsg.id, { retry: null });
         }
       }
@@ -3012,8 +3013,21 @@ export function ChatPanel() {
   const stop = () => {
     useStore.getState().setChatPendingAsk(chatIdRef.current, null);
     useStore.getState().setChatPendingPermission(chatIdRef.current, null);
-    abortRef.current?.abort();
-    useStore.getState().chatAborts[chatIdRef.current]?.abort();
+    // Abort both the local controller and the store-level one. The store
+    // controller is the "authoritative" one used by the stall watchdog and
+    // retryMessage, so always try it. Wrap in try/catch because abort()
+    // throws if the controller was already used.
+    try { abortRef.current?.abort(); } catch { /* already aborted */ }
+    try {
+      const ctrl = useStore.getState().chatAborts?.[chatIdRef.current];
+      if (ctrl && !ctrl.signal.aborted) ctrl.abort();
+    } catch { /* already aborted */ }
+    // Force-clear busy + streaming so the Stop button vanishes immediately.
+    // Normally the send() finally block handles this, but if abortRef was
+    // already null (e.g. reconnect race) the finally block never ran, leaving
+    // busy stuck as true and the Stop button permanently visible.
+    setBusy(false);
+    useStore.getState().setStreaming(false, false);
   };
 
   // Dismiss the retry banner WITHOUT deleting the turn: clear the message's

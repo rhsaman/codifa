@@ -304,6 +304,9 @@ export interface ChatMessage {
    *  producing reasoning content (driven by the {kind:"thinking",active:true}
    *  event). Gates the in-message "Thinking" indicator. */
   thinkingActive?: boolean
+  /** Wall-clock timestamp when thinking started — survives remounts so the
+   *  elapsed timer doesn't reset when the user switches chats. */
+  thinkingStartedAt?: number
   /** True when this message was persisted mid-stream (heartbeat snapshot) and
    *  the app died before the turn completed — shown as "interrupted" after a
    *  crash/power cut instead of looking like a complete reply. Cleared by the
@@ -323,7 +326,7 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean

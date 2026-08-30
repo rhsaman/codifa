@@ -1585,7 +1585,10 @@ export function ChatPanel() {
         // model actually produces reasoning content. Drive the per-message
         // thinking indicator from it (not from mere streaming).
         useStore.getState().setStreaming(true, !!event.active);
-        store.updateMessage(assistantMsg.id, { thinkingActive: !!event.active });
+        store.updateMessage(assistantMsg.id, {
+          thinkingActive: !!event.active,
+          ...(event.active ? { thinkingStartedAt: Date.now() } : {}),
+        });
       } else if (event.kind === "skill") {
         // Deliberately NOT rendered into the chat — the user asked for the
         // "Attached skills" / MCP notes to stay out of the transcript. The
@@ -1665,6 +1668,7 @@ export function ChatPanel() {
           agent: event.agent ?? "",
           fallback: event.fallback,
           reconnecting: event.reconnecting,
+          startedAt: Date.now(),
         };
         if (event.reconnecting) {
           // Client self-heal: keep the already-streamed text; just show a
@@ -1830,12 +1834,11 @@ export function ChatPanel() {
         // banner stuck next to the error. Clear it defensively (the backend's
         // own compact_failed event already does this on its normal path).
         useStore.getState().setChatCompacting(chat.id, false);
+        // Do NOT append the error text to the message content — errors are
+        // shown only in the notification banner (RetryBanner), not as inline
+        // chat bubbles. The `retry` object below is what triggers the banner;
+        // `error: true` keeps the failed-turn styling without rendering text.
         store.updateMessage(assistantMsg.id, {
-          content:
-            (store.chats
-              .find((c) => c.id === chat.id)
-              ?.messages.find((m) => m.id === assistantMsg.id)?.content ?? "") +
-            `\n\n> **Error:** ${event.content}`,
           error: true,
           // A failed turn's usage is the last request before the drop — often
           // inflated to ~100% (the reason the provider cut the stream). Don't
@@ -3329,6 +3332,7 @@ export function ChatPanel() {
                 agent={effectiveRetry.agent}
                 fallback={effectiveRetry.fallback}
                 stalled={stalled}
+                startedAt={effectiveRetry.startedAt}
                 onRetry={() => {
                   // Resume-only: re-send the last user turn WITHOUT deleting
                   // anything. The error banner must never fall through to

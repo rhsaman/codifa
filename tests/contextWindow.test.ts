@@ -80,7 +80,7 @@ console.log('1) contextMap[model] کوچکتر از contextWindow پروواید
   check('context_window = 128000 (پنجرهٔ مدل، نه 200000 پرووایدر)', body.context_window === 128000, body)
 }
 
-console.log('2) بدون contextMap → fallback به contextWindow (رفتار قبلی حفظ شده):')
+console.log('2) بدون contextMap → مدل ناشناخته، context_window صفر (بکاند از کاتالوگ models.dev حل میکند):')
 {
   const body = await sentBody({
     id: 'openai',
@@ -90,7 +90,7 @@ console.log('2) بدون contextMap → fallback به contextWindow (رفتار 
     model: 'gpt-4o',
     contextWindow: 200000,
   })
-  check('context_window = 200000', body.context_window === 200000, body)
+  check('context_window = 0 (fallback به provider.contextWindow حذف شده)', body.context_window === 0, body)
 }
 
 console.log('3) نه contextMap نه contextWindow → صفر (بکاند از کاتالوگ models.dev حل میکند):')

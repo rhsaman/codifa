@@ -149,29 +149,47 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_500_retries_then_giveup_after_budget(run_events, monkeypatch):
-    """A 500 (server error) is now a transient failure, so it auto-retries up to
-    the unified budget (``_RETRY_MAX_ATTEMPTS``) instead of surfacing as a fatal
-    error immediately. After exhausting the budget it gives up (a ``retry_giveup``
-    or ``error`` event) rather than hanging forever. Every request is forced to
-    500 so the turn keeps hitting the transient failure until the budget runs
-    out."""
+async def test_500_idle_shows_error(run_events, monkeypatch):
+    """وقتی agent هیچ output تولید نکرده و خطای non-retryable (500) بخورد،
+    نباید retry کند اما باید error event بفرستد تا کاربر دلیل خطا رو ببیند.
+    فقط 429/502/503/504 retryable هستند — بقیه خطاها مستقیماً نمایش داده می‌شوند."""
     monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [text_reply("Done")]
-    # Force a 500 on EVERY request index (0..budget) so the turn never succeeds
-    # before the retry budget is exhausted.
-    mock.error_at = {i: (500, "server error") for i in range(agents._RETRY_MAX_ATTEMPTS + 1)}
+    # همه فراخوانی‌ها 500 می‌دهند — 500 non-retryable است.
+    mock.error_at = {i: (500, "Internal Server Error") for i in range(agents._RETRY_MAX_ATTEMPTS + 1)}
 
     events = await run_events("read app.py and summarize it", mode="plan")
 
     retries = _retry_events(events)
-    assert retries, "500 must now auto-retry (it is a transient failure)"
-    assert len(retries) <= agents._RETRY_MAX_ATTEMPTS, \
-        f"retries must stay within the budget, got {len(retries)}"
-    # After exhausting the budget it must give up (retry_giveup or error), not hang.
-    assert any(e.get("kind") in ("retry_giveup", "error") for e in events), \
-        "500 must surface as retry_giveup/error after the budget is spent"
+    assert retries == [], \
+        "500 is non-retryable — must NOT retry"
+    giveups = [e for e in events if e.get("kind") == "retry_giveup"]
+    assert giveups == [], \
+        "500 is non-retryable — must NOT retry_giveup"
+    errors = [e for e in events if e.get("kind") == "error"]
+    assert len(errors) == 1, \
+        "500 must surface as an error event so the user sees the banner"
     assert _all_requests_have_no_resume()
+
+
+async def test_500_active_output_then_retries(run_events, monkeypatch):
+    """وقتی agent ابتدا output تولید کند (tool call) و بعد خطای transient
+    بخورد، باید retry کند تا کار ناتمام ادامه یابد."""
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
+    mock.script = [
+        tool_call("write_file", json.dumps({"path": "a.py", "content": "x"})),
+        text_reply("Done"),
+    ]
+    # درخواست اول (index 0) tool call موفق → agent فعال می‌شود.
+    # درخواست دوم (index 1) 429 → retry (چون agent قبلاً output داشته).
+    mock.error_at = {1: (429, "rate limited")}
+
+    events = await run_events("create a.py", mode="coder")
+
+    retries = _retry_events(events)
+    assert retries, \
+        "after producing tool output, a 429 must trigger retry"
+    assert retries[0].get("attempt", 0) >= 1
 
 
 async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspace):

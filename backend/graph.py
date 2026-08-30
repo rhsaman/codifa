@@ -640,7 +640,15 @@ def resolve_subagent_model(
     if not model:
         return None
     return build_chat_model(
-        kind, model, burl, akey, env, oauth, temperature=0.2, timeout=timeout, cache=True
+        kind,
+        model,
+        burl,
+        akey,
+        env,
+        oauth,
+        temperature=0.2,
+        timeout=timeout,
+        cache=True,
     )
 
 
@@ -1200,8 +1208,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _mentioned_idents: set[str] = set()
             _hist_for_map = state.get("history") or []
             for _turn in _hist_for_map:
-                for _ta in (_turn.get("toolActivity") or []):
-                    _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get("filePath")
+                for _ta in _turn.get("toolActivity") or []:
+                    _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get(
+                        "filePath"
+                    )
                     if _p:
                         _mentioned_fnames.add(os.path.relpath(_p, root))
                 _content = _turn.get("content") or ""
@@ -1237,7 +1247,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     _map_hash = ""
     if code_map_block:
         try:
-            _map_hash = hashlib.md5(code_map_block.encode("utf-8", "ignore")).hexdigest()[:12]
+            _map_hash = hashlib.md5(
+                code_map_block.encode("utf-8", "ignore")
+            ).hexdigest()[:12]
         except Exception:  # noqa: BLE001, S110
             pass
 
@@ -1258,7 +1270,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # re-expanding it — keeping historyLimit and auto-compact compatible.
     _history_limit = 0
     with contextlib.suppress(Exception):
-        _history_limit = int((state_db.get_settings() or {}).get("historyLimit", 0) or 0)
+        _history_limit = int(
+            (state_db.get_settings() or {}).get("historyLimit", 0) or 0
+        )
     if _history_limit > 0 and len(history) > _history_limit:
         _recent = history[-_history_limit:]
         _older = history[:-_history_limit]
@@ -1279,9 +1293,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # مدل با یه marker بی‌محتوا ("see previous turn") که به هیچی اشاره نمی‌کنه
     # گمراه نشه. کش هش per-chat هست (chat_id کلید dict) نه یه scalar global.
     if code_map_block and mode in ("coder", "plan", "ask") and _map_hash:
-        code_map_block = _dedup_code_map(
-            code_map_block, _map_hash, chat_id, lc_history
-        )
+        code_map_block = _dedup_code_map(code_map_block, _map_hash, chat_id, lc_history)
     with contextlib.suppress(Exception):
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
@@ -1294,11 +1306,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                             _tool_items_chars += len(str(_it.get("snippet", "")))
                         else:
                             _tool_items_chars += len(str(_it))
-        print(
-            f"[CTX_DEBUG] history_msgs={len(history)} lc_msgs={len(lc_history)} "
-            f"est_tokens={_hist_chars // 4} tool_items_chars={_tool_items_chars}",
-            flush=True,
-        )
+        # print(
+        #     f"[CTX_DEBUG] history_msgs={len(history)} lc_msgs={len(lc_history)} "
+        #     f"est_tokens={_hist_chars // 4} tool_items_chars={_tool_items_chars}",
+        #     flush=True,
+        # )
 
     if mode == "coder":
         reuse = _agents._plan_reuse_note(history)
@@ -1345,8 +1357,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "unless they touch existing tested behavior; prefer extending "
                         "existing tests over adding trivial new ones. Run them yourself "
                         "(uv run pytest / npm test / cargo test / go test / mvn test / "
-                        "dotnet test / flutter test / dart test / ..." + fw_note + ")."
-                        + cmd_note + "Do NOT finish with red tests — keep fixing until "
+                        "dotnet test / flutter test / dart test / ..."
+                        + fw_note
+                        + ")."
+                        + cmd_note
+                        + "Do NOT finish with red tests — keep fixing until "
                         "all tests pass."
                     )
                 ),
@@ -1379,7 +1394,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     _mode_caps = _agents._MODE_CAPS.get(mode, "")
     user_parts.append(f"MODE: {_mode_label} — {_mode_caps}")
     if _mode_changed and _prev_mode:
-        _prev_label = _agents._MODE_LABELS.get(_prev_mode, (_prev_mode or "Ask").capitalize())
+        _prev_label = _agents._MODE_LABELS.get(
+            _prev_mode, (_prev_mode or "Ask").capitalize()
+        )
         user_parts.append(
             f"⚠ MODE SWITCHED: the previous turn ran in {_prev_label}; this turn runs in "
             f"{_mode_label}. Fully re-orient to {_mode_label} NOW — ignore the style, length, "
@@ -1451,11 +1468,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 len(str(c.get("text", ""))) for c in user_content if isinstance(c, dict)
             )
         )
-        print(
-            f"[CTX_DEBUG] sys_chars={_sys_chars} hist_chars={_hist_chars} "
-            f"user_chars={_user_chars} total_chars={_sys_chars + _hist_chars + _user_chars}",
-            flush=True,
-        )
+        # print(
+        #     f"[CTX_DEBUG] sys_chars={_sys_chars} hist_chars={_hist_chars} "
+        #     f"user_chars={_user_chars} total_chars={_sys_chars + _hist_chars + _user_chars}",
+        #     flush=True,
+        # )
 
     # Convert the mode-filtered fns to LangChain StructuredTools. MCP tools are
     # already StructuredTools (built in build_mcp_tools), so they pass through.
@@ -1721,8 +1738,7 @@ async def _summarize_history_head(compact_model: Any, older: list, root: str) ->
         # Fallback without an LLM: keep the last few user messages + first line
         # of each assistant reply so the model still has the gist.
         _parts = [
-            f"{t.get('role')}: {str(t.get('content', ''))[:200]}"
-            for t in older[-12:]
+            f"{t.get('role')}: {str(t.get('content', ''))[:200]}" for t in older[-12:]
         ]
         _summary = "[Compacted earlier context]\n" + "\n".join(_parts)
     else:
@@ -1864,7 +1880,9 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
         if role == "assistant":
             # Keep the structured tool_calls so a compacted in-flight step can
             # still be continued by the model (older distilled turns carry none).
-            rebuilt.append(AIMessage(content=content, tool_calls=d.get("tool_calls") or []))
+            rebuilt.append(
+                AIMessage(content=content, tool_calls=d.get("tool_calls") or [])
+            )
         elif role == "tool":
             # Keep the ORIGINAL tool_call_id so it still links to the assistant's
             # tool_calls entry. The placeholder is only a fallback for tool
@@ -1923,7 +1941,9 @@ async def _maybe_auto_compact(
     # Single auto-compaction threshold as a percentage of the RAW context window
     # (user-tunable, default 80). Clamp defensively so a mis-set value can never
     # disable compaction (>=1) or fire on every step (<=99).
-    _pct = max(1, min(99, int(compact_at_percent if compact_at_percent is not None else 80)))
+    _pct = max(
+        1, min(99, int(compact_at_percent if compact_at_percent is not None else 80))
+    )
     threshold = int(ctx * _pct / 100)
     dicts = _agents._messages_to_dicts(msgs)
     # Auto-compaction fires off the SAME token breakdown the context meter
@@ -1949,10 +1969,10 @@ async def _maybe_auto_compact(
         total = live_total or 0
     # Diagnostic: surface the real window/threshold so we can confirm compaction
     # only fires when the prompt genuinely nears the window (and not spuriously).
-    logger.debug(
-        "[CTX_DEBUG] auto_compact ctx=%s pct=%s threshold=%s total=%s msgs=%s",
-        ctx, _pct, threshold, total, len(msgs),
-    )
+    # logger.debug(
+    #     "[CTX_DEBUG] auto_compact ctx=%s pct=%s threshold=%s total=%s msgs=%s",
+    #     ctx, _pct, threshold, total, len(msgs),
+    # )
     # opencode fires compaction when the latest turn reaches the threshold
     # (pct% of the raw window). The meter shows the same percentage, so the bar
     # hits the threshold exactly when compaction fires.
@@ -2031,6 +2051,36 @@ async def _run_mode_turn(
     filtered = tctx["tools"]
     mcp_cleanup = tctx.get("mcp_cleanup")
     messages: list[BaseMessage] = list(tctx["messages"])
+    # Tracks whether the agent has produced at least one meaningful event
+    # (text / tool / thinking / usage) in this turn.  Retry budget below is
+    # only spent if this is True — an idle agent (no output yet) failing to
+    # start is NOT a transient blip worth 10×15 s of silent retry; the stream
+    # should close quietly so the client treats it as a normal drop.
+    # A one-element list is the standard Python idiom for a mutable closure
+    # variable that nested coroutines can flip without `nonlocal`.
+    _agent_produced: list[bool] = [False]
+
+    # --- Patch queue.put_nowait to track agent activity --------------------
+    # Tools capture `queue` via `make_tool_callbacks(root, lambda ev:
+    # queue.put_nowait(ev), …)`.  The lambda resolves `queue.put_nowait` by
+    # attribute lookup at call-time, so monkey-patching the method here is
+    # enough to intercept every event the tools emit (tool / tool_result).
+    # Text / thinking / usage events are patched inline below.
+    _orig_put = queue.put_nowait
+
+    def _put_and_track(ev: object) -> None:
+        if isinstance(ev, dict) and ev.get("kind") in (
+            "text",
+            "tool",
+            "tool_result",
+            "thinking",
+            "usage",
+        ):
+            _agent_produced[0] = True
+        _orig_put(ev)
+
+    queue.put_nowait = _put_and_track  # type: ignore[assignment]
+
     # Compact model used for in-turn tool-history compaction (spec §10). May be
     # None when the user hasn't configured a compact/subagent model — in that
     # case obsolete tool results are dropped outright instead of summarized.
@@ -2089,17 +2139,17 @@ async def _run_mode_turn(
                 if not isinstance(m, AIMessage):
                     continue
                 for tc in getattr(m, "tool_calls", None) or []:
-                    if json.dumps(
-                        {"n": tc.get("name"), "a": tc.get("args") or {}},
-                        sort_keys=True,
-                        ensure_ascii=False,
-                    ) == _sig:
+                    if (
+                        json.dumps(
+                            {"n": tc.get("name"), "a": tc.get("args") or {}},
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        )
+                        == _sig
+                    ):
                         _cid = tc.get("id")
                         for mm in messages:
-                            if (
-                                isinstance(mm, ToolMessage)
-                                and mm.tool_call_id == _cid
-                            ):
+                            if isinstance(mm, ToolMessage) and mm.tool_call_id == _cid:
                                 return mm.content
         return None
 
@@ -2351,10 +2401,12 @@ async def _run_mode_turn(
                 meta = getattr(ai, "response_metadata", {}) or {}
                 fr = meta.get("finish_reason") or meta.get("finishReason")
                 if not fr and isinstance(getattr(ai, "additional_kwargs", None), dict):
-                    fr = ai.additional_kwargs.get("finish_reason") or ai.additional_kwargs.get(
-                        "finishReason"
-                    )
-                _partial = ai.content if isinstance(ai.content, str) else str(ai.content)
+                    fr = ai.additional_kwargs.get(
+                        "finish_reason"
+                    ) or ai.additional_kwargs.get("finishReason")
+                _partial = (
+                    ai.content if isinstance(ai.content, str) else str(ai.content)
+                )
                 if fr == "length":
                     # opencode treats length-truncation as a normal (partial) stop
                     # and AUTO-CONTINUES the generation so the answer completes
@@ -2640,8 +2692,9 @@ async def _run_mode_turn(
                         except Exception:  # noqa: BLE001, S110
                             pass
                     break
-                # Transient failure: retry up to the budget, 30s apart.
+                # Transient failure: retry up to the budget, 15s apart.
                 if attempt >= _agents._RETRY_MAX_ATTEMPTS:
+                    # Budget exhausted — surface the error to the user.
                     # Surface the exhausted retry in codifa.log (not just as an SSE
                     # event) so a cut-off turn is diagnosable without scraping the
                     # stream. Timeouts here are the classic "turn cut off after a
@@ -2762,7 +2815,9 @@ def detect_test_commands(root: str) -> list[str]:
                 if not re.match(r"^test(\b|:)", key):
                     continue
                 val = str(scripts[key])
-                if python_cmd_added and ("pytest" in val or "python -m unittest" in val):
+                if python_cmd_added and (
+                    "pytest" in val or "python -m unittest" in val
+                ):
                     continue
                 cmds.append(f"npm run {key}")
             test_script = str(scripts.get("test", ""))
@@ -2864,13 +2919,17 @@ def detect_frontend_stack(root: str) -> str:
     runner = (
         "vitest"
         if has("vitest")
-        else "jest"
-        if has("jest") or has("react-scripts")
-        else "playwright"
-        if has("@playwright/test")
-        else "cypress"
-        if has("cypress")
-        else ""
+        else (
+            "jest"
+            if has("jest") or has("react-scripts")
+            else (
+                "playwright"
+                if has("@playwright/test")
+                else "cypress"
+                if has("cypress")
+                else ""
+            )
+        )
     )
     if has("next"):
         fw = "Next.js"
@@ -2937,7 +2996,9 @@ def _route_coder_entry(state: AgentState) -> str:
 
 async def coder_node(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "coder", queue, run_flags=state.get("_run_flags"))
+    reply = await _run_mode_turn(
+        state, "coder", queue, run_flags=state.get("_run_flags")
+    )
     return {"coder_result": reply, "final_response": reply}
 
 
@@ -4196,7 +4257,13 @@ async def reader_answer(state: AgentState) -> dict:
     state["mode"] = "reader"
     queue = state["_queue"]
     extra = _build_reader_context(state)
-    reply = await _run_mode_turn(state, "reader", queue, extra_instruction=extra, run_flags=state.get("_run_flags"))
+    reply = await _run_mode_turn(
+        state,
+        "reader",
+        queue,
+        extra_instruction=extra,
+        run_flags=state.get("_run_flags"),
+    )
     return {"final_response": reply}
 
 
@@ -4226,7 +4293,9 @@ def _route_reader_dispatch(state: AgentState) -> str:
 
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
-    reply = await _run_mode_turn(state, "plan", queue, run_flags=state.get("_run_flags"))
+    reply = await _run_mode_turn(
+        state, "plan", queue, run_flags=state.get("_run_flags")
+    )
     # Guard against a non-string reply (e.g. None when the turn fails) so we
     # don't crash on .strip() — and never silently swallow a save failure.
     if not isinstance(reply, str):

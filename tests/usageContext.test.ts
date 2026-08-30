@@ -35,7 +35,7 @@ console.log('۱) modelContextWindow — پنجرهی کانتکست مدل عد�
   } as any
   check('از contextMap (id پیشونددار) عدد واقعی برمیگردد', modelContextWindow(p2, 'gpt-4o') === 128000, modelContextWindow(p2, 'gpt-4o'))
 
-  // Provider-level fallback when no per-model entry exists.
+  // مدل ناشناخته در contextMap → null (context window فقط از مدل گرفته می‌شود).
   const p3 = {
     id: 'x',
     name: 'X',
@@ -43,7 +43,7 @@ console.log('۱) modelContextWindow — پنجرهی کانتکست مدل عد�
     contextMap: {},
     contextWindow: 200000,
   } as any
-  check('fallback روی provider.contextWindow عدد واقعی است', modelContextWindow(p3, 'm1') === 200000, modelContextWindow(p3, 'm1'))
+  check('مدل ناشناخته در contextMap null برمیگرداند (نه fallback به provider.contextWindow)', modelContextWindow(p3, 'm1') === null, modelContextWindow(p3, 'm1'))
 
   // When the backend supplies ANY context (our fix guarantees this), the bar must
   // never fall back to showing a blank/“—”. A genuinely unknown provider returns

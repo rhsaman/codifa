@@ -255,6 +255,7 @@ export function modelContextWindow(
   provider: {
     id?: string
     contextMap?: Record<string, number>
+    contextWindow?: number
   } | null | undefined,
   model: string,
 ): number | null {

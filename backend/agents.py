@@ -899,7 +899,7 @@ _THINKING_LEVELS = {
 }
 
 # HTTP status codes that are worth retrying (transient server / rate-limit).
-_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_STATUS = {429, 502, 503, 504}
 
 # Files the workspace memory loader pulls in, and the cap on each (bytes).
 _PROJECT_MEMORY_FILES = ["AGENTS.md"]
@@ -950,13 +950,12 @@ _RETRYABLE_PHRASES = (
     "no providers",
     "capacity",
     "transiently",
-    # Mid-stream provider 5xx surfaced by some SDKs as a bare `APIError` with
-    # NO status code attached (openai's stream-error path raises
-    # `APIError("Internal server error", ...)` without `.status_code`) — the
-    # message text is the only signal, so match the server-error wording too.
-    "internal server error",
-    "internal error",
-    "server error",
+    # NOTE: "internal server error" / "server error" / "internal error" are
+    # deliberately EXCLUDED — they match provider 5xx (e.g. 500 Internal Server
+    # Error) which should NOT auto-retry.  Only rate-limit (429) and server
+    # busy (502/503/504) are retryable.  Genuine transient connection errors
+    # that happen to mention "server error" in their text are already covered
+    # by _RETRYABLE_EXC_NAMES (class-based matching).
     "gateway timeout",
     # Upstream capacity / worker exhaustion (e.g. OpenRouter wrapping a Nvidia
     # provider overload as `ResourceExhausted: Worker local total request limit

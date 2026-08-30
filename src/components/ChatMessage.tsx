@@ -406,6 +406,7 @@ export function RetryBanner({
   agent,
   fallback,
   stalled,
+  startedAt,
   onCancel,
   onRetry,
 }: {
@@ -419,12 +420,18 @@ export function RetryBanner({
   agent?: string;
   fallback?: boolean;
   stalled?: boolean;
+  startedAt?: number;
   onCancel?: () => void;
   onRetry?: () => void;
 }) {
-  const [left, setLeft] = useState(delay);
+  // Initialize from wall-clock time so the countdown survives remounts
+  // (switching chats and coming back doesn't reset to `delay`).
+  const [left, setLeft] = useState(() => {
+    if (!startedAt || delay <= 0) return delay;
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    return Math.max(0, delay - elapsed);
+  });
   useEffect(() => {
-    setLeft(delay);
     if (delay <= 0) return;
     const t = setInterval(() => {
       setLeft((l) => {
@@ -569,14 +576,17 @@ function UsageBadge({
  * داده می‌شود. ۳ نقطهٔ لودینگ از سمت راست شروع به پر شدن می‌کنند (نقطهٔ اول =
  * سمت راست زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
  */
-export function ThinkingIndicator() {
-  const startRef = useRef(Date.now());
-  const [elapsed, setElapsed] = useState(0);
+export function ThinkingIndicator({ startedAt }: { startedAt?: number }) {
+  const [elapsed, setElapsed] = useState(() => {
+    const base = startedAt ?? Date.now();
+    return Date.now() - base;
+  });
   useEffect(() => {
-    startRef.current = Date.now();
-    const id = setInterval(() => setElapsed(Date.now() - startRef.current), 250);
+    const base = startedAt ?? Date.now();
+    setElapsed(Date.now() - base);
+    const id = setInterval(() => setElapsed(Date.now() - base), 250);
     return () => clearInterval(id);
-  }, []);
+  }, [startedAt]);
   return (
     <span className="msg-thinking" aria-label="Thinking">
       <span className="msg-thinking-inner" dir="ltr">
@@ -1264,7 +1274,7 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
             </>
           )}
-          {message.streaming && message.thinkingActive && <ThinkingIndicator />}
+          {message.streaming && message.thinkingActive && <ThinkingIndicator startedAt={message.thinkingStartedAt} />}
         </div>
       )}
 

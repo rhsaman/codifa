@@ -223,7 +223,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -236,7 +236,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -432,6 +432,9 @@ interface State {
   fetchUrlTtlDays: number
   setWebSearchTtlDays: (d: number) => void
   setFetchUrlTtlDays: (d: number) => void
+  /** How many top web_search results are auto-fetched for real page content (0 = off, snippet-only). */
+  webSearchAutoFetch: number
+  setWebSearchAutoFetch: (n: number) => void
   /** TTL for RAG web/fetch storage (days). */
   ragWebTtlDays: number
   setRagWebTtlDays: (d: number) => void
@@ -652,6 +655,7 @@ export const useStore = create<State>((set, get) => ({
   vectorDbPath: '',
   webSearchTtlDays: 7,
   fetchUrlTtlDays: 7,
+  webSearchAutoFetch: 3,
   ragWebTtlDays: 90,
   whisperModel: 'Systran/faster-whisper-medium',
   whisperBaseUrl: '',
@@ -1206,6 +1210,14 @@ export const useStore = create<State>((set, get) => ({
   },
   setFetchUrlTtlDays: (d) => {
     set({ fetchUrlTtlDays: Math.max(1, Math.round(d) || 7) })
+    get().persist()
+  },
+  setWebSearchAutoFetch: (n) => {
+    // 0 is a valid, deliberate value (disable auto-fetch) — unlike the TTL
+    // setters above, we can't fall back with `|| default` since that would
+    // silently turn 0 back into the default.
+    const r = Math.round(n)
+    set({ webSearchAutoFetch: Number.isFinite(r) ? Math.max(0, Math.min(10, r)) : 3 })
     get().persist()
   },
   setRagWebTtlDays: (d) => {

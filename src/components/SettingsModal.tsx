@@ -465,6 +465,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setWebSearchTtlDays = useStore((s) => s.setWebSearchTtlDays)
   const fetchUrlTtlDays = useStore((s) => s.fetchUrlTtlDays ?? 7)
   const setFetchUrlTtlDays = useStore((s) => s.setFetchUrlTtlDays)
+  const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
+  const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
   const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
   const setRagWebTtlDays = useStore((s) => s.setRagWebTtlDays)
   const root = useStore((s) => s.root)
@@ -1785,6 +1787,29 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   aria-label="Fetch URL cache TTL in days"
                 />
                 <span className="field-unit">days</span>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Auto-fetch top results</div>
+                <div className="settings-row-desc">
+                  How many of <b>web_search</b>'s top results get their real page content fetched
+                  (not just a snippet) before answering. <code>0</code> disables this and falls
+                  back to snippet-only results. Default: <code>3</code>.
+                </div>
+              </div>
+              <div className="settings-row-control">
+                <input
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={webSearchAutoFetch}
+                  onChange={(e) => setWebSearchAutoFetch(Number(e.target.value))}
+                  dir="ltr"
+                  aria-label="Web search auto-fetch top N results"
+                />
+                <span className="field-unit">results</span>
               </div>
             </div>
           </div>

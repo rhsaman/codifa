@@ -46,6 +46,8 @@ TERMINAL_TIMEOUT_MAX = 300
 MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
 WEB_SEARCH_TIMEOUT = 15
+WEB_SEARCH_AUTO_FETCH = 3  # top-N results to actually fetch full content for, not just snippet
+WEB_SEARCH_FETCH_CHARS = 4000  # per-page cap when auto-fetched inside web_search (keeps distill input lean)
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
 SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
@@ -951,6 +953,20 @@ def _fetch_cache_ttl() -> int:
     except (TypeError, ValueError):
         days = 7
     return days * 86400
+
+
+def _web_search_auto_fetch() -> int:
+    """تعداد نتایج بالای web_search که واقعاً fetch می‌شن (نه فقط snippet)، از
+    تنظیمات — پیش‌فرض WEB_SEARCH_AUTO_FETCH (3). صفر یعنی غیرفعال‌شدن کامل
+    (برگشت به رفتار snippet-only قدیمی). سقف بالا 10 تا هر سرچ یک سرچ فچش بیش از حد
+    نشه.
+    """
+    try:
+        s = (_state_db.get_settings() or {})
+        n = int(s.get("webSearchAutoFetch", WEB_SEARCH_AUTO_FETCH))
+    except (TypeError, ValueError):
+        n = WEB_SEARCH_AUTO_FETCH
+    return max(0, min(10, n))
 
 
 def _rag_web_enabled() -> bool:
@@ -2100,6 +2116,44 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
     if len(text) > max_chars:
         text = text[:max_chars] + "\n…(truncated)"
     return {"url": url, "title": title, "content": text}
+
+
+def _fetch_for_search(url: str, max_chars: int = WEB_SEARCH_FETCH_CHARS) -> str | None:
+    """Fetch a result's real page content for use inside web_search itself.
+
+    Shares the same 24h fetch cache as fetch_url_tool (keyed by URL), so a
+    page already fetched once — via search or an explicit fetch_url call —
+    is never fetched twice. Returns the page text, or None on any failure;
+    never raises, so one broken/slow URL never breaks the rest of a search.
+    """
+    cache = _get_result_cache()
+    cache_key = f"fetch:{url}"
+    cached = cache.get(cache_key)
+    if cached:
+        try:
+            data = json.loads(cached)
+            body = data.get("content", "")
+            if body:
+                return body
+        except (ValueError, TypeError):
+            pass
+    result = fetch_url(url, max_chars)
+    if "error" in result:
+        return None
+    body = result.get("content", "")
+    if body:
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(
+                    {"content": body, "title": result.get("title", "")},
+                    ensure_ascii=False,
+                ),
+                _fetch_cache_ttl(),
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return body or None
 
 
 def _html_to_text(html: str) -> tuple[str, str]:
@@ -4123,7 +4177,7 @@ When you need to read several files, read multiple independent files in parallel
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
-        """Search the web for a query and return the top results (title, URL, snippet). Results are cached for 24h, so repeating the exact same query costs no extra call. If you need several searches, fire all `web_search` calls in the SAME turn (parallel tool calls) — combine alternatives with `foo|bar` to collapse several searches into one. Before `fetch_url`, run `web_search` first to find the right URL; then fetch only the URLs you actually need — not every result."""
+        """Search the web AND fetch the full page content of the top results (not just a snippet) before answering. Results are cached for 24h, so repeating the exact same query costs no extra call. If you need several searches, fire all `web_search` calls in the SAME turn (parallel tool calls) — combine alternatives with `foo|bar` to collapse several searches into one. Only reach for `fetch_url` afterward for a specific URL that wasn't among the top results."""
         # The model that will distill the results: the web sub-agent, or the
         # MAIN model once this slot has fallen back earlier in the turn.
         _web_runner = main_model if _fallback_state.get("web") else web_model
@@ -4183,14 +4237,40 @@ When you need to read several files, read multiple independent files in parallel
         if not results:
             emit({"kind": "tool_result", "tool": "web_search", "summary": "no results"})
             return f"No web results for {query!r}."
+        # Auto-fetch the top N results' real page content — a bare snippet
+        # (title/URL/200-char excerpt) is rarely enough to actually answer the
+        # query. Fetched in parallel; a failed/slow fetch for one URL just
+        # falls back to its snippet instead of failing the whole search.
+        fetch_targets = results[: _web_search_auto_fetch()]
+        fetched_pages: dict[str, str] = {}
+        if fetch_targets:
+            fetched = await asyncio.gather(
+                *[
+                    asyncio.to_thread(_fetch_for_search, r["url"], WEB_SEARCH_FETCH_CHARS)
+                    for r in fetch_targets
+                ],
+                return_exceptions=True,
+            )
+            for r, body in zip(fetch_targets, fetched):
+                if isinstance(body, str) and body:
+                    fetched_pages[r["url"]] = body
         lines = []
         ui_items: list[dict] = []
         for r in results:
             snippet = r["snippet"]
             if len(snippet) > WEB_SEARCH_SNIPPET_MAX:
                 snippet = snippet[:WEB_SEARCH_SNIPPET_MAX] + " …"
-            lines.append(f"- {r['title']}\n  {r['url']}\n  {snippet}")
-            ui_items.append({"title": r["title"], "url": r["url"], "snippet": snippet})
+            full_body = fetched_pages.get(r["url"])
+            body_for_lines = full_body if full_body else snippet
+            lines.append(f"- {r['title']}\n  {r['url']}\n  {body_for_lines}")
+            ui_items.append(
+                {
+                    "title": r["title"],
+                    "url": r["url"],
+                    "snippet": snippet,
+                    "fetched": bool(full_body),
+                }
+            )
             # Persist each hit into the workspace vector store (KIND_WEB) so
             # later retrieval can recall it without re-fetching the web.
             # اختیاری: فقط اگه مدل embedding در دسترس باشه (RAG فعال).
@@ -4207,7 +4287,7 @@ When you need to read several files, read multiple independent files in parallel
                         f"web:{r['url']}",
                         KIND_WEB,
                         r.get("title", r["url"]),
-                        [snippet],
+                        [body_for_lines],
                         {"source_url": r["url"], "source_type": "web"},
                     )
                 except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
@@ -4216,7 +4296,7 @@ When you need to read several files, read multiple independent files in parallel
                     # فقط وقتی خودمان بازش کردیم ببندیم (نشت connection).
                     if store is None:
                         _ws.close()
-        summary = f"{len(results)} results"
+        summary = f"{len(results)} results ({len(fetched_pages)} fetched)"
         fallbacks = result.get("fallbacks") or []
         engine = result.get("engine") or ""
         if fallbacks:

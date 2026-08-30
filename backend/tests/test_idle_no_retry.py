@@ -69,8 +69,9 @@ async def test_idle_hard_error_shows_error(run_events, monkeypatch):
 async def test_output_then_429_retries(run_events, monkeypatch):
     """وقتی agent ابتدا tool call موفق دارد و بعد خطای 429 می‌خورد،
     باید retry کند."""
-    from mock_openai import mock, text_reply, tool_call
     import json
+
+    from mock_openai import mock, text_reply, tool_call
 
     monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [

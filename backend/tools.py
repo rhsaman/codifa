@@ -1833,6 +1833,15 @@ def _rg_search(
         return None  # invalid regex or scan error -> let the Python fallback try
 
     matches: list[dict] = []
+    # Context lines arrive interleaved with matches in the JSON stream. rg
+    # emits the match line itself as a separate ``"match"`` event — NOT as
+    # ``"context"`` — so the previous parser dropped the actual matching line
+    # from ``context_lines``, leaving ``grep_tool`` unable to render the ``>``
+    # marker and forcing the model to ``read`` the file just to see what
+    # matched. We buffer context lines in ``pending`` so a match can pull its
+    # before-context out of the buffer; context lines that arrive AFTER a
+    # match are appended to that match as after-context.
+    pending: list[dict] = []
     for line in proc.stdout.splitlines():
         if not line.startswith("{"):
             continue
@@ -1846,27 +1855,61 @@ def _rg_search(
             file = path_text.removeprefix("./")
             if in_coder:
                 file = os.path.join(coder, file)
-            entry = {
-                "file": file,
+            match_line = data.get("line_number")
+            match_text = ((data.get("lines") or {}).get("text") or "").rstrip("\n")[
+                :500
+            ]
+            entry: dict = {"file": file, "line": match_line, "text": match_text}
+            if ctx > 0:
+                ctx_lines: list[dict] = []
+                lo = (match_line or 0) - ctx
+                # Pull before-context from pending: only lines in
+                # [match_line - ctx, match_line). Any line whose number
+                # equals the match line itself is dropped (we add the real
+                # match line below with the canonical text).
+                ctx_lines.extend(
+                    c
+                    for c in pending
+                    if c.get("line") is not None
+                    and lo <= c["line"] < (match_line or 0)
+                )
+                # The match line itself, so the `>` marker in grep_tool
+                # (which checks cl['line'] == m['line']) actually fires.
+                ctx_lines.append({"line": match_line, "text": match_text})
+                entry["context_lines"] = ctx_lines
+                # Anything older than match_line - ctx can never become
+                # before-context for a future match, so it's safe to drop.
+                pending = []
+            matches.append(entry)
+            if len(matches) >= MAX_SEARCH_RESULTS:
+                return {"query": query, "matches": matches, "truncated": True}
+        elif obj.get("type") == "context":
+            if ctx <= 0:
+                continue
+            ctx_line = {
                 "line": data.get("line_number"),
                 "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[
                     :500
                 ],
             }
-            if ctx > 0:
-                entry["context_lines"] = []
-            matches.append(entry)
-            if len(matches) >= MAX_SEARCH_RESULTS:
-                return {"query": query, "matches": matches, "truncated": True}
-        elif obj.get("type") == "context" and ctx > 0 and matches:
-            matches[-1]["context_lines"].append(
-                {
-                    "line": data.get("line_number"),
-                    "text": ((data.get("lines") or {}).get("text") or "").rstrip("\n")[
-                        :500
-                    ],
-                }
-            )
+            cl_line = ctx_line["line"]
+            if matches and cl_line is not None and matches[-1]["line"] is not None:
+                m_line = matches[-1]["line"]
+                # After-context for the last match: in range
+                # (m_line, m_line + ctx]. Anything beyond that is a gap
+                # whose context belongs to a future match → pending.
+                if m_line < cl_line <= m_line + ctx:
+                    matches[-1].setdefault("context_lines", []).append(ctx_line)
+                else:
+                    # Either before-context (cl_line <= m_line) or beyond
+                    # the last match's after-context window — both belong
+                    # in the pending buffer for a future match.
+                    pending.append(ctx_line)
+            else:
+                # Before the first match — keep in pending so the first
+                # match can use it as before-context (previously these
+                # were dropped entirely because ``and matches`` failed).
+                pending.append(ctx_line)
     return {"query": query, "matches": matches, "truncated": False}
 
 

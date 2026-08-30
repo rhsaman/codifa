@@ -1802,10 +1802,27 @@ export function ChatPanel() {
         });
       } else if (event.kind === "ask") {
         setAskFreeText("");
+        // آیتم‌های options ممکنه از سمت backend غیررشته باشن (object/array/null).
+        // همه رو به string coerce می‌کنیم تا prepareContent کرش نکنه.
+        const rawOpts: unknown[] = Array.isArray(event.options)
+          ? event.options
+          : [];
+        const options: string[] = rawOpts
+          .map((o: unknown) =>
+            typeof o === "string"
+              ? o
+              : o == null
+                ? ""
+                : typeof o === "object"
+                  ? JSON.stringify(o)
+                  : String(o),
+          )
+          .map((s: string) => s.trim())
+          .filter((s: string) => s.length > 0);
         useStore.getState().setChatPendingAsk(chat.id, {
           id: event.id ?? "",
-          question: event.question ?? "",
-          options: Array.isArray(event.options) ? event.options : [],
+          question: typeof event.question === "string" ? event.question : "",
+          options,
         });
       } else if (event.kind === "error") {
         // A backend error while the summarizer was supposedly running means the

@@ -24,6 +24,7 @@ export const RTL_CHAR_RE = new RegExp(`[${PERSIAN_RANGE}]`)
 const BIDI_MARKS = /[\u202A-\u202E\u2066-\u2069]/g
 
 export function stripBidiMarks(text: string): string {
+  if (typeof text !== "string") return ""
   return text.replace(BIDI_MARKS, "")
 }
 
@@ -290,6 +291,12 @@ function foldLineCaptions(text: string): string {
 }
 
 export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
+  // اگر ورودی رشته نباشد (مثلاً object/array از tool output)، coerce کن
+  // تا کل ChatPanel کرش نکنه.
+  if (text == null) return ""
+  if (typeof text !== "string") {
+    try { text = String(text) } catch { return "" }
+  }
   if (!text) return text
   const cleaned = stripBidiMarks(text)
   // Fold "خط N: path" captions into the following fence BEFORE splitting on

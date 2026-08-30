@@ -5,9 +5,10 @@
 // Covers:
 //  - a clean stream completes without any reconnect
 //  - a network failure to CONNECT retries with exponential backoff, then succeeds
-//  - a network failure MID-STREAM (reader throws) retries and resumes
+//  - a network failure MID-STREAM (reader throws) after events → throws (no auto-retry)
 //  - a manual abort does NOT trigger a reconnect (AbortError propagates)
 //  - an HTTP error response (non-2xx) is NOT retried
+//  - a stream ending without `done` after events → throws (no auto-retry)
 //  - SSE ": keepalive" comments are forwarded as "keepalive" events (heartbeat)
 
 // Stub the Electron bridge so ensureSidecar() returns a fixed URL. This MUST
@@ -122,22 +123,33 @@ async function run() {
     check('۲) در نهایت event های داده رسید', received.filter((e) => e.kind !== 'retry').length === 2, received)
   }
 
-  // 3) Mid-stream drop → retry and resume.
+  // 3) Mid-stream drop AFTER events received → NOT auto-reconnected (intentional).
+  //    When events were already flowing, the drop is treated as an interruption
+  //    (client disconnect / user navigated away) rather than a sidecar crash.
+  //    Auto-reconnecting here would cause the unwanted "Provider hiccup during
+  //    idle" behavior.  Instead, streamChat throws so the UI can show a manual
+  //    Retry banner that resumes from the on-disk LangGraph checkpoint.
   {
     let calls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
       calls++
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
-      // First attempt drops mid-stream; second completes cleanly.
+      // First attempt drops mid-stream; no second attempt should happen.
       return makeStreamResponse(
         [{ kind: 'text', content: 'a' }, { kind: 'text', content: 'b' }, { kind: 'done' }],
         calls === 2,
       )
     }
-    await streamChat(baseParams, (e) => received.push(e))
-    check('۳) روی قطع شدن وسط استریم دوباره تلاش می‌کند', calls >= 3, calls)
-    check('۳) استریم دوم کامل رسید', received.some((e) => e.kind === 'done'), received)
+    let threwMsg = ''
+    try {
+      await streamChat(baseParams, (e) => received.push(e))
+    } catch (err) {
+      threwMsg = (err as Error).message
+    }
+    check('۳) قطع وسط استریم بعد از event → auto-reconnect نمی‌شود', calls === 2, calls)
+    check('۳) خطا "Connection lost mid-turn" برگشت', threwMsg.includes('Connection lost mid-turn'), threwMsg)
+    check('۳) event های جزئی قبل از قطع رسیدند', received.some((e) => e.kind === 'text'), received)
   }
 
   // 4) Manual abort → no reconnect, AbortError propagates.
@@ -207,22 +219,29 @@ async function run() {
     check('۶) event های data همچنان رسیدند', received.filter((e) => e.kind !== 'keepalive').length === 2, received)
   }
 
-  // 7) Stream ends WITHOUT a terminal `done` (sidecar crashed mid-turn) →
-  //    treated as a drop, reconnects and resumes (instead of silently stopping).
+  // 7) Stream ends WITHOUT a terminal `done` but AFTER delivering events →
+  //    NOT auto-reconnected (same as case 3). The gotAnyEvent flag is true
+  //    because a "text" event was delivered before the stream closed, so
+  //    streamChat throws "Connection lost mid-turn" instead of reconnecting.
+  //    The UI shows a Retry banner; clicking it resumes from the checkpoint.
   {
     let streamCalls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
       if (url.endsWith('/chat/stream')) streamCalls++
-      // First attempt closes at EOF with NO `done` (simulates a sidecar crash);
-      // second attempt is a normal, complete stream.
+      // First attempt closes at EOF with NO `done` (simulates a sidecar crash).
       if (streamCalls === 1) return makeStreamResponse([{ kind: 'text', content: 'partial' }])
       return makeStreamResponse([{ kind: 'text', content: 'rest' }, { kind: 'done' }])
     }
-    await streamChat(baseParams, (e) => received.push(e))
-    check('۷) استریم بدون done باعث reconnect می‌شود', streamCalls === 2, streamCalls)
-    check('۷) پس از reconnect استریم کامل رسید', received.some((e) => e.kind === 'done'), received)
+    let threwMsg = ''
+    try {
+      await streamChat(baseParams, (e) => received.push(e))
+    } catch (err) {
+      threwMsg = (err as Error).message
+    }
+    check('۷) استریم بدون done (با event قبلی) → auto-reconnect نمی‌شود', streamCalls === 1, streamCalls)
+    check('۷) خطا "Connection lost mid-turn" برگشت', threwMsg.includes('Connection lost mid-turn'), threwMsg)
   }
 
   if (failed > 0) {

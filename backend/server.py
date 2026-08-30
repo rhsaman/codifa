@@ -17,7 +17,6 @@ import os
 import re
 import secrets
 import time
-import traceback
 import tracemalloc
 from typing import Annotated
 from urllib.parse import quote
@@ -31,7 +30,12 @@ logger = logging.getLogger("codifa.server")
 # so codifa.log can show *which* allocator is growing between runs — the key to
 # diagnosing the RSS climb flagged by the "agent run complete rss_mb=..." line.
 _TRACE_PREV_SNAPSHOT = None
-_TRACE_FRAMES = 25
+# frame depth must be small: in production self-cost is dominated by per-allocation
+# bookkeeping, and 5 frames is enough to locate any allocator.
+_TRACE_FRAMES = 5
+# Skip snapshot above this RSS — tracemalloc's own materialization can push a
+# near-OOM process over the edge. 1200 MB matches Electron's typical heap cap.
+_TRACE_RSS_SNAPSHOT_MAX_MB = 1200.0
 
 
 def _rss_mb() -> float | None:
@@ -84,13 +88,33 @@ def _log_memory_snapshot(chat_id: str) -> None:
     if not tracemalloc.is_tracing():
         return
     try:
+        # Guard: skip the snapshot when RSS is already too high. take_snapshot()
+        # materializes every live trace and can transiently spike RSS by hundreds
+        # of MB; on a near-OOM sidecar that materialization can be the trigger
+        # that finally tips the process over the edge.
+        _rss = _rss_mb() or 0.0
+        if _rss > _TRACE_RSS_SNAPSHOT_MAX_MB:
+            logger.warning(
+                "tracemalloc snapshot skipped chat_id=%s rss_mb=%.1f (above %.0f MiB cap)",
+                chat_id, _rss, _TRACE_RSS_SNAPSHOT_MAX_MB,
+            )
+            return
+
+        # Drop the previous snapshot reference FIRST so its trace frames are
+        # reclaimable before we allocate the next one. Without this, the old
+        # trace stays alive in tracemalloc's internal bookkeeping and RSS
+        # high-water accumulates run-over-run.
+        prev = _TRACE_PREV_SNAPSHOT
+        _TRACE_PREV_SNAPSHOT = None
+        del prev
+
         # NOTE: take_snapshot() materializes every live trace (hundreds of
         # thousands here) and can transiently spike RSS by hundreds of MB. On
         # macOS ru_maxrss is a monotonic high-water mark, so that transient spike
         # shows up as a fake "jump" in the next "agent run start rss_mb". Log RSS
         # around the snapshot so the instrumentation's own cost is visible and
         # not mistaken for a leak.
-        _rss_before = _rss_mb() or 0.0
+        _rss_before = _rss
         _snap = tracemalloc.take_snapshot()
         _rss_after = _rss_mb() or 0.0
         if _rss_after - _rss_before > 50.0:
@@ -110,7 +134,7 @@ def _log_memory_snapshot(chat_id: str) -> None:
             return _frames[-1] if _frames else "?"
 
         if _TRACE_PREV_SNAPSHOT is not None:
-            _top = _snap.compare_to(_TRACE_PREV_SNAPSHOT, "lineno")[:12]
+            _top = _snap.compare_to(_TRACE_PREV_SNAPSHOT, "lineno")[:8]
             _lines = [
                 f"MEM-GROW chat_id={chat_id} top allocators since last run (size KiB / count):"
             ]
@@ -120,7 +144,7 @@ def _log_memory_snapshot(chat_id: str) -> None:
                 )
             logger.warning("\n".join(_lines))
         # Top overall current holders (where the memory lives right now).
-        _overall = _snap.statistics("lineno")[:12]
+        _overall = _snap.statistics("lineno")[:8]
         _olines = [
             f"MEM-NOW chat_id={chat_id} top current allocations (size KiB / count):"
         ]
@@ -1300,11 +1324,16 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 ka_count,
             )
             return
-        except Exception as exc:  # noqa: BLE001 — must always surface an SSE error
-            # Full traceback to the sidecar stderr so an opaque upstream message
-            # ("Exceeded maximum output retries (1)", ...) never hides the real
-            # trigger; the user still sees a readable error over SSE.
-            traceback.print_exc()
+        except Exception as exc:
+            # Log the full traceback to the FILE handler (codifa.log) so an opaque
+            # upstream message ("Exceeded maximum output retries (1)", ...) never
+            # hides the real trigger. Stderr may not be captured by Electron in
+            # packaged mode, so print_exc alone is not enough. The user still sees
+            # a readable error over SSE.
+            logger.exception(
+                "agent run failed chat_id=%s rss_mb=%.1f",
+                req.chat_id, _rss_mb() or 0.0,
+            )
             yield _sse({"kind": "error", "content": _friendly_error(exc, req.model, req.base_url)})
         except BaseException as exc:  # non-Exception death (KeyboardInterrupt/SystemExit/custom)
             # Anything that is NOT a normal Exception (e.g. a BaseException raised
@@ -1566,13 +1595,21 @@ def main() -> None:
     # whose stderr is not captured still leaves a persistent error trail behind.
     try:
         import logging
+        import logging.handlers
 
         from tools import user_coder_dir
 
         _log_dir = user_coder_dir()
         os.makedirs(_log_dir, exist_ok=True)
-        _handler = logging.FileHandler(
-            os.path.join(_log_dir, "codifa.log"), encoding="utf-8"
+        # Rotating handler: cap each log at 5 MB and keep 3 backups (15 MB total).
+        # Without rotation, repeated run-start/complete lines + MEM-NOW/MEM-GROW
+        # snapshot blocks push codifa.log into the hundreds-of-MB range over a
+        # long session, and the file keeps growing forever.
+        _handler = logging.handlers.RotatingFileHandler(
+            os.path.join(_log_dir, "codifa.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
         )
         _handler.setFormatter(
             logging.Formatter(
@@ -1580,11 +1617,13 @@ def main() -> None:
             )
         )
         _root = logging.getLogger()
-        # Allow raising the file-log verbosity via CODFA_LOG_LEVEL (e.g. "DEBUG")
-        # so diagnostic lines like graph.py's "[CTX_DEBUG] auto_compact ..." reach
-        # the persistent log. Defaults to WARNING to keep the file quiet in normal
-        # use. The value is validated against logging's known levels, falling back
-        # to WARNING on anything unrecognized.
+        # Allow raising the file-log verbosity via CODFA_LOG_LEVEL (e.g. "DEBUG"
+        # or "WARNING") so diagnostic lines like graph.py's "[CTX_DEBUG]
+        # auto_compact ..." reach the persistent log when needed. Defaults to
+        # WARNING+ so every exception (logger.exception / logger.error / logger.warning)
+        # lands in codifa.log — the persistent record the user reviews when a
+        # run cuts off or errors silently.  Operators can raise to ERROR via
+        # CODFA_LOG_LEVEL=ERROR to suppress warnings in the file.
         _level_name = os.environ.get("CODFA_LOG_LEVEL", "WARNING").upper()
         _root.setLevel(getattr(logging, _level_name, logging.WARNING))
         _root.addHandler(_handler)
@@ -1662,6 +1701,81 @@ def main() -> None:
         import state_db as _state_db
 
         atexit.register(lambda: _state_db.prune_orphan_plans())
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    # Make sure any unhandled exception (e.g. in a background task, signal
+    # handler, or top-level code path that bypasses FastAPI) still reaches the
+    # persistent codifa.log — not just stderr, which Electron may not capture
+    # in packaged mode. Without this, a hard crash inside a background task
+    # only shows up as a single "Task exception was never retrieved" line that
+    # the user can never see, which is exactly the "message cuts off" symptom.
+    try:
+        import sys
+
+        def _excepthook(exc_type, exc_value, exc_tb):
+            logging.getLogger("codifa.server").error(
+                "unhandled exception (not caught by FastAPI):",
+                exc_info=(exc_type, exc_value, exc_tb),
+            )
+            # Also call the default hook so the process still dies normally
+            # and the traceback reaches stderr for live dev.
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _excepthook
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    # Same for asyncio: an orphaned background task that raises will print
+    # "Task exception was never retrieved" to stderr (often dropped by
+    # Electron) and otherwise disappear. Wire the loop's exception handler so
+    # the same traceback lands in codifa.log.
+    try:
+
+        def _asyncio_excepthook(loop, context):
+            logging.getLogger("codifa.server").error(
+                "asyncio task exception: %s",
+                context,
+                exc_info=context.get("exception"),
+            )
+            loop.default_exception_handler(context)
+
+        # Defer until uvicorn creates the loop — installing it here would be
+        # overwritten by uvicorn's own loop setup. We register it via an
+        # atexit-like boot hook by wrapping the existing handler install path
+        # after uvicorn.run starts; the simplest approach is to monkey-patch
+        # asyncio.get_event_loop_policy later. Instead, install a one-shot
+        # factory that wires the handler as soon as a loop is created.
+        _orig_get_event_loop_policy = asyncio.get_event_loop_policy
+
+        class _PolicyWithHandler:
+            def __init__(self, inner):
+                self._inner = inner
+                self._installed = False
+
+            def get_event_loop(self):
+                loop = self._inner.get_event_loop()
+                self._install(loop)
+                return loop
+
+            def new_event_loop(self):
+                loop = self._inner.new_event_loop()
+                self._install(loop)
+                return loop
+
+            def _install(self, loop):
+                if self._installed:
+                    return
+                self._installed = True
+                try:
+                    loop.set_exception_handler(_asyncio_excepthook)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        asyncio.set_event_loop_policy(_PolicyWithHandler(_orig_get_event_loop_policy()))
     except Exception:  # noqa: BLE001, S110
         pass
 

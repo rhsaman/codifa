@@ -3990,17 +3990,19 @@ def _in_file_grep(root: str, rel: str, patterns: list[re.Pattern]) -> set[int]:
         target = _agents.resolve_safe(root, rel)
     except Exception:  # noqa: BLE001
         return set()
+    out: set[int] = set()
     try:
         with open(target, "r", errors="ignore") as fh:
-            lines = fh.readlines()
+            # Stream line-by-line instead of fp.readlines() — huge files were
+            # spiking the explore pipeline's memory cost. Output (set of line
+            # numbers) is identical to the readlines() version.
+            for i, line in enumerate(fh, 1):
+                for rx in patterns:
+                    if rx.search(line):
+                        out.add(i)
+                        break
     except OSError:
         return set()
-    out: set[int] = set()
-    for i, line in enumerate(lines, 1):
-        for rx in patterns:
-            if rx.search(line):
-                out.add(i)
-                break
     return out
 
 
@@ -4532,13 +4534,18 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
                 initial.get("chat_id", ""),
             )
             return
-        except Exception as _exc:  # noqa: BLE001 — surface the real failure
+        except Exception as _exc:
             # Never swallow the error silently: a bare `queue.put(None)` would
             # end the stream with NO error event, so the frontend sees a sudden
             # "disconnect" (the message just cuts off) instead of a real error
             # it can show as a Retry banner. This is the root cause of the
             # intermittent "first/any message disconnects instantly" reports.
             _clean = False
+            # Log the full traceback to the FILE handler (codifa.log) — stderr
+            # alone is not enough because Electron may not capture it in
+            # packaged mode. Also call traceback.print_exc() as a fallback for
+            # live dev where stderr IS the live log.
+            logger.exception("[run_graph] agent crashed chat_id=%s", initial.get("chat_id", ""))
             traceback.print_exc()
             await queue.put(
                 {

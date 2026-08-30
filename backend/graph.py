@@ -878,6 +878,36 @@ def _dedup_code_map(
     return code_map_block
 
 
+def _slice_history_by_turns(history: list, n: int) -> list:
+    """برش history به «n رفت‌وبرگشت اخیر» بر اساس مرز پیام user.
+
+    یک turn = یک entry با ``role == "user"`` (به‌همراه هر entry غیر user که بعد
+    از آن و قبل از user بعدی آمده، مثل system entryهای mode-switch). از آخر
+    آرایه به عقب n پیام user می‌شماریم و slice از اولین آن‌ها به بعد
+    برمی‌گردانیم. اگر تعداد user کمتر از n باشد، کل history برگردانده می‌شود
+    (caller این حالت را با مقایسهٔ ``len(_recent) == len(history)`` تشخیص می‌دهد
+    و در آن صورت اصلاً trim نمی‌کند).
+
+    این helper تضمین می‌کند:
+    - n واقعاً «n رفت‌وبرگشت» می‌شود (نه ≈n/2 با شمارش entryهای flat).
+    - slice همیشه با یک ``user`` شروع می‌شود و هیچ‌وقت وسط یک جفت
+      user/assistant نمی‌افتد.
+    - system entryهای بین آخرین nامین user و انتهای آرایه (مثل mode-switch
+      notice بعد از آخرین reply) به‌عنوان بخشی از همان turn نگه داشته می‌شوند
+      و از سهم n کم نمی‌شوند.
+    """
+    if n <= 0 or not history:
+        return list(history)
+    for i in range(len(history) - 1, -1, -1):
+        entry = history[i]
+        if isinstance(entry, dict) and entry.get("role") == "user":
+            n -= 1
+            if n == 0:
+                return history[i:]
+    # تعداد user کمتر از n درخواستی → همهٔ history نگه داشته می‌شود.
+    return list(history)
+
+
 async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     """Assemble everything one mode-turn needs: system prompt, history messages,
     the mode-filtered tool set, and the LangChain chat model.
@@ -1274,17 +1304,30 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             (state_db.get_settings() or {}).get("historyLimit", 0) or 0
         )
     if _history_limit > 0 and len(history) > _history_limit:
-        _recent = history[-_history_limit:]
-        _older = history[:-_history_limit]
-        _summary = await _summarize_history_head(compact_model, _older, root)
-        lc_history = history_to_langchain_messages(_recent, current_mode=mode)
-        lc_history.insert(0, SystemMessage(content=_summary))
-        # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
-        # از context افتاده. کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل بفرسته
-        # نه marker بی‌محتوای «see previous turn».
-        _code_map_hash_cache = getattr(build_turn_context, "_code_map_hash_cache", None)
-        if isinstance(_code_map_hash_cache, dict) and chat_id in _code_map_hash_cache:
-            _code_map_hash_cache.pop(chat_id, None)
+        # بر اساس «N رفت‌وبرگشت» که UI در SettingsModal تب General وعده داده، نه
+        # شمارش entry خام. هر turn = یک پیام user (+ هر entry غیر user که بعد
+        # از آن و قبل از user بعدی آمده، مثل mode-switch system entry). slice
+        # باید از Nامین پیام user از آخر شروع بشود تا (الف) برش وسط یک جفت
+        # user/assistant نیفتد، و (ب) تعداد entryهای نگه‌داشته‌شده واقعاً متناسب
+        # با N باشد نه ≈N/2.
+        _recent = _slice_history_by_turns(history, _history_limit)
+        if len(_recent) == len(history):
+            # تعداد user واقعی کمتر از N درخواستی → همهٔ history نگه داشته می‌شود
+            # (همان رفتار حالت «no trim»).
+            lc_history = history_to_langchain_messages(history, current_mode=mode)
+        else:
+            _older = history[: len(history) - len(_recent)]
+            _summary = await _summarize_history_head(compact_model, _older, root)
+            lc_history = history_to_langchain_messages(_recent, current_mode=mode)
+            lc_history.insert(0, SystemMessage(content=_summary))
+            # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
+            # از context افتاده. کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل
+            # بفرسته نه marker بی‌محتوای «see previous turn».
+            _code_map_hash_cache = getattr(
+                build_turn_context, "_code_map_hash_cache", None
+            )
+            if isinstance(_code_map_hash_cache, dict) and chat_id in _code_map_hash_cache:
+                _code_map_hash_cache.pop(chat_id, None)
     else:
         lc_history = history_to_langchain_messages(history, current_mode=mode)
     # CODE MAP dedup: فقط وقتی marker "unchanged" بفرست که نقشهٔ کامل هنوز

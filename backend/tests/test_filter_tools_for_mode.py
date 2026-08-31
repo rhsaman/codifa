@@ -39,13 +39,12 @@ def test_web_denied_only_when_cap_web_false():
 
 def test_web_survives_ask_trivial_prompt():
     # Even a trivial ask prompt must keep web tools; only the planning /
-    # permission / memory tools are dropped.
+    # permission tools are dropped.
     tools = filter_tools_for_mode(
         "ask", _fake_tools(), {}, set(), True, False, prompt="سلام", root=""
     )
     assert _WEB <= set(tools)
     assert "update_plan" not in tools
-    assert "memory" not in tools
     assert "ask_user" not in tools
 
 

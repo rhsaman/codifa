@@ -12,7 +12,6 @@ from agents import (
     _skills_section,
     _subagent_target,
 )
-from graph import _MEMORY_RECALL_CUES
 from providers import OPENROUTER_BASE
 
 
@@ -184,24 +183,3 @@ def test_is_test_task_still_detects_test_prompts():
     assert _is_test_task("تست بنویس")
     assert _is_test_task("add unit tests for the parser")
     assert not _is_test_task("fix the login bug")
-
-
-# ---------------------------------------------------------------------------
-# Memory auto-recall gating (graph._MEMORY_RECALL_CUES)
-# ---------------------------------------------------------------------------
-
-
-def test_memory_recall_cue_explicit_persian_and_english():
-    # The user's own phrase ("از مموری ببین") and common variants must trigger.
-    for p in ("از مموری ببین", "ببین تو مموری چی داری", "در حافظه چیزی داری؟",
-              "look in memory", "search memory for the auth flow",
-              "check memory", "recall what we decided about ports"):
-        assert _MEMORY_RECALL_CUES.search(p), p
-
-
-def test_memory_recall_cue_not_on_plain_chatter():
-    # Normal questions / code questions must NOT be treated as a memory request
-    # (otherwise the gate would re-fire on every turn and defeat its purpose).
-    for p in ("سلام", "how does auth work?", "fix the login bug",
-              "what is a closure", "the memory leak is in parser.py"):
-        assert not _MEMORY_RECALL_CUES.search(p), p

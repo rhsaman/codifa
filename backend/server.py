@@ -1502,7 +1502,6 @@ class CleanupRunResponse(BaseModel):
     ok: bool = False
     evicted: int = 0
     pruned_files: int = 0
-    expired_notes: int = 0
     vacuumed: bool = False
     error: str = ""
 

@@ -737,12 +737,14 @@ _UNIVERSAL_RULES = (
     "4. PERSIAN TYPOGRAPHY: when replying in Persian, always use the half-space "
     "(ZWNJ, U+200C) between word components — e.g. کتابخانه‌ها, منسوخ‌شده‌اند, "
     "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it.\n"
-    "5. MEMORY IS AUTO-INJECTED: this project's relevant durable memory notes are "
-    "loaded into your context automatically every run, so you rarely need "
-    "search_memory — the notes are already in front of you. Only call "
-    "search_memory when you explicitly need MORE than what's already here (a "
-    "different angle, older notes, or a deliberate mid-task re-check). Never call "
-    "it routinely or on every step."
+    "5. WORKSPACE SUMMARY: when you start a NEW chat in a workspace that has "
+    "prior chats, a short recap of those prior chats is auto-injected into the "
+    "system prompt as a 'WORKSPACE SUMMARY' block (see "
+    "state_db.get_workspace_summary and the build_turn_context injection point "
+    "in graph.py). Use it as context for the current task. It is a static "
+    "reference — there is no 'memory' or 'search_memory' tool to call; do not "
+    "try to refresh or re-fetch it from inside a turn. The recap is refreshed "
+    "only on the first message of a new chat."
 )
 
 # Length rule for plan/coder ONLY — these modes need full, complete deliverables
@@ -1972,16 +1974,6 @@ def _load_workspace_summary(root: str) -> str:
 
 
 # The agent's OWN self-written memory (distinct from the user-authored AGENTS.md
-# above). Curated via the `memory` tool (add/replace/remove; see tools.py) as
-# the agent works, so a later session in the same project starts already
-# knowing things it learned before — conventions it discovered, gotchas, fixes
-# that worked. Notes are stored as RAG embeddings in the workspace vector store
-# (kind ``memory``) and the top few relevant to the CURRENT prompt are
-# auto-injected below every run (see _load_learned_memory) — search_memory is
-# still available as a tool for pulling in MORE or DIFFERENT notes than what
-# was auto-recalled (a different angle, older notes that fell outside top-6).
-
-
 _FTS_STOPWORDS = frozenset(
     [
         "the",
@@ -2146,126 +2138,6 @@ def _fts_keywords(query: str, max_terms: int = 6) -> list[str]:
     return out[:max_terms]
 
 
-# Learned-memory injection budget. Mirrors the file/web RAG block (build_context
-# caps at max_chars / per_section_chars) so one turn can never dump unbounded
-# notes into the context. All three modes share this path.
-_MEMORY_MAX_CHARS = 2_400
-_MEMORY_PER_NOTE_CHARS = 1_200
-_MEMORY_SEMANTIC_MIN_SCORE = 0.4
-# Lexical floor: bm25 is negative (more negative = more relevant) and its
-# magnitude scales with corpus stats (a tiny store scores exact matches near
-# -1e-06 while a large one hits -3.6), so an absolute threshold is unreliable.
-# Instead we drop a keyword's best hit only when it is several times weaker
-# than the strongest lexical hit of the run — a relative band, not an absolute.
-_MEMORY_LEXICAL_REL_FLOOR = 0.5
-_MEMORY_TOP_K = 8
-
-
-def _load_learned_memory(store: VectorStore | None, query: str = "") -> str:
-    """Always read the project's RAG memory and inject the relevant notes into
-    the context, so the model starts every run with its saved knowledge instead
-    of having to remember to call search_memory. Never raises.
-
-    Hybrid retrieval: FTS5 lexical match runs FIRST so exact terms (file
-    paths, symbol names, specific corrections the user stated) are never
-    missed just because their embedding isn't semantically close to the
-    query — vector-only search is unreliable for that. Vector/semantic
-    results then fill any remaining slots, deduped by chunk id.
-
-    The block is budgeted (``_MEMORY_MAX_CHARS`` total, ``_MEMORY_PER_NOTE_CHARS``
-    per note) so a single turn can never inject unbounded memory. Both sources
-    are merged and ranked by relevance (bm25-derived for lexical, cosine for
-    semantic) rather than lexical-always-first, so a wall of weak lexical hits
-    can't crowd out genuinely relevant semantic notes.
-    """
-    if store is None:
-        return ""
-    try:
-        total = store.count_docs(KIND_MEMORY)
-    except Exception:  # noqa: BLE001
-        return ""
-    if total == 0:
-        return ""
-    try:
-        if (query or "").strip():
-            lexical: list[dict] = []
-            for kw in _fts_keywords(query):
-                try:
-                    hits = store.fts_search(kw, KIND_MEMORY, top_k=2)
-                except Exception:  # noqa: BLE001, S112 — a failed term just contributes no hits
-                    continue
-                if hits:
-                    # Keep only the single best hit per keyword — the 2nd/3rd
-                    # matches of the same term are near-duplicates of it.
-                    lexical.append(hits[0])
-            # Relative lexical floor: drop hits far weaker than the strongest
-            # exact-term match of this run (bm25 magnitude is corpus-dependent,
-            # so this is anchored to the best hit rather than an absolute value).
-            if lexical:
-                best_rank = min(float(h.get("_bm25_rank") or 0.0) for h in lexical)
-                floor = _MEMORY_LEXICAL_REL_FLOOR * best_rank
-                lexical = [
-                    h for h in lexical if float(h.get("_bm25_rank") or 0.0) <= floor
-                ]
-            semantic = store.search(
-                query,
-                KIND_MEMORY,
-                top_k=_MEMORY_TOP_K,
-                min_score=_MEMORY_SEMANTIC_MIN_SCORE,
-            )
-            seen: set[int] = set()
-            scored: list[tuple[float, dict]] = []
-            for r in lexical:
-                cid = r.get("_chunk_id")
-                if cid is not None and cid in seen:
-                    continue
-                if cid is not None:
-                    seen.add(cid)
-                rank = float(r.get("_bm25_rank") or 0.0)
-                scored.append((-rank, r))  # more negative rank → higher score
-            for r in semantic:
-                cid = r.get("_chunk_id")
-                if cid is not None and cid in seen:
-                    continue
-                if cid is not None:
-                    seen.add(cid)
-                scored.append((float(r.get("score", 0.0)), r))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            notes: list[str] = []
-            used = 0
-            for _, r in scored:
-                if len(notes) >= _MEMORY_TOP_K:
-                    break
-                text = str(r.get("text", "")).strip()
-                if not text:
-                    continue
-                if len(text) > _MEMORY_PER_NOTE_CHARS:
-                    text = text[:_MEMORY_PER_NOTE_CHARS] + "…"
-                if notes and used + len(text) > _MEMORY_MAX_CHARS:
-                    break
-                notes.append(text)
-                used += len(text)
-        else:
-            docs = store.doc_texts(KIND_MEMORY)
-            notes = []
-            for d in reversed(docs[-_MEMORY_TOP_K:]):
-                text = str(d.get("text", "")).strip()
-                if not text:
-                    continue
-                if len(text) > _MEMORY_PER_NOTE_CHARS:
-                    text = text[:_MEMORY_PER_NOTE_CHARS] + "…"
-                notes.append(text)
-    except Exception:  # noqa: BLE001
-        return ""
-    if not notes:
-        return ""
-    body = "\n".join(f"- {n}" for n in notes)
-    return (
-        "\n\n===== YOUR OWN MEMORY =====\n"
-        "Saved notes from earlier sessions on this project (retrieved from the vector store):\n"
-        f"{body}\n"
-        "===== END YOUR OWN MEMORY ====="
-    )
 
 
 # Conservative defaults so even small-context local models (e.g. 8k) fit.
@@ -3289,14 +3161,6 @@ async def _compact_history(
     )
 
 
-# Maximum number of auto-extracted memory notes written per run (Hermes-style
-# self-curation). Prevents a single turn from flooding memory.
-_AUTO_MEMORY_MAX_NOTES = 2
-# Minimum combined (prompt + reply) length before we bother asking the model to
-# reflect — short/simple exchanges usually hold nothing durable worth saving.
-_AUTO_MEMORY_MIN_CHARS = 120
-
-
 def _load_skills(root: str) -> list[dict]:
     """Load all user skills from the app database (single source of truth).
 
@@ -3396,11 +3260,6 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
 
 # -- Workspace summary refresh (LLM-backed, with safe fallback) ------------- #
 
-_SUMMARY_FALLBACK = (
-    "[No prior chats found in this workspace, or summary unavailable.]"
-)
-
-
 async def _maybe_refresh_workspace_summary(
     root: str,
     current_chat_id: str,
@@ -3417,8 +3276,10 @@ async def _maybe_refresh_workspace_summary(
       1. Walk every prior chat for this workspace.
       2. If nothing changed vs the cached ``covered_message_counts`` AND a
          summary exists → reuse it.
-      3. Otherwise summarise ONLY the new tail (since last refresh) with a
-         short LLM call; persist; return the wrapped block.
+      3. Otherwise feed the existing summary + new tails to the LLM for an
+         UPDATED merge; persist; return the wrapped block.
+      4. On LLM failure, keep the old summary (if any) — never poison the
+         cache with fallback text.
     """
     try:
         workspace_slug = (
@@ -3494,14 +3355,29 @@ async def _maybe_refresh_workspace_summary(
         return _load_workspace_summary(root) if existing else ""
 
     body = "\n".join(new_tail_lines)[:20000]
+    existing_content = (existing or {}).get("content") or ""
+
     system_prompt = (
-        "Summarise the following new turns from earlier chats of this "
-        "workspace. Produce a concise bullet list covering: tasks completed, "
-        "files changed, architectural decisions, unresolved issues. "
+        "You maintain a running summary of this workspace across chats.\n"
+        "Below is the EXISTING summary (if any), followed by NEW turns "
+        "since the last update. Produce an UPDATED summary that merges "
+        "both — keep anything from the existing summary still relevant, "
+        "add what's new, drop what's now stale/superseded.\n"
+        "Format: concise bullet list covering tasks completed, files "
+        "changed, architectural decisions, unresolved issues.\n"
         "Maximum ~2000 characters. "
         "Write in the same language the turns use (Persian or English). "
         "No preamble, no closing remarks — bullets only."
     )
+
+    user_msg = body
+    if existing_content.strip():
+        user_msg = (
+            "EXISTING SUMMARY:\n"
+            + existing_content.strip()
+            + "\n\nNEW TURNS:\n"
+            + body
+        )
 
     summary_text = ""
     chosen = model or fallback_model
@@ -3512,13 +3388,15 @@ async def _maybe_refresh_workspace_summary(
             summary_text, _ = await llm_generate(
                 chosen,
                 system=system_prompt,
-                user=body,
+                user=user_msg,
             )
         except Exception:  # noqa: BLE001
             summary_text = ""
 
+    # Bug fix: on LLM failure do NOT poison the cache with fallback text.
+    # Keep the old summary (if any) intact by returning early without save.
     if not summary_text.strip():
-        summary_text = _SUMMARY_FALLBACK + "\n" + body[:1500]
+        return _load_workspace_summary(root) if existing else ""
 
     try:
         state_db.save_workspace_summary(

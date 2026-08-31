@@ -93,7 +93,6 @@ _SEQUENTIAL_TOOLS = {
     "edit_file",
     "run_terminal",
     "confirm_action",
-    "memory",
     "create_skill",
     "create_mcp",
     "ask_user",
@@ -517,8 +516,6 @@ def filter_tools_for_mode(
     # coder-only (handled in the blocks above); non-coder modes therefore keep
     # only read/search/web/vision capabilities. The Explore subagent reuses the
     # same tool runtime in an isolated context.
-    if mode == "ask":
-        tools.pop("memory", None)
     if mode == "ask" and _agents._trivial_prompt(prompt):
         for n in (
             "update_plan",
@@ -4619,12 +4616,3 @@ _ASK_REPO_CUES = re.compile(
     re.IGNORECASE,
 )
 
-
-# Explicit user cues that mean "look at the saved memory now" (so we recall it
-# outside the first-message auto-recall). Persian + English.
-_MEMORY_RECALL_CUES = re.compile(
-    r"از مموری|مموری|در حافظه|یادآوری|حافظه|"
-    r"look in memory|from memory|search memory|check memory|what.?s in memory|"
-    r"recall|remember",
-    re.IGNORECASE,
-)

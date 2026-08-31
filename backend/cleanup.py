@@ -55,16 +55,14 @@ def _prune_missing_files(store: VectorStore, root: str) -> int:
 def run_cleanup(
     store: VectorStore | None,
     root: str = "",
-    memory_manager: object | None = None,
     vacuum_threshold_mb: int = 64,
 ) -> dict:
     """Run the full cleanup pass and return a human-readable report.
 
     ``store`` may be None (caller couldn't open it) — the report then says so
-    instead of raising. ``memory_manager`` is a ``MemoryManager`` (or anything
-    with ``purge_expired()``) and is optional.
+    instead of raising.
     """
-    report: dict = {"evicted": 0, "pruned_files": 0, "expired_notes": 0, "vacuumed": False}
+    report: dict = {"evicted": 0, "pruned_files": 0, "vacuumed": False}
 
     if store is not None:
         try:
@@ -73,12 +71,6 @@ def run_cleanup(
             pass
         if root:
             report["pruned_files"] = _prune_missing_files(store, root)
-
-    if memory_manager is not None:
-        try:
-            report["expired_notes"] = int(memory_manager.purge_expired() or 0)
-        except Exception:  # noqa: BLE001, S110 — best-effort, never raises
-            pass
 
     # VACUUM only when the DB is meaningfully large and something was removed,
     # so we never pay the full-rewrite cost on tiny or untouched stores. The

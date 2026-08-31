@@ -1271,6 +1271,40 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     break
 
     async def event_gen():
+        # Create the agent generator so we can close it on disconnect
+        agent_gen = run_agent(
+            provider=req.provider,
+            model_name=req.model,
+            base_url=req.base_url,
+            api_key=req.api_key,
+            env_var=req.env_var,
+            root=req.root,
+            mode=req.mode,
+            prompt=req.prompt,
+            history=req.history,
+            attachments=req.attachments,
+            images=req.images,
+            system_prompt=req.system_prompt,
+            thinking_level=req.thinking_level,
+            model_reasoning=req.model_reasoning,
+            mcp_servers=req.mcp_servers,
+            skills=req.skills,
+            context_window=req.context_window,
+            allow_create=req.allow_create,
+            cap=req.cap,
+            permission_gates=PERMISSION_GATES,
+            ask_gates=ASK_GATES,
+            allow_outside=req.allow_outside,
+            nvim_file=req.nvim_file,
+            nvim_diagnostics=req.nvim_diagnostics,
+            vector_db_path=req.vector_db_path,
+            vector_config=req.vector_config,
+            retrieval_config=req.retrieval_config,
+            subagent_models=req.subagent_models,
+            chat_id=req.chat_id,
+            providers=req.providers,
+            compact_at_percent=req.compact_at_percent,
+        )
         try:
             logger.warning(
                 "agent run start chat_id=%s rss_mb=%.1f",
@@ -1278,41 +1312,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 _rss_mb() or 0.0,
             )
             ka_count = 0
-            async for event in _with_keepalive(
-                run_agent(
-                provider=req.provider,
-                model_name=req.model,
-                base_url=req.base_url,
-                api_key=req.api_key,
-                env_var=req.env_var,
-                root=req.root,
-                mode=req.mode,
-                prompt=req.prompt,
-                history=req.history,
-                attachments=req.attachments,
-                images=req.images,
-                system_prompt=req.system_prompt,
-                thinking_level=req.thinking_level,
-                model_reasoning=req.model_reasoning,
-                mcp_servers=req.mcp_servers,
-                skills=req.skills,
-                context_window=req.context_window,
-                allow_create=req.allow_create,
-                cap=req.cap,
-                permission_gates=PERMISSION_GATES,
-                ask_gates=ASK_GATES,
-                allow_outside=req.allow_outside,
-                nvim_file=req.nvim_file,
-                nvim_diagnostics=req.nvim_diagnostics,
-                vector_db_path=req.vector_db_path,
-                vector_config=req.vector_config,
-                retrieval_config=req.retrieval_config,
-                subagent_models=req.subagent_models,
-                chat_id=req.chat_id,
-                providers=req.providers,
-                compact_at_percent=req.compact_at_percent,
-                )
-            ):
+            async for event in _with_keepalive(agent_gen):
                 if event.get("kind") == "_keepalive":
                     ka_count += 1
                     yield ": keepalive\n\n"
@@ -1334,10 +1334,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             _log_memory_snapshot(req.chat_id)
 
         except asyncio.CancelledError:
-            # Client disconnected (aborted the stream): the run_agent generator
-            # and its background producer task are unwound inside run_agent's
-            # finally block, so just stop iterating cleanly — do NOT emit a
-            # trailing "done" event, since the user closed the stream themselves.
+            # Client disconnected (aborted the stream): close the agent generator
+            # to unwind its background _drive task (which runs graph.astream).
+            # This ensures the LLM provider call is properly interrupted.
+            with contextlib.suppress(Exception):
+                await agent_gen.aclose()
             # Log the drop with peak RSS so a recurring silent interrupt (crash /
             # OOM) becomes visible in codifa.log instead of going unnoticed.
             logger.warning(

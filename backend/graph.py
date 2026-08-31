@@ -1512,7 +1512,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         + ")."
                         + cmd_note
                         + "Do NOT finish with red tests — keep fixing until "
-                        "all tests pass."
+                        "all tests pass. "
+                        + "TEST LOCATION: permanent regression tests ship next to the "
+                        "code they test (in the same package/sub-package). Temporary "
+                        "tests — scratch / probe / smoke / quick experiments you do "
+                        "just to verify behavior, reproduce a bug, or sanity-check an "
+                        "API — may live in /tmp/ (the sandbox already permits this "
+                        "path). Do NOT commit scratch tests under backend/tests/ or any "
+                        "tracked test directory; clean them up when done."
                     )
                 ),
             )
@@ -1918,94 +1925,6 @@ async def _summarize_history_head(compact_model: Any, older: list, root: str) ->
     return _summary
 
 
-async def _compact_tool_history(
-    msgs: list, compact_model: Any, budget_chars: int
-) -> bool:
-    """Compress older tool results in place when the transcript exceeds the
-    budget. All but the two most-recent ToolMessages are summarized by the
-    compact model into a single compressed ToolMessage; if no compact model is
-    configured they are dropped outright. Returns True if a compaction ran.
-
-    This is the in-turn half of context management (spec §10 / invariant #12):
-    it stops the provider from re-receiving an ever-growing raw tool history on
-    every step. The Explore sub-agent keeps its own isolated transcript, so this
-    only ever touches the Main Agent's own turn loop.
-    """
-    total = sum(len(getattr(m, "content", "") or "") for m in msgs)
-    if total <= budget_chars:
-        return False
-    tool_idx = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
-    if len(tool_idx) <= 2:
-        return False
-    old_idx = tool_idx[:-2]
-    old_text = "\n".join(
-        f"<tool_result>\n{msgs[i].content}\n</tool_result>" for i in old_idx
-    )
-    # tool_call_ids we are about to drop. An AIMessage that requested a dropped
-    # tool but receives NO ToolMessage is an INVALID transcript: the provider sees
-    # an unanswered tool request and the model re-issues the SAME call on the next
-    # step, which trips the repetition-loop guard and aborts the turn. So we also
-    # neutralize the parent assistant message(s) below.
-    _dropped_ids = {msgs[i].tool_call_id for i in old_idx}
-    # Drop the old tool messages first so we always shrink, even if the
-    # summarization call below fails.
-    for i in reversed(old_idx):
-        del msgs[i]
-    # Strip the now-dangling tool_calls from their parent assistant messages. We
-    # rebuild each affected AIMessage (model_copy) rather than mutate it in place,
-    # and drop pure tool-call steps that are left with no reasoning text so we
-    # don't leave an empty assistant stub in the transcript.
-    _rebuilt: list = []
-    for _m in msgs:
-        if isinstance(_m, AIMessage) and getattr(_m, "tool_calls", None):
-            _kept = [tc for tc in _m.tool_calls if tc.get("id") not in _dropped_ids]
-            if len(_kept) != len(_m.tool_calls):
-                if not _kept and not (getattr(_m, "content", "") or "").strip():
-                    # Pure tool-call step with no reasoning: drop the empty stub.
-                    continue
-                _m = _m.model_copy(update={"tool_calls": _kept})
-        _rebuilt.append(_m)
-    msgs[:] = _rebuilt
-    if compact_model is None:
-        msgs.append(
-            ToolMessage(
-                content=(
-                    f"[Earlier tool results compacted to save context: "
-                    f"{len(old_idx)} tool outputs removed.]"
-                ),
-                tool_call_id="__compact__",
-            )
-        )
-        return True
-    try:
-        summary, _ = await llm_generate(
-            compact_model,
-            system=(
-                "You are a context compressor for a coding agent. The following "
-                "are EARLIER tool results from this session. Produce ONE concise "
-                "summary (under ~1500 chars) that preserves only what the agent "
-                "still needs: exact file paths, line numbers, symbol/function "
-                "names, and concrete findings. Drop duplicates and raw noise."
-            ),
-            user=old_text,
-        )
-    except Exception:  # noqa: BLE001 — degrade to a plain removal
-        msgs.append(
-            ToolMessage(
-                content=f"[Earlier tool results compacted; {len(old_idx)} outputs removed.]",
-                tool_call_id="__compact__",
-            )
-        )
-        return True
-    msgs.append(
-        ToolMessage(
-            content="[Compressed earlier tool results]\n" + (summary or ""),
-            tool_call_id="__compact__",
-        )
-    )
-    return True
-
-
 def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
     """Rebuild ``msgs`` in place from a compacted history dict list.
 
@@ -2127,6 +2046,40 @@ async def _maybe_auto_compact(
     # opencode fires compaction when the latest turn reaches the threshold
     # (pct% of the raw window). The meter shows the same percentage, so the bar
     # hits the threshold exactly when compaction fires.
+    # --- cheap truncation: runs at 50% of the compaction threshold --------
+    # Before the heavy LLM summarization, replace old ToolMessage contents
+    # with a short placeholder so the transcript sheds weight early.  This
+    # fires at half the user's compact_at_percent, is a no-LLM operation,
+    # and prevents slow context creep across many tool-call steps.
+    _cheap_pct = _pct // 2  # e.g. 80 → 40
+    cheap_threshold = int(ctx * _cheap_pct / 100)
+    if total >= cheap_threshold and not getattr(msgs, "_cheap_truncated", False):
+        _tool_idxs = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
+        _KEEP = 6
+        if len(_tool_idxs) > _KEEP:
+            _old = set(_tool_idxs[:-_KEEP])
+            _ph = "[result truncated — see earlier compact summary]"
+            _changed = False
+            for i in _old:
+                _c = getattr(msgs[i], "content", "")
+                if len(str(_c)) > len(_ph) + 20:
+                    msgs[i] = msgs[i].copy(update={"content": _ph})
+                    _changed = True
+            if _changed:
+                # Mark so we only do this once per turn (avoid repeated scans)
+                msgs._cheap_truncated = True  # type: ignore[attr-defined]
+                # Recalculate total after truncation so the threshold check
+                # below sees the reduced size.
+                total = max(
+                    last_context_tokens or 0,
+                    _estimate_prompt_tokens(msgs) or 0,
+                )
+                if total <= 0:
+                    total = sum(
+                        _agents._estimate_tokens(d["content"])
+                        for d in _agents._messages_to_dicts(msgs)
+                    )
+    # --- end cheap truncation -------------------------------------------
     if total < threshold:
         return 0
     # opencode prune: clear old tool outputs (not the whole turn) before the
@@ -2427,6 +2380,10 @@ async def _run_mode_turn(
                 # chunks) shows no indicator. The window closes on the first
                 # answer text (below) and as a safety net at stream end.
                 async for chunk in bound.astream(msgs):
+                    # Check for cancellation at each chunk so the Stop button
+                    # properly interrupts the provider call (llama.cpp / local servers).
+                    if asyncio.current_task().cancelled():
+                        raise asyncio.CancelledError()
                     _astream_count_local += 1
                     # LangChain accumulates streamed deltas via AIMessageChunk.__add__
                     # (the standard, documented mechanism). We rely on it rather than
@@ -2811,26 +2768,11 @@ async def _run_mode_turn(
                         )
                     )
                 )
-            # In-turn context management: if the transcript (including every
-            # tool result so far this turn) has grown past the budget, compress
-            # the older tool results so we don't keep re-sending the whole raw
-            # history to the provider on every subsequent step (spec §10).
-            await _compact_tool_history(
-                msgs, compact_model, max(30_000, int(ctx or 0) * 3)
-            )
-            # Bounded context auto-compact: once the assembled prompt reaches the
-            # usable window (ctx - reserved), summarize the older turns in place
-            # so a long-running turn never overflows the model's context. Driven
-            # by the SAME input_tokens the context meter displays
-            # (state["last_input_tokens"], set at the usage-emit site above), so
-            # the meter and the trigger always agree. No-op below the threshold.
-            # Fires at `usable * compact_trigger_fraction` (mid-turn, before the
-            # limit) so the agent keeps working on a compacted transcript instead
-            # of running out of context mid-task.
+            # In-turn context management: single entry-point driven by the
+            # user's compact_at_percent setting.  _maybe_auto_compact handles
+            # BOTH cheap truncation (old ToolMessage placeholders) AND heavier
+            # LLM summarization when the threshold is crossed.
             if ctx > 0 and _compact_count < _MAX_COMPACT_PER_TURN:
-                # `_maybe_auto_compact` returns the number of compactions it
-                # actually performed (0 = under threshold / 1 = fired), so we can
-                # throttle per-turn fire count without inspecting the event queue.
                 _compact_count += await _maybe_auto_compact(
                     state,
                     queue,
@@ -2856,7 +2798,7 @@ async def _run_mode_turn(
         return mode if mode in ("explore", "general") else ""
 
     reply = ""
-    attempt = 0
+    # attempt is reset per step inside the loop
     # Log every attempt start so the user can verify from the sidecar log
     # that retries are actually firing. The renderer-side Network tab CAN'T
     # see these requests: they originate from the Python sidecar subprocess
@@ -2868,6 +2810,7 @@ async def _run_mode_turn(
     logger.info("[run_graph] agent run starting (chat_id=%s)", chat_id)
     try:
         while True:
+            attempt = 0  # Reset counter for each step
             attempt += 1
             logger.info(
                 "[run_graph] agent run attempt %s/%s (chat_id=%s)",

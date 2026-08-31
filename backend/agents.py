@@ -982,15 +982,6 @@ _RETRYABLE_PHRASES = (
     "remote protocol error",
     "broken pipe",
     "zero length read",
-    # OpenRouter wraps upstream-provider failures as 400 with body
-    # "Backend request failed with status 400" + the provider's error in
-    # the metadata. The 400 status makes the basic status-code branch
-    # non-retryable, but the upstream is genuinely transient (e.g. Gemini
-    # rate limit propagated as 400). Match the wrapper phrase so the
-    # 30s backoff rides it out instead of failing the turn on the first
-    # blip — this is the same class of "the gateway's upstream hiccuped"
-    # error as the existing 502/503/504 retries.
-    "backend request failed",
 )
 
 # Exception CLASS names whose *type* indicates a transient connection/flow
@@ -1128,6 +1119,20 @@ def _friendly_retry_reason(exc: BaseException) -> str:
             "Authentication failed (401) — check the API key in Settings. "
             "Retrying won't help until it's fixed."
         )
+    # Any other recognized status (400, 403, 404, 5xx that wasn't caught by
+    # the phrase check, etc.) gets a clean one-liner prefix so the user sees
+    # the HTTP code up front instead of having to dig it out of the raw
+    # exception text. The detailed exception text is appended below the
+    # prefix for diagnosis. Skipped for 401 (handled above with a specific
+    # actionable message) and 0 (no status code at all — likely a
+    # connection or transport error, handled by the phrase check above).
+    if code and code != 401:
+        raw = str(exc)[:200]
+        # Avoid double-prefixing when the raw text already leads with the
+        # code (some LangChain wrappers format as "Error code: 400 - {...}").
+        if raw.lower().lstrip().startswith(f"error code: {code}"):
+            return raw
+        return f"Provider returned HTTP {code}. {raw}".strip()
     return str(exc)[:200]
 
 
@@ -3059,6 +3064,20 @@ async def _compact_history(
         tail.append(m)
         tail_tokens += est
     tail.reverse()
+    # --- never split a tool_calls round from its tool results ---------------
+    # The token-budget cutoff above can land right after an EARLIER (not just
+    # the final in-flight) assistant tool_calls step, leaving its ToolMessage
+    # results in `tail` while the assistant message that produced them gets
+    # summarized away into `older`. The provider then sees a `tool` role
+    # message with no matching `tool_calls` before it -- llama.cpp's chat
+    # template renderer (minja) trips on this and 400s ("Unable to generate
+    # parser for this template"). Walk any leading orphaned tool messages back
+    # into `tail` so every round of tool_calls stays paired with its results,
+    # not just the last one (the in-flight guard below only covers that case).
+    _cutoff = len(history) - len(tail)
+    while tail and tail[0].get("role") == "tool" and _cutoff > 0:
+        _cutoff -= 1
+        tail.insert(0, history[_cutoff])
     # --- protect the in-flight step (mid-turn auto-compact) -----------------
     # When auto-compact fires DURING a turn, the transcript ends with the current
     # step: an assistant message carrying tool_calls followed by its tool results.

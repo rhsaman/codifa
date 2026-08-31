@@ -14,7 +14,7 @@ _BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardi
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_BACKEND_DIR))
 
-from server import _friendly_error  # noqa: E402
+from server import _friendly_error
 
 
 def test_friendly_error_unwraps_metadata_raw():

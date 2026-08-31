@@ -107,8 +107,12 @@ function codeStartLine(children: ReactNode): number {
     // appears after a colon, not just at the start of the string.
     const meta = (props?.["data-meta"] ?? "").replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)));
     const m =
-      /(\d+)(?:-\d+)?(?::(?:[\w./-]+\/)*[\w./-]*[\w.-]+\.\w+)?$/.exec(meta) ??
-      /:(\d+)(?:-\d+)?/.exec(meta) ??
+      // form 1: "19-20:path" — start before "-"
+      /(\d+)(?=-\d+:)/.exec(meta) ??
+      // form 2: ":19-20:path" — start after ":" and before "-"
+      /:(\d+)(?=-)/.exec(meta) ??
+      // form 3: "32:path" (single line) — digits right after ":" before next ":" or end
+      /:(\d+)(?=[:\b]|$)/.exec(meta) ??
       (props?.className
         ? /language-[\w-]+:(\d+)(?:-\d+)?/.exec(String(props.className))
         : null);
@@ -538,7 +542,9 @@ export function RetryBanner({
   const label = gaveUp
     ? watchdog
       ? "Connection lost"
-      : "Retry limit reached"
+      : attempt > 1
+        ? "Retry limit reached"
+        : "Provider rejected the request"
     : isRateLimit
       ? "Provider rate limit"
       : unlimited

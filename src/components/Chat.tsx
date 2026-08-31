@@ -87,6 +87,7 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
+import { BalanceChip } from "./BalanceChip";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -258,20 +259,21 @@ export function ChatPanel() {
   // fire-and-forget from React's perspective — a re-render during an open
   // /chat/stream SSE is the surest way to make the renderer event loop
   // stutter enough to drop a streaming chunk.
-  const refreshingRef = useRef(false);
+  // Spinner state — a tiny React state so the chip class is correct without
+  // the old DOM-trick (`refreshButtonsRef` + `refreshingRef.current`).
+  // Re-renders are cheap: the chip is a single button and the change is one
+  // class flip. The previous ref-only design was needed when click handlers
+  // were forbidden to schedule renders, but that constraint is gone now.
+  const [creditBusy, setCreditBusy] = useState(false);
   // Hold the in-flight promise in a ref so a second click while the first
   // is still pending dedupes to the same request (and so a fast double-click
   // can't queue two parallel fetches racing for the same sidecar slot).
   const inFlightRef = useRef<Promise<void> | null>(null);
-  // The set of buttons currently in the "refreshing" state — updated by the
-  // ref callback below. This is purely DOM bookkeeping, not React state.
-  const refreshButtonsRef = useRef<Set<HTMLButtonElement>>(new Set());
   const refreshCredits = useCallback(() => {
     if (!provider) return;
     if (inFlightRef.current) return inFlightRef.current;
     const target = provider;
-    refreshingRef.current = true;
-    for (const btn of refreshButtonsRef.current) btn.classList.add("refreshing");
+    setCreditBusy(true);
     const p = (async () => {
       try {
         const result = await fetchCredits(target);
@@ -281,9 +283,7 @@ export function ChatPanel() {
       } catch {
         /* swallow — balance is non-critical UI */
       } finally {
-        refreshingRef.current = false;
-        for (const btn of refreshButtonsRef.current)
-          btn.classList.remove("refreshing");
+        setCreditBusy(false);
         inFlightRef.current = null;
       }
     })();
@@ -3145,99 +3145,73 @@ export function ChatPanel() {
     );
   }
 
+  const toolbar = (
+    <div className="chat-toolbar titlebar-toolbar">
+      <button
+        className="dir-toggle"
+        onClick={toggleDir}
+        title={
+          dir === "rtl"
+            ? "Right-to-left (فارسی) — click for LTR"
+            : "Left-to-right — click for RTL"
+        }
+      >
+        {dir === "rtl" ? "RTL" : "LTR"}
+      </button>
+      <span className="badge" title="Active model">
+        <span className="badge-provider">
+          {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
+        </span>
+        {activeModel || "no model"}
+      </span>
+      <span
+        className={`badge context-meter${contextWarn(contextUsed, usable) ? " warn" : ""}`}
+        title={
+          ctxWindow != null
+            ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the auto-compaction threshold (${formatTokens(usable ?? 0)} tokens = ${compactAtPercent}% of the window) — the same point where auto-compaction fires.`
+            : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
+        }
+        dir="ltr"
+      >
+        {ctxPct !== null && contextUsed > 0 && (
+          <span className="context-meter-track">
+            <span
+              className="context-meter-fill"
+              style={{ width: `${Math.min(100, ctxPct)}%` }}
+            />
+          </span>
+        )}
+        <span className="context-meter-text">
+          {contextUsed > 0 ? (
+            <>
+              {formatTokens(contextUsed)}
+              {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
+              {ctxPct !== null ? ` (${ctxPct}%)` : ""}
+            </>
+          ) : (
+            "—"
+          )}
+        </span>
+      </span>
+      <BalanceChip
+        providerName={
+          shownBal
+            ? shownBal.provider.name || shownBal.provider.id
+            : provider
+              ? provider.name || provider.id
+              : null
+        }
+        amount={shownBal ? shownBal.amount : null}
+        busy={creditBusy}
+        disabled={!provider || creditBusy}
+        onRefresh={refreshCredits}
+      />
+    </div>
+  );
+
   return (
     <div className="chat-panel">
-      {titlebarEl &&
-        createPortal(
-          <div className="chat-toolbar titlebar-toolbar">
-            <button
-              className="dir-toggle"
-              onClick={toggleDir}
-              title={
-                dir === "rtl"
-                  ? "Right-to-left (فارسی) — click for LTR"
-                  : "Left-to-right — click for RTL"
-              }
-            >
-              {dir === "rtl" ? "RTL" : "LTR"}
-            </button>
-            <span className="badge" title="Active model">
-              <span className="badge-provider">
-                {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
-              </span>
-              {activeModel || "no model"}
-            </span>
-            <span
-              className={`badge context-meter${contextWarn(contextUsed, usable) ? " warn" : ""}`}
-              title={
-                ctxWindow != null
-                  ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the auto-compaction threshold (${formatTokens(usable ?? 0)} tokens = ${compactAtPercent}% of the window) — the same point where auto-compaction fires.`
-                  : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
-              }
-              dir="ltr"
-            >
-              {ctxPct !== null && contextUsed > 0 && (
-                <span className="context-meter-track">
-                  <span
-                    className="context-meter-fill"
-                    style={{ width: `${Math.min(100, ctxPct)}%` }}
-                  />
-                </span>
-              )}
-              <span className="context-meter-text">
-                {contextUsed > 0 ? (
-                  <>
-                    {formatTokens(contextUsed)}
-                    {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
-                    {ctxPct !== null ? ` (${ctxPct}%)` : ""}
-                  </>
-                ) : (
-                  "—"
-                )}
-              </span>
-            </span>
-            {shownBal && (
-              <button
-                type="button"
-                className="badge titlebar-balance titlebar-balance-clickable"
-                title={`${shownBal.provider.name} balance — click to refresh`}
-                dir="ltr"
-                ref={(el) => {
-                  if (el) refreshButtonsRef.current.add(el);
-                  else refreshButtonsRef.current.delete(el as unknown as HTMLButtonElement);
-                }}
-                onClick={() => {
-                  // Click-to-refresh: pure fire-and-forget. The handler is
-                  // synchronous (no setState, no await on click) so React
-                  // never schedules a re-render as a result of the click.
-                  // The "refreshing" spinner is applied directly to the DOM
-                  // via the ref above. This is the design the user requested:
-                  // nothing about a credit click should ever touch the
-                  // /chat/stream SSE — not even a render.
-                  refreshCredits();
-                }}
-              >
-                <svg
-                  className="titlebar-balance-icon"
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
-                  <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
-                  <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
-                </svg>
-                ${shownBal.amount.toFixed(2)}
-              </button>
-            )}
-          </div>,
-          titlebarEl,
-        )}
+      {titlebarEl ? createPortal(toolbar, titlebarEl) : toolbar}
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (

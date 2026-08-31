@@ -5843,7 +5843,10 @@ textarea {
   border-color: var(--success);
 }
 
-/* Provider balance chip in the chat titlebar (next to the context meter). */
+/* Provider balance chip in the chat titlebar (next to the context meter).
+   Kept self-contained: the chip may also render as a fallback outside the
+   titlebar portal (see ChatPanel), so the font-size + min-width here must NOT
+   depend on a `.titlebar` ancestor. */
 .titlebar-balance {
   display: inline-flex;
   align-items: center;
@@ -5852,6 +5855,10 @@ textarea {
   font-weight: 600;
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+  /* Stable width: "—" placeholder and "$12.34" stay the same width so the
+     toolbar doesn't jitter while a refresh is in flight. */
+  min-width: 5.5ch;
+  justify-content: center;
 }
 
 .titlebar-balance-icon {

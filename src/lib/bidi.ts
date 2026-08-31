@@ -246,7 +246,7 @@ function foldLineCaptions(text: string): string {
       }
       const fence = j < lines.length ? /^```\s*([\w-]+)/.exec(lines[j]) : null
       if (fence) {
-        const lang = fence[1]
+        const lang = fence[1] || 'text'
         // Carry the file path into the info string as `lang:start-end:path`
         // so the renderer can show it next to the language name in the header.
         lines[j] = '```' + lang + ':' + lo + '-' + hi + ':' + pathM[1]
@@ -283,9 +283,9 @@ function foldLineCaptions(text: string): string {
           if (bare) {
             // Fence already carries its own line range — keep it, just attach
             // the path from the caption (don't overwrite the model's range).
-            lines[j] = '```' + bare[1] + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + pathM[1]
+            lines[j] = '```' + (bare[1] || 'text') + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + pathM[1]
           } else {
-            lines[j] = '```' + fence[1] + ':' + lo + '-' + hi + ':' + pathM[1]
+            lines[j] = '```' + (fence[1] || 'text') + ':' + lo + '-' + hi + ':' + pathM[1]
           }
           // Keep the prose line — it may contain descriptive text beyond the
           // path:line reference (e.g. "توی file.go:32 تغییر شماره...").
@@ -301,7 +301,7 @@ function foldLineCaptions(text: string): string {
       const bare = BARE_RANGE_FENCE_RE.exec(lines[i])
       if (bare && lastPath) {
         lines[i] =
-          '```' + bare[1] + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + lastPath
+          '```' + (bare[1] || 'text') + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + lastPath
       }
     }
     out.push(lines[i])

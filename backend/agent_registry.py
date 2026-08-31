@@ -119,9 +119,27 @@ def agent_description(name: str) -> str:
 
 
 def agent_system(name: str) -> str:
-    """The system prompt for a sub-agent type (defaults to empty)."""
+    """The system prompt for a sub-agent type (defaults to empty).
+
+    The shared search/discovery rule (`_SEARCH_RULE` from ``agents``) is
+    prepended so every sub-agent — even ones that don't mention the search
+    tools in their own prompt (e.g. ``general``) — gets the same discovery
+    discipline as the main mode agents: prefer targeted grep/glob/read,
+    delegate broad/multi-file search to the ``explore`` sub-agent, batch
+    parallel tool calls, page large files with offset/limit.
+
+    NOTE: ``EXPLORE_SYSTEM`` repeats parts of the rule for emphasis; that
+    redundancy is intentional until ``EXPLORE_SYSTEM`` is rewritten to
+    reference the shared block by name.
+    """
+    # Late import: ``agents`` imports from many modules (tools, llm, etc.)
+    # and is heavier; pulling `_SEARCH_RULE` at call time keeps registry
+    # import cheap. No cycle — ``agents`` does not import this module.
+    from agents import _SEARCH_RULE
+
     ent = AGENTS.get(name)
-    return ent.get("system", "") if ent else ""
+    base = ent.get("system", "") if ent else ""
+    return _SEARCH_RULE + base if base else _SEARCH_RULE
 
 
 def agent_tools(name: str) -> list | None:

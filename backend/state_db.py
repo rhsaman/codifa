@@ -61,7 +61,7 @@ def bootstrap() -> None:
     missing a directory.
     """
     data_root()
-    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir()):
+    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir(), workspace_summaries_dir()):
         os.makedirs(d, exist_ok=True)
     os.makedirs(vector_db_dir(), exist_ok=True)
     sp = settings_path()
@@ -687,6 +687,106 @@ def save_plan(workspace: str, title: str, content: str, chat_id: str = "") -> No
                 "updated_at": _now(),
             },
         )
+
+
+# -- Workspace summary (cross-chat recap, distinct from plans) --------------- #
+
+
+def workspace_summaries_dir() -> str:
+    """Top-level dir holding ``workspace-summary/<ws>/summary.md`` sidecars."""
+    return os.path.join(data_root(), "workspace-summary")
+
+
+def _workspace_summary_dir(workspace: str) -> str:
+    ws = _safe_file(workspace or "workspace", "workspace")
+    return os.path.join(workspace_summaries_dir(), ws)
+
+
+def save_workspace_summary(
+    workspace: str,
+    content: str,
+    covered_message_counts: dict[str, int],
+) -> None:
+    """Upsert the workspace-level summary as ``workspace-summary/<ws>/summary.md``.
+
+    ``covered_message_counts`` records ``{chat_id: n}`` for every prior chat at
+    the moment of summarisation, so a later call can cheaply detect "nothing
+    new to summarise" by comparing the per-chat counts.
+    """
+    with _LOCK:
+        _migrate_legacy_db()
+        d = _workspace_summary_dir(workspace)
+        _atomic_write(os.path.join(d, "summary.md"), str(content or ""))
+        _atomic_write_json(
+            os.path.join(d, "summary.meta.json"),
+            {
+                "workspace": str(workspace or ""),
+                "updated_at": _now(),
+                "covered_message_counts": {
+                    str(k): int(v)
+                    for k, v in (covered_message_counts or {}).items()
+                },
+            },
+        )
+
+
+def get_workspace_summary(workspace: str) -> dict | None:
+    """Return ``{"workspace", "updated_at", "covered_message_counts", "content"}``.
+
+    Returns ``None`` when no summary has been written yet, or when the
+    sidecar is empty / unreadable. Never raises.
+    """
+    with _LOCK:
+        d = _workspace_summary_dir(workspace)
+        meta = _read_json(os.path.join(d, "summary.meta.json")) or {}
+        content = _read_text(os.path.join(d, "summary.md"))
+        if not content.strip():
+            return None
+        return {
+            "workspace": str(workspace or meta.get("workspace") or ""),
+            "updated_at": float(meta.get("updated_at") or 0.0),
+            "covered_message_counts": dict(
+                meta.get("covered_message_counts") or {}
+            ),
+            "content": content,
+        }
+
+
+def iter_workspace_chats(workspace: str) -> list[dict]:
+    """Walk ``chats/<ws>/<chat-id>.json`` and return ``[{chat_id, message_count}]``.
+
+    ``message_count`` is the count of turns/entries in the chat JSON, used by
+    the workspace-summary refresh to decide "nothing new to summarise". Never
+    raises — unreadable or missing files are skipped.
+    """
+    ws = _safe_file(workspace or "workspace", "workspace")
+    base = os.path.join(chats_dir(), ws)
+    out: list[dict] = []
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return out
+    for cid in entries:
+        path = os.path.join(base, cid)
+        if not (cid.endswith(".json") and os.path.isfile(path)):
+            continue
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            continue
+        turns = data.get("history")
+        if not isinstance(turns, list):
+            turns = data.get("messages")
+        if not isinstance(turns, list):
+            turns = []
+        out.append(
+            {
+                "chat_id": (
+                    cid[: -len(".json")] if cid.endswith(".json") else cid
+                ),
+                "message_count": len(turns),
+            }
+        )
+    return out
 
 
 def _most_recent_chat_dir(ws_dir: str) -> str | None:

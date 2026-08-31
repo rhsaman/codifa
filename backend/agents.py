@@ -1915,6 +1915,62 @@ def _read_project_memory(root: str) -> str:
     return ""
 
 
+# -- Workspace summary (cross-chat recap for new chats) --------------------- #
+
+_WORKSPACE_SUMMARY_MAX_BYTES = 2000
+_WORKSPACE_SUMMARY_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_WORKSPACE_SUMMARY_CACHE_MAX = 64
+
+
+def _workspace_summary_wrapper(content: str) -> str:
+    """Wrap summary text in a system-prompt-friendly block."""
+    body = (content or "").strip()
+    if not body:
+        return ""
+    if len(body) > _WORKSPACE_SUMMARY_MAX_BYTES:
+        body = (
+            body[:_WORKSPACE_SUMMARY_MAX_BYTES]
+            + "\n…(truncated — summary exceeds the auto-included limit)"
+        )
+    return (
+        "\n\n===== WORKSPACE SUMMARY (from earlier chats in this workspace) =====\n"
+        "Recap of what was done in previous chats of this same workspace. "
+        "Use it as context for the current task; ignore anything unrelated.\n"
+        f"{body}\n"
+        "===== END WORKSPACE SUMMARY ====="
+    )
+
+
+def _load_workspace_summary(root: str) -> str:
+    """Cached read of the workspace summary.
+
+    Returns the ready-to-append block (or ``""`` when no summary exists).
+    Mirrors _load_project_memory's mtime-based cache so we don't hit disk
+    every turn in long sessions.
+    """
+    try:
+        workspace_slug = (
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+            or "workspace"
+        )
+        meta = state_db.get_workspace_summary(workspace_slug)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not meta:
+        return ""
+    mtime = float(meta.get("updated_at") or 0.0)
+    cached = _WORKSPACE_SUMMARY_CACHE.get(root)
+    if cached is not None and cached[0] >= mtime:
+        _WORKSPACE_SUMMARY_CACHE.move_to_end(root)
+        return cached[1]
+    wrapped = _workspace_summary_wrapper(meta.get("content") or "")
+    _WORKSPACE_SUMMARY_CACHE[root] = (mtime, wrapped)
+    _WORKSPACE_SUMMARY_CACHE.move_to_end(root)
+    while len(_WORKSPACE_SUMMARY_CACHE) > _WORKSPACE_SUMMARY_CACHE_MAX:
+        _WORKSPACE_SUMMARY_CACHE.popitem(last=False)
+    return wrapped
+
+
 # The agent's OWN self-written memory (distinct from the user-authored AGENTS.md
 # above). Curated via the `memory` tool (add/replace/remove; see tools.py) as
 # the agent works, so a later session in the same project starts already
@@ -3336,6 +3392,158 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
         "If this message continues that task, follow this plan. If it is a new, "
         "unrelated task, ignore it."
     )
+
+
+# -- Workspace summary refresh (LLM-backed, with safe fallback) ------------- #
+
+_SUMMARY_FALLBACK = (
+    "[No prior chats found in this workspace, or summary unavailable.]"
+)
+
+
+async def _maybe_refresh_workspace_summary(
+    root: str,
+    current_chat_id: str,
+    model: Any,
+    fallback_model: Any | None,
+) -> str:
+    """Build / refresh the workspace summary for ``root``, excluding the
+    current chat.
+
+    Returns the ready-to-append block (or "" on any failure — a new chat
+    must never be blocked by a summary refresh).
+
+    Strategy:
+      1. Walk every prior chat for this workspace.
+      2. If nothing changed vs the cached ``covered_message_counts`` AND a
+         summary exists → reuse it.
+      3. Otherwise summarise ONLY the new tail (since last refresh) with a
+         short LLM call; persist; return the wrapped block.
+    """
+    try:
+        workspace_slug = (
+            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
+            or "workspace"
+        )
+        prior = [
+            c
+            for c in state_db.iter_workspace_chats(workspace_slug)
+            if c.get("chat_id") and c["chat_id"] != current_chat_id
+        ]
+    except Exception:  # noqa: BLE001
+        return ""
+    if not prior:
+        return ""
+
+    current_counts = {c["chat_id"]: c["message_count"] for c in prior}
+
+    existing: dict | None = None
+    try:
+        existing = state_db.get_workspace_summary(workspace_slug)
+    except Exception:  # noqa: BLE001
+        existing = None
+
+    if existing:
+        prev_counts = existing.get("covered_message_counts") or {}
+        if (
+            all(
+                int(prev_counts.get(cid, 0)) == n
+                for cid, n in current_counts.items()
+            )
+            and len(prev_counts) == len(current_counts)
+        ):
+            cached = _load_workspace_summary(root)
+            if cached:
+                return cached
+
+    # Read the prior chats' JSON for the NEW tail only.
+    new_tail_lines: list[str] = []
+    prev_counts = (existing or {}).get("covered_message_counts") or {}
+    try:
+        ws_dir = os.path.join(
+            state_db.chats_dir(),
+            _safe_file(workspace_slug, "workspace"),
+        )
+    except Exception:  # noqa: BLE001
+        ws_dir = ""
+
+    if ws_dir:
+        for c in prior:
+            cid = c["chat_id"]
+            prev_n = int(prev_counts.get(cid, 0))
+            new_n = int(c["message_count"])
+            if new_n <= prev_n:
+                continue
+            path = os.path.join(
+                ws_dir, f"{_safe_file(cid, cid)}.json"
+            )
+            data = _read_json_chat(path)
+            if not isinstance(data, dict):
+                continue
+            turns = data.get("history") or data.get("messages") or []
+            if not isinstance(turns, list):
+                continue
+            for t in turns[prev_n:]:
+                role = str(t.get("role") or "")
+                content = str(t.get("content") or "")[:1500]
+                if not content.strip():
+                    continue
+                new_tail_lines.append(f"[{cid}] {role}: {content}")
+
+    if not new_tail_lines:
+        return _load_workspace_summary(root) if existing else ""
+
+    body = "\n".join(new_tail_lines)[:20000]
+    system_prompt = (
+        "Summarise the following new turns from earlier chats of this "
+        "workspace. Produce a concise bullet list covering: tasks completed, "
+        "files changed, architectural decisions, unresolved issues. "
+        "Maximum ~2000 characters. "
+        "Write in the same language the turns use (Persian or English). "
+        "No preamble, no closing remarks — bullets only."
+    )
+
+    summary_text = ""
+    chosen = model or fallback_model
+    if chosen is not None:
+        try:
+            from llm import llm_generate
+
+            summary_text, _ = await llm_generate(
+                chosen,
+                system=system_prompt,
+                user=body,
+            )
+        except Exception:  # noqa: BLE001
+            summary_text = ""
+
+    if not summary_text.strip():
+        summary_text = _SUMMARY_FALLBACK + "\n" + body[:1500]
+
+    try:
+        state_db.save_workspace_summary(
+            workspace_slug,
+            summary_text,
+            current_counts,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _workspace_summary_wrapper(summary_text)
+
+
+def _safe_file(name: str, fallback: str = "item") -> str:
+    """Local copy of state_db._safe_file — avoids import cycle."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip()).strip(".-")
+    return safe or fallback
+
+
+def _read_json_chat(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.loads(fh.read())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 _IMAGE_EXTS: dict[str, str] = {

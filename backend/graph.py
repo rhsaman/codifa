@@ -1210,6 +1210,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if project_memory:
         system_final += project_memory
 
+    # Workspace summary — cross-chat recap, only on the first message of a
+    # new chat.  Skipped for continuing conversations to avoid context bloat.
+    if len(state.get("history") or []) <= 1:
+        try:
+            _ws_summary = await _agents._maybe_refresh_workspace_summary(
+                root,
+                current_chat_id=chat_id,
+                model=compact_model,
+                fallback_model=model,
+            )
+        except Exception:  # noqa: BLE001
+            _ws_summary = ""
+        if _ws_summary:
+            system_final += _ws_summary
+
     # Skills.
     system_final += _build_skills_section(skills or [], root)
 

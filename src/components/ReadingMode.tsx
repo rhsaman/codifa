@@ -141,6 +141,18 @@ export function ReadingMode({
     }
   }
 
+  // Track the per-drag listeners so we can clean them up if the component
+  // unmounts mid-drag (e.g. user pressed Esc to close the panel while still
+  // holding the resize handle — without this, the listeners would leak on
+  // `window` and keep firing against a torn-down state).
+  const dragCleanup = useRef<(() => void) | null>(null)
+  useEffect(() => {
+    return () => {
+      dragCleanup.current?.()
+      dragCleanup.current = null
+    }
+  }, [])
+
   // Drag the panel's left edge to resize (right-anchored, so dragging left
   // grows the panel and dragging right shrinks it — the inverse of the
   // left-anchored sidebar).
@@ -160,9 +172,11 @@ export function ReadingMode({
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
+      dragCleanup.current = null
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
+    dragCleanup.current = onUp
   }
 
   const panel = (

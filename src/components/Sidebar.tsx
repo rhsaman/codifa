@@ -347,6 +347,17 @@ export function Sidebar() {
     return Number.isFinite(n) ? Math.max(180, Math.min(480, n)) : 264;
   });
   const sidebarDrag = useRef<{ startX: number; startW: number } | null>(null);
+  // Track the per-drag listeners so we can clean them up if the component
+  // unmounts mid-drag (e.g. user pressed ⌘B to toggle the sidebar off while
+  // still holding the resize handle — without this, the listeners would
+  // leak on `window` and keep firing against a torn-down state).
+  const sidebarDragCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    return () => {
+      sidebarDragCleanup.current?.();
+      sidebarDragCleanup.current = null;
+    };
+  }, []);
   const startSidebarResize = (e: React.MouseEvent) => {
     e.preventDefault();
     sidebarDrag.current = { startX: e.clientX, startW: sidebarWidth };
@@ -367,9 +378,11 @@ export function Sidebar() {
       sidebarDrag.current = null;
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      sidebarDragCleanup.current = null;
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+    sidebarDragCleanup.current = onUp;
   };
 
   const allProviders = useStore((s) => s.settings.providers);

@@ -325,6 +325,20 @@ class VectorStore:
             except sqlite3.Error:
                 pass
 
+    def vacuum(self) -> bool:
+        """Reclaim disk space after a big purge.
+
+        VACUUM requires no active transaction; we hold the shared lock so
+        concurrent readers are flushed first. Returns True when the call
+        succeeded, False otherwise (best-effort: a locked DB just yields False).
+        """
+        try:
+            with _DB_LOCK:
+                self._conn.execute("VACUUM")
+            return True
+        except sqlite3.Error:
+            return False
+
     # -- helpers ---------------------------------------------------------- #
 
     def _vec_to_blob(self, vec: Sequence[float]) -> bytes:

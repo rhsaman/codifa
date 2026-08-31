@@ -202,7 +202,19 @@ function foldLineCaptions(text: string): string {
   let lastPath = ''
   while (i < lines.length) {
     const rangeM = LINE_RANGE_RE.exec(lines[i])
-    const pathM = PATH_RE.exec(lines[i])
+    let pathM = PATH_RE.exec(lines[i])
+    // PATH_RE requires the path to be followed by :digits or end-of-string.
+    // In captions like "کد در Plan.go خط ۲۰-۱۹ هست:", the path is followed by a
+    // space + more text, so PATH_RE misses it.  Use a fallback that accepts a
+    // simple name.ext pattern followed by whitespace / end-of-string.
+    if (!pathM && rangeM) {
+      const looseM = /([\w\/\\-]+\.\w{1,5})(?:\s|$|[:\(])/.exec(lines[i])
+      if (looseM) {
+        // Wrap in a match-like array with the same group layout as PATH_RE:
+        // [full, path, startLine, endLine]
+        pathM = [looseM[0], looseM[1], "", ""] as unknown as RegExpExecArray
+      }
+    }
     if (rangeM && pathM) {
       const startN = parseInt(faToLat(rangeM[1]), 10)
       const endN = rangeM[2] ? parseInt(faToLat(rangeM[2]), 10) : startN
@@ -231,9 +243,8 @@ function foldLineCaptions(text: string): string {
         // Carry the file path into the info string as `lang:start-end:path`
         // so the renderer can show it next to the language name in the header.
         lines[j] = '```' + lang + ':' + lo + '-' + hi + ':' + pathM[1]
-        // Keep the caption line (the model's prose) in the output, but advance
-        // past it so we don't re-process it (which would re-stamp the fence).
-        out.push(lines[i])
+        // Caption line is dropped — its info is now in the fence info string.
+        // Advance past the fence so we don't re-process it.
         i = j
         continue
       }
@@ -269,7 +280,9 @@ function foldLineCaptions(text: string): string {
           } else {
             lines[j] = '```' + fence[1] + ':' + lo + '-' + hi + ':' + pathM[1]
           }
-          // Keep the caption line (prose) — only the fence is rewritten.
+          // Keep the prose line — it may contain descriptive text beyond the
+          // path:line reference (e.g. "توی file.go:32 تغییر شماره...").
+          // Only the fence is rewritten; advance past it.
           out.push(lines[i])
           i = j
           continue
@@ -298,7 +311,14 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
     try { text = String(text) } catch { return "" }
   }
   if (!text) return text
-  const cleaned = stripBidiMarks(text)
+  // Models sometimes emit literal <br/>, <br>, </br>, <br /> between paragraphs.
+  // Replace with \n outside fenced code blocks; inside ```…``` leave untouched
+  // (highlight.js / escapeHtml will show them as literal text).
+  const brCleaned = text
+    .split(/(```[\s\S]*?```)/g)
+    .map((seg, i) => (i % 2 === 1 ? seg : seg.replace(/<\/?br\s*\/?>/gi, '\n')))
+    .join('')
+  const cleaned = stripBidiMarks(brCleaned)
   // Fold "خط N: path" captions into the following fence BEFORE splitting on
   // ```, otherwise the caption lands in a non-code segment and the fence info
   // string can't be rewritten.

@@ -9,7 +9,6 @@ line on stderr that the user can never see, which is exactly the
 "message cuts off" symptom the user is trying to debug.
 """
 import logging
-import os
 import sys
 
 

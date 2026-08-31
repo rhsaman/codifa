@@ -33,7 +33,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 from tools import make_tool_callbacks
 
 
-async def main():
+async def _run_parallel_tools_cases() -> None:
     ws = tempfile.mkdtemp(prefix="coder-test-parallel-ws-")
     for name in "abcde":
         with open(os.path.join(ws, f"{name}.py"), "w") as fh:  # noqa: ASYNC230
@@ -71,5 +71,16 @@ async def main():
     print("PARALLEL-TOOLS TEST PASSED")
 
 
+async def test_parallel_tools() -> None:
+    """Same coverage as the legacy ``main()``; exposed as a pytest test so
+    ``pytest tests/`` actually collects and runs it.
+    """
+    await _run_parallel_tools_cases()
+
+
+def main() -> None:
+    asyncio.run(_run_parallel_tools_cases())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

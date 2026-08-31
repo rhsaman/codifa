@@ -1602,7 +1602,7 @@ def _estimate_prompt_tokens(messages: list) -> int | None:
         return None
 
 
-def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
+def _usage_event_from_ai(ai: Any, model: str, provider: str = "") -> dict | None:
     """Build a frontend ``usage`` event from a LangChain ``AIMessage``.
 
     LangChain surfaces token counts in ``usage_metadata`` (OpenAI/Google),
@@ -1691,6 +1691,7 @@ def _usage_event_from_ai(ai: Any, model: str) -> dict | None:
         "reasoning_tokens": reasoning_tokens,
         "context_tokens": context_tokens,
         "model": model or "",
+        "provider": provider,
     }
 
 
@@ -2417,7 +2418,7 @@ async def _run_mode_turn(
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
-                usage_ev = _usage_event_from_ai(ai, model_id)
+                usage_ev = _usage_event_from_ai(ai, model_id, state.get("provider", ""))
                 if usage_ev:
                     # Track the SAME token breakdown the frontend context meter
                     # shows, so auto-compaction fires off the exact value the meter

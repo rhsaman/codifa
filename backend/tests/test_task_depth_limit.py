@@ -46,7 +46,7 @@ class _FakeModel:
         return AIMessage(content=self._text)
 
 
-async def main():
+async def _run_task_depth_limit_cases() -> None:
     ws = tempfile.mkdtemp(prefix="coder-test-task-depth-ws-")
     emitted: list[dict] = []
     tools = make_tool_callbacks(
@@ -73,5 +73,16 @@ async def main():
     print("TASK-DEPTH-LIMIT TEST PASSED")
 
 
+async def test_task_depth_limit() -> None:
+    """Same coverage as the legacy ``main()``; exposed as a pytest test so
+    ``pytest tests/`` actually collects and runs it.
+    """
+    await _run_task_depth_limit_cases()
+
+
+def main() -> None:
+    asyncio.run(_run_task_depth_limit_cases())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

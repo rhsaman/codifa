@@ -23,6 +23,7 @@ import { useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
 import { handleLinkClick } from "../lib/link";
+import { sanitizeHtml } from "../lib/sanitizeHtml";
 import {
   ToolCallView,
   ToolGroupView,
@@ -208,7 +209,12 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
       lang && hljs.getLanguage(lang)
         ? hljs.highlight(whole, { language: lang }).value
         : hljs.highlightAuto(whole).value;
-    highlightedLines = splitHighlightedHtml(html);
+    // highlight.js round-trips whatever the model wrote into the code block
+    // (e.g. unterminated tags, stray attributes) into the highlighted HTML.
+    // Sanitize the result so a malicious payload can't smuggle an event
+    // handler or a javascript: URL into the chat via a code block.
+    const safeHtml = sanitizeHtml(html);
+    highlightedLines = splitHighlightedHtml(safeHtml);
   } catch {
     highlightedLines = codeLines.map(escapeHtml);
   }

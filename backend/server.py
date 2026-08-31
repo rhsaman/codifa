@@ -1597,6 +1597,7 @@ def main() -> None:
         import logging
         import logging.handlers
 
+        from _log_filter import ServerErrorOnlyFilter
         from tools import user_coder_dir
 
         _log_dir = user_coder_dir()
@@ -1616,6 +1617,15 @@ def main() -> None:
                 "%(asctime)s %(levelname)s %(name)s: %(message)s"
             )
         )
+        # Default-on: silence the noisy per-run WARNING lines from codifa.server
+        # ("agent run start/complete", "stream DISCONNECTED", rss snapshots …)
+        # so codifa.log keeps only the genuine errors. Disconnect diagnostics
+        # from graph.py / codifa.graph are unaffected (they reach the file
+        # because they are emitted by a different logger name). Operators can
+        # turn this off with CODFA_LOG_FILE_SERVER_ERROR_ONLY=0 if they need
+        # the full per-run trail in the persistent log again.
+        if os.environ.get("CODFA_LOG_FILE_SERVER_ERROR_ONLY", "1") != "0":
+            _handler.addFilter(ServerErrorOnlyFilter())
         _root = logging.getLogger()
         # Allow raising the file-log verbosity via CODFA_LOG_LEVEL (e.g. "DEBUG"
         # or "WARNING") so diagnostic lines like graph.py's "[CTX_DEBUG]

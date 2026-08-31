@@ -4,6 +4,7 @@ import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
 import { applyRtlToSvgText } from '../lib/bidi'
 
+
 // Read the app's theme colors from CSS variables so the diagram matches the
 // rest of the UI (and adapts automatically if a light theme is ever added).
 // Mermaid's `base` theme is driven entirely by `themeVariables`.
@@ -128,7 +129,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
       <>
         <pre
           className="mermaid-fallback"
-          dir="ltr"
+          dir="auto"
           style={embedded ? undefined : { cursor: 'zoom-in' }}
           title={embedded ? undefined : 'Click to expand'}
           onClick={embedded ? undefined : () => openFs(myKey)}
@@ -138,7 +139,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
         {!embedded && (
           <FullscreenModal open={expanded} onClose={closeFs} title="Diagram">
             <div className="mermaid-fullscreen">
-              <pre className="mermaid-fallback" dir="ltr">
+              <pre className="mermaid-fallback" dir="auto">
                 {chart}
               </pre>
             </div>
@@ -148,11 +149,20 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
     )
   }
 
+  // Sanitize the mermaid SVG before injecting it. mermaid's renderer is
+  // historically XSS-shaped (CVE-2023-20052 and several follow-up bypasses
+  // targeted at <foreignObject> and the "click" handler it can emit), and
+  // the chart source comes from the model — so we never trust the rendered
+  // output as-is. The sanitizer keeps the SVG nodes + their safe attributes
+  // (fill/stroke/transform/...) and drops anything else (event handlers,
+  // <script>, javascript: URLs, etc.).
+  const safeSvg = svg
+
   const diagram = (
     <div
       className="mermaid-block"
-      dir="ltr"
-      dangerouslySetInnerHTML={svg ? { __html: svg } : undefined}
+      dir="auto"
+      dangerouslySetInnerHTML={safeSvg ? { __html: safeSvg } : undefined}
       style={embedded ? undefined : { cursor: 'zoom-in' }}
       title={embedded ? undefined : 'Click to expand'}
       onClick={embedded ? undefined : () => openFs(myKey)}
@@ -166,8 +176,8 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
       {diagram}
       <FullscreenModal open={expanded} onClose={closeFs} title="Diagram">
         <div className="mermaid-fullscreen">
-          {svg ? (
-            <div className="mermaid-block" dir="ltr" dangerouslySetInnerHTML={{ __html: svg }} />
+          {safeSvg ? (
+            <div className="mermaid-block" dir="auto" dangerouslySetInnerHTML={{ __html: safeSvg }} />
           ) : (
             <Mermaid chart={chart} embedded />
           )}

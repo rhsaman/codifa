@@ -666,9 +666,20 @@ export function ChatPanel() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     window.coder
       .getSidecarUrl()
-      .then((url) => setSidecarStatus(url ? "ok" : "fail"));
+      .then((url) => {
+        if (cancelled) return;
+        setSidecarStatus(url ? "ok" : "fail");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSidecarStatus("fail");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Track the file currently open in Neovim (fed by the main-process watcher,
@@ -1437,7 +1448,14 @@ export function ChatPanel() {
       // far past the last one (a genuinely dead connection).
       if (watchdogAutoRetriedRef.current < WATCHDOG_MAX_RETRIES) {
         watchdogAutoRetriedRef.current += 1;
-        const msgs = chat?.messages ?? [];
+        // Read the latest messages from the store, not the closure. The stall
+        // watchdog fires 10s apart on a stable `setInterval`; reading
+        // `chat.messages` from the closure would let it see a stale chat object
+        // during a long stream and pick an outdated `lastUser` to retry.
+        const liveChat = useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id);
+        const msgs = liveChat?.messages ?? [];
         const lastUser = [...msgs].reverse().find((m) => m.role === "user");
         if (lastUser) {
           // Show a visible "stalled — retrying" pill instead of a silent
@@ -1893,9 +1911,12 @@ export function ChatPanel() {
         const inputTokens = event.input_tokens ?? 0;
         const outputTokens = event.output_tokens ?? 0;
         const total = event.total_tokens ?? inputTokens + outputTokens;
-        // The provider that ACTUALLY ran this chat (from getChatProvider) — the
-        // authoritative source, no guessing. Stored explicitly on the entry.
-        const providerId = getChatProvider(chat.id).id ?? "unknown";
+        // Prefer the provider the backend actually used (from the usage event);
+        // fall back to the chat's own provider for legacy events without it.
+        const providerId =
+          (event.provider as string | undefined) ||
+          getChatProvider(chat.id).id ||
+          "unknown";
         const model = normalizeUsageModel(
           providerId,
           (event.model || "").trim() || activeModel || "main",

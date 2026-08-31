@@ -33,10 +33,11 @@ export function normalizeUsageEntry(
     let model = key;
     if (slash > 0) {
       const prefix = key.slice(0, slash);
-      // Keep the prefix only when it names a REAL provider; otherwise it is a
-      // model namespace and the provider is the chat's own.
-      if (providerIds.includes(prefix)) {
-        providerId = prefix;
+      // Only strip the prefix when it IS the chat's own provider id.  A
+      // different prefix (e.g. "anthropic" in "anthropic/claude-…") is a model
+      // namespace, not a provider routing hint — keep the full key as the model
+      // name and the chat's own provider as providerId.
+      if (prefix === chatProviderId) {
         model = key.slice(slash + 1);
       }
     }

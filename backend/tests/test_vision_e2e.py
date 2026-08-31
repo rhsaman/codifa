@@ -138,11 +138,11 @@ async def test_vision_prefetch_failure_injects_note(run_events):
 
 
 @pytest.mark.asyncio
-async def test_vision_retries_transient_500_then_succeeds(run_events):
+async def test_vision_retries_transient_429_then_succeeds(run_events):
     # A transient 429 on the FIRST vision request must be retried (not silently
     # dropped). The retry recovers and the analysis is injected normally.
     mock.script = [
-        text_reply("PREFETCH_ANALYSIS after a transient 500"),
+        text_reply("PREFETCH_ANALYSIS after a transient 429"),
         text_reply("FINAL_ANSWER based on the analysis"),
     ]
     # 429 on request index 0 (the vision pre-fetch); the retry hits index 1.
@@ -153,7 +153,7 @@ async def test_vision_retries_transient_500_then_succeeds(run_events):
         subagent_models={"vision": "mock-model"},
         images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
     )
-    # The analysis recovered from the 500 and was injected into the main model.
+    # The analysis recovered from the 429 and was injected into the main model.
     assert any(
         "PREFETCH_ANALYSIS" in _all_text(b) for b in mock.captured
     ), "vision did not recover from a transient 429 and inject the analysis"

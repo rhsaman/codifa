@@ -1,6 +1,6 @@
 [project]
 name = "codifa"
-version = "1.5.2"
+version = "1.5.4"
 description = "Codifa Coder Agent"
 requires-python = ">=3.10"
 dependencies = [

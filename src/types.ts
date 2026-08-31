@@ -456,6 +456,10 @@ export interface SidecarEvent {
    *  the model that ran the call; for 'usage' events, the model the usage
    *  belongs to. Empty/absent = the main conversation model. */
   model?: string
+  /** The provider that actually executed this usage event (e.g. 'openrouter',
+   *  'anthropic').  Absent on legacy events — the frontend falls back to the
+   *  chat's own provider when missing. */
+  provider?: string
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string

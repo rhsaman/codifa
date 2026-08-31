@@ -45,6 +45,11 @@ def main() -> int:
 
     import time
 
+    # 5s polling strikes a sensible balance: long enough that we don't burn CPU
+    # on a multi-GB download (the default model is several GB) and short enough
+    # that progress feedback feels live (file:// and HF mirror endpoints both
+    # push state updates in well under 5s). 1s was wasteful.
+    POLL_INTERVAL_S = 5
     print(f"Downloading {args.model} -> {model_download.whisper_dir()} ...")
     deadline = time.time() + 3600
     while True:
@@ -57,7 +62,7 @@ def main() -> int:
         if state.get("state") == "error":
             print(f"Download failed: {state.get('error')}")
             return 1
-        time.sleep(1)
+        time.sleep(POLL_INTERVAL_S)
     print("Done.")
     return 0
 

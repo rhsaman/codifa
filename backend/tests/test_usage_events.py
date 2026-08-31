@@ -172,6 +172,38 @@ def test_usage_event_returns_none_on_zero_tokens():
     assert _usage_event_from_ai(ai, "m") is None
 
 
+def test_usage_event_includes_provider():
+    # The provider field must be forwarded so the frontend can route usage
+    # entries to the correct provider group in the sidebar.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "claude-3.5-sonnet", provider="openrouter")
+    assert ev is not None
+    assert ev["provider"] == "openrouter"
+    assert ev["model"] == "claude-3.5-sonnet"
+
+
+def test_usage_event_provider_defaults_to_empty():
+    # Legacy callers that don't pass provider should get an empty string.
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "gpt-4o")
+    assert ev is not None
+    assert ev["provider"] == ""
+
+
 def test_usage_event_surfaces_reasoning_tokens():
     # Reasoning/thinking tokens (OpenAI o-series / Anthropic extended thinking /
     # DeepSeek reasoner) occupy the context window and must be surfaced so the
@@ -325,3 +357,48 @@ def test_last_context_tokens_uses_provider_total_not_hand_sum():
     assert ev["total_tokens"] == 6450
     # The compaction trigger must see the provider total, never the double-count.
     assert ev["total_tokens"] < 6286 + 164 + 6144
+
+
+def test_usage_event_includes_provider_field():
+    """provider field is surfaced so the frontend groups usage under the correct provider."""
+    ai = AIMessage(
+        content="hi",
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "claude-3.5-sonnet", provider="openrouter")
+    assert ev is not None
+    assert ev["provider"] == "openrouter"
+
+
+def test_usage_event_provider_default_empty():
+    """When no provider is passed, the field defaults to empty string (legacy compat)."""
+    ai = AIMessage(
+        content="hi",
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "gpt-4o")
+    assert ev is not None
+    assert ev["provider"] == ""
+
+
+def test_usage_event_from_llm_generate_includes_provider():
+    """usage_event() in llm.py also surfaces the provider field."""
+    from llm import usage_event
+
+    metadata = {
+        "input_tokens": 500,
+        "output_tokens": 40,
+        "total_tokens": 540,
+    }
+    ev = usage_event(metadata, model="gpt-4o", provider="openrouter")
+    assert ev is not None
+    assert ev["provider"] == "openrouter"
+    assert ev["model"] == "gpt-4o"

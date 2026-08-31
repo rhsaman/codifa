@@ -153,6 +153,25 @@ console.log('10) foldLineCaptions: path:line بدون فنس بعدی فقط pat
   check('خط path:line بدون فنس دست‌نخورده می‌ماند', out === 'ببین changePhoneConfirm.go:32 را', out)
 }
 
+console.log('11) <br/> بیرون بلوک کد → \\n تبدیل شود:')
+{
+  const out = prepareContent('مرحله ۱</br>مرحله ۲<br/>مرحله ۳')
+  check('<br/> → \\n', out === 'مرحله ۱\nمرحله ۲\nمرحله ۳', out)
+}
+
+console.log('12) <br/> داخل بلوک کد → دست‌نخورده بماند:')
+{
+  const out = prepareContent('متن\n\n```html\n<br/>\n```')
+  check('<br/> داخل کد حفظ شد', out.includes('<br/>'), out)
+}
+
+console.log('13) <br/> ترکیبی (بیرون + داخل):')
+{
+  const out = prepareContent('خط اول<br/>خط دوم\n\n```html\n<br/>\n```')
+  check('بیرون تبدیل شد', out.startsWith('خط اول\nخط دوم'), out)
+  check('داخل حفظ شد', out.includes('<br/>'), out)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

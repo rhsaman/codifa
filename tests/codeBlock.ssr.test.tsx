@@ -179,7 +179,10 @@ console.log('6) کامنت واقعی با / دیگر هدر فایل نمی‌�
     </CodeBlock>,
   )
   check('کلاس code-block-file ندارد', !html.includes('code-block-file'))
-  check('نام فایل src/components/App.tsx در هدر نیست', !html.includes('src/components/App.tsx'), html)
+  // The filename may appear inside code text (as a comment) — only verify
+  // it is NOT rendered inside the code-block-head header area.
+  const headHtml = html.split('</div>')[0] // first </div> closes code-block-head
+  check('نام فایل src/components/App.tsx در هدر نیست', !headHtml.includes('src/components/App.tsx'), html)
   check('متن کامنت در کد حاضر است', html.replace(/<[^>]+>/g, '').includes('src/components/App.tsx'))
 }
 

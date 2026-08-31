@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import warnings
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
@@ -62,11 +63,13 @@ _STEER_LOCK = asyncio.Lock()
 
 
 async def _drain_steer(chat_id: str) -> list[dict]:
-    """Pop and return all pending steer messages for a chat."""
+    """Pop and return all pending steer messages for a chat.
+
+    Also drops the chat's entry from the inbox so long-running sessions don't
+    accumulate empty buckets for every chat that ever received a steer.
+    """
     async with _STEER_LOCK:
-        items = STEER_INBOX.get(chat_id) or []
-        if items:
-            STEER_INBOX[chat_id] = []
+        items = STEER_INBOX.pop(chat_id, [])
         return items
 
 
@@ -1849,7 +1852,8 @@ class _HighWatermark(Exception):
         self.note = note
 
 
-_PROJECT_MEMORY_CACHE: dict[str, tuple[float, str]] = {}
+_PROJECT_MEMORY_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_PROJECT_MEMORY_CACHE_MAX = 64
 
 
 def _load_project_memory(root: str) -> str:
@@ -1860,7 +1864,8 @@ def _load_project_memory(root: str) -> str:
 
     Cached per ``root`` keyed on the newest file's mtime, so repeated turns in
     the same session skip the disk read + string assembly (the content is
-    static across turns unless the file is edited).
+    static across turns unless the file is edited). The cache is bounded so
+    long sessions that touch many workspaces don't grow it without bound.
     """
     mtime = 0.0
     for rel in _PROJECT_MEMORY_FILES:
@@ -1870,9 +1875,14 @@ def _load_project_memory(root: str) -> str:
             pass
     cached = _PROJECT_MEMORY_CACHE.get(root)
     if cached is not None and cached[0] >= mtime:
+        # Touch — move to the back so the LRU eviction keeps the active workspace.
+        _PROJECT_MEMORY_CACHE.move_to_end(root)
         return cached[1]
     result = _read_project_memory(root)
     _PROJECT_MEMORY_CACHE[root] = (mtime, result)
+    _PROJECT_MEMORY_CACHE.move_to_end(root)
+    while len(_PROJECT_MEMORY_CACHE) > _PROJECT_MEMORY_CACHE_MAX:
+        _PROJECT_MEMORY_CACHE.popitem(last=False)
     return result
 
 

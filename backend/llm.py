@@ -446,6 +446,7 @@ async def llm_generate(
     user: str,
     images: list[str] | None = None,
     sub: bool = False,
+    provider: str = "",
 ) -> tuple[str, dict | None]:
     """Run a single LLM completion (no tools).
 
@@ -484,7 +485,7 @@ async def llm_generate(
         text = text or str(content)
     else:
         text = str(content or "")
-    usage = usage_event(getattr(res, "usage_metadata", None), model=model_name, sub=sub)
+    usage = usage_event(getattr(res, "usage_metadata", None), model=model_name, sub=sub, provider=provider)
     return text, usage
 
 
@@ -515,6 +516,7 @@ async def langchain_tool_loop(
     compact_model: Any = None,
     reserved: int | None = None,
     emit: Any = None,
+    provider: str = "",
 ) -> str:
     """Run a bounded tool-calling loop on a LangChain model.
 
@@ -579,6 +581,7 @@ async def langchain_tool_loop(
                     _um,
                     model=str(getattr(model, "model_name", "") or ""),
                     sub=True,
+                    provider=provider,
                 )
                 if _ev:
                     emit(_ev)
@@ -735,7 +738,11 @@ async def _auto_compact_subagent(
 
 
 def usage_event(
-    metadata: Any, model: str = "", sub: bool = False, prompt_tokens: int | None = None
+    metadata: Any,
+    model: str = "",
+    sub: bool = False,
+    prompt_tokens: int | None = None,
+    provider: str = "",
 ) -> dict | None:
     """Build a SSE ``usage`` event from a LangChain ``usage_metadata`` mapping.
 
@@ -816,6 +823,7 @@ def usage_event(
             "context_tokens": prompt_tokens,
             "model": model or "",
             "sub": sub,
+            "provider": provider,
         }
     except Exception:  # noqa: BLE001 -- usage must never crash a run
         return None

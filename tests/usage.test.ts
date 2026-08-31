@@ -36,12 +36,34 @@ console.log('۲) پیشوند namespace مدل (مثل anthropic/claude-...) ن�
   check('کل مدل (با پیشوندش) حفظ می‌شود', out?.entries[0]?.model === 'anthropic/claude-3.5-sonnet', out)
 }
 
-console.log('۳) پیشوند واقعی پرووایدر (subagent routing) حفظ می‌شود:')
+console.log('۳) پیشوند پروایدر غیرفعال (subagent routing) حفظ می‌شود:')
 {
+  // اگر chat روی openrouter باشد و کلید "myprovider/free" باشد، چون
+  // myprovider !== chatProviderId، کلید به‌عنوان نام مدل باقی می‌ماند و
+  // providerId همان chatProviderId (openrouter) است.
   const legacy = { 'myprovider/free': { input: 3, output: 4 } }
   const out = normalizeUsageEntry(legacy, 'openrouter', providerIds)
-  check('پرووایدر پیشوند به‌عنوان providerId می‌رود', out?.entries[0]?.providerId === 'myprovider', out)
-  check('مدل باقی‌مانده درست است', out?.entries[0]?.model === 'free', out)
+  check('providerId همان chatProviderId می‌ماند', out?.entries[0]?.providerId === 'openrouter', out)
+  check('کل کلید (با پیشوند) حفظ می‌شود', out?.entries[0]?.model === 'myprovider/free', out)
+}
+
+console.log('۳ب) پیشوندی که خودِ chatProviderId باشد از مدل حذف می‌شود:')
+{
+  const legacy = { 'openrouter/claude-3.5-sonnet': { input: 5, output: 6 } }
+  const out = normalizeUsageEntry(legacy, 'openrouter', providerIds)
+  check('providerId همان openrouter است', out?.entries[0]?.providerId === 'openrouter', out)
+  check('پیشوند openrouter/ از مدل حذف شده', out?.entries[0]?.model === 'claude-3.5-sonnet', out)
+}
+
+console.log('۳ج) namespace مدل که اسمش با یکی از پروایدرها یکی باشد ولی chatProviderId متفاوت باشد (باگ اصلی):')
+{
+  // سناریو: کاربر هم anthropic و هم openrouter دارد. چت روی openrouter است
+  // و مدل "anthropic/claude-3.5-sonnet" بوده. نباید زیر anthropic برود!
+  const providersWithAnthropic = [mkProvider('anthropic'), mkProvider('openrouter')]
+  const legacy = { 'anthropic/claude-3.5-sonnet': { input: 100, output: 200 } }
+  const out = normalizeUsageEntry(legacy, 'openrouter', providersWithAnthropic.map(p => p.id))
+  check('زیر openrouter می‌رود (نه anthropic)', out?.entries[0]?.providerId === 'openrouter', out)
+  check('کل مدل حفظ می‌شود', out?.entries[0]?.model === 'anthropic/claude-3.5-sonnet', out)
 }
 
 console.log('۴) دادهٔ جدید (شکل entry) دست‌نخورده عبور می‌کند:')

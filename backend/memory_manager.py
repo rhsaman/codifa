@@ -143,46 +143,43 @@ class MemoryManager:
 
     def _init_fts(self) -> None:
         try:
-            conn = sqlite3.connect(self._fts_path)
-            conn.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    id UNINDEXED,
-                    project_id UNINDEXED,
-                    memory_type UNINDEXED,
-                    content
+            with sqlite3.connect(self._fts_path) as conn:
+                conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                        id UNINDEXED,
+                        project_id UNINDEXED,
+                        memory_type UNINDEXED,
+                        content
+                    )
+                    """
                 )
-                """
-            )
-            conn.commit()
-            conn.close()
+                conn.commit()
         except sqlite3.Error:
             pass  # degraded: lexical search falls back to a full scan
 
     def _fts_upsert(self, rec: dict) -> None:
         try:
-            conn = sqlite3.connect(self._fts_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO memories_fts(id, project_id, memory_type, content) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    rec.get("id", ""),
-                    rec.get("project_id", ""),
-                    rec.get("memory_type", ""),
-                    rec.get("content", ""),
-                ),
-            )
-            conn.commit()
-            conn.close()
+            with sqlite3.connect(self._fts_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO memories_fts(id, project_id, memory_type, content) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        rec.get("id", ""),
+                        rec.get("project_id", ""),
+                        rec.get("memory_type", ""),
+                        rec.get("content", ""),
+                    ),
+                )
+                conn.commit()
         except sqlite3.Error:
             pass
 
     def _fts_delete(self, mid: str) -> None:
         try:
-            conn = sqlite3.connect(self._fts_path)
-            conn.execute("DELETE FROM memories_fts WHERE id = ?", (mid,))
-            conn.commit()
-            conn.close()
+            with sqlite3.connect(self._fts_path) as conn:
+                conn.execute("DELETE FROM memories_fts WHERE id = ?", (mid,))
+                conn.commit()
         except sqlite3.Error:
             pass
 
@@ -230,16 +227,15 @@ class MemoryManager:
         if not match:
             return []
         try:
-            conn = sqlite3.connect(self._fts_path)
-            rows = conn.execute(
-                """
-                SELECT id FROM memories_fts
-                WHERE memories_fts MATCH ? AND project_id = ?
-                ORDER BY rank LIMIT ?
-                """,
-                (match, project_id, limit),
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(self._fts_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id FROM memories_fts
+                    WHERE memories_fts MATCH ? AND project_id = ?
+                    ORDER BY rank LIMIT ?
+                    """,
+                    (match, project_id, limit),
+                ).fetchall()
             return [str(r[0]) for r in rows]
         except sqlite3.Error:
             return []

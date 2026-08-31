@@ -67,7 +67,7 @@ def check(label: str, got, want) -> bool:
     return ok
 
 
-async def main() -> None:
+async def _run_models_dev_cases() -> None:
     ok = True
 
     # cloudflare: provider key resolves to the catalog's real key.
@@ -138,5 +138,16 @@ async def main() -> None:
     print("MODELS-DEV TESTS PASSED")
 
 
+async def test_models_dev() -> None:
+    """Same coverage as the legacy ``main()``; exposed as a pytest test so
+    ``pytest tests/`` actually collects and runs it.
+    """
+    await _run_models_dev_cases()
+
+
+def main() -> None:
+    asyncio.run(_run_models_dev_cases())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -26,7 +26,6 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 from langchain_core.messages import AIMessage
 
 import llm as llm_mod
-import tools as tools_mod
 from tools import make_tool_callbacks
 
 
@@ -73,11 +72,11 @@ async def _run_explore(explore_model, main_model):
             subagent_type="explore",
         )
     finally:
-        tools_mod.langchain_tool_loop = _orig
+        llm_mod.langchain_tool_loop = _orig
     return captured.get("model_name", "")
 
 
-async def main():
+async def _run_explore_model_override_cases() -> None:
     main_model = _FakeModel("main-model")
     explore_model = _FakeModel("explore-model")
 
@@ -116,7 +115,7 @@ async def main():
             subagent_type="general",
         )
     finally:
-        tools_mod.langchain_tool_loop = _orig
+        llm_mod.langchain_tool_loop = _orig
     assert captured.get("model_name") == "main-model", (
         f"general sub-agent should use main model, got {captured.get('model_name')!r}"
     )
@@ -125,5 +124,16 @@ async def main():
     print("EXPLORE-MODEL OVERRIDE TEST PASSED")
 
 
+async def test_explore_model_override() -> None:
+    """Same coverage as the legacy ``main()``; exposed as a pytest test so
+    ``pytest tests/`` actually collects and runs it.
+    """
+    await _run_explore_model_override_cases()
+
+
+def main() -> None:
+    asyncio.run(_run_explore_model_override_cases())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -117,7 +117,7 @@ async def _run_with(model, state):
     return events
 
 
-async def main():
+async def _run_loop_detection_cases() -> None:
     state = {
         "chat_id": "loop-test",
         "context_window": 0,
@@ -151,5 +151,17 @@ async def main():
     print("LOOP-DETECTION TEST PASSED")
 
 
+async def test_loop_detection() -> None:
+    """Same coverage as the legacy ``main()``; exposed as a pytest test so
+    ``pytest tests/`` actually collects and runs it (the old script was
+    asyncio.run()'d only when invoked directly and was silently skipped by CI).
+    """
+    await _run_loop_detection_cases()
+
+
+def main() -> None:
+    asyncio.run(_run_loop_detection_cases())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

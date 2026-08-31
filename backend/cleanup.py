@@ -81,15 +81,19 @@ def run_cleanup(
             pass
 
     # VACUUM only when the DB is meaningfully large and something was removed,
-    # so we never pay the full-rewrite cost on tiny or untouched stores.
+    # so we never pay the full-rewrite cost on tiny or untouched stores. The
+    # store exposes ``vacuum()`` as the public API; reaching into the private
+    # ``_conn`` would race with concurrent writers inside the store.
     if store is not None and (report["evicted"] or report["pruned_files"]):
         try:
-            db_file = getattr(store, "_db_path", "") or ""
-            if db_file and os.path.isfile(db_file):
-                size_mb = os.path.getsize(db_file) / (1024 * 1024)
-                if size_mb >= vacuum_threshold_mb:
-                    store._conn.execute("VACUUM")
-                    report["vacuumed"] = True
+            db_file = getattr(store, "db_path", "") or ""
+            if (
+                db_file
+                and os.path.isfile(db_file)
+                and os.path.getsize(db_file) / (1024 * 1024) >= vacuum_threshold_mb
+                and store.vacuum()
+            ):
+                report["vacuumed"] = True
         except Exception:  # noqa: BLE001, S110 — best-effort, never raises
             pass
     return report

@@ -1,16 +1,16 @@
 """LangChain chat-model factory.
 
-Replaces pydantic-ai's ``build_model`` with a provider-config → LangChain
-``BaseChatModel`` mapping so the LangGraph orchestration can call any
-OpenAI-compatible / Google / OpenRouter gateway through one interface.
+Maps a provider-config to a LangChain ``BaseChatModel`` so the LangGraph
+orchestration can call any OpenAI-compatible / Google / OpenRouter gateway
+through one interface.
 
 It reuses the SAME provider configuration that the rest of the app already
 reads (``providers._provider_meta``, ``normalize_base_url``, ``env_key``,
 ``OPENCODE_UA``, ``model_timeout``, ...), so the user's Settings → Providers
-entries keep working unchanged. Only the model *construction* differs.
+entries keep working unchanged.
 
-The reasoning/UA/cache handling that pydantic-ai did with custom ``Model``
-subclasses is reproduced with the equivalents LangChain supports:
+Reasoning / User-Agent / cache handling is reproduced with the equivalents
+LangChain supports:
 
 * opencode zen gateway UA spoof -> ``default_headers``.
 * OpenRouter prompt-cache breakpoints -> ``default_headers`` (best-effort).
@@ -189,8 +189,7 @@ def build_chat_model(
     """Build a LangChain chat model for the given provider configuration.
 
     Mirrors ``providers.build_model``'s resolution (qualify id, credential
-    chain, UA spoof, reasoning) but returns a ``BaseChatModel`` instead of a
-    pydantic-ai ``Model``.
+    chain, UA spoof, reasoning) but returns a ``BaseChatModel``.
 
     ``model_reasoning`` is the per-model capability flag (from the provider's
     ``/models`` ``reasoning`` field). It lets local / custom providers that
@@ -747,7 +746,7 @@ def usage_event(
     """Build a SSE ``usage`` event from a LangChain ``usage_metadata`` mapping.
 
     Mirrors ``agents._usage_event``'s output shape so the frontend context meter
-    keeps working after the pydantic-ai removal.
+    keeps working.
     """
     if not metadata:
         return None

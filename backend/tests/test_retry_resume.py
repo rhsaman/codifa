@@ -1,13 +1,10 @@
 """Live tests: error handling continues WITHOUT learned replay.
 
-The LangGraph migration removed the old pydantic-ai ``resume_tool`` replay and
-the durable resume-file mechanism. On error the agent now:
-
-* continues on ANY transient provider failure (429 throttle, 5xx, timeout,
-  network blip) via a unified bounded backoff (``_RETRY_MAX_ATTEMPTS`` attempts,
-  30s apart), re-sending the REAL transcript (tool results are already in
-  ``messages``) -- no synthetic "you already did X" injection and nothing is
-  persisted to "teach" the model;
+On error the agent continues on ANY transient provider failure (429 throttle,
+5xx, timeout, network blip) via a unified bounded backoff
+(``_RETRY_MAX_ATTEMPTS`` attempts, 30s apart), re-sending the REAL transcript
+(tool results are already in ``messages``) -- no synthetic "you already did
+X" injection and nothing is persisted to "teach" the model;
 * surfaces a hard/fatal error (400 / quota exhausted / auth) as an ``error``
   event and stops gracefully, without writing a durable replay file.
 

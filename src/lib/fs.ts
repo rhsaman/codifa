@@ -14,6 +14,7 @@ export interface SearchMatch {
 
 export const api = {
   getSidecarUrl: () => window.coder.getSidecarUrl(),
+  probeSidecar: () => window.coder.probeSidecar(),
   getEnv: (key: string): Promise<string | null> => window.coder.getEnv(key),
   googleSignIn: (
     clientId: string,

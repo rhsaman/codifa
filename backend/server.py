@@ -1,4 +1,4 @@
-"""FastAPI sidecar serving the Pydantic AI agent over SSE.
+"""FastAPI sidecar serving the LangGraph agent over SSE.
 
 Runs on 127.0.0.1:<ephemeral port>, spawned by the Electron main process. Only
 reachable from the local machine. All file access is confined to the ROOT
@@ -859,7 +859,7 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     # isn't left with the generic fallback at the bottom.
     if not text.strip():
         text = "The model request timed out (no data arrived from the provider for an extended period)."
-    # pydantic-ai HTTP errors render as: status_code: 400, model_name: ...,
+    # LangChain HTTP errors render as: status_code: 400, model_name: ...,
     # body: {'message': '...'} (or body: [{'error': {'message': '...'}}] from
     # Gemini's OpenAI-compat endpoint). Pull out the server's own message.
     detail = ""
@@ -870,6 +870,29 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
             detail = body.get("message") or body.get("error") or ""
             if isinstance(detail, dict):
                 detail = str(detail)
+            # OpenRouter / ai-gateway-style wrappers bury the REAL upstream
+            # error inside `metadata.raw` as an escaped JSON string. When the
+            # outer message is the generic "Provider returned error" (their
+            # default wrapper), dig one level deeper to surface the actual
+            # failure — otherwise the user sees a useless "Provider returned
+            # error" with no clue what went wrong.
+            meta = body.get("metadata") if isinstance(body, dict) else None
+            raw = meta.get("raw") if isinstance(meta, dict) else None
+            if (
+                isinstance(raw, str)
+                and (detail or "").strip().lower() in ("provider returned error", "")
+            ):
+                try:
+                    inner = ast.literal_eval(raw)
+                    inner_msg = (
+                        inner.get("message")
+                        if isinstance(inner, dict)
+                        else None
+                    )
+                    if isinstance(inner_msg, str) and inner_msg.strip():
+                        detail = inner_msg
+                except (ValueError, SyntaxError, TypeError):
+                    pass
         except (ValueError, SyntaxError, TypeError):
             detail = ""
     if not detail:

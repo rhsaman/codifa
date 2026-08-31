@@ -1,7 +1,6 @@
 """LangGraph orchestration for the Codifa agent workflow.
 
-This replaces the old single ``Agent`` pydantic-ai ``run_agent`` loop with an
-explicit LangGraph state machine:
+Explicit state machine:
 
     Router
     +-- Ask   (web_search / fetch_url / vision / read / grep / glob)
@@ -45,6 +44,8 @@ import traceback
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,87 @@ def _parse_checkpoint_ts(ts_raw) -> float | None:
     return None
 
 
+# Default guards for "is this checkpoint fresh enough to resume?". A stale
+# checkpoint from a previous model, workspace, or mode is more dangerous than
+# useful: resuming it would re-execute already-done tool calls and could
+# produce a silently broken first reply. Drop and start fresh instead.
+_RESUME_MAX_AGE_S = 30 * 60  # 30 minutes
+_RESUME_MAX_TOOL_CALLS = 8
+
+
+async def _load_turn_checkpoint_valid(
+    thread_id: str,
+    *,
+    max_age_s: int = _RESUME_MAX_AGE_S,
+    max_tool_calls: int = _RESUME_MAX_TOOL_CALLS,
+    current_mode: str = "",
+) -> list | None:
+    """Load a resume checkpoint only if it is still fresh.
+
+    Returns the in-flight message transcript (same as ``_load_turn_checkpoint``)
+    when all three guards pass:
+      * age  — checkpoint is younger than ``max_age_s`` seconds;
+      * size — checkpoint contains at most ``max_tool_calls`` ToolMessages;
+      * mode — checkpoint's saved mode matches ``current_mode`` (when both are
+        non-empty).
+
+    On any failure the checkpoint is cleared so the next turn starts clean.
+    """
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        async with AsyncSqliteSaver.from_conn_string(
+            _resume_checkpoint_path()
+        ) as saver:
+            tup = await saver.aget_tuple(_resume_checkpoint_config(thread_id))
+    except Exception:  # noqa: BLE001 — best-effort: a missing/corrupt checkpoint just means "no resume"
+        return None
+    if tup is None:
+        return None
+    ckpt = tup.checkpoint or {}
+    messages = ckpt.get("channel_values", {}).get("messages")
+
+    # Age guard: a checkpoint older than the TTL is from a previous session /
+    # previous model — resuming it would replay stale tool calls.
+    ts = _parse_checkpoint_ts(ckpt.get("ts"))
+    if ts is not None:
+        age = datetime.now(timezone.utc).timestamp() - ts
+        if age > max_age_s:
+            logger.warning(
+                "resume checkpoint is stale (age=%.0fs > %ds); dropping",
+                age, max_age_s,
+            )
+            await _clear_turn_checkpoint(thread_id)
+            return None
+
+    # Size guard: a checkpoint with too many tool calls is almost certainly
+    # from a stuck loop; resuming it would just keep looping.
+    if isinstance(messages, list):
+        tool_count = sum(1 for m in messages if isinstance(m, ToolMessage))
+        if tool_count > max_tool_calls:
+            logger.warning(
+                "resume checkpoint has too many tool calls (%d > %d); dropping",
+                tool_count, max_tool_calls,
+            )
+            await _clear_turn_checkpoint(thread_id)
+            return None
+
+    # Mode guard: a checkpoint from a different mode (ask / plan / coder) is
+    # almost always from a turn the user has since abandoned. Drop and start
+    # fresh so the model isn't fed a half-finished turn from another mode.
+    if current_mode:
+        saved_mode = (ckpt.get("channel_values", {}) or {}).get("mode")
+        if saved_mode and saved_mode != current_mode:
+            logger.warning(
+                "resume checkpoint mode mismatch (saved=%s current=%s); dropping",
+                saved_mode, current_mode,
+            )
+            await _clear_turn_checkpoint(thread_id)
+            return None
+
+    return messages if isinstance(messages, list) else None
+
+
 async def clear_chat_resume_checkpoint(chat_id: str) -> None:
     """Drop the resume checkpoint for a deleted chat so it doesn't orphan on disk."""
     with contextlib.suppress(Exception):
@@ -371,6 +453,11 @@ def history_to_langchain_messages(
     for turn in history or []:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
+        # Non-visible recap of completed tools from a previously interrupted
+        # turn. Folded into the assistant content so the model sees what was
+        # already done and skips re-executing — the UI never renders this
+        # string (it lives on `preservedToolSummary` on the frontend message).
+        preserved_summary = turn.get("preservedToolSummary") or ""
         tool_activity = turn.get("toolActivity") or []
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
@@ -416,15 +503,17 @@ def history_to_langchain_messages(
                     result = ta.get("summary") or ""
                 tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             if tool_calls:
-                out.append(AIMessage(content=content, tool_calls=tool_calls))
+                _ai_content = content + preserved_summary if preserved_summary else content
+                out.append(AIMessage(content=_ai_content, tool_calls=tool_calls))
                 out.extend(tool_msgs)
                 continue
-        if not content:
+        if not content and not preserved_summary:
             continue
         if role == "system":
             out.append(SystemMessage(content=content))
         elif role == "assistant":
-            out.append(AIMessage(content=content))
+            _ai_content = content + preserved_summary if preserved_summary else content
+            out.append(AIMessage(content=_ai_content))
         else:
             out.append(HumanMessage(content=content))
     return out
@@ -1209,6 +1298,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
 
     # Workspace summary — cross-chat recap, only on the first message of a
     # new chat.  Skipped for continuing conversations to avoid context bloat.
+    # Filtered to what's relevant to THIS first message so unrelated earlier
+    # work doesn't bleed into the new chat. The merge (persisted, full
+    # record) and the relevance filter (injected, scoped to this chat) run
+    # as a SINGLE LLM call when possible -- see
+    # _maybe_refresh_workspace_summary's docstring for the fallback path.
     if len(state.get("history") or []) <= 1:
         try:
             _ws_summary = await _agents._maybe_refresh_workspace_summary(
@@ -1216,6 +1310,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 current_chat_id=chat_id,
                 model=compact_model,
                 fallback_model=model,
+                user_prompt=prompt,
             )
         except Exception:  # noqa: BLE001
             _ws_summary = ""
@@ -2222,7 +2317,13 @@ async def _run_mode_turn(
     # (reader/explore) which don't interrupt mid-tool-loop.
     _resume_thread = _resume_thread_id(state)
     if not extra_instruction:
-        _ckpt_msgs = await _load_turn_checkpoint(_resume_thread)
+        # Only resume from a checkpoint that is still fresh: if it is stale
+        # (older than the TTL), oversized (likely a loop), or from a different
+        # mode, drop it and start fresh instead of replaying a poisoned turn.
+        # See _load_turn_checkpoint_valid for the policy.
+        _ckpt_msgs = await _load_turn_checkpoint_valid(
+            _resume_thread, current_mode=state.get("mode", "")
+        )
         if _ckpt_msgs:
             messages = list(_ckpt_msgs)
             # The checkpoint already holds the full in-flight transcript
@@ -2452,6 +2553,51 @@ async def _run_mode_turn(
                     _no_so = True
                     model = _strip_stream_options(model)
                     continue
+                # Surface the most common per-step failures as readable SSE
+                # events instead of letting them bubble up to _drive as raw
+                # tracebacks (the old behavior looked like a silent
+                # "instant disconnect" to the user). The checkpoint is left
+                # behind so a Retry resumes from the already-done tool work.
+                _low = str(exc).lower()
+                if isinstance(exc, asyncio.TimeoutError) or "timed out" in _low:
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                "The model request timed out before producing any "
+                                "output. Tap Retry to resume from the last "
+                                "checkpoint, or switch to a faster model in Settings."
+                            ),
+                        }
+                    )
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["error"] = True
+                    return reply or ""
+                if (
+                    isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout))
+                    or "connection refused" in _low
+                    or "name or service not known" in _low
+                    or "connection reset" in _low
+                    or "connection was closed" in _low
+                    or "remote protocol error" in _low
+                ):
+                    _endpoint = (state.get("base_url") or "").strip()
+                    _hint = f" at {_endpoint}" if _endpoint else ""
+                    queue.put_nowait(
+                        {
+                            "kind": "error",
+                            "content": (
+                                f"Couldn't reach the model provider{_hint}. "
+                                "Check Settings → Providers or your network, then "
+                                "tap Retry."
+                            ),
+                        }
+                    )
+                    if run_flags is not None:
+                        with contextlib.suppress(Exception):
+                            run_flags["error"] = True
+                    return reply or ""
                 raise
             if not getattr(ai, "tool_calls", None):
                 meta = getattr(ai, "response_metadata", {}) or {}
@@ -2711,9 +2857,24 @@ async def _run_mode_turn(
 
     reply = ""
     attempt = 0
+    # Log every attempt start so the user can verify from the sidecar log
+    # that retries are actually firing. The renderer-side Network tab CAN'T
+    # see these requests: they originate from the Python sidecar subprocess
+    # (Electron main spawns it as a child), so they don't pass through the
+    # renderer's fetch pipeline. The RetryBanner UI shows the same counter
+    # (`4/10`); the log is the source of truth for "did the request actually
+    # reach the provider or fail before the HTTP layer".
+    chat_id = state.get("chat_id", "")
+    logger.info("[run_graph] agent run starting (chat_id=%s)", chat_id)
     try:
         while True:
             attempt += 1
+            logger.info(
+                "[run_graph] agent run attempt %s/%s (chat_id=%s)",
+                attempt,
+                _agents._RETRY_MAX_ATTEMPTS,
+                chat_id,
+            )
             try:
                 reply = await _inner()
                 break
@@ -2782,6 +2943,23 @@ async def _run_mode_turn(
                 delay = _agents._RETRY_BASE_SECONDS
                 if not isinstance(delay, (int, float)) or delay < 0:
                     delay = 30
+                # Log each retry to codifa.log so a "no network entries in
+                # DevTools" symptom is diagnosable. The retry's provider
+                # HTTP request fires from the sidecar subprocess, which the
+                # renderer-side Network tab CANNOT see (Electron spawns
+                # the Python sidecar as a child process; the renderer's
+                # fetch pipeline only sees requests made by the renderer
+                # itself). The RetryBanner counter (`4/10`) is the
+                # in-UI confirmation; this log line is the source of
+                # truth for "did the request actually reach the provider".
+                logger.warning(
+                    "[run_graph] agent run failed (chat_id=%s attempt=%s/%s): %s — retrying in %ss",
+                    state.get("chat_id", ""),
+                    attempt,
+                    _agents._RETRY_MAX_ATTEMPTS,
+                    _agents._friendly_retry_reason(exc),
+                    delay,
+                )
                 queue.put_nowait(
                     {
                         "kind": "retry",

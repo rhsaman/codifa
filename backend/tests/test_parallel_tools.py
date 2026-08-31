@@ -3,11 +3,10 @@
 The bug being guarded against: `make_tool_callbacks` used to correlate each
 `tool_result` back to its originating `tool` by a name-based FIFO (pop the
 oldest pending id for that tool name). When the SAME tool runs multiple times
-in PARALLEL (pydantic-ai runs each call as a separate async task), completion
-order can differ from start order — a name-based FIFO then swaps which card
-owns which result. On a Stop this made the frontend mark the wrong cards done
-(one left stuck "running") and the retried model re-ran already-completed
-duplicates.
+in PARALLEL (each call is a separate async task), completion order can differ
+from start order — a name-based FIFO then swaps which card owns which result.
+On a Stop this made the frontend mark the wrong cards done (one left stuck
+"running") and the retried model re-ran already-completed duplicates.
 
 The fix threads a per-INVOCATION `call_id` through a `contextvars.ContextVar`
 set inside each tool invocation, so a `tool` and its own `tool_result` always

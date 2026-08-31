@@ -1,4 +1,4 @@
-"""Pydantic AI agents for the two UI modes.
+"""LangGraph agents for the two UI modes.
 
 * ``chat``      -> conversational coding assistant (conservative tool use)
 * ``codewriter``-> autonomous code-writing agent (proactive tool use)
@@ -982,6 +982,15 @@ _RETRYABLE_PHRASES = (
     "remote protocol error",
     "broken pipe",
     "zero length read",
+    # OpenRouter wraps upstream-provider failures as 400 with body
+    # "Backend request failed with status 400" + the provider's error in
+    # the metadata. The 400 status makes the basic status-code branch
+    # non-retryable, but the upstream is genuinely transient (e.g. Gemini
+    # rate limit propagated as 400). Match the wrapper phrase so the
+    # 30s backoff rides it out instead of failing the turn on the first
+    # blip — this is the same class of "the gateway's upstream hiccuped"
+    # error as the existing 502/503/504 retries.
+    "backend request failed",
 )
 
 # Exception CLASS names whose *type* indicates a transient connection/flow
@@ -1051,7 +1060,7 @@ def _is_retryable(exc: BaseException) -> bool:
     identically on retry.
     """
     # Prefer the real HTTP status carried on the exception object (openai's
-    # APIError / pydantic-ai set `.status_code`) — reliable even when the
+    # APIError sets `.status_code`) — reliable even when the
     # message text omits it.
     try:
         code = int(getattr(exc, "status_code", 0) or 0)
@@ -1167,7 +1176,7 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
 # failure recovers automatically — up to this many attempts, 30s apart — instead
 # of giving up on the first blip. Configurable so tests can zero the backoff.
 _RETRY_MAX_ATTEMPTS = 10
-_RETRY_BASE_SECONDS = 15
+_RETRY_BASE_SECONDS = 30
 
 
 def _is_image_rejection(exc: BaseException) -> bool:
@@ -1203,12 +1212,13 @@ def _is_image_rejection(exc: BaseException) -> bool:
 
 
 def _is_empty_output_error(exc: BaseException) -> bool:
-    """Detect the "model returned nothing usable" failure: pydantic-ai raises
-    ``ToolRetryError: Please return text or call a tool.`` when a response has
-    NO parts (no text, no tool call), and after the output-retry budget it
-    surfaces as ``UnexpectedModelBehavior('Exceeded maximum output retries')``.
+    """Detect the "model returned nothing usable" failure: some LangChain
+    chat models raise ``ToolRetryError: Please return text or call a tool.``
+    when a response has NO parts (no text, no tool call), and after the
+    output-retry budget it surfaces as
+    ``UnexpectedModelBehavior('Exceeded maximum output retries')``.
     Free/weak model tiers do this intermittently — retrying the same request
-    shape usually fails again, so run_agent drops the tool set instead.
+    shape usually fails again, so the loop drops the tool set instead.
     """
     text = str(exc).lower()
     return (
@@ -1520,35 +1530,35 @@ def _dangling_fragment(text: str) -> str:
 
 def _usage_event(usage, model: str = "") -> dict | None:
     """
-    Extracts usage statistics from the Pydantic AI result with robust fallback.
-    Handles different attribute names used by various LLM providers.
+    Extracts usage statistics from the LangChain usage metadata with robust
+    fallback. Handles different attribute names used by various LLM providers.
     """
     if not usage:
         return None
 
     try:
-        # 1. تلاش برای استخراج با نام‌های استاندارد pydantic-ai
+        # 1. Try the standard names used by our LangChain chat-model wrappers.
         input_tokens = getattr(usage, "input_tokens", 0)
         output_tokens = getattr(usage, "output_tokens", 0)
         cache_read_tokens = getattr(usage, "cache_read_tokens", 0)
         cache_write_tokens = getattr(usage, "cache_write_tokens", 0)
 
-        # 2. اگر مقادیر صفر بودند، تلاش برای استخراج از نام‌های رایج در OpenAI/OpenRouter
+        # 2. If both are zero, fall back to the common OpenAI / OpenRouter names.
         if not input_tokens and not output_tokens:
             input_tokens = getattr(usage, "prompt_tokens", 0)
             output_tokens = getattr(usage, "completion_tokens", 0)
 
-            # اگر باز هم صفر بود، سعی می‌کنیم از دیکشنری استفاده کنیم (اگر usage دیکشنری باشد)
+            # Last-ditch: usage might be a dict, not an object.
             if isinstance(usage, dict):
                 input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
                 output_tokens = usage.get(
                     "completion_tokens", usage.get("output_tokens", 0)
                 )
 
-        # 3. کل واقعی = total_tokens معادل pydantic-ai یعنی input + output.
-        #    نکته مهم: input_tokens در pydantic-ai ALREADY شامل cache_read/cache_write
-        #    است، بنابراین cache را جدا اضافه نمی‌کنیم تا عدد دو بار نشمارده نشود
-        #    (کاملاً منطبق با مستندات pydantic-ai و رویه‌ی opencode).
+        # 3. total_tokens = input + output. input_tokens ALREADY includes
+        #    cache_read/cache_write, so we do NOT add cache on top (matches
+        #    the opencode convention used by our LangChain wrappers).
+        #    Otherwise the context meter would double-count cached tokens.
         total_tokens = int(input_tokens) + int(output_tokens)
 
         # 3b. یک رکورد usage با صفر توکن، دژنره است (درخواست ردشده/خالی که
@@ -1810,7 +1820,7 @@ def _summary_output_budget(
     return max(1024, min(_SUMMARY_OUTPUT_TOKENS, usable - 1024))
 
 
-# ProcessHistory sliding-window guard. pydantic-ai re-sends the ENTIRE
+# ProcessHistory sliding-window guard. LangGraph re-sends the ENTIRE
 # accumulated message history on every model request, so even with the reactive
 # _UsageCapability (which compacts at 60% of the window) a long tool-loop turn
 # re-sends a growing context on every step — the dominant token cost. This
@@ -1920,8 +1930,6 @@ def _read_project_memory(root: str) -> str:
 # -- Workspace summary (cross-chat recap for new chats) --------------------- #
 
 _WORKSPACE_SUMMARY_MAX_BYTES = 2000
-_WORKSPACE_SUMMARY_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
-_WORKSPACE_SUMMARY_CACHE_MAX = 64
 
 
 def _workspace_summary_wrapper(content: str) -> str:
@@ -1943,12 +1951,11 @@ def _workspace_summary_wrapper(content: str) -> str:
     )
 
 
-def _load_workspace_summary(root: str) -> str:
-    """Cached read of the workspace summary.
-
-    Returns the ready-to-append block (or ``""`` when no summary exists).
-    Mirrors _load_project_memory's mtime-based cache so we don't hit disk
-    every turn in long sessions.
+def _load_workspace_summary_raw(root: str) -> str:
+    """Read the workspace summary's raw content (no header/footer, no
+    truncation, no cache -- only called once per new chat, so caching
+    isn't worth the complexity). Used as input to the relevance filter,
+    not for direct injection into a system prompt.
     """
     try:
         workspace_slug = (
@@ -1960,17 +1967,63 @@ def _load_workspace_summary(root: str) -> str:
         return ""
     if not meta:
         return ""
-    mtime = float(meta.get("updated_at") or 0.0)
-    cached = _WORKSPACE_SUMMARY_CACHE.get(root)
-    if cached is not None and cached[0] >= mtime:
-        _WORKSPACE_SUMMARY_CACHE.move_to_end(root)
-        return cached[1]
-    wrapped = _workspace_summary_wrapper(meta.get("content") or "")
-    _WORKSPACE_SUMMARY_CACHE[root] = (mtime, wrapped)
-    _WORKSPACE_SUMMARY_CACHE.move_to_end(root)
-    while len(_WORKSPACE_SUMMARY_CACHE) > _WORKSPACE_SUMMARY_CACHE_MAX:
-        _WORKSPACE_SUMMARY_CACHE.popitem(last=False)
-    return wrapped
+    return meta.get("content") or ""
+
+
+async def _select_relevant_summary(
+    full_content: str,
+    user_prompt: str,
+    model: Any,
+    fallback_model: Any | None,
+) -> str:
+    """Filter the cumulative workspace summary down to only the bullets
+    relevant to the user's first message in a new chat. Never invents
+    content -- only selects/trims from what's already in full_content.
+
+    Fails closed: returns "" if nothing is relevant or the call fails,
+    rather than falling back to the full (unfiltered) summary -- injecting
+    nothing is safer than injecting unrelated context.
+    """
+    full_content = (full_content or "").strip()
+    user_prompt = (user_prompt or "").strip()
+    if not full_content or not user_prompt:
+        return ""
+
+    system_prompt = (
+        "You will be given a cumulative summary of earlier work in this "
+        "workspace (a bullet list) and the user's first message in a "
+        "brand new chat.\n"
+        "Select ONLY the bullets relevant to what the user is about to "
+        "do. Copy them verbatim or lightly trimmed -- do NOT invent, "
+        "infer, or add anything not already in the summary.\n"
+        "If nothing in the summary is relevant, output nothing at all "
+        "(an empty response) -- that is the correct answer in that "
+        "case.\n"
+        "Maximum ~1200 characters. No preamble, no closing remarks, "
+        "bullets only."
+    )
+    user_msg = (
+        "WORKSPACE SUMMARY:\n"
+        + full_content
+        + "\n\nUSER'S FIRST MESSAGE:\n"
+        + user_prompt
+    )
+
+    filtered = ""
+    chosen = model or fallback_model
+    if chosen is not None:
+        try:
+            from llm import llm_generate
+
+            filtered, _ = await llm_generate(
+                chosen,
+                system=system_prompt,
+                user=user_msg,
+            )
+        except Exception:  # noqa: BLE001
+            filtered = ""
+
+    return _workspace_summary_wrapper(filtered)
 
 
 # The agent's OWN self-written memory (distinct from the user-authored AGENTS.md
@@ -2525,7 +2578,7 @@ def _trivial_prompt(prompt: str) -> bool:
     Mirrors the shape check in ``_needs_workspace`` — a greeting or one-liner
     (≤ 8 chars) needs no live progress list, so Ask mode skips the
     ``update_plan`` tool for it and saves a whole extra model round-trip
-    (pydantic-ai re-sends the full message list on every tool-loop step).
+    (LangGraph re-sends the full message list on every tool-loop step).
     Real questions keep the tool; RAG and skills are never affected.
     """
     return len((prompt or "").strip()) <= 8
@@ -2641,7 +2694,7 @@ def _scout_workspace_cached(root: str, chat_id: str, max_total: int) -> str:
 
 
 def _is_output_budget_exhausted(exc: BaseException) -> bool:
-    """True for pydantic-ai's specific "the model burned its entire per-request
+    """True for LangChain's "the model burned its entire per-request
     `max_tokens` output budget on invisible reasoning/thinking tokens and
     produced no visible reply" error.
 
@@ -3265,21 +3318,30 @@ async def _maybe_refresh_workspace_summary(
     current_chat_id: str,
     model: Any,
     fallback_model: Any | None,
+    user_prompt: str = "",
 ) -> str:
     """Build / refresh the workspace summary for ``root``, excluding the
-    current chat.
+    current chat, and (when ``user_prompt`` is given) return the subset
+    relevant to it, ready to inject into a system prompt.
 
-    Returns the ready-to-append block (or "" on any failure — a new chat
-    must never be blocked by a summary refresh).
+    Returns "" when there's nothing to inject (no summary, nothing
+    relevant, or ``user_prompt`` was empty) — the cumulative summary is
+    still refreshed as a side effect in that case, just nothing is
+    returned to show.
 
     Strategy:
       1. Walk every prior chat for this workspace.
       2. If nothing changed vs the cached ``covered_message_counts`` AND a
-         summary exists → reuse it.
-      3. Otherwise feed the existing summary + new tails to the LLM for an
-         UPDATED merge; persist; return the wrapped block.
-      4. On LLM failure, keep the old summary (if any) — never poison the
-         cache with fallback text.
+         summary exists → reuse it (no merge call). If ``user_prompt`` is
+         given, run ONE filter call against the cached content.
+      3. Otherwise feed the existing summary + new tails to the LLM. If
+         ``user_prompt`` is given, this is a SINGLE combined call that
+         both merges the summary AND selects the relevant subset (dual
+         marker output) — avoids a second round trip in the common case.
+         If the combined call fails to parse, fall back to a plain merge
+         plus a separate filter call.
+      4. On any LLM failure, keep the old summary (if any) intact — never
+         poison the cache with fallback text, never block chat creation.
     """
     try:
         workspace_slug = (
@@ -3304,6 +3366,8 @@ async def _maybe_refresh_workspace_summary(
     except Exception:  # noqa: BLE001
         existing = None
 
+    user_prompt = (user_prompt or "").strip()
+
     if existing:
         prev_counts = existing.get("covered_message_counts") or {}
         if (
@@ -3313,9 +3377,12 @@ async def _maybe_refresh_workspace_summary(
             )
             and len(prev_counts) == len(current_counts)
         ):
-            cached = _load_workspace_summary(root)
-            if cached:
-                return cached
+            cached = _load_workspace_summary_raw(root)
+            if cached and user_prompt:
+                return await _select_relevant_summary(
+                    cached, user_prompt, model, fallback_model
+                )
+            return ""
 
     # Read the prior chats' JSON for the NEW tail only.
     new_tail_lines: list[str] = []
@@ -3352,11 +3419,70 @@ async def _maybe_refresh_workspace_summary(
                 new_tail_lines.append(f"[{cid}] {role}: {content}")
 
     if not new_tail_lines:
-        return _load_workspace_summary(root) if existing else ""
+        raw = _load_workspace_summary_raw(root) if existing else ""
+        if raw and user_prompt:
+            return await _select_relevant_summary(
+                raw, user_prompt, model, fallback_model
+            )
+        return ""
 
     body = "\n".join(new_tail_lines)[:20000]
     existing_content = (existing or {}).get("content") or ""
+    chosen = model or fallback_model
 
+    if user_prompt:
+        # Combined path: one call both merges the summary AND selects the
+        # relevant subset -- avoids a second round trip in the common case.
+        updated, relevant = await _merge_and_filter_summary(
+            existing_content, body, user_prompt, chosen
+        )
+        if updated.strip():
+            try:
+                state_db.save_workspace_summary(
+                    workspace_slug, updated, current_counts,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return _workspace_summary_wrapper(relevant)
+        # Combined call failed or was malformed -- fall back to a plain
+        # merge (keeps the cumulative record correct) plus a separate
+        # filter call against the fresh result.
+        summary_text = await _merge_summary_only(existing_content, body, chosen)
+        if summary_text.strip():
+            try:
+                state_db.save_workspace_summary(
+                    workspace_slug, summary_text, current_counts,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return await _select_relevant_summary(
+                summary_text, user_prompt, model, fallback_model
+            )
+        # Both failed -- keep whatever was persisted before, inject nothing.
+        return ""
+
+    # No prompt to filter for (e.g. the new chat opened with an attachment
+    # only) -- just refresh the cumulative record as a side effect; there's
+    # nothing to inject without a prompt to filter against.
+    summary_text = await _merge_summary_only(existing_content, body, chosen)
+    if summary_text.strip():
+        try:
+            state_db.save_workspace_summary(
+                workspace_slug, summary_text, current_counts,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return ""
+
+
+async def _merge_summary_only(
+    existing_content: str, new_tail_body: str, chosen: Any,
+) -> str:
+    """Single-purpose merge call: existing summary + new tail -> updated
+    summary. Returns "" on failure (caller keeps the old persisted copy).
+    """
+    if chosen is None:
+        return ""
     system_prompt = (
         "You maintain a running summary of this workspace across chats.\n"
         "Below is the EXISTING summary (if any), followed by NEW turns "
@@ -3369,45 +3495,103 @@ async def _maybe_refresh_workspace_summary(
         "Write in the same language the turns use (Persian or English). "
         "No preamble, no closing remarks — bullets only."
     )
-
-    user_msg = body
+    user_msg = new_tail_body
     if existing_content.strip():
         user_msg = (
             "EXISTING SUMMARY:\n"
             + existing_content.strip()
             + "\n\nNEW TURNS:\n"
-            + body
+            + new_tail_body
         )
-
-    summary_text = ""
-    chosen = model or fallback_model
-    if chosen is not None:
-        try:
-            from llm import llm_generate
-
-            summary_text, _ = await llm_generate(
-                chosen,
-                system=system_prompt,
-                user=user_msg,
-            )
-        except Exception:  # noqa: BLE001
-            summary_text = ""
-
-    # Bug fix: on LLM failure do NOT poison the cache with fallback text.
-    # Keep the old summary (if any) intact by returning early without save.
-    if not summary_text.strip():
-        return _load_workspace_summary(root) if existing else ""
-
     try:
-        state_db.save_workspace_summary(
-            workspace_slug,
-            summary_text,
-            current_counts,
-        )
-    except Exception:  # noqa: BLE001
-        pass
+        from llm import llm_generate
 
-    return _workspace_summary_wrapper(summary_text)
+        text, _ = await llm_generate(chosen, system=system_prompt, user=user_msg)
+        return text or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_DUAL_SUMMARY_MARK_UPDATED = "===UPDATED_SUMMARY==="
+_DUAL_SUMMARY_MARK_RELEVANT = "===RELEVANT_TO_THIS_CHAT==="
+_DUAL_SUMMARY_MARK_END = "===END==="
+
+
+def _parse_dual_summary_output(raw: str) -> tuple[str, str]:
+    """Parse the dual-marker output of _merge_and_filter_summary into
+    (updated_summary, relevant_excerpt). Fails closed: if both markers
+    aren't present, returns ("", "") rather than guessing -- a malformed
+    response must never be persisted as the cumulative summary.
+    """
+    raw = raw or ""
+    if (
+        _DUAL_SUMMARY_MARK_UPDATED not in raw
+        or _DUAL_SUMMARY_MARK_RELEVANT not in raw
+    ):
+        return "", ""
+    updated = raw.split(_DUAL_SUMMARY_MARK_UPDATED, 1)[1].split(
+        _DUAL_SUMMARY_MARK_RELEVANT, 1
+    )[0].strip()
+    rest = raw.split(_DUAL_SUMMARY_MARK_RELEVANT, 1)[1]
+    relevant = (
+        rest.split(_DUAL_SUMMARY_MARK_END, 1)[0]
+        if _DUAL_SUMMARY_MARK_END in rest
+        else rest
+    ).strip()
+    return updated, relevant
+
+
+async def _merge_and_filter_summary(
+    existing_content: str, new_tail_body: str, user_prompt: str, chosen: Any,
+) -> tuple[str, str]:
+    """Combined call: merge existing+new into an updated cumulative
+    summary AND select the subset relevant to the user's first message,
+    in one round trip. Returns (updated_summary, relevant_excerpt); both
+    "" if the call fails or the output doesn't match the expected format.
+    """
+    if chosen is None:
+        return "", ""
+    system_prompt = (
+        "You maintain a running summary of this workspace across chats, "
+        "and also prepare a filtered excerpt for a brand-new chat.\n"
+        "You are given: (1) the EXISTING summary (if any), (2) NEW turns "
+        "since the last update, (3) the user's first message in a "
+        "brand-new chat.\n"
+        "Do TWO things:\n"
+        "A. Merge (1)+(2) into an UPDATED summary: keep what's still "
+        "relevant from the existing summary, add what's new, drop what's "
+        "stale. Bullet list covering tasks completed, files changed, "
+        "architectural decisions, unresolved issues. Max ~2000 "
+        "characters. This must stand on its own as the full record -- do "
+        "NOT filter it by the user's message.\n"
+        "B. From that UPDATED summary, select ONLY the bullets relevant "
+        "to the user's first message -- copy verbatim or lightly "
+        "trimmed, do not invent anything new. If nothing is relevant, "
+        "leave this section empty. Max ~1200 characters.\n"
+        "Write in the same language the turns use (Persian or English).\n"
+        "Output EXACTLY in this format, with these literal markers on "
+        "their own lines and nothing outside them:\n"
+        f"{_DUAL_SUMMARY_MARK_UPDATED}\n"
+        "<updated summary bullets>\n"
+        f"{_DUAL_SUMMARY_MARK_RELEVANT}\n"
+        "<relevant bullets, or leave empty>\n"
+        f"{_DUAL_SUMMARY_MARK_END}"
+    )
+    user_msg = (
+        "EXISTING SUMMARY:\n"
+        + (existing_content.strip() or "(none)")
+        + "\n\nNEW TURNS:\n"
+        + new_tail_body
+        + "\n\nUSER'S FIRST MESSAGE:\n"
+        + user_prompt
+    )
+    try:
+        from llm import llm_generate
+
+        raw, _ = await llm_generate(chosen, system=system_prompt, user=user_msg)
+    except Exception:  # noqa: BLE001
+        return "", ""
+    return _parse_dual_summary_output(raw)
 
 
 def _safe_file(name: str, fallback: str = "item") -> str:

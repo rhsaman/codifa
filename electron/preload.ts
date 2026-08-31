@@ -22,6 +22,7 @@ export interface SearchMatch {
 
 const api = {
   getSidecarUrl: (): Promise<string | null> => ipcRenderer.invoke('sidecar:url'),
+  probeSidecar: (): Promise<boolean> => ipcRenderer.invoke('sidecar:probe'),
   secretsGetKey: (): Promise<string> => ipcRenderer.invoke('secrets:getKey'),
   getEnv: (key: string): Promise<string | null> => ipcRenderer.invoke('env:get', key),
   googleSignIn: (

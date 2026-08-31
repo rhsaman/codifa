@@ -424,6 +424,15 @@ export function ThinkingBlock({ text }: { text: string }) {
   );
 }
 
+// Used by the RetryBanner countdown. Pure function so it can be called from
+// `useState` initializer AND from the effect that resets `left` when
+// `startedAt` changes mid-mount.
+function computeLeft(delay: number, startedAt: number | undefined): number {
+  if (!startedAt || delay <= 0) return delay;
+  const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+  return Math.max(0, delay - elapsed);
+}
+
 export function RetryBanner({
   attempt,
   maxAttempts,
@@ -453,15 +462,25 @@ export function RetryBanner({
   onCancel?: () => void;
   onRetry?: () => void;
 }) {
-  // Initialize from wall-clock time so the countdown survives remounts
-  // (switching chats and coming back doesn't reset to `delay`).
-  const [left, setLeft] = useState(() => {
-    if (!startedAt || delay <= 0) return delay;
-    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-    return Math.max(0, delay - elapsed);
-  });
+  // Recompute `left` from props on every render. The banner may receive a new
+  // `startedAt` (and a bumped `attempt`) on each retry cycle WITHOUT remounting
+  // — the previous version initialized `left` once via `useState` and only
+  // decremented it, so once a cycle ended at `left = 0` the next cycle
+  // inherited that 0 and the countdown never reset (the user reported
+  // "ریترای استپ زیاد میشه اما تایمر جدید نشون نمیده" — counter goes up but
+  // the new timer never shows).
+  const [left, setLeft] = useState(() => computeLeft(delay, startedAt));
+  // Keep the interval in sync with whichever prop changed: `delay` (backoff
+  // changed), `startedAt` (a new retry cycle started), or `attempt` (parent
+  // bumped it for any reason). When `startedAt` changes, force `left` back to
+  // its freshly-computed value before re-arming the interval.
+  const lastStartedAt = useRef<number | undefined>(startedAt);
   useEffect(() => {
     if (delay <= 0) return;
+    if (lastStartedAt.current !== startedAt) {
+      lastStartedAt.current = startedAt;
+      setLeft(computeLeft(delay, startedAt));
+    }
     const t = setInterval(() => {
       setLeft((l) => {
         if (l <= 1) {
@@ -472,7 +491,7 @@ export function RetryBanner({
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [delay]);
+  }, [delay, startedAt, attempt]);
   const unlimited = maxAttempts <= 0;
   const isRateLimit =
     reason?.toLowerCase().includes("rate limit") ||

@@ -12,12 +12,12 @@ from memory_manager import (
 )
 
 mm = MemoryManager()
-mm.add("The project uses FastAPI with pydantic-ai for the sidecar", project_id="myproj")
+mm.add("The project uses FastAPI for the sidecar", project_id="myproj")
 mm.add("Port 8080 is used for dev", project_id="myproj", memory_type=MEM_TASK)
 mm.add("Different project note", project_id="other")
 
 # Dedup: exact re-add of same content should skip
-res = mm.add("The project uses FastAPI with pydantic-ai for the sidecar", project_id="myproj")
+res = mm.add("The project uses FastAPI for the sidecar", project_id="myproj")
 assert res.get("skipped") == "duplicate", res
 
 # List scoped per project
@@ -26,7 +26,7 @@ assert len(mine) == 2, mine
 assert mm.list(project_id="other")[0]["content"] == "Different project note"
 
 # FTS lexical search
-hits = mm.search("fastapi pydantic", project_id="myproj", top_k=5)
+hits = mm.search("fastapi", project_id="myproj", top_k=5)
 assert any("FastAPI" in h["content"] for h in hits), hits
 assert all(h["project_id"] == "myproj" for h in hits), hits
 

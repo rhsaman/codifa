@@ -86,3 +86,61 @@ async def test_output_then_429_retries(run_events, monkeypatch):
     assert retries, \
         "after producing tool output, a 429 must trigger retry"
     assert retries[0].get("attempt", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter wraps upstream-provider failures as 400 with the phrase
+# "Backend request failed" in the body. The status code is 400 (normally
+# non-retryable per the status-code check), but the body phrase is the
+# gateway's signal that the upstream hiccuped — the 30s backoff should
+# ride it out instead of failing the turn.
+# ---------------------------------------------------------------------------
+
+
+async def test_openrouter_upstream_400_wraps_as_retryable(run_events, monkeypatch):
+    """OpenRouter 400 with 'Backend request failed' body must trigger a retry,
+    NOT a hard error. This is the exact shape the user reported: a real
+    400 status from openrouter with the upstream-provider error in metadata."""
+    import json
+
+    from mock_openai import mock, text_reply, tool_call
+
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
+    mock.script = [
+        tool_call("read", json.dumps({"filePath": "x.ts", "offset": 1, "limit": 10})),
+        text_reply("ok"),
+    ]
+    # The real exception text emitted by langchain-openai for the user's
+    # reported 400 — exact substring of `Backend request failed` lives
+    # inside the metadata.raw JSON. Mirrors the first SSE the user pasted
+    # in the bug report (truncated for readability here).
+    real_exception = (
+        "Error code: 400 - {'error': {'message': 'Provider returned error', "
+        "'code': 400, 'metadata': {'raw': '{\"error\":{\"message\":\"Backend "
+        "request failed with status 400\",\"type\":\"backend_error\""
+    )
+    mock.error_at = {1: (400, real_exception)}
+
+    events = await run_events("read x.ts", mode="coder")
+
+    retries = _retry_events(events)
+    assert retries, (
+        "OpenRouter 'Backend request failed' wrapper must trigger a retry — "
+        "the upstream is transient, the 400 status alone is misleading."
+    )
+    assert retries[0].get("attempt", 0) >= 1
+
+
+def test_is_retryable_matches_backend_failed_phrase():
+    """Unit test for the phrase check independent of the run pipeline:
+    a 400 exception whose text contains the OpenRouter 'Backend request
+    failed' wrapper must be classified as retryable."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': 'Provider returned error', "
+        "'code': 400, 'metadata': {'raw': '{\"error\":{\"message\":\"Backend "
+        "request failed with status 400\",\"type\":\"backend_error\""
+    )
+    assert agents._is_retryable(exc), (
+        "A 400 carrying the OpenRouter 'Backend request failed' wrapper must "
+        "be classified as retryable so the 30s backoff rides it out."
+    )

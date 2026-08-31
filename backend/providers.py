@@ -1,8 +1,8 @@
-"""Provider abstraction: map UI provider configs to Pydantic AI models.
+"""Provider abstraction: map UI provider configs to LangChain chat models.
 
 All three supported provider types expose an OpenAI-compatible HTTP API, so
-every one collapses to pydantic_ai's ``OpenAIModel`` with a custom base URL and
-API key.
+every one collapses to a LangChain ``ChatOpenAI`` (or Google-specific) model
+with a custom base URL and API key.
 
 Model lists are fetched live from the provider and cached for a short TTL.
 """
@@ -46,14 +46,11 @@ GOOGLE_TOKEN_LEEWAY = 120  # seconds
 _google_token_cache: dict[str, tuple[str, float]] = {}
 
 # opencode's zen gateway misclassifies plain python/httpx clients as
-# rate-limited: the default `python-httpx/...` / `pydantic-ai/...` User-Agent
-# gets a bogus HTTP 429 `FreeUsageLimitError` even on a healthy free-tier
-# account, while a UA that looks like the real opencode client streams
-# normally. This constant is the hammer used everywhere a request to the zen
-# gateway is built (provider client default headers AND per-request model
-# settings extra_headers — pydantic-ai's own openai adapter unconditionally
-# overrides the UA with `pydantic-ai/x.y.z` unless the setting already carries
-# one).
+# rate-limited: the default `python-httpx/...` User-Agent gets a bogus HTTP
+# 429 `FreeUsageLimitError` even on a healthy free-tier account, while a UA
+# that looks like the real opencode client streams normally. This constant
+# is the hammer used everywhere a request to the zen gateway is built
+# (provider client default headers AND model default headers).
 OPENCODE_UA = "opencode/1.18.15 (npm:@opencode-ai/opencode)"
 
 
@@ -122,8 +119,8 @@ class ProviderError(RuntimeError):
 #   requires_key         True = a credential is mandatory (blocked otherwise).
 #   env_vars             Env-var names accepted for the API key.
 #   account_var          Optional env var carrying an account/org id (cloudflare).
-#   model_class          "google" | "openrouter" use pydantic-ai native model
-#                        classes; everything else uses the generic OpenAIChatModel.
+#   model_class          "google" | "openrouter" use provider-specific LangChain
+#                        chat classes; everything else uses ChatOpenAI.
 #   models               Model-list payload format: "openai" (GET /models,
 #                        `data[]`), "tags" (ollama /api/tags) or
 #                        "cloudflare_search" (GET .../ai/models/search, `result[]`).
@@ -1081,6 +1078,60 @@ async def fetch_credits(
         raise ProviderError(f"credits lookup failed: {exc}") from exc
 
 
+async def _list_google_models_native(oauth_token: str) -> list[dict]:
+    """List Google models via the native ``/v1beta/models`` endpoint using an
+    OAuth access token. Used by ``list_models`` when the caller authenticated
+    with OAuth (the OpenAI-compat ``/v1beta/openai/models`` rejects OAuth
+    tokens with 400 — API keys only).
+
+    Returns the same ``[{"id", "context", "max_output", "reasoning"}, ...]``
+    shape as ``list_models`` does for the OpenAI-compat path. Cached under a
+    separate cache key so an API-key request and an OAuth request don't share
+    a (potentially empty) payload. Best-effort: any HTTP error falls back to
+    an empty list, mirroring the graceful-degradation behavior of
+    ``_google_model_limits`` — the user still gets a working chat, they just
+    don't see a populated model list in the picker.
+    """
+    cache_key = ("google-oauth", oauth_token)
+    cached = _model_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < _MODEL_CACHE_TTL:
+        return cached[1]
+    headers = {"Authorization": f"Bearer {oauth_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        raise ProviderError(f"google oauth /models failed: {exc}") from exc
+    out: list[dict] = []
+    for m in data.get("models") or []:
+        name = m.get("name") or ""
+        if not name:
+            continue
+        # Native ids are "models/gemini-1.5-pro"; strip the leading segment
+        # so the picker shows the same id as the OpenAI-compat path would.
+        name = name.removeprefix("models/")
+        ctx = m.get("inputTokenLimit")
+        out.append(
+            {
+                "id": name,
+                "context": int(ctx) if ctx else None,
+                "max_output": (
+                    int(m["outputTokenLimit"]) if m.get("outputTokenLimit") else None
+                ),
+                "pricing": None,
+                "reasoning": None,
+            }
+        )
+    out.sort(key=lambda m: m["id"])
+    _model_cache[cache_key] = (time.monotonic(), out)
+    return out
+
+
 async def list_models(
     provider: str,
     base_url: str = "",
@@ -1100,7 +1151,15 @@ async def list_models(
     * ollama     -> per-model ``/api/show`` (tags carry no context)
     * custom     -> ``max_model_len`` per model, else llama.cpp/LM Studio
                     ``/props`` ``n_ctx`` as a server-wide default
+
+    Google with OAuth tokens is a special case: the OpenAI-compat endpoint at
+    ``/v1beta/openai/models`` only accepts API keys (an OAuth access token
+    there returns 400). For OAuth we hit the native ``/v1beta/models`` and
+    parse its ``{models: [{name, inputTokenLimit, ...}]}`` shape instead,
+    stripping the leading ``models/`` from each id (Google convention).
     """
+    if provider == "google" and oauth_token:
+        return await _list_google_models_native(oauth_token)
     url, fmt = _models_endpoint(provider, base_url)
     cache_key = (provider, url)
     cached = _model_cache.get(cache_key)

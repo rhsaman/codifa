@@ -8,6 +8,7 @@ import { LoadingScreen } from './components/LoadingScreen'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
+import { invalidateSidecarCache } from './lib/api'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -58,6 +59,36 @@ export default function App() {
     useStore.getState().setTheme(saved)
     runLoad()
   }, [load, runLoad])
+
+  // Background sidecar health probe. Fires every 60s while the app is open
+  // and pings /health against the cached URL. If the sidecar hung (process
+  // alive but HTTP server wedged) the `sidecar:dead` event from main never
+  // fires, so the cached URL stays stale and every subsequent call hits a
+  // dead port. Catching that proactively keeps the next ensureSidecar() from
+  // waiting for a real /models or /credits request to fail first. Bypasses
+  // the in-flight dedup on purpose — we want a fresh probe, not the
+  // previously-cached result.
+  useEffect(() => {
+    const PROBE_INTERVAL_MS = 60_000
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const probe = async () => {
+      if (cancelled) return
+      try {
+        const ok = await window.coder.probeSidecar()
+        if (cancelled) return
+        if (!ok) invalidateSidecarCache()
+      } catch {
+        /* probe itself failed — leave the cache; the next real call will surface it */
+      }
+      if (!cancelled) timer = setTimeout(probe, PROBE_INTERVAL_MS)
+    }
+    timer = setTimeout(probe, PROBE_INTERVAL_MS)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
 
   useEffect(() => {
     const cancelPrefix = () => {

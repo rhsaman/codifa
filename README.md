@@ -23,7 +23,7 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 ![Electron](https://img.shields.io/badge/Electron-31-47848F?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![Pydantic AI](https://img.shields.io/badge/Pydantic%20AI-v2-8A2BE2)
+![LangGraph](https://img.shields.io/badge/LangGraph-Latest-1C3C3C?logo=langchain&logoColor=white)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 ![GitHub stars](https://img.shields.io/github/stars/rhsaman/codifa?style=social)
 ![GitHub downloads](https://img.shields.io/github/downloads/rhsaman/codifa/total)
@@ -76,7 +76,7 @@ Drop files into docs/screenshots/ and reference them, e.g.:
 
 ```bash
 npm install       # JavaScript dependencies
-npm run setup     # creates backend/.venv and installs pydantic-ai, fastapi, uvicorn
+npm run setup     # creates backend/.venv and installs langgraph, fastapi, uvicorn
 ```
 
 Voice and RAG-memory models are optional. Install them from the app's
@@ -89,7 +89,7 @@ npm run dev
 ```
 
 Opens the Electron window with a hot-reloading renderer. The Python sidecar
-(FastAPI + Pydantic AI) is auto-spawned on an ephemeral localhost port. When
+(FastAPI + LangGraph) is auto-spawned on an ephemeral localhost port. When
 launched from the packaged `.app`, Codifa also merges the GUI PATH with your
 login-shell path so tools like `docker` (used by MCP stdio connectors) are found.
 
@@ -167,7 +167,7 @@ Output lands in `release/`.
 │ server.py      FastAPI  /health  /models                          │
 │                /chat/stream (SSE)  /fs  /transcribe (Whisper)     │
 │                /app/state (SQLite settings + chats)               │
-│ providers.py   → pydantic-ai OpenAIModel                          │
+│ providers.py   → LangChain ChatModel                            │
 │ tools.py       sandboxed fs tools + memory + MCP                  │
 │ agents.py      Ask / Plan / Coder agents                          │
 │                (live usage + compact + RAG memory)                │
@@ -213,7 +213,7 @@ Output lands in `release/`.
 
 ```bash
 npm install       # نصب وابستگی‌های جاوااسکریپت
-npm run setup     # ساخت backend/.venv و نصب pydantic-ai، fastapi و uvicorn
+npm run setup     # ساخت backend/.venv و نصب langgraph، fastapi و uvicorn
 ```
 
 مدل‌های صوتی و حافظهٔ RAG اختیاری‌اند و از تب **تنظیمات ← مدل‌ها** نصب
@@ -226,7 +226,7 @@ npm run dev
 ```
 
 پنجرهٔ Electron با رابطِ گرم (hot-reload) باز می‌شود. sidecar پایتونی
-(FastAPI + Pydantic AI) به‌صورت خودکار روی یک پورت محلیِ موقت اجرا می‌شود. در
+(FastAPI + LangGraph) به‌صورت خودکار روی یک پورت محلیِ موقت اجرا می‌شود. در
 نسخهٔ بسته‌بندی‌شده نیز PATH رابط گرافیکی با PATH شلِ ورود ترکیب می‌شود تا
 ابزارهایی مانند `docker` (موردنیاز اتصال‌های MCP) پیدا شوند.
 
@@ -309,7 +309,7 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 │ server.py      FastAPI  /health  /models                            │
 │                /chat/stream (SSE)  /fs  /transcribe (Whisper)       │
 │                /app/state (SQLite تنظیمات و گفتگوها)                 │
-│ providers.py   → pydantic-ai OpenAIModel                            │
+│ providers.py   → LangChain ChatModel                              │
 │ tools.py       ابزارهای امنِ فایل + memory + MCP                    │
 │ agents.py      عامل پرسش / برنامه / نویسندهٔ کد                      │
 │                (مصرف زندهٔ بافت + فشرده‌سازی + حافظهٔ RAG)           │

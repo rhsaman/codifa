@@ -412,6 +412,25 @@ function registerIpc(): void {
 
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
+  // Liveness probe: returns true if the cached sidecar URL still answers
+  // /health within 1.5s, false otherwise. Does NOT start or restart the
+  // sidecar — the renderer uses this to detect a hung sidecar (process
+  // alive but HTTP server wedged) and invalidate its cache, so the next
+  // ensureSidecar() call will go through getSidecarUrl() and trigger a
+  // restart if the handle is gone.
+  ipcMain.handle('sidecar:probe', async () => {
+    const url = peekSidecarUrl()
+    if (!url) return false
+    try {
+      const c = new AbortController()
+      const t = setTimeout(() => c.abort(), 1500)
+      const res = await fetch(`${url}/health`, { signal: c.signal })
+      clearTimeout(t)
+      return res.ok
+    } catch {
+      return false
+    }
+  })
 
   // --- open external links in the OS browser --------------------------------
   // Only http(s) URLs are forwarded to the system browser; internal anchors

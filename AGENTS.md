@@ -1,5 +1,5 @@
 pyproject is contain backend with python and front end with electron and react in src/.
-dont grep and read release folder
+dont grep and read release folder and README.md
 
 # backend
 

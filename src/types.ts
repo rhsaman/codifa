@@ -331,6 +331,11 @@ export interface ChatMessage {
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
   modeSwitch?: boolean
+  /** Tool-output recap from a previously interrupted turn. NEVER rendered in
+   *  the UI; sent to the model so a retry knows what was already done without
+   *  re-executing the tools. The visible transcript is kept clean of the
+   *  warning text. */
+  preservedToolSummary?: string
   createdAt: number
 }
 

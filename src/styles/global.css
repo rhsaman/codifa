@@ -5859,6 +5859,40 @@ textarea {
   opacity: 0.9;
 }
 
+/* Click-to-refresh: the balance is no longer auto-polled, so the user
+   refreshes it on demand. Reset native <button> styles so the chip still
+   looks like a chip, and add a hover state so the affordance is visible. */
+.titlebar-balance-clickable {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 2px 6px;
+  margin: 0 -6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.titlebar-balance-clickable:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.titlebar-balance-clickable:active {
+  background: var(--active);
+}
+
+.titlebar-balance-clickable.refreshing .titlebar-balance-icon {
+  animation: titlebar-balance-spin 0.9s linear infinite;
+}
+
+@keyframes titlebar-balance-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .context-meter {
   display: inline-flex;
   align-items: center;

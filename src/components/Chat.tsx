@@ -235,54 +235,61 @@ export function ChatPanel() {
   const activeModel = chat?.model ?? provider.model;
   const allProviders = useStore((s) => s.settings.providers);
 
-  // Live provider balance (OpenRouter), polled every 60s. Queried for every
-  // configured provider so the header always surfaces a real remaining balance
-  // (OpenRouter) even when the active provider has no balance endpoint.
-  // `balanceTick` is bumped right after each completed turn, so the chip also
-  // refreshes immediately whenever usage actually changes — without hammering
-  // the provider while idle.
+  // Live provider balance (OpenRouter). STRICTLY click-to-refresh — NO
+  // automatic polling, no mount seed, no post-turn refresh, no post-compact
+  // refresh. Every automatic /credits request competes for the same local
+  // sidecar the open /chat/stream is using, and the user has reported that
+  // ANY background /credits firing near a live stream correlates with the
+  // stream dropping (the fetch is independent but the render churn /
+  // promise scheduling can interact with the SSE read loop on the renderer
+  // side). The chip below calls `refreshCredits` only on click; everything
+  // else is explicit. Trade-off: a stale balance until the user clicks —
+  // acceptable because the chip is informational, not load-bearing.
   const [creditMap, setCreditMap] = useState<
     Record<
       string,
       Partial<{ balance: number; total_credits: number; total_usage: number }>
     >
   >({});
-  const [balanceTick, setBalanceTick] = useState(0);
-  useEffect(() => {
-    if (!allProviders || allProviders.length === 0) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      const settled = await Promise.allSettled(
-        allProviders.map((p) => fetchCredits(p)),
-      );
-      if (cancelled) return;
-      const map: Record<
-        string,
-        Partial<{ balance: number; total_credits: number; total_usage: number }>
-      > = {};
-      allProviders.forEach((p, i) => {
-        const r = settled[i];
-        if (r.status === "fulfilled") map[p.id] = r.value;
-      });
-      setCreditMap(map);
-      timer = setTimeout(poll, 60_000);
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [
-    // Rerun only when the provider shape (id/kind/key base) changes.
-    allProviders
-      .map(
-        (p) =>
-          `${p.id}|${p.kind}|${p.apiKey ?? ""}|${p.envVar ?? ""}|${p.baseUrl ?? ""}|${p.authType ?? ""}|${p.oauthRefreshToken ?? ""}`,
-      )
-      .join(";"),
-    balanceTick,
-  ]);
+  // The "refreshing" indicator uses a ref + DOM class so the click handler
+  // does NOT trigger a React re-render at all. The chip's <button> reads
+  // `refreshingRef.current` via a className callback ref that touches the
+  // DOM directly, bypassing the React tree. This keeps the click truly
+  // fire-and-forget from React's perspective — a re-render during an open
+  // /chat/stream SSE is the surest way to make the renderer event loop
+  // stutter enough to drop a streaming chunk.
+  const refreshingRef = useRef(false);
+  // Hold the in-flight promise in a ref so a second click while the first
+  // is still pending dedupes to the same request (and so a fast double-click
+  // can't queue two parallel fetches racing for the same sidecar slot).
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  // The set of buttons currently in the "refreshing" state — updated by the
+  // ref callback below. This is purely DOM bookkeeping, not React state.
+  const refreshButtonsRef = useRef<Set<HTMLButtonElement>>(new Set());
+  const refreshCredits = useCallback(() => {
+    if (!provider) return;
+    if (inFlightRef.current) return inFlightRef.current;
+    const target = provider;
+    refreshingRef.current = true;
+    for (const btn of refreshButtonsRef.current) btn.classList.add("refreshing");
+    const p = (async () => {
+      try {
+        const result = await fetchCredits(target);
+        if (result && target) {
+          setCreditMap((m) => ({ ...m, [target.id]: result }));
+        }
+      } catch {
+        /* swallow — balance is non-critical UI */
+      } finally {
+        refreshingRef.current = false;
+        for (const btn of refreshButtonsRef.current)
+          btn.classList.remove("refreshing");
+        inFlightRef.current = null;
+      }
+    })();
+    inFlightRef.current = p;
+    return p;
+  }, [provider]);
 
   // Which provider's balance the header chip displays: only the active provider
   // (the one the main model belongs to). If it has no balance endpoint, show
@@ -1192,6 +1199,14 @@ export function ChatPanel() {
     return out;
   }, [chat?.usage, provider.pricingMap]);
 
+  // ============================================================================
+  // INVARIANT: the send path MUST NOT await /credits (or any other sidecar
+  // call besides /chat/stream). Polling for the active provider's balance is
+  // fire-and-forget in ChatPanel's credits effect above; the header chip
+  // tolerates a missing balance until the next poll resolves. If you need
+  // credits data on send, read it from `creditMap` (updated by the polling
+  // effect), never from a fresh `fetchCredits` call.
+  // ============================================================================
   const send = async (
     text: string,
     atts: string[] = [],
@@ -1229,7 +1244,17 @@ export function ChatPanel() {
       }
     }
     const rootDir = chat.root || s.root;
-    if (!rootDir) return;
+    if (!rootDir) {
+      // Every chat belongs to a workspace (see store.ts newChat/newChatInRoot).
+      // A silent return here used to look like an "instant disconnect" — the
+      // composer cleared but nothing happened. Surface a visible /cmd error so
+      // the user knows exactly why the send did nothing.
+      useStore.getState().setChatCmdError(
+        chat.id,
+        "Open or create a workspace to start a chat — every chat belongs to a workspace.",
+      );
+      return;
+    }
     const activeProvider = getChatProvider(chat.id);
     if (!activeProvider.model) {
       s.setSettingsOpen(true);
@@ -1376,6 +1401,10 @@ export function ChatPanel() {
         toolActivity: (m.toolActivity ?? []).filter(
           (a) => a.status !== "running",
         ),
+        // Sent to the model only — UI never renders this field. The backend
+        // folds it into the AIMessage's content so a retry knows what was
+        // already done without re-executing completed tools.
+        preservedToolSummary: m.preservedToolSummary,
       }));
     const history = sliceToBudget(allHistory);
 
@@ -1499,12 +1528,13 @@ export function ChatPanel() {
     }, 10_000);
 
     // Preserve tool-call context on a FAILED turn so the next one doesn't redo
-    // it. `toolActivity` is a frontend-only render field and never part of the
-    // `history` sent to the backend (only role/content travel), so without
-    // folding the completed tool calls into `content`, the next turn would not
-    // know what this turn already did and would redo it from scratch. Fire it
-    // on EVERY failure path: the streamChat catch below AND inline SSE "error"
-    // events (a backend fatal arrives as a normal event, not a throw).
+    // it. The recap is written to a NON-visible `preservedToolSummary` field on
+    // the message (NOT appended to `content` — that polluted the visible
+    // transcript and tripped small models on the next send). The model still
+    // sees the recap on the next turn (the history map below carries the
+    // field), but the UI never renders it. Fire it on EVERY failure path: the
+    // streamChat catch below AND inline SSE "error" events (a backend fatal
+    // arrives as a normal event, not a throw).
     // A turn's stream can end without a tool_result for every started card
     // (backend crash, stop, error, lost SSE). Force any still-"running" card to
     // "done" so the spinner/tick never hangs forever.
@@ -1560,13 +1590,13 @@ export function ChatPanel() {
           : "";
         blocks.push(body ? `${head}\n${body}` : head);
       }
-      const note = `\n\n[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${blocks.join("\n")}]`;
-      const current = useStore
-        .getState()
-        .chats.find((c) => c.id === chat.id)
-        ?.messages.find((m) => m.id === assistantMsg.id);
+      // Written to a non-visible field so the model still sees what was done
+      // (avoids re-executing completed tools) but the visible transcript stays
+      // clean — small/free models on opencode misread the inlined warning as
+      // a new instruction, which looked like an instant disconnect.
+      const summary = `[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${blocks.join("\n")}]`;
       useStore.getState().updateMessage(assistantMsg.id, {
-        content: (current?.content ?? "") + note,
+        preservedToolSummary: summary,
       });
     };
 
@@ -1959,11 +1989,27 @@ export function ChatPanel() {
         // re-set it after the stream closes.
         lastEventAt.current = Date.now();
         resolveStuckCards();
-        // A successful completion clears ANY retry banner (not just reconnecting).
-        // This ensures the attempt counter resets to 1 on the next turn's first error.
+        // A successful completion clears ANY retry banner (not just
+        // reconnecting). This ensures the attempt counter resets to 1 on the
+        // next turn's first error.
+        //
+        // BUT: a `done` arriving AFTER an `error` is just the server's
+        // stream-close sentinel — it is NOT a success. The previous version
+        // unconditionally set `retry: null` here, which wiped the error
+        // banner the user needs to see. Only clear the banner when the
+        // turn actually succeeded (`error: false`), or when the retry
+        // object is a transient (in-progress) one that should naturally
+        // retire on turn completion. A terminal `retry.gaveUp` /
+        // `retry.watchdog` MUST survive the `done` so the user has a
+        // Retry button to click.
         const curMsg = findMsg();
         if (curMsg?.retry) {
-          useStore.getState().updateMessage(assistantMsg.id, { retry: null });
+          const r = curMsg.retry;
+          const isTerminal = r.gaveUp === true || r.watchdog === true;
+          const isFailedTurn = curMsg.error === true;
+          if (!isTerminal && !isFailedTurn) {
+            useStore.getState().updateMessage(assistantMsg.id, { retry: null });
+          }
         }
       }
     };
@@ -2093,8 +2139,10 @@ export function ChatPanel() {
         thinkingActive: false,
         ...(keepRetry ? {} : { retry: null }),
       });
-      // A turn just completed → usage changed. Refresh the balance chip now.
-      setBalanceTick((t) => t + 1);
+      // No auto-refresh of the credit chip here — strictly click-to-refresh
+      // (see the credits block above). A turn-end fetch can land right when
+      // the SSE connection is closing, and the user has seen it correlate
+      // with the stream dropping.
     }
     // Auto-drain: this turn ended and other messages are still queued for this
     // chat (typed while the agent was working, or unconsumed steers) — start
@@ -2239,9 +2287,8 @@ export function ChatPanel() {
 
     setBusy(false);
     useStore.getState().setChatCompacting(ch.id, false);
-    // A compact call just completed → usage may have changed. Refresh the
-    // balance chip now, same as a normal turn does.
-    setBalanceTick((t) => t + 1);
+    // No auto-refresh of the credit chip after compact either — see the
+    // credits block above. Strictly click-to-refresh.
 
     // A summarizer that errored, timed out, or returned nothing is a failed
     // compact — do NOT collapse the real messages behind a fake summary. Leave
@@ -3150,10 +3197,25 @@ export function ChatPanel() {
               </span>
             </span>
             {shownBal && (
-              <span
-                className="badge titlebar-balance"
-                title={`${shownBal.provider.name} balance`}
+              <button
+                type="button"
+                className="badge titlebar-balance titlebar-balance-clickable"
+                title={`${shownBal.provider.name} balance — click to refresh`}
                 dir="ltr"
+                ref={(el) => {
+                  if (el) refreshButtonsRef.current.add(el);
+                  else refreshButtonsRef.current.delete(el as unknown as HTMLButtonElement);
+                }}
+                onClick={() => {
+                  // Click-to-refresh: pure fire-and-forget. The handler is
+                  // synchronous (no setState, no await on click) so React
+                  // never schedules a re-render as a result of the click.
+                  // The "refreshing" spinner is applied directly to the DOM
+                  // via the ref above. This is the design the user requested:
+                  // nothing about a credit click should ever touch the
+                  // /chat/stream SSE — not even a render.
+                  refreshCredits();
+                }}
               >
                 <svg
                   className="titlebar-balance-icon"
@@ -3171,7 +3233,7 @@ export function ChatPanel() {
                   <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
                 </svg>
                 ${shownBal.amount.toFixed(2)}
-              </span>
+              </button>
             )}
           </div>,
           titlebarEl,

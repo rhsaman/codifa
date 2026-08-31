@@ -49,7 +49,7 @@ Python ≥ 3.10 (managed by uv).
 
 ```bash
 npm install       # JavaScript dependencies
-npm run setup     # creates backend/.venv and installs pydantic-ai, fastapi, uvicorn
+npm run setup     # creates backend/.venv and installs langgraph, fastapi, uvicorn
 npm run dev       # opens the Electron window with hot reload
 ```
 
@@ -61,7 +61,7 @@ Voice and RAG-memory models are optional — install them from the app's
 ```
 electron/   main process — window, sidecar spawn, fs IPC, SQLite persistence
 src/        React renderer — Monaco editor, chat (SSE), file explorer
-backend/    Python sidecar — FastAPI + Pydantic AI agents, tools, Whisper
+backend/    Python sidecar — FastAPI + LangGraph agents, tools, Whisper
 test/       frontend tests
 scripts/    build helpers (ad-hoc signing, after-pack)
 .github/    CI workflow + issue/PR templates

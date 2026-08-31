@@ -1,4 +1,4 @@
-"""Sandboxed filesystem tools for the Pydantic AI agent.
+"""Sandboxed filesystem tools for the LangGraph agent.
 
 Every path is resolved through a project ROOT. Absolute paths, `..` escapes and
 symlink escapes are rejected by comparing realpaths so the agent can never touch
@@ -2318,7 +2318,7 @@ def _html_to_markdown(html: str) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# Pydantic AI tool registrations
+# Tool registrations (LangGraph nodes read these from the registry)
 # --------------------------------------------------------------------------- #
 
 
@@ -2615,8 +2615,9 @@ def make_tool_callbacks(
     result stays well within a small model's context window across a multi-step
     run — avoiding context overflow that truncates the session.
 
-    Tools are async so pydantic-ai executes them on the event loop, keeping the
-    shared emit callback aligned with the streaming loop.
+    Tools are async so the LangGraph orchestrator can execute them on the
+    event loop, keeping the shared emit callback aligned with the streaming
+    loop.
     """
 
     # Correlate every tool call with its result via a per-invocation `call_id`.
@@ -2627,7 +2628,7 @@ def make_tool_callbacks(
     # leaving a genuinely-started card stuck on "running" forever.
     #
     # Parent tools carry their pairing through a `contextvars.ContextVar` set per
-    # invocation: pydantic-ai runs parallel same-name tool calls as SEPARATE
+    # invocation: LangGraph runs parallel same-name tool calls as SEPARATE
     # async tasks (each with a copied context), and each task emits its own
     # `tool` then its own `tool_result`. Threading the id through the context
     # keeps tool→result correct even when parallel calls finish OUT of order — a
@@ -2769,7 +2770,7 @@ def make_tool_callbacks(
         Sticky per slot per turn: a slot that already fell back skips the
         sub-agent model and goes straight to the main model.
 
-        Uses a LangChain model (no pydantic-ai)."""
+        Uses a LangChain model."""
         from llm import llm_generate
 
         model = main_model if _fallback_state.get(slot) else sub_model

@@ -1,10 +1,11 @@
 """Shared local mock OpenAI-compatible server for backend live tests.
 
-Drives the REAL backend (agents.run_agent / tools) against a controllable
+Drives the REAL backend (LangGraph run / tools) against a controllable
 in-process server so tests are deterministic and cost nothing. The mock honors
-the two request shapes pydantic-ai uses: streaming SSE (``stream: true``) and
-plain JSON (the explore sub-agent's non-streaming run), and can be switched into
-a mode that rejects ``parallel_tool_calls`` (to exercise the provider allowlist).
+the two request shapes we use: streaming SSE (``stream: true``) and plain
+JSON (the explore sub-agent's non-streaming run), and can be switched into
+a mode that rejects ``parallel_tool_calls`` (to exercise the provider
+allowlist).
 """
 import asyncio
 import json
@@ -79,7 +80,7 @@ def tool_call(tool, args_json, call_id="call_x", finish="tool_calls"):
 
 def length_reply(finish="length"):
     """Emulate a small local model whose context window was exceeded: an empty
-    response with ``finish_reason: 'length'``. pydantic-ai raises
+    response with ``finish_reason: 'length'``. LangChain raises
     ``UnexpectedModelBehavior`` on this — exactly the crash the sub-agents now
     degrade from instead of killing the turn."""
     return [

@@ -14,7 +14,7 @@
     "offline-first",
     "local-llm",
     "rag",
-    "pydantic-ai",
+    "langgraph",
     "whisper",
     "openrouter",
     "ollama",

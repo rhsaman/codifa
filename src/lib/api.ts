@@ -3,9 +3,17 @@ import { api } from './fs'
 import { modelContextWindow } from './context'
 
 let sidecarUrl: string | null = null
+// In-flight `ensureSidecar` resolution. Shared by every concurrent caller so
+// React StrictMode's double-mount + the multiple effects that all call
+// `fetchModels` / `fetchCredits` on chat switch coalesce into ONE probe (or
+// ONE getSidecarUrl IPC) instead of firing `/health` for each call. Without
+// this, a single chat switch produced 3× /health (one per ensureSidecar
+// invocation × 2 in StrictMode).
+let sidecarInFlight: Promise<string | null> | null = null
 
 api.onSidecarChanged(() => {
   sidecarUrl = null
+  sidecarInFlight = null
 })
 
 // The Electron sidecar process crashed (e.g. segfault while loading the Whisper
@@ -13,6 +21,7 @@ api.onSidecarChanged(() => {
 // waiting for the next health probe to fail with "Failed to fetch".
 api.onSidecarDead(() => {
   sidecarUrl = null
+  sidecarInFlight = null
 })
 
 /**
@@ -30,16 +39,47 @@ async function isSidecarAlive(url: string): Promise<boolean> {
 }
 
 export async function ensureSidecar(): Promise<string | null> {
-  if (sidecarUrl) {
-    // The cached URL may point at a dead process (e.g. the Python sidecar
-    // crashed while loading the Whisper model). Probe before trusting it so we
-    // don't keep hitting a dead port and surfacing "Failed to fetch".
-    if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
-    sidecarUrl = null
-  }
-  const url = await api.getSidecarUrl()
-  if (url) sidecarUrl = url
-  return sidecarUrl
+  // Dedup: if a previous call is still resolving (probing /health or
+  // awaiting the getSidecarUrl IPC), every concurrent caller awaits the
+  // SAME promise instead of each firing its own /health probe.
+  if (sidecarInFlight) return sidecarInFlight
+  // Fast path: URL is already cached AND the last probe succeeded → no
+  // /health, no IPC, just return. (The /health probe only happens when a
+  // caller finds sidecarUrl set but hasn't yet verified it; subsequent
+  // calls skip the probe entirely.)
+  if (sidecarUrl) return sidecarUrl
+  const p = (async () => {
+    if (sidecarUrl) {
+      // The cached URL may point at a dead process (e.g. the Python sidecar
+      // crashed while loading the Whisper model). Probe before trusting it so
+      // we don't keep hitting a dead port and surfacing "Failed to fetch".
+      if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
+      sidecarUrl = null
+    }
+    const url = await api.getSidecarUrl()
+    if (url) sidecarUrl = url
+    return sidecarUrl
+  })()
+  sidecarInFlight = p
+  // Do NOT clear sidecarInFlight after settle: keeping the resolved
+  // promise in the slot lets a StrictMode re-mount (or any caller arriving
+  // microseconds after settle) skip its own /health probe and reuse this
+  // result. The slot is only reset by onSidecarChanged / onSidecarDead,
+  // which is the only case where the URL is genuinely stale and a fresh
+  // resolution is needed.
+  return p
+}
+
+/**
+ * Drop the cached sidecar URL so the next `ensureSidecar()` re-resolves
+ * (and re-starts the sidecar if it died). Called by the background health
+ * probe in App.tsx when a /health ping against the cached URL fails — the
+ * cached URL points at a dead port and every subsequent request would
+ * surface "Failed to fetch" otherwise. Safe to call from any context.
+ */
+export function invalidateSidecarCache(): void {
+  sidecarUrl = null
+  sidecarInFlight = null
 }
 
 export interface ModelPricing {
@@ -132,8 +172,19 @@ export async function transcribeAudio(
   }
 }
 
-export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {  const url = await ensureSidecar()
+export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
+  const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  // Dedupe concurrent calls for the SAME provider config. React StrictMode
+  // mounts every effect twice in dev, and ProviderModelSelect + Chat.tsx both
+  // fire on chat switch — without this cache, a single chat switch produced
+  // 2× /models?provider=… requests (the user's reported "هر کدوم ۲ بار فچ
+  // میشه"). The cache holds the in-flight Promise so the second caller awaits
+  // the first; resolved promises are kept briefly to also dedupe back-to-back
+  // calls (e.g. provider config edit + dropdown open).
+  const sig = providerRequestKey(cfg)
+  const cached = modelsInFlight.get(sig)
+  if (cached) return cached
   const params = new URLSearchParams({
     provider: cfg.kind,
     base_url: cfg.baseUrl,
@@ -141,25 +192,53 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> { 
   })
   if (cfg.envVar) params.set('env_var', cfg.envVar)
   for (const [k, v] of oauthParams(cfg)) params.set(k, v)
-  const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error((body as { detail?: string }).detail || `models request failed (${res.status})`)
-  }
-  const data = (await res.json()) as {
-    models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null; reasoning?: boolean | null }>
-  }
-  const models: string[] = []
-  const context: Record<string, number> = {}
-  const pricing: Record<string, ModelPricing> = {}
-  const reasoning: Record<string, boolean> = {}
-  for (const m of data.models ?? []) {
-    models.push(m.id)
-    if (m.context) context[m.id] = m.context
-    if (m.pricing) pricing[m.id] = m.pricing
-    if (typeof m.reasoning === 'boolean') reasoning[m.id] = m.reasoning
-  }
-  return { models, context, pricing, reasoning }
+  const p = (async () => {
+    const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error((body as { detail?: string }).detail || `models request failed (${res.status})`)
+    }
+    const data = (await res.json()) as {
+      models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null; reasoning?: boolean | null }>
+    }
+    const models: string[] = []
+    const context: Record<string, number> = {}
+    const pricing: Record<string, ModelPricing> = {}
+    const reasoning: Record<string, boolean> = {}
+    for (const m of data.models ?? []) {
+      models.push(m.id)
+      if (m.context) context[m.id] = m.context
+      if (m.pricing) pricing[m.id] = m.pricing
+      if (typeof m.reasoning === 'boolean') reasoning[m.id] = m.reasoning
+    }
+    return { models, context, pricing, reasoning }
+  })()
+  modelsInFlight.set(sig, p)
+  // Clear the cache entry once the request settles, but keep a short "fresh"
+  // window so a re-mount within ~1s still dedupes.
+  p.finally(() => {
+    setTimeout(() => {
+      if (modelsInFlight.get(sig) === p) modelsInFlight.delete(sig)
+    }, 1000)
+  })
+  return p
+}
+
+// In-flight /models dedup. Keyed by provider config so changing baseUrl /
+// apiKey / OAuth creds always triggers a fresh fetch.
+const modelsInFlight = new Map<string, Promise<ModelsResult>>()
+function providerRequestKey(cfg: ProviderConfig): string {
+  return [
+    cfg.id,
+    cfg.kind,
+    cfg.baseUrl ?? "",
+    cfg.apiKey ?? "",
+    cfg.envVar ?? "",
+    cfg.authType ?? "",
+    cfg.oauthClientId ?? "",
+    cfg.oauthClientSecret ?? "",
+    cfg.oauthRefreshToken ?? "",
+  ].join("|")
 }
 
 export interface CreditsResult {
@@ -173,6 +252,12 @@ export interface CreditsResult {
 export async function fetchCredits(cfg: ProviderConfig): Promise<Partial<CreditsResult>> {
   const url = await ensureSidecar()
   if (!url) return {}
+  // Dedupe concurrent calls (React StrictMode mounts effects twice in dev,
+  // and a chat switch re-fires the polling effect — without this, every
+  // chat switch fired 2× /credits?provider=…).
+  const sig = providerRequestKey(cfg)
+  const cached = creditsInFlight.get(sig)
+  if (cached) return cached
   const params = new URLSearchParams({
     provider: cfg.kind,
     base_url: cfg.baseUrl,
@@ -180,15 +265,26 @@ export async function fetchCredits(cfg: ProviderConfig): Promise<Partial<Credits
   })
   if (cfg.envVar) params.set('env_var', cfg.envVar)
   for (const [k, v] of oauthParams(cfg)) params.set(k, v)
-  try {
-    const res = await fetch(`${url}/credits?${params}`, { signal: AbortSignal.timeout(15_000) })
-    if (!res.ok) return {}
-    const data = (await res.json()) as Partial<CreditsResult>
-    return data
-  } catch {
-    return {}
-  }
+  const p = (async () => {
+    try {
+      const res = await fetch(`${url}/credits?${params}`, { signal: AbortSignal.timeout(15_000) })
+      if (!res.ok) return {}
+      const data = (await res.json()) as Partial<CreditsResult>
+      return data
+    } catch {
+      return {}
+    }
+  })()
+  creditsInFlight.set(sig, p)
+  p.finally(() => {
+    setTimeout(() => {
+      if (creditsInFlight.get(sig) === p) creditsInFlight.delete(sig)
+    }, 1000)
+  })
+  return p
 }
+
+const creditsInFlight = new Map<string, Promise<Partial<CreditsResult>>>()
 
 export interface StreamParams {
   provider: ProviderConfig
@@ -212,6 +308,10 @@ export interface StreamParams {
       status: string
       items?: Array<Record<string, unknown>>
     }>
+    /** Tool-output recap from a previously interrupted turn. NOT rendered in
+     *  the UI; folded into the assistant message's content server-side so the
+     *  model sees what was already done without re-executing the tools. */
+    preservedToolSummary?: string
   }>
   attachments?: string[]
   /** Each image is a path string OR an object {path, dataUrl}; the backend

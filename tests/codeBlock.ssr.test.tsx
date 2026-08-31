@@ -186,7 +186,7 @@ console.log('6) کامنت واقعی با / دیگر هدر فایل نمی‌�
   check('متن کامنت در کد حاضر است', html.replace(/<[^>]+>/g, '').includes('src/components/App.tsx'))
 }
 
-console.log('7) فرمت کانونیکال lang:START-END:path شماره خط را رعایت می‌کند (بدون هدر فایل):')
+console.log('7) فرمت کانونیکال lang:START-END:path شماره خط را رعایت می‌کند (مسیر در هدر نمایش داده می‌شود):')
 {
   const html = renderToString(
     <CodeBlock className="language-go">
@@ -195,9 +195,35 @@ console.log('7) فرمت کانونیکال lang:START-END:path شماره خط 
       </code>
     </CodeBlock>,
   )
-  check('کلاس code-block-file ندارد', !html.includes('code-block-file'))
-  check('نام فایل در هدر نیست', !html.includes('applications/buyusecase/Plan.go'), html)
+  check('مسیر فایل در هدر هست', html.includes('applications/buyusecase/Plan.go'), html)
   check('شماره خط ۱۹ در gutter هست', html.includes('code-gutter" aria-hidden="true">19<'))
+}
+
+if (failed > 0) {
+  console.error(`\n${failed} تست شکست خورد ❌`)
+  process.exit(1)
+}
+
+console.log('8) دو بلوک کد متوالی هر کدام مسیر فایل جداگانه دارند:')
+{
+  const html1 = renderToString(
+    <CodeBlock className="language-go">
+      <code className="language-go" data-meta="19-20:Plan.go">
+        {'func main() {}'}
+      </code>
+    </CodeBlock>,
+  )
+  const html2 = renderToString(
+    <CodeBlock className="language-python">
+      <code className="language-python" data-meta="5-10:utils.py">
+        {'def helper(): pass'}
+      </code>
+    </CodeBlock>,
+  )
+  check('بلوک اول: مسیر Plan.go در هدر', html1.includes('Plan.go'), html1)
+  check('بلوک اول: شماره خط ۱۹', html1.includes('code-gutter" aria-hidden="true">19<'), html1)
+  check('بلوک دوم: مسیر utils.py در هدر', html2.includes('utils.py'), html2)
+  check('بلوک دوم: شماره خط ۵', html2.includes('code-gutter" aria-hidden="true">5<'), html2)
 }
 
 if (failed > 0) {

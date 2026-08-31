@@ -167,7 +167,11 @@ export function detectDir(text: string): 'rtl' | 'ltr' {
 const FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
 const DIGITS_RE = `[0-9${FA_DIGITS}]`;
 const LINE_RANGE_RE = new RegExp(
-  `خط\\s*(${DIGITS_RE}+)(?:\\s*-\\s*(${DIGITS_RE}+))?`,
+  `خط\\s*(${DIGITS_RE}+)(?:\\s*[-–—~]\\s*(${DIGITS_RE}+))?`,
+);
+// Persian connectors: "خط ۱۹ تا ۲۰" or "خط ۱۹ الی ۲۰"
+const LINE_RANGE_CONN_RE = new RegExp(
+  `خط\\s*(${DIGITS_RE}+)\\s+(?:تا|الی)\\s+(${DIGITS_RE}+)`,
 );
 // A file path is `dir/.../name.ext` or `name.ext` (exactly one dot). A dotted
 // reference like `user.CreatedAt.After` has no `/` and multiple dots, so it is
@@ -190,7 +194,9 @@ function faToLat(n: string): string {
 
 // A bare fence that already carries a line range but NO path, e.g.
 // ```go:19-20 — we may still attach the most recent file path to it.
-const BARE_RANGE_FENCE_RE = /^```\s*([\w-]+):(\d+)-(\d+)\s*$/;
+const BARE_RANGE_FENCE_RE = new RegExp(
+  '^```\\s*([\\w-]+):(' + DIGITS_RE + '+)-(' + DIGITS_RE + '+)\\s*$'
+);
 
 function foldLineCaptions(text: string): string {
   const lines = text.split('\n')
@@ -201,7 +207,8 @@ function foldLineCaptions(text: string): string {
   // path once, then several ```lang:start-end fences without repeating it).
   let lastPath = ''
   while (i < lines.length) {
-    const rangeM = LINE_RANGE_RE.exec(lines[i])
+    let rangeM = LINE_RANGE_RE.exec(lines[i])
+    if (rangeM && !rangeM[2]) rangeM = LINE_RANGE_CONN_RE.exec(lines[i]) ?? rangeM
     let pathM = PATH_RE.exec(lines[i])
     // PATH_RE requires the path to be followed by :digits or end-of-string.
     // In captions like "کد در Plan.go خط ۲۰-۱۹ هست:", the path is followed by a
@@ -276,7 +283,7 @@ function foldLineCaptions(text: string): string {
           if (bare) {
             // Fence already carries its own line range — keep it, just attach
             // the path from the caption (don't overwrite the model's range).
-            lines[j] = '```' + bare[1] + ':' + bare[2] + '-' + bare[3] + ':' + pathM[1]
+            lines[j] = '```' + bare[1] + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + pathM[1]
           } else {
             lines[j] = '```' + fence[1] + ':' + lo + '-' + hi + ':' + pathM[1]
           }
@@ -294,13 +301,58 @@ function foldLineCaptions(text: string): string {
       const bare = BARE_RANGE_FENCE_RE.exec(lines[i])
       if (bare && lastPath) {
         lines[i] =
-          '```' + bare[1] + ':' + bare[2] + '-' + bare[3] + ':' + lastPath
+          '```' + bare[1] + ':' + faToLat(bare[2]) + '-' + faToLat(bare[3]) + ':' + lastPath
       }
     }
     out.push(lines[i])
     i++
   }
-  return out.join('\n')
+  // ── Pass 2: detect "# path:start-end" comments INSIDE code fences ──
+  // Models sometimes put the file path as the first comment line inside the
+  // fenced code block.  Strip it from the code content and inject the info
+  // into the fence info string so the gutter shows correct line numbers.
+  const result: string[] = []
+  let k = 0
+  while (k < out.length) {
+    const fenceOpen = /^```(\s*)([\w-]*)/.exec(out[k])
+    if (fenceOpen) {
+      const indent = fenceOpen[1]
+      const existingLang = faToLat(fenceOpen[2])
+      // Check if the very next non-blank line is a "# path:start-end" comment.
+      let contentIdx = k + 1
+      while (contentIdx < out.length && out[contentIdx].trim() === '') contentIdx++
+      if (contentIdx < out.length) {
+        // Match paths with multiple dots like backend/agents/tools/instagram_tools.py:82-84
+        const commentM = /^#\s*((?:[\w\/\\-]+\/)*[\w\/\\-]*[\w.-]+\.\w+):(\d+)(?:-(\d+))?/.exec(out[contentIdx].trim())
+        if (commentM) {
+          const startN = parseInt(commentM[2], 10)
+          const endN = commentM[3] ? parseInt(commentM[3], 10) : startN
+          const lo = Math.min(startN, endN)
+          const hi = Math.max(startN, endN)
+          lastPath = commentM[1]
+          // Rewrite the fence open line with lang:start-end:path
+          const lang = existingLang || 'text'
+          result.push('```' + lang + ':' + lo + '-' + hi + ':' + commentM[1])
+          // Skip the comment line — don't emit it into the code content.
+          k = contentIdx + 1
+          // Emit remaining code lines until the closing fence.
+          while (k < out.length && !/^```\s*$/.test(out[k])) {
+            result.push(out[k])
+            k++
+          }
+          // Emit the closing fence if present.
+          if (k < out.length && /^```\s*$/.test(out[k])) {
+            result.push(out[k])
+            k++
+          }
+          continue
+        }
+      }
+    }
+    result.push(out[k])
+    k++
+  }
+  return result.join('\n')
 }
 
 export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {

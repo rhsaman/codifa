@@ -105,9 +105,9 @@ function codeStartLine(children: ReactNode): number {
     // either the canonical `lang:start-end:path` (foldLineCaptions output) or the
     // legacy `start-end:path` form, so match the `start-end` range wherever it
     // appears after a colon, not just at the start of the string.
-    const meta = props?.["data-meta"] ?? "";
+    const meta = (props?.["data-meta"] ?? "").replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)));
     const m =
-      /(\d+)(?:-\d+)?(?::[\w./-]+\.\w+)?$/.exec(meta) ??
+      /(\d+)(?:-\d+)?(?::(?:[\w./-]+\/)*[\w./-]*[\w.-]+\.\w+)?$/.exec(meta) ??
       /:(\d+)(?:-\d+)?/.exec(meta) ??
       (props?.className
         ? /language-[\w-]+:(\d+)(?:-\d+)?/.exec(String(props.className))
@@ -170,11 +170,25 @@ function splitHighlightedHtml(html: string): string[] {
   return lines;
 }
 
+function codeFilePath(children: ReactNode): string {
+  const kids = Array.isArray(children) ? children : [children];
+  for (const k of kids) {
+    const props = (k as { props?: { className?: string; "data-meta"?: string } } | null)?.props;
+    const meta = props?.["data-meta"] ?? "";
+    // meta is like "19-20:backend/agents/tools/instagram_tools.py" — extract path after the range.
+    // Path can have multiple dots and slashes.
+    const m = /\d+(?:-\d+)?:((?:[\w\/\\-]+\/)*[\w\/\\-]*[\w.-]+\.\w+)$/.exec(meta);
+    if (m) return m[1];
+  }
+  return "";
+}
+
 function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const [copied, setCopied] = useState(false);
   const code = textFromChildren(props.children).replace(/^\n+|\n+$/g, "");
   const lang = codeLang(props.children);
   const startLine = codeStartLine(props.children);
+  const filePath = codeFilePath(props.children);
 
   // A ```mermaid fenced block is rendered as a live diagram, not as code.
   if (lang === "mermaid") {
@@ -239,6 +253,7 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   return (
     <div className="code-block">
       <div className="code-block-head">
+        {filePath && <span className="code-block-path">{filePath}</span>}
         <span className="code-block-lang">
           {lang || "code"}
         </span>
@@ -267,7 +282,15 @@ export const mdComponents = {
   // stash the full meta (`19-20:Plan.go`) on `data-meta` so CodeBlock can read
   // the real line range and file name that foldLineCaptions injected.
   code: (props: any) => {
-    const meta = props.node?.data?.meta ?? "";
+    const node = props.node;
+    let meta = node?.data?.meta ?? "";
+    // Fallback: react-markdown v9 may put the entire info string in className
+    // (e.g. "language-go:19-20:Plan.go"). Extract meta after the language prefix.
+    if (!meta) {
+      const cn = String(node?.properties?.className ?? props.className ?? "");
+      const m = /^language-[\w-]+:(.+)/.exec(cn);
+      if (m) meta = m[1];
+    }
     return (
       <code {...props} data-meta={meta}>
         {props.children}

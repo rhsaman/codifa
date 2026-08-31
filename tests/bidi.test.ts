@@ -172,6 +172,30 @@ console.log('13) <br/> ترکیبی (بیرون + داخل):')
   check('داخل حفظ شد', out.includes('<br/>'), out)
 }
 
+console.log('14) خط connector فارسی «تا»: خط ۱۹ تا ۲۰')
+{
+  const out = prepareContent('خط ۱۹ تا ۲۰ در Plan.go:\n\n```go\nx := 1\n```')
+  check('بازه با تا تزریق شد', out.includes('```go:19-20:Plan.go'), out)
+}
+
+console.log('15) خط connector فارسی «الی»: خط ۱۹ الی ۲۰')
+{
+  const out = prepareContent('خط ۱۹ الی ۲۰ در Plan.go:\n\n```go\nx := 1\n```')
+  check('بازه با الی تزریق شد', out.includes('```go:19-20:Plan.go'), out)
+}
+
+console.log('16) خط با em dash: خط ۱۹—۲۰')
+{
+  const out = prepareContent('خط ۱۹—۲۰ در Plan.go:\n\n```go\nx := 1\n```')
+  check('بازه با em dash تزریق شد', out.includes('```go:19-20:Plan.go'), out)
+}
+
+console.log('17) فنس با ارقام فارسی در range:')
+{
+  const out = prepareContent('خط ۱۹ تا ۲۰ در Plan.go:\n\n```go:۱۹-۲۰\nx := 1\n```')
+  check('اقلام فارسی به لاتین تبدیل شد', out.includes('```go:19-20:Plan.go'), out)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

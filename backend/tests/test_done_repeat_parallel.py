@@ -153,6 +153,35 @@ def test_is_parallel_calls_error_detects_400_with_field():
     assert llm._is_parallel_calls_error(exc) is True
 
 
+def test_is_parallel_calls_error_detects_openrouter_generic_wrapper():
+    """OpenRouter wraps upstream errors in a generic ``Provider returned
+    error`` with the real cause in ``metadata.raw`` (which is often
+    truncated by the SSE transport, hiding the actual field name). The
+    detector must still match this case — otherwise the very model this
+    bug report is about (``minimax/minimax-m3:free``) wouldn't get the
+    auto-strip retry and would just fail every turn."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': 'Provider returned error', "
+        "'code': 400, 'metadata': {'raw': '{\"error\":{\"message\":\"Backend "
+        "request failed with status 400\",\"type\":\"backend_error\",\"code\":"
+        "400,\"det..."
+    )
+    assert llm._is_parallel_calls_error(exc) is True, (
+        "openrouter's generic 400 wrapper must be matched even when the "
+        "real upstream field name is hidden in (truncated) metadata.raw"
+    )
+
+
+def test_is_parallel_calls_error_detects_backend_request_failed():
+    """A second common wrapper shape: ``Backend request failed with status
+    400`` with no further detail. The detector must match it so the
+    auto-strip path can recover."""
+    exc = Exception(
+        "Error code: 400 - Backend request failed with status 400"
+    )
+    assert llm._is_parallel_calls_error(exc) is True
+
+
 def test_is_parallel_calls_error_ignores_other_400s():
     """A 400 that does NOT mention `parallel_tool_calls` must NOT trigger the
     auto-strip — otherwise we'd hide a real bad-request (e.g. invalid prompt)
@@ -257,3 +286,49 @@ async def test_parallel_calls_error_strips_and_retries():
         if e.get("kind") == "error":
             errors.append(e)
     assert errors == [], f"the 400 was recovered, no error event expected; got: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 (root cause): parallel_tool_calls is NOT sent on the wire by default.
+# This is what fixes the actual user-visible bug — opencode never sent the
+# field either, so several free-tier OpenRouter models (e.g.
+# minimax/minimax-m3:free) stopped 400-ing. The 400-strip retry above is a
+# belt-and-braces fallback for the (rare) case where some other field trips
+# a model in the future.
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_tool_calls_not_sent_by_default():
+    """The OpenRouter free-tier model that broke every turn with 400 is
+    minimax/minimax-m3:free. opencode routes the same model WITHOUT the
+    ``parallel_tool_calls`` request field and it works fine. codifa used to
+    set ``parallel_tool_calls: True`` in model_kwargs for every OpenAI-
+    compatible provider, which the model rejected with 400. The fix: never
+    set it by default (matches opencode)."""
+    m = llm.build_chat_model(
+        provider="openrouter",
+        model="minimax/minimax-m3:free",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test-key",
+    )
+    assert "parallel_tool_calls" not in m.model_kwargs, (
+        f"parallel_tool_calls must NOT be sent by default "
+        f"(it 400s free-tier models). Got: {m.model_kwargs}"
+    )
+
+
+def test_parallel_tool_calls_not_sent_for_any_provider():
+    """Cross-provider check: codifa must not enable parallel tool calls for
+    any provider by default — every provider goes through OpenRouter-style
+    gateways or local servers that may reject the field."""
+    for provider in ("openrouter", "custom", "ollama", "cloudflare", "nvidia"):
+        m = llm.build_chat_model(
+            provider=provider,
+            model="m",
+            base_url="",
+            api_key="k",
+        )
+        assert "parallel_tool_calls" not in m.model_kwargs, (
+            f"provider={provider} should not send parallel_tool_calls; "
+            f"got model_kwargs={m.model_kwargs}"
+        )

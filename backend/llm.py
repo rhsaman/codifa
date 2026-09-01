@@ -221,8 +221,15 @@ def build_chat_model(
     lc_timeout = timeout or 900
     tkwargs = _thinking_kwargs(provider, model, thinking_level, model_reasoning)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
-    if meta.get("parallel_calls"):
-        tkwargs["parallel_tool_calls"] = True
+    # parallel_tool_calls is intentionally NOT sent. opencode also doesn't
+    # send it, and several OpenRouter free-tier models (e.g.
+    # minimax/minimax-m3:free) reject it with 400 — which would kill every
+    # turn. If a future provider really needs it, set it explicitly in
+    # tkwargs here; the strip-on-400 retry path in graph._run_mode_turn will
+    # also handle any model that flips between supporting and not supporting
+    # the field.
+    # if meta.get("parallel_calls"):
+    #     tkwargs["parallel_tool_calls"] = True
     # Ask OpenAI-compatible providers to return token usage on the final streamed
     # chunk. Without this, streaming responses omit usage and `usage_metadata`
     # stays None, so no `usage` event is emitted and the sidebar shows no cost /
@@ -346,25 +353,54 @@ def _is_stream_options_error(exc: Exception) -> bool:
 
 
 def _is_parallel_calls_error(exc: Exception) -> bool:
-    """True when an exception is a 4xx caused by an unsupported
+    """True when an exception is a 4xx that LOOKS LIKE an unsupported
     ``parallel_tool_calls`` request field. Some free-tier OpenRouter models
-    (e.g. ``minimax/minimax-m3:free``) reject the field with 400 even though
-    opencode routes the same model without it fine. The runner retries once
-    with the field stripped instead of failing the whole turn."""
-    msg = str(exc).lower()
-    if "parallel_tool_calls" in msg and (
-        "400" in msg
-        or "unsupported" in msg
-        or "not supported" in msg
-        or "additionalproperties" in msg
-        or "additional properties" in msg
-    ):
-        return True
+    (e.g. ``minimax/minimax-m3:free``) reject the field with 400 — opencode
+    routes the same model without it and works fine. The runner retries once
+    with the field stripped instead of failing the whole turn.
+
+    Detection strategy: any 400 that doesn't unambiguously identify itself
+    as a different kind of bad-request (invalid API key, invalid model id,
+    context length exceeded, etc.) is treated as a possible
+    parallel_tool_calls rejection, since that field is the one most commonly
+    sent-but-unsupported across OpenRouter's free-tier models. The
+    conservative fallback: if the field is set on the model and we got a
+    400, strip and retry — the cost of one extra round-trip is much lower
+    than killing the whole turn.
+    """
     status = getattr(exc, "status_code", None)
     if status is None:
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", None)
-    return bool(status == 400 and "parallel_tool_calls" in msg)
+    if status is None:
+        # LangChain HTTP errors often don't carry status_code on the exception
+        # itself — the status is embedded in the text. Parse it from the
+        # string. Match both `Error code: 400` (openai SDK) and `code: 400` /
+        # `status_code: 400` forms.
+        import re
+        m = re.search(r"(?:error\s+code|status_code|code)[:=\s]+(\d{3})", str(exc))
+        if m:
+            try:
+                status = int(m.group(1))
+            except (TypeError, ValueError):
+                status = None
+    if status != 400:
+        return False
+    msg = str(exc).lower()
+    # The error explicitly names parallel_tool_calls (most specific case).
+    if "parallel_tool_calls" in msg:
+        return True
+    # The error doesn't identify another specific cause — and we only enter
+    # this branch when the model actually has parallel_tool_calls enabled.
+    # Falling through here is safe because the retry path strips a single
+    # non-essential OpenAI field, not a real bad-request param.
+    if any(phrase in msg for phrase in (
+        "provider returned error",  # OpenRouter generic wrapper
+        "backend request failed",   # OpenRouter upstream wrapper
+        "backend_error",            # explicit error type
+    )):
+        return True
+    return False
 
 
 def _strip_parallel_calls(model: Any) -> Any:

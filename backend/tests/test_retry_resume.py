@@ -209,6 +209,60 @@ async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspa
     # turn simply stops with an error event (no retry, no injected replay).
 
 
+# ---------------------------------------------------------------------------
+# RETRY GIVE-UP — the bounded retry loop must actually stop at the budget.
+# ---------------------------------------------------------------------------
+
+
+async def test_retry_gives_up_at_max_attempts(run_events, monkeypatch):
+    """The retry counter used to be reset to 0 on every loop iteration
+    (``attempt = 0`` lived inside ``while True:``), so the budget check
+    ``attempt >= _RETRY_MAX_ATTEMPTS`` was always ``1 >= 10`` → never true →
+    the loop never gave up. With every transient 429 a chat would spin
+    forever in "retrying..." with no ``retry_giveup`` event for the user.
+
+    After the fix the counter persists across iterations, so a sustained
+    burst of retryable failures hits the budget and the turn terminates
+    with a single ``retry_giveup`` event. The number of ``retry`` events
+    is bounded by ``_RETRY_MAX_ATTEMPTS - 1`` (the last attempt is the one
+    that gives up — no further ``retry`` event for it).
+    """
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
+    mock.script = [text_reply("Done")]
+    # Every request returns a 429. The model produces NO tool output first
+    # (idle throttle), so the retry path runs but nothing advances.
+    mock.error_at = {i: (429, "Rate limit exceeded.") for i in range(
+        agents._RETRY_MAX_ATTEMPTS + 2
+    )}
+
+    events = await run_events("hi", mode="coder")
+
+    retries = _retry_events(events)
+    giveups = [e for e in events if e.get("kind") == "retry_giveup"]
+    errors = [e for e in events if e.get("kind") == "error"]
+
+    # The give-up must fire — that's the whole point of the fix.
+    assert len(giveups) == 1, (
+        f"expected exactly one retry_giveup event, got {len(giveups)} "
+        f"(retries={len(retries)}, errors={len(errors)})"
+    )
+    # The give-up must report the budget, not 1.
+    g = giveups[0]
+    assert g.get("attempt", 0) >= agents._RETRY_MAX_ATTEMPTS, g
+    assert g.get("max_attempts") == agents._RETRY_MAX_ATTEMPTS, g
+    # Bounded retry count (last attempt is the give-up, no further retry event).
+    assert len(retries) <= agents._RETRY_MAX_ATTEMPTS - 1, (
+        f"too many retry events: {len(retries)}"
+    )
+    # The attempt counter must be monotonically increasing (proves the counter
+    # is no longer reset to 0 inside the loop).
+    attempts = [r.get("attempt", 0) for r in retries]
+    assert attempts == sorted(attempts) and attempts, attempts
+    assert attempts[0] >= 1, attempts
+    # No bare error event — give-up is the user-facing signal.
+    assert errors == [], f"retry_giveup should not be paired with an error event: {errors}"
+
+
 def test_free_usage_limit_is_transient_not_quota():
     """A free-tier gateway's ``FreeUsageLimitError`` carrying a "Rate limit
     exceeded. Please try again later." message is a BRIEF 429 throttle, not a

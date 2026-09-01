@@ -621,3 +621,107 @@ def test_auto_compact_in_place_noop_below_threshold():
     assert msgs[1].content == "hi"
     assert msgs[2].content == "answer"
     assert q.items == []
+
+
+def test_cheap_truncation_does_not_crash_on_plain_list():
+    # The cheap-truncation pass used to mark the live transcript with
+    # ``msgs._cheap_truncated = True`` to avoid re-scanning. ``msgs`` is a plain
+    # ``list[BaseMessage]`` so that assignment raised ``AttributeError`` on the
+    # EXACT turn compaction is needed most (long transcript, many old tool
+    # results), killing the whole turn with no retry and no ``compact_start``
+    # event reaching the frontend. Prove cheap truncation now runs cleanly and
+    # rewrites old tool messages in place (without the AttributeError) by
+    # triggering ONLY the cheap pass: ``compact_at_percent=99`` sets the heavy
+    # compact threshold above the live transcript (~120k tokens of tool
+    # results, well below 99% of 200k) but the cheap pass (40% threshold =
+    # 80k) still fires.
+    placeholder = "[result truncated — see earlier compact summary]"
+
+    async def fake_compact(*a, **k):
+        # Should NOT be called — the heavy threshold is above the transcript.
+        raise AssertionError("heavy compact must not be called for this test")
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        big = "x" * 60_000  # ~15k tokens each, 8 of them = ~120k tokens total
+        msgs = [SystemMessage(content="sys")]
+        for i in range(8):
+            tcid = f"t{i}"
+            msgs += [
+                AIMessage(
+                    content="call",
+                    tool_calls=[{"id": tcid, "name": "read", "args": {}}],
+                ),
+                ToolMessage(content=big, tool_call_id=tcid, name="read"),
+            ]
+        q = _Queue()
+        # Must NOT raise — the whole point of the fix.
+        asyncio.run(
+            graph._maybe_auto_compact(
+                {"compact_at_percent": 99}, q, None, None, msgs, 200_000,
+                last_context_tokens=0,
+            )
+        )
+    finally:
+        graph._agents._compact_history = original
+
+    # Heavy compact did NOT fire (cheap-pass-only scenario).
+    assert q.items == [], f"heavy compact should not have fired, got {q.items}"
+    # Cheap pass must have rewritten old tool results in place. With 8 tool
+    # results and _KEEP=6, the first 2 are eligible for shortening.
+    shortened = [
+        m for m in msgs
+        if isinstance(m, ToolMessage) and m.content == placeholder
+    ]
+    assert len(shortened) >= 1, (
+        f"cheap pass did not rewrite any tool message in place; got: "
+        f"{[type(m).__name__ + ':' + str(len(getattr(m, 'content', ''))) for m in msgs]}"
+    )
+
+
+def test_messages_to_dicts_tags_tool_name_for_prune_protection():
+    # The prune-protected-tools check (``m.get("tool") not in {"skill"}``) was
+    # a no-op in production because ``_messages_to_dicts`` never set the
+    # ``tool`` key on ``ToolMessage`` dicts. After the fix, a ToolMessage
+    # produced by the ``skill`` tool keeps its name all the way through
+    # ``_messages_to_dicts`` -> ``_prune_history`` and is therefore spared by
+    # the prune pass while unprotected tools (e.g. ``read``) are cleared.
+    # Three user turns so the first turn is older than opencode's
+    # "preserve recent two turns" window and is actually eligible for pruning.
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    msgs = [
+        HumanMessage(content="first turn"),
+        AIMessage(
+            content="skill",
+            tool_calls=[{"id": "c-skill", "name": "skill", "args": {}}],
+        ),
+        ToolMessage(content="X" * 200_000, tool_call_id="c-skill", name="skill"),
+        AIMessage(
+            content="read",
+            tool_calls=[{"id": "c-read", "name": "read", "args": {"filePath": "a"}}],
+        ),
+        ToolMessage(content="Y" * 200_000, tool_call_id="c-read", name="read"),
+        HumanMessage(content="second turn"),
+        AIMessage(content="between"),
+        HumanMessage(content="third turn"),
+        AIMessage(content="more"),
+    ]
+    dicts = graph._agents._messages_to_dicts(msgs)
+    # Every tool message must be tagged with its originating tool name.
+    by_tcid = {d.get("tool_call_id"): d for d in dicts if d.get("role") == "tool"}
+    assert by_tcid["c-skill"].get("tool") == "skill", by_tcid
+    assert by_tcid["c-read"].get("tool") == "read", by_tcid
+
+    # Now run the real prune path. The skill result must survive; the read
+    # result must be cleared.
+    pruned = graph._agents._prune_history(dicts)
+    skill_msg = next(d for d in pruned if d.get("tool_call_id") == "c-skill")
+    read_msg = next(d for d in pruned if d.get("tool_call_id") == "c-read")
+    assert not skill_msg.get("compacted"), (
+        f"skill tool result must be protected, got: {skill_msg.get('content')[:80]!r}"
+    )
+    assert skill_msg["content"] == "X" * 200_000
+    assert read_msg.get("compacted"), "non-protected tool result should be pruned"
+    assert read_msg["content"] == "[Old tool result content cleared]"

@@ -1628,6 +1628,20 @@ def _messages_to_dicts(msgs: list) -> list[dict]:
     Kept here (not in graph.py) so the sub-agent loop in ``llm.py`` can reuse it
     without importing graph.py (which would be a circular import).
     """
+    # Pre-build tool name lookup from AIMessage.tool_calls keyed by id, so
+    # each ToolMessage can be tagged with the originating tool name. Without
+    # this, downstream code (e.g. _prune_history's protected-tools check)
+    # can never identify which tool produced a result, and the protection is
+    # silently bypassed for every tool (the dict only carries role/content
+    # /tool_call_id otherwise).
+    tool_names: dict[str, str] = {}
+    for _m in msgs or []:
+        if isinstance(_m, AIMessage):
+            for _tc in getattr(_m, "tool_calls", None) or []:
+                _tcid = _tc.get("id")
+                _tname = _tc.get("name")
+                if _tcid and _tname:
+                    tool_names[_tcid] = _tname
     out: list[dict] = []
     for m in msgs or []:
         if isinstance(m, SystemMessage):
@@ -1668,6 +1682,14 @@ def _messages_to_dicts(msgs: list) -> list[dict]:
             tcid = getattr(m, "tool_call_id", None)
             if tcid:
                 d["tool_call_id"] = tcid
+            # Tag the originating tool name so downstream consumers
+            # (_prune_history, the frontend history view, etc.) can identify
+            # it. Prefer ToolMessage.name (LangChain sets it directly); fall
+            # back to the lookup built above from the matching AIMessage's
+            # tool_calls.
+            _tool_name = getattr(m, "name", None) or tool_names.get(tcid or "")
+            if _tool_name:
+                d["tool"] = _tool_name
         out.append(d)
     return out
 

@@ -1249,6 +1249,105 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
         raise
 
 
+async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
+    """Yield SSE bytes for every event from ``agent_gen`` with abort safety.
+
+    Extracted from ``event_gen`` so the disconnect / GeneratorExit handling
+    can be unit-tested without spinning up FastAPI. MUST stay in sync with
+    the abort contract:
+
+    * ``CancelledError`` (Starlette aborts with this in some paths) →
+      close ``agent_gen`` and return silently.
+    * ``GeneratorExit`` (Starlette aborts with this in other paths) →
+      close ``agent_gen`` and re-raise. Without the close, the background
+      ``_drive`` task keeps the LLM provider stream alive and every
+      Stop + resend stacks another stream on top of the same chat.
+    * Other ``Exception`` → close ``agent_gen`` and surface an error
+      event so the frontend can render a banner.
+    * Other ``BaseException`` (non-GeneratorExit) → log and surface a
+      generic crash event.
+    """
+    ka_count = 0
+    try:
+        async for event in _with_keepalive(agent_gen):
+            if event.get("kind") == "_keepalive":
+                ka_count += 1
+                yield ": keepalive\n\n"
+            else:
+                yield _sse(event)
+        # Run finished cleanly: surface the post-run RSS so a growing memory
+        # trend between runs is visible in codifa.log, and reclaim any cyclic
+        # garbage the agent graph/SDK left behind (Python's allocator often
+        # keeps RSS high even after objects die, so this only frees what it
+        # can, but it makes genuine leaks observable).
+        import gc
+
+        gc.collect()
+        logger.warning(
+            "agent run complete chat_id=%s rss_mb=%.1f",
+            chat_id,
+            _rss_mb() or 0.0,
+        )
+        _log_memory_snapshot(chat_id)
+    except asyncio.CancelledError:
+        # Client disconnected (aborted the stream): close the agent generator
+        # to unwind its background _drive task (which runs graph.astream).
+        # This ensures the LLM provider call is properly interrupted.
+        with contextlib.suppress(Exception):
+            await agent_gen.aclose()
+        # Log the drop with peak RSS so a recurring silent interrupt (crash /
+        # OOM) becomes visible in codifa.log instead of going unnoticed.
+        logger.warning(
+            "stream DISCONNECTED (client/sidecar drop) chat_id=%s rss_mb=%.1f keepalives_sent=%d",
+            chat_id,
+            _rss_mb() or 0.0,
+            ka_count,
+        )
+    except Exception as exc:
+        # Log the full traceback to the FILE handler (codifa.log) so an opaque
+        # upstream message ("Exceeded maximum output retries (1)", ...) never
+        # hides the real trigger. Stderr may not be captured by Electron in
+        # packaged mode, so print_exc alone is not enough. The user still sees
+        # a readable error over SSE.
+        with contextlib.suppress(Exception):
+            await agent_gen.aclose()
+        logger.exception(
+            "agent run failed chat_id=%s rss_mb=%.1f",
+            chat_id, _rss_mb() or 0.0,
+        )
+        yield _sse({"kind": "error", "content": _friendly_error(exc, model, base_url)})
+    except BaseException as exc:  # non-Exception death (KeyboardInterrupt/SystemExit/custom)
+        # Anything that is NOT a normal Exception (e.g. a BaseException raised
+        # deep in the model SDK or checkpointer) would otherwise tear down the
+        # SSE socket with NO event, so the frontend sees a silent "disconnect"
+        # and self-heals with no explanation. Log it loudly and surface a
+        # visible error so the real trigger is captured in codifa.log instead
+        # of going unnoticed.
+        if isinstance(exc, GeneratorExit):
+            # Starlette frequently tears down an SSE stream with
+            # ``GeneratorExit`` instead of ``CancelledError`` when the client
+            # aborts (Stop button / closed socket). We must explicitly close
+            # the agent generator here — otherwise ``run_graph``'s ``finally``
+            # never runs, ``_drive`` is never cancelled, and the LLM provider
+            # stream keeps running orphaned in the background. With every Stop
+            # + resend a fresh stream is added on top, so the same chat ends
+            # up with N concurrent provider streams still token-burning.
+            with contextlib.suppress(Exception):
+                await agent_gen.aclose()
+            raise
+        with contextlib.suppress(Exception):
+            await agent_gen.aclose()
+        logger.exception(
+            "agent run terminated by non-Exception (silent-interrupt source) chat_id=%s rss_mb=%.1f",
+            chat_id,
+            _rss_mb() or 0.0,
+        )
+        try:
+            yield _sse({"kind": "error", "content": f"agent crashed: {exc!r}"})
+        except Exception:  # noqa: BLE001, S110 — best-effort: the stream is already dying
+            pass
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     if not req.root or not os.path.isdir(req.root):
@@ -1311,72 +1410,10 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 req.chat_id,
                 _rss_mb() or 0.0,
             )
-            ka_count = 0
-            async for event in _with_keepalive(agent_gen):
-                if event.get("kind") == "_keepalive":
-                    ka_count += 1
-                    yield ": keepalive\n\n"
-                else:
-                    yield _sse(event)
-            # Run finished cleanly: surface the post-run RSS so a growing memory
-            # trend between runs is visible in codifa.log, and reclaim any cyclic
-            # garbage the agent graph/SDK left behind (Python's allocator often
-            # keeps RSS high even after objects die, so this only frees what it
-            # can, but it makes genuine leaks observable).
-            import gc
-
-            gc.collect()
-            logger.warning(
-                "agent run complete chat_id=%s rss_mb=%.1f",
-                req.chat_id,
-                _rss_mb() or 0.0,
-            )
-            _log_memory_snapshot(req.chat_id)
-
-        except asyncio.CancelledError:
-            # Client disconnected (aborted the stream): close the agent generator
-            # to unwind its background _drive task (which runs graph.astream).
-            # This ensures the LLM provider call is properly interrupted.
-            with contextlib.suppress(Exception):
-                await agent_gen.aclose()
-            # Log the drop with peak RSS so a recurring silent interrupt (crash /
-            # OOM) becomes visible in codifa.log instead of going unnoticed.
-            logger.warning(
-                "stream DISCONNECTED (client/sidecar drop) chat_id=%s rss_mb=%.1f keepalives_sent=%d",
-                req.chat_id,
-                _rss_mb() or 0.0,
-                ka_count,
-            )
-            return
-        except Exception as exc:
-            # Log the full traceback to the FILE handler (codifa.log) so an opaque
-            # upstream message ("Exceeded maximum output retries (1)", ...) never
-            # hides the real trigger. Stderr may not be captured by Electron in
-            # packaged mode, so print_exc alone is not enough. The user still sees
-            # a readable error over SSE.
-            logger.exception(
-                "agent run failed chat_id=%s rss_mb=%.1f",
-                req.chat_id, _rss_mb() or 0.0,
-            )
-            yield _sse({"kind": "error", "content": _friendly_error(exc, req.model, req.base_url)})
-        except BaseException as exc:  # non-Exception death (KeyboardInterrupt/SystemExit/custom)
-            # Anything that is NOT a normal Exception (e.g. a BaseException raised
-            # deep in the model SDK or checkpointer) would otherwise tear down the
-            # SSE socket with NO event, so the frontend sees a silent "disconnect"
-            # and self-heals with no explanation. Log it loudly and surface a
-            # visible error so the real trigger is captured in codifa.log instead
-            # of going unnoticed.
-            if isinstance(exc, GeneratorExit):
-                raise
-            logger.exception(
-                "agent run terminated by non-Exception (silent-interrupt source) chat_id=%s rss_mb=%.1f",
-                req.chat_id,
-                _rss_mb() or 0.0,
-            )
-            try:
-                yield _sse({"kind": "error", "content": f"agent crashed: {exc!r}"})
-            except Exception:  # noqa: BLE001, S110 — best-effort: the stream is already dying
-                pass
+            async for chunk in _stream_drive(
+                agent_gen, req.chat_id, req.model, req.base_url
+            ):
+                yield chunk
         finally:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
             # Clear any unconsumed steers for this chat so they don't leak into

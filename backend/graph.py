@@ -2053,32 +2053,29 @@ async def _maybe_auto_compact(
     # and prevents slow context creep across many tool-call steps.
     _cheap_pct = _pct // 2  # e.g. 80 → 40
     cheap_threshold = int(ctx * _cheap_pct / 100)
-    if total >= cheap_threshold and not getattr(msgs, "_cheap_truncated", False):
+    if total >= cheap_threshold:
         _tool_idxs = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
         _KEEP = 6
         if len(_tool_idxs) > _KEEP:
             _old = set(_tool_idxs[:-_KEEP])
             _ph = "[result truncated — see earlier compact summary]"
-            _changed = False
             for i in _old:
                 _c = getattr(msgs[i], "content", "")
                 if len(str(_c)) > len(_ph) + 20:
                     msgs[i] = msgs[i].copy(update={"content": _ph})
-                    _changed = True
-            if _changed:
-                # Mark so we only do this once per turn (avoid repeated scans)
-                msgs._cheap_truncated = True  # type: ignore[attr-defined]
-                # Recalculate total after truncation so the threshold check
-                # below sees the reduced size.
-                total = max(
-                    last_context_tokens or 0,
-                    _estimate_prompt_tokens(msgs) or 0,
+            # Recalculate total after truncation so the threshold check
+            # below sees the reduced size. No per-turn marker is needed: once
+            # the old results are replaced with the short placeholder, the
+            # len() check above skips them on subsequent visits.
+            total = max(
+                last_context_tokens or 0,
+                _estimate_prompt_tokens(msgs) or 0,
+            )
+            if total <= 0:
+                total = sum(
+                    _agents._estimate_tokens(d["content"])
+                    for d in _agents._messages_to_dicts(msgs)
                 )
-                if total <= 0:
-                    total = sum(
-                        _agents._estimate_tokens(d["content"])
-                        for d in _agents._messages_to_dicts(msgs)
-                    )
     # --- end cheap truncation -------------------------------------------
     if total < threshold:
         return 0
@@ -2798,7 +2795,6 @@ async def _run_mode_turn(
         return mode if mode in ("explore", "general") else ""
 
     reply = ""
-    # attempt is reset per step inside the loop
     # Log every attempt start so the user can verify from the sidecar log
     # that retries are actually firing. The renderer-side Network tab CAN'T
     # see these requests: they originate from the Python sidecar subprocess
@@ -2808,9 +2804,9 @@ async def _run_mode_turn(
     # reach the provider or fail before the HTTP layer".
     chat_id = state.get("chat_id", "")
     logger.info("[run_graph] agent run starting (chat_id=%s)", chat_id)
+    attempt = 0
     try:
         while True:
-            attempt = 0  # Reset counter for each step
             attempt += 1
             logger.info(
                 "[run_graph] agent run attempt %s/%s (chat_id=%s)",
@@ -2852,7 +2848,7 @@ async def _run_mode_turn(
                         except Exception:  # noqa: BLE001, S110
                             pass
                     break
-                # Transient failure: retry up to the budget, 15s apart.
+                # Transient failure: retry up to the budget, 30s apart.
                 if attempt >= _agents._RETRY_MAX_ATTEMPTS:
                     # Budget exhausted — surface the error to the user.
                     # Surface the exhausted retry in codifa.log (not just as an SSE

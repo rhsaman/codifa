@@ -156,11 +156,13 @@ console.log('۷) tool_result بدون match: کارت بدون تغییر باق
 
 console.log('۸) sub-event (branch) nesting: tool sub داخل task card قرار می‌گیرد:')
 {
+  // backend همیشه branch روی task card می‌ذاره (tools.py:3783-3786)
   const taskEvent: SidecarEvent = {
     kind: "tool",
     tool: "task",
     args: { prompt: "find files" },
     id: "task_1",
+    branch: 0,
   } as any
   const subEvent: SidecarEvent = {
     kind: "tool",
@@ -179,11 +181,13 @@ console.log('۸) sub-event (branch) nesting: tool sub داخل task card قرا�
 
 console.log('۹) sub-event duplicate: فقط یک child:')
 {
+  // backend همیشه branch روی task card می‌ذاره (tools.py:3783-3786)
   const taskEvent: SidecarEvent = {
     kind: "tool",
     tool: "task",
     args: { prompt: "x" },
     id: "task_1",
+    branch: 0,
   } as any
   const subEvent1: SidecarEvent = {
     kind: "tool",

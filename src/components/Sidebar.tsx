@@ -1183,8 +1183,7 @@ export function Sidebar() {
                               className="chat-item-menu-btn danger"
                               role="menuitem"
                               onClick={() => {
-                                setSelectingWsKey(g.key);
-                                setSelectedChats(new Set([c.id]));
+                                useStore.getState().deleteChat(c.id);
                                 setMenuOpenId(null);
                               }}
                             >

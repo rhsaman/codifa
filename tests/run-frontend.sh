@@ -221,6 +221,12 @@ echo ""
 echo "── تست ۳۴: watchdog tool-counter (شمارنده به‌جای boolean برای tool موازی) ──"
 node tests/watchdog.test.ts
 
-rm -f tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs
+echo ""
+echo "── تست ۳۵: fetchAndPersist (skip/merge/persist با fetchFn و store تزریقی) ──"
+npx esbuild tests/fetchAndPersist.test.ts --bundle --platform=node --format=esm \
+  --packages=external --external:electron --outfile=tests/.tmp-fp.mjs >/dev/null 2>&1
+node tests/.tmp-fp.mjs
+
+rm -f tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

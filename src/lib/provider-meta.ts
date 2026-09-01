@@ -136,3 +136,49 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
 export function providerMeta(kind: ProviderKind | undefined | null): ProviderKindMeta {
   return PROVIDER_META[kind ?? 'custom'] ?? PROVIDER_META.custom
 }
+
+/** Built-in provider kind ids that are known to act as a model-id prefix
+ *  on the wire (e.g. OpenRouter returns "openai/gpt-4o", opencode exposes
+ *  "opencode/..."). A model id that starts with `${kind}/` therefore
+ *  belongs to THAT provider's catalog and must not be rendered under a
+ *  different provider — even if it has been persisted into the wrong
+ *  provider row (e.g. a stale recentModels entry migrated onto another
+ *  provider, or a hand-edited `p.models` list).
+ *
+ *  This is intentionally a fixed set of built-in kind ids, NOT derived
+ *  from per-user `p.id` values, because the user is free to rename their
+ *  provider row ("my-openrouter"); only the kind id is authoritative.
+ */
+export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
+  Object.keys(PROVIDER_META),
+)
+
+/** True when a BARE model id (already passed through `bareModel` so any
+ *  redundant `${p.id}/` prefix is stripped) belongs to a DIFFERENT known
+ *  provider kind, and therefore must not be rendered under this provider.
+ *
+ *  Examples (all under p.id = "local"):
+ *    "opencode/big-pickle"   → head = "opencode" ∈ prefixes, head !== p.id → FOREIGN
+ *    "nvidia/foo"            → head = "nvidia"   ∈ prefixes, head !== p.id → FOREIGN
+ *    "llama3"                → no slash                              → INTERNAL
+ *    "meta-llama/llama-3.1"  → head = "meta-llama", unknown kind     → INTERNAL
+ *    "local/foo"             → head = "local",   head === p.id       → INTERNAL
+ *
+ *  Why run on `b` (after bareModel) and not on the raw `m`? Because a
+ *  stored entry may carry a doubled prefix that the raw check would miss:
+ *    m = "local/opencode/big-pickle", p.id = "local"
+ *    raw:   head = "local"   === p.id → not foreign (WRONG, leaks through)
+ *    b  = "opencode/big-pickle"
+ *    bare:  head = "opencode" ∈ prefixes, head !== p.id → foreign ✓
+ *
+ *  This is intentionally stricter than "starts with any `${providerId}/`":
+ *  we only flag KNOWN kind prefixes, so nvidia's own catalog entries like
+ *  "meta-llama/llama-3.1-70b-instruct" (which carry a slash but no known
+ *  provider prefix) are kept. */
+export function isForeignModelId(p: { id: string }, b: string): boolean {
+  const slash = b.indexOf('/')
+  if (slash <= 0) return false
+  const head = b.slice(0, slash)
+  if (head === p.id) return false
+  return FOREIGN_PROVIDER_PREFIXES.has(head)
+}

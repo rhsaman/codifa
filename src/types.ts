@@ -201,8 +201,10 @@ export interface ToolActivity {
   startedAt?: number
   reverted?: boolean
   /** Per-call correlation id (backend-assigned) so a tool_result resolves the
-   *  exact card it belongs to even when the same tool runs many times. */
-  callId?: number
+   *  exact card it belongs to even when the same tool runs many times. May
+   *  be a number (LangChain auto-incremented ``call_id``) or a string
+   *  (Anthropic-native ``tool_use.id``). */
+  callId?: number | string
   /** True for tool calls emitted by a SUB-AGENT (e.g. explore's internal
    *  read/grep/glob). Rendered nested inside the parent explore card, not as a
    *  top-level timeline card. */

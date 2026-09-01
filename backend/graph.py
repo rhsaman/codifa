@@ -65,14 +65,16 @@ from _common import (
     _extract_cache_tokens,
     _extract_reasoning_tokens,
     _is_repeating,
+    _resolve_stream_end_text,
+    _scrub_think_prefix,
     _strip_think_tags,
 )
 from agents import normalize_mode
 from llm import (
-    _is_stream_options_error,
-    _strip_stream_options,
     _is_parallel_calls_error,
+    _is_stream_options_error,
     _strip_parallel_calls,
+    _strip_stream_options,
     build_chat_model,
     chat_model_settings,
     llm_generate,
@@ -849,16 +851,18 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
 
 
 def _is_transient_error(exc: Exception) -> bool:
-    """Return True for retryable provider errors (429 / 5xx / timeout / network).
+    """Return True for retryable provider errors (400 / 429 / 5xx / timeout / network).
 
-    Permanent client errors (4xx other than 429) are NOT transient — retrying
-    them just wastes time and hides a real config problem."""
+    400 is treated as transient because some upstream gateways (e.g. minimax-m3:free
+    on OpenRouter) return 400 for transient conditions that resolve on retry.
+    Other 4xx errors are NOT transient — retrying them just wastes time and hides
+    a real config problem."""
     status = getattr(exc, "status_code", None)
     if status is None:
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", None)
     if status is not None:
-        return status == 429 or 500 <= status < 600
+        return status in (400, 429) or 500 <= status < 600
     # No status code -> treat as a network/timeout blip (retryable).
     msg = str(exc).lower()
     return any(
@@ -1947,7 +1951,13 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
         if role == "system" and had_system:
             # The compacted head is itself a "[Compacted earlier context]"
             # system note; fold it into the existing system prompt slot rather
-            # than appending a second system message.
+            # than appending a second system message — the model must see the
+            # summary to retain context across compaction.
+            if content:
+                prev = rebuilt[0]
+                rebuilt[0] = prev.model_copy(
+                    update={"content": prev.content + "\n\n" + content}
+                )
             continue
         if role == "assistant":
             # Keep the structured tool_calls so a compacted in-flight step can
@@ -2363,15 +2373,24 @@ async def _run_mode_turn(
                 _in_think = False
                 _think_buf = ""
                 # Degenerate text-loop guard: accumulate the visible reply in a
-                # buffer and, every few chunks, check whether the model has
-                # started repeating itself verbatim (e.g. "Let me check. Let me
-                # check." 80 times). The existing guards only watch tool-call
-                # signatures, so a no-tool-call text loop slips through. We break
-                # the stream early and surface a warning instead of emitting the
-                # full duplicated output.
+                # buffer and check on every chunk whether the model has started
+                # repeating itself verbatim (e.g. "Let me check. Let me check."
+                # 80 times). The existing tool-signature guard only watches
+                # tool calls, so a no-tool text loop slips through. We check on
+                # EVERY chunk (not every Nth) because a fast model can push out
+                # a complete 80x loop in fewer than N chunks — a 4-chunk cadence
+                # only cuts ~75% of the wasted text, the rest still hits the UI.
                 _reply_buf = ""
-                _repeat_check_every = 4
                 _chunk_idx = 0
+                # Track the cumulative length of text we've actually emitted as
+                # `kind: "text"` events. The stream-end re-emit path (when a
+                # reasoning-capable model sent no real reasoning field) needs
+                # this to know whether the dropped buffer was already partially
+                # flushed — re-emitting the whole ``ai.content`` after a partial
+                # emit duplicates everything the user already saw. The int is
+                # wrapped in a list so the post-loop block can read it without
+                # a `nonlocal` declaration.
+                _emitted_text_len: list[int] = [0]
                 # Emit the lightweight "thinking" toggle ONLY when the model
                 # actually produces reasoning content (a dedicated reasoning
                 # field caught by _thinking_from_chunk) — NOT merely because it
@@ -2419,11 +2438,13 @@ async def _run_mode_turn(
                         # itself with no tool call). The tool-call guard below
                         # only watches signatures, so this catches the no-tool
                         # case; we abort mid-stream instead of dumping it all.
+                        # Check on EVERY chunk (not every Nth) — a fast model
+                        # can push a full 80x loop out in fewer than N chunks,
+                        # so a throttled cadence only cuts ~75% of the wasted
+                        # text and the rest still hits the UI.
                         _reply_buf += content
                         _chunk_idx += 1
-                        if _chunk_idx % _repeat_check_every == 0 and _is_repeating(
-                            _reply_buf
-                        ):
+                        if _is_repeating(_reply_buf):
                             queue.put_nowait(
                                 {
                                     "kind": "warn",
@@ -2441,16 +2462,89 @@ async def _run_mode_turn(
                         if _model_reasoning and not _saw_real_reasoning:
                             continue
                         queue.put_nowait({"kind": "text", "content": content})
+                        _emitted_text_len[0] += len(content)
                     elif isinstance(content, list):
+                        # Anthropic / Gemini stream content as a list of typed
+                        # parts (`{"type": "text", "text": …}` /
+                        # `{"type": "tool_use", …}`). The text branch here MUST
+                        # scrub a leading <think>…</think> opener before the
+                        # first streamed part: those providers can emit the
+                        # opener as part 0 in a single chunk (no delta), which
+                        # the per-chunk _strip_think_tags above would not see
+                        # because it runs on the full chunk text, not the
+                        # text-part slice. Without this, "<think>answer"
+                        # arrives in the UI verbatim on the very first frame.
+                        # `ai.tool_calls` (extracted after the stream) carries
+                        # the matching tool_use parts — we mirror them as
+                        # `kind: "tool"` events here so the UI gets them in
+                        # the correct order with the text that prompted them,
+                        # instead of racing the tool-execution callback path
+                        # which can interleave them.
                         for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
+                            if not isinstance(part, dict):
+                                continue
+                            ptype = part.get("type")
+                            if ptype == "text":
+                                t = part.get("text") or ""
+                                if not t:
+                                    continue
+                                t = _scrub_think_prefix(t)
+                                if not t:
+                                    continue
                                 if _thinking_active:
                                     _thinking_active = False
                                     queue.put_nowait(
                                         {"kind": "thinking", "active": False}
                                     )
+                                _reply_buf += t
+                                _chunk_idx += 1
+                                if _is_repeating(_reply_buf):
+                                    queue.put_nowait(
+                                        {
+                                            "kind": "warn",
+                                            "content": (
+                                                "The model entered a text "
+                                                "repetition loop; showing "
+                                                "partial output."
+                                            ),
+                                        }
+                                    )
+                                    break
+                                if _model_reasoning and not _saw_real_reasoning:
+                                    continue
+                                queue.put_nowait({"kind": "text", "content": t})
+                                _emitted_text_len[0] += len(t)
+                            elif ptype in ("tool_use", "tool_call"):
+                                # Surface the tool_use part as a `kind: "tool"`
+                                # event IN ORDER with the text that preceded
+                                # it, so the UI's tool/text interleaving never
+                                # flips (a free-tier model that announces
+                                # "I'll search" then immediately emits the
+                                # tool_use part would otherwise show the tool
+                                # card AFTER the answer finished). ``name`` /
+                                # ``input`` are the Anthropic-native keys;
+                                # ``function`` is the OpenAI-native shape —
+                                # we coerce to a single shape so the frontend
+                                # doesn't have to know which provider it came
+                                # from.
+                                _pname = part.get("name") or (
+                                    part.get("function") or {}
+                                ).get("name") or ""
+                                _pargs = part.get("input")
+                                if _pargs is None:
+                                    _pargs = (part.get("function") or {}).get("arguments")
+                                if isinstance(_pargs, str):
+                                    try:
+                                        _pargs = json.loads(_pargs)
+                                    except Exception:
+                                        _pargs = {"_raw": _pargs}
                                 queue.put_nowait(
-                                    {"kind": "text", "content": part["text"]}
+                                    {
+                                        "kind": "tool",
+                                        "tool": _pname,
+                                        "args": _pargs or {},
+                                        "id": part.get("id") or "",
+                                    }
                                 )
                 if ai is None:
                     break
@@ -2464,7 +2558,16 @@ async def _run_mode_turn(
                 # answer (opencode sent no reasoning at all). Re-emit it so the
                 # user never gets an empty reply.
                 if _model_reasoning and not _saw_real_reasoning:
-                    dropped = ai.content if isinstance(ai.content, str) else ""
+                    # The streaming loop may have emitted SOME of the text
+                    # before the loop guard fired (we cut at the first repeat,
+                    # not at byte 0), AND may have dropped earlier chunks that
+                    # looked like CoT before we knew reasoning was absent. Use
+                    # the emitted-text counter to slice off the prefix the UI
+                    # already saw, so the re-emit never duplicates any word
+                    # the user is currently reading.
+                    dropped = _resolve_stream_end_text(
+                        ai.content, _emitted_text_len[0]
+                    )
                     if dropped and _is_repeating(dropped):
                         queue.put_nowait(
                             {
@@ -2502,6 +2605,16 @@ async def _run_mode_turn(
                     state["last_context_tokens"] = usage_ev["total_tokens"]
                     queue.put_nowait(usage_ev)
             except Exception as exc:  # surfaced to the retry wrapper
+                # DIAGNOSTIC: log the FULL upstream error so a recurring 400
+                # shows the real cause in codifa.log (instead of just the
+                # truncated openrouter wrapper that the user sees in the UI).
+                logger.warning(
+                    "[run_graph] step failed chat_id=%s step=%s exc_type=%s msg=%r",
+                    state.get("chat_id", ""),
+                    steps,
+                    type(exc).__name__,
+                    str(exc),
+                )
                 # A few local OpenAI-compatible servers (old llama.cpp / custom
                 # builds) reject `stream_options` even though most accept or
                 # ignore it. Retry the current step once with a model built
@@ -2724,6 +2837,18 @@ async def _run_mode_turn(
                 )
                 is None
             ]
+            # انتشار event ابزار قبل از اجرا — کارت ابزار فوراً در UI نمایش
+            # داده می‌شود (پیش از اجرای واقعی)، مشابه مسیر Anthropic که
+            # tool_use inline با stream منتشر می‌شود.
+            for _ptc in _pending:
+                queue.put_nowait(
+                    {
+                        "kind": "tool",
+                        "tool": _ptc.get("name") or "",
+                        "args": _ptc.get("args") or {},
+                        "id": _ptc.get("id") or "",
+                    }
+                )
             _parallel = [
                 tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
             ]

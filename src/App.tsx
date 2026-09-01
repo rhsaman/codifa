@@ -8,7 +8,8 @@ import { LoadingScreen } from './components/LoadingScreen'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
-import { invalidateSidecarCache } from './lib/api'
+import { fetchModels, invalidateSidecarCache } from './lib/api'
+import { fetchAndPersist } from './lib/provider-fetch'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -89,6 +90,36 @@ export default function App() {
       if (timer) clearTimeout(timer)
     }
   }, [])
+
+  // One-time startup model refresh: for every configured provider, ask the
+  // sidecar `/models` endpoint and persist the result (model ids, context
+  // windows, per-model pricing, reasoning support) into the store. Without
+  // this, dropdowns opened BEFORE the user clicks any provider show 0 models
+  // (the picker used to wait for a click / dropdown-open to fetch), and the
+  // local kind (ollama/llama.cpp/lmstudio) never auto-loads its model list
+  // on app start.
+  //
+  // Runs ONCE per session (gated by `loaded` so it only fires after the
+  // persisted providers are in the store). Parallel via `allSettled` so a
+  // single unreachable provider (e.g. ollama not running) doesn't block the
+  // rest. Custom-added and explicitly-removed entries are preserved via the
+  // same merge rule the Settings modal uses. fetchModels already dedupes
+  // in-flight requests by provider-config signature, so opening a dropdown
+  // while this is still running will await the same promise rather than
+  // refetching.
+  useEffect(() => {
+    if (!loaded) return
+    let cancelled = false
+    void (async () => {
+      const providers = useStore.getState().settings.providers
+      await Promise.allSettled(
+        providers.map((p) => fetchAndPersist(p, { cancelled: () => cancelled })),
+      )
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [loaded])
 
   useEffect(() => {
     const cancelPrefix = () => {

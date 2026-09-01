@@ -189,24 +189,38 @@ async def test_500_active_output_then_retries(run_events, monkeypatch):
     assert retries[0].get("attempt", 0) >= 1
 
 
-async def test_fatal_400_surfaces_as_error_no_durable_resume(run_events, workspace):
-    """A hard 400 after a completed read: surfaces as an `error` event (no
-    raise, no crash) and does NOT "teach" the model the interrupted work. The
-    interrupted-turn resume checkpoint (LangGraph checkpointer) is left in place
-    on a hard error so a same-prompt retry can resume, but nothing is injected
-    back into the prompt."""
+async def test_400_retries_then_surfaces_error(run_events, monkeypatch, workspace):
+    """A 400 from upstream (e.g. minimax-m3:free on OpenRouter) is treated as
+    transient and retried up to the budget. If it persists, it surfaces as a
+    `retry_giveup` event (no raise, no crash) and does NOT "teach" the model the
+    interrupted work. The interrupted-turn resume checkpoint (LangGraph
+    checkpointer) is left in place on a hard error so a same-prompt retry can
+    resume, but nothing is injected back into the prompt."""
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     mock.script = [
         tool_call("read", json.dumps({"filePath": "app.py"})),
-        None,  # hard 400 on the main model's next request
+        None,  # 400 on the main model's next request
     ]
+    # Every request returns a 400. The model produces NO tool output first
+    # (idle 400), so the retry path runs but nothing advances.
+    mock.error_at = {i: (400, "Bad Request") for i in range(
+        agents._RETRY_MAX_ATTEMPTS + 2
+    )}
+
     events = await run_events(
         "read app.py and summarize it", mode="plan", chat_id="pytest-chat"
     )
 
-    assert any(e.get("kind") == "error" for e in events), \
-        "fatal 400 must surface as an error event (no raise)"
-    # Nothing about the hard error teaches the model the interrupted work; the
-    # turn simply stops with an error event (no retry, no injected replay).
+    retries = _retry_events(events)
+    giveups = [e for e in events if e.get("kind") == "retry_giveup"]
+
+    # 400 is now retryable — expect retry events.
+    assert retries, "400 should trigger auto-retry events"
+    # After exhausting the budget, a give-up event surfaces.
+    assert len(giveups) == 1, (
+        f"expected exactly one retry_giveup event, got {len(giveups)}"
+    )
+    assert _all_requests_have_no_resume()
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +288,13 @@ def test_free_usage_limit_is_transient_not_quota():
         '"message": "Rate limit exceeded. Please try again later."}}'
     )
     assert agents._is_quota_exhausted(exc) is False
+    assert agents._is_retryable(exc) is True
+
+
+def test_400_is_retryable():
+    """HTTP 400 is retryable because some upstream gateways (e.g. minimax-m3:free
+    on OpenRouter) return 400 for transient conditions that resolve on retry."""
+    exc = RuntimeError('Error code: 400 - {"error": {"message": "Bad Request"}}')
     assert agents._is_retryable(exc) is True
 
 

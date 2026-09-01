@@ -43,16 +43,15 @@ export async function ensureSidecar(): Promise<string | null> {
   // awaiting the getSidecarUrl IPC), every concurrent caller awaits the
   // SAME promise instead of each firing its own /health probe.
   if (sidecarInFlight) return sidecarInFlight
-  // Fast path: URL is already cached AND the last probe succeeded → no
-  // /health, no IPC, just return. (The /health probe only happens when a
-  // caller finds sidecarUrl set but hasn't yet verified it; subsequent
-  // calls skip the probe entirely.)
-  if (sidecarUrl) return sidecarUrl
   const p = (async () => {
     if (sidecarUrl) {
       // The cached URL may point at a dead process (e.g. the Python sidecar
       // crashed while loading the Whisper model). Probe before trusting it so
       // we don't keep hitting a dead port and surfacing "Failed to fetch".
+      // We DO probe on every call (no "fast path" that skips the probe) so
+      // a crash between calls is detected immediately: the previous resolution
+      // success doesn't mean the sidecar is still alive, and skipping the
+      // probe would leave the user hitting a dead port until the next call.
       if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
       sidecarUrl = null
     }
@@ -61,12 +60,13 @@ export async function ensureSidecar(): Promise<string | null> {
     return sidecarUrl
   })()
   sidecarInFlight = p
-  // Do NOT clear sidecarInFlight after settle: keeping the resolved
-  // promise in the slot lets a StrictMode re-mount (or any caller arriving
-  // microseconds after settle) skip its own /health probe and reuse this
-  // result. The slot is only reset by onSidecarChanged / onSidecarDead,
-  // which is the only case where the URL is genuinely stale and a fresh
-  // resolution is needed.
+  // After the resolution settles, clear the in-flight slot so subsequent
+  // sequential callers re-probe (health-check) instead of blindly reusing
+  // a potentially stale result. Concurrent callers that arrived while the
+  // probe was still in-flight already share `p` and will get the same
+  // result without an extra /health call. The slot is also reset by
+  // onSidecarChanged / onSidecarDead for the explicit crash scenario.
+  p.finally(() => { sidecarInFlight = null })
   return p
 }
 

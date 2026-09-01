@@ -47,12 +47,30 @@ export function planRetry(
  * وقتی بک‌اند یک رویداد `retry` می‌فرستد، attempt قبلی ممکن است چند chunk متن
  * واقعی را قبلاً stream کرده باشد. آن متن هرگز به تاریخچه (msgs) اضافه نشده —
  * فقط در UI مانده. قبل از شروع attempt بعدی باید پاک شود تا با پاسخ کامل جدید
- * ترکیب نشود. tool/user segments حفظ می‌شوند (کار واقعیِ replay‌شده).
+ * ترکیب نشود.
+ *
+ * به‌طور پیش‌فرض، همه‌چیز غیر از متن (tool / tool_result) حفظ می‌شود: در
+ * حالت resume (banner retry) کار واقعی replay می‌شود. در حالت restart (دکمهٔ
+ * retry روی پیام) attempt جدید tool callهای تازه می‌سازد، پس segments
+ * و toolActivity هم باید پاک شوند. فراخوان با ``mode`` کنترل می‌کند.
  */
+export type ResetMode = 'resume' | 'restart'
+
 export function resetStreamForRetry(
   content: string,
   segments?: MessageSegment[],
+  mode: ResetMode = 'resume',
 ): { content: string; segments: MessageSegment[] } {
+  if (mode === 'restart') {
+    // Restart: tool calls are about to be re-issued by the model, so EVERY
+    // segment is stale. Drop them all so the new stream starts on a clean
+    // transcript and segments stay in 1:1 order with the new tool/text
+    // events.
+    return { content: '', segments: [] }
+  }
+  // Resume: keep tool segments (work was done; the next attempt continues
+  // from the same transcript) but drop text segments (the next attempt will
+  // re-stream its own answer and we don't want a duplicate).
   const kept = (segments ?? []).filter((s) => s.kind !== 'text')
   return { content: '', segments: kept }
 }

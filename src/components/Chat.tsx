@@ -1695,16 +1695,29 @@ export function ChatPanel() {
           const next = applyToolEvent(findMsg()?.toolActivity ?? [], event);
           store.updateMessage(assistantMsg.id, { toolActivity: next });
         } else {
-          const act = makeToolActivity(event);
+          // Top-level tool event. De-dupes against an existing card with the
+          // same callId (provider-native id or LangChain numeric): the
+          // Anthropic / Gemini stream can emit a `tool_use` part AND the
+          // tool's own callback can both surface a `kind: "tool"` event for
+          // the same call, and we want ONE card per call, not two stacked.
           const current = findMsg()?.toolActivity ?? [];
-          store.updateMessage(assistantMsg.id, {
-            toolActivity: [...current, act],
-            segments: [
-              ...(findMsg()?.segments ?? []),
-              { kind: "tool", index: current.length } as MessageSegment,
-            ],
-            retry: null,
-          });
+          const next = applyToolEvent(current, event);
+          // Only mint a new render-segment when the activity list actually
+          // grew. applyToolEvent returns the same list (by reference) when
+          // it dedupes — checking `next.length` against `current.length` is
+          // the cheapest way to tell "new card" from "merged into existing".
+          if (next.length > current.length) {
+            store.updateMessage(assistantMsg.id, {
+              toolActivity: next,
+              segments: [
+                ...(findMsg()?.segments ?? []),
+                { kind: "tool", index: current.length } as MessageSegment,
+              ],
+              retry: null,
+            });
+          } else {
+            store.updateMessage(assistantMsg.id, { toolActivity: next });
+          }
         }
       } else if (event.kind === "retry") {
         const info = {
@@ -1724,11 +1737,21 @@ export function ChatPanel() {
           store.updateMessage(assistantMsg.id, { retry: info });
         } else {
           const cur = findMsg();
-          const reset = resetStreamForRetry(cur?.content ?? "", cur?.segments);
+          // Banner retry without `reconnecting` is a user-triggered RESTART
+          // (e.g. a transient retry failed and the user hit the banner
+          // button). Wipe the streamed text AND the tool segments — the new
+          // attempt is going to re-stream its own answer AND re-issue tool
+          // calls, so keeping the old timeline would duplicate everything.
+          const reset = resetStreamForRetry(
+            cur?.content ?? "",
+            cur?.segments,
+            "restart",
+          );
           store.updateMessage(assistantMsg.id, {
             retry: info,
             content: reset.content,
             segments: reset.segments,
+            toolActivity: [],
           });
         }
       } else if (event.kind === "retry_giveup") {

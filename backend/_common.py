@@ -10,18 +10,58 @@
 
 from __future__ import annotations
 
+import re
+
+# All literal chain-of-thought tag flavors some gateways / opencode-style
+# OpenAI-compatible servers surface inside the visible ``content`` stream.
+# Each entry is the literal opener we look for at the START of a tag, paired
+# with the matching closer. We strip ALL of them (not just ``<think>``) so a
+# gateway that emits ``<reasoning>…</reasoning>`` or ``<reflection>…</reflection>``
+# can never leak raw CoT into the chat transcript.
+_THINK_OPENERS: tuple[tuple[str, str], ...] = (
+    ("<think", "think"),
+    ("<thinking", "thinking"),
+    ("<reasoning", "reasoning"),
+    ("<reflection", "reflection"),
+    ("<thought", "thought"),
+)
+# After matching an opener, we read the rest of the opening tag and either
+# accept it (when the closing ``>`` is in this chunk) or buffer it for the next
+# chunk. Anything before the matched opener prefix (e.g. ``<rea`` of
+# ``<reasoning>``) is left untouched and re-scanned on the next call.
+_THINK_OPENER_RE = re.compile(
+    r"<("
+    + "|".join(re.escape(o[0][1:]) for o in _THINK_OPENERS)
+    + r")"
+)
+_THINK_CLOSER_RE = re.compile(
+    r"</("
+    + "|".join(re.escape(o[1]) for o in _THINK_OPENERS)
+    + r")>"
+)
+
 
 def _strip_think_tags(
     text: str, in_think: bool, think_buf: str
 ) -> tuple[str, bool, str]:
-    """Remove literal ``<think>…</think>`` reasoning from streamed text.
+    """Remove literal ``<think>…</think>`` (and flavor variants) from streamed text.
 
-    Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways)
-    emit their chain-of-thought as a literal ``<think>…</think>`` block inside
-    the ``content`` stream instead of using a dedicated reasoning field. We drop
-    it from the visible text so it never leaks to the frontend. The tag may span
-    multiple streamed deltas, so the ``in_think`` / ``think_buf`` state is
-    preserved across calls.
+    Some models (DeepSeek/Qwen/llama.cpp and a few OpenAI-compatible gateways
+    such as opencode/openrouter) emit their chain-of-thought as a literal
+    ``<think>…</think>`` (or ``<reasoning>…</reasoning>``, ``<thought>…</thought>``,
+    ``<reflection>…</reflection>``) block inside the ``content`` stream instead
+    of using a dedicated reasoning field. We drop it from the visible text so
+    it never leaks to the frontend. The tag may span multiple streamed deltas,
+    so the ``in_think`` / ``think_buf`` state is preserved across calls.
+
+    State machine:
+      * ``in_think=False``: scan for the next opener. When found, append the
+        preceding visible text to ``out`` and switch to ``in_think=True``.
+        If the opening tag is incomplete (the ``>`` hasn't arrived), buffer
+        what we have so the next chunk can finish it.
+      * ``in_think=True``: scan for the closer. When found, capture the hidden
+        text in ``think_buf`` and switch back. If the closer hasn't arrived,
+        keep appending hidden text to ``think_buf`` (it's never re-emitted).
     """
     if not text:
         return text, in_think, think_buf
@@ -30,33 +70,84 @@ def _strip_think_tags(
     n = len(text)
     while i < n:
         if not in_think:
-            start = text.find("<think", i)
-            if start == -1:
+            # Fast path: no opener can start before the next '<'. find() avoids
+            # the regex engine for the common (no-tag) case.
+            lt = text.find("<", i)
+            if lt == -1:
                 out.append(text[i:])
                 break
-            out.append(text[i:start])
+            # If we just consumed a partial opener in a previous chunk, ``lt``
+            # is the start of a tag we already matched — handle it inline.
+            if lt > i:
+                out.append(text[i:lt])
+            i = lt
+            m = _THINK_OPENER_RE.match(text, i)
+            if not m:
+                # Not any of our opener prefixes; emit the '<' literally and
+                # advance. Avoids accidentally eating real text like ``<div>``
+                # in code samples — those tags are not in _THINK_OPENERS.
+                out.append("<")
+                i += 1
+                continue
             in_think = True
-            i = start + len("<think")
-            # Consume the optional 'i' of the <thinking> variant, then skip to
-            # the closing '>' of the opening tag.
+            i = m.end()  # right after the matched prefix (e.g. "think" / "reasoning")
+            # Skip the optional 'i' of ``<thinking>`` so the opener absorbs both
+            # ``<think>`` and ``<thinking>``. Other flavors (reasoning/thought/
+            # reflection) have no such optional letter, so this is a no-op for them.
             if i < n and text[i] == "i":
                 i += 1
+            # Consume the rest of the opening tag up to the closing '>'.
             gt = text.find(">", i)
             if gt == -1:
+                # Opening tag is split across chunks — buffer the rest so the
+                # next chunk knows we ARE inside a think block (not just that
+                # we saw a stray '<'). Without this, a literal "<think>partial "
+                # would leak the '<' to the UI on the first chunk.
                 think_buf += text[i:]
                 i = n
             else:
                 i = gt + 1
         else:
-            end = text.find("</think>", i)
-            if end == -1:
+            # We're inside a think block. Look for ANY of the configured closers
+            # so a stream that started as <think> can still close with </thinking>
+            # and vice versa (mixed gateway output, malformed finishers, etc.).
+            m = _THINK_CLOSER_RE.search(text, i)
+            if not m:
                 think_buf += text[i:]
                 i = n
             else:
-                think_buf += text[i:end]
+                think_buf = ""
                 in_think = False
-                i = end + len("</think>")
+                i = m.end()
     return "".join(out), in_think, think_buf
+
+
+def _scrub_think_prefix(text: str) -> str:
+    """Drop a leading partial think-opener from the very first chunk.
+
+    Some providers emit ``content: [{\"type\": \"text\", \"text\": \"<think>\"}]``
+    as the FIRST list-part, before any streaming delta arrives. The main
+    stream handler (``_run_mode_turn``) calls this on each text part so a
+    standalone opening tag is consumed without leaking to the UI, while any
+    visible text after the opener is preserved for the next pass through
+    ``_strip_think_tags``.
+
+    Returns the input unchanged when there's no leading opener.
+    """
+    if not text:
+        return text
+    m = _THINK_OPENER_RE.match(text)
+    if not m:
+        return text
+    i = m.end()
+    if i < len(text) and text[i] == "i":
+        i += 1
+    gt = text.find(">", i)
+    if gt == -1:
+        # Partial opener: consume only what we matched, leave the rest for the
+        # streaming loop to handle via _strip_think_tags with in_think=True.
+        return text[i:]
+    return text[gt + 1 :]
 
 
 def _is_repeating(
@@ -87,6 +178,62 @@ def _is_repeating(
         if all(tail[i * unit : (i + 1) * unit] == first for i in range(1, min_reps)):
             return True
     return False
+
+
+def _resolve_stream_end_text(
+    ai_content: str | list | None,
+    emitted_text_len: int,
+) -> str:
+    """Decide what text (if any) to re-emit at stream-end when reasoning is enabled.
+
+    Some providers null out ``reasoning_content`` and stream the chain-of-thought
+    as plain content before the real answer. The streaming loop in
+    ``_run_mode_turn`` drops those pre-answer content chunks while we are still
+    waiting for a genuine reasoning field (``_saw_real_reasoning``). Once the
+    stream ends, the cumulative ``ai.content`` therefore contains BOTH the
+    dropped pre-answer CoT and the real answer that was already streamed as
+    ``kind: "text"`` events.
+
+    Blindly re-emitting the whole ``ai.content`` would duplicate the visible
+    answer. The right behaviour is:
+
+      * If nothing was emitted yet (the entire response was CoT), emit the full
+        ``ai_content`` so the user sees the model's "best-effort" answer.
+      * If something was already emitted, return ONLY the part of ``ai_content``
+        that comes AFTER what was already streamed, so the user gets exactly
+        one copy of the final answer.
+
+    The split is by character count. The streaming loop only ever appends
+    ``content`` to the emitted-text counter in the order it appeared, and the
+    LangChain ``AIMessageChunk.__add__`` accumulator preserves that order, so
+    the prefix of ``ai_content`` is exactly what was emitted.
+
+    Parameters
+    ----------
+    ai_content:
+        The full ``ai.content`` (string or list of parts) at stream-end.
+    emitted_text_len:
+        How many characters of text were already emitted as ``kind: "text"``
+        events during the stream.
+
+    Returns
+    -------
+    The suffix of ``ai_content`` that was NOT yet emitted, or ``""`` if
+    everything was already streamed. For a list content, returns a list of
+    parts (only the un-emitted suffix) or ``""`` when nothing is left.
+    """
+    if isinstance(ai_content, list):
+        # For list-parts the streaming loop already emits each text part in
+        # order, so by the time the stream ends EVERY visible text part has
+        # already been flushed — nothing left to re-emit.
+        return ""
+    if not isinstance(ai_content, str):
+        return ""
+    if emitted_text_len <= 0:
+        return ai_content
+    if emitted_text_len >= len(ai_content):
+        return ""
+    return ai_content[emitted_text_len:]
 
 
 def _extract_cache_tokens(um: dict) -> tuple[int, int, bool]:

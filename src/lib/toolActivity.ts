@@ -18,7 +18,13 @@ export function makeToolActivity(event: SidecarEvent): ToolActivity {
     args: event.args,
     status: "running",
     startedAt: Date.now(),
-    callId: typeof event.call_id === "number" ? event.call_id : undefined,
+    // Prefer the provider-native string id when present (Anthropic tool_use.id,
+    // OpenAI tool_call_id). Falls back to the LangChain numeric call_id so the
+    // existing sub-agent pairing still works. See SidecarEvent.call_id and
+    // SidecarEvent.id.
+    callId:
+      (typeof event.id === "string" && event.id) ||
+      (typeof event.call_id === "number" ? event.call_id : undefined),
     sub: event.sub,
     branch: typeof event.branch === "number" ? event.branch : undefined,
     model: event.model || undefined,
@@ -30,12 +36,30 @@ export function makeToolActivity(event: SidecarEvent): ToolActivity {
  * the matching `task` card (by `branch`), regardless of that card's status —
  * a late sub-tool that arrives after the parent resolved must still be nested,
  * not dropped.
+ *
+ * Dedupes: a tool event whose ``callId`` (or provider-native ``id``) already
+ * has a matching card is a re-emit (the stream list-parts and the tool
+ * callback can both surface the same call). The existing card is updated in
+ * place instead of appended, so a duplicate "I'll search" pair doesn't render
+ * as two stacked tool cards in the timeline.
  */
 export function applyToolEvent(
   activities: ToolActivity[],
   event: SidecarEvent,
 ): ToolActivity[] {
   const act = makeToolActivity(event);
+  // De-dup key: prefer provider-native id (string), fall back to call_id.
+  // Bump the key in one place so nested-sub matching below stays in sync.
+  const dedupKey = act.callId;
+  const findExisting = (
+    list: ToolActivity[],
+  ): { idx: number; existing: ToolActivity } | null => {
+    if (dedupKey === undefined) return null;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].callId === dedupKey) return { idx: i, existing: list[i] };
+    }
+    return null;
+  };
   if (event.sub) {
     const branch = typeof event.branch === "number" ? event.branch : undefined;
     return activities.map((a) => {
@@ -45,10 +69,38 @@ export function applyToolEvent(
         // card. Match regardless of status so a done parent still receives its
         // late children.
         if (branch !== undefined && a.branch !== branch) return a;
-        return { ...a, children: [...(a.children ?? []), act] };
+        const childList = a.children ?? [];
+        // De-dup a sub-event whose callId is already on the card.
+        const dup = findExisting(childList);
+        if (dup) {
+          const merged: ToolActivity = {
+            ...dup.existing,
+            // The re-emit may carry a richer status/args (e.g. the tool
+            // callback arrives AFTER the stream part), so prefer non-empty
+            // values from the incoming event.
+            args: act.args ?? dup.existing.args,
+            model: act.model ?? dup.existing.model,
+          };
+          const next = childList.slice();
+          next[dup.idx] = merged;
+          return { ...a, children: next };
+        }
+        return { ...a, children: [...childList, act] };
       }
       return a;
     });
+  }
+  // Top-level path: drop the duplicate if the same callId is already there.
+  const dup = findExisting(activities);
+  if (dup) {
+    const merged: ToolActivity = {
+      ...dup.existing,
+      args: act.args ?? dup.existing.args,
+      model: act.model ?? dup.existing.model,
+    };
+    const next = activities.slice();
+    next[dup.idx] = merged;
+    return next;
   }
   return [...activities, act];
 }
@@ -89,13 +141,23 @@ export function resolveToolResult(
       return act;
     }
 
+    // Resolve by provider-native id (``event.id``) when present — Anthropic /
+    // Gemini stream that as a string, so a numeric-only match would miss. Falls
+    // back to the LangChain numeric ``call_id`` to keep the existing sub-agent
+    // pairing working.
+    const idMatch =
+      (typeof event.id === "string" &&
+        event.id !== "" &&
+        act.callId === event.id) ||
+      (gotId && (sub || act.status === "running") && act.callId === event.call_id);
     // Sub-results attach regardless of status; top-level results keep requiring
     // a still-running target (existing behaviour).
-    const target = gotId && (sub || act.status === "running") && act.callId === event.call_id;
+    const target = idMatch;
     const branchMatch = gotBranch && act.branch === event.branch;
     const fallback =
       !gotId &&
       !gotBranch &&
+      typeof event.id !== "string" &&
       act.tool === event.tool &&
       (sub || act.status === "running");
 

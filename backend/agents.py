@@ -904,7 +904,11 @@ _THINKING_LEVELS = {
 }
 
 # HTTP status codes that are worth retrying (transient server / rate-limit).
-_RETRYABLE_STATUS = {429, 502, 503, 504}
+# 400 is included because some upstream gateways (e.g. minimax-m3:free on
+# OpenRouter) return 400 for transient conditions (rate-limit-style throttling,
+# temporary model unavailability) that resolve on retry — treating it as fatal
+# would surface a hard error for what is effectively a transient blip.
+_RETRYABLE_STATUS = {400, 429, 502, 503, 504}
 
 # Files the workspace memory loader pulls in, and the cap on each (bytes).
 _PROJECT_MEMORY_FILES = ["AGENTS.md"]
@@ -1181,7 +1185,7 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
 # failure recovers automatically — up to this many attempts, 30s apart — instead
 # of giving up on the first blip. Configurable so tests can zero the backoff.
 _RETRY_MAX_ATTEMPTS = 10
-_RETRY_BASE_SECONDS = 30
+_RETRY_BASE_SECONDS = 15
 
 
 def _is_image_rejection(exc: BaseException) -> bool:
@@ -1615,8 +1619,11 @@ def _estimate_tokens(text: str) -> int:
     text = text or ""
     if not text:
         return 1
-    persian = len(re.findall(
-        r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", text))
+    persian = len(
+        re.findall(
+            r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", text
+        )
+    )
     latin = max(0, len(text) - persian)
     return max(1, latin // 4 + (persian + 2) // 3)
 
@@ -2216,8 +2223,6 @@ def _fts_keywords(query: str, max_terms: int = 6) -> list[str]:
         out.append(t)
     out.sort(key=len, reverse=True)
     return out[:max_terms]
-
-
 
 
 # Conservative defaults so even small-context local models (e.g. 8k) fit.
@@ -3354,6 +3359,7 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
 
 # -- Workspace summary refresh (LLM-backed, with safe fallback) ------------- #
 
+
 async def _maybe_refresh_workspace_summary(
     root: str,
     current_chat_id: str,
@@ -3411,13 +3417,9 @@ async def _maybe_refresh_workspace_summary(
 
     if existing:
         prev_counts = existing.get("covered_message_counts") or {}
-        if (
-            all(
-                int(prev_counts.get(cid, 0)) == n
-                for cid, n in current_counts.items()
-            )
-            and len(prev_counts) == len(current_counts)
-        ):
+        if all(
+            int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items()
+        ) and len(prev_counts) == len(current_counts):
             cached = _load_workspace_summary_raw(root)
             if cached and user_prompt:
                 return await _select_relevant_summary(
@@ -3443,9 +3445,7 @@ async def _maybe_refresh_workspace_summary(
             new_n = int(c["message_count"])
             if new_n <= prev_n:
                 continue
-            path = os.path.join(
-                ws_dir, f"{_safe_file(cid, cid)}.json"
-            )
+            path = os.path.join(ws_dir, f"{_safe_file(cid, cid)}.json")
             data = _read_json_chat(path)
             if not isinstance(data, dict):
                 continue
@@ -3480,7 +3480,9 @@ async def _maybe_refresh_workspace_summary(
         if updated.strip():
             try:
                 state_db.save_workspace_summary(
-                    workspace_slug, updated, current_counts,
+                    workspace_slug,
+                    updated,
+                    current_counts,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -3492,7 +3494,9 @@ async def _maybe_refresh_workspace_summary(
         if summary_text.strip():
             try:
                 state_db.save_workspace_summary(
-                    workspace_slug, summary_text, current_counts,
+                    workspace_slug,
+                    summary_text,
+                    current_counts,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -3509,7 +3513,9 @@ async def _maybe_refresh_workspace_summary(
     if summary_text.strip():
         try:
             state_db.save_workspace_summary(
-                workspace_slug, summary_text, current_counts,
+                workspace_slug,
+                summary_text,
+                current_counts,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -3517,7 +3523,9 @@ async def _maybe_refresh_workspace_summary(
 
 
 async def _merge_summary_only(
-    existing_content: str, new_tail_body: str, chosen: Any,
+    existing_content: str,
+    new_tail_body: str,
+    chosen: Any,
 ) -> str:
     """Single-purpose merge call: existing summary + new tail -> updated
     summary. Returns "" on failure (caller keeps the old persisted copy).
@@ -3565,14 +3573,13 @@ def _parse_dual_summary_output(raw: str) -> tuple[str, str]:
     response must never be persisted as the cumulative summary.
     """
     raw = raw or ""
-    if (
-        _DUAL_SUMMARY_MARK_UPDATED not in raw
-        or _DUAL_SUMMARY_MARK_RELEVANT not in raw
-    ):
+    if _DUAL_SUMMARY_MARK_UPDATED not in raw or _DUAL_SUMMARY_MARK_RELEVANT not in raw:
         return "", ""
-    updated = raw.split(_DUAL_SUMMARY_MARK_UPDATED, 1)[1].split(
-        _DUAL_SUMMARY_MARK_RELEVANT, 1
-    )[0].strip()
+    updated = (
+        raw.split(_DUAL_SUMMARY_MARK_UPDATED, 1)[1]
+        .split(_DUAL_SUMMARY_MARK_RELEVANT, 1)[0]
+        .strip()
+    )
     rest = raw.split(_DUAL_SUMMARY_MARK_RELEVANT, 1)[1]
     relevant = (
         rest.split(_DUAL_SUMMARY_MARK_END, 1)[0]
@@ -3583,7 +3590,10 @@ def _parse_dual_summary_output(raw: str) -> tuple[str, str]:
 
 
 async def _merge_and_filter_summary(
-    existing_content: str, new_tail_body: str, user_prompt: str, chosen: Any,
+    existing_content: str,
+    new_tail_body: str,
+    user_prompt: str,
+    chosen: Any,
 ) -> tuple[str, str]:
     """Combined call: merge existing+new into an updated cumulative
     summary AND select the subset relevant to the user's first message,

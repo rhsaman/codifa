@@ -6,7 +6,7 @@ import { downloadModel, fetchModels, getModelsStatus, listSkills, removeModel, s
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
-import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
+import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
@@ -64,17 +64,31 @@ function ToolModelSelect({
   // Union of the provider's live /models results and its saved list, so the
   // subagent picker can search & pick any model the provider actually offers
   // (matching the main composer picker) — not just the ones already saved.
+  // Saved entries are filtered by `removed` too so a model the user removed
+  // (e.g. via Settings → Providers) doesn't sneak back into the picker just
+  // because it's still in `p.models` from an earlier write. Foreign-provider
+  // ids (e.g. a stale "openrouter/sonnet" that landed here via recentModels
+  // migration or a hand-edited saved list) are also skipped so they don't
+  // render under the wrong provider. The foreign-id check runs on the BARE
+  // id `b` (post-strip), not on the raw `m` — otherwise a doubled-prefix
+  // entry like "local/opencode/big-pickle" would pass the raw check (head
+  // === p.id) but still render as the wrong model.
   const modelsFor = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? [])
     const out = new Set<string>()
     for (const m of live[p.id] ?? []) {
       const b = bareModelFor(p, m)
+      if (isForeignModelId(p, b)) continue
       if (!removed.has(b)) out.add(b)
     }
-    for (const m of p.models ?? []) out.add(bareModelFor(p, m))
+    for (const m of p.models ?? []) {
+      const b = bareModelFor(p, m)
+      if (isForeignModelId(p, b)) continue
+      if (!removed.has(b)) out.add(b)
+    }
     if (p.model) {
       const b = bareModelFor(p, p.model)
-      if (!removed.has(b)) out.add(b)
+      if (!isForeignModelId(p, b) && !removed.has(b)) out.add(b)
     }
     return Array.from(out)
   }
@@ -505,6 +519,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return d
   })
 
+  // Filter the active provider's model list: strip foreign-provider IDs that
+  // may have leaked in through stale state or cross-provider merge, matching
+  // the filter applied in ToolModelSelect.modelsFor / ProviderModelSelect.allModels.
+  const settingsModelsFor = (p: ProviderConfig): string[] => {
+    const removed = new Set(p.removedModels ?? [])
+    return (p.models ?? []).filter((m) => {
+      const b = bareModelFor(p, m)
+      return !removed.has(b) && !isForeignModelId(p, b)
+    })
+  }
+
   const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
@@ -785,9 +810,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           const current = useStore.getState().settings.providers.find((p) => p.id === active.id)
           const existing = current?.models ?? []
           const removed = new Set(current?.removedModels ?? [])
+          const fetchedBare = new Set(res.models.map((m) => bareModelFor(active, m)))
           setProviderModels(
             active.id,
-            Array.from(new Set([...res.models.filter((m) => !removed.has(m)), ...existing])),
+            Array.from(new Set([
+              ...res.models.filter((m) => !removed.has(m) && !isForeignModelId(active, bareModelFor(active, m))),
+              ...existing.filter((m) => fetchedBare.has(bareModelFor(active, m)) && !isForeignModelId(active, bareModelFor(active, m))),
+            ])),
           )
         }
         setCfg((c) => {
@@ -1317,11 +1346,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 pick in the composer and custom ones added below are saved to the database for this
                 provider.
               </div>
-              {(active.models ?? []).length === 0 ? (
+              {settingsModelsFor(active).length === 0 ? (
                 <div className="hint">No models saved yet — they appear here after fetching or adding one.</div>
               ) : (
                 <div className="model-tags">
-                  {(active.models ?? []).map((m) => (
+                  {settingsModelsFor(active).map((m) => (
                     <span key={m} className={`model-tag ${m === cfg.model ? 'current' : ''}`}>
                       {m}
                       <button

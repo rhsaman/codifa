@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderConfig } from "../types";
 import { useStore } from "../lib/store";
 import { fetchModels } from "../lib/api";
-import { PROVIDER_META } from "../lib/provider-meta";
+import { PROVIDER_META, isForeignModelId } from "../lib/provider-meta";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
@@ -114,18 +114,32 @@ export function ProviderModelSelect() {
   const activeModel = chat?.model ?? active.model;
 
   // Fetched models + the provider's saved list (custom-added, from the DB) +
-  // current model, minus the models the user explicitly removed.
+  // current model, minus the models the user explicitly removed. Saved entries
+  // are filtered by `removed` too so a model the user removed (e.g. via
+  // Settings → Providers) doesn't sneak back into the dropdown just because
+  // it's still in `p.models` from an earlier write. Foreign-provider ids
+  // (e.g. a stale "openrouter/sonnet" that landed in nvidia's `p.models`
+  // via recentModels migration or a custom-row copy) are also skipped so
+  // they don't render under the wrong provider. The foreign-id check runs
+  // on the BARE id `b` (post-strip), not on the raw `m` — otherwise a
+  // doubled-prefix entry like "local/opencode/big-pickle" would pass the
+  // raw check (head === p.id) but still render as the wrong model.
   const allModels = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? []);
     const out = new Set<string>();
     for (const m of live[p.id] ?? []) {
       const b = bareModel(p, m);
+      if (isForeignModelId(p, b)) continue;
       if (!removed.has(b)) out.add(b);
     }
-    for (const m of p.models ?? []) out.add(bareModel(p, m));
+    for (const m of p.models ?? []) {
+      const b = bareModel(p, m);
+      if (isForeignModelId(p, b)) continue;
+      if (!removed.has(b)) out.add(b);
+    }
     if (p.model) {
       const b = bareModel(p, p.model);
-      if (!removed.has(b)) out.add(b);
+      if (!isForeignModelId(p, b) && !removed.has(b)) out.add(b);
     }
     return Array.from(out);
   };
@@ -155,6 +169,7 @@ export function ProviderModelSelect() {
       if (!p) continue;
       if ((p.removedModels ?? []).includes(r.model)) continue;
       const model = bareModel(p, r.model);
+      if (isForeignModelId(p, model)) continue;
       const key = `${p.id}/${model}`;
       if (seen.has(key)) continue;
       seen.add(key);

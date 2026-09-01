@@ -507,11 +507,11 @@ def test_auto_compact_applies_result_in_place():
     finally:
         graph._agents._compact_history = original
 
-    # The leading system prompt is preserved verbatim.
+    # The leading system prompt is preserved, and the compacted summary is
+    # folded INTO it so the model retains context across compaction.
     assert isinstance(msgs[0], SystemMessage)
-    assert msgs[0].content == "system prompt"
-    # The compacted head (a "[Compacted earlier context]" system note) is folded
-    # into the existing system slot, NOT appended as a second system message.
+    assert msgs[0].content == "system prompt\n\n[Compacted earlier context]\nSUMMARY"
+    # Only one system message exists (the summary is merged, not appended).
     assert sum(1 for m in msgs if isinstance(m, SystemMessage)) == 1
     # The old turns are gone; only the summary + recent tail remain.
     assert len(msgs) == 3

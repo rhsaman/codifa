@@ -56,6 +56,14 @@ EXPLORE_SYSTEM = (
     # filePaths=[...] — never read one file per call (that multiplies turns).
     "When you know multiple files, read them ALL in ONE call using filePaths=[...]. "
     "Never read one-by-one.\n"
+    # Concrete few-shot example — models follow patterns better than abstract rules:
+    "Example — WRONG (2 turns, 2 calls):\n"
+    "  Turn 1: grep(pattern='_MAX_STEPS', include='*.py')\n"
+    "  Turn 2: grep(pattern='_DOOM_LOOP', include='*.py')\n\n"
+    "Example — RIGHT (1 turn, 1 call with '|'):\n"
+    "  Turn 1: grep(pattern='_MAX_STEPS|_DOOM_LOOP', include='*.py')\n\n"
+    "When you have 2+ related patterns for the same path/include, merge them "
+    "with '|' into a single grep call instead of firing separate greps.\n"
     # search_memory is NOT useful for exploration — the CODE MAP above already
     # gives you the symbol layout, and web/fetch recall is handled by the main
     # agent. Do not call search_memory.

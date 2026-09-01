@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 import tracemalloc
+from collections.abc import AsyncIterator
 from typing import Annotated
 from urllib.parse import quote
 
@@ -240,7 +241,27 @@ def _oauth_redirect_uri() -> str:
     return f"http://127.0.0.1:{_SIDECAR_PORT}/oauth/google/callback"
 
 
-app = FastAPI(title="Codifa agent sidecar")
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """پیش‌بارگذاری کاتالوگ models.dev در هنگام راه‌اندازی سرور.
+
+    این کاتالوگ فقط یک‌بار از اینترنت دریافت می‌شود و در حافظه cache می‌شود.
+    اگر در startup انجام نشود، اولین پیام کاربر باید منتظر HTTP request بماند.
+    """
+
+    async def _bg() -> None:
+        try:
+            from providers import _models_dev_catalog
+
+            await _models_dev_catalog()
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    asyncio.create_task(_bg())
+    yield
+
+
+app = FastAPI(title="Codifa agent sidecar", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

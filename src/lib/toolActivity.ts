@@ -188,3 +188,31 @@ export function resolveToolResult(
 
   return activities.map((a) => resolved(a, true));
 }
+
+/**
+ * Force all "running" cards (including nested children) to "done" with an
+ * elapsed time. Used by `resolveStuckCards` in Chat.tsx when a stream ends
+ * without a `tool_result` for every started card (backend crash, stop,
+ * reconnect, lost SSE). Recursion is needed because sub-agent task cards
+ * nest grep/read children that also get stuck at "running" status.
+ */
+export function resolveStuckActivities(
+  activities: ToolActivity[],
+  now: number = Date.now(),
+): ToolActivity[] {
+  const resolve = (a: ToolActivity): ToolActivity => {
+    const children = a.children?.map(resolve);
+    const childrenChanged =
+      children && a.children && children.some((c, i) => c !== a.children![i]);
+    if (a.status === "running") {
+      return {
+        ...a,
+        status: "done" as const,
+        elapsedMs: now - (a.startedAt ?? now),
+        ...(childrenChanged ? { children } : {}),
+      };
+    }
+    return childrenChanged ? { ...a, children } : a;
+  };
+  return activities.map(resolve);
+}

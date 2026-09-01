@@ -15,7 +15,7 @@ import {
 } from "../lib/store";
 import { api } from "../lib/fs";
 import { resetStreamForRetry } from "../lib/retry";
-import { applyToolEvent, makeToolActivity, resolveToolResult } from "../lib/toolActivity";
+import { applyToolEvent, makeToolActivity, resolveStuckActivities, resolveToolResult } from "../lib/toolActivity";
 import { bumpToolRunning, dropToolRunning, isToolRunning } from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { normalizeUsageModel } from "../lib/usage";
@@ -1537,21 +1537,25 @@ export function ChatPanel() {
     // arrives as a normal event, not a throw).
     // A turn's stream can end without a tool_result for every started card
     // (backend crash, stop, error, lost SSE). Force any still-"running" card to
-    // "done" so the spinner/tick never hangs forever.
+    // "done" so the spinner/tick never hangs forever. Recursively resolves
+    // children too — without this, orphaned sub-agent children (grep/read
+    // inside explore task cards) stay "running" forever with a growing timer.
     const resolveStuckCards = () => {
       const msg = useStore
         .getState()
         .chats.find((c) => c.id === chat.id)
         ?.messages.find((m) => m.id === assistantMsg.id);
-      if (!msg || !msg.toolActivity?.some((a) => a.status === "running"))
-        return;
-      const now = Date.now();
+      // Guard: check recursively — a child can be orphaned at "running" even
+      // when the parent task card is already "done" (FIFO race edge case).
+      const hasRunning = (acts: ToolActivity[]): boolean =>
+        acts.some(
+          (a) =>
+            a.status === "running" ||
+            (a.children != null && hasRunning(a.children)),
+        );
+      if (!msg || !hasRunning(msg.toolActivity ?? [])) return;
       useStore.getState().updateMessage(assistantMsg.id, {
-        toolActivity: msg.toolActivity.map((a) =>
-          a.status === "running"
-            ? { ...a, status: "done", elapsedMs: now - (a.startedAt ?? now) }
-            : a,
-        ),
+        toolActivity: resolveStuckActivities(msg.toolActivity ?? []),
       });
     };
 
@@ -1734,6 +1738,10 @@ export function ChatPanel() {
         if (event.reconnecting) {
           // Client self-heal: keep the already-streamed text; just show a
           // transient "reconnecting" pill so the user understands the restart.
+          // Resolve any stuck "running" cards from the previous session first
+          // (including orphaned sub-agent children) so their timers don't grow
+          // forever. The new stream will add fresh cards for this attempt.
+          resolveStuckCards();
           store.updateMessage(assistantMsg.id, { retry: info });
         } else {
           const cur = findMsg();

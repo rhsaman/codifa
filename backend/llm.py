@@ -641,6 +641,8 @@ async def langchain_tool_loop(
     _last_call_sig = None
     _same_call_streak = 0
     _DOOM_LOOP_LIMIT = 3
+    _TOOL_CALL_SOFT_LIMIT = 8
+    _tool_call_count = 0
     while steps < max_steps:
         steps += 1
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -693,6 +695,32 @@ async def langchain_tool_loop(
                     content = content[: _unit * 3] + " … [repetition loop truncated]"
             return str(content) if isinstance(content, str) else str(content or "")
         msgs.append(ai)
+        # ── Deduplicate identical tool calls ──────────────────────────
+        # The model sometimes outputs the same (name, args) pair twice in one
+        # step.  Execute each unique call once and reuse the result for the
+        # duplicates so we don't burn extra I/O, emit duplicate sidecar
+        # events, or send redundant ToolMessages back to the LLM.
+        _dup_ids: dict[str, str] = {}  # duplicate tool_call_id → original id
+        if tcs:
+            _seen_sigs: dict[str, str] = {}
+            _deduped: list = []
+            for _tc in tcs:
+                _sig = (
+                    f"{_tc.get('name')}:"
+                    f"{json.dumps(_tc.get('args') or {}, sort_keys=True, ensure_ascii=False)}"
+                )
+                _orig_id = _seen_sigs.get(_sig)
+                if _orig_id is not None:
+                    _dup_ids[_tc.get("id", "")] = _orig_id
+                else:
+                    _seen_sigs[_sig] = _tc.get("id", "")
+                    _deduped.append(_tc)
+            if _dup_ids:
+                _logger.info(
+                    "deduped %d duplicate tool calls in sub-agent step",
+                    len(_dup_ids),
+                )
+            tcs = _deduped
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -716,6 +744,42 @@ async def langchain_tool_loop(
         for tc in _sequential:
             result = await _exec(tc)
             msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
+        # Emit ToolMessages for duplicate tool calls that were deduped above so
+        # the LLM sees a result for every tool_call_id it originally sent.
+        if _dup_ids:
+            for _dup_id, _orig_id in _dup_ids.items():
+                for _m in reversed(msgs):
+                    if (
+                        isinstance(_m, ToolMessage)
+                        and getattr(_m, "tool_call_id", "") == _orig_id
+                    ):
+                        msgs.append(
+                            ToolMessage(content=_m.content, tool_call_id=_dup_id)
+                        )
+                        break
+        # --- soft tool-call budget nudge ---
+        # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or
+        # summarizing — mirrors the doom-loop guard but for "too many calls" rather
+        # than "same call repeated". The model can still call tools if genuinely
+        # needed; this just breaks the habit of fire-one-at-a-time greps.
+        _tool_call_count += len(tcs)
+        if (
+            _tool_call_count >= _TOOL_CALL_SOFT_LIMIT
+            and steps < max_steps - 1
+        ):
+            msgs.append(
+                SystemMessage(
+                    content=(
+                        f"You have made {_tool_call_count} tool calls so far "
+                        f"(soft limit: {_TOOL_CALL_SOFT_LIMIT}). "
+                        "If you have enough information, STOP calling tools and "
+                        "summarize your findings now. "
+                        "If not, batch remaining searches: combine patterns with "
+                        "'|' in a single grep, use filePaths=[...] for multiple "
+                        "reads, and fire them all in ONE parallel turn."
+                    )
+                )
+            )
         # --- doom-loop guard (opencode's repeated-call detector) ---
         # Build a signature of THIS step's tool calls; if it matches the previous
         # step exactly N times in a row, the model is looping — inject a hard

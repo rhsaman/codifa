@@ -1188,9 +1188,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # and merge the live tools into the same `filtered` dict the tool loop
     # reads, plus expose a cleanup coroutine so the caller can close the
     # sessions when the turn ends.
-    mcp_tools, mcp_cleanup = await build_mcp_tools(
-        state.get("mcp_servers") or {}, lambda ev: queue.put_nowait(ev)
-    )
+    mcp_tools: list = []
+    mcp_cleanup = None
+    _mcp_servers = state.get("mcp_servers") or {}
+    if _mcp_servers:
+        mcp_tools, mcp_cleanup = await build_mcp_tools(
+            _mcp_servers, lambda ev: queue.put_nowait(ev)
+        )
     for t in mcp_tools:
         filtered[t.name] = t.func
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
@@ -1525,8 +1529,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "just to verify behavior, reproduce a bug, or sanity-check an "
                         "API — may live in the OS temp directory (use Python's "
                         "tempfile.gettempdir() or Node's os.tmpdir(); the sandbox "
-                        "permits this). Do NOT commit scratch tests under backend/tests/ or any "
-                        "tracked test directory; clean them up when done."
+                        "permits this). Do NOT commit scratch tests into the project's "
+                        "version-controlled directories; clean them up when done."
                     )
                 ),
             )
@@ -2516,37 +2520,14 @@ async def _run_mode_turn(
                                 queue.put_nowait({"kind": "text", "content": t})
                                 _emitted_text_len[0] += len(t)
                             elif ptype in ("tool_use", "tool_call"):
-                                # Surface the tool_use part as a `kind: "tool"`
-                                # event IN ORDER with the text that preceded
-                                # it, so the UI's tool/text interleaving never
-                                # flips (a free-tier model that announces
-                                # "I'll search" then immediately emits the
-                                # tool_use part would otherwise show the tool
-                                # card AFTER the answer finished). ``name`` /
-                                # ``input`` are the Anthropic-native keys;
-                                # ``function`` is the OpenAI-native shape —
-                                # we coerce to a single shape so the frontend
-                                # doesn't have to know which provider it came
-                                # from.
-                                _pname = part.get("name") or (
-                                    part.get("function") or {}
-                                ).get("name") or ""
-                                _pargs = part.get("input")
-                                if _pargs is None:
-                                    _pargs = (part.get("function") or {}).get("arguments")
-                                if isinstance(_pargs, str):
-                                    try:
-                                        _pargs = json.loads(_pargs)
-                                    except Exception:
-                                        _pargs = {"_raw": _pargs}
-                                queue.put_nowait(
-                                    {
-                                        "kind": "tool",
-                                        "tool": _pname,
-                                        "args": _pargs or {},
-                                        "id": part.get("id") or "",
-                                    }
-                                )
+                                # Each tool function (via make_tool_callbacks)
+                                # emits its own {"kind": "tool"} event during
+                                # execution. We do NOT emit here to avoid
+                                # duplicate UI cards — this streaming emit AND
+                                # the in-tool emit both produced a card with
+                                # different IDs (LLM string vs call_id int),
+                                # doubling every tool row in the UI.
+                                pass
                 if ai is None:
                     break
                 # Safety net for models that only reason and emit no text: make
@@ -2838,18 +2819,36 @@ async def _run_mode_turn(
                 )
                 is None
             ]
-            # انتشار event ابزار قبل از اجرا — کارت ابزار فوراً در UI نمایش
-            # داده می‌شود (پیش از اجرای واقعی)، مشابه مسیر Anthropic که
-            # tool_use inline با stream منتشر می‌شود.
-            for _ptc in _pending:
-                queue.put_nowait(
-                    {
-                        "kind": "tool",
-                        "tool": _ptc.get("name") or "",
-                        "args": _ptc.get("args") or {},
-                        "id": _ptc.get("id") or "",
-                    }
+            # ── Deduplicate identical tool calls in the main agent loop ──
+            # The model sometimes outputs the same (name, args) pair twice in
+            # one step. Execute each unique call once and reuse the result for
+            # the duplicates to save I/O, token cost, and avoid duplicate UI
+            # sidecar events.
+            _dup_ids: dict[str, str] = {}  # duplicate id → original id
+            _seen_sigs: dict[str, str] = {}
+            _deduped: list = []
+            for _tc in _pending:
+                _sig = (
+                    f"{_tc.get('name')}:"
+                    f"{json.dumps(_tc.get('args') or {}, sort_keys=True, ensure_ascii=False)}"
                 )
+                _orig_id = _seen_sigs.get(_sig)
+                if _orig_id is not None:
+                    _dup_ids[_tc.get("id", "")] = _orig_id
+                else:
+                    _seen_sigs[_sig] = _tc.get("id", "")
+                    _deduped.append(_tc)
+            if _dup_ids:
+                import logging as _log
+                _log.getLogger(__name__).info(
+                    "deduped %d duplicate tool calls in main agent step",
+                    len(_dup_ids),
+                )
+            _pending = _deduped
+            # NOTE: Each tool function (via make_tool_callbacks) emits its own
+            # {"kind": "tool"} event internally. We do NOT emit here to avoid
+            # duplicate UI cards — previously this pre-execution emit AND the
+            # in-tool emit both produced a card, doubling every tool row.
             _parallel = [
                 tc for tc in _pending if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
             ]
@@ -2889,6 +2888,19 @@ async def _run_mode_turn(
                 )
                 # Persist this completed (mutating) tool result too.
                 await _save_turn_checkpoint(_resume_thread, msgs)
+            # Emit ToolMessages for duplicate tool calls that were deduped above
+            # so the LLM sees a result for every tool_call_id it originally sent.
+            if _dup_ids:
+                for _dup_id, _orig_id in _dup_ids.items():
+                    for _m in reversed(msgs):
+                        if (
+                            isinstance(_m, ToolMessage)
+                            and getattr(_m, "tool_call_id", "") == _orig_id
+                        ):
+                            msgs.append(
+                                ToolMessage(content=_m.content, tool_call_id=_dup_id)
+                            )
+                            break
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
             # transcript stays valid (a tool_calls AIMessage must be followed by its
             # ToolMessages before any new HumanMessage). Gives the model a chance to

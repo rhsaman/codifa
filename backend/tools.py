@@ -16,9 +16,9 @@ import json
 import os
 import re
 import shutil
-import tempfile
 import signal
 import subprocess
+import tempfile
 import time
 import unicodedata
 import uuid

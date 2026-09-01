@@ -39,9 +39,10 @@ out/
 *.pkg
 
 # Test temp artifacts (real test files ARE tracked — see test/ and backend/tests/)
-backend/test/_tmp_*/
-test/.tmp-*
-test/dump-ssr.out.mjs
+backend/tests/_tmp_*/
+tests/.tmp-*
+tests/dump-ssr.out.mjs
+.tmp-*.mjs
 
 # ============================================================
 # Python / uv

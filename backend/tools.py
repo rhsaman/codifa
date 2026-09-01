@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import signal
 import subprocess
 import time
@@ -627,10 +628,11 @@ def _escapes_root(command: str, root: str) -> str | None:
     if re.search(r"(^|[\s;|&])\.\.(/|\s|$)", command):
         return "references paths outside the project root (..)"
     # Absolute paths must lie inside the workspace (or be a safe system sink).
-    _SAFE_ABS = ("/dev/null", "/tmp/", "/dev/std", "/dev/fd")
+    _os_tmp = tempfile.gettempdir().rstrip("/\\") + os.sep
+    _SAFE_ABS = ("/dev/null", _os_tmp, "/tmp/", "/dev/std", "/dev/fd")
     for m in re.finditer(r"(?:^|[\s;|&])(/[^\s;|&'\"`]*)", command):
         p = m.group(1)
-        if p == "/tmp" or p.startswith(_SAFE_ABS):
+        if p == "/tmp" or p.rstrip("/\\") == _os_tmp.rstrip("/\\") or p.startswith(_SAFE_ABS):
             continue
         try:
             real = os.path.realpath(p)

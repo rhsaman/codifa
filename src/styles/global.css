@@ -18,6 +18,15 @@
   /* Freshly-processed (non-cached) tokens, shown next to the cached (⚡)
      badge in the Model usage panel -- Catppuccin Mocha peach. */
   --fresh: #fab387;
+  /* Per-provider dot colors for the Model usage panel — fallback (Catppuccin). */
+  --provider-opencode: #f38ba8;
+  --provider-openrouter: #fab387;
+  --provider-google: #f9e2af;
+  --provider-nvidia: #94e2d5;
+  --provider-cloudflare: #89b4fa;
+  --provider-tokenrouter: #cba6f7;
+  --provider-ollama: #f5c2e7;
+  --provider-custom: #a6adc8;
   /* Tool-call category colors are derived from the theme accent via
      --tool-color overrides on each card class: single = full accent,
      group = muted mix, explore = dimmer mix. No fixed per-category vars. */
@@ -1205,7 +1214,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 7px 10px;
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -1213,6 +1222,7 @@ textarea {
   color: var(--text-dim);
   cursor: pointer;
   user-select: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 }
 
 .sidebar-panel-head:hover {
@@ -1345,10 +1355,10 @@ textarea {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: baseline;
-  gap: 2px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
@@ -1358,7 +1368,7 @@ textarea {
 }
 
 .sidebar-usage-grand-cache {
-  color: var(--text-dim);
+  color: var(--text);
   font-weight: 600;
 }
 
@@ -1392,7 +1402,7 @@ textarea {
 .sidebar-usage-groups {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   padding: 2px 6px 6px;
   overflow-y: auto;
 }
@@ -1424,6 +1434,14 @@ textarea {
   border-color: var(--border);
 }
 
+/* Enhanced group hover — subtle glow effect. */
+.sidebar-usage-group:hover {
+  border-color: color-mix(in srgb, var(--accent) 12%, var(--border));
+}
+.sidebar-usage-group.open:hover {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+}
+
 .sidebar-usage-group-head {
   display: flex;
   align-items: center;
@@ -1447,8 +1465,43 @@ textarea {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 20%, transparent);
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+  transition: background 0.2s, box-shadow 0.2s;
+}
+
+/* Per-provider dot colors — matched via data-provider attribute. */
+.sidebar-usage-group[data-provider="opencode"] .sidebar-usage-group-dot {
+  background: var(--provider-opencode);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-opencode) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="openrouter"] .sidebar-usage-group-dot {
+  background: var(--provider-openrouter);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-openrouter) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="google"] .sidebar-usage-group-dot {
+  background: var(--provider-google);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-google) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="nvidia"] .sidebar-usage-group-dot {
+  background: var(--provider-nvidia);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-nvidia) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="cloudflare"] .sidebar-usage-group-dot {
+  background: var(--provider-cloudflare);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-cloudflare) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="ollama"] .sidebar-usage-group-dot {
+  background: var(--provider-ollama);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-ollama) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="tokenrouter"] .sidebar-usage-group-dot {
+  background: var(--provider-tokenrouter);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-tokenrouter) 25%, transparent);
+}
+.sidebar-usage-group[data-provider="custom"] .sidebar-usage-group-dot {
+  background: var(--provider-custom);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-custom) 25%, transparent);
 }
 
 .sidebar-usage-group-name {
@@ -1464,7 +1517,8 @@ textarea {
 .sidebar-usage-group-total {
   flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
-  color: var(--text-dim);
+  color: var(--text);
+  font-weight: 600;
 }
 
 .sidebar-usage-list {
@@ -1473,8 +1527,8 @@ textarea {
   padding: 2px 6px 6px 21px;
   display: flex;
   flex-direction: column;
-  gap: 1px;
-  border-top: 1px dashed var(--border);
+  gap: 2px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 }
 
 .sidebar-usage-head,
@@ -1490,11 +1544,11 @@ textarea {
 .sidebar-usage-head {
   color: var(--text-dim);
   font-weight: 700;
-  font-size: 9px;
+  font-size: 9.5px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
   padding: 6px 4px 4px;
-  opacity: 0.65;
+  opacity: 0.75;
 }
 
 .sidebar-usage-item {

@@ -1523,6 +1523,7 @@ export function Sidebar() {
                       <div
                         key={pid}
                         className={`sidebar-usage-group${open ? " open" : ""}`}
+                        data-provider={pid}
                       >
                         <div
                           className="sidebar-usage-group-head"

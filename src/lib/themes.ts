@@ -31,6 +31,14 @@ export const THEMES: Theme[] = [
       '--success': '#46a758',
       '--link': '#e88d67',
       '--thinking': '#e8c468',
+      '--provider-opencode': '#e5484d',
+      '--provider-openrouter': '#e8c468',
+      '--provider-google': '#46a758',
+      '--provider-nvidia': '#6bb8a8',
+      '--provider-cloudflare': '#e88d67',
+      '--provider-tokenrouter': '#d97757',
+      '--provider-ollama': '#a78bfa',
+      '--provider-custom': '#b8b6ac',
     },
     workspaceColors: [
       '#e5484d', // red
@@ -63,6 +71,14 @@ export const THEMES: Theme[] = [
       '--success': '#9ece6a',
       '--link': '#7aa2f7',
       '--thinking': '#e0af68',
+      '--provider-opencode': '#f7768e',
+      '--provider-openrouter': '#e0af68',
+      '--provider-google': '#9ece6a',
+      '--provider-nvidia': '#73daca',
+      '--provider-cloudflare': '#7aa2f7',
+      '--provider-tokenrouter': '#bb9af7',
+      '--provider-ollama': '#ff9e64',
+      '--provider-custom': '#c0caf5',
     },
     workspaceColors: [
       '#f7768e', // red
@@ -95,6 +111,14 @@ export const THEMES: Theme[] = [
       '--success': '#a6e3a1',
       '--link': '#89b4fa',
       '--thinking': '#f9e2af',
+      '--provider-opencode': '#f38ba8',
+      '--provider-openrouter': '#fab387',
+      '--provider-google': '#f9e2af',
+      '--provider-nvidia': '#94e2d5',
+      '--provider-cloudflare': '#89b4fa',
+      '--provider-tokenrouter': '#cba6f7',
+      '--provider-ollama': '#f5c2e7',
+      '--provider-custom': '#a6adc8',
     },
     workspaceColors: [
       '#f38ba8', // red
@@ -127,6 +151,14 @@ export const THEMES: Theme[] = [
       '--success': '#a6da95',
       '--link': '#8aadf4',
       '--thinking': '#eed49f',
+      '--provider-opencode': '#ed8796',
+      '--provider-openrouter': '#f5a97f',
+      '--provider-google': '#eed49f',
+      '--provider-nvidia': '#8bd5ca',
+      '--provider-cloudflare': '#8aadf4',
+      '--provider-tokenrouter': '#c6a0f6',
+      '--provider-ollama': '#f5bde6',
+      '--provider-custom': '#b8c0e0',
     },
     workspaceColors: [
       '#ed8796', // red
@@ -159,6 +191,14 @@ export const THEMES: Theme[] = [
       '--success': '#a6d189',
       '--link': '#8caaee',
       '--thinking': '#e5c890',
+      '--provider-opencode': '#e78284',
+      '--provider-openrouter': '#ef9f76',
+      '--provider-google': '#e5c890',
+      '--provider-nvidia': '#81c8be',
+      '--provider-cloudflare': '#8caaee',
+      '--provider-tokenrouter': '#ca9ee6',
+      '--provider-ollama': '#f4b8e4',
+      '--provider-custom': '#c6d0f5',
     },
     workspaceColors: [
       '#e78284', // red
@@ -194,6 +234,14 @@ export const THEMES: Theme[] = [
       '--diff-text': '#3d4057',
       '--link': '#1a5cd6',
       '--thinking': '#8f6200',
+      '--provider-opencode': '#d20f39',
+      '--provider-openrouter': '#fe640b',
+      '--provider-google': '#df8e1d',
+      '--provider-nvidia': '#179299',
+      '--provider-cloudflare': '#1e66f5',
+      '--provider-tokenrouter': '#8839ef',
+      '--provider-ollama': '#ea76cb',
+      '--provider-custom': '#40435a',
     },
     workspaceColors: [
       '#d20f39', // red
@@ -226,6 +274,14 @@ export const THEMES: Theme[] = [
       '--success': '#b8bb26',
       '--link': '#83a598',
       '--thinking': '#fabd2f',
+      '--provider-opencode': '#fb4934',
+      '--provider-openrouter': '#fabd2f',
+      '--provider-google': '#b8bb26',
+      '--provider-nvidia': '#8ec07c',
+      '--provider-cloudflare': '#83a598',
+      '--provider-tokenrouter': '#d3869b',
+      '--provider-ollama': '#fe8019',
+      '--provider-custom': '#ebdbb2',
     },
     workspaceColors: [
       '#fb4934', // red
@@ -258,6 +314,14 @@ export const THEMES: Theme[] = [
       '--success': '#50fa7b',
       '--link': '#8be9fd',
       '--thinking': '#f1fa8c',
+      '--provider-opencode': '#ff5555',
+      '--provider-openrouter': '#f1fa8c',
+      '--provider-google': '#50fa7b',
+      '--provider-nvidia': '#8be9fd',
+      '--provider-cloudflare': '#bd93f9',
+      '--provider-tokenrouter': '#ff79c6',
+      '--provider-ollama': '#ffb86c',
+      '--provider-custom': '#f8f8f2',
     },
     workspaceColors: [
       '#ff5555', // red
@@ -290,6 +354,14 @@ export const THEMES: Theme[] = [
       '--success': '#a3be8c',
       '--link': '#81a1c1',
       '--thinking': '#ebcb8b',
+      '--provider-opencode': '#bf616a',
+      '--provider-openrouter': '#ebcb8b',
+      '--provider-google': '#a3be8c',
+      '--provider-nvidia': '#88c0d0',
+      '--provider-cloudflare': '#81a1c1',
+      '--provider-tokenrouter': '#b48ead',
+      '--provider-ollama': '#d08770',
+      '--provider-custom': '#d8dee9',
     },
     workspaceColors: [
       '#bf616a', // red
@@ -322,6 +394,14 @@ export const THEMES: Theme[] = [
       '--success': '#9ccfd8',
       '--link': '#4a9bc0',
       '--thinking': '#f6c177',
+      '--provider-opencode': '#eb6f92',
+      '--provider-openrouter': '#f6c177',
+      '--provider-google': '#9ccfd8',
+      '--provider-nvidia': '#31748f',
+      '--provider-cloudflare': '#c4a7e7',
+      '--provider-tokenrouter': '#ebbcba',
+      '--provider-ollama': '#6e6a86',
+      '--provider-custom': '#e0def4',
     },
     workspaceColors: [
       '#eb6f92', // red
@@ -354,6 +434,14 @@ export const THEMES: Theme[] = [
       '--success': '#98c379',
       '--link': '#61afef',
       '--thinking': '#e5c07b',
+      '--provider-opencode': '#e06c75',
+      '--provider-openrouter': '#e5c07b',
+      '--provider-google': '#98c379',
+      '--provider-nvidia': '#56b6c2',
+      '--provider-cloudflare': '#61afef',
+      '--provider-tokenrouter': '#c678dd',
+      '--provider-ollama': '#d19a66',
+      '--provider-custom': '#abb2bf',
     },
     workspaceColors: [
       '#e06c75', // red
@@ -386,6 +474,14 @@ export const THEMES: Theme[] = [
       '--success': '#a6e22e',
       '--link': '#66d9ef',
       '--thinking': '#e6db74',
+      '--provider-opencode': '#f92672',
+      '--provider-openrouter': '#e6db74',
+      '--provider-google': '#a6e22e',
+      '--provider-nvidia': '#66d9ef',
+      '--provider-cloudflare': '#ae81ff',
+      '--provider-tokenrouter': '#fd971f',
+      '--provider-ollama': '#f8f8f2',
+      '--provider-custom': '#75715e',
     },
     workspaceColors: [
       '#f92672', // red
@@ -418,6 +514,14 @@ export const THEMES: Theme[] = [
       '--success': '#7fa172',
       '--link': '#7fb4ca',
       '--thinking': '#dca561',
+      '--provider-opencode': '#c34043',
+      '--provider-openrouter': '#dca561',
+      '--provider-google': '#76946a',
+      '--provider-nvidia': '#6a9589',
+      '--provider-cloudflare': '#7e9cd8',
+      '--provider-tokenrouter': '#957fb8',
+      '--provider-ollama': '#7fb4ca',
+      '--provider-custom': '#dcd7ba',
     },
     workspaceColors: [
       '#c34043', // red
@@ -450,6 +554,14 @@ export const THEMES: Theme[] = [
       '--success': '#a7c080',
       '--link': '#7fbbb3',
       '--thinking': '#dbbc7f',
+      '--provider-opencode': '#e67e80',
+      '--provider-openrouter': '#dbbc7f',
+      '--provider-google': '#a7c080',
+      '--provider-nvidia': '#83c092',
+      '--provider-cloudflare': '#7fbbb3',
+      '--provider-tokenrouter': '#d699b6',
+      '--provider-ollama': '#e69875',
+      '--provider-custom': '#d3c6aa',
     },
     workspaceColors: [
       '#e67e80', // red

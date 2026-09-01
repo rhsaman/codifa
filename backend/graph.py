@@ -1523,8 +1523,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "code they test (in the same package/sub-package). Temporary "
                         "tests — scratch / probe / smoke / quick experiments you do "
                         "just to verify behavior, reproduce a bug, or sanity-check an "
-                        "API — may live in /tmp/ (the sandbox already permits this "
-                        "path). Do NOT commit scratch tests under backend/tests/ or any "
+                        "API — may live in the OS temp directory (use Python's "
+                        "tempfile.gettempdir() or Node's os.tmpdir(); the sandbox "
+                        "permits this). Do NOT commit scratch tests under backend/tests/ or any "
                         "tracked test directory; clean them up when done."
                     )
                 ),

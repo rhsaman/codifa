@@ -71,6 +71,8 @@ from agents import normalize_mode
 from llm import (
     _is_stream_options_error,
     _strip_stream_options,
+    _is_parallel_calls_error,
+    _strip_parallel_calls,
     build_chat_model,
     chat_model_settings,
     llm_generate,
@@ -2294,6 +2296,7 @@ async def _run_mode_turn(
         steps = 0
         reply = ""
         _no_so = False
+        _no_pc = False
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
         # Every completed tool result is persisted to LangGraph's checkpointer
         # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
@@ -2507,6 +2510,15 @@ async def _run_mode_turn(
                     _no_so = True
                     model = _strip_stream_options(model)
                     continue
+                # Some free-tier OpenRouter models (e.g. minimax/minimax-m3:free)
+                # reject `parallel_tool_calls` with a 400. opencode routes the
+                # same model without the field and works fine. Strip it and
+                # retry once so codifa matches opencode's behaviour instead of
+                # failing the whole turn on a non-essential OpenAI field.
+                if not _no_pc and _is_parallel_calls_error(exc):
+                    _no_pc = True
+                    model = _strip_parallel_calls(model)
+                    continue
                 # Surface the most common per-step failures as readable SSE
                 # events instead of letting them bubble up to _drive as raw
                 # tracebacks (the old behavior looked like a silent
@@ -2661,14 +2673,16 @@ async def _run_mode_turn(
                     with contextlib.suppress(Exception):
                         run_flags["error"] = True
                 break
-            elif _tool_sig:
+            elif _tool_sig and _repeat_count >= 1:
                 # Recoverable repetition: the SAME tool call with IDENTICAL
                 # arguments just repeated, but we haven't hit the hard-stop yet.
                 # Nudge the model to vary its approach instead of aborting on the
                 # first repeat. The nudge HumanMessage is appended after the tool
                 # results below (see _nudge_pending) so the transcript stays valid.
                 # The model gets (_MAX_REPEAT - 1) chances to break the loop before
-                # the hard stop fires.
+                # the hard stop fires. Skip the warn when _repeat_count == 0:
+                # that's a fresh tool call, not a repeat (the previous "0 time(s)
+                # in a row" message was a confusing false-positive).
                 try:
                     _sig = json.loads(_tool_sig)
                     _nudge_tool = _sig[0][0] if _sig else "tool"
@@ -3197,12 +3211,18 @@ def review_node(state: AgentState) -> dict:
 
 
 def done_node(state: AgentState) -> dict:
-    """Finalize the run."""
-    queue = state["_queue"]
+    """Finalize the run.
+
+    The terminal ``done`` SSE event is emitted by ``server.event_gen``'s
+    ``finally`` block (always runs on every path: clean, error, cancel). It
+    used to also be emitted here, which caused a duplicate ``done`` event
+    on every turn (graph.done_node + event_gen.finally) — the frontend
+    treats the second one as "stream DISCONNECTED" and could trigger a
+    needless reconnect. Keep only the state update here.
+    """
     final = state.get("final_response", "")
     if state.get("review_result"):
         final = final + "\n\n[Review] " + state["review_result"]
-    queue.put_nowait({"kind": "done"})
     return {"final_response": final}
 
 

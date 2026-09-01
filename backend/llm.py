@@ -345,6 +345,52 @@ def _is_stream_options_error(exc: Exception) -> bool:
     return bool(status == 400 and "stream_options" in msg)
 
 
+def _is_parallel_calls_error(exc: Exception) -> bool:
+    """True when an exception is a 4xx caused by an unsupported
+    ``parallel_tool_calls`` request field. Some free-tier OpenRouter models
+    (e.g. ``minimax/minimax-m3:free``) reject the field with 400 even though
+    opencode routes the same model without it fine. The runner retries once
+    with the field stripped instead of failing the whole turn."""
+    msg = str(exc).lower()
+    if "parallel_tool_calls" in msg and (
+        "400" in msg
+        or "unsupported" in msg
+        or "not supported" in msg
+        or "additionalproperties" in msg
+        or "additional properties" in msg
+    ):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    return bool(status == 400 and "parallel_tool_calls" in msg)
+
+
+def _strip_parallel_calls(model: Any) -> Any:
+    """Return a copy of ``model`` with ``parallel_tool_calls`` removed from
+    model_kwargs. Mirrors ``_strip_stream_options`` for the same class of
+    "free-tier model rejects a non-essential OpenAI field" failure."""
+    try:
+        clone = model.model_copy(deep=False)
+    except Exception:  # noqa: BLE001
+        return model
+    mk = dict(getattr(clone, "model_kwargs", None) or {})
+    if "parallel_tool_calls" in mk:
+        mk = {k: v for k, v in mk.items() if k != "parallel_tool_calls"}
+        try:
+            clone.model_kwargs = mk
+        except Exception:  # noqa: BLE001, S110
+            pass
+    pa = getattr(clone, "parallel_tool_calls", None)
+    if pa is not None:
+        try:
+            clone.parallel_tool_calls = None
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return clone
+
+
 async def chat_model_settings(
     mode: str,
     ctx: int,

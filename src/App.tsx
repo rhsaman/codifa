@@ -5,6 +5,7 @@ import { Sidebar } from './components/Sidebar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
@@ -219,9 +220,10 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="titlebar">
+      <header className="titlebar" role="banner">
         <button
           className="icon-btn"
+          aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
           title={sidebarOpen ? 'Hide sidebar (⌘B)' : 'Show sidebar (⌘B)'}
           onClick={() => useStore.getState().toggleSidebar()}
         >
@@ -234,18 +236,21 @@ export default function App() {
         <UpdateButton />
         <button
           className="workspace-btn"
+          aria-label="Open workspace folder"
           title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
           onClick={() => void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))}
         >
           📁 {activeChatRoot ? activeChatRoot.split('/').filter(Boolean).pop() : 'Open workspace'}
         </button>
-      </div>
+      </header>
 
       <div className="app-body">
-        <Sidebar />
-        <main className="main">
-          <ChatPanel key={activeChatId} />
-        </main>
+        <ErrorBoundary>
+          <Sidebar />
+          <main className="main">
+            <ChatPanel key={activeChatId} />
+          </main>
+        </ErrorBoundary>
       </div>
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}

@@ -804,7 +804,25 @@ export function Sidebar() {
                       </>
                     )}
                   </svg>
-                  <span className="sidebar-group-label">{g.label}</span>
+                  {renamingWsKey === g.key ? (
+                    <input
+                      className="ws-rename-input"
+                      autoFocus
+                      value={wsRenameValue}
+                      onChange={(e) => setWsRenameValue(e.target.value)}
+                      onBlur={commitWsRename}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitWsRename();
+                        else if (e.key === "Escape") {
+                          setRenamingWsKey(null);
+                          setWsRenameValue("");
+                        }
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <span className="sidebar-group-label">{g.label}</span>
+                  )}
                 </button>
                 <div className="sidebar-group-actions">
                   <button

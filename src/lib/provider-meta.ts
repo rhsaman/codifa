@@ -28,8 +28,10 @@ export interface ProviderKindMeta {
   local?: boolean
   /** True = the user can enter a custom Base URL (custom / ollama). */
   editableBaseUrl?: boolean
-  /** Read-only base-URL hint shown for built-in providers. */
+  /** Read-only base-URL hint shown for built-in providers (just the URL). */
   baseUrlHint?: string
+  /** Optional description shown below the base-URL hint. */
+  baseUrlDesc?: string
   /** Default base URL for built-in providers (used when user doesn't override). */
   defaultBaseUrl?: string
   /** True = supports Google-style OAuth sign-in. */
@@ -50,7 +52,8 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: false,
     builtin: true,
     unprefixedModelId: true,
-    baseUrlHint: 'https://opencode.ai/zen/v1 — routed via the opencode gateway (never OpenRouter).',
+    baseUrlHint: 'https://opencode.ai/zen/v1',
+    baseUrlDesc: 'Routed via the opencode gateway.',
     defaultBaseUrl: 'https://opencode.ai/zen/v1',
   },
   openrouter: {
@@ -73,7 +76,8 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: true,
     builtin: true,
     oauth: true,
-    baseUrlHint: 'https://generativelanguage.googleapis.com/v1beta/openai — Gemini models via Google.',
+    baseUrlHint: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    baseUrlDesc: 'Gemini models via Google.',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
   },
   nvidia: {
@@ -84,7 +88,8 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     envVars: ['NVIDIA_API_KEY'],
     requiresKey: true,
     builtin: true,
-    baseUrlHint: 'https://integrate.api.nvidia.com/v1 — NVIDIA NIM hosted models.',
+    baseUrlHint: 'https://integrate.api.nvidia.com/v1',
+    baseUrlDesc: 'NVIDIA NIM hosted models.',
     defaultBaseUrl: 'https://integrate.api.nvidia.com/v1',
   },
   cloudflare: {
@@ -95,7 +100,8 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     envVars: ['CLOUDFLARE_AUTH_TOKEN', 'CLOUDFLARE_API_TOKEN'],
     requiresKey: true,
     builtin: true,
-    baseUrlHint: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 — Workers AI.',
+    baseUrlHint: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1',
+    baseUrlDesc: 'Workers AI.',
     extraHint: 'Also requires CLOUDFLARE_ACCOUNT_ID in your environment.',
     defaultBaseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1',
   },
@@ -107,7 +113,8 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     envVars: ['TOKEN_ROUTER_API_KEY', 'TOKENROUTER_API_KEY'],
     requiresKey: true,
     builtin: true,
-    baseUrlHint: 'https://api.tokenrouter.com/v1 — unified AI model hub.',
+    baseUrlHint: 'https://api.tokenrouter.com/v1',
+    baseUrlDesc: 'Unified AI model hub.',
     defaultBaseUrl: 'https://api.tokenrouter.com/v1',
   },
   ollama: {

@@ -20,6 +20,28 @@ const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .map((m) => m.kind)
 const NEW_SKILL_KEY = '__new_skill__'
 
+/** بررسی می‌کنه آیا یک پروایدر تنظیم شده (کلید API یا OAuth یا env var داره).
+ *  envVarVerified: برای پروایدر فعال، مقدار async-شده envVarValue رو بفرست. */
+function isProviderConfigured(p: ProviderConfig, envVarVerified?: boolean | null): boolean {
+  if (providerMeta(p.kind).local) return true
+  if (p.apiKey) return true
+  if (p.authType === 'oauth' && p.oauthRefreshToken) return true
+  if (p.envVar) {
+    // فقط وقتی سبز باش که env var واقعاً وجود داشته باشه
+    if (envVarVerified !== undefined) return envVarVerified === true
+    // برای پروایدرهای غیرفعال نمی‌تونیم env var رو async چک کنیم → خاکستری
+    return false
+  }
+  return false
+}
+
+/** توضیح کوتاه بر اساس kind */
+function providerDescription(p: ProviderConfig): string {
+  if (p.envVar) return `Env: ${p.envVar}`
+  if (p.baseUrl) return p.baseUrl.replace(/^https?:\/\//, '').slice(0, 40)
+  return KIND_LABELS[p.kind] || p.kind
+}
+
 function modelLabelForOpts(kind: ProviderKind, providerId: string, m: string): string {
   return PROVIDER_META[kind]?.unprefixedModelId ? m : `${providerId}/${m}`
 }
@@ -501,6 +523,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // open, "ok"/"error" + message when the flow settles.
   const [oauthState, setOauthState] = useState<{ status: string; msg: string }>({ status: '', msg: '' })
   const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
+  // وضعیت env var همه پروایدرها — برای dot تب‌ها استفاده می‌شه
+  const [providerEnvMap, setProviderEnvMap] = useState<Map<string, boolean>>(new Map())
   // Which credential source the provider being edited will use: 'env' (an
   // environment variable that must already exist) or 'key' (an API key stored
   // encrypted at rest). Exactly ONE is active — the user picks, never both.
@@ -794,6 +818,26 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       cancelled = true
     }
   }, [cfg.envVar, active.id])
+
+  // چک کردن env var همه پروایدرها هنگام باز شدن modal — نتیجه برای dot تب‌ها
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const results = new Map<string, boolean>()
+      await Promise.all(
+        providers.map(async (p) => {
+          const ev = (p.envVar || '').trim()
+          if (!ev) return
+          try {
+            const val = await api.getEnv(ev)
+            results.set(p.id, !!val)
+          } catch { /* ignore */ }
+        }),
+      )
+      if (!cancelled) setProviderEnvMap(results)
+    })()
+    return () => { cancelled = true }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch & persist the model list for the active provider (merged with any
   // manually added models so they are never overwritten). Models the user
@@ -1096,7 +1140,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   return (
     <div className="modal-overlay" onMouseDown={onClose}>
-      <div className="modal modal-wide settings-modal" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="modal modal-wide settings-modal" role="dialog" aria-modal="true" aria-label="Settings" onMouseDown={(e) => e.stopPropagation()}>
         <div className="settings-header">
           <div className="settings-header-title">
             <h2>Settings</h2>
@@ -1140,8 +1184,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 className={`provider-tab ${p.id === active.id ? 'active' : ''}`}
                 onClick={() => setEditId(p.id)}
               >
+                <span
+                  className={`provider-tab-dot ${isProviderConfigured(p, providerEnvMap.get(p.id)) ? 'ok' : 'off'}`}
+                  title={isProviderConfigured(p, providerEnvMap.get(p.id)) ? 'Configured' : 'Not configured'}
+                />
                 <span className="provider-tab-name">{p.name}</span>
-                <span className="provider-tab-kind">{KIND_LABELS[p.kind]}</span>
                 {!BUILTIN_KINDS.includes(p.kind) && providers.length > 1 && (
                   <button
                     className="provider-tab-remove"
@@ -1169,17 +1216,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         {active && (
           <>
             {providerMeta(cfg.kind).local ? (
-              <div className="env-key-hint">
+              <div className="env-key-hint ok">
                 <span className="status-dot ok" />
                 Local provider — no API key needed.
               </div>
             ) : oauthReady ? (
-              <div className="env-key-hint">
+              <div className="env-key-hint ok">
                 <span className="status-dot ok" />
                 Ready — connected via your Google account (Settings → Auth).
               </div>
             ) : credentialReady ? (
-              <div className="env-key-hint">
+              <div className="env-key-hint ok">
                 <span className="status-dot ok" />
                 Ready — authenticated via{' '}
                 {hasSavedKey ? 'saved API key' : cfg.envVar ? `env var ${cfg.envVar}` : 'the default env var'}
@@ -1193,7 +1240,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 {credWarn && ' Save was blocked until you configure one.'}
               </div>
             ) : (
-              <div className="env-key-hint">
+              <div className="env-key-hint fail">
                 <span className="status-dot fail" />
                 No API key set — the provider will use an environment variable if one is available, or may
                 work without a key.
@@ -1230,15 +1277,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             {providerMeta(cfg.kind).baseUrlHint && !providerMeta(cfg.kind).editableBaseUrl && (
               <div className="field">
                 <label>Base URL</label>
-                <div className="env-key-hint">
-                  <span className="status-dot ok" />
-                  {providerMeta(cfg.kind).baseUrlHint}
-                </div>
+                <div className="hint">{providerMeta(cfg.kind).baseUrlHint}</div>
+                {providerMeta(cfg.kind).baseUrlDesc && (
+                  <div className="hint">{providerMeta(cfg.kind).baseUrlDesc}</div>
+                )}
                 {providerMeta(cfg.kind).extraHint && (
-                  <div className="env-key-hint">
-                    <span className="status-dot ok" />
-                    {providerMeta(cfg.kind).extraHint}
-                  </div>
+                  <div className="hint">{providerMeta(cfg.kind).extraHint}</div>
                 )}
               </div>
             )}
@@ -1278,42 +1322,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    {envVarValue === true ? (
-                      <div className="env-key-hint">
-                        <span className="status-dot ok" />
-                        {cfg.envVar} is set in your environment — Codifa will use it.
-                      </div>
-                    ) : envVarValue === false ? (
-                      <>
-                        <div className="env-key-hint fail">
-                          <span className="status-dot fail" />
-                          <strong>{cfg.envVar}</strong> is not set in your environment. Codifa only sees
-                          variables that exist in your OS before it starts (launches from Finder/Dock
-                          ignore your shell profile). Either export it and restart Codifa, or paste the
-                          key value below — it will be saved encrypted instead.
-                        </div>
-                        <div className="cred-inline-fallback">
-                          <label className="field-label">…or paste the key value (stored encrypted)</label>
-                          <input
-                            type="password"
-                            value={cfg.apiKey ?? ''}
-                            onChange={(e) => {
-                              setCfg({ ...cfg, apiKey: e.target.value })
-                              if (e.target.value.trim()) setCredMode('key')
-                            }}
-                            placeholder="e.g. AIza…"
-                            dir="ltr"
-                            autoComplete="off"
-                            spellCheck={false}
-                          />
-                        </div>
-                      </>
-                    ) : cfg.envVar ? (
-                      <div className="env-key-hint">Checking {cfg.envVar}…</div>
-                    ) : (
-                      <div className="env-key-hint">
-                        Empty uses the built-in default (
-                        {providerMeta(cfg.kind).envVars.join(' / ') || 'none'}).
+                    {envVarValue === false && (
+                      <div className="hint fail" style={{ marginTop: 4 }}>
+                        Env var not found in your environment. Switch to "Saved API key" mode to paste a key directly.
                       </div>
                     )}
                   </div>
@@ -1329,7 +1340,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    <div className="env-key-hint">
+                    <div className="hint" style={{ marginTop: 4 }}>
                       Nothing is stored yet — paste the actual key value here and it will be encrypted
                       (AES-256-GCM) when you press Save. This is an alternative to the environment
                       variable method, not the place to type a variable name.

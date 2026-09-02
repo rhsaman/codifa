@@ -52,6 +52,19 @@
     "IRANYekanX", monospace;
 
   --chat-font-size: 14px;
+
+  /* ── z-index scale ──────────────────────────────────────────────────── */
+  --z-sidebar-resize: 20;
+  --z-scroll-jump: 30;
+  --z-popover: 40;
+  --z-modal-overlay: 100;
+  --z-reading-mode: 90;
+  --z-ws-menu: 110;
+
+  /* ── layout tokens ──────────────────────────────────────────────────── */
+  --titlebar-h: 38px;
+  --sidebar-w: 264px;
+  --chat-max-w: 920px;
 }
 
 @font-face {
@@ -178,6 +191,12 @@ button:disabled {
   opacity: 0.5;
 }
 
+/* Global focus-visible ring for all interactive elements. */
+:focus-visible {
+  outline: 2px solid var(--accent, #3b82f6);
+  outline-offset: 2px;
+}
+
 input,
 select,
 textarea {
@@ -214,7 +233,7 @@ textarea {
   width: 6px;
   height: 100%;
   cursor: ew-resize;
-  z-index: 20;
+  z-index: var(--z-sidebar-resize);
 }
 
 .sidebar-resize-handle::after {
@@ -234,8 +253,8 @@ textarea {
 }
 
 .sidebar {
-  flex: 0 0 264px;
-  width: 264px;
+  flex: 0 0 var(--sidebar-w);
+  width: var(--sidebar-w);
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -350,11 +369,6 @@ textarea {
     box-shadow 0.15s;
 }
 
-.sidebar-search-input:focus {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
-}
-
 .sidebar-search-input:hover {
   border-color: color-mix(in srgb, var(--text) 18%, var(--border));
 }
@@ -442,6 +456,10 @@ textarea {
   background: var(--bg-hover);
   color: var(--text);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.chat-item:active {
+  transform: scale(0.96);
 }
 
 .chat-item.active {
@@ -722,7 +740,7 @@ textarea {
 }
 .ws-menu {
   position: fixed;
-  z-index: 1000;
+  z-index: var(--z-ws-menu);
   min-width: 168px;
   padding: 5px;
   border-radius: 10px;
@@ -775,7 +793,7 @@ textarea {
 
 .ws-delete-menu-wrap {
   position: fixed;
-  z-index: 1001;
+  z-index: var(--z-ws-menu);
 }
 .ws-delete-menu {
   min-width: 180px;
@@ -1070,6 +1088,10 @@ textarea {
   color: var(--accent);
 }
 
+.sidebar-group-btn:active {
+  transform: scale(0.92);
+}
+
 .sidebar-group-btn.danger:hover {
   background: var(--danger);
   color: #fff;
@@ -1106,17 +1128,39 @@ textarea {
   color: var(--ws);
 }
 
+.ws-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-panel));
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  align-self: center;
+}
+
+.ws-rename-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
 .color-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  z-index: var(--z-scroll-jump);
 }
 
 .color-popover {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  z-index: 40;
+  z-index: var(--z-popover);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1165,6 +1209,7 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
 }
 
 .color-none:hover {
@@ -1223,6 +1268,7 @@ textarea {
   cursor: pointer;
   user-select: none;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  transition: color 0.12s;
 }
 
 .sidebar-panel-head:hover {
@@ -1314,6 +1360,7 @@ textarea {
   font-size: 12px;
   color: var(--text-dim);
   line-height: 1.4;
+  transition: color 0.14s, background 0.14s;
 }
 
 .sidebar-todo-item.done {
@@ -1662,8 +1709,12 @@ textarea {
   color: var(--text);
 }
 
+.sidebar-foot-btn:active {
+  transform: scale(0.96);
+}
+
 .titlebar {
-  height: 38px;
+  height: var(--titlebar-h);
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -1685,20 +1736,16 @@ textarea {
   letter-spacing: 0.2px;
 }
 
-.icon-btn {
+/* Titlebar icon buttons: smaller than the base .icon-btn (composer). */
+.titlebar .icon-btn {
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-dim);
-  border: 1px solid transparent;
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
 }
 
-.icon-btn:hover {
-  background: var(--bg-input);
-  color: var(--text);
+.titlebar .icon-btn:not(:disabled):active {
+  transform: scale(0.92);
 }
 
 .workspace-btn {
@@ -1716,11 +1763,16 @@ textarea {
   background: var(--bg-input);
   color: var(--text);
   font-size: 12px;
+  transition: border-color 0.12s, color 0.12s;
 }
 
 .workspace-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.workspace-btn:active {
+  transform: scale(0.96);
 }
 
 /* ----- update button (titlebar, next to the workspace picker) ----- */
@@ -2273,7 +2325,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-width: 920px;
+  max-width: var(--chat-max-w);
   width: 100%;
   margin: 0 auto;
   flex: 1 1 auto;
@@ -2896,8 +2948,13 @@ textarea {
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
-  transition: color 0.15s;
+  transition: color 0.15s, background 0.12s;
   font-size: var(--chat-font-size);
+  caret-color: var(--accent);
+}
+
+.composer-input:focus-visible {
+  outline: none;
 }
 
 .composer-input::placeholder {
@@ -2963,6 +3020,10 @@ textarea {
   filter: brightness(1.1);
 }
 
+.btn:active {
+  transform: scale(0.96);
+}
+
 .btn:disabled {
   opacity: 0.4;
 }
@@ -3017,6 +3078,7 @@ textarea {
 }
 
 .attach-btn {
+  position: relative;
   background: transparent;
   color: var(--text-dim);
   border: none;
@@ -3031,10 +3093,6 @@ textarea {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 14%, transparent);
-}
-
-.attach-btn {
-  position: relative;
 }
 
 .attach-count {
@@ -3349,6 +3407,10 @@ textarea {
 .mode-menu-item:hover {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.mode-menu-item:active {
+  transform: scale(0.96);
 }
 
 .mode-menu-item.active {
@@ -3685,6 +3747,12 @@ textarea {
   cursor: pointer;
   max-width: 96px;
   padding: 0 2px;
+}
+
+.thinking-select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 4px;
 }
 
 .thinking-select option {
@@ -5274,6 +5342,10 @@ textarea {
   color: var(--text);
 }
 
+.settings-tab:active {
+  transform: scale(0.96);
+}
+
 .settings-tab.active {
   color: var(--text);
   border-bottom-color: var(--accent);
@@ -5363,8 +5435,12 @@ textarea {
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: var(--success);
+  color: var(--text-secondary);
   margin-bottom: 6px;
+}
+
+.env-key-hint.ok {
+  color: var(--success);
 }
 
 .env-key-hint.fail {
@@ -5592,15 +5668,26 @@ textarea {
   background: var(--accent-dim);
 }
 
+.provider-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.provider-tab-dot.ok {
+  background: var(--success, #22c55e);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--success, #22c55e) 50%, transparent);
+}
+.provider-tab-dot.off {
+  background: color-mix(in srgb, var(--text-dim) 40%, transparent);
+}
+
 .provider-tab-name {
   font-weight: 600;
   font-size: 13px;
 }
 
-.provider-tab-kind {
-  font-size: 10px;
-  color: var(--text-dim);
-}
+
 
 .provider-tab.add {
   border-style: dashed;
@@ -11190,4 +11277,17 @@ textarea {
 .tool-fullscreen-btn:hover {
   color: var(--text);
   border-color: var(--accent);
+}
+
+/* ── Reduced motion: kill ALL animations and transitions ─────────────────
+   Single catch-all block so no animation or transition leaks through for
+   users who prefer reduced motion. Must come after all other rules to win
+   by specificity on equal selectors. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -43,6 +43,7 @@ import {
   listSkills,
   triggerCompact,
   type CompactResult,
+  type StreamParams,
 } from "../lib/api";
 
 import type { SkillRow } from "../lib/api";
@@ -177,45 +178,6 @@ function relFromRoot(root: string, p: string): string | null {
   if (i < r.length) return null;
   const rel = f.slice(i).join("/");
   return rel || null;
-}
-
-const CHARS_PER_TOKEN = 4;
-
-function sliceToBudget(
-  history: Array<{
-    role: string;
-    content: string;
-    thinking?: string;
-    plan?: Array<{ content: string; status: string }>;
-    mode?: string;
-    toolActivity?: Array<{
-      tool: string;
-      args?: Record<string, unknown>;
-      summary?: string;
-      status: string;
-    }>;
-  }>,
-  contextWindow?: number,
-): Array<{
-  role: string;
-  content: string;
-  thinking?: string;
-  plan?: Array<{ content: string; status: string }>;
-  mode?: string;
-  toolActivity?: Array<{
-    tool: string;
-    args?: Record<string, unknown>;
-    summary?: string;
-    status: string;
-  }>;
-}> {
-  // opencode sends the FULL history every turn and compacts on overflow — it
-  // never drops messages by count or by a per-mode char budget. Keep everything
-  // (system summaries already survive at the head); the backend compacts on
-  // overflow. This fixes two bugs: switching mode no longer shrinks the
-  // context (no MODE_HISTORY_CAPS), and messages no longer disappear every turn
-  // (no maxHistory tail slice).
-  return history;
 }
 
 export function ChatPanel() {
@@ -1406,7 +1368,11 @@ export function ChatPanel() {
         // already done without re-executing completed tools.
         preservedToolSummary: m.preservedToolSummary,
       }));
-    const history = sliceToBudget(allHistory);
+    // Cast: SearchResultItem fields (title, url, snippet) are valid JSON-
+    // serializable keys; the narrower StreamParams type omits them but they
+    // survive the round-trip fine.  The pre-existing sliceToBudget wrapper
+    // masked this mismatch with an implicit any.
+    const history = allHistory as StreamParams["history"];
 
     const abort = new AbortController();
     abortRef.current = abort;

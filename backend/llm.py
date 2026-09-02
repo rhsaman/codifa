@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -266,6 +267,11 @@ def build_chat_model(
             thinking_budget=thinking_budget,
         )
 
+    # stream_chunk_timeout: maximum seconds between two consecutive streaming
+    # chunks.  The default in langchain_openai is 120 s, which is too aggressive
+    # for slow providers (e.g. minimax-m3 can pause > 2 min while the model
+    # thinks silently).  Allow overriding via env; 150 s is a safe default.
+    _chunk_timeout = int(os.environ.get("STREAM_CHUNK_TIMEOUT", "150"))
     lc_kwargs: dict[str, Any] = {
         "model": model,
         "openai_api_base": base or None,
@@ -274,6 +280,7 @@ def build_chat_model(
         "max_tokens": max_tokens or None,
         "streaming": True,
         "timeout": lc_timeout,
+        "stream_chunk_timeout": _chunk_timeout,
         "model_kwargs": tkwargs,
         "default_headers": headers or None,
     }
@@ -378,6 +385,7 @@ def _is_parallel_calls_error(exc: Exception) -> bool:
         # string. Match both `Error code: 400` (openai SDK) and `code: 400` /
         # `status_code: 400` forms.
         import re
+
         m = re.search(r"(?:error\s+code|status_code|code)[:=\s]+(\d{3})", str(exc))
         if m:
             try:
@@ -394,13 +402,14 @@ def _is_parallel_calls_error(exc: Exception) -> bool:
     # this branch when the model actually has parallel_tool_calls enabled.
     # Falling through here is safe because the retry path strips a single
     # non-essential OpenAI field, not a real bad-request param.
-    if any(phrase in msg for phrase in (
-        "provider returned error",  # OpenRouter generic wrapper
-        "backend request failed",   # OpenRouter upstream wrapper
-        "backend_error",            # explicit error type
-    )):
-        return True
-    return False
+    return any(
+        phrase in msg
+        for phrase in (
+            "provider returned error",  # OpenRouter generic wrapper
+            "backend request failed",  # OpenRouter upstream wrapper
+            "backend_error",  # explicit error type
+        )
+    )
 
 
 def _strip_parallel_calls(model: Any) -> Any:
@@ -566,7 +575,12 @@ async def llm_generate(
         text = text or str(content)
     else:
         text = str(content or "")
-    usage = usage_event(getattr(res, "usage_metadata", None), model=model_name, sub=sub, provider=provider)
+    usage = usage_event(
+        getattr(res, "usage_metadata", None),
+        model=model_name,
+        sub=sub,
+        provider=provider,
+    )
     return text, usage
 
 
@@ -763,10 +777,7 @@ async def langchain_tool_loop(
         # than "same call repeated". The model can still call tools if genuinely
         # needed; this just breaks the habit of fire-one-at-a-time greps.
         _tool_call_count += len(tcs)
-        if (
-            _tool_call_count >= _TOOL_CALL_SOFT_LIMIT
-            and steps < max_steps - 1
-        ):
+        if _tool_call_count >= _TOOL_CALL_SOFT_LIMIT and steps < max_steps - 1:
             msgs.append(
                 SystemMessage(
                     content=(
@@ -929,7 +940,11 @@ def usage_event(
             # Cache is separate from input_tokens -> add it back for the true
             # total. reasoning_tokens is reported separately, so include it.
             total = (
-                input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write
+                input_tokens
+                + output_tokens
+                + reasoning_tokens
+                + cache_read
+                + cache_write
             )
         else:
             # Subset convention: cache_read/write is already folded into

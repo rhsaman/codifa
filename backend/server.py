@@ -254,8 +254,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             from providers import _models_dev_catalog
 
             await _models_dev_catalog()
-        except Exception:  # noqa: BLE001, S110
-            pass
+        except Exception:
+            logger.warning(
+                "models.dev catalog preload failed (non-fatal)", exc_info=True
+            )
 
     asyncio.create_task(_bg())
     yield

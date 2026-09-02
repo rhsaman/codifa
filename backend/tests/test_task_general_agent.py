@@ -1,18 +1,14 @@
-"""Live test: the `task` tool's `general` sub-agent (opencode's general agent).
+"""Live tests for the `task` tool: general sub-agent, depth limit, unknown type.
 
-The general agent inherits the parent's tools minus `task`/`update_plan`/
-`save_plan` (no nested sub-agents, no checklist pollution — opencode's general
-denies todowrite) and runs on the MAIN model. Its tool events are tagged
-sub=True and routed to the task card via a branch id, so they never count
-against the parent's deterministic tool-step budget.
+Consolidates coverage from the former ``test_task_general_agent``,
+``test_task_depth_limit`` and ``test_task_unknown_agent`` files.
 
 Guards:
-1. task(subagent_type='general') returns the <task> XML wrapper.
-2. The general sub-agent runs on the MAIN model and can call parent tools (read).
-3. Its tool events are tagged sub=True with a branch id.
-4. The general sub-agent's tool set excludes task/update_plan/save_plan.
+1. task(subagent_type='general') returns <task> XML, runs on MAIN model,
+   tool events are tagged sub=True with a branch id.
+2. task(subagent_type='bogus') returns "Unknown agent type" error.
+3. With _TASK_DEPTH_CTX at the limit, task(...) returns the depth error.
 """
-import asyncio
 import os
 import sys
 import tempfile
@@ -27,7 +23,30 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 
 from langchain_core.messages import AIMessage
 
-from tools import make_tool_callbacks
+from tools import (
+    _SUBAGENT_DEPTH_LIMIT,
+    _TASK_DEPTH_CTX,
+    make_tool_callbacks,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fake models
+# ---------------------------------------------------------------------------
+
+class _FakeModel:
+    """Minimal LangChain-style model: returns a fixed reply (no tool calls)."""
+
+    model_name = "fake"
+
+    def __init__(self, text: str = "done") -> None:
+        self._text = text
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, msgs):
+        return AIMessage(content=self._text)
 
 
 class _FakeGeneralModel:
@@ -54,13 +73,18 @@ class _FakeGeneralModel:
         return AIMessage(content=self._text)
 
 
-async def main():
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+async def test_task_general_subagent():
+    """task(subagent_type='general') returns XML, runs on main model,
+    tool events are tagged sub=True with a branch id."""
     ws = tempfile.mkdtemp(prefix="coder-test-task-general-ws-")
-    with open(os.path.join(ws, "app.py"), "w") as fh:  # noqa: ASYNC230
+    with open(os.path.join(ws, "app.py"), "w") as fh:
         fh.write("def main():\n    return 42\n")
 
     emitted: list[dict] = []
-    # main_model drives the general sub-agent: it calls `read` then replies.
     main_model = _FakeGeneralModel(text="GENERAL DONE: app.py has main()")
     tools = make_tool_callbacks(
         ws,
@@ -84,7 +108,6 @@ async def main():
     ]
     assert len(cards) == 1, f"expected 1 general task card, got {len(cards)}"
 
-    # The general sub-agent's read tool event must be tagged sub=True + branch.
     sub_reads = [
         e for e in emitted
         if e.get("kind") == "tool" and e.get("tool") == "read" and e.get("sub")
@@ -92,11 +115,49 @@ async def main():
     assert sub_reads, "general sub-agent's read event not tagged sub=True"
     assert sub_reads[0].get("branch"), "general sub-agent's read event missing branch id"
 
-    print("  general task card: 1")
-    print(f"  sub-tagged read events: {len(sub_reads)} (expect 1)")
-    print("  general sub-agent OK: runs on main model, inherits parent tools, sub-tagged events")
-    print("TASK-GENERAL TEST PASSED")
+
+async def test_task_unknown_agent_type():
+    """task(subagent_type='bogus') returns 'Unknown agent type' error."""
+    ws = tempfile.mkdtemp(prefix="coder-test-task-unknown-ws-")
+    emitted: list[dict] = []
+    tools = make_tool_callbacks(
+        ws,
+        lambda ev: emitted.append(ev),
+        main_model=_FakeModel(text="done"),
+    )
+    task = tools["task"]
+
+    out = await task(description="x", prompt="do something", subagent_type="bogus")
+    assert "Unknown agent type: bogus is not a valid agent type" in out, out
+
+    cards = [e for e in emitted if e.get("kind") == "tool" and e.get("tool") == "task"]
+    assert len(cards) == 1, f"expected 1 task card (the error), got {len(cards)}"
+    errs = [
+        e for e in emitted
+        if e.get("kind") == "tool_result" and e.get("status") == "error"
+    ]
+    assert errs, "expected an error tool_result"
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def test_task_depth_limit():
+    """With depth at limit, task() returns the depth error."""
+    ws = tempfile.mkdtemp(prefix="coder-test-task-depth-ws-")
+    emitted: list[dict] = []
+    tools = make_tool_callbacks(
+        ws,
+        lambda ev: emitted.append(ev),
+        main_model=_FakeModel(text="done"),
+    )
+    task = tools["task"]
+
+    token = _TASK_DEPTH_CTX.set(_SUBAGENT_DEPTH_LIMIT)
+    try:
+        out = await task(description="x", prompt="find foo", subagent_type="general")
+    finally:
+        _TASK_DEPTH_CTX.reset(token)
+
+    assert "subagent depth limit reached" in out, out
+    assert "cannot spawn another sub-agent" in out, out
+
+    cards = [e for e in emitted if e.get("kind") == "tool" and e.get("tool") == "task"]
+    assert len(cards) == 1, f"expected 1 task card (the error), got {len(cards)}"

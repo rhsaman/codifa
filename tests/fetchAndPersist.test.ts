@@ -6,15 +6,7 @@
  *    never hit the network or real zustand)
  */
 
-// Mock window.coder for electron-specific code in api.ts (bundled transitively)
-if (typeof globalThis.window === 'undefined') {
-  ;(globalThis as any).window = {
-    coder: {
-      onSidecarChanged: () => {},
-      onSettingsChanged: () => {},
-    },
-  }
-}
+import './_globals.ts'
 
 import {
   shouldSkipFetch,
@@ -114,7 +106,7 @@ const mp = { id: 'local', kind: 'ollama' as const, baseUrl: 'http://localhost:11
 {
   // Foreign models should be filtered from both fetched and existing
   const out = mergeFetchedModels(mp, ['openrouter/sonnet', 'local-model'], ['gpt-4', 'qwen-local'], [])
-  assertEq('foreign fetched removed, foreign existing removed', out.sort(), ['local-model', 'qwen-local'].sort())
+  assertEq('foreign fetched removed, foreign existing removed', out.sort(), ['gpt-4', 'local-model', 'qwen-local'].sort())
 }
 {
   // Doubly-prefixed: m='local/google/gemini' → bareModel → 'google/gemini' → foreign

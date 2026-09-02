@@ -85,6 +85,7 @@ export interface ProviderConfig {
   envVar?: string
   baseUrl: string
   model: string
+  enabled?: boolean
   /** OAuth login (Google "google" kind): auth_type = "oauth" turns the provider
    *  into a token-based connection resolved from oauthRefreshToken. */
   authType?: string

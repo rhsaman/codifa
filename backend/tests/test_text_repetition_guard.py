@@ -46,7 +46,7 @@ def test_strip_think_complete_tag():
     out, in_think, buf = _strip_think_tags(text, False, "")
     assert out == "Before  After"
     assert in_think is False
-    assert "secret reasoning" in buf
+    assert buf == ""  # buffer is cleared after the complete closer tag
 
 
 def test_strip_think_spanning_chunks():
@@ -56,14 +56,14 @@ def test_strip_think_spanning_chunks():
     out2, in_think, buf2 = _strip_think_tags("rest</think> B", in_think, buf1)
     assert out2 == " B"
     assert in_think is False
-    assert "partial rest" in buf2
+    assert buf2 == ""  # buffer is cleared after the complete closer tag
 
 
 def test_strip_think_thinking_variant():
     text = "x <thinking>hidden</think> y"
     out, _in_think, buf = _strip_think_tags(text, False, "")
     assert out == "x  y"
-    assert "hidden" in buf
+    assert buf == ""  # buffer is cleared after the complete closer tag
 
 
 def test_repeating_dropped_reasoning_content_truncated():

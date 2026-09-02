@@ -51,7 +51,6 @@ from tools import (
     slugify,
     user_coder_dir,
 )
-from vector_store import KIND_MEMORY, VectorStore
 
 # Steer messages injected into a RUNNING agent without interrupting it. Keyed
 # by chat_id; each entry is {"id", "prompt"}. The frontend POSTs here while the
@@ -2549,7 +2548,12 @@ _IMPL_TASK_RE = re.compile(
 _TRIVIAL_TASK_RE = re.compile(
     r"(?:\b(readme|docs?|documentation|comment|typo|rename|"
     r"style|styling|css|color|font|explain|what|why|how|list|show|"
-    r"summar|translate|format)\b|مستند|توضیح|چیست|چطور|خلاصه|ترجمه)",
+    r"summar|translate|format|"
+    r"config|setting|env|environment|variable|constant|flag|option|preference|"
+    r"log|logging|error.?message|warn|info.?message|"
+    r"import|sort|order|organize|clean.?up|remove.?dead)\b|"
+    r"مستند|توضیح|چیست|چطور|خلاصه|ترجمه|"
+    r"پیکربندی|متغیر|ورودی|پیام|خطا|ورود)",
     re.IGNORECASE,
 )
 
@@ -3495,7 +3499,7 @@ async def _refresh_workspace_summary_background(
                 summary_text,
                 current_counts,
             )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 — summary save failure is non-critical
         pass
 
 

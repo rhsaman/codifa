@@ -14,7 +14,7 @@ import { useStore } from './store'
 import { isForeignModelId } from './provider-meta'
 import type { ProviderConfig } from '../types'
 
-export type FetchSkipReason = 'no-base-url'
+export type FetchSkipReason = 'no-base-url' | 'disabled'
 
 export type FetchAndPersistResult =
   | { ok: true; count: number }
@@ -49,6 +49,7 @@ export interface FetchOptions {
  *   user-cleared editable field (e.g. a fresh ollama row)
  */
 export function shouldSkipFetch(p: ProviderConfig): false | FetchSkipReason {
+  if (p.enabled === false) return 'disabled'
   if (!p.baseUrl || p.baseUrl.trim() === '') return 'no-base-url'
   return false
 }
@@ -68,21 +69,15 @@ export function mergeFetchedModels(
   const prefix = `${p.id}/`
   const bare = (m: string) => (m.startsWith(prefix) ? m.slice(prefix.length) : m)
 
-  // bare→original lookup so we can reconstruct prefixed IDs from the fetched set
-  const fetchedBare = new Set(fetched.map((m) => bare(m)))
-
   return Array.from(
     new Set([
       ...fetched.filter((m) => {
         const b = bare(m)
         return !removedSet.has(b) && !isForeignModelId(p, b)
       }),
-      // Keep only existing models the backend actually confirmed (fetchedBare).
-      // This prevents stale cross-provider entries (e.g. "gpt-5" under ollama)
-      // from surviving merges — they won't appear in fetchedBare.
       ...existing.filter((m) => {
         const b = bare(m)
-        return fetchedBare.has(b) && !isForeignModelId(p, b)
+        return !isForeignModelId(p, b)
       }),
     ]),
   )

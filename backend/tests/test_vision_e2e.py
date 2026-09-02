@@ -118,11 +118,11 @@ async def test_vision_analyzes_image_from_history(run_events):
 async def test_vision_prefetch_failure_injects_note(run_events):
     # Vision model errors during pre-fetch -> a clear note is injected (no crash,
     # no fallback to the main model).
-    # A non-retryable (400) failure — e.g. a vision model that rejects images.
-    # (500s are retried by the OpenAI client, so use 400 to force a permanent
-    # failure the pre-fetch cannot recover from.)
+    # A non-retryable (401) failure — e.g. an authentication error with the
+    # vision provider. (400/429/5xx are all retried now, so use 401 to force a
+    # permanent failure the pre-fetch cannot recover from.)
     mock.script = [text_reply("FINAL_ANSWER")]
-    mock.error_at = {0: (400, "vision boom")}
+    mock.error_at = {0: (401, "vision boom")}
     await run_events(
         "what do you see in this image?",
         mode="ask",
@@ -165,18 +165,18 @@ async def test_vision_retries_transient_429_then_succeeds(run_events):
 
 
 @pytest.mark.asyncio
-async def test_vision_non_transient_400_not_retried(run_events):
-    # A permanent 400 must NOT be retried — it should surface immediately as a
-    # diagnostic note (no wasted retries, no silent drop).
+async def test_vision_non_transient_error_not_retried(run_events):
+    # A permanent non-retryable error (e.g. 401 auth failure) must NOT be retried
+    # — it should surface immediately as a diagnostic note (no wasted retries).
     mock.script = [text_reply("FINAL_ANSWER")]
-    mock.error_at = {0: (400, "vision boom")}
+    mock.error_at = {0: (401, "vision boom")}
     await run_events(
         "what do you see in this image?",
         mode="ask",
         subagent_models={"vision": "mock-model"},
         images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
     )
-    # The 400 is permanent -> no retry -> the diagnostic note is injected.
+    # The 401 is permanent -> no retry -> the diagnostic note is injected.
     assert any(
         "could not analyze" in _all_text(b) for b in mock.captured
     ), "permanent 400 failure did not inject a diagnostic note"

@@ -1309,10 +1309,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # Workspace summary — cross-chat recap, only on the first message of a
     # new chat.  Skipped for continuing conversations to avoid context bloat.
     # Filtered to what's relevant to THIS first message so unrelated earlier
-    # work doesn't bleed into the new chat. The merge (persisted, full
-    # record) and the relevance filter (injected, scoped to this chat) run
-    # as a SINGLE LLM call when possible -- see
-    # _maybe_refresh_workspace_summary's docstring for the fallback path.
+    # work doesn't bleed into the new chat. Only the (fast, timeout-capped)
+    # relevance filter blocks this response -- the heavier merge of new
+    # turns into the cumulative summary runs as a detached background task
+    # and never delays chat creation. See _maybe_refresh_workspace_summary's
+    # docstring for details.
     if len(state.get("history") or []) <= 1:
         try:
             _ws_summary = await _agents._maybe_refresh_workspace_summary(

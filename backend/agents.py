@@ -1985,25 +1985,6 @@ def _workspace_summary_wrapper(content: str) -> str:
     )
 
 
-def _load_workspace_summary_raw(root: str) -> str:
-    """Read the workspace summary's raw content (no header/footer, no
-    truncation, no cache -- only called once per new chat, so caching
-    isn't worth the complexity). Used as input to the relevance filter,
-    not for direct injection into a system prompt.
-    """
-    try:
-        workspace_slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
-        meta = state_db.get_workspace_summary(workspace_slug)
-    except Exception:  # noqa: BLE001
-        return ""
-    if not meta:
-        return ""
-    return meta.get("content") or ""
-
-
 async def _select_relevant_summary(
     full_content: str,
     user_prompt: str,
@@ -3360,6 +3341,19 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
 # -- Workspace summary refresh (LLM-backed, with safe fallback) ------------- #
 
 
+_WORKSPACE_SUMMARY_FILTER_TIMEOUT = 8.0
+
+_WORKSPACE_SUMMARY_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> None:
+    """Fire-and-forget a coroutine, keeping a reference so it isn't
+    garbage-collected mid-flight (a common asyncio pitfall)."""
+    task = asyncio.create_task(coro)
+    _WORKSPACE_SUMMARY_BG_TASKS.add(task)
+    task.add_done_callback(_WORKSPACE_SUMMARY_BG_TASKS.discard)
+
+
 async def _maybe_refresh_workspace_summary(
     root: str,
     current_chat_id: str,
@@ -3367,28 +3361,22 @@ async def _maybe_refresh_workspace_summary(
     fallback_model: Any | None,
     user_prompt: str = "",
 ) -> str:
-    """Build / refresh the workspace summary for ``root``, excluding the
-    current chat, and (when ``user_prompt`` is given) return the subset
-    relevant to it, ready to inject into a system prompt.
+    """Return the workspace-summary excerpt relevant to ``user_prompt`` for
+    a brand-new chat, WITHOUT blocking the response on a full re-merge.
 
-    Returns "" when there's nothing to inject (no summary, nothing
-    relevant, or ``user_prompt`` was empty) — the cumulative summary is
-    still refreshed as a side effect in that case, just nothing is
-    returned to show.
+    Fast path (this is what the caller awaits): filter whatever's already
+    persisted on disk against ``user_prompt`` -- one small LLM call,
+    capped by a hard timeout so a slow/hanging provider can never stall
+    chat creation by more than a few seconds.
 
-    Strategy:
-      1. Walk every prior chat for this workspace.
-      2. If nothing changed vs the cached ``covered_message_counts`` AND a
-         summary exists → reuse it (no merge call). If ``user_prompt`` is
-         given, run ONE filter call against the cached content.
-      3. Otherwise feed the existing summary + new tails to the LLM. If
-         ``user_prompt`` is given, this is a SINGLE combined call that
-         both merges the summary AND selects the relevant subset (dual
-         marker output) — avoids a second round trip in the common case.
-         If the combined call fails to parse, fall back to a plain merge
-         plus a separate filter call.
-      4. On any LLM failure, keep the old summary (if any) intact — never
-         poison the cache with fallback text, never block chat creation.
+    Slow path (never awaited here): if this workspace's chats have grown
+    since the persisted summary was built, a background task is spawned
+    to merge the new turns in. This chat doesn't wait for it -- the NEXT
+    new chat in this workspace will see the refreshed summary.
+
+    Returns "" whenever there's nothing to inject (no persisted summary
+    yet, nothing relevant, ``user_prompt`` empty, or the filter timed
+    out/failed).
     """
     try:
         workspace_slug = (
@@ -3406,6 +3394,7 @@ async def _maybe_refresh_workspace_summary(
         return ""
 
     current_counts = {c["chat_id"]: c["message_count"] for c in prior}
+    user_prompt = (user_prompt or "").strip()
 
     existing: dict | None = None
     try:
@@ -3413,32 +3402,66 @@ async def _maybe_refresh_workspace_summary(
     except Exception:  # noqa: BLE001
         existing = None
 
-    user_prompt = (user_prompt or "").strip()
-
-    if existing:
-        prev_counts = existing.get("covered_message_counts") or {}
-        if all(
-            int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items()
-        ) and len(prev_counts) == len(current_counts):
-            cached = _load_workspace_summary_raw(root)
-            if cached and user_prompt:
-                return await _select_relevant_summary(
-                    cached, user_prompt, model, fallback_model
-                )
-            return ""
-
-    # Read the prior chats' JSON for the NEW tail only.
-    new_tail_lines: list[str] = []
     prev_counts = (existing or {}).get("covered_message_counts") or {}
+    needs_refresh = not (
+        existing
+        and all(
+            int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items()
+        )
+        and len(prev_counts) == len(current_counts)
+    )
+    if needs_refresh:
+        # Never awaited -- this chat doesn't wait on it. Persists (or
+        # silently gives up) in the background; the NEXT new chat in this
+        # workspace picks up whatever it managed to produce.
+        _spawn_background_task(
+            _refresh_workspace_summary_background(
+                root,
+                workspace_slug,
+                prior,
+                existing,
+                current_counts,
+                model,
+                fallback_model,
+            )
+        )
+
+    raw = (existing or {}).get("content") or ""
+    if not raw or not user_prompt:
+        return ""
     try:
+        return await asyncio.wait_for(
+            _select_relevant_summary(raw, user_prompt, model, fallback_model),
+            timeout=_WORKSPACE_SUMMARY_FILTER_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _refresh_workspace_summary_background(
+    root: str,
+    workspace_slug: str,
+    prior: list[dict],
+    existing: dict | None,
+    current_counts: dict,
+    model: Any,
+    fallback_model: Any | None,
+) -> None:
+    """Runs detached via _spawn_background_task -- never awaited by the
+    request path, so its latency (including a slow provider) never
+    delays chat creation. Any failure here is silent: it just means the
+    next new chat's fast-path filter still works off the older cached
+    content, and this same refresh is retried on the next new chat.
+    """
+    try:
+        prev_counts = (existing or {}).get("covered_message_counts") or {}
+        new_tail_lines: list[str] = []
         ws_dir = os.path.join(
             state_db.chats_dir(),
             _safe_file(workspace_slug, "workspace"),
         )
-    except Exception:  # noqa: BLE001
-        ws_dir = ""
-
-    if ws_dir:
         for c in prior:
             cid = c["chat_id"]
             prev_n = int(prev_counts.get(cid, 0))
@@ -3459,67 +3482,21 @@ async def _maybe_refresh_workspace_summary(
                     continue
                 new_tail_lines.append(f"[{cid}] {role}: {content}")
 
-    if not new_tail_lines:
-        raw = _load_workspace_summary_raw(root) if existing else ""
-        if raw and user_prompt:
-            return await _select_relevant_summary(
-                raw, user_prompt, model, fallback_model
-            )
-        return ""
+        if not new_tail_lines:
+            return
 
-    body = "\n".join(new_tail_lines)[:20000]
-    existing_content = (existing or {}).get("content") or ""
-    chosen = model or fallback_model
-
-    if user_prompt:
-        # Combined path: one call both merges the summary AND selects the
-        # relevant subset -- avoids a second round trip in the common case.
-        updated, relevant = await _merge_and_filter_summary(
-            existing_content, body, user_prompt, chosen
-        )
-        if updated.strip():
-            try:
-                state_db.save_workspace_summary(
-                    workspace_slug,
-                    updated,
-                    current_counts,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return _workspace_summary_wrapper(relevant)
-        # Combined call failed or was malformed -- fall back to a plain
-        # merge (keeps the cumulative record correct) plus a separate
-        # filter call against the fresh result.
+        body = "\n".join(new_tail_lines)[:20000]
+        existing_content = (existing or {}).get("content") or ""
+        chosen = model or fallback_model
         summary_text = await _merge_summary_only(existing_content, body, chosen)
         if summary_text.strip():
-            try:
-                state_db.save_workspace_summary(
-                    workspace_slug,
-                    summary_text,
-                    current_counts,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return await _select_relevant_summary(
-                summary_text, user_prompt, model, fallback_model
-            )
-        # Both failed -- keep whatever was persisted before, inject nothing.
-        return ""
-
-    # No prompt to filter for (e.g. the new chat opened with an attachment
-    # only) -- just refresh the cumulative record as a side effect; there's
-    # nothing to inject without a prompt to filter against.
-    summary_text = await _merge_summary_only(existing_content, body, chosen)
-    if summary_text.strip():
-        try:
             state_db.save_workspace_summary(
                 workspace_slug,
                 summary_text,
                 current_counts,
             )
-        except Exception:  # noqa: BLE001
-            pass
-    return ""
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _merge_summary_only(
@@ -3559,90 +3536,6 @@ async def _merge_summary_only(
         return text or ""
     except Exception:  # noqa: BLE001
         return ""
-
-
-_DUAL_SUMMARY_MARK_UPDATED = "===UPDATED_SUMMARY==="
-_DUAL_SUMMARY_MARK_RELEVANT = "===RELEVANT_TO_THIS_CHAT==="
-_DUAL_SUMMARY_MARK_END = "===END==="
-
-
-def _parse_dual_summary_output(raw: str) -> tuple[str, str]:
-    """Parse the dual-marker output of _merge_and_filter_summary into
-    (updated_summary, relevant_excerpt). Fails closed: if both markers
-    aren't present, returns ("", "") rather than guessing -- a malformed
-    response must never be persisted as the cumulative summary.
-    """
-    raw = raw or ""
-    if _DUAL_SUMMARY_MARK_UPDATED not in raw or _DUAL_SUMMARY_MARK_RELEVANT not in raw:
-        return "", ""
-    updated = (
-        raw.split(_DUAL_SUMMARY_MARK_UPDATED, 1)[1]
-        .split(_DUAL_SUMMARY_MARK_RELEVANT, 1)[0]
-        .strip()
-    )
-    rest = raw.split(_DUAL_SUMMARY_MARK_RELEVANT, 1)[1]
-    relevant = (
-        rest.split(_DUAL_SUMMARY_MARK_END, 1)[0]
-        if _DUAL_SUMMARY_MARK_END in rest
-        else rest
-    ).strip()
-    return updated, relevant
-
-
-async def _merge_and_filter_summary(
-    existing_content: str,
-    new_tail_body: str,
-    user_prompt: str,
-    chosen: Any,
-) -> tuple[str, str]:
-    """Combined call: merge existing+new into an updated cumulative
-    summary AND select the subset relevant to the user's first message,
-    in one round trip. Returns (updated_summary, relevant_excerpt); both
-    "" if the call fails or the output doesn't match the expected format.
-    """
-    if chosen is None:
-        return "", ""
-    system_prompt = (
-        "You maintain a running summary of this workspace across chats, "
-        "and also prepare a filtered excerpt for a brand-new chat.\n"
-        "You are given: (1) the EXISTING summary (if any), (2) NEW turns "
-        "since the last update, (3) the user's first message in a "
-        "brand-new chat.\n"
-        "Do TWO things:\n"
-        "A. Merge (1)+(2) into an UPDATED summary: keep what's still "
-        "relevant from the existing summary, add what's new, drop what's "
-        "stale. Bullet list covering tasks completed, files changed, "
-        "architectural decisions, unresolved issues. Max ~2000 "
-        "characters. This must stand on its own as the full record -- do "
-        "NOT filter it by the user's message.\n"
-        "B. From that UPDATED summary, select ONLY the bullets relevant "
-        "to the user's first message -- copy verbatim or lightly "
-        "trimmed, do not invent anything new. If nothing is relevant, "
-        "leave this section empty. Max ~1200 characters.\n"
-        "Write in the same language the turns use (Persian or English).\n"
-        "Output EXACTLY in this format, with these literal markers on "
-        "their own lines and nothing outside them:\n"
-        f"{_DUAL_SUMMARY_MARK_UPDATED}\n"
-        "<updated summary bullets>\n"
-        f"{_DUAL_SUMMARY_MARK_RELEVANT}\n"
-        "<relevant bullets, or leave empty>\n"
-        f"{_DUAL_SUMMARY_MARK_END}"
-    )
-    user_msg = (
-        "EXISTING SUMMARY:\n"
-        + (existing_content.strip() or "(none)")
-        + "\n\nNEW TURNS:\n"
-        + new_tail_body
-        + "\n\nUSER'S FIRST MESSAGE:\n"
-        + user_prompt
-    )
-    try:
-        from llm import llm_generate
-
-        raw, _ = await llm_generate(chosen, system=system_prompt, user=user_msg)
-    except Exception:  # noqa: BLE001
-        return "", ""
-    return _parse_dual_summary_output(raw)
 
 
 def _safe_file(name: str, fallback: str = "item") -> str:

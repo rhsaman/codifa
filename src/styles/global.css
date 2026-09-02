@@ -11279,15 +11279,4 @@ textarea {
   border-color: var(--accent);
 }
 
-/* ── Reduced motion: kill ALL animations and transitions ─────────────────
-   Single catch-all block so no animation or transition leaks through for
-   users who prefer reduced motion. Must come after all other rules to win
-   by specificity on equal selectors. */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-}
+

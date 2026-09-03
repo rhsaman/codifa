@@ -1189,7 +1189,7 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
 # failure recovers automatically — up to this many attempts, 30s apart — instead
 # of giving up on the first blip. Configurable so tests can zero the backoff.
 _RETRY_MAX_ATTEMPTS = 10
-_RETRY_BASE_SECONDS = 15
+_RETRY_BASE_SECONDS = 30
 
 
 def _is_image_rejection(exc: BaseException) -> bool:
@@ -1616,6 +1616,33 @@ _SUMMARY_OUTPUT_TOKENS = 8_192
 _MIN_PRESERVE_RECENT_TOKENS = 2_000
 _MAX_PRESERVE_RECENT_TOKENS = 15_000
 
+# --- Small-context optimisation (local models with tight windows) -----------
+# When the configured model context window is below the threshold below we
+# switch to a token-frugal prompt assembly: smaller CODE MAP, half-size RAG,
+# skill index without descriptions, tighter project-memory cap, and tighter
+# tool-output trim. Models with ctx ≥ threshold keep the full prompt unchanged.
+# Threshold 32k catches qwen2.5-coder:7b (32k), llama3.1:8b (8k/16k),
+# gemma2:9b (8k), phi-3/4 (4k-16k). Larger models (Claude/GPT-4 / 200k ctx)
+# are unaffected. context_window=0 means "unknown" → safe default (no opt).
+_SMALL_CTX_THRESHOLD = 32_000
+_SMALL_CTX_CODE_MAP_TOKENS = 256  # was 512 (ask) / 1024 (coder/plan)
+_SMALL_CTX_SKILL_DESC_LIMIT = 0  # 0 = no description, only name
+_SMALL_CTX_RAG_MAX_CHARS = 1_500  # half of _DEFAULT_MAX_CHARS=3_600
+_SMALL_CTX_TOOL_OUTPUT_MAX = 1_200  # tighter than _TOOL_OUTPUT_MAX_CHARS=2_000
+_SMALL_CTX_PROJECT_MEMORY_MAX = 4_000  # tighter than _PROJECT_MEMORY_MAX_BYTES=12_000
+
+
+def is_small_context(ctx: int | None) -> bool:
+    """True when the configured context window is below the small-model threshold.
+
+    A value of 0 (or non-numeric) means "unknown" and returns False so the
+    caller keeps the existing (full) prompt — we never optimise blindly.
+    """
+    try:
+        return 0 < int(ctx or 0) < _SMALL_CTX_THRESHOLD
+    except (TypeError, ValueError):
+        return False
+
 
 def _estimate_tokens(text: str) -> int:
     """Heuristic token count. Latin ~4 chars/token; Persian/Arabic ~2.5
@@ -1906,7 +1933,7 @@ _PROJECT_MEMORY_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
 _PROJECT_MEMORY_CACHE_MAX = 64
 
 
-def _load_project_memory(root: str) -> str:
+def _load_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) -> str:
     """Read the project's persistent instructions file, if present.
 
     Returns a ready-to-append system-prompt section, or ``""`` if no such file
@@ -1916,6 +1943,10 @@ def _load_project_memory(root: str) -> str:
     the same session skip the disk read + string assembly (the content is
     static across turns unless the file is edited). The cache is bounded so
     long sessions that touch many workspaces don't grow it without bound.
+
+    ``max_bytes`` lets small-context callers use a tighter cap; the cache only
+    holds the trimmed result for the latest caller, so cross-session re-entry
+    with a different cap simply re-runs the read.
     """
     mtime = 0.0
     for rel in _PROJECT_MEMORY_FILES:
@@ -1928,7 +1959,7 @@ def _load_project_memory(root: str) -> str:
         # Touch — move to the back so the LRU eviction keeps the active workspace.
         _PROJECT_MEMORY_CACHE.move_to_end(root)
         return cached[1]
-    result = _read_project_memory(root)
+    result = _read_project_memory(root, max_bytes=max_bytes)
     _PROJECT_MEMORY_CACHE[root] = (mtime, result)
     _PROJECT_MEMORY_CACHE.move_to_end(root)
     while len(_PROJECT_MEMORY_CACHE) > _PROJECT_MEMORY_CACHE_MAX:
@@ -1936,7 +1967,7 @@ def _load_project_memory(root: str) -> str:
     return result
 
 
-def _read_project_memory(root: str) -> str:
+def _read_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) -> str:
     """Read + truncate the project memory file (uncached core of _load_project_memory)."""
     for rel in _PROJECT_MEMORY_FILES:
         try:
@@ -1948,9 +1979,9 @@ def _read_project_memory(root: str) -> str:
         body = result["content"].strip()
         if not body:
             continue
-        if len(body) > _PROJECT_MEMORY_MAX_BYTES:
+        if len(body) > max_bytes:
             body = (
-                body[:_PROJECT_MEMORY_MAX_BYTES]
+                body[:max_bytes]
                 + "\n…(truncated — file exceeds the auto-included limit; read the "
                 "rest with read_file if needed)"
             )
@@ -3286,7 +3317,7 @@ def _load_skills(root: str) -> list[dict]:
     return skills
 
 
-def _skills_section(skills: list[dict]) -> str:
+def _skills_section(skills: list[dict], desc_limit: int = 100) -> str:
     """Compact skill index for the system prompt (discovery only).
 
     Skills come from the app database and cannot be reached through the
@@ -3296,9 +3327,26 @@ def _skills_section(skills: list[dict]) -> str:
     the token cost of every body on every turn. Full bodies are never inlined
     here — skills are used only via @mention, which inlines their full
     instructions.
+
+    ``desc_limit`` controls how much of each description is shown:
+      * default 100 → balanced (matches legacy behaviour)
+      * 0 → drop descriptions entirely, list names only (small-context mode)
     """
     if not skills:
         return ""
+    if desc_limit <= 0:
+        lines = [
+            "\n\n=== AVAILABLE SKILLS ===",
+            (
+                "These skills are available. They are used ONLY when the user "
+                "explicitly attaches one with @mention in the message. Names only "
+                "are listed to keep the system prompt small; @mention inlines the "
+                "full instructions on demand."
+            ),
+        ]
+        for s in skills:
+            lines.append(f"- {s['name']}")
+        return "\n".join(lines)
     lines = [
         "\n\n=== AVAILABLE SKILLS ===",
         (
@@ -3311,8 +3359,8 @@ def _skills_section(skills: list[dict]) -> str:
     for s in skills:
         name = s["name"]
         desc = s["description"] or ""
-        if len(desc) > 100:
-            desc = desc[:97].rstrip() + "…"
+        if len(desc) > desc_limit:
+            desc = desc[: desc_limit - 1].rstrip() + "…"
         lines.append(f"- {name} — {desc}" if desc else f"- {name}")
     return "\n".join(lines)
 
@@ -3414,9 +3462,7 @@ async def _maybe_refresh_workspace_summary(
     prev_counts = (existing or {}).get("covered_message_counts") or {}
     needs_refresh = not (
         existing
-        and all(
-            int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items()
-        )
+        and all(int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items())
         and len(prev_counts) == len(current_counts)
     )
     if needs_refresh:

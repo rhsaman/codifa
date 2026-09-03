@@ -910,7 +910,11 @@ async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | Non
     return result
 
 
-def _build_skills_section(picked_names: list[str], root: str) -> str:
+def _build_skills_section(
+    picked_names: list[str],
+    root: str,
+    desc_limit: int = 100,
+) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
     Attached/picked skills have their FULL body inlined (so the agent adopts
@@ -930,7 +934,8 @@ def _build_skills_section(picked_names: list[str], root: str) -> str:
         by_name = {s["name"].lower(): s for s in all_skills}
         picked = [by_name[n.lower()] for n in manual_names if n.lower() in by_name]
     section = _agents._skills_section(
-        [s for s in all_skills if s["name"] not in {p["name"] for p in picked}]
+        [s for s in all_skills if s["name"] not in {p["name"] for p in picked}],
+        desc_limit=desc_limit,
     )
     if picked:
         bodies = "\n\n".join(
@@ -1067,6 +1072,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001
             ctx = 0
     ctx = max(0, ctx)
+    # Small-context mode: when the model's window is below the threshold we
+    # switch to a token-frugal prompt assembly (smaller CODE MAP, no skill
+    # descriptions, tighter project-memory cap, tighter tool-output trim).
+    # Models with ctx >= threshold (or unknown ctx=0) keep the full prompt.
+    small_ctx = _agents.is_small_context(ctx)
 
     cap = state.get("cap")
     # All sub-agents (search / web / explore / vision / compact distills) and the
@@ -1304,7 +1314,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
 
     try:
-        project_memory = _agents._load_project_memory(root)
+        project_memory = _agents._load_project_memory(
+            root,
+            max_bytes=(
+                _agents._SMALL_CTX_PROJECT_MEMORY_MAX
+                if small_ctx
+                else _agents._PROJECT_MEMORY_MAX_BYTES
+            ),
+        )
     except Exception:  # noqa: BLE001
         project_memory = ""
     if project_memory:
@@ -1332,8 +1349,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if _ws_summary:
             system_final += _ws_summary
 
-    # Skills.
-    system_final += _build_skills_section(skills or [], root)
+    # Skills. small_ctx → list names only (no description) to save tokens.
+    system_final += _build_skills_section(
+        skills or [],
+        root,
+        desc_limit=(
+            _agents._SMALL_CTX_SKILL_DESC_LIMIT if small_ctx else 100
+        ),
+    )
 
     if mode in ("plan", "coder"):
         try:
@@ -1373,7 +1396,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                             _mentioned_idents.add(_m)
 
             # ask توکن‌حساس‌تره → بودجه کمتر.
-            max_map_tokens = 512 if mode == "ask" else 1024
+            if small_ctx:
+                max_map_tokens = _agents._SMALL_CTX_CODE_MAP_TOKENS  # 256
+            else:
+                max_map_tokens = 512 if mode == "ask" else 1024
             # نقشه کامل فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
             # نقشه باعث می‌شد ایجنت فایل موردنظرش رو توی نقشه نبینه و مجبور بشه
             # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
@@ -1452,6 +1478,19 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 _code_map_hash_cache.pop(chat_id, None)
     else:
         lc_history = history_to_langchain_messages(history, current_mode=mode)
+    # Small-context: tighter cap on tool outputs in the history transcript.
+    # Anything over the cap gets a marker so the model knows it was trimmed
+    # and can re-read with offset/limit if it needs the rest.
+    if small_ctx:
+        _tool_cap = _agents._SMALL_CTX_TOOL_OUTPUT_MAX
+        for _m in lc_history:
+            if getattr(_m, "type", "") == "tool":
+                _c = getattr(_m, "content", "") or ""
+                if isinstance(_c, str) and len(_c) > _tool_cap:
+                    _m.content = (
+                        _c[:_tool_cap]
+                        + "\n[truncated for small-context model — re-read with offset/limit if needed]"
+                    )
     # CODE MAP dedup: فقط وقتی marker "unchanged" بفرست که نقشهٔ کامل هنوز
     # تو recent tail (lc_history) هست — وگرنه (اگه historyLimit یا auto-compact
     # turn حاوی نقشه رو حذف/خلاصه کرده باشه) نقشهٔ کامل رو دوباره می‌فرستیم تا

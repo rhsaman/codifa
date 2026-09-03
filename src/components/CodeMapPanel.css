@@ -1,0 +1,167 @@
+/* CodeMapPanel — پنل سمت راست که code map زنده‌ی پروژه رو درختی نشون می‌ده.
+ * از همون متغیرهای تم Catppuccin (styles/global.css) استفاده می‌کنه تا با
+ * sidebar هماهنگ باشه. عرض ثابت 320px، در RTL روی ضلع فیزیکی راست می‌نشینه. */
+
+.codemap-panel {
+  width: 320px;
+  min-width: 260px;
+  max-width: 480px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-alt, #181825);
+  border-inline-start: 1px solid var(--border, #45475a);
+  overflow: hidden;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--text, #cdd6f4);
+}
+
+.codemap-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid var(--border, #45475a);
+  background: var(--bg, #1e1e2e);
+}
+
+.codemap-search {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-input, #45475a);
+  color: var(--text, #cdd6f4);
+  border: 1px solid var(--border, #45475a);
+  border-radius: 6px;
+  font: inherit;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.codemap-search:focus-visible {
+  border-color: var(--accent, #89b4fa);
+  box-shadow: var(--focus-ring, 0 0 0 2px rgba(137, 180, 250, 0.25));
+}
+.codemap-search::placeholder { color: var(--text-dim, #a6adc8); }
+
+.codemap-meta {
+  font-size: 11px;
+  color: var(--text-dim, #a6adc8);
+  padding-inline: 2px;
+}
+
+.codemap-tree {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 4px 16px;
+  scrollbar-width: thin;
+}
+
+.codemap-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-dim, #a6adc8);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* فایل — هر details یه فایل‌ست */
+.codemap-file {
+  margin: 0 2px 4px;
+  border-radius: 6px;
+}
+.codemap-file > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  user-select: none;
+  transition: background 100ms ease;
+}
+.codemap-file > summary::-webkit-details-marker { display: none; }
+.codemap-file > summary:hover { background: var(--bg-hover, #45475a); }
+.codemap-file[open] > summary {
+  color: var(--accent, #89b4fa);
+  font-weight: 500;
+}
+
+.codemap-file-icon { font-size: 12px; opacity: 0.8; }
+.codemap-file-name {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.codemap-file-count {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--bg-raised, #45475a);
+  color: var(--text-dim, #a6adc8);
+}
+
+/* لیست نمادها */
+.codemap-symbols {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 4px 18px; /* indent از parent (summary) */
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.codemap-symbol {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 100ms ease;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.codemap-symbol:hover { background: var(--bg-hover, #45475a); }
+.codemap-symbol:focus-visible {
+  outline: none;
+  background: var(--bg-hover, #45475a);
+  box-shadow: var(--focus-ring, 0 0 0 2px rgba(137, 180, 250, 0.25));
+}
+
+.codemap-kind {
+  flex: 0 0 auto;
+  width: 64px;
+  font-size: 10px;
+  text-transform: lowercase;
+  color: var(--text-dim, #a6adc8);
+  letter-spacing: 0.02em;
+}
+
+.codemap-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codemap-line {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-dim, #a6adc8);
+  font-variant-numeric: tabular-nums;
+}
+
+/* رنگ‌بندی بر اساس kind — طیف‌های متفاوت Catppuccin برای جداسازی بصری */
+.codemap-symbol.kind-class .codemap-kind    { color: var(--provider-google, #f9e2af); }
+.codemap-symbol.kind-function .codemap-kind { color: var(--accent, #89b4fa); }
+.codemap-symbol.kind-method .codemap-kind   { color: var(--provider-nvidia, #94e2d5); }
+.codemap-symbol.kind-interface .codemap-kind{ color: var(--provider-cloudflare, #89b4fa); }
+.codemap-symbol.kind-type .codemap-kind     { color: var(--provider-google, #f9e2af); }
+.codemap-symbol.kind-struct .codemap-kind   { color: var(--provider-tokenrouter, #cba6f7); }
+.codemap-symbol.kind-enum .codemap-kind     { color: var(--provider-openrouter, #fab387); }
+.codemap-symbol.kind-variable .codemap-kind { color: var(--text-dim, #a6adc8); }

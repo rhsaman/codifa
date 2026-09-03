@@ -435,7 +435,13 @@ export async function streamChat(
         headers: { 'Content-Type': 'application/json' },
         signal: params.signal,
         body: JSON.stringify({
+          // `provider` stays as the kind so the backend can keep using it as
+          // the model-lookup / timeout key, which is provider-KIND-scoped
+          // (e.g. "openrouter" / "opencode" / "google"). `provider_id` carries
+          // the user-configured id so per-usage entries group under the right
+          // provider even when several providers share the same kind.
           provider: params.provider.kind,
+          provider_id: params.provider.id,
           api_key: params.provider.apiKey,
           env_var: params.provider.envVar ?? '',
           base_url: params.provider.baseUrl,

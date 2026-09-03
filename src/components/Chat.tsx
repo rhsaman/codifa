@@ -1939,8 +1939,11 @@ export function ChatPanel() {
         const outputTokens = event.output_tokens ?? 0;
         const total = event.total_tokens ?? inputTokens + outputTokens;
         // Prefer the provider the backend actually used (from the usage event);
-        // fall back to the chat's own provider for legacy events without it.
+        // `provider_id` is the user-configured id, which the sidebar groups by
+        // (several providers can share the same kind). Fall back to the kind
+        // field for legacy events, then to the chat's own provider.
         const providerId =
+          (event.provider_id as string | undefined) ||
           (event.provider as string | undefined) ||
           getChatProvider(chat.id).id ||
           "unknown";

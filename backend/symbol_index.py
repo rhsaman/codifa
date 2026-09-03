@@ -49,6 +49,14 @@ _TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".swift", ".rb", ".php", ".c", ".cc",
     ".cpp", ".h", ".hpp", ".cs", ".sql", ".sh", ".bash", ".vue", ".svelte",
+    # زبان‌های جدید (اضافه‌شده برای پوشش چندزبانه)
+    ".zig", ".dart", ".lua", ".scala", ".sbt",
+    ".ex", ".exs", ".erl", ".hrl",
+    ".hs", ".ml", ".mli",
+    ".clj", ".cljs", ".cljc",
+    ".groovy", ".gradle",
+    ".jl", ".r", ".R", ".pl", ".pm",
+    ".nim", ".cr",
 }
 
 # نگاشت پسوند → زبانِ پشتیبانی‌شده توسط tree-sitter-language-pack.
@@ -64,6 +72,31 @@ _LANG_ALIASES = {
     ".cjs": "javascript",
     ".vue": "html",
     ".svelte": "html",
+    # زبان‌های جدید — اگر tree-sitter-language-pack اسمشون رو متفاوت می‌ده، صریح نگاشت می‌کنیم
+    ".zig": "zig",
+    ".dart": "dart",
+    ".lua": "lua",
+    ".scala": "scala",
+    ".sbt": "scala",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".erl": "erlang",
+    ".hrl": "erlang",
+    ".hs": "haskell",
+    ".ml": "ocaml",
+    ".mli": "ocaml",
+    ".clj": "clojure",
+    ".cljs": "clojure",
+    ".cljc": "clojure",
+    ".groovy": "groovy",
+    ".gradle": "groovy",
+    ".jl": "julia",
+    ".r": "r",
+    ".R": "r",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".nim": "nim",
+    ".cr": "crystal",
 }
 
 # پوشه‌هایی که نباید پیمایش بشن (مطابق با ابزارهای فایل).

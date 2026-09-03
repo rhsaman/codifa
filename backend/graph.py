@@ -368,6 +368,10 @@ class AgentState(TypedDict, total=False):
     images: list[str]
     # Provider / model config (preserved verbatim from the UI request)
     provider: str
+    # User-configured provider id (distinct from `provider` which is the kind).
+    # Emitted back on usage events so the sidebar groups per-usage entries by
+    # the exact id the user picked, not just by the shared kind.
+    provider_id: str
     model_name: str
     base_url: str
     api_key: str
@@ -1735,7 +1739,9 @@ def _estimate_prompt_tokens(messages: list) -> int | None:
         return None
 
 
-def _usage_event_from_ai(ai: Any, model: str, provider: str = "") -> dict | None:
+def _usage_event_from_ai(
+    ai: Any, model: str, provider: str = "", provider_id: str = ""
+) -> dict | None:
     """Build a frontend ``usage`` event from a LangChain ``AIMessage``.
 
     LangChain surfaces token counts in ``usage_metadata`` (OpenAI/Google),
@@ -1825,6 +1831,10 @@ def _usage_event_from_ai(ai: Any, model: str, provider: str = "") -> dict | None
         "context_tokens": context_tokens,
         "model": model or "",
         "provider": provider,
+        # User-configured provider id (distinct from `provider` which is the
+        # kind). Frontend groups per-usage entries by this id so several
+        # providers sharing the same kind do not collapse into one bucket.
+        "provider_id": provider_id,
     }
 
 
@@ -2581,7 +2591,12 @@ async def _run_mode_turn(
                 _astream_count_local_val = _astream_count_local
                 # Surface token usage so the frontend can show per-model cost in
                 # the sidebar and a real consumed-context meter in the title bar.
-                usage_ev = _usage_event_from_ai(ai, model_id, state.get("provider", ""))
+                usage_ev = _usage_event_from_ai(
+                    ai,
+                    model_id,
+                    state.get("provider", ""),
+                    state.get("provider_id", ""),
+                )
                 if usage_ev:
                     # Track the SAME token breakdown the frontend context meter
                     # shows, so auto-compaction fires off the exact value the meter

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
+import { CodeMapPanel } from './components/CodeMapPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -21,6 +22,7 @@ export default function App() {
   const activeChatId = useStore((s) => s.activeChatId)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
+  const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -185,7 +187,7 @@ export default function App() {
         }
         case 'o': {
           e.preventDefault()
-          void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))
+          useStore.getState().toggleCodeMapPanel()
           break
         }
         case 'm': {
@@ -250,6 +252,17 @@ export default function App() {
           <main className="main">
             <ChatPanel key={activeChatId} />
           </main>
+          {codeMapPanelOpen && (
+            <CodeMapPanel
+              onJumpToFile={(path, line) => {
+                // فعلاً: یه CustomEvent می‌فرستیم که هر listener (مثل editor آینده)
+                // بتونه فایل رو در خط دلخواه باز کنه. این نقطه‌ی توسعه‌ست.
+                window.dispatchEvent(
+                  new CustomEvent('coder:open-file', { detail: { path, line } }),
+                )
+              }}
+            />
+          )}
         </ErrorBoundary>
       </div>
 

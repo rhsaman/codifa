@@ -3777,6 +3777,11 @@ async def run_agent(
     mode: str,
     prompt: str,
     history: list[dict],
+    # User-configured provider id (distinct from `provider` which is the kind).
+    # Several providers can share the same kind (e.g. two openrouter accounts
+    # with different ids); we propagate this into the usage event so the
+    # sidebar groups per-usage entries under the exact id the user picked.
+    provider_id: str = "",
     attachments: list[str] | None = None,
     images: list[str] | None = None,
     system_prompt: str = "",
@@ -3822,6 +3827,7 @@ async def run_agent(
 
     initial: dict = {
         "provider": provider,
+        "provider_id": provider_id,
         "model_name": model_name,
         "base_url": base_url,
         "api_key": api_key,

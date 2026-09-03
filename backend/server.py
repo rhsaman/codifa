@@ -275,6 +275,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     provider: str = "custom"
+    # User-configured provider id (distinct from `provider` which is the kind).
+    # Several providers can share the same kind (e.g. two openrouter accounts
+    # with different ids), so the kind alone is ambiguous for per-usage
+    # grouping. Frontend sends both; backend propagates provider_id into the
+    # usage event so the sidebar groups by the id the user actually picked.
+    provider_id: str = ""
 
     @model_validator(mode="after")
     def _normalize_mode(self) -> ChatRequest:
@@ -1396,6 +1402,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         # Create the agent generator so we can close it on disconnect
         agent_gen = run_agent(
             provider=req.provider,
+            provider_id=req.provider_id,
             model_name=req.model,
             base_url=req.base_url,
             api_key=req.api_key,
@@ -1600,6 +1607,33 @@ def _open_store(root: str, vector_db_path: str):
     if store is None:
         raise HTTPException(status_code=503, detail="vector store unavailable")
     return store
+
+
+@app.get("/code-map")
+async def get_code_map(
+    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
+) -> dict:
+    """نقشه‌ی زنده‌ی نمادهای پروژه را برای پنل CodeMapPanel برمی‌گرداند.
+
+    خروجی به شکل ``{rel_path: [{name, line, kind}, ...]}`` است؛ هر فایل فقط
+    نمادهای قابل استخراج (تابع، کلاس، متد، struct، enum، ...) را شامل می‌شود.
+    """
+    from symbol_index import build_symbol_map
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=404, detail=f"workspace not found: {root}")
+    try:
+        sym_map = await asyncio.to_thread(build_symbol_map, root)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("code-map build failed for %s: %s", root, exc)
+        raise HTTPException(status_code=500, detail=f"code-map build failed: {exc}") from exc
+    # تبدیل tuple به dict (frontend-friendly) — kind همان مقدار "function"/"class"/...
+    return {
+        rel: [{"name": n, "line": l, "kind": k} for (n, l, k) in syms]
+        for rel, syms in sym_map.items()
+    }
 
 
 @app.get("/index/status")

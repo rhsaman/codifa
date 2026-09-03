@@ -120,6 +120,8 @@ export interface Settings {
   compact?: boolean
   recentModels?: RecentModel[]
   sidebarOpen?: boolean
+  /** پنل code map سمت راست (Ctrl+O) باز باشد یا نه — مثل sidebarOpen persisted می‌شود. */
+  codeMapPanelOpen?: boolean
   /** Directory for the per-workspace RAG vector store (memory + web chunks).
    *  Empty string = default ({dataPath}/vector-db). */
   vectorDbPath?: string
@@ -468,6 +470,11 @@ export interface SidecarEvent {
    *  'anthropic').  Absent on legacy events — the frontend falls back to the
    *  chat's own provider when missing. */
   provider?: string
+  /** The user-configured provider id for this usage event — distinct from
+   *  `provider` (the kind). Several providers can share the same kind
+   *  (e.g. two openrouter accounts with different ids), so the sidebar groups
+   *  per-usage entries by this id. Empty on legacy events. */
+  provider_id?: string
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string
@@ -500,3 +507,15 @@ export interface SidecarEvent {
    *  (which slowed the UI); the frontend uses it to glow the composer. */
   active?: boolean
 }
+
+/** یک نماد استخراج‌شده از فایل (تابع، کلاس، متد، struct، enum، ...) — خروجی
+ *  مستقیم endpoint بک‌اند `GET /code-map`. */
+export interface CodeSymbol {
+  name: string
+  line: number
+  /** "function" | "class" | "method" | "struct" | "enum" | "interface" | ... */
+  kind: string
+}
+
+/** نقشه‌ی کامل یک پروژه: مسیر نسبی فایل → لیست نمادهایش. */
+export type CodeMap = Record<string, CodeSymbol[]>

@@ -488,6 +488,7 @@ dependencies = [
     { name = "sqlite-vec" },
     { name = "tokenizers" },
     { name = "tree-sitter" },
+    { name = "tree-sitter-language-pack" },
     { name = "uvicorn" },
 ]
 
@@ -523,6 +524,7 @@ requires-dist = [
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "tokenizers", specifier = ">=0.19" },
     { name = "tree-sitter", specifier = ">=0.26.0" },
+    { name = "tree-sitter-language-pack", specifier = ">=1.15.8" },
     { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 

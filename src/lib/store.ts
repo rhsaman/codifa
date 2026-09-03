@@ -252,7 +252,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -265,7 +265,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -391,6 +391,7 @@ interface State {
   dir: 'rtl' | 'ltr'
   recentModels: RecentModel[]
   sidebarOpen: boolean
+  codeMapPanelOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
@@ -447,6 +448,8 @@ interface State {
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
   toggleSidebar: () => void
+  setCodeMapPanelOpen: (open: boolean) => void
+  toggleCodeMapPanel: () => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
@@ -697,6 +700,7 @@ export const useStore = create<State>((set, get) => ({
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
+  codeMapPanelOpen: false,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -945,6 +949,7 @@ export const useStore = create<State>((set, get) => ({
       },
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
+      codeMapPanelOpen: raw.codeMapPanelOpen === true,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
       pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
@@ -1304,6 +1309,16 @@ export const useStore = create<State>((set, get) => ({
   toggleSidebar: () => {
     const next = !get().sidebarOpen
     get().setSidebarOpen(next)
+  },
+
+  setCodeMapPanelOpen: (codeMapPanelOpen) => {
+    set({ codeMapPanelOpen })
+    get().persist()
+  },
+
+  toggleCodeMapPanel: () => {
+    const next = !get().codeMapPanelOpen
+    get().setCodeMapPanelOpen(next)
   },
 
   setRecentModels: (recentModels) => {

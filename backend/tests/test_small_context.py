@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 
 import pytest
 
@@ -157,64 +158,19 @@ def test_small_ctx_constants_are_reasonable():
 # ---- end-to-end: مسیر کامل ollama/llama.cpp → small_ctx -----------------
 
 
-class _FakeResp:
-    """پاسخ ساختگی httpx."""
-
-    def __init__(self, payload):
-        self._p = payload
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._p
-
-
-class _FakeClient:
-    """AsyncClient ساختگی که فقط URL‌های شناخته‌شده را جواب می‌دهد."""
-
-    def __init__(self, routes: dict[str, dict]):
-        self._routes = routes
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def get(self, url, headers=None):
-        for key, payload in self._routes.items():
-            if key in url:
-                return _FakeResp(payload)
-        raise AssertionError(f"unexpected GET {url}")
-
-    async def post(self, url, json=None, headers=None):
-        for key, payload in self._routes.items():
-            if key in url:
-                return _FakeResp(payload)
-        raise AssertionError(f"unexpected POST {url}")
-
-
 @pytest.mark.asyncio
-async def test_ollama_8k_triggers_small_context_via_api_show(monkeypatch):
-    """وقتی client مقدار context_window نداد، model_context از ollama /api/show
+async def test_ollama_8k_triggers_small_context(monkeypatch):
+    """وقتی client مقدار context_window نداد، model_context از models.dev catalog
     مقدار واقعی (8192) را می‌گیرد و is_small_context فعال می‌شود."""
     import providers as P
 
-    ollama_show_payload = {
-        "model_info": {
-            "qwen2.context_length": 8192,
-        }
+    # فرمت صحیح catalog: provider_key → "models" → model_id → "limit" → "context"
+    # timestamp باید time.time() باشد تا cache منقضی نشود و از شبکه خوانده نشود
+    fake_catalog = {
+        "ollama": {"models": {"qwen2.5-coder:7b": {"limit": {"context": 8192}}}}
     }
-    monkeypatch.setattr(
-        P.httpx,
-        "AsyncClient",
-        lambda *a, **k: _FakeClient(
-            {"/api/show": ollama_show_payload, "/api/tags": {"models": []}}
-        ),
-    )
+    monkeypatch.setattr(P, "_models_dev_cache", (time.time(), fake_catalog))
     monkeypatch.setattr(P, "_model_cache", {})
-    monkeypatch.setattr(P, "_models_dev_cache", None)
 
     ctx = await P.model_context(
         provider="ollama",
@@ -226,23 +182,17 @@ async def test_ollama_8k_triggers_small_context_via_api_show(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_llamacpp_8k_triggers_small_context_via_props(monkeypatch):
-    """llama.cpp مقدار n_ctx را در /props expose می‌کند. وقتی client مقدار نداد،
-    model_context از آنجا 8192 می‌گیرد."""
+async def test_llamacpp_8k_triggers_small_context(monkeypatch):
+    """وقتی client مقدار context_window نداد، model_context از models.dev catalog
+    مقدار llama.cpp (8192) را می‌گیرد و is_small_context فعال می‌شود."""
     import providers as P
 
-    props_payload = {
-        "default_generation_settings": {"n_ctx": 8192},
+    fake_catalog = {
+        "custom": {"models": {"qwen2.5-coder-7b-q4": {"limit": {"context": 8192}}}}
     }
-    monkeypatch.setattr(
-        P.httpx,
-        "AsyncClient",
-        lambda *a, **k: _FakeClient({"/props": props_payload}),
-    )
+    monkeypatch.setattr(P, "_models_dev_cache", (time.time(), fake_catalog))
     monkeypatch.setattr(P, "_model_cache", {})
-    monkeypatch.setattr(P, "_models_dev_cache", None)
 
-    # base_url شامل /v1 باشد تا _looks_local درست تشخیص دهد و /props شاخه فعال شود
     ctx = await P.model_context(
         provider="custom",
         model="qwen2.5-coder-7b-q4",
@@ -257,20 +207,11 @@ async def test_large_model_200k_keeps_full_prompt(monkeypatch):
     """مدل‌های بزرگ (200k) نباید small_context شوند حتی اگر model_context مقدار دهد."""
     import providers as P
 
-    ollama_show_payload = {
-        "model_info": {
-            "qwen.context_length": 200_000,
-        }
+    fake_catalog = {
+        "ollama": {"models": {"qwen2.5-coder:32b": {"limit": {"context": 200_000}}}}
     }
-    monkeypatch.setattr(
-        P.httpx,
-        "AsyncClient",
-        lambda *a, **k: _FakeClient(
-            {"/api/show": ollama_show_payload, "/api/tags": {"models": []}}
-        ),
-    )
+    monkeypatch.setattr(P, "_models_dev_cache", (time.time(), fake_catalog))
     monkeypatch.setattr(P, "_model_cache", {})
-    monkeypatch.setattr(P, "_models_dev_cache", None)
 
     ctx = await P.model_context(
         provider="ollama",
@@ -279,6 +220,26 @@ async def test_large_model_200k_keeps_full_prompt(monkeypatch):
     )
     assert ctx == 200_000
     assert is_small_context(ctx) is False  # بالای آستانه
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_4k_small_context(monkeypatch):
+    """LM Studio با 4k context → is_small_context فعال."""
+    import providers as P
+
+    fake_catalog = {
+        "custom": {"models": {"local-model": {"limit": {"context": 4096}}}}
+    }
+    monkeypatch.setattr(P, "_models_dev_cache", (time.time(), fake_catalog))
+    monkeypatch.setattr(P, "_model_cache", {})
+
+    ctx = await P.model_context(
+        provider="custom",
+        model="local-model",
+        base_url="http://localhost:1234/v1",
+    )
+    assert ctx == 4096
+    assert is_small_context(ctx) is True
 
 
 def test_is_small_context_threshold_boundary():

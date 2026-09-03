@@ -1674,8 +1674,35 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     else:
         user_content = "\n\n".join(user_parts)
 
+    # Strict-mode chat templates (Qwen3.5/Qwen2.5, llama.cpp Jinja, some
+    # vLLM templates) require a SystemMessage to be the FIRST message in the
+    # list and reject the request if a SystemMessage appears later. Several
+    # code paths above (``lc_history.insert(0, SystemMessage(...))`` at
+    # historyLimit summary, _plan_reuse_note, _plan_discovery_note, the
+    # test-verification rule, and _tool_reuse_note) inject SystemMessage
+    # blocks into ``lc_history``. Without this fix, the final messages list
+    # becomes:
+    #   [SystemMessage(system_final),
+    #    SystemMessage(reuse_note|summary|...),
+    #    HumanMessage(user), AIMessage, ToolMessage, ...]
+    # which Qwen/llama.cpp reject with ``Jinja Exception: System message
+    # must be at the beginning``. Merge all those SystemMessages into the
+    # leading ``system_final`` so the model sees exactly ONE SystemMessage
+    # at position 0 — content is preserved (concatenated), order stays
+    # deterministic, and the LangGraph checkpointer / code-map dedup cache
+    # keep working because ``lc_history`` still carries every non-system
+    # message in order.
+    _sys_extras: list[str] = []
+    for _m in lc_history:
+        if isinstance(_m, SystemMessage):
+            _c = getattr(_m, "content", "")
+            if isinstance(_c, str) and _c:
+                _sys_extras.append(_c)
+    if _sys_extras:
+        system_final = system_final + "\n\n" + "\n\n".join(_sys_extras)
+    _lc_no_sys = [m for m in lc_history if not isinstance(m, SystemMessage)]
     messages: list[BaseMessage] = [SystemMessage(content=system_final)]
-    messages.extend(lc_history)
+    messages.extend(_lc_no_sys)
     messages.append(HumanMessage(content=user_content))
 
     with contextlib.suppress(Exception):

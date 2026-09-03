@@ -645,6 +645,15 @@ async def langchain_tool_loop(
             return f"ERROR running {name}: {exc}"
 
     msgs: list[Any] = []
+    # Safety net: some chat templates (e.g. Qwen3.5 / llama.cpp) crash with
+    # "System message must be at the beginning" if msgs[0] is a HumanMessage.
+    # Callers like ``graph._read`` pass ``system=""`` explicitly; without this
+    # guard the ``if system:`` check below would skip the SystemMessage and
+    # msgs[0] would become HumanMessage. Fall back to a minimal placeholder
+    # so the template parser stays happy. Sub-agents don't share prefix cache
+    # with the main agent, so this has no cache cost.
+    if not system:
+        system = "You are a helpful assistant."
     if system:
         msgs.append(SystemMessage(content=system))
     msgs.append(HumanMessage(content=user))
@@ -778,10 +787,14 @@ async def langchain_tool_loop(
         # needed; this just breaks the habit of fire-one-at-a-time greps.
         _tool_call_count += len(tcs)
         if _tool_call_count >= _TOOL_CALL_SOFT_LIMIT and steps < max_steps - 1:
+            # Inject as HumanMessage (not SystemMessage) so it lands mid-list
+            # without violating chat templates that require SystemMessage only
+            # at position 0 (e.g. Qwen3.5 / llama.cpp). This mirrors the same
+            # fix applied in graph.py for plan/tool-reuse notes.
             msgs.append(
-                SystemMessage(
+                HumanMessage(
                     content=(
-                        f"You have made {_tool_call_count} tool calls so far "
+                        f"[steering] You have made {_tool_call_count} tool calls so far "
                         f"(soft limit: {_TOOL_CALL_SOFT_LIMIT}). "
                         "If you have enough information, STOP calling tools and "
                         "summarize your findings now. "
@@ -805,12 +818,15 @@ async def langchain_tool_loop(
             _same_call_streak = 1
             _last_call_sig = _step_sig
         if _same_call_streak >= _DOOM_LOOP_LIMIT:
+            # Inject as HumanMessage (not SystemMessage) so it lands mid-list
+            # without violating chat templates that require SystemMessage only
+            # at position 0 (e.g. Qwen3.5 / llama.cpp).
             msgs.append(
-                SystemMessage(
+                HumanMessage(
                     content=(
-                        "You have issued the same tool call 3 times in a row with "
-                        "identical arguments — this is a loop. Stop calling tools and "
-                        "report your findings in text now."
+                        "[steering] You have issued the same tool call 3 times in a row "
+                        "with identical arguments — this is a loop. Stop calling tools "
+                        "and report your findings in text now."
                     )
                 )
             )

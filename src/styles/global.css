@@ -4019,6 +4019,11 @@ textarea {
   padding: 8px 0;
   font-size: 12px;
   font-family: var(--font-mono);
+  /* unicode-bidi: plaintext باعث می‌شود مرورگر جهت هر خط را مستقل از
+     کاراکتر اول خط تعیین کند. ترکیب با dir="ltr" روی <pre> و LRMهای
+     تزریق‌شده توسط injectLrmMarks در bidi.ts، باعث می‌شود کلمات
+     فارسی و انگلیسی در کامنت‌های مخلوط به ترتیب صحیح نمایش داده شوند. */
+  unicode-bidi: plaintext;
 }
 
 /* Each code line is wrapped in a `.code-line` span containing a `.code-gutter`

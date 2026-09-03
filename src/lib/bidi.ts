@@ -377,9 +377,125 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   const folded = foldLineCaptions(cleaned)
   const parts = folded.split(/```/g)
   const fixed = parts.map((p, i) => {
-    if (i % 2 === 1) return p // inside code block, don't modify
+    if (i % 2 === 1) return fixCodeBlock(p) // code block: fix Persian runs only
     return fixZwsp(p)
   })
   return fixed.join('```')
+}
+
+// fixZwsp را روی بلوک کد به‌طور مستقیم نزن: hljs و escapeHtml ساختار کد
+// (operatorها، پرانتزها، تورفتگی) را می‌بینند و اگر ZWNJ/ZWNJ-like را در
+// میانه‌ی خط به فاصله تبدیل کنیم، توکنایز کد می‌شکند و highlight از کار
+// می‌افتد. ولی مدل در کامنت‌های فارسی داخل کد (مثل `// سلام ‏world`)
+// همان جداکننده‌های نامرئی (ZWSP/LRM/RLM) را بین واژه‌ها می‌گذارد و اگر
+// دست نخوریم، کلمه‌های فارسی و انگلیسی به هم می‌چسبند یا ترتیب bidi
+// درست نمی‌شود. راه‌حل: در هر خط، هر زیررشته‌ای که با کاراکتر فارسی/عربی
+// شروع می‌شود را جدا کن، fixZwsp را فقط روی همان بزن، و بقیه‌ی خط (کد
+// واقعی، operator، نام متغیر، و غیره) را دست‌نخورده برگردان. به این ترتیب
+// ساختار کد محفوظ می‌ماند ولی متن فارسی داخل کامنت/رشته هم اصلاح می‌شود.
+//
+// یک استثنا: داخل رشته‌ی نقل‌قولی ("…" و '…') نباید ZWNJ/ZWSP را به فاصله
+// تبدیل کنیم چون ممکن است بخشی از literal باشد. تشخیص نقل‌قول ساده نیست
+// (escape، multi-line، template literal) و مدل در اکثر موارد متن فارسی
+// را در کامنت می‌نویسد نه در رشته؛ بنابراین فعلاً فقط کامنت‌ها را هدف
+// می‌گیریم: هر خط از `#` یا `//` به بعد، یا از ابتدای خط اگر کل خط با
+// کاراکتر فارسی شروع شده (مثل یک خط کامنت تمام‌فارسی یا label).
+// هر زیررشته‌ای که کاراکتر فارسی دارد ولی از کاراکتر ASCII غیرکامنتی شروع
+// شده (مثل نام متغیر `priceCalc`) دست‌نخورده می‌ماند.
+//
+// مرحله‌ی دوم: مدل گاهی کلمه‌های فارسی و انگلیسی را بدون هیچ جداکننده‌ای
+// پشت سر هم می‌نویسد (مثل «کاربرuser.id» یا «user.idرو»). در این حالت
+// نه fixZwsp کاری انجام می‌دهد (چون ZWSP/RLM/LRM وجود ندارد) و نه مرورگر
+// می‌تواند دو کلمه‌ی متصل از دو اسکریپت را از هم جدا کند. در نتیجه کلمه‌ها
+// در جهت اشتباه چسبیده به هم رندر می‌شوند. راه‌حل: داخل ناحیه‌ی فارسی
+// (tail)، بین هر جفت کاراکتر word از دو اسکریپت که مستقیماً کنار هم
+// هستند (یعنی نه space، نه ZWSP/RLM/LRM/ALM بینشان) یک space تزریق می‌کنیم.
+// این کار فقط روی tail انجام می‌شود تا کد خالص (return user.id) دست نخورد.
+const COMMENT_PREFIX_RE = /^\s*(#|\/\/\/?)/
+// جفت «فارسی + ASCII word» یا «ASCII word + فارسی» که بینشان هیچ
+// جداکننده‌ای نیست. ASCII word = حرف/رقم/underscore.
+const MIXED_WORD_RE = new RegExp(
+  `([${PERSIAN_RANGE}])([A-Za-z0-9_])|([A-Za-z0-9_])([${PERSIAN_RANGE}])`,
+  'g',
+)
+function fixCodeBlock(code: string): string {
+  return code
+    .split('\n')
+    .map((line) => {
+      // تشخیص خط کامنت: از اولین # یا // به بعد متن فارسی است.
+      // اگر خط کامنت نیست ولی با کاراکتر فارسی شروع می‌شود (مثل label
+      // یا متن آزاد)، کل خط را به‌عنوان ناحیه‌ی فارسی در نظر می‌گیریم.
+      const cmt = COMMENT_PREFIX_RE.exec(line)
+      const start = cmt ? cmt[0].length : 0
+      // ناحیه‌ی قبل از کامنت (کد) → دست نمی‌زنیم
+      const head = line.slice(0, start)
+      const tail = line.slice(start)
+      // اگر tail فارسی ندارد، چیزی برای اصلاح نیست
+      if (!RTL_CHAR_RE.test(tail)) return line
+      // مرحله‌ی ۱: ZWSP/RLM/LRM/ALM اضافی مدل را در قطعات فارسی به فاصله
+      // تبدیل کن (الگوریتم فعلی، حفظ می‌شود).
+      const PERSIAN_RUN_RE = new RegExp(`[${PERSIAN_RANGE}][^\\x00-\\x7F]*`, 'g')
+      let result = ''
+      let cursor = 0
+      let m: RegExpExecArray | null
+      while ((m = PERSIAN_RUN_RE.exec(tail)) !== null) {
+        // بین cursor و m.index: ناحیه‌ی ASCII (دست نخورده)
+        result += tail.slice(cursor, m.index)
+        // خود قطعه‌ی فارسی: fixZwsp می‌کنیم
+        result += fixZwsp(m[0])
+        cursor = m.index + m[0].length
+      }
+      result += tail.slice(cursor)
+      // مرحله‌ی ۲: بین هر جفت کاراکتر word از دو اسکریپت که بدون جداکننده
+      // کنار هم چسبیده‌اند، یک space تزریق کن. این کار فقط در tail انجام
+      // می‌شود؛ head (کد خالص) دست نخورده می‌ماند.
+      // تکرار: ممکن است یک تزریق، جفت جدیدی بسازد (مثلاً «user. id» بعد
+      // از تزریق، بین «.» و «id» نه، ولی بین «.id» و «رو» می‌تواند بسازد).
+      // یک بار اجرا برای اکثر موارد کافی است؛ چون فقط جفت‌های مجاور
+      // پردازش می‌شوند، حلقه تا زمانی که تغییری رخ نداده ادامه می‌یابد.
+      let prev: string
+      do {
+        prev = result
+        result = result.replace(MIXED_WORD_RE, (mm, fa1, as1, as2, fa2) => {
+          return fa1 !== undefined ? fa1 + ' ' + as1 : as2 + ' ' + fa2
+        })
+      } while (result !== prev)
+      // مرحله‌ی ۳: بین هر جفت کاراکتر فارسی/عربی و ASCII (یا بالعکس)
+      // که مستقیماً کنار هم هستند، یک LRM (U+200E) تزریق کن تا مرورگر
+      // boundary بین دو اسکریپت را تشخیص دهد و متن را در جهت صحیح
+      // رندر کند. بدون LRM، الگوریتم bidi مرورگر ممکن است کلمه‌ی
+      // فارسی و انگلیسی را در جهت اشتباه چسبیده به هم نشان دهد.
+      return head + injectLrmMarks(result)
+    })
+    .join('\n')
+}
+
+// LRM = Left-to-Right Mark (U+200E). مرورگر bidi این کاراکتر را به
+// عنوان مرز LTR می‌شناسد و از ادغام اسکریپت‌های مختلف جلوگیری می‌کند.
+const LRM = '\u200E'
+// الگوی تشخیص جفت «فارسی + ASCII» یا «ASCII + فارسی» بدون جداکننده.
+// فقط حروف، ارقام و underscore ([A-Za-z0-9_]) — فاصله و نشانه‌گذاری
+// شامل نمی‌شوند چون خودشان مرز جداکننده‌ی طبیعی بین اسکریپت‌ها هستند.
+const SCRIPT_BOUNDARY_RE = new RegExp(
+  `([${PERSIAN_RANGE}])([A-Za-z0-9_])|([A-Za-z0-9_])([${PERSIAN_RANGE}])`,
+  'g',
+)
+function injectLrmMarks(text: string): string {
+  // فقط روی خطوطی اعمال می‌شود که کاراکتر فارسی/عربی دارند.
+  if (!RTL_CHAR_RE.test(text)) return text
+  // ۱. در ابتدای خط، اگر اولین کاراکتر قوی فارسی باشد، یک LRM تزریق کن.
+  //    این کار باعث می‌شود که در حالت unicode-bidi: plaintext، مرورگر
+  //    خط را LTR ببیند ولی کلمات فارسی به ترتیب صحیح (چپ به راست) نمایش
+  //    داده شوند — نه معکوس.
+  const LEADING_PERSIAN_RE = new RegExp(`^[^${PERSIAN_RANGE}]*[${PERSIAN_RANGE}]`)
+  if (LEADING_PERSIAN_RE.test(text)) {
+    text = LRM + text
+  }
+  // ۲. بین هر جفت کاراکتر word از دو اسکریپت که بدون جداکننده
+  //    کنار هم چسبیده‌اند، یک LRM تزریق کن تا مرورگر boundary بین
+  //    دو اسکریپت را تشخیص دهد.
+  return text.replace(SCRIPT_BOUNDARY_RE, (m, fa1, as1, as2, fa2) => {
+    return fa1 !== undefined ? fa1 + LRM + as1 : as2 + LRM + fa2
+  })
 }
 

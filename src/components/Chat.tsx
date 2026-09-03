@@ -462,6 +462,10 @@ export function ChatPanel() {
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
   const [scrollTick, setScrollTick] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
+  /** Set to true when the user manually stops the turn. Prevents trailing
+   *  retry / retry_giveup events (from the backend's asyncio.sleep loop) from
+   *  re-activating the retry banner after the user explicitly dismissed it. */
+  const stoppedRef = useRef(false);
   const chatIdRef = useRef(chat?.id ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
@@ -1178,6 +1182,7 @@ export function ChatPanel() {
     continueAssistantId?: string,
     forceScroll = false,
   ) => {
+    stoppedRef.current = false;
     const s = useStore.getState();
     // Use THIS panel's chat (captured at render), never s.activeChatId: a
     // queued turn drained while the user is viewing ANOTHER chat must still
@@ -1694,6 +1699,9 @@ export function ChatPanel() {
           }
         }
       } else if (event.kind === "retry") {
+        // If the user already clicked Stop, ignore any trailing retry events
+        // that the backend may still be emitting during its asyncio.sleep delay.
+        if (stoppedRef.current) return;
         const info = {
           attempt: event.attempt ?? 1,
           maxAttempts: event.max_attempts ?? 3,
@@ -1733,6 +1741,7 @@ export function ChatPanel() {
           });
         }
       } else if (event.kind === "retry_giveup") {
+        if (stoppedRef.current) return;
         store.updateMessage(assistantMsg.id, {
           retry: {
             attempt: event.attempt ?? 1,
@@ -3083,6 +3092,7 @@ export function ChatPanel() {
   };
 
   const stop = () => {
+    stoppedRef.current = true;
     useStore.getState().setChatPendingAsk(chatIdRef.current, null);
     useStore.getState().setChatPendingPermission(chatIdRef.current, null);
     // Abort both the local controller and the store-level one. The store

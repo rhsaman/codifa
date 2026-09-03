@@ -265,7 +265,7 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
           {copied ? "Copied ✓" : "Copy"}
         </button>
       </div>
-      <pre {...props} className="code-lines hljs">
+      <pre {...props} dir="ltr" className="code-lines hljs">
         {lines}
       </pre>
     </div>

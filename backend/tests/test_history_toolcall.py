@@ -116,12 +116,14 @@ def test_assistant_without_tool_activity_is_plain_ai():
 
 
 def test_system_and_user_turns_unchanged():
-    """System/user turns ignore any stray toolActivity field."""
+    """System/user turns ignore any stray toolActivity field.
+    Note: role 'system' from history now becomes HumanMessage (not SystemMessage)
+    to avoid 'System message must be at the beginning' errors on strict templates."""
     history = [
         {"role": "system", "content": "be helpful", "toolActivity": [{"tool": "x"}]},
         {"role": "user", "content": "go", "toolActivity": [{"tool": "y"}]},
     ]
     msgs = history_to_langchain_messages(history)
     assert len(msgs) == 2
-    assert isinstance(msgs[0], SystemMessage)
+    assert isinstance(msgs[0], HumanMessage)
     assert isinstance(msgs[1], HumanMessage)

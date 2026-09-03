@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>تست bidi کد بلاک</title>
+<style>
+  body { font-family: system-ui; padding: 2rem; background: #1e1e1e; color: #ccc; }
+  h2 { margin-top: 2rem; }
+  .box { border: 2px solid; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .bad { border-color: #e74c3c; }
+  .good { border-color: #2ecc71; }
+  pre { margin: 0; padding: 0.5rem; background: #2d2d2d; border-radius: 4px; }
+  .label { font-size: 0.85rem; margin-bottom: 0.3rem; }
+</style>
+</head>
+<body>
+
+<h1>مقایسه رندرینگ بلوک کد با کامنت فارسی/انگلیسی</h1>
+
+<!-- ===== حالت بد: بدون dir="ltr" ===== -->
+<h2>❌ بدون <code>dir="ltr"</code> (وضعیت فعلی شما)</h2>
+
+<div class="box bad">
+  <div class="label"> tapped from parent dir="rtl" → مشکل bidi</div>
+  <pre class="code-lines hljs" style="direction: ltr;">
+<span class="hljs-comment">// HashMap نقش را بازی می‌کند</span>
+<span class="hljs-keyword">const</span> map = <span class="hljs-keyword">new</span> Map();</pre>
+</div>
+
+<div class="box bad">
+  <div class="label"> tapped from parent dir="rtl" → کلمات جابه‌جا</div>
+  <pre class="code-lines hljs" style="direction: ltr;">
+<span class="hljs-comment"># کاربر user.id را ست کرد</span>
+user_id = <span class="hljs-number">1</span></pre>
+</div>
+
+<!-- ===== حالت خوب: با dir="ltr" ===== -->
+<h2>✅ با <code>dir="ltr"</code> + <code>unicode-bidi: plaintext</code></h2>
+
+<div class="box good">
+  <div class="label"> dir="ltr" + unicode-bidi: plaintext → درست</div>
+  <pre class="code-lines hljs" dir="ltr" style="direction: ltr; unicode-bidi: plaintext;">
+<span class="hljs-comment">// HashMap نقش را بازی می‌کند</span>
+<span class="hljs-keyword">const</span> map = <span class="hljs-keyword">new</span> Map();</pre>
+</div>
+
+<div class="box good">
+  <div class="label"> dir="ltr" + unicode-bidi: plaintext → درست</div>
+  <pre class="code-lines hljs" dir="ltr" style="direction: ltr; unicode-bidi: plaintext;">
+<span class="hljs-comment"># کاربر user.id را ست کرد</span>
+user_id = <span class="hljs-number">1</span></pre>
+</div>
+
+<div class="box good">
+  <div class="label"> کامنت فقط فارسی → همچنان RTL</div>
+  <pre class="code-lines hljs" dir="ltr" style="direction: ltr; unicode-bidi: plaintext;">
+<span class="hljs-comment">// این تابع کاربر را احراز هویت می‌کند</span>
+<span class="hljs-keyword">function</span> auth(user) {}</pre>
+</div>
+
+<div class="box good">
+  <div class="label"> کامنت فقط انگلیسی → همچنان LTR</div>
+  <pre class="code-lines hljs" dir="ltr" style="direction: ltr; unicode-bidi: plaintext;">
+<span class="hljs-comment">// authenticate the user</span>
+<span class="hljs-keyword">function</span> auth(user) {}</pre>
+</div>
+
+<h3>نکته: کافیه یکی از دو <code>dir="ltr"</code> یا <code>unicode-bidi: plaintext</code> رو برداری تا مشکل برگرده.</h3>
+
+</body>
+</html>

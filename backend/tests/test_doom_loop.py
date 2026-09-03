@@ -23,7 +23,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 
 import llm as _llm
 
@@ -142,7 +142,148 @@ def test_varied_calls_not_falsely_stopped():
     assert result == "done"
 
 
+def test_steering_messages_are_human_not_system():
+    """Regression: the soft tool-call budget nudge and the doom-loop guard
+    inject steering text mid-list. To keep chat templates that require the
+    SystemMessage only at position 0 happy (e.g. Qwen3.5 / llama.cpp), both
+    must be HumanMessage, NOT SystemMessage.
+
+    The constants ``_TOOL_CALL_SOFT_LIMIT`` and ``_DOOM_LOOP_LIMIT`` are
+    function-local in ``langchain_tool_loop``, so we don't try to monkey-patch
+    them. Instead we record every snapshot the model receives and assert no
+    snapshot has a SystemMessage at a mid-list position.
+    """
+
+    seen: list = []
+
+    class _RecordingModel:
+        model_name = "fake-record"
+
+        def bind_tools(self, tools):
+            class _Bound:
+                def __init__(self, outer):
+                    self._outer = outer
+                    self._n = 0
+
+                async def ainvoke(self, msgs):
+                    # Snapshot msgs so we can check what type the steering
+                    # messages are, then return a fresh tool-call to keep the
+                    # loop alive for one more step.
+                    seen.append(list(msgs))
+                    self._n += 1
+                    if self._n >= 12:
+                        # Cap the loop so the test terminates.
+                        return AIMessage(content="done")
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "grep",
+                                "args": {"pattern": "x"},
+                                "id": f"call-{self._n}",
+                            }
+                        ],
+                    )
+
+            return _Bound(self)
+
+    rec = _RecordingModel()
+
+    async def grep(**kwargs):
+        return "no matches"
+
+    async def _driver():
+        await _llm.langchain_tool_loop(
+            rec,
+            system="sys-prompt",
+            user="find bugs",
+            tools={"grep": grep},
+            max_steps=20,
+            ctx=0,
+            emit=None,
+        )
+
+    asyncio.run(_driver())
+
+    # At least one snapshot must have been recorded (model was called).
+    assert seen, "model was never called"
+
+    # No snapshot may contain a SystemMessage at any position other than 0
+    # (the initial system prompt). Steering messages that land mid-list
+    # MUST be HumanMessage.
+    for snapshot in seen:
+        for i, m in enumerate(snapshot):
+            if i == 0:
+                continue  # the system prompt is allowed here
+            assert not isinstance(m, SystemMessage), (
+                f"SystemMessage found at mid-list position {i} — would crash "
+                f"Qwen3.5 / llama.cpp templates that require SystemMessage "
+                f"only at position 0. Content: {getattr(m, 'content', '')[:80]!r}"
+            )
+
+
+def test_empty_system_still_emits_system_message_at_index_0():
+    """Regression: when ``system=""`` (empty string) is passed, ``langchain_tool_loop``
+    must still place a SystemMessage at position 0 of the message list sent to the
+    model. Some chat templates (e.g. Qwen3.5 / llama.cpp) crash with
+    "System message must be at the beginning" if ``msgs[0]`` is a HumanMessage.
+
+    The caller in ``graph._read`` (and similar sub-agent entry points) passes
+    ``system=""`` explicitly. Without a safety net, the ``if system:`` guard in
+    ``langchain_tool_loop`` would skip the SystemMessage entirely, and msgs[0]
+    would become HumanMessage — breaking strict local-model templates.
+    """
+
+    seen: list = []
+
+    class _RecordingModel:
+        model_name = "fake-record-empty-sys"
+
+        def bind_tools(self, tools):
+            class _Bound:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                async def ainvoke(self, msgs):
+                    # Snapshot only the first call (where the bug would occur).
+                    if not seen:
+                        seen.append(list(msgs))
+                    return AIMessage(content="done")
+
+            return _Bound(self)
+
+    rec = _RecordingModel()
+
+    async def grep(**kwargs):
+        return "no matches"
+
+    async def _driver():
+        await _llm.langchain_tool_loop(
+            rec,
+            system="",  # <-- the critical case: empty system prompt
+            user="find bugs",
+            tools={"grep": grep},
+            max_steps=5,
+            ctx=0,
+            emit=None,
+        )
+
+    asyncio.run(_driver())
+
+    assert seen, "model was never called"
+    msgs = seen[0]
+    # msgs[0] must be a SystemMessage (possibly with a placeholder), never
+    # HumanMessage. This is the contract that keeps strict templates happy.
+    assert isinstance(msgs[0], SystemMessage), (
+        f"msgs[0] must be SystemMessage even when system='' (was "
+        f"{type(msgs[0]).__name__}). This breaks Qwen3.5 / llama.cpp templates "
+        f"that require SystemMessage at the beginning."
+    )
+
+
 if __name__ == "__main__":
     test_doom_loop_stops_after_3_identical_calls()
     test_varied_calls_not_falsely_stopped()
+    test_steering_messages_are_human_not_system()
+    test_empty_system_still_emits_system_message_at_index_0()
     print("OK")

@@ -517,8 +517,18 @@ def history_to_langchain_messages(
                 continue
         if not content and not preserved_summary:
             continue
+        # History system messages (compact summaries, mode-switch markers)
+        # are injected as HumanMessage — never SystemMessage — so
+        # system_final at position 0 stays clean.  This avoids
+        # "System message must be at the beginning" on strict Jinja
+        # templates (Qwen3.5 etc.) where a second SystemMessage
+        # anywhere else in the list raises an exception.
+        # The compact summary content is still visible to the model;
+        # it just looks like a user note, which is consistent with how
+        # reuse/discovery/tool-reuse notes are already injected
+        # (see build_turn_context lines ~1677-1681).
         if role == "system":
-            out.append(SystemMessage(content=content))
+            out.append(HumanMessage(content=content))
         elif role == "assistant":
             _ai_content = content + preserved_summary if preserved_summary else content
             out.append(AIMessage(content=_ai_content))
@@ -1467,7 +1477,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _older = history[: len(history) - len(_recent)]
             _summary = await _summarize_history_head(compact_model, _older, root)
             lc_history = history_to_langchain_messages(_recent, current_mode=mode)
-            lc_history.insert(0, SystemMessage(content=_summary))
+            lc_history.insert(0, HumanMessage(content=_summary))
             # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
             # از context افتاده. کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل
             # بفرسته نه marker بی‌محتوای «see previous turn».
@@ -1519,10 +1529,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if mode == "coder":
         reuse = _agents._plan_reuse_note(history)
         if reuse:
-            lc_history.insert(0, SystemMessage(content=reuse))
+            lc_history.insert(0, HumanMessage(content=reuse))
         disc = _agents._plan_discovery_note(history)
         if disc:
-            lc_history.insert(0, SystemMessage(content=disc))
+            lc_history.insert(0, HumanMessage(content=disc))
         # Enforce the test-verification rule at runtime for any code-changing
         # coder task (feature/bugfix/refactor), not only when the prompt
         # literally says "test". This closes the gap the user reported: coder
@@ -1551,7 +1561,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 )
             lc_history.insert(
                 0,
-                SystemMessage(
+                HumanMessage(
                     content=(
                         "TEST VERIFICATION RULE: this is code-changing work. "
                         "Write/update the relevant test(s) for the language(s) you "
@@ -1587,7 +1597,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             )
     reuse_tool = _agents._tool_reuse_note(history)
     if reuse_tool:
-        lc_history.insert(0, SystemMessage(content=reuse_tool))
+        lc_history.insert(0, HumanMessage(content=reuse_tool))
 
     # User content (prompt; images as content parts). Attached FILE
     # contents are no longer force-injected here — they enter via scope + the
@@ -1674,35 +1684,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     else:
         user_content = "\n\n".join(user_parts)
 
-    # Strict-mode chat templates (Qwen3.5/Qwen2.5, llama.cpp Jinja, some
-    # vLLM templates) require a SystemMessage to be the FIRST message in the
-    # list and reject the request if a SystemMessage appears later. Several
-    # code paths above (``lc_history.insert(0, SystemMessage(...))`` at
-    # historyLimit summary, _plan_reuse_note, _plan_discovery_note, the
-    # test-verification rule, and _tool_reuse_note) inject SystemMessage
-    # blocks into ``lc_history``. Without this fix, the final messages list
-    # becomes:
-    #   [SystemMessage(system_final),
-    #    SystemMessage(reuse_note|summary|...),
-    #    HumanMessage(user), AIMessage, ToolMessage, ...]
-    # which Qwen/llama.cpp reject with ``Jinja Exception: System message
-    # must be at the beginning``. Merge all those SystemMessages into the
-    # leading ``system_final`` so the model sees exactly ONE SystemMessage
-    # at position 0 — content is preserved (concatenated), order stays
-    # deterministic, and the LangGraph checkpointer / code-map dedup cache
-    # keep working because ``lc_history`` still carries every non-system
-    # message in order.
-    _sys_extras: list[str] = []
-    for _m in lc_history:
-        if isinstance(_m, SystemMessage):
-            _c = getattr(_m, "content", "")
-            if isinstance(_c, str) and _c:
-                _sys_extras.append(_c)
-    if _sys_extras:
-        system_final = system_final + "\n\n" + "\n\n".join(_sys_extras)
-    _lc_no_sys = [m for m in lc_history if not isinstance(m, SystemMessage)]
+    # All notes (reuse, discovery, test-rule, tool-reuse, summary) are
+    # injected as HumanMessage — never SystemMessage — so system_final
+    # stays clean at position 0.  This keeps provider prefix cache intact
+    # for Claude / GPT-4 while avoiding "System message must be at the
+    # beginning" errors on strict Jinja templates (Qwen3.5 etc.).
     messages: list[BaseMessage] = [SystemMessage(content=system_final)]
-    messages.extend(_lc_no_sys)
+    messages.extend(lc_history)
     messages.append(HumanMessage(content=user_content))
 
     with contextlib.suppress(Exception):
@@ -2289,7 +2277,17 @@ async def _run_mode_turn(
     compact_model = tctx.get("compact_model")
 
     if extra_instruction:
-        messages.insert(1, SystemMessage(content=extra_instruction))
+        # Inject as HumanMessage (not SystemMessage) so it lands mid-list
+        # without violating chat templates that require SystemMessage only
+        # at position 0 (Qwen3.5 / llama.cpp raise
+        # "System message must be at the beginning" otherwise). Marked as a
+        # non-user directive so the model still treats it as guidance.
+        messages.insert(
+            1,
+            HumanMessage(
+                content=f"[Earlier context — non-user directive]\n{extra_instruction}"
+            ),
+        )
 
     # NOTE: on a (re)started/interrupted turn we intentionally do NOT inject a
     # "here is what you already did" resume note or persist a durable replay

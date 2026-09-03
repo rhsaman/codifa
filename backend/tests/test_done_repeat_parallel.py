@@ -10,15 +10,12 @@
 4. The "Repetition detected" warn message accurately reflects the count.
 """
 import asyncio
-import contextlib
 from typing import Any
 
-import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 import graph as _graph
 import llm
-
 
 # ---------------------------------------------------------------------------
 # Fix 1: done event is no longer emitted twice.
@@ -111,7 +108,6 @@ async def test_repetition_warn_not_emitted_on_first_occurrence():
     that does a single read. The fix gates the warn on
     ``_repeat_count >= 1`` so it only fires when there's an actual repeat."""
     events = await _run_with_model(_RepeatModel())
-    kinds = [e.get("kind") for e in events]
 
     # The model loops on the same tool call 3 times → hard stop fires
     # ("repetition loop" error event). The "Repetition detected" warn should
@@ -246,9 +242,8 @@ async def test_parallel_calls_error_strips_and_retries():
         async def astream(self, msgs):
             self.attempts += 1
             if self.attempts == 1:
-                raise Exception(
-                    "Error code: 400 - parallel_tool_calls not supported by this model"
-                )
+                msg = "Error code: 400 - parallel_tool_calls not supported by this model"
+                raise RuntimeError(msg)
             yield AIMessage(content="ok after strip")
 
     m = _PCModel()

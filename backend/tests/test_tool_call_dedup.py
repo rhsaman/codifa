@@ -31,7 +31,6 @@ from langchain_core.messages import AIMessage
 
 import llm as _llm
 
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 class _DuplicateCallModel:

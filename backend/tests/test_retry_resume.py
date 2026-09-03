@@ -105,6 +105,13 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
     retries = _retry_events(events)
     assert retries, "expected an auto-retry event after the throttle"
     assert "rate limit" in retries[0].get("reason", "").lower(), retries[0]
+    # Backend-driven retries are self-heals, not user restarts: they MUST carry
+    # `reconnecting: True` so the frontend keeps the already-streamed text
+    # instead of wiping it (which made the user see the reply vanish while
+    # the agent was clearly still working).
+    assert all(e.get("reconnecting") is True for e in retries), (
+        f"every backend retry event must include reconnecting=True, got: {retries}"
+    )
 
     last = _body_with_write()
     assert last is not None, "expected a captured request containing the write call"
@@ -133,6 +140,11 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
 
     retries = _retry_events(events)
     assert len(retries) == 2, f"expected 2 auto-retries, got {len(retries)}"
+    # Same reconnecting=True contract as the single-retry test: the frontend
+    # relies on this flag to distinguish backend self-heal from user restart.
+    assert all(e.get("reconnecting") is True for e in retries), (
+        f"every backend retry event must include reconnecting=True, got: {retries}"
+    )
 
     last = _body_with_write()
     assert last is not None, "expected a captured request containing the write call"

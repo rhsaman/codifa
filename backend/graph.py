@@ -3082,6 +3082,15 @@ async def _run_mode_turn(
                         "delay": delay,
                         "reason": _agents._friendly_retry_reason(exc),
                         "agent": _retry_event_agent(state),
+                        # A backend-driven retry (transient 429/5xx/timeout) is
+                        # a self-heal, not a user-triggered restart: the agent
+                        # will resume from the existing transcript. The frontend
+                        # branches on `reconnecting` to keep the already-
+                        # streamed text and tool timeline; without this flag it
+                        # wipes the partial reply, which made the user see the
+                        # message vanish while the agent was clearly still
+                        # working.
+                        "reconnecting": True,
                     }
                 )
                 await asyncio.sleep(delay)

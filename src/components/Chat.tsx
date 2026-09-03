@@ -1606,6 +1606,10 @@ export function ChatPanel() {
         store.updateMessage(assistantMsg.id, {
           thinkingActive: !!event.active,
           ...(event.active ? { thinkingStartedAt: Date.now() } : {}),
+          // Safety net: if a retry banner is somehow still attached (e.g. a
+          // retry resumed into a long thinking pass before the first text/tool
+          // chunk arrives), clear it now — the model is clearly working again.
+          retry: null,
         });
       } else if (event.kind === "skill") {
         // Deliberately NOT rendered into the chat — the user asked for the

@@ -16,7 +16,7 @@ that every disconnect path closes the agent generator.
 """
 import asyncio
 import contextlib
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from server import _stream_drive
 
@@ -49,7 +49,6 @@ class _RecordingAgent:
         self.aclose_awaited = True
         if self._aclose_raises:
             raise RuntimeError("aclose failed")
-        return None
 
     def aclose(self):
         self.aclose_called = True

@@ -781,7 +781,7 @@ def iter_workspace_chats(workspace: str) -> list[dict]:
         out.append(
             {
                 "chat_id": (
-                    cid[: -len(".json")] if cid.endswith(".json") else cid
+                    cid.removesuffix(".json")
                 ),
                 "message_count": len(turns),
             }

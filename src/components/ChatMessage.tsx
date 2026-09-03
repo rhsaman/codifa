@@ -127,6 +127,7 @@ function codeStartLine(children: ReactNode): number {
       const fallback =
         /\(\s*(?:خط|Line|line)\s*([\d۰-۹]+)\s*\)/.exec(raw);
       if (fallback) {
+        // parseInt doesn't handle Persian digits (۰-۹) — normalise first
         const n = parseInt(fallback[1].replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d))), 10);
         if (!Number.isNaN(n)) return n;
       }

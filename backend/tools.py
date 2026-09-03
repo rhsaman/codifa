@@ -5202,6 +5202,21 @@ When you need to read several files, read multiple independent files in parallel
         )
         return result
 
+    async def current_time_tool() -> str:
+        """Return the current UTC date and time. Call this when the user asks about 'today', 'now', 'current date', 'recent', 'latest', or any time-sensitive question where you need the actual current timestamp."""
+        import datetime as _dt
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        return json.dumps(
+            {
+                "utc": now.isoformat(),
+                "utc_date": now.strftime("%Y-%m-%d"),
+                "utc_time": now.strftime("%H:%M:%S"),
+                "weekday": now.strftime("%A"),
+                "unix": int(now.timestamp()),
+            }
+        )
+
     _tools = {
         "request_permission": request_permission_tool,
         "confirm_action": confirm_action_tool,
@@ -5219,6 +5234,7 @@ When you need to read several files, read multiple independent files in parallel
         "search_console": search_console_tool,
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
+        "current_time": current_time_tool,
     }
     # The `vision` tool is only meaningful when a dedicated vision model is
     # configured AND this turn actually carries images — otherwise the main

@@ -743,7 +743,12 @@ _UNIVERSAL_RULES = (
     "in graph.py). Use it as context for the current task. It is a static "
     "reference — there is no 'memory' or 'search_memory' tool to call; do not "
     "try to refresh or re-fetch it from inside a turn. The recap is refreshed "
-    "only on the first message of a new chat."
+    "only on the first message of a new chat.\n"
+    "6. CURRENT TIME: you do NOT know the current date/time — your knowledge has "
+    "a training cutoff. Always call the `current_time` tool when the user asks "
+    "about 'today', 'now', 'recent', 'latest', 'what day is it', 'current date', "
+    "or any time-sensitive question. Do NOT guess or use your training data for "
+    "the current date."
 )
 
 # Length rule for plan/coder ONLY — these modes need full, complete deliverables

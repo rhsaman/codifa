@@ -1706,11 +1706,11 @@ export function ChatPanel() {
           startedAt: Date.now(),
         };
         if (event.reconnecting) {
-          // Client self-heal: keep the already-streamed text; just show a
-          // transient "reconnecting" pill so the user understands the restart.
-          // Resolve any stuck "running" cards from the previous session first
-          // (including orphaned sub-agent children) so their timers don't grow
-          // forever. The new stream will add fresh cards for this attempt.
+          // Backend automatic retry (or client self-heal): keep the
+          // already-streamed text and segments — do NOT reset the message.
+          // Show the retry banner so the user knows a retry is in progress;
+          // once the model resumes (thinking / text / tool events), the
+          // banner is cleared automatically via retry:null in those handlers.
           resolveStuckCards();
           store.updateMessage(assistantMsg.id, { retry: info });
         } else {

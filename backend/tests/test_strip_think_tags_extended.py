@@ -38,21 +38,21 @@ def test_partial_think_split_across_chunks():
 
 # ── 3. تگ معادل ``
 def test_reasoning_tag_removed():
-    out, in_t, buf = _strip_think_tags("a<reasoning>x</reasoning>b", False, "")
+    out, in_t, _buf = _strip_think_tags("a<reasoning>x</reasoning>b", False, "")
     assert out == "ab"
     assert in_t is False
 
 
 # ── 4. تگ معادل ``
 def test_thought_tag_removed():
-    out, in_t, buf = _strip_think_tags("hi<thought>q</thought>bye", False, "")
+    out, in_t, _buf = _strip_think_tags("hi<thought>q</thought>bye", False, "")
     assert out == "hibye"
     assert in_t is False
 
 
 # ── 5. تگ معادل ``
 def test_reflection_tag_removed():
-    out, in_t, buf = _strip_think_tags("start<reflection>rrr</reflection>end", False, "")
+    out, in_t, _buf = _strip_think_tags("start<reflection>rrr</reflection>end", False, "")
     assert out == "startend"
     assert in_t is False
 
@@ -74,7 +74,7 @@ def test_scrub_think_prefix_no_tag():
 # ── 8. تگ‌های تو در تو
 def test_nested_tags_removed():
     # دو تگ متوالی (غیر تو در تو) باید هر دو حذف شوند
-    out, in_t, buf = _strip_think_tags(
+    out, in_t, _buf = _strip_think_tags(
         "x<think>c1</think>y<think>c2</think>z", False, ""
     )
     assert out == "xyz"
@@ -88,13 +88,13 @@ def test_open_tag_with_no_continuation():
     assert "hello" in out1 or out1 == "hello"
 
     # chunk بعدی: "" (پایان stream)
-    out2, in_t2, _buf2 = _strip_think_tags("", in_t1, buf1)
+    _out2, in_t2, _buf2 = _strip_think_tags("", in_t1, buf1)
     assert in_t2 is True  # هنوز در think هستیم
 
 
 # ── 10. تگ `` باز و بسته در دو chunk متوالی
 def test_open_close_in_separate_chunks():
-    out1, in_t1, buf1 = _strip_think_tags("a<think>secret", False, "")
+    out1, in_t1, _buf1 = _strip_think_tags("a<think>secret", False, "")
     assert out1 == "a"
     assert in_t1 is True
 

@@ -461,6 +461,11 @@ textarea {
 .chat-item:active {
   transform: scale(0.96);
 }
+/* When the kebab menu is open, disable the scale-down so that clicking a
+   menu button doesn't shift the button out from under the cursor. */
+.chat-item:has(.chat-item-kebab-wrap.open):active {
+  transform: none;
+}
 
 .chat-item.active {
   /* Tinted with the theme's main accent color (--accent) so the current chat

@@ -12,6 +12,7 @@ Guards:
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="coder-test-task-general-data-")
 os.environ["CODER_DATA_DIR"] = _TMP
@@ -80,8 +81,7 @@ async def test_task_general_subagent():
     """task(subagent_type='general') returns XML, runs on main model,
     tool events are tagged sub=True with a branch id."""
     ws = tempfile.mkdtemp(prefix="coder-test-task-general-ws-")
-    with open(os.path.join(ws, "app.py"), "w") as fh:
-        fh.write("def main():\n    return 42\n")
+    Path(os.path.join(ws, "app.py")).write_text("def main():\n    return 42\n")
 
     emitted: list[dict] = []
     main_model = _FakeGeneralModel(text="GENERAL DONE: app.py has main()")

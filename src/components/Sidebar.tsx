@@ -186,7 +186,10 @@ export function Sidebar() {
     if (!menuOpenId) return;
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as Node | null;
-      if (!(t instanceof Element) || !t.closest(".chat-item-kebab-wrap")) {
+      if (
+        !(t instanceof Element) ||
+        (!t.closest(".chat-item-kebab-wrap") && !t.closest(".chat-item-menu"))
+      ) {
         setMenuOpenId(null);
       }
     };
@@ -216,7 +219,10 @@ export function Sidebar() {
       const t = e.target as Node | null;
       if (
         !(t instanceof Element) ||
-        (!t.closest(".ws-menu-wrap") && !t.closest(".ws-delete-menu-wrap"))
+        (!t.closest(".ws-menu-wrap") &&
+          !t.closest(".ws-delete-menu-wrap") &&
+          !t.closest(".ws-menu") &&
+          !t.closest(".ws-delete-menu"))
       ) {
         setWsMenuOpenKey(null);
         setDeleteMenuKey(null);
@@ -885,7 +891,7 @@ export function Sidebar() {
                           top: wsMenuPos.top,
                           left: wsMenuPos.left,
                         }}
-                        onClick={(e) => e.stopPropagation()}
+                        onMouseDown={(e) => e.stopPropagation()}
                       >
                         <button
                           className={`ws-menu-btn${isPinned ? " active" : ""}`}
@@ -989,9 +995,14 @@ export function Sidebar() {
                       top: deleteMenuPos.top,
                       left: deleteMenuPos.left,
                     }}
+                    onMouseDown={(e) => e.stopPropagation()}
                     onClick={(e) => e.stopPropagation()}
                   >
-                    <div className="ws-delete-menu" role="menu">
+                    <div
+                      className="ws-delete-menu"
+                      role="menu"
+                      onMouseDown={(e) => e.stopPropagation()}
+                    >
                       <div className="ws-delete-menu-title">Delete…</div>
                       <button
                         className="ws-delete-menu-btn danger"
@@ -1151,6 +1162,7 @@ export function Sidebar() {
                           <div
                             className={`chat-item-menu${menuOpenId === c.id ? " open" : ""}`}
                             role="menu"
+                            onMouseDown={(e) => e.stopPropagation()}
                             onClick={(e) => e.stopPropagation()}
                           >
                             <button

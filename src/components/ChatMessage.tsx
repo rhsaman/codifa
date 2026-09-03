@@ -100,7 +100,7 @@ function codeLang(children: ReactNode): string {
 function codeStartLine(children: ReactNode): number {
   const kids = Array.isArray(children) ? children : [children];
   for (const k of kids) {
-    const props = (k as { props?: { className?: string; "data-meta"?: string } } | null)?.props;
+    const props = (k as { props?: { className?: string; "data-meta"?: string; children?: ReactNode } } | null)?.props;
     // Prefer the full meta string that the `code` component stashes. It may be
     // either the canonical `lang:start-end:path` (foldLineCaptions output) or the
     // legacy `start-end:path` form, so match the `start-end` range wherever it
@@ -119,6 +119,17 @@ function codeStartLine(children: ReactNode): number {
     if (m) {
       const n = parseInt(m[1], 10);
       if (!Number.isNaN(n)) return n;
+    }
+    // Fallback: extract from comments inside code, e.g.
+    // "// front/app/layout.tsx (خط 34)" or "# file (line 50)"
+    const raw = typeof props?.children === "string" ? props.children : "";
+    if (raw) {
+      const fallback =
+        /\(\s*(?:خط|Line|line)\s*([\d۰-۹]+)\s*\)/.exec(raw);
+      if (fallback) {
+        const n = parseInt(fallback[1].replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d))), 10);
+        if (!Number.isNaN(n)) return n;
+      }
     }
   }
   return 0;

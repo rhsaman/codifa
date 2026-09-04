@@ -75,7 +75,37 @@ class ReasoningChatOpenAI(ChatOpenAI):
     reaches the frontend. We patch the *output* message chunk (not the raw
     ``delta``) because the parent parser ignores ``reasoning_content`` entirely
     and would otherwise discard our backfill.
+
+    It also de-duplicates per-chunk token usage: some gateways (TokenRouter /
+    opencode providers) include the FULL ``usage`` block in EVERY SSE chunk
+    instead of only the final one (the OpenAI spec). LangChain's chunk merge
+    (``AIMessageChunk.__add__`` → ``add_usage``) SUMS usage across chunks, so a
+    350-chunk reply with a real 14K-token request would be reported as ~4.9M
+    input tokens — inflating the sidebar totals, the context meter and firing
+    spurious auto-compactions. Here we drop ``usage`` from non-terminal chunks
+    (keeping it only on the final usage-only chunk or any chunk carrying a
+    ``finish_reason``) so the merged ``usage_metadata`` always equals exactly
+    one request's true usage.
     """
+
+    @staticmethod
+    def _chunk_is_terminal(chunk: dict) -> bool:
+        """True when a raw SSE chunk may legitimately carry final usage.
+
+        The OpenAI streaming spec sends usage once, on a terminal chunk: either
+        the final usage-only chunk (``choices`` empty) or a chunk whose choice
+        carries ``finish_reason``. Some gateways attach usage to ordinary
+        mid-stream deltas too — those are the ones this filter must reject.
+        """
+        if not isinstance(chunk, dict):
+            return False
+        choices = chunk.get("choices")
+        if not choices:
+            return True
+        for choice in choices:
+            if isinstance(choice, dict) and choice.get("finish_reason"):
+                return True
+        return False
 
     def _convert_chunk_to_generation_chunk(
         self,
@@ -83,6 +113,15 @@ class ReasoningChatOpenAI(ChatOpenAI):
         default_chunk_class: type,
         base_generation_info: dict | None,
     ) -> Any:
+        if (
+            isinstance(chunk, dict)
+            and chunk.get("usage") is not None
+            and not self._chunk_is_terminal(chunk)
+        ):
+            # Mid-stream chunk carrying the gateway's running/full usage —
+            # dropping it here prevents add_usage() from summing it into an
+            # N-chunks-inflated total. A terminal usage chunk still passes.
+            chunk = {k: v for k, v in chunk.items() if k != "usage"}
         generation_chunk = super()._convert_chunk_to_generation_chunk(
             chunk, default_chunk_class, base_generation_info
         )

@@ -62,6 +62,19 @@ def test_discovery_block_compact():
     assert "compact report" not in _DISCOVERY_BLOCK
 
 
+def test_ask_mode_answers_general_questions():
+    # Ask mode is a simple general-purpose assistant: it must handle BOTH
+    # everyday questions and codebase questions, in the user's language.
+    ask = SYSTEM_PROMPTS["ask"]
+    assert "everyday questions" in ask
+    assert "project/code questions" in ask
+    assert "SAME LANGUAGE" in ask
+    # _MODE_CAPS should also reflect the general-purpose nature.
+    from agents import _MODE_CAPS
+    assert "everyday questions" in _MODE_CAPS["ask"]
+    assert "project/code questions" in _MODE_CAPS["ask"]
+
+
 if __name__ == "__main__":
     test_ask_prompt_drops_explain_the_why()
     test_universal_rules_no_longer_match_length_to_need()

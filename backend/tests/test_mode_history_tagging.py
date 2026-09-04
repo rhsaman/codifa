@@ -53,7 +53,7 @@ def test_mode_declare_roles_are_distinct():
     ask = agents._mode_declare("ask")
     plan = agents._mode_declare("plan")
     coder = agents._mode_declare("coder")
-    assert "MENTOR" in ask
+    assert "assistant" in ask
     assert "PLANNER" in plan
     assert "implementation agent" in coder
     # Each must mention its own label as the current mode.

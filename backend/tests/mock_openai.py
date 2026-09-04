@@ -158,7 +158,10 @@ async def chat_handler(request: Request):
     resp_text = ""
     if body.get("stream"):
         for c in spec:
-            resp_text += (c.get("choices", [{}])[0].get("delta", {}).get("content") or "")
+            choices = c.get("choices") or []
+            if not choices:
+                continue  # usage-only final chunk has no delta
+            resp_text += (choices[0].get("delta", {}).get("content") or "")
     else:
         if spec and any(c.get("choices", [{}])[0].get("finish_reason") for c in spec):
             finish = next((c["choices"][0]["finish_reason"] for c in spec
@@ -173,8 +176,26 @@ async def chat_handler(request: Request):
         "total_tokens": prompt_tokens + completion_tokens,
     }
     if body.get("stream"):
+        # Stamp the derived usage onto the LAST chunk that legitimately carries
+        # usage per the OpenAI spec — a finish_reason chunk or a usage-only
+        # final chunk. The chunk's SHAPE (empty choices vs finish_reason) is
+        # preserved so the per-chunk-usage dedup regression tests see the
+        # gateway's real wire format; only the counts are replaced with values
+        # derived from the actual request/response so behavior tests assert
+        # against internally-logical numbers.
         if spec:
-            spec[-1]["usage"] = usage
+            stamped = False
+            for c in reversed(spec):
+                choices = c.get("choices") or []
+                has_finish = any(
+                    (ch or {}).get("finish_reason") for ch in choices
+                ) or not choices
+                if c.get("usage") is not None and has_finish:
+                    c["usage"] = usage
+                    stamped = True
+                    break
+            if not stamped:
+                spec[-1]["usage"] = usage
         return StreamingResponse(sse(*spec)(), media_type="text/event-stream")
     finish = "stop"
     if spec and any(c.get("choices", [{}])[0].get("finish_reason") for c in spec):

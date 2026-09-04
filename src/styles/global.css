@@ -1392,87 +1392,124 @@ textarea {
   text-overflow: ellipsis;
 }
 
-/* ---- Model usage panel ---- */
-.sidebar-balance {
-  flex: 0 0 auto;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-}
-
-/* Grand total (all providers combined), shown right in the panel header so
-   the full session usage/cost is visible without expanding a single group. */
-.sidebar-usage-grand-total {
-  flex: 0 0 auto;
+/* ---- Titlebar usage chip (total chat tokens; details on hover) ----
+   ONE pill: token count · bolt+cached · reset — single flat container. */
+.usage-chip {
+  position: relative;
   display: inline-flex;
-  align-items: baseline;
-  gap: 3px;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
   color: var(--text);
-  font-variant-numeric: tabular-nums;
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: none;
-  letter-spacing: 0;
-}
-
-.sidebar-usage-grand-cache {
-  color: var(--text);
+  font-size: 12px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  flex: 0 0 auto;
+  transition:
+    border-color 0.15s,
+    background 0.15s,
+    box-shadow 0.15s;
+  -webkit-app-region: no-drag;
 }
 
-.sidebar-usage-grand-cost {
-  color: var(--success);
-  font-weight: 700;
+.usage-chip:hover,
+.usage-chip:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-input));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
-.sidebar-usage-reset {
+.usage-chip svg {
+  color: var(--fresh);
+  flex-shrink: 0;
+  display: block;
+}
+
+.usage-chip-count {
+  white-space: nowrap;
+}
+
+/* Cached portion label (bolt icon + cached tokens) — same line inside the pill. */
+.usage-chip-cached {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--fresh);
+  white-space: nowrap;
+}
+
+/* Thin separator between cached count and reset button. */
+.usage-chip-sep {
+  width: 1px;
+  height: 12px;
+  background: var(--border);
+  flex-shrink: 0;
+  margin: 0 1px;
+}
+
+/* Reset button — same pill, no extra border. */
+.usage-reset {
   flex: 0 0 auto;
   border: none;
   background: transparent;
   color: var(--text-dim);
   font-size: 13px;
   line-height: 1;
-  padding: 0 2px;
+  padding: 0;
   cursor: pointer;
-  border-radius: 4px;
   transition:
-    background 0.15s,
     color 0.15s,
     transform 0.15s;
 }
 
-.sidebar-usage-reset:hover {
+.usage-reset:hover {
   color: var(--text);
-  background: var(--border);
   transform: rotate(-45deg);
 }
 
-.sidebar-usage-groups {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 2px 6px 6px;
+/* Details popover, anchored below the chip. */
+.usage-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: var(--z-popover);
+  min-width: 320px;
+  max-width: 400px;
+  max-height: min(60vh, 440px);
   overflow-y: auto;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+  animation: popover-in 0.12s ease;
+  -webkit-app-region: no-drag;
 }
 
-.sidebar-usage-groups::-webkit-scrollbar {
+.usage-popover::-webkit-scrollbar {
   width: 6px;
 }
 
-.sidebar-usage-groups::-webkit-scrollbar-track {
+.usage-popover::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.sidebar-usage-groups::-webkit-scrollbar-thumb {
+.usage-popover::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 4px;
 }
 
-.sidebar-usage-group {
+.usage-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.usage-group {
   border: 1px solid transparent;
   border-radius: 10px;
   background: color-mix(in srgb, var(--bg-alt) 55%, transparent);
@@ -1481,20 +1518,11 @@ textarea {
     border-color 0.14s;
 }
 
-.sidebar-usage-group.open {
-  background: color-mix(in srgb, var(--bg-alt) 80%, transparent);
-  border-color: var(--border);
-}
-
-/* Enhanced group hover — subtle glow effect. */
-.sidebar-usage-group:hover {
-  border-color: color-mix(in srgb, var(--accent) 12%, var(--border));
-}
-.sidebar-usage-group.open:hover {
+.usage-group:hover {
   border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
 }
 
-.sidebar-usage-group-head {
+.usage-group-head {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1502,17 +1530,11 @@ textarea {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-dim);
-  cursor: pointer;
   user-select: none;
   border-radius: 9px;
-  transition: color 0.12s;
 }
 
-.sidebar-usage-group-head:hover {
-  color: var(--text);
-}
-
-.sidebar-usage-group-dot {
+.usage-group-dot {
   flex: 0 0 auto;
   width: 6px;
   height: 6px;
@@ -1523,40 +1545,40 @@ textarea {
 }
 
 /* Per-provider dot colors — matched via data-provider attribute. */
-.sidebar-usage-group[data-provider="opencode"] .sidebar-usage-group-dot {
+.usage-group[data-provider="opencode"] .usage-group-dot {
   background: var(--provider-opencode);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-opencode) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="openrouter"] .sidebar-usage-group-dot {
+.usage-group[data-provider="openrouter"] .usage-group-dot {
   background: var(--provider-openrouter);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-openrouter) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="google"] .sidebar-usage-group-dot {
+.usage-group[data-provider="google"] .usage-group-dot {
   background: var(--provider-google);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-google) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="nvidia"] .sidebar-usage-group-dot {
+.usage-group[data-provider="nvidia"] .usage-group-dot {
   background: var(--provider-nvidia);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-nvidia) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="cloudflare"] .sidebar-usage-group-dot {
+.usage-group[data-provider="cloudflare"] .usage-group-dot {
   background: var(--provider-cloudflare);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-cloudflare) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="ollama"] .sidebar-usage-group-dot {
+.usage-group[data-provider="ollama"] .usage-group-dot {
   background: var(--provider-ollama);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-ollama) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="tokenrouter"] .sidebar-usage-group-dot {
+.usage-group[data-provider="tokenrouter"] .usage-group-dot {
   background: var(--provider-tokenrouter);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-tokenrouter) 25%, transparent);
 }
-.sidebar-usage-group[data-provider="custom"] .sidebar-usage-group-dot {
+.usage-group[data-provider="custom"] .usage-group-dot {
   background: var(--provider-custom);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-custom) 25%, transparent);
 }
 
-.sidebar-usage-group-name {
+.usage-group-name {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -1566,14 +1588,15 @@ textarea {
   font-weight: 700;
 }
 
-.sidebar-usage-group-total {
+.usage-group-total {
   flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   color: var(--text);
   font-weight: 600;
+  white-space: nowrap;
 }
 
-.sidebar-usage-list {
+.usage-list {
   list-style: none;
   margin: 0;
   padding: 2px 6px 6px 21px;
@@ -1583,8 +1606,8 @@ textarea {
   border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 }
 
-.sidebar-usage-head,
-.sidebar-usage-item {
+.usage-row,
+.usage-row-head {
   display: grid;
   grid-template-columns: 1fr auto auto;
   align-items: center;
@@ -1593,7 +1616,7 @@ textarea {
   line-height: 1.4;
 }
 
-.sidebar-usage-head {
+.usage-row-head {
   color: var(--text-dim);
   font-weight: 700;
   font-size: 9.5px;
@@ -1603,7 +1626,7 @@ textarea {
   opacity: 0.75;
 }
 
-.sidebar-usage-item {
+.usage-row {
   font-size: 12px;
   color: var(--text-dim);
   padding: 3px 4px;
@@ -1611,18 +1634,18 @@ textarea {
   transition: background 0.12s;
 }
 
-.sidebar-usage-item:hover {
+.usage-row:hover {
   background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
-.sidebar-usage-head span:nth-child(2),
-.sidebar-usage-item span:nth-child(2),
-.sidebar-usage-head span:nth-child(3),
-.sidebar-usage-item span:nth-child(3) {
+.usage-row-head span:nth-child(2),
+.usage-row span:nth-child(2),
+.usage-row-head span:nth-child(3),
+.usage-row span:nth-child(3) {
   text-align: right;
 }
 
-.sidebar-usage-model {
+.usage-model {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1632,7 +1655,7 @@ textarea {
   text-align: left;
 }
 
-.sidebar-usage-tokens {
+.usage-tokens {
   font-variant-numeric: tabular-nums;
   min-width: 0;
   display: flex;
@@ -1643,36 +1666,16 @@ textarea {
 }
 
 /* Second line under the per-model total: fresh (🔥) and cached (⚡) badges sit
-   side by side in one row instead of stacking on their own lines, so a model
-   with both never grows to three cramped rows. */
-.sidebar-usage-breakdown {
+   side by side in one row instead of stacking on their own lines. */
+.usage-breakdown {
   display: flex;
   align-items: baseline;
   justify-content: flex-end;
   gap: 6px;
 }
 
-/* Cached (prompt-cache) tokens, shown next to the real token count. Used both
-   inline (grand total / group total: "1.2k · ⚡300") and inside the per-model
-   tokens column where it sits next to the fresh badge on the second line. */
-.sidebar-usage-cache,
-.sidebar-usage-grand-cache {
-  font-variant-numeric: tabular-nums;
-  color: var(--accent);
-  opacity: 0.85;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.sidebar-usage-cache {
-  font-size: 0.82em;
-}
-
-/* Freshly-processed (non-cached) tokens — same placement pattern as the
-   cached badge above but in --fresh (peach) so the two are never confused at
-   a glance. Only shown inline on the per-model row (header/group totals keep
-   the fresh figure in a tooltip instead, to avoid crowding the pill). */
-.sidebar-usage-fresh {
+/* Cached (prompt-cache) tokens — fresh color, matching the titlebar chip. */
+.usage-cache {
   font-variant-numeric: tabular-nums;
   color: var(--fresh);
   opacity: 0.85;
@@ -1681,7 +1684,25 @@ textarea {
   white-space: nowrap;
 }
 
-.sidebar-usage-cost {
+.usage-cache svg {
+  vertical-align: middle;
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+}
+
+/* Freshly-processed (non-cached) tokens — peach (--fresh) so the two are
+   never confused at a glance. */
+.usage-fresh {
+  font-variant-numeric: tabular-nums;
+  color: var(--fresh);
+  opacity: 0.85;
+  font-weight: 600;
+  font-size: 0.82em;
+  white-space: nowrap;
+}
+
+.usage-cost {
   font-variant-numeric: tabular-nums;
   min-width: 0;
   color: var(--success);
@@ -1689,7 +1710,7 @@ textarea {
   opacity: 0.9;
 }
 
-.sidebar-usage-cost.no-price {
+.usage-cost.no-price {
   color: var(--text-dim);
   font-weight: 400;
   opacity: 0.55;
@@ -10404,7 +10425,7 @@ textarea {
 .chat-rename-input,
 .seg-steer,
 .msg.user .msg-bubble,
-.sidebar-usage-group.open,
+.usage-group,
 .retry-banner .retry-cancel,
 .plan-block,
 .nvim-label,
@@ -10478,7 +10499,7 @@ textarea {
 .context-meter-models,
 .model-select-item.add,
 .model-picker-section:not(:first-child),
-.sidebar-usage-list,
+.usage-list,
 .diff-side-head>span,
 .diff-side-row>.diff-side-num:first-child,
 .diff-side-row>.diff-side-num:nth-child(3) {

@@ -8,15 +8,20 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import {
-  getActiveProvider,
-  getChatProvider,
-  useStore,
-} from "../lib/store";
+import { getActiveProvider, getChatProvider, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { resetStreamForRetry } from "../lib/retry";
-import { applyToolEvent, makeToolActivity, resolveStuckActivities, resolveToolResult } from "../lib/toolActivity";
-import { bumpToolRunning, dropToolRunning, isToolRunning } from "../lib/watchdog";
+import {
+  applyToolEvent,
+  makeToolActivity,
+  resolveStuckActivities,
+  resolveToolResult,
+} from "../lib/toolActivity";
+import {
+  bumpToolRunning,
+  dropToolRunning,
+  isToolRunning,
+} from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { normalizeUsageModel } from "../lib/usage";
 import { stripLeadingModeTag } from "../lib/modeTag";
@@ -319,9 +324,8 @@ export function ChatPanel() {
   // before the `retry`/`reconnecting` event arrives). Treat a live reconnect as
   // busy too, so the Stop button stays up and the user can see the turn is
   // still running instead of the Send button appearing mid-reconnect.
-  const chatReconnecting = chat?.messages.some(
-    (m) => m.retry?.reconnecting === true,
-  ) ?? false;
+  const chatReconnecting =
+    chat?.messages.some((m) => m.retry?.reconnecting === true) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
   const busy = busyLocal || chatHasStreaming || chatReconnecting;
   /** The assistant message currently being rate-limited/retried by the provider,
@@ -1109,8 +1113,7 @@ export function ChatPanel() {
   // opencode's `overflow.ts` accounting. opencode shows 0% until the first real
   // usage event arrives — no estimate fallback — so a brand-new chat reads empty.
   const contextUsed = useMemo(
-    () =>
-      computeContextUsed(chat, systemPrompt, ctxWindow ?? undefined),
+    () => computeContextUsed(chat, systemPrompt, ctxWindow ?? undefined),
     [chat, systemPrompt, ctxWindow],
   );
 
@@ -1123,9 +1126,9 @@ export function ChatPanel() {
   // Warn (yellow) when used context reaches the auto-compaction threshold
   // (compactAtPercent% of the raw window) — the same point where backend
   // auto-compaction fires.
-  const compactAtPercent = settings.compactAtPercent ?? 80
+  const compactAtPercent = settings.compactAtPercent ?? 80;
   const usable =
-    ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null
+    ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null;
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -1150,7 +1153,12 @@ export function ChatPanel() {
       // cache lines at their own cheaper rate when advertised, else full input.
       const cacheRead = u.cacheRead ?? 0;
       const cacheWrite = u.cacheWrite ?? 0;
-      const cost = computeUsageCost(price, { input: u.input, output: u.output, cacheRead, cacheWrite });
+      const cost = computeUsageCost(price, {
+        input: u.input,
+        output: u.output,
+        cacheRead,
+        cacheWrite,
+      });
       out.push({
         providerId: u.providerId,
         model: u.model,
@@ -1216,10 +1224,12 @@ export function ChatPanel() {
       // A silent return here used to look like an "instant disconnect" — the
       // composer cleared but nothing happened. Surface a visible /cmd error so
       // the user knows exactly why the send did nothing.
-      useStore.getState().setChatCmdError(
-        chat.id,
-        "Open or create a workspace to start a chat — every chat belongs to a workspace.",
-      );
+      useStore
+        .getState()
+        .setChatCmdError(
+          chat.id,
+          "Open or create a workspace to start a chat — every chat belongs to a workspace.",
+        );
       return;
     }
     const activeProvider = getChatProvider(chat.id);
@@ -1466,7 +1476,8 @@ export function ChatPanel() {
               attempt: watchdogAutoRetriedRef.current,
               maxAttempts: WATCHDOG_MAX_RETRIES,
               delay: 0,
-              reason: "Connection stalled — the model is taking a while; auto-retrying…",
+              reason:
+                "Connection stalled — the model is taking a while; auto-retrying…",
               reconnecting: true,
             },
           });
@@ -1545,23 +1556,25 @@ export function ChatPanel() {
         // not re-execute the call and waste context. `items`/`results` carry the
         // actual rows (grep hits, glob paths, web_search links, …); fall back to
         // the summary only when there is no structured result.
-        const rows = (a.items ?? a.results ?? []) as unknown as Array<Record<string, unknown>>;
+        const rows = (a.items ?? a.results ?? []) as unknown as Array<
+          Record<string, unknown>
+        >;
         const body = rows.length
           ? rows
-              .slice(0, 50)
-              .map((r) => {
-                const line =
-                  (r.snippet as string) ||
-                  (r.content as string) ||
-                  (r.text as string) ||
-                  (r.title as string) ||
-                  (r.url as string) ||
-                  (r.path as string) ||
-                  (r.file as string) ||
-                  JSON.stringify(r);
-                return `    ${line}`;
-              })
-              .join("\n")
+            .slice(0, 50)
+            .map((r) => {
+              const line =
+                (r.snippet as string) ||
+                (r.content as string) ||
+                (r.text as string) ||
+                (r.title as string) ||
+                (r.url as string) ||
+                (r.path as string) ||
+                (r.file as string) ||
+                JSON.stringify(r);
+              return `    ${line}`;
+            })
+            .join("\n")
           : "";
         blocks.push(body ? `${head}\n${body}` : head);
       }
@@ -2432,84 +2445,81 @@ export function ChatPanel() {
   // same handler as typing the equivalent slash command.
   handleCommandRef.current = handleCommand;
 
-  const retryMessage = useCallback(
-    (id: string) => {
-      // If a previous turn is still mid-stream (auto-retry waiting on a provider
-      // throttle, streaming reply, etc.), pressing Retry must cancel that run
-      // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
-      // guard below and nothing happens, even after the user changed the model.
-      const active = useStore.getState().chatAborts[chatIdRef.current];
-      if (active && !active.signal.aborted) {
-        active.abort();
-      }
-      const s = useStore.getState();
-      const ch = s.chats.find((c) => c.id === s.activeChatId);
-      if (!ch) return;
-      const msg = ch.messages.find((m) => m.id === id);
-      if (!msg) return;
-      // Resolve to the OWNING user message: a failed/error "retry" can be
-      // triggered from an assistant message's banner, so find the user turn that
-      // produced it before resuming/regenerating.
-      let userMsg = msg;
-      if (msg.role !== "user") {
-        const idx = ch.messages.findIndex((m) => m.id === id);
-        const prevUser = [...ch.messages.slice(0, idx)]
-          .reverse()
-          .find((m) => m.role === "user");
-        if (!prevUser) return;
-        userMsg = prevUser;
-      }
-      if (!userMsg.content.trim()) return;
+  const retryMessage = useCallback((id: string) => {
+    // If a previous turn is still mid-stream (auto-retry waiting on a provider
+    // throttle, streaming reply, etc.), pressing Retry must cancel that run
+    // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
+    // guard below and nothing happens, even after the user changed the model.
+    const active = useStore.getState().chatAborts[chatIdRef.current];
+    if (active && !active.signal.aborted) {
+      active.abort();
+    }
+    const s = useStore.getState();
+    const ch = s.chats.find((c) => c.id === s.activeChatId);
+    if (!ch) return;
+    const msg = ch.messages.find((m) => m.id === id);
+    if (!msg) return;
+    // Resolve to the OWNING user message: a failed/error "retry" can be
+    // triggered from an assistant message's banner, so find the user turn that
+    // produced it before resuming/regenerating.
+    let userMsg = msg;
+    if (msg.role !== "user") {
+      const idx = ch.messages.findIndex((m) => m.id === id);
+      const prevUser = [...ch.messages.slice(0, idx)]
+        .reverse()
+        .find((m) => m.role === "user");
+      if (!prevUser) return;
+      userMsg = prevUser;
+    }
+    if (!userMsg.content.trim()) return;
 
-      // RESUME, don't restart: if this user's turn left a failed assistant
-      // message behind (partial content + preserved tool activity + plan),
-      // keep it in the transcript and re-run the SAME user message so the
-      // model continues from where it was cut off instead of redoing the
-      // completed work. Only when there is no failed turn to resume do we
-      // fall back to the old truncate-and-restart behavior.
-      const idx = ch.messages.findIndex((m) => m.id === userMsg.id);
-      const failed = ch.messages
-        .slice(idx + 1)
-        .find(
-          (m) =>
-            m.role === "assistant" &&
-            (m.retry ||
-              m.error ||
-              (typeof m.content === "string" &&
-                m.content.includes("[Interrupted before finishing"))),
-        );
-      if (failed) {
-        // send() reuses the existing user bubble (no duplicate), clears the
-        // retry banner, and keeps the failed assistant message in history so
-        // the model sees the partial work + preserved tool list and continues
-        // (promptWithResume reinforces the plan continuation).
-        setTimeout(
-          () =>
-            send(
-              userMsg.content,
-              userMsg.attachments ?? [],
-              userMsg.images ?? [],
-              false,
-              userMsg.id,
-            ),
-          0,
-        );
-        return;
-      }
-
-      // No failed assistant turn to resume — restart from this user message.
-      if (!s.truncateTo(userMsg.id)) return;
-      const text = userMsg.content;
-      // Give the abort's finally block a tick to reset busy/streaming state
-      // before re-sending (send() re-sets busy=true itself, but the abort's
-      // finally would otherwise clear it mid-run).
+    // RESUME, don't restart: if this user's turn left a failed assistant
+    // message behind (partial content + preserved tool activity + plan),
+    // keep it in the transcript and re-run the SAME user message so the
+    // model continues from where it was cut off instead of redoing the
+    // completed work. Only when there is no failed turn to resume do we
+    // fall back to the old truncate-and-restart behavior.
+    const idx = ch.messages.findIndex((m) => m.id === userMsg.id);
+    const failed = ch.messages
+      .slice(idx + 1)
+      .find(
+        (m) =>
+          m.role === "assistant" &&
+          (m.retry ||
+            m.error ||
+            (typeof m.content === "string" &&
+              m.content.includes("[Interrupted before finishing"))),
+      );
+    if (failed) {
+      // send() reuses the existing user bubble (no duplicate), clears the
+      // retry banner, and keeps the failed assistant message in history so
+      // the model sees the partial work + preserved tool list and continues
+      // (promptWithResume reinforces the plan continuation).
       setTimeout(
-        () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
+        () =>
+          send(
+            userMsg.content,
+            userMsg.attachments ?? [],
+            userMsg.images ?? [],
+            false,
+            userMsg.id,
+          ),
         0,
       );
-    },
-    [],
-  );
+      return;
+    }
+
+    // No failed assistant turn to resume — restart from this user message.
+    if (!s.truncateTo(userMsg.id)) return;
+    const text = userMsg.content;
+    // Give the abort's finally block a tick to reset busy/streaming state
+    // before re-sending (send() re-sets busy=true itself, but the abort's
+    // finally would otherwise clear it mid-run).
+    setTimeout(
+      () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
+      0,
+    );
+  }, []);
 
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
   // recreated `onRetry` per render would defeat it. Route through a ref instead.
@@ -3107,11 +3117,17 @@ export function ChatPanel() {
     // controller is the "authoritative" one used by the stall watchdog and
     // retryMessage, so always try it. Wrap in try/catch because abort()
     // throws if the controller was already used.
-    try { abortRef.current?.abort(); } catch { /* already aborted */ }
+    try {
+      abortRef.current?.abort();
+    } catch {
+      /* already aborted */
+    }
     try {
       const ctrl = useStore.getState().chatAborts?.[chatIdRef.current];
       if (ctrl && !ctrl.signal.aborted) ctrl.abort();
-    } catch { /* already aborted */ }
+    } catch {
+      /* already aborted */
+    }
     // Force-clear busy + streaming so the Stop button vanishes immediately.
     // Normally the send() finally block handles this, but if abortRef was
     // already null (e.g. reconnect race) the finally block never ran, leaving
@@ -3987,9 +4003,7 @@ export function ChatPanel() {
                 textAlign: dir === "rtl" ? "right" : "left",
               }}
               placeholder={
-                wroot
-                  ? "Ask the agent…  (⌘P file · ⚡ skill · / command)"
-                  : "Open a project folder first (⌘O)…"
+                wroot ? "Ask the agent…" : "Open a project folder first (⌘O)…"
               }
               ref={textareaRef}
               value={input}

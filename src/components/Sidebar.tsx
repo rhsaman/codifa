@@ -1,19 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useShallow } from "zustand/react/shallow";
 import { useStore, workspaceKey } from "../lib/store";
 export { useStore };
 import { themeById } from "../lib/themes";
-import type { Chat, ChatMessage, ProviderConfig, Workspace } from "../types";
+import type { Chat, ChatMessage, Workspace } from "../types";
 import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
-import {
-  formatTokens,
-  formatCost,
-  priceForModel,
-  computeUsageCost,
-  computeUsageCostBreakdown,
-} from "../lib/context";
-import { normalizeUsageEntry } from "../lib/usage";
 
 function titleOf(chat: Chat): string {
   if (chat.title && chat.title !== "New chat") return chat.title;
@@ -36,14 +27,11 @@ interface Group {
 }
 
 /** Persisted sidebar UI state (localStorage `coder:sidebarUi`): collapse
- *  toggles + panel heights for workspace groups, Todos and Model usage, so the
+ *  toggles + panel heights for workspace groups and Todos, so the
  *  layout the user left comes back exactly as it was after a restart. */
 interface SidebarUiState {
   todoCollapsed?: boolean;
-  usageCollapsed?: boolean;
   todoHeight?: number;
-  usageHeight?: number;
-  usageGroupsClosed?: string[];
   collapsedGroups?: string[];
 }
 
@@ -246,37 +234,20 @@ export function Sidebar() {
 
   const open = useStore((s) => s.sidebarOpen);
   const dir = useStore((s) => s.dir);
-  const provider = useStore(
-    (s) =>
-      s.settings.providers.find((p) => p.id === s.settings.activeProviderId) ??
-      s.settings.providers[0],
-  );
 
-  // ---- Footer panel state (todos + model usage), VSCode-style: each panel is
-  // collapsible and its content height is user-resizable via a drag handle. ----
+  // ---- Footer panel state (todos), VSCode-style: collapsible with a
+  // user-resizable content height via a drag handle. ----
   const [todoCollapsed, setTodoCollapsed] = useState(
     () => savedUi.todoCollapsed ?? false,
   );
-  const [usageCollapsed, setUsageCollapsed] = useState(
-    () => savedUi.usageCollapsed ?? false,
-  );
   const [todoHeight, setTodoHeight] = useState(() => savedUi.todoHeight ?? 320);
-  const [usageHeight, setUsageHeight] = useState(
-    () => savedUi.usageHeight ?? 200,
-  );
-  // Tracks CLOSED groups (not open ones) so every provider starts expanded
-  // by default — the user has to collapse a group explicitly to hide it.
-  const [usageGroupsClosed, setUsageGroupsClosed] = useState<Set<string>>(
-    () => new Set(savedUi.usageGroupsClosed ?? []),
-  );
   const todoDrag = useRef<{ startY: number; startH: number } | null>(null);
-  const usageDrag = useRef<{ startY: number; startH: number } | null>(null);
 
   // Persist the panel/group UI state whenever it changes, so collapse toggles
   // and panel heights survive restarts. Debounced: a height drag fires
-  // setTodoHeight/setUsageHeight on every mousemove, and writing localStorage
-  // per frame would lag the drag — the write lands 250ms after the drag
-  // settles, and the app-close flush below guarantees the final value.
+  // setTodoHeight on every mousemove, and writing localStorage per frame
+  // would lag the drag — the write lands 250ms after the drag settles, and
+  // the app-close flush below guarantees the final value.
   useEffect(() => {
     const t = setTimeout(() => {
       try {
@@ -284,10 +255,7 @@ export function Sidebar() {
           "coder:sidebarUi",
           JSON.stringify({
             todoCollapsed,
-            usageCollapsed,
             todoHeight,
-            usageHeight,
-            usageGroupsClosed: [...usageGroupsClosed],
             collapsedGroups: [...collapsed],
           }),
         );
@@ -296,14 +264,7 @@ export function Sidebar() {
       }
     }, 250);
     return () => clearTimeout(t);
-  }, [
-    todoCollapsed,
-    usageCollapsed,
-    todoHeight,
-    usageHeight,
-    usageGroupsClosed,
-    collapsed,
-  ]);
+  }, [todoCollapsed, todoHeight, collapsed]);
 
   // Flush the latest sidebar UI state synchronously on app close, so a toggle
   // or resize made right before quitting is never lost to the debounce above.
@@ -317,10 +278,7 @@ export function Sidebar() {
           "coder:sidebarUi",
           JSON.stringify({
             todoCollapsed,
-            usageCollapsed,
             todoHeight,
-            usageHeight,
-            usageGroupsClosed: [...usageGroupsClosed],
             collapsedGroups: [...collapsed],
           }),
         );
@@ -336,14 +294,7 @@ export function Sidebar() {
       window.removeEventListener("beforeunload", flush);
       window.removeEventListener("pagehide", flush);
     };
-  }, [
-    todoCollapsed,
-    usageCollapsed,
-    todoHeight,
-    usageHeight,
-    usageGroupsClosed,
-    collapsed,
-  ]);
+  }, [todoCollapsed, todoHeight, collapsed]);
 
   // Sidebar width — drag-resizable on the right edge (VSCode-style), persisted
   // locally so the layout survives restarts.
@@ -391,22 +342,10 @@ export function Sidebar() {
     sidebarDragCleanup.current = onUp;
   };
 
-  const allProviders = useStore((s) => s.settings.providers);
-  const recentModels = useStore((s) => s.recentModels);
-  // Subscribe to the active chat's `usage` object by reference. `updateMessage`
-  // leaves `usage` untouched on per-token content deltas (it only rewrites
-  // `content`), so this reference is stable across the whole stream — meaning
-  // the expensive usage computation below does NOT re-run on every token. It
-  // only changes when `accrueChatUsage` rebuilds the entries array (turn end).
-  const activeUsage = useStore(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.usage,
-  );
-
   // `buildGroups` walks every chat + sorts; memoize it so it only re-runs when
   // the underlying data actually changes (not on every unrelated re-render such
   // as hover/scroll state). `chats` is rebuilt by the store on each streamed
-  // token, so this still recomputes during streaming — but the heavy usage
-  // computation below is now fully memoized and no longer the bottleneck.
+  // token, so this still recomputes during streaming.
   const groups = useMemo(
     () => buildGroups(chats, workspaces, pinnedWorkspaces, pinnedChats),
     [chats, workspaces, pinnedWorkspaces, pinnedChats],
@@ -446,158 +385,6 @@ export function Sidebar() {
       }
     }
   }
-
-  // Per-model token usage + cost for the active chat (session totals), grouped
-  // by provider and sorted by most-recently-used first. Each usage key is stored
-  // as "providerId/model" (see Chat.tsx) — the provider that ACTUALLY ran the
-  // chat — so it is resolved by a direct split, with no scoring or heuristics.
-  // Legacy bare keys (recorded before this scheme) that match no provider land
-  // in a group named after the model id itself, never silently merged into the
-  // ACTIVE provider — so a previous main model/provider always stays visible.
-  //
-  // Memoized on `activeUsage` (the active chat's `usage` object by reference)
-  // and `allProviders`: this is the heavy loop + cost breakdown + multi-stage
-  // sort that was previously recomputed on EVERY render — i.e. on every
-  // streamed token, because `updateMessage` rebuilds the whole `chats` array
-  // and the sidebar subscribed to it. Since `updateMessage` leaves `usage`
-  // untouched on per-token content deltas, `activeUsage` stays referentially
-  // stable across the stream, so this now runs only when usage actually
-  // changes (turn end), eliminating the per-token recompute that caused the
-  // sidebar lag during streaming.
-  const {
-    usageGroups,
-    usageGroupOrder,
-    usageGrandTokens,
-    usageGrandCached,
-    usageGrandCost,
-    usageGrandCostFresh,
-    usageGrandCostCached,
-    usageGrandTotal,
-    usageGrandFresh,
-  } = useMemo(() => {
-    const usageGroups = new Map<
-      string,
-      Array<{
-        model: string;
-        input: number;
-        output: number;
-        cacheRead: number;
-        cacheWrite: number;
-        cost: number | null;
-        costFresh: number | null;
-        costCached: number | null;
-        lastUsed: number;
-      }>
-    >();
-    if (activeUsage) {
-      for (const u of activeUsage.entries) {
-        // Keep cache-only entries (input=0, output=0, but cacheRead/cacheWrite>0)
-        // so the cached portion is never silently dropped from the totals.
-        if (
-          (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) <=
-          0
-        )
-          continue;
-        // providerId + model are stored EXPLICITLY on the entry (see Chat.tsx /
-        // store.ts) — read them directly, no key parsing, no guessing. Any future
-        // provider/model displays correctly. Legacy chats (pre-change) are
-        // migrated to this shape on load (see normalizeUsageEntry).
-        const p = allProviders.find((x) => x.id === u.providerId) ?? null;
-        const key = u.providerId;
-        const price = priceForModel(p?.pricingMap, u.model);
-        // Cost bills cache-read/cache-write tokens at their own (cheaper) rate
-        // when the provider advertises one — input_tokens already includes the
-        // cache portion, so it must be split out before charging full input.
-        const cacheRead = u.cacheRead ?? 0;
-        const cacheWrite = u.cacheWrite ?? 0;
-        const breakdown = computeUsageCostBreakdown(price, {
-          input: u.input,
-          output: u.output,
-          cacheRead,
-          cacheWrite,
-        });
-        const cost =
-          breakdown?.total ??
-          computeUsageCost(price, {
-            input: u.input,
-            output: u.output,
-            cacheRead,
-            cacheWrite,
-          });
-        const costFresh = breakdown?.fresh ?? null;
-        const costCached = breakdown?.cached ?? null;
-        if (!usageGroups.has(key)) usageGroups.set(key, []);
-        usageGroups.get(key)!.push({
-          model: u.model,
-          input: u.input,
-          output: u.output,
-          cacheRead,
-          cacheWrite,
-          cost,
-          costFresh,
-          costCached,
-          lastUsed: u.lastUsed ?? 0,
-        });
-      }
-    }
-    // Sort each provider group by total usage (heaviest first); ties by most
-    // recently used so the freshest model wins when token counts are equal.
-    for (const entries of usageGroups.values()) {
-      entries.sort((a, b) => {
-        const d = b.input + b.output - (a.input + a.output);
-        if (d !== 0) return d;
-        return (b.lastUsed ?? 0) - (a.lastUsed ?? 0);
-      });
-    }
-    // Provider groups ordered by total usage (the biggest consumer on top);
-    // ties by the group's most recently used model.
-    const usageGroupOrder = [...usageGroups.entries()].sort((a, b) => {
-      const aTotal = a[1].reduce((s, e) => s + e.input + e.output, 0);
-      const bTotal = b[1].reduce((s, e) => s + e.input + e.output, 0);
-      if (aTotal !== bTotal) return bTotal - aTotal;
-      const aLast = Math.max(...a[1].map((e) => e.lastUsed ?? 0), 0);
-      const bLast = Math.max(...b[1].map((e) => e.lastUsed ?? 0), 0);
-      return bLast - aLast;
-    });
-    // Grand total across every provider group, shown right in the panel header
-    // so the full session usage/cost is visible without expanding each group.
-    let usageGrandTokens = 0;
-    let usageGrandCached = 0;
-    let usageGrandCost: number | null = null;
-    let usageGrandCostFresh: number | null = null;
-    let usageGrandCostCached: number | null = null;
-    for (const [, entries] of usageGroupOrder) {
-      for (const e of entries) {
-        usageGrandTokens += e.input + e.output;
-        usageGrandCached += e.cacheRead + e.cacheWrite;
-        if (e.cost !== null) usageGrandCost = (usageGrandCost ?? 0) + e.cost;
-        if (e.costFresh !== null)
-          usageGrandCostFresh = (usageGrandCostFresh ?? 0) + e.costFresh;
-        if (e.costCached !== null)
-          usageGrandCostCached = (usageGrandCostCached ?? 0) + e.costCached;
-      }
-    }
-    // Header shows TOTAL billed tokens (input + output) — the whole amount the
-    // provider processed this session — with the cached portion called out
-    // separately via the ⚡ badge. (Many sessions are cache-heavy, so showing
-    // only the non-cached remainder as the main number read as "under-counted".)
-    const usageGrandTotal = usageGrandTokens;
-    // Tokens NOT served from the provider's prompt cache this turn/session —
-    // the portion that was actually freshly processed (billed at the full,
-    // non-cache rate). Shown next to the ⚡ cached badge as 🔥.
-    const usageGrandFresh = Math.max(0, usageGrandTokens - usageGrandCached);
-    return {
-      usageGroups,
-      usageGroupOrder,
-      usageGrandTokens,
-      usageGrandCached,
-      usageGrandCost,
-      usageGrandCostFresh,
-      usageGrandCostCached,
-      usageGrandTotal,
-      usageGrandFresh,
-    };
-  }, [activeUsage, allProviders]);
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();
@@ -1398,276 +1185,6 @@ export function Sidebar() {
                     </li>
                   ))}
                 </ul>
-              </>
-            )}
-          </div>
-        )}
-        {usageGroups.size > 0 && (
-          <div
-            className={`sidebar-panel ${usageCollapsed ? "collapsed" : ""}`}
-            dir="ltr"
-          >
-            <div
-              className="sidebar-panel-head"
-              onClick={() => setUsageCollapsed((v) => !v)}
-              title={
-                usageCollapsed ? "Expand Model usage" : "Collapse Model usage"
-              }
-            >
-              <span className="sidebar-panel-chevron">
-                {usageCollapsed ? "▸" : "▾"}
-              </span>
-              <span className="sidebar-panel-title">Model usage</span>
-              <span
-                className="sidebar-usage-grand-total"
-                title={[
-                  "Total billed tokens (input + output) this session",
-                  usageGrandFresh > 0
-                    ? `Fresh (non-cached): ${formatTokens(usageGrandFresh)} tokens${usageGrandCostFresh !== null ? ` · ${formatCost(usageGrandCostFresh)}` : ""}`
-                    : "",
-                  usageGrandCached > 0
-                    ? `Cached: ${formatTokens(usageGrandCached)} tokens${usageGrandCostCached !== null ? ` · ${formatCost(usageGrandCostCached)}` : ""}`
-                    : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              >
-                {formatTokens(usageGrandTotal)}
-                {usageGrandCached > 0 && (
-                  <span className="sidebar-usage-grand-cache">
-                    {" "}
-                    · ⚡{formatTokens(usageGrandCached)}
-                  </span>
-                )}
-                {usageGrandCost !== null && (
-                  <span className="sidebar-usage-grand-cost">
-                    {" "}
-                    · {formatCost(usageGrandCost)}
-                  </span>
-                )}
-              </span>
-              <button
-                className="sidebar-usage-reset"
-                title="Reset all model usage to zero"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (
-                    window.confirm(
-                      "Reset token usage and cost for all models in this chat?",
-                    )
-                  ) {
-                    useStore.getState().resetChatUsage(activeChatId);
-                  }
-                }}
-              >
-                ↺
-              </button>
-            </div>
-            {!usageCollapsed && (
-              <>
-                <div
-                  className="sidebar-panel-resize"
-                  title="Drag up to grow, down to shrink"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    usageDrag.current = {
-                      startY: e.clientY,
-                      startH: usageHeight,
-                    };
-                    const onMove = (ev: MouseEvent) => {
-                      if (!usageDrag.current) return;
-                      // No fixed cap: the panel can grow as tall as the window
-                      // allows (minus room for the sidebar header + footer).
-                      setUsageHeight(
-                        Math.max(
-                          60,
-                          Math.min(
-                            window.innerHeight - 140,
-                            usageDrag.current.startH -
-                            (ev.clientY - usageDrag.current.startY),
-                          ),
-                        ),
-                      );
-                    };
-                    const onUp = () => {
-                      usageDrag.current = null;
-                      window.removeEventListener("mousemove", onMove);
-                      window.removeEventListener("mouseup", onUp);
-                    };
-                    window.addEventListener("mousemove", onMove);
-                    window.addEventListener("mouseup", onUp);
-                  }}
-                />
-                <div
-                  className="sidebar-usage-groups"
-                  style={{ maxHeight: usageHeight }}
-                >
-                  {usageGroupOrder.map(([pid, entries]) => {
-                    const pcfg = allProviders.find((p) => p.id === pid) ?? null;
-                    // Inverted: a group is open unless the user explicitly closed it,
-                    // so every provider starts expanded by default.
-                    const open = !usageGroupsClosed.has(pid);
-                    const groupTokens = entries.reduce(
-                      (s, e) => s + e.input + e.output,
-                      0,
-                    );
-                    const groupCached = entries.reduce(
-                      (s, e) => s + e.cacheRead + e.cacheWrite,
-                      0,
-                    );
-                    // Fresh (non-cached) tokens — shown as the 🔥 badge, NOT as the main
-                    // number (the main number is the group's TOTAL billed tokens, same
-                    // basis as the header and the per-model rows below).
-                    const groupFresh = Math.max(0, groupTokens - groupCached);
-                    const groupCost = entries.reduce<number | null>((s, e) => {
-                      if (e.cost === null) return s;
-                      return (s ?? 0) + e.cost;
-                    }, null);
-                    const groupCostFresh = entries.reduce<number | null>(
-                      (s, e) => {
-                        if (e.costFresh === null) return s;
-                        return (s ?? 0) + e.costFresh;
-                      },
-                      null,
-                    );
-                    const groupCostCached = entries.reduce<number | null>(
-                      (s, e) => {
-                        if (e.costCached === null) return s;
-                        return (s ?? 0) + e.costCached;
-                      },
-                      null,
-                    );
-                    const groupTitle = [
-                      "Total billed tokens (input + output) this provider",
-                      groupFresh > 0
-                        ? `Fresh (non-cached): ${formatTokens(groupFresh)} tokens${groupCostFresh !== null ? ` · ${formatCost(groupCostFresh)}` : ""}`
-                        : "",
-                      groupCached > 0
-                        ? `Cached: ${formatTokens(groupCached)} tokens${groupCostCached !== null ? ` · ${formatCost(groupCostCached)}` : ""}`
-                        : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" · ");
-                    return (
-                      <div
-                        key={pid}
-                        className={`sidebar-usage-group${open ? " open" : ""}`}
-                        data-provider={pid}
-                      >
-                        <div
-                          className="sidebar-usage-group-head"
-                          onClick={() =>
-                            setUsageGroupsClosed((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(pid)) next.delete(pid);
-                              else next.add(pid);
-                              return next;
-                            })
-                          }
-                        >
-                          <span className="sidebar-panel-chevron small">
-                            {open ? "▾" : "▸"}
-                          </span>
-                          <span
-                            className="sidebar-usage-group-dot"
-                            aria-hidden
-                          />
-                          <span className="sidebar-usage-group-name">
-                            {pcfg?.name ?? pid}
-                          </span>
-                          <span
-                            className="sidebar-usage-group-total"
-                            title={groupTitle}
-                          >
-                            {formatTokens(groupTokens)}
-                            {groupCached > 0 && (
-                              <span className="sidebar-usage-cache">
-                                {" "}
-                                · ⚡{formatTokens(groupCached)}
-                              </span>
-                            )}
-                            {groupCost !== null && (
-                              <span className="sidebar-usage-cost">
-                                {" "}
-                                · {formatCost(groupCost)}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        {open && (
-                          <ul className="sidebar-usage-list">
-                            <li className="sidebar-usage-head" aria-hidden>
-                              <span>Model</span>
-                              <span>Tokens</span>
-                              <span>Cost</span>
-                            </li>
-                            {entries.map(
-                              ({
-                                model,
-                                input,
-                                output,
-                                cacheRead,
-                                cacheWrite,
-                                cost,
-                                costFresh,
-                                costCached,
-                              }) => {
-                                const cached = cacheRead + cacheWrite;
-                                const total = input + output;
-                                const fresh = Math.max(0, total - cached);
-                                const itemTitle = [
-                                  fresh > 0
-                                    ? `Fresh (non-cached): ${formatTokens(fresh)} tokens${costFresh !== null ? ` · ${formatCost(costFresh)}` : ""}`
-                                    : "",
-                                  cached > 0
-                                    ? `Cached: ${formatTokens(cached)} tokens${costCached !== null ? ` · ${formatCost(costCached)}` : ""}`
-                                    : "",
-                                ]
-                                  .filter(Boolean)
-                                  .join(" · ");
-                                return (
-                                  <li
-                                    key={model}
-                                    className="sidebar-usage-item"
-                                  >
-                                    <span
-                                      className="sidebar-usage-model"
-                                      title={model}
-                                    >
-                                      {model ? model.split("/").pop() : "main"}
-                                    </span>
-                                    <span
-                                      className="sidebar-usage-tokens"
-                                      title={itemTitle || undefined}
-                                    >
-                                      {formatTokens(total)}
-                                      {cached > 0 && (
-                                        <span className="sidebar-usage-breakdown">
-                                          <span className="sidebar-usage-fresh">
-                                            🔥 {formatTokens(fresh)}
-                                          </span>
-                                          <span className="sidebar-usage-cache">
-                                            ⚡ {formatTokens(cached)}
-                                          </span>
-                                        </span>
-                                      )}
-                                    </span>
-                                    <span
-                                      className={`sidebar-usage-cost${cost === null ? " no-price" : ""}`}
-                                      title={itemTitle || undefined}
-                                    >
-                                      {cost !== null ? formatCost(cost) : "—"}
-                                    </span>
-                                  </li>
-                                );
-                              },
-                            )}
-                          </ul>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
               </>
             )}
           </div>

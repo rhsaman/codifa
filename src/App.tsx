@@ -10,6 +10,7 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
+import { UsageChip } from './components/UsageChip'
 import { fetchModels, invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 
@@ -235,6 +236,7 @@ export default function App() {
         </button>
         <span className="app-title">Codifa</span>
         <div id="titlebar-toolbar" />
+        <UsageChip />
         <UpdateButton />
         <button
           className="workspace-btn"

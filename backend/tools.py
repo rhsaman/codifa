@@ -36,6 +36,7 @@ from vector_store import (
     StoreConfig,
     VectorStore,
     db_path_for,
+    web_rag_path_for,
 )
 
 MAX_READ_BYTES = 2_000_000  # 2 MB
@@ -950,25 +951,21 @@ def _get_result_cache() -> Cache:
 
 
 def _web_cache_ttl() -> int:
-    """TTL کش وب‌سرچ (ثانیه) از تنظیمات — پیش‌فرض ۷ روز."""
+    """TTL کش متنی وب‌سرچ (ثانیه) — از ragWebTtlDays می‌خونه.
+    پیش‌فرض ۹۰ روز (همون پیش‌فرض RAG)."""
     try:
         s = (_state_db.get_settings() or {})
-        days = int(s.get("webSearchTtlDays", 7))
+        days = int(s.get("ragWebTtlDays", 90))
         days = max(1, days)
     except (TypeError, ValueError):
-        days = 7
+        days = 90
     return days * 86400
 
 
 def _fetch_cache_ttl() -> int:
-    """TTL کش fetch_url (ثانیه) از تنظیمات — پیش‌فرض ۷ روز."""
-    try:
-        s = (_state_db.get_settings() or {})
-        days = int(s.get("fetchUrlTtlDays", 7))
-        days = max(1, days)
-    except (TypeError, ValueError):
-        days = 7
-    return days * 86400
+    """TTL کش متنی fetch_url (ثانیه) — از ragWebTtlDays می‌خونه.
+    پیش‌فرض ۹۰ روز. کش متنی و RAG حالا TTL یکسان دارن (ساده‌سازی تنظیمات)."""
+    return _web_cache_ttl()
 
 
 def _web_search_auto_fetch() -> int:
@@ -995,15 +992,21 @@ def _rag_web_enabled() -> bool:
         return False
 
 
-def _get_web_store(root: str) -> VectorStore | None:
-    """باز کردن lazy vector store فقط وقتی واقعاً لازمه (وب/fetch).
+def _get_web_store(root: str = "") -> VectorStore | None:
+    """باز کردن lazy vector store سراسری برای RAG وب/fetch.
 
-    اینطوری بدون embedding هیچ پوشه‌ای ساخته نمی‌شه — چون open_vector_store
-    فقط توی این تابع صدا زده می‌شه که خودش توی web_search_tool/fetch_url_tool
-    فراخوانی می‌شه (نه اول چت).
+    این store بین همهٔ ورک‌اسپیس‌ها share می‌شه (فایل ``web-rag.vectors.sqlite``).
+    چون RAG وب ذاتاً سراسریه — اگه React docs رو یه بار فچ کردی، همه
+    ورک‌اسپیس‌ها باید بتونن recall کنن. ``root`` صرفاً برای logging نگه داشته می‌شه.
     """
     try:
-        return open_vector_store(root, "", None)
+        db_path = web_rag_path_for(_state_db.vector_db_dir())
+        # TTL از ragWebTtlDays بیاد نه مقدار hardcode پیش‌فرض
+        s = (_state_db.get_settings() or {})
+        config = {
+            "ttl_days": max(1, int(s.get("ragWebTtlDays", 90))),
+        }
+        return VectorStore(db_path, StoreConfig.from_dict(config))
     except Exception:  # noqa: BLE001
         return None
 

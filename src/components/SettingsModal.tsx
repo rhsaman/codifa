@@ -497,10 +497,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
-  const webSearchTtlDays = useStore((s) => s.webSearchTtlDays ?? 7)
-  const setWebSearchTtlDays = useStore((s) => s.setWebSearchTtlDays)
-  const fetchUrlTtlDays = useStore((s) => s.fetchUrlTtlDays ?? 7)
-  const setFetchUrlTtlDays = useStore((s) => s.setFetchUrlTtlDays)
   const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
   const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
   const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
@@ -1781,7 +1777,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
         {tab === 'storage' && (
         <>
-          {/* ===== Web & Fetch cache TTL (separate) ===== */}
+          {/* ===== Web & Fetch cache ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
               <span className="settings-group-icon">🌐</span>
@@ -1789,50 +1785,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <div className="settings-group-title">Web &amp; Fetch cache</div>
                 <div className="settings-group-desc">
                   How long web search results and fetched pages stay cached before a re-fetch.
-                  Set each separately — web results change faster than fetched docs.
+                  Uses the same TTL as RAG storage (below) — set once, applies everywhere.
                 </div>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Web search cache TTL</div>
-                <div className="settings-row-desc">
-                  How long <b>web search results</b> stay cached. Default: <code>7</code> days.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={1}
-                  max={365}
-                  value={webSearchTtlDays}
-                  onChange={(e) => setWebSearchTtlDays(Number(e.target.value))}
-                  dir="ltr"
-                  aria-label="Web search cache TTL in days"
-                />
-                <span className="field-unit">days</span>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Fetch URL cache TTL</div>
-                <div className="settings-row-desc">
-                  How long <b>fetched pages</b> stay cached. Default: <code>7</code> days.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={1}
-                  max={365}
-                  value={fetchUrlTtlDays}
-                  onChange={(e) => setFetchUrlTtlDays(Number(e.target.value))}
-                  dir="ltr"
-                  aria-label="Fetch URL cache TTL in days"
-                />
-                <span className="field-unit">days</span>
               </div>
             </div>
 
@@ -1868,8 +1822,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <div className="settings-group-title">RAG storage (web/fetch)</div>
                 <div className="settings-group-desc">
                   When an embedding model is available, web/fetch results are also stored in the
-                  local vector store for semantic recall. This is <b>optional</b> — without an
-                  embedding model, web search and fetch still work (just no RAG recall).
+                  local vector store for semantic recall. This TTL also controls how long web/fetch
+                  text cache (above) stays valid. Without an embedding model, web search and fetch
+                  still work (just no RAG recall). Store is <b>shared</b> across all workspaces.
                 </div>
               </div>
             </div>

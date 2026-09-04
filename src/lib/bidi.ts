@@ -376,9 +376,16 @@ export function prepareContent(text: string, _dir?: 'rtl' | 'ltr'): string {
   // string can't be rewritten.
   const folded = foldLineCaptions(cleaned)
   const parts = folded.split(/```/g)
+  // Reference-style link definitions like "[label]: https://..." must not be
+  // modified by fixZwsp — ZWNJ/LRM injection breaks the label match.
+  const REF_DEF_RE = /^\[([^\]]+)\]:\s+https?:\/\//i
   const fixed = parts.map((p, i) => {
     if (i % 2 === 1) return fixCodeBlock(p) // code block: fix Persian runs only
-    return fixZwsp(p)
+    // Skip lines that are reference-style link definitions
+    return p.split('\n').map(line => {
+      if (REF_DEF_RE.test(line)) return line
+      return fixZwsp(line)
+    }).join('\n')
   })
   return fixed.join('```')
 }

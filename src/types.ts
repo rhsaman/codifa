@@ -134,10 +134,7 @@ export interface Settings {
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
-  /** TTL for web search / fetch cache (days). Default: 7. */
-  webSearchTtlDays?: number
-  fetchUrlTtlDays?: number
-  /** TTL for RAG web/fetch storage (days). Default: 90. */
+  /** TTL for web/fetch text cache + RAG storage (days). Default: 90. */
   ragWebTtlDays?: number
   /** How many top web_search results get their page content auto-fetched
    *  before answering (0 = off, snippet-only). Default: 3. */

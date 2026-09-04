@@ -252,7 +252,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -265,7 +265,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchTtlDays, fetchUrlTtlDays, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -458,16 +458,10 @@ interface State {
   /** Directory for the per-workspace RAG vector store; "" = default. */
   vectorDbPath: string
   setVectorDbPath: (p: string) => void
-  /** RAG web/fetch storage TTL (days). */
-  /** TTL for web search / fetch cache (days). */
-  webSearchTtlDays: number
-  fetchUrlTtlDays: number
-  setWebSearchTtlDays: (d: number) => void
-  setFetchUrlTtlDays: (d: number) => void
   /** How many top web_search results are auto-fetched for real page content (0 = off, snippet-only). */
   webSearchAutoFetch: number
   setWebSearchAutoFetch: (n: number) => void
-  /** TTL for RAG web/fetch storage (days). */
+  /** TTL for web/fetch text cache + RAG storage (days). */
   ragWebTtlDays: number
   setRagWebTtlDays: (d: number) => void
   /** User-level data root (app DB + skills/plans/mcp + vector stores). */
@@ -685,8 +679,6 @@ export const useStore = create<State>((set, get) => ({
   dir: 'rtl',
   fontSize: 14,
   vectorDbPath: '',
-  webSearchTtlDays: 7,
-  fetchUrlTtlDays: 7,
   webSearchAutoFetch: 3,
   ragWebTtlDays: 90,
   whisperModel: 'Systran/faster-whisper-medium',
@@ -931,9 +923,11 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
-      webSearchTtlDays: coercePositiveInt(raw.webSearchTtlDays, 7),
-      fetchUrlTtlDays: coercePositiveInt(raw.fetchUrlTtlDays, 7),
-      ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 90),
+      // Migration: اگه settings قدیمی webSearchTtlDays داشت ولی ragWebTtlDays نداشت،
+      // مقدار webSearchTtlDays → ragWebTtlDays منتقل بشه.
+      ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 0)
+        || coercePositiveInt((raw as Record<string, unknown>).webSearchTtlDays, 0)
+        || 90,
       // 0 is a valid, deliberate value (auto-fetch disabled) — keep it.
       webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 3, 0, 10),
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
@@ -1246,14 +1240,6 @@ export const useStore = create<State>((set, get) => ({
   },
   setEmbeddingBaseUrl: (u) => {
     set({ embeddingBaseUrl: (u ?? '').trim() })
-    get().persist()
-  },
-  setWebSearchTtlDays: (d) => {
-    set({ webSearchTtlDays: Math.max(1, Math.round(d) || 7) })
-    get().persist()
-  },
-  setFetchUrlTtlDays: (d) => {
-    set({ fetchUrlTtlDays: Math.max(1, Math.round(d) || 7) })
     get().persist()
   },
   setWebSearchAutoFetch: (n) => {

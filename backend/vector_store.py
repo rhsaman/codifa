@@ -106,6 +106,22 @@ def db_path_for(base_dir: str, workspace_slug: str) -> str:
     return os.path.join(base_dir, f"{slug}{_VEC_SUFFIX}")
 
 
+WEB_RAG_FILENAME_STEM = "web-rag"
+
+
+def web_rag_path_for(base_dir: str) -> str:
+    """مسیر store سراسری RAG وب/فچ.
+
+    یک فایل sqlite ثابت برای همهٔ ورک‌اسپیس‌ها — چون RAG وب ذاتاً
+    سراسریه (یه React doc یه بار فچ شد، همه جا recall می‌شه).
+    از همون suffix ``_VEC_SUFFIX`` برای سازگاری با migration استفاده می‌کنه.
+    """
+    base_dir = os.path.expanduser(base_dir or "")
+    if not base_dir:
+        raise ValueError("vectorDbPath is not configured")
+    return os.path.join(base_dir, f"{WEB_RAG_FILENAME_STEM}{_VEC_SUFFIX}")
+
+
 def migrate_legacy_dbs(base_dir: str) -> None:
     """Rename any old ``{slug}.sqlite`` / ``skills.sqlite`` files under
     ``base_dir`` to the new ``{slug}.vectors.sqlite`` layout.

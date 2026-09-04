@@ -291,8 +291,6 @@ _DEFAULT_SETTINGS_KEYS = frozenset(
         "whisperBaseUrl",
         "embeddingModel",
         "embeddingBaseUrl",
-        "webSearchTtlDays",
-        "fetchUrlTtlDays",
         "ragWebTtlDays",
         "subagentModels",
         "memory",

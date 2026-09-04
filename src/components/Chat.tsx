@@ -1761,6 +1761,14 @@ export function ChatPanel() {
         // so late sub-results are never dropped.
         const next = resolveToolResult(findMsg()?.toolActivity ?? [], event);
         store.updateMessage(assistantMsg.id, { toolActivity: next });
+        // When the AI creates a skill via the create_skill tool, invalidate
+        // the frontend skills cache so the @mention picker picks it up.
+        // Must also refresh the component's skillsList state — clearing the
+        // module-level cache alone doesn't trigger a re-render.
+        if (event.tool === "create_skill") {
+          invalidateSkillsList();
+          void ensureSkills();
+        }
       } else if (event.kind === "diff") {
         const current = findMsg()?.toolActivity ?? [];
         const next = current.map((a) => {

@@ -68,6 +68,19 @@ function ensureMermaidInit() {
   }
 }
 
+/**
+ * Strip invisible Unicode bidi/control characters injected by fixCodeBlock's
+ * `injectLrmMarks` step.  Mermaid's parser treats these as unexpected tokens
+ * and fails (e.g. "Expecting 'SOLID_ARROW', got 'NEWLINE'" or "Unrecognized
+ * text").  The characters are pure rendering hints for the browser's bidi
+ * algorithm inside code blocks — they carry no diagram semantics and are safe
+ * to remove.
+ */
+const BIDI_CONTROL_RE = /[\u200B\u200E\u200F\u2066-\u2069\u061C]/g
+function sanitizeChart(text: string): string {
+  return text.replace(BIDI_CONTROL_RE, '')
+}
+
 export function Mermaid({ chart, embedded = false }: { chart: string; embedded?: boolean }) {
   const [svg, setSvg] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
@@ -80,6 +93,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
   const renderDiagram = () => {
     setFailed(false)
     const id = `mmd-${Math.random().toString(36).slice(2)}`
+    const cleanChart = sanitizeChart(chart)
     // Render into a container we own and remove afterward. mermaid.render()
     // otherwise leaks a temporary node into <body> (the "duplicate diagram
     // appears at the bottom of the page" bug).
@@ -95,31 +109,32 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
       document.getElementById(`d${id}`)?.remove()
     }
     mermaid
-      .render(id, chart, container)
+      .render(id, cleanChart, container)
       .then((r) => {
         setSvg(applyRtlToSvgText(r.svg))
         return r
       })
-      .catch(() => {
-        // A custom `themeVariables` set can fail on some mermaid builds. Retry
-        // once with the built-in dark theme so the diagram (and its
-        // click-to-expand) still works instead of dropping to the fallback.
-        try {
-          mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' })
-        } catch {
-          // best-effort
-        }
-        return mermaid.render(`${id}-retry`, chart, container)
+      .catch((err) => {
+        console.error('[Mermaid] render failed, retrying with dark theme:', err)
+        // Do NOT call mermaid.initialize() here — it resets global state while a
+        // render is still partially committed, which makes the retry fail too and
+        // breaks every other diagram on the page.  Instead just re-render with
+        // the same init (which already has themeVariables from readThemeVars());
+        // if that fails it means the chart syntax itself is bad.
+        return mermaid.render(`${id}-retry`, cleanChart, container)
       })
       .then((r) => {
         if (r) setSvg(applyRtlToSvgText(r.svg))
       })
-      .catch(() => setFailed(true))
+      .catch((err) => {
+        console.error('[Mermaid] retry also failed, showing fallback:', err)
+        setFailed(true)
+      })
       .finally(cleanup)
   }
 
   useEffect(() => {
-    const t = setTimeout(renderDiagram, 200)
+    const t = setTimeout(renderDiagram, 400)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chart])

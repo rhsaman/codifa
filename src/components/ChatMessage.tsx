@@ -284,6 +284,148 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   );
 }
 
+// ── Video-embed detection ────────────────────────────────────────────────
+// Detects YouTube / Vimeo links and returns metadata for a clickable
+//  thumbnail card (thumbnail + play overlay).  Iframes are unreliable in
+//  Electron because YouTube blocks embedding from non-standard origins,
+//  so we show a static thumbnail that opens the video in the system browser.
+
+interface VideoEmbed {
+  platform: "youtube" | "vimeo";
+  videoUrl: string;
+  thumbnailUrl: string;
+  title: string;
+}
+
+function _ytId(u: URL): string | null {
+  // youtu.be/ID
+  if (u.hostname === "youtu.be") {
+    const id = u.pathname.slice(1);
+    return id || null;
+  }
+  if (!u.hostname.includes("youtube.com")) return null;
+  // youtube.com/watch?v=ID
+  const v = u.searchParams.get("v");
+  if (v) return v;
+  // youtube.com/shorts/ID
+  const shorts = /\/shorts\/([\w-]+)/.exec(u.pathname);
+  if (shorts) return shorts[1];
+  // youtube.com/embed/ID
+  const embed = /\/embed\/([\w-]+)/.exec(u.pathname);
+  return embed ? embed[1] : null;
+}
+
+function _vimeoId(u: URL): string | null {
+  if (u.hostname !== "vimeo.com" && u.hostname !== "player.vimeo.com") return null;
+  return /\/video\/(\d+)/.exec(u.pathname)?.[1]
+    ?? /^\/(\d+)/.exec(u.pathname)?.[1]
+    ?? null;
+}
+
+function extractVideoEmbed(href: string): VideoEmbed | null {
+  try {
+    const u = new URL(href);
+    const ytId = _ytId(u);
+    if (ytId) {
+      return {
+        platform: "youtube",
+        videoUrl: `https://www.youtube.com/watch?v=${ytId}`,
+        // maxresdefault falls back to hqdefault automatically
+        thumbnailUrl: `https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`,
+        title: "YouTube video",
+      };
+    }
+    const vmId = _vimeoId(u);
+    if (vmId) {
+      return {
+        platform: "vimeo",
+        videoUrl: `https://vimeo.com/${vmId}`,
+        // Vimeo thumbnail via oEmbed isn't available client-side, use placeholder
+        thumbnailUrl: `https://vumbnail.com/${vmId}.jpg`,
+        title: "Vimeo video",
+      };
+    }
+  } catch {
+    // invalid URL — ignore
+  }
+  return null;
+}
+
+// ── Markdown image with error handling ──────────────────────────────────────
+// Shows a fallback placeholder when the image URL is broken or unreachable.
+
+function MarkdownImage({
+  src,
+  alt,
+  ...props
+}: React.ImgHTMLAttributes<HTMLImageElement>) {
+  const [errored, setErrored] = useState(false);
+
+  if (!src || errored) {
+    return (
+      <span className="md-image-wrap md-image-errored">
+        <span className="md-image-fallback">
+          🖼️ {alt || "Image unavailable"}
+        </span>
+      </span>
+    );
+  }
+
+  return (
+    <span className="md-image-wrap">
+      {/* eslint-disable-next-line @next/next/no-img-element -- markdown inline image */}
+      <img
+        src={src}
+        alt={alt ?? ""}
+        loading="lazy"
+        onError={() => setErrored(true)}
+        {...props}
+      />
+      {alt ? <span className="md-image-caption">{alt}</span> : null}
+    </span>
+  );
+}
+
+// ── Video thumbnail card ──────────────────────────────────────────────────
+// Shows a clickable YouTube/Vimeo thumbnail with a play overlay.
+// Clicking opens the video in the system browser — more reliable than
+// iframe embeds, which YouTube blocks from Electron origins.
+
+function VideoThumbnailCard({
+  video,
+  href,
+  children,
+}: {
+  video: VideoEmbed;
+  href: string;
+  children?: ReactNode;
+}) {
+  const [thumbErr, setThumbErr] = useState(false);
+  const label = children?.toString().trim() || video.title;
+  const openVideo = () => void window.coder.openExternal(video.videoUrl);
+
+  return (
+    <span className="md-video-card" onClick={openVideo} role="button" tabIndex={0}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") openVideo(); }}>
+      {!thumbErr ? (
+        <img
+          className="md-video-thumb"
+          src={video.thumbnailUrl}
+          alt={label}
+          loading="lazy"
+          onError={() => setThumbErr(true)}
+        />
+      ) : (
+        <span className="md-video-thumb md-video-thumb-fallback">
+          🎬
+        </span>
+      )}
+      <span className="md-video-play">▶</span>
+      <span className="md-video-label">{label}</span>
+    </span>
+  );
+}
+
 // Shared overrides for every markdown renderer in this component.
 // `table` is wrapped in a scroll container: `display: block` on the <table>
 // itself makes its anonymous inner table shrink-wrap to content width, so the
@@ -313,22 +455,38 @@ export const mdComponents = {
       </code>
     );
   },
-  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
-    <a
-      {...props}
-      target="_blank"
-      rel="noreferrer"
-      onClick={(e) => {
-        // Forward http(s) links to the OS browser; internal anchors keep
-        // their default behaviour inside the app.
-        handleLinkClick(
-          e,
-          props.href,
-          (url) => void window.coder.openExternal(url),
-        );
-      }}
-    />
+  img: (props: React.ImgHTMLAttributes<HTMLImageElement> & { node?: unknown }) => (
+    <MarkdownImage {...props} />
   ),
+  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
+    const href = props.href ?? "";
+    const video = extractVideoEmbed(href);
+    if (video) {
+      return (
+        <VideoThumbnailCard
+          video={video}
+          href={href}
+          children={props.children}
+        />
+      );
+    }
+    return (
+      <a
+        {...props}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => {
+          // Forward http(s) links to the OS browser; internal anchors keep
+          // their default behaviour inside the app.
+          handleLinkClick(
+            e,
+            props.href,
+            (url) => void window.coder.openExternal(url),
+          );
+        }}
+      />
+    );
+  },
   pre: (props: React.HTMLAttributes<HTMLPreElement>) => (
     <CodeBlock {...props} />
   ),

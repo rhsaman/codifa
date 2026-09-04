@@ -9,7 +9,7 @@ model sees the prior work and does NOT re-run the tool calls.
 Run: uv run pytest backend/test/test_history_toolcall.py
 """
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph import history_to_langchain_messages
 

@@ -137,12 +137,6 @@ def build_context_with_memory(
     (which also touches their TTL) aren't fetched twice through different
     paths.
     """
-    rag = build_context(store, prompt, settings, max_chars=max_chars, kinds=(KIND_WEB,))
-    memory_block = (memory_block or "").strip()
-    if not memory_block:
-        return rag
-    if rag and len(rag) + len(memory_block) > max_chars:
-        # Prefer the memory block (agent's own knowledge) over file snippets
-        # when both can't fit.
-        return memory_block
-    return memory_block + rag
+    # RAG context injection حذف شد — فقط tool-level recall فعاله
+    # (web_search_tool و fetch_url_tool خودشون از RAG recall می‌کنن)
+    return (memory_block or "").strip()

@@ -507,14 +507,22 @@ def test_auto_compact_applies_result_in_place():
     finally:
         graph._agents._compact_history = original
 
-    # The leading system prompt is preserved, and the compacted summary is
-    # folded INTO it so the model retains context across compaction.
+    # opencode parity: the leading system prompt is preserved BYTE-IDENTICAL
+    # (never grows, prefix-cache friendly) and the compact summary lands as its
+    # OWN message right after it — not folded into the system prompt.
     assert isinstance(msgs[0], SystemMessage)
-    assert msgs[0].content == "system prompt\n\n[Compacted earlier context]\nSUMMARY"
-    # Only one system message exists (the summary is merged, not appended).
+    assert msgs[0].content == "system prompt"
+    # Only one system message exists (the summary is a separate HumanMessage).
     assert sum(1 for m in msgs if isinstance(m, SystemMessage)) == 1
+    # The summary is a standalone HumanMessage carrying the compact marker.
+    summary_msgs = [
+        m for m in msgs
+        if isinstance(m, HumanMessage) and "[Compacted earlier context]" in m.content
+    ]
+    assert summary_msgs, "compact summary must survive as its own message"
+    assert summary_msgs[0].content == "[Compacted earlier context]\nSUMMARY"
     # The old turns are gone; only the summary + recent tail remain.
-    assert len(msgs) == 3
+    assert len(msgs) == 4
     assert any(
         isinstance(m, HumanMessage) and m.content == "recent question" for m in msgs
     )
@@ -621,6 +629,57 @@ def test_auto_compact_in_place_noop_below_threshold():
     assert msgs[1].content == "hi"
     assert msgs[2].content == "answer"
     assert q.items == []
+
+
+def test_repeated_compaction_never_grows_system_prompt():
+    """opencode parity: the summary is its OWN message, never folded into the
+    system prompt. Regression guard for the bug where each compaction appended
+    another summary onto the system message (prompt + summary1 + summary2 + …),
+    so the prompt grew on every compact until the window overflowed — the
+    system prompt must stay byte-identical across any number of compactions."""
+    async def fake_compact(*a, **k):
+        return (
+            [
+                {"role": "system", "content": "[Compacted earlier context]\nSUMMARY"},
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+            ],
+            2,
+            None,
+        )
+
+    original = graph._agents._compact_history
+    graph._agents._compact_history = fake_compact
+    try:
+        msgs = [
+            SystemMessage(content="system prompt"),
+            HumanMessage(content="old q"),
+            AIMessage(content="old a"),
+            HumanMessage(content="recent question"),
+            AIMessage(content="recent answer"),
+        ]
+        for _ in range(3):  # three consecutive compactions
+            q = _Queue()
+            asyncio.run(
+                graph._maybe_auto_compact(
+                    {"compact_at_percent": 80}, q, None, None, msgs, 200_000,
+                    last_context_tokens=190_000,
+                )
+            )
+    finally:
+        graph._agents._compact_history = original
+
+    # The system prompt is byte-identical after 3 compactions — never grew.
+    assert isinstance(msgs[0], SystemMessage)
+    assert msgs[0].content == "system prompt"
+    # Exactly ONE summary message exists (replaced each time, not stacked).
+    summaries = [
+        m for m in msgs
+        if isinstance(m, HumanMessage) and "[Compacted earlier context]" in m.content
+    ]
+    assert len(summaries) == 1, f"summary stacked: {[m.content for m in summaries]}"
+    # The transcript is summary + recent tail — bounded, not growing per compact.
+    assert len(msgs) == 4
 
 
 def test_cheap_truncation_does_not_crash_on_plain_list():

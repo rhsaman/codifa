@@ -2024,11 +2024,17 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
     """Rebuild ``msgs`` in place from a compacted history dict list.
 
     Keeps the original leading ``SystemMessage`` (the assembled system prompt)
-    and converts each compacted dict back to a LangChain message, mirroring
-    ``llm._auto_compact_subagent``. Tool/assistant turns lose their structured
-    ``tool_calls`` (they become plain text), which is exactly what a compacted
-    summary tail should be — the model only needs the distilled context, not
-    the original callable tool signatures.
+    UNTOUCHED — opencode stores the compaction summary as its own message part,
+    never folded into the system prompt, so the prompt stays byte-identical
+    across compactions (prefix-cache friendly) and can never grow. The compact
+    head (``[Compacted earlier context]``) is re-injected as a standalone
+    ``HumanMessage`` right after the system prompt, mirroring
+    ``history_to_langchain_messages`` which already renders history system
+    notes as HumanMessage (Jinja-safe: SystemMessage stays at position 0).
+    Tool/assistant turns lose their structured ``tool_calls`` (they become
+    plain text), which is exactly what a compacted summary tail should be —
+    the model only needs the distilled context, not the original callable
+    tool signatures.
     """
     rebuilt: list[BaseMessage] = []
     had_system = bool(msgs) and isinstance(msgs[0], SystemMessage)
@@ -2039,22 +2045,11 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
         content = str(d.get("content") or "")
         if role == "system" and had_system:
             # The compacted head is itself a "[Compacted earlier context]"
-            # system note; fold it into the existing system prompt slot rather
-            # than appending a second system message — the model must see the
-            # summary to retain context across compaction.
-            #
-            # IMPORTANT: we *replace* any prior summary instead of appending,
-            # to prevent summary stacking.  Without this, each compaction
-            # concatenates another ~4K summary onto the system message,
-            # eventually overflowing the context window.
+            # system note. opencode keeps it as a separate message; we inject
+            # it as a HumanMessage (never a second SystemMessage — strict Jinja
+            # templates like Qwen3.5 require system only at position 0).
             if content:
-                prev = rebuilt[0]
-                _marker = "[Compacted earlier context]"
-                _cut = prev.content.find("\n\n" + _marker)
-                _base = prev.content[:_cut] if _cut >= 0 else prev.content
-                rebuilt[0] = prev.model_copy(
-                    update={"content": _base + "\n\n" + content}
-                )
+                rebuilt.append(HumanMessage(content=content))
             continue
         if role == "assistant":
             # Keep the structured tool_calls so a compacted in-flight step can

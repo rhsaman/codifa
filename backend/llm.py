@@ -1071,6 +1071,14 @@ async def _auto_compact_subagent(
         role = d.get("role")
         content = str(d.get("content") or "")
         if role == "system" and had_system:
+            # The compact head ("[Compacted earlier context]") is the sub-agent's
+            # ONLY memory of the summarized turns — dropping it (the old `continue`)
+            # made the sub-agent forget everything it had done before compaction.
+            # opencode keeps the summary as its own message; inject it as a
+            # HumanMessage (never a second SystemMessage — strict Jinja
+            # templates require system only at position 0).
+            if content:
+                rebuilt.append(HumanMessage(content=content))
             continue
         if role == "assistant":
             rebuilt.append(AIMessage(content=content))

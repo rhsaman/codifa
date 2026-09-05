@@ -3247,9 +3247,11 @@ async def _compact_history(
     # MERGES it (carries forward details) rather than re-compressing it, so we
     # pass it to the model as the <prior-summary> instead of concatenating.
     #
-    # After _apply_compaction_in_place the summary is *appended* to the system
-    # prompt, so content looks like "<prompt>\n\n[Compacted earlier context]\n…".
-    # We use .find() instead of .startswith() to locate the marker anywhere.
+    # The summary arrives as its OWN system dict at the head (opencode parity:
+    # never folded into the system prompt). Legacy transcripts from before that
+    # change may still carry it appended to the system prompt content
+    # ("<prompt>\n\n[Compacted earlier context]\n…"), so .find() locates the
+    # marker anywhere in the content as a fallback.
     _marker = "[Compacted earlier context]"
     existing_summary = ""
     older_turns: list[dict] = []
@@ -3258,7 +3260,10 @@ async def _compact_history(
         if t.get("role") == "system":
             _idx = content.find(_marker)
             if _idx >= 0:
-                # Extract the summary after the marker for merge.
+                # Extract the summary after the marker for merge. When the
+                # marker sits at the head of its own message (the normal case)
+                # this is the whole content; when appended to a legacy system
+                # prompt it is just the summary tail.
                 existing_summary += content[_idx + len(_marker):].lstrip("\n")
             else:
                 # No compaction history yet — keep the system prompt in

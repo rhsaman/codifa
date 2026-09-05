@@ -3988,28 +3988,169 @@ export function ChatPanel() {
                 })}
               </div>
             )}
-            <textarea
-              className="composer-input"
-              rows={1}
-              // Follows the app-wide dir toggle (same as message bubbles) instead of
-              // auto-detecting per keystroke: switching direction mid-sentence as
-              // soon as a Persian/Latin char appears was the actual "جابه‌جایی"
-              // problem — cursor and text order would jump while typing. A fixed
-              // dir means the textarea's own bidi handling of mixed FA/EN input
-              // stays stable and consistent with the rest of the UI.
-              dir={dir}
-              style={{
-                direction: dir,
-                textAlign: dir === "rtl" ? "right" : "left",
-              }}
-              placeholder={
-                wroot ? "Ask the agent…" : "Open a project folder first (⌘O)…"
-              }
-              ref={textareaRef}
-              value={input}
-              onChange={onInputChange}
-              onKeyDown={onKeyDown}
-            />
+            <div className="composer-input-row">
+              <button
+                className="icon-btn plus-btn"
+                onClick={attachFile}
+                disabled={busy}
+                title="Attach files or images"
+                aria-label="Attach"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 8v8M8 12h8" />
+                </svg>
+              </button>
+              <textarea
+                className="composer-input"
+                rows={1}
+                // Follows the app-wide dir toggle (same as message bubbles) instead of
+                // auto-detecting per keystroke: switching direction mid-sentence as
+                // soon as a Persian/Latin char appears was the actual "جابه‌جایی"
+                // problem — cursor and text order would jump while typing. A fixed
+                // dir means the textarea's own bidi handling of mixed FA/EN input
+                // stays stable and consistent with the rest of the UI.
+                dir={dir}
+                style={{
+                  direction: dir,
+                  textAlign: dir === "rtl" ? "right" : "left",
+                }}
+                placeholder={
+                  wroot ? "Write a message…" : "Open a project folder first (⌘O)…"
+                }
+                ref={textareaRef}
+                value={input}
+                onChange={onInputChange}
+                onKeyDown={onKeyDown}
+              />
+              <div className="composer-actions-right">
+                <button
+                  className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                  onClick={toggleRecording}
+                  disabled={busy}
+                  title={
+                    transcribing
+                      ? "Transcribing voice…"
+                      : recording
+                        ? "Stop recording (Ctrl+X Space)"
+                        : "Record voice input (Ctrl+X then Space)"
+                  }
+                >
+                  {recording ? (
+                    <span className="wave animate" aria-hidden="true">
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                    </span>
+                  ) : transcribing ? (
+                    <span className="wave transcribing" aria-hidden="true">
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M8 9l0 6" />
+                        <path d="M12 7l0 10" />
+                        <path d="M16 9l0 6" />
+                      </svg>
+                    </span>
+                  ) : (
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                      <line x1="12" y1="19" x2="12" y2="22" />
+                    </svg>
+                  )}
+                </button>
+                <button
+                  className="icon-btn attach-btn"
+                  onClick={captureRegion}
+                  disabled={busy}
+                  title="Capture a region of the screen"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                    <circle cx="12" cy="13" r="4" />
+                  </svg>
+                </button>
+                <button
+                  className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
+                  onClick={() => void openSkillPicker()}
+                  disabled={busy}
+                  title="Add MCP tools to this message"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                  </svg>
+                  {mcpEnabled.length > 0 && (
+                    <span className="attach-count">{mcpEnabled.length}</span>
+                  )}
+                </button>
+                {busy ? (
+                  <button
+                    className="icon-btn stop-btn"
+                    onClick={stop}
+                    title="Stop"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    className="icon-btn send-btn"
+                    disabled={!input.trim() && images.length === 0}
+                    onClick={submit}
+                    title="Send"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 19V5M5 12l7-7 7 7" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
 
           {nvimLabel && (
@@ -4187,238 +4328,67 @@ export function ChatPanel() {
             </div>
           )}
 
-          <div className="composer-row">
-            <span className="composer-left">
-              <ModeSelect
-                modes={modes}
-                value={chat.mode}
-                iconOnly
-                onChange={changeMode}
-              />
-              {provider &&
-                (modelReasoning(provider, activeModel) ??
-                  supportsReasoning(activeModel, provider.kind)) && (
-                  <span
-                    className={`thinking-pill${thinkingLevel ? " on" : ""}`}
-                    ref={thinkingRef}
-                  >
-                    <button
-                      type="button"
-                      className="thinking-pill-btn"
-                      onClick={() => setThinkingOpen((o) => !o)}
-                      title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
-                      aria-label="Reasoning effort for this message"
-                      aria-expanded={thinkingOpen}
+          <div className="composer-footer">
+            <span className="composer-disclaimer">
+              {getMode(settings, chat.mode).label} is AI and can make mistakes. Please double-check responses.
+            </span>
+            <span className="composer-footer-right">
+              <span className="composer-mode">
+                <ModeSelect
+                  modes={modes}
+                  value={chat.mode}
+                  iconOnly
+                  onChange={changeMode}
+                />
+                {provider &&
+                  (modelReasoning(provider, activeModel) ??
+                    supportsReasoning(activeModel, provider.kind)) && (
+                    <span
+                      className={`thinking-pill${thinkingLevel ? " on" : ""}`}
+                      ref={thinkingRef}
                     >
-                      <svg
-                        className="thinking-icon"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
+                      <button
+                        type="button"
+                        className="thinking-pill-btn"
+                        onClick={() => setThinkingOpen((o) => !o)}
+                        title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
+                        aria-label="Reasoning effort for this message"
+                        aria-expanded={thinkingOpen}
                       >
-                        <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
-                        <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
-                        <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
-                        <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
-                        <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
-                        <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
-                        <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
-                        <path d="M6 18a4 4 0 0 1-1.967-.516" />
-                        <path d="M19.967 17.484A4 4 0 0 1 18 18" />
-                      </svg>
-                      <span className="thinking-label">
-                        {THINKING_LABELS[thinkingLevel] ?? "Medium"}
-                      </span>
-                      <span className="mode-select-caret" aria-hidden="true">
-                        {thinkingOpen ? "▲" : "▼"}
-                      </span>
-                    </button>
-                    {thinkingOpen && (
-                      <div className="mode-menu thinking-menu">
-                        {THINKING_OPTIONS.map(([v, label]) => (
-                          <button
-                            key={v}
-                            type="button"
-                            className={`mode-menu-item thinking-item${thinkingLevel === v ? " active" : ""}`}
-                            onClick={() => {
-                              setThinkingLevel(v);
-                              setThinkingOpen(false);
-                            }}
-                          >
-                            <span className="mode-menu-text">
-                              <span className="mode-menu-label">{label}</span>
-                              <span className="mode-menu-desc">
-                                {THINKING_DESCS[v]}
+                        <span className="thinking-label">
+                          {THINKING_LABELS[thinkingLevel] ?? "Medium"}
+                        </span>
+                        <span className="mode-select-caret" aria-hidden="true">
+                          {thinkingOpen ? "▲" : "▼"}
+                        </span>
+                      </button>
+                      {thinkingOpen && (
+                        <div className="mode-menu thinking-menu">
+                          {THINKING_OPTIONS.map(([v, label]) => (
+                            <button
+                              key={v}
+                              type="button"
+                              className={`mode-menu-item thinking-item${thinkingLevel === v ? " active" : ""}`}
+                              onClick={() => {
+                                setThinkingLevel(v);
+                                setThinkingOpen(false);
+                              }}
+                            >
+                              <span className="mode-menu-text">
+                                <span className="mode-menu-label">{label}</span>
+                                <span className="mode-menu-desc">
+                                  {THINKING_DESCS[v]}
+                                </span>
                               </span>
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </span>
-                )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </span>
+                  )}
+              </span>
               <ProviderModelSelect />
             </span>
-            <span className="composer-hint" />
-            <div className="composer-actions">
-              <button
-                className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
-                onClick={toggleRecording}
-                disabled={busy}
-                title={
-                  transcribing
-                    ? "Transcribing voice…"
-                    : recording
-                      ? "Stop recording (Ctrl+X Space)"
-                      : "Record voice input (Ctrl+X then Space)"
-                }
-              >
-                {recording ? (
-                  <span className="wave animate" aria-hidden="true">
-                    <span className="wave-bar" />
-                    <span className="wave-bar" />
-                    <span className="wave-bar" />
-                    <span className="wave-bar" />
-                  </span>
-                ) : transcribing ? (
-                  <span className="wave transcribing" aria-hidden="true">
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <circle cx="12" cy="12" r="10" />
-                      <path d="M8 9l0 6" />
-                      <path d="M12 7l0 10" />
-                      <path d="M16 9l0 6" />
-                    </svg>
-                  </span>
-                ) : (
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                    <line x1="12" y1="19" x2="12" y2="22" />
-                  </svg>
-                )}
-              </button>
-              <button
-                className="icon-btn attach-btn"
-                onClick={captureRegion}
-                disabled={busy}
-                title="Capture a region of the screen"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-                  <circle cx="12" cy="13" r="4" />
-                </svg>
-              </button>
-              <button
-                className="icon-btn attach-btn"
-                onClick={attachFile}
-                disabled={busy}
-                title="Attach an image or file"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-                </svg>
-              </button>
-              <button
-                className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
-                onClick={() => void openSkillPicker()}
-                disabled={busy}
-                title="Add MCP tools to this message"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
-                </svg>
-                {mcpEnabled.length > 0 && (
-                  <span className="attach-count">{mcpEnabled.length}</span>
-                )}
-              </button>
-              {busy ? (
-                <>
-                  <button
-                    className="icon-btn queue-btn"
-                    onClick={queueForLater}
-                    disabled={!input.trim() && images.length === 0}
-                    title="Queue — send after the current turn finishes (won't interrupt)"
-                  >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01" />
-                    </svg>
-                  </button>
-                  <button
-                    className="icon-btn stop-btn"
-                    onClick={stop}
-                    title="Stop"
-                  >
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
-                    </svg>
-                  </button>
-                </>
-              ) : (
-                <button
-                  className="icon-btn send-btn"
-                  disabled={!input.trim() && images.length === 0}
-                  onClick={submit}
-                  title="Send"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M12 19V5M5 12l7-7 7 7" />
-                  </svg>
-                </button>
-              )}
-            </div>
           </div>
         </div>
       </div>

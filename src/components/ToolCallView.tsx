@@ -9,18 +9,20 @@ import { useFullscreen } from '../lib/fullscreen'
 import { useDragScroll } from '../lib/useDragScroll'
 
 const TOOL_LABEL: Record<string, string> = {
-  write_file: 'write_file',
-  list_files: 'list_files',
-  grep: 'grep',
-  glob: 'glob',
-  web_search: 'web_search',
-  run_terminal: 'run_terminal',
-  search_memory: 'search_memory',
-  memory: 'memory',
-  ask_user: 'ask_user',
-  fetch_url: 'fetch_url',
-  task: 'task',
-  vision: 'vision',
+  write_file: 'Write File',
+  list_files: 'List Directory',
+  grep: 'Search Files',
+  glob: 'Search Files',
+  web_search: 'Web Search',
+  run_terminal: 'Run Command',
+  search_memory: 'Search Memory',
+  memory: 'Memory',
+  ask_user: 'Ask User',
+  fetch_url: 'Fetch URL',
+  task: 'Task',
+  vision: 'Vision',
+  create_skill: 'Create Skill',
+  create_mcp: 'Create MCP',
 }
 
 /** Small glyph per tool category, shown at the head of each collapsed-group
@@ -68,8 +70,8 @@ function groupSummary(activities: ToolActivity[]): string {
   for (const a of activities) counts[a.tool] = (counts[a.tool] || 0) + 1
   return Object.entries(counts)
     .map(([tool, n]) => {
-      const noun = TOOL_NOUN[tool] ?? ['tool call', 'tool calls']
-      return `${n} ${n === 1 ? noun[0] : noun[1]}`
+      const name = TOOL_LABEL[tool] ?? tool
+      return n > 1 ? `${name} ×${n}` : name
     })
     .join(', ')
 }
@@ -83,11 +85,77 @@ function fmtTime(ms?: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`
 }
 
+/* ——— High-quality SVG icons ——— */
+function IconSparkle({ className }: { className?: string }) {
+  return (
+    <svg className={className} width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 1L14.5 9.5L23 12L14.5 14.5L12 23L9.5 14.5L1 12L9.5 9.5Z" />
+    </svg>
+  )
+}
+
+function IconChevron({ open, className }: { open?: boolean; className?: string }) {
+  return (
+    <svg
+      className={`${className ?? ''} ${open ? 'open' : ''}`}
+      width="22" height="22" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ transition: 'transform 0.18s ease', transform: open ? 'rotate(90deg)' : 'rotate(0deg)' }}
+    >
+      <path d="M9 18l6-6-6-6" />
+    </svg>
+  )
+}
+
+function IconCheck({ className }: { className?: string }) {
+  return (
+    <svg className={className} width="14" height="14" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M20 6L9 17l-5-5" />
+    </svg>
+  )
+}
+
+function IconX({ className }: { className?: string }) {
+  return (
+    <svg className={className} width="14" height="14" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
 function StatusIcon({ status }: { status: ToolActivity['status'] }) {
   if (status === 'running') return <span className="spinner" />
-  if (status === 'error') return <span className="status-err">✗</span>
+  if (status === 'error') return <IconX className="status-err" />
   if (status === 'denied') return <span className="status-denied">⏹</span>
-  return <span className="status-ok">✓</span>
+  return <IconCheck className="status-ok" />
+}
+
+/** Parse unified diff into before/after line arrays for side-by-side display */
+function parseUnifiedDiff(diff: string): { before: string[]; after: string[] } {
+  const before: string[] = []
+  const after: string[] = []
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++')) {
+      // hunk headers go in both
+      before.push(line)
+      after.push(line)
+    } else if (line.startsWith('-')) {
+      before.push(line.slice(1))
+      after.push('')
+    } else if (line.startsWith('+')) {
+      before.push('')
+      after.push(line.slice(1))
+    } else {
+      // context line (starts with space or no prefix)
+      const clean = line.startsWith(' ') ? line.slice(1) : line
+      before.push(clean)
+      after.push(clean)
+    }
+  }
+  return { before, after }
 }
 
 /** Extract a clean host label (e.g. "github.com") from a URL for the
@@ -469,44 +537,47 @@ export const ToolGroupView = memo(function ToolGroupView({
 }: {
   activities: { activity: ToolActivity; index: number }[]
   /** The short narration line the model wrote right before this run of calls
-   *  (see renderSegments in ChatMessage.tsx). Shown as a caption above the
-   *  collapsible head so the group reads as "here's what I'm doing, here's
-   *  the calls" instead of a bare count summary. */
+   *  (see renderSegments in ChatMessage.tsx). Used as the trace-head status
+   *  text (Claude.ai-style: ✱ + "Tracing X" + elapsed time), instead of a
+   *  separate caption above the head. */
   caption?: string
   onReverted?: (index: number) => void
 }) {
   const [open, setOpen] = useState(false)
   const running = activities.some((a) => a.activity.status === 'running')
-  const errored = activities.every((a) => a.activity.status === 'error')
-  const denied = activities.every((a) => a.activity.status === 'denied')
   const totalMs = activities.reduce((sum, a) => sum + (a.activity.elapsedMs || 0), 0)
-  const summary = groupSummary(activities.map((a) => a.activity))
+  // Always show tool names + counts as the main status text.
+  // Caption (model narration) is shown as a secondary line if present.
+  // Build per-tool pills: [{tool: "read", count: 3}, ...]
+  const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
+    acc[a.activity.tool] = (acc[a.activity.tool] || 0) + 1
+    return acc
+  }, {})
 
   return (
-    <div className={`tool-group ${errored ? 'error' : running ? 'running' : denied ? 'denied' : 'done'}`}>
-      {caption && (
-        <div className="tool-narrated-caption" dir="auto">
-          {fixZwsp(caption)}
-        </div>
-      )}
-      <button className={`tool-group-head ${open ? 'open' : ''}`} onClick={() => setOpen((o) => !o)}>
-        <span className={`chev ${open ? 'open' : ''}`}>▾</span>
-        {running ? (
-          <span className="spinner" />
-        ) : errored ? (
-          <span className="status-err">✗</span>
-        ) : denied ? (
-          <span className="status-denied">⏹</span>
-        ) : (
-          <span className="status-ok">✓</span>
-        )}
-        <span className="tool-group-label">{summary}</span>
-        <span className="tool-ms">{fmtTime(totalMs)}</span>
+    <div className={`tool-group ${open ? 'open' : ''} ${running ? 'running' : 'done'}`}>
+      <button
+        className={`trace-head ${open ? 'open' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <IconSparkle className="trace-sparkle" />
+        <span className="trace-head-pills">
+          {Object.entries(toolCounts).map(([tool, n]) => (
+            <span key={tool} className="trace-pill">
+              {TOOL_LABEL[tool] ?? tool}
+              {n > 1 && <span className="trace-pill-count">×{n}</span>}
+            </span>
+          ))}
+        </span>
+        <span className="trace-head-right">
+          {totalMs > 0 && <span className="trace-time">{fmtTime(totalMs)}</span>}
+          <IconChevron open={open} className="trace-chev" />
+        </span>
       </button>
       {open && (
-        <div className="tool-timeline">
+        <div className="trace-list">
           {activities.map(({ activity, index }) => (
-            <ToolTimelineRow key={index} activity={activity} />
+            <TraceRow key={index} activity={activity} />
           ))}
         </div>
       )}
@@ -611,11 +682,99 @@ export const ToolSubRow = memo(function ToolSubRow({ activity }: { activity: Too
   )
 })
 
-/** One row in a group's expanded timeline: category icon, tool label, a
- *  one-line arg summary, status glyph and elapsed time — flat text, no card
- *  border/background, connected by the `.tool-timeline` spine. Mirrors
- *  Claude.ai's own trace rows (icon + short description) rather than the
- *  boxed mini-cards the old cascade preview used. */
+/** One row in a Claude-style trace group: a single quiet line per call with
+ *  a tool icon, a short description (the model's arg summary or activity
+ *  summary), and a right-side chevron `›` so the row reads as a list item you
+ *  can scan, not a mini-card. Mirrors Claude.ai's own trace row layout (icon
+ *  + short text + chevron), not the spine-and-circle timeline the old version
+ *  used. */
+const TraceRow = memo(function TraceRow({ activity }: { activity: ToolActivity }) {
+  const [now, setNow] = useState(() => Date.now())
+  // edit_file / write_file همیشه باز باشن (diff نشون بدن)
+  const [expanded, setExpanded] = useState(() =>
+    activity.tool === 'edit_file' || activity.tool === 'write_file',
+  )
+  const running = activity.status === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 500)
+    return () => clearInterval(t)
+  }, [running])
+  const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
+  const label = TOOL_LABEL[activity.tool] ?? activity.tool
+  const detail = activity.summary
+    ? fixZwsp(activity.summary)
+    : subArgSummary(activity)
+
+  const argsText = activity.args
+    ? Object.entries(activity.args)
+        .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join('\n')
+    : ''
+
+  const isEdit = activity.tool === 'edit_file' || activity.tool === 'write_file'
+
+  return (
+    <div className={`trace-row ${activity.status}${running ? ' running' : ''}${expanded ? ' expanded' : ''}${isEdit ? ' edit-file' : ''}`}>
+      <button className="trace-row-head" onClick={() => !isEdit && setExpanded((e) => !e)}>
+        <span className="trace-row-bullet" aria-hidden="true">
+          {running ? <span className="spinner" /> : '•'}
+        </span>
+        <span className="trace-pill">{label}</span>
+        <span className="trace-row-detail" dir="auto" title={detail ?? ''}>
+          {detail}
+        </span>
+        <span className="trace-row-end">
+          {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
+          <StatusIcon status={activity.status} />
+          <IconChevron open={expanded} className="trace-row-chev" />
+        </span>
+      </button>
+      {expanded && (
+        <div className="trace-row-expand">
+          {activity.summary && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Summary</span>
+              <span className="trace-expand-val" dir="auto">{fixZwsp(activity.summary)}</span>
+            </div>
+          )}
+          {argsText && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Args</span>
+              <pre className="trace-expand-val trace-expand-pre" dir="auto">{argsText}</pre>
+            </div>
+          )}
+          {activity.diff && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Diff</span>
+              <pre className="trace-expand-val trace-expand-pre trace-expand-diff" dir="auto">{activity.diff}</pre>
+            </div>
+          )}
+          {activity.items && activity.items.length > 0 && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Results</span>
+              <div className="trace-expand-results">
+                {activity.items.map((it, i) => (
+                  it.url ? (
+                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
+                      {it.title || it.url}
+                    </a>
+                  ) : (
+                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
+                  )
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+})
+
+/** Legacy timeline row, kept exported in case any caller still imports it
+ *  directly. New code should use TraceRow instead — Claude.ai's trace UI is a
+ *  flat list of quiet rows, not a spine-and-circle timeline. */
 const ToolTimelineRow = memo(function ToolTimelineRow({ activity }: { activity: ToolActivity }) {
   const [now, setNow] = useState(() => Date.now())
   const running = activity.status === 'running'
@@ -718,8 +877,9 @@ const ToolCascade = memo(function ToolCascade({ activities }: { activities: Tool
  * A SINGLE read-only tool call rendered as ONE cohesive row — not a header
  * bolted onto an empty body (which is what a lone ToolCallView looks like for
  * grep/read/glob/search). Anthropic-frontend principles: one clear unit,
- * restrained chrome, status + name + args + time in a single quiet line. Used
- * for standalone single calls; multi-call runs still collapse into a group.
+ * restrained chrome, icon + short description + chevron in a single quiet line.
+ * Used for standalone single calls; multi-call runs still collapse into a
+ * group. Mirrors Claude.ai's own trace row layout.
  */
 export const ToolSingleRow = memo(function ToolSingleRow({
   activity,
@@ -727,6 +887,9 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   activity: ToolActivity
 }) {
   const [now, setNow] = useState(() => Date.now())
+  const [expanded, setExpanded] = useState(() =>
+    activity.tool === 'edit_file' || activity.tool === 'write_file',
+  )
   const running = activity.status === 'running'
   useEffect(() => {
     if (!running) return
@@ -734,28 +897,118 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     return () => clearInterval(t)
   }, [running])
   const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
-  const detail = subArgSummary(activity)
-  const hasBody =
-    Boolean(activity.summary) ||
-    Boolean(activity.items?.length) ||
-    Boolean(activity.children?.length)
+  const label = TOOL_LABEL[activity.tool] ?? activity.tool
+  const detail = activity.summary
+    ? fixZwsp(activity.summary)
+    : subArgSummary(activity)
+
+  const argsText = activity.args
+    ? Object.entries(activity.args)
+        .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join('\n')
+    : ''
+
+  const isEdit = activity.tool === 'edit_file' || activity.tool === 'write_file'
+
+  /** Compute +/- stats from diff */
+  const diffStats = (() => {
+    if (!activity.diff) return null
+    let adds = 0, dels = 0
+    for (const line of activity.diff.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) adds++
+      else if (line.startsWith('-') && !line.startsWith('---')) dels++
+    }
+    return adds || dels ? `+${adds}/-${dels}` : null
+  })()
+
   return (
-    <div className={`tool-single ${activity.status}${running ? ' running' : ''}`}>
-      <StatusIcon status={activity.status} />
-      <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-      {activity.tool === 'web_search' && activity.engine && (
-        <span className="tool-badge tool-engine-badge">{activity.engine}</span>
-      )}
-      {detail && (
-        <span className="tool-single-detail" title={detail}>
-          {detail}
+    <div className={`trace-row single ${activity.status}${running ? ' running' : ''}${expanded ? ' expanded' : ''}${isEdit ? ' edit-file' : ''}`}>
+      <button className="trace-row-head" onClick={() => !isEdit && setExpanded((e) => !e)}>
+        <StatusIcon status={activity.status} />
+        <span className="trace-pill">{label}</span>
+        {isEdit ? (
+          <span className="trace-row-detail" dir="auto" title={String(activity.args?.path ?? '')}>
+            {String(activity.args?.path ?? '').split('/').pop()}
+          </span>
+        ) : (
+          <span className="trace-row-detail" dir="auto" title={detail ?? ''}>
+            {detail}
+          </span>
+        )}
+        {activity.tool === 'web_search' && activity.engine && (
+          <span className="trace-row-engine">{activity.engine}</span>
+        )}
+        <span className="trace-row-end">
+          {isEdit && diffStats && <span className="trace-row-diff-stats">{diffStats}</span>}
+          {isEdit && (
+            <button className="trace-row-revert" title="Revert this change" onClick={(e) => e.stopPropagation()}>
+              Revert
+            </button>
+          )}
+          {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
+          <IconChevron open={expanded} className="trace-row-chev" />
         </span>
-      )}
-      {hasBody && activity.summary && (
-        <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
-      )}
-      <span className="tool-ms">{fmtTime(ms)}</span>
-      {activity.items && activity.items.length > 0 && (activity.tool === 'web_search' || activity.tool === 'fetch_url' ? <WebResultLinks items={activity.items} /> : <FileResultLinks tool={activity.tool} items={activity.items as unknown as Array<Record<string, unknown>>} />)}
+      </button>
+      {expanded && isEdit && activity.diff ? (
+        <div className="trace-row-expand edit-file-expand">
+          {(() => {
+            const { before, after } = parseUnifiedDiff(activity.diff)
+            return (
+              <div className="diff-columns">
+                <div className="diff-col">
+                  <div className="diff-col-header diff-col-before">Before</div>
+                  <pre className="diff-col-code">{before.map((l, i) =>
+                    <span key={i} className="diff-line">{l || '\u00A0'}</span>
+                  )}</pre>
+                </div>
+                <div className="diff-col">
+                  <div className="diff-col-header diff-col-after">After</div>
+                  <pre className="diff-col-code">{after.map((l, i) =>
+                    <span key={i} className="diff-line">{l || '\u00A0'}</span>
+                  )}</pre>
+                </div>
+              </div>
+            )
+          })()}
+        </div>
+      ) : expanded ? (
+        <div className="trace-row-expand">
+          {activity.summary && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Summary</span>
+              <span className="trace-expand-val" dir="auto">{fixZwsp(activity.summary)}</span>
+            </div>
+          )}
+          {argsText && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Args</span>
+              <pre className="trace-expand-val trace-expand-pre" dir="auto">{argsText}</pre>
+            </div>
+          )}
+          {activity.diff && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Diff</span>
+              <pre className="trace-expand-val trace-expand-pre trace-expand-diff" dir="auto">{activity.diff}</pre>
+            </div>
+          )}
+          {activity.items && activity.items.length > 0 && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Results</span>
+              <div className="trace-expand-results">
+                {activity.items.map((it, i) => (
+                  it.url ? (
+                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
+                      {it.title || it.url}
+                    </a>
+                  ) : (
+                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
+                  )
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : null}
     </div>
   )
 })
@@ -765,10 +1018,11 @@ export const ToolSingleRow = memo(function ToolSingleRow({
  * right before calling it (e.g. "بذار ببینم X رو..."). Instead of stacking a
  * full paragraph text block above a separate, unrelated tool row — which is
  * what made multi-step tool runs feel noisy (every call got its own two-part
- * block) — the caption and the call render as ONE quiet unit: caption line on
- * top, compact tool line below, sharing a single card. See renderSegments in
- * ChatMessage.tsx for how captions get attached to the call(s) that follow
- * them. Falls back to the plain ToolSingleRow when there's no caption.
+ * block) — the caption and the call render as a single quiet row: caption
+ * text + status icon + chevron, matching Claude.ai's trace rows. See
+ * renderSegments in ChatMessage.tsx for how captions get attached to the
+ * call(s) that follow them. Falls back to the plain ToolSingleRow when
+ * there's no caption.
  */
 export const ToolNarratedRow = memo(function ToolNarratedRow({
   caption,
@@ -778,6 +1032,9 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
   activity: ToolActivity
 }) {
   const [now, setNow] = useState(() => Date.now())
+  const [expanded, setExpanded] = useState(() =>
+    activity.tool === 'edit_file' || activity.tool === 'write_file',
+  )
   const running = activity.status === 'running'
   useEffect(() => {
     if (!running) return
@@ -785,34 +1042,75 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
     return () => clearInterval(t)
   }, [running])
   const ms = running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs
-  const detail = subArgSummary(activity)
-  const hasBody =
-    Boolean(activity.summary) || Boolean(activity.items?.length) || Boolean(activity.children?.length)
-
   if (!caption) return <ToolSingleRow activity={activity} />
 
+  const label = TOOL_LABEL[activity.tool] ?? activity.tool
+  const detail = activity.summary ? fixZwsp(activity.summary) : subArgSummary(activity)
+
+  const argsText = activity.args
+    ? Object.entries(activity.args)
+        .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join('\n')
+    : ''
+
+  const isEdit = activity.tool === 'edit_file' || activity.tool === 'write_file'
+
   return (
-    <div className={`tool-narrated ${activity.status}${running ? ' running' : ''}`}>
-      <div className="tool-narrated-caption" dir="auto">
-        {fixZwsp(caption)}
-      </div>
-      <div className="tool-narrated-row">
-        <StatusIcon status={activity.status} />
-        <span className="tool-name">{TOOL_LABEL[activity.tool] ?? activity.tool}</span>
-        {activity.tool === 'web_search' && activity.engine && (
-          <span className="tool-badge tool-engine-badge">{activity.engine}</span>
-        )}
-        {detail && (
-          <span className="tool-single-detail" title={detail}>
-            {detail}
+    <div className={`trace-row narrated ${activity.status}${running ? ' running' : ''}${expanded ? ' expanded' : ''}${isEdit ? ' edit-file' : ''}`}>
+      <button className="trace-row-head" onClick={() => !isEdit && setExpanded((e) => !e)}>
+        <span className="trace-row-caption" dir="auto">
+          {fixZwsp(caption)}
+        </span>
+        <span className="trace-pill">{label}</span>
+        {isEdit && activity.summary ? (
+          <span className="trace-row-detail trace-row-summary" dir="auto">
+            {activity.summary}
           </span>
-        )}
-        {hasBody && activity.summary && (
-          <span className="tool-single-summary">{fixZwsp(activity.summary)}</span>
-        )}
-        <span className="tool-ms">{fmtTime(ms)}</span>
-      </div>
-      {activity.items && activity.items.length > 0 && (activity.tool === 'web_search' || activity.tool === 'fetch_url' ? <WebResultLinks items={activity.items} /> : <FileResultLinks tool={activity.tool} items={activity.items as unknown as Array<Record<string, unknown>>} />)}
+        ) : null}
+        <span className="trace-row-end">
+          {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
+          <StatusIcon status={activity.status} />
+          {!isEdit && <IconChevron open={expanded} className="trace-row-chev" />}
+        </span>
+      </button>
+      {expanded && (
+        <div className="trace-row-expand">
+          {activity.summary && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Summary</span>
+              <span className="trace-expand-val" dir="auto">{fixZwsp(activity.summary)}</span>
+            </div>
+          )}
+          {argsText && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Args</span>
+              <pre className="trace-expand-val trace-expand-pre" dir="auto">{argsText}</pre>
+            </div>
+          )}
+          {activity.diff && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Diff</span>
+              <pre className="trace-expand-val trace-expand-pre trace-expand-diff" dir="auto">{activity.diff}</pre>
+            </div>
+          )}
+          {activity.items && activity.items.length > 0 && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Results</span>
+              <div className="trace-expand-results">
+                {activity.items.map((it, i) => (
+                  it.url ? (
+                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
+                      {it.title || it.url}
+                    </a>
+                  ) : (
+                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
+                  )
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 })

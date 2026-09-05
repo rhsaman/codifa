@@ -831,7 +831,7 @@ export function ThinkingIndicator({ startedAt }: { startedAt?: number }) {
 // memory/skill/connector saves) sweeps into the collapsed Claude-app-style
 // trace group. Explore sub-agents are also always-visible (isExploreCard
 // below) so the explorer never hides inside the collapsed group.
-const ALWAYS_VISIBLE_TOOLS = new Set(["write_file", "edit_file"]);
+const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file"]);
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
  *  2+ consecutive read-only/non-mutating tool calls (grep/glob/read/
@@ -1086,9 +1086,6 @@ function renderSegments(
       return;
     }
     if (seg.kind === "text") {
-      // A text segment always ends whatever tool run was accumulating.
-      flush(`grp-${i}`);
-
       // Does this text immediately precede a groupable (non-always-visible)
       // tool call? If so, hold it back as that call's caption instead of
       // rendering it as its own paragraph — the run stays inside the same
@@ -1104,11 +1101,14 @@ function renderSegments(
         !isExploreCard(nextActivity);
 
       if (nextIsGroupable && isCaptionCandidate(seg.text)) {
+        // Hold back as caption — do NOT flush yet so pending tools merge
+        // into the same group as the upcoming tool calls.
         pendingCaption = seg.text;
         return;
       }
 
-      // Genuine prose — the trace run (if any) is really over now.
+      // Genuine prose — flush whatever tool run was accumulating.
+      flush(`grp-${i}`);
       wrapTrace(`trace-${i}`);
       renderProse(String(i), seg.text);
       return;

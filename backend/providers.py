@@ -338,23 +338,30 @@ async def google_refresh_token(
     client_id: str, client_secret: str, refresh_token: str
 ) -> dict:
     """Refresh an OAuth access token from its refresh token."""
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            GOOGLE_OAUTH_TOKEN_URL,
-            data={
-                "refresh_token": refresh_token,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "grant_type": "refresh_token",
-            },
-        )
-        data = resp.json()
-        if resp.status_code >= 400:
-            raise ProviderError(
-                f"google oauth refresh failed ({resp.status_code}): "
-                f"{data.get('error_description') or data.get('error') or data}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                GOOGLE_OAUTH_TOKEN_URL,
+                data={
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "grant_type": "refresh_token",
+                },
             )
-        return data
+            data = resp.json()
+            if resp.status_code >= 400:
+                raise ProviderError(
+                    f"google oauth refresh failed ({resp.status_code}): "
+                    f"{data.get('error_description') or data.get('error') or data}"
+                )
+            return data
+    except ProviderError:
+        raise
+    except httpx.HTTPError as exc:
+        raise ProviderError(
+            f"google oauth refresh network error: {exc}"
+        ) from exc
 
 
 async def google_access_token(

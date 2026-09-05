@@ -531,6 +531,52 @@ def _strip_parallel_calls(model: Any) -> Any:
     return clone
 
 
+def _is_temperature_error(exc: Exception) -> bool:
+    """True when an exception is a 4xx caused by an unsupported
+    ``temperature`` param. Reasoning-only model routes (e.g. some custom
+    gateways' o-series style models) reject the field with a 400 — the runner
+    retries once without it so the model still works instead of failing every
+    turn."""
+    msg = str(exc).lower()
+    if "temperature" in msg and (
+        "400" in msg
+        or "not supported" in msg
+        or "unsupported" in msg
+        or "invalid_request_error" in msg
+        or "remove the field" in msg
+    ):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    return bool(status == 400 and "temperature" in msg)
+
+
+def _strip_temperature(model: Any) -> Any:
+    """Return a copy of ``model`` with ``temperature`` cleared (set to ``None``
+    so the request param is omitted entirely). Mirrors ``_strip_stream_options``
+    for the same class of "route rejects a non-essential OpenAI field" failure.
+    Falls back to the original model if cloning fails for any reason."""
+    try:
+        clone = model.model_copy(deep=False)
+    except Exception:  # noqa: BLE001
+        return model
+    mk = dict(getattr(clone, "model_kwargs", None) or {})
+    if "temperature" in mk:
+        mk = {k: v for k, v in mk.items() if k != "temperature"}
+        try:
+            clone.model_kwargs = mk
+        except Exception:  # noqa: BLE001, S110
+            pass
+    if getattr(clone, "temperature", None) is not None:
+        try:
+            clone.temperature = None
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return clone
+
+
 async def chat_model_settings(
     mode: str,
     ctx: int,

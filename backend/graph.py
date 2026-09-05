@@ -73,8 +73,10 @@ from agents import normalize_mode
 from llm import (
     _is_parallel_calls_error,
     _is_stream_options_error,
+    _is_temperature_error,
     _strip_parallel_calls,
     _strip_stream_options,
+    _strip_temperature,
     build_chat_model,
     chat_model_settings,
     llm_generate,
@@ -2409,6 +2411,7 @@ async def _run_mode_turn(
         reply = ""
         _no_so = False
         _no_pc = False
+        _no_temp = False
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
         # Every completed tool result is persisted to LangGraph's checkpointer
         # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
@@ -2727,6 +2730,13 @@ async def _run_mode_turn(
                 if not _no_pc and _is_parallel_calls_error(exc):
                     _no_pc = True
                     model = _strip_parallel_calls(model)
+                    continue
+                # Some custom / reasoning-only model routes (e.g. o-series
+                # style endpoints) reject ``temperature`` with a 400. Strip it
+                # and retry once so the turn still works.
+                if not _no_temp and _is_temperature_error(exc):
+                    _no_temp = True
+                    model = _strip_temperature(model)
                     continue
                 # Surface the most common per-step failures as readable SSE
                 # events instead of letting them bubble up to _drive as raw

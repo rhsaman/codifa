@@ -327,3 +327,59 @@ def test_parallel_tool_calls_not_sent_for_any_provider():
             f"provider={provider} should not send parallel_tool_calls; "
             f"got model_kwargs={m.model_kwargs}"
         )
+
+
+# ---------------------------------------------------------------------------
+# temperature strip-on-400 (custom / reasoning-only model routes)
+# ---------------------------------------------------------------------------
+
+
+def test_is_temperature_error_detects_not_supported():
+    """A 400 that mentions temperature and 'not supported' must be detected."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"The parameter 'temperature' "
+        "is not supported by this model route. Remove the field or choose a "
+        "different model.\", 'type': 'invalid_request_error', 'param': 'temperature'}}"
+    )
+    assert llm._is_temperature_error(exc) is True
+
+
+def test_is_temperature_error_ignores_other_400s():
+    """A 400 that does NOT mention temperature must NOT trigger the auto-strip."""
+    exc = Exception("Error code: 400 - {'error': {'message': 'Invalid API key'}}")
+    assert llm._is_temperature_error(exc) is False
+
+
+def test_strip_temperature_removes_from_model_and_kwargs():
+    """The strip helper must drop temperature from the model attribute AND from
+    model_kwargs, while leaving other fields untouched."""
+    from pydantic import BaseModel
+
+    class _FakeChat(BaseModel):
+        model_kwargs: dict = {"temperature": 0.4, "stream_options": {"include_usage": True}}
+        temperature: Any = 0.4
+
+    m = _FakeChat()
+    out = llm._strip_temperature(m)
+    assert out is not m, "expected a copy, got the same instance back"
+    assert out.temperature is None, f"top-level temperature not cleared: {out.temperature!r}"
+    assert "temperature" not in out.model_kwargs, (
+        f"temperature not removed from model_kwargs: {out.model_kwargs}"
+    )
+    # Original must be untouched.
+    assert m.model_kwargs["temperature"] == 0.4
+    assert m.temperature == 0.4
+    # Other fields survive.
+    assert "stream_options" in out.model_kwargs
+
+
+def test_strip_temperature_returns_original_on_clone_failure():
+    """If the model refuses to clone, fall back to the original — never raise."""
+
+    class _UnclonableModel:
+        def model_copy(self, deep):
+            raise RuntimeError("cannot copy")
+
+    m = _UnclonableModel()
+    out = llm._strip_temperature(m)
+    assert out is m

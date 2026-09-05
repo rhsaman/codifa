@@ -32,14 +32,9 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 
 </div>
 
-<!--
-📸 Screenshots — add your images here so visitors see the app instantly.
-Drop files into docs/screenshots/ and reference them, e.g.:
-
-![Coder mode](docs/screenshots/coder-mode.png)
-![Voice input](docs/screenshots/voice-input.png)
-![Plan mode](docs/screenshots/plan-mode.png)
--->
+<p align="center">
+  <img src="images/app-image.jpg" alt="Codifa app screenshot" width="700">
+</p>
 
 ---
 

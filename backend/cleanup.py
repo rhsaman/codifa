@@ -72,6 +72,11 @@ def run_cleanup(
         if root:
             report["pruned_files"] = _prune_missing_files(store, root)
 
+    # Expired entries in the tool-result cache (cache.sqlite). Lazy purge on
+    # read only removes keys that are read again; entries never re-read would
+    # otherwise keep the file growing forever. Best-effort like every step.
+    report["cache_purged"] = _purge_result_cache()
+
     # VACUUM only when the DB is meaningfully large and something was removed,
     # so we never pay the full-rewrite cost on tiny or untouched stores. The
     # store exposes ``vacuum()`` as the public API; reaching into the private
@@ -89,3 +94,23 @@ def run_cleanup(
         except Exception:  # noqa: BLE001, S110 — best-effort, never raises
             pass
     return report
+
+
+def _purge_result_cache() -> int:
+    """Purge expired entries from the tool-result cache (cache.sqlite).
+
+    Returns the number of rows removed; 0 on any failure (missing data root,
+    locked DB, …). Never raises — mirrors the best-effort contract of
+    ``run_cleanup``.
+    """
+    try:
+        import state_db
+        from cache import Cache, cache_path_for
+
+        c = Cache(cache_path_for(state_db.data_root()))
+        try:
+            return int(c.purge_expired() or 0)
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001 — best-effort, never raises
+        return 0

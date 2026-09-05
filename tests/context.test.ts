@@ -135,6 +135,18 @@ console.log('۸) usage cost splits cached tokens at the cheaper rate (subset con
   check('null price -> null (renders —)', computeUsageCost(null, u) === null)
 }
 
+console.log('۹) computeUsageCost clamps fresh input to 0 when cacheRead > input:')
+{
+  // اگر provider کش را جزئی از input گزارش نکند (قرارداد Anthropic) و cacheRead > input،
+  // بخش fresh (input - cacheRead - cacheWrite) منفی می‌شود. clamp باید آن را صفر کند.
+  const u = { input: 5000, output: 100, cacheRead: 8000, cacheWrite: 0 }
+  const price = { input: 3.0, output: 15.0, cacheRead: 0.3 }
+  const got = computeUsageCost(price, u)!
+  // fresh = max(0, 5000 - 8000) = 0 → فقط cacheRead + output
+  const expected = (8000 / 1e6) * 0.3 + (100 / 1e6) * 15.0
+  check('fresh input خالی می‌شود (نه منفی)', Math.abs(got - expected) < 1e-9, { got, expected })
+}
+
 if ((globalThis as any).__FAILED) {
   console.error('\nFAILED')
   process.exit(1)

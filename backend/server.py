@@ -1594,6 +1594,7 @@ class CleanupRunResponse(BaseModel):
     evicted: int = 0
     pruned_files: int = 0
     vacuumed: bool = False
+    cache_purged: int = 0
     error: str = ""
 
 

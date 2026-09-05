@@ -187,61 +187,35 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // `estimated` is the local history estimate (system prompt + every non-compacted
-  // exchange). It is only the fallback used before the first usage event arrives
-  // (or a fixture that omits `total_tokens`); in normal operation the meter uses
-  // the backend's `total_tokens`, described below.
+  // The local history estimate (system prompt + every non-compacted exchange)
+  // reflects the TRUE context sent to the model. It is always computed first
+  // and serves as the baseline.
   const estimated = Math.round(
     estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN,
   )
 
-  // The title-bar meter reflects the CURRENT turn's backend-reported token
-  // breakdown, summed exactly like opencode's session `Tokens()`:
-  //
-  //   used = input + output + reasoning + cache.read + cache.write
-  //
-  // opencode's TUI shows `tokens.total / limit.context`, and its `total` is the
-  // hand-summed breakdown above (NOT the provider's native `total_tokens`, which
-  // double-counts cache under AI-SDK-v6-style input accounting). We mirror that
-  // here so the meter is faithful to opencode: reasoning/thinking tokens are
-  // billable output that occupy the window, and cache read/write are part of the
-  // real footprint. The meter tracks the live conversation and may only drop
-  // when the context genuinely shrinks (e.g. after auto-compaction).
-  //
-  // Before the first usage event arrives (a brand-new chat) there is no
-  // breakdown yet, so we fall back to the local history estimate.
+  // Find the latest assistant usage event.
   let last: TokenUsage | null = null
   for (const m of active) {
     const u = m.usage
     if (u && m.role === "assistant") last = u
   }
-  // Only trust the provider breakdown when it actually reports the input
-  // context (inputTokens > 0). Some providers only surface billable
-  // (non-cached) output tokens, or omit input_tokens entirely — in those
-  // cases the breakdown under-reports the real context, so the local
-  // history estimate wins (it reflects the true window size).
+
+  // Some providers are stateful or only surface billable (non-cached) tokens,
+  // so their per-turn usage can be far smaller than the real context.  We only
+  // trust the provider value when it is AT LEAST as large as our local
+  // estimate — meaning the provider is reporting the full context (cache
+  // included) — otherwise the estimate wins.
   if (last && (last.inputTokens ?? 0) > 0) {
     // Prefer the provider's `totalTokens` (the backend's `total_tokens`): it
-    // already encodes whether cache is additive (Anthropic: total = input +
-    // output + reasoning + cache) or a SUBSET of input (OpenAI / OpenRouter /
-    // Google: total = input + output, cache already folded into input). Using
-    // it directly avoids double-counting cache for subset providers. We only
-    // fall back to the opencode hand-sum (input + output + reasoning +
-    // cache.read + cache.write) when the provider omits total_tokens entirely.
-    const providerTotal = last.totalTokens ?? 0
-    if (providerTotal > 0) return providerTotal
-    const used =
-      (last.inputTokens ?? 0) +
-      (last.outputTokens ?? 0) +
-      (last.reasoningTokens ?? 0) +
-      (last.cacheReadTokens ?? 0) +
-      (last.cacheWriteTokens ?? 0)
-    if (used > 0) return used
+    // already encodes whether cache is additive (Anthropic) or a subset of
+    // input (OpenAI / OpenRouter / Google).  When omitted, fall back to just
+    // inputTokens (not the hand-sum of breakdown fields, which can double-count
+    // cache for subset providers).
+    const providerTotal = last.totalTokens ?? last.inputTokens ?? 0
+    if (providerTotal >= estimated) return providerTotal
   }
-  // No usage breakdown on the latest main turn yet (only happens before the
-  // first usage event, or a fixture that omits it — the real app always sets
-  // it): fall back to the local history estimate, which reflects the true
-  // context window size rather than just the last message's raw token count.
+  // No usage yet, or provider under-reports: the local estimate wins.
   return estimated
 }
 
@@ -345,7 +319,7 @@ export function computeUsageCost(
   const cacheRead = u.cacheRead ?? 0
   const cacheWrite = u.cacheWrite ?? 0
   return (
-    ((u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
+    (Math.max(0, u.input - cacheRead - cacheWrite) / 1_000_000) * price.input +
     (cacheRead / 1_000_000) * (price.cacheRead ?? price.input) +
     (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input) +
     (u.output / 1_000_000) * price.output

@@ -1071,6 +1071,12 @@ def _is_retryable(exc: BaseException) -> bool:
     )
     if any(p in _low for p in _validation_patterns):
         return False
+    # ── Hard-fail: context overflow ───────────────────────────────────
+    # 400 "exceeds the available context size" / "context_length_exceeded"
+    # means the *entire request* is too big — retrying the same oversized
+    # payload burns budget for nothing.  The caller should compact first.
+    if _is_context_overflow(exc):
+        return False
     # Prefer the real HTTP status carried on the exception object (openai's
     # APIError sets `.status_code`) — reliable even when the
     # message text omits it.
@@ -3236,14 +3242,24 @@ async def _compact_history(
     # A previous compact left a summary at the head. On a 2nd+ compact opencode
     # MERGES it (carries forward details) rather than re-compressing it, so we
     # pass it to the model as the <prior-summary> instead of concatenating.
+    #
+    # After _apply_compaction_in_place the summary is *appended* to the system
+    # prompt, so content looks like "<prompt>\n\n[Compacted earlier context]\n…".
+    # We use .find() instead of .startswith() to locate the marker anywhere.
+    _marker = "[Compacted earlier context]"
     existing_summary = ""
     older_turns: list[dict] = []
     for t in older:
         content = str(t.get("content", ""))
-        if t.get("role") == "system" and content.startswith(
-            "[Compacted earlier context]"
-        ):
-            existing_summary += content.removeprefix("[Compacted earlier context]\n")
+        if t.get("role") == "system":
+            _idx = content.find(_marker)
+            if _idx >= 0:
+                # Extract the summary after the marker for merge.
+                existing_summary += content[_idx + len(_marker):].lstrip("\n")
+            else:
+                # No compaction history yet — keep the system prompt in
+                # older_turns so the summarizer has context.
+                older_turns.append(t)
         else:
             older_turns.append(t)
     if not older_turns:

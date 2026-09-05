@@ -742,7 +742,7 @@ def test_compact_removes_orphaned_tool_messages():
     # assistant(A,B,C) falls into the older (summarized) part.  Tool messages
     # for A, B, C are orphaned because no assistant with those tool_call_ids
     # remains in the tail.
-    history = [
+    _history = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "start"},
         {

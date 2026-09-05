@@ -172,8 +172,10 @@ def resolve_key(
     return oauth_token or api_key or env_key(provider=provider, env_var=env_var) or ""
 
 
-def _extra_headers(provider: str, base_url: str, cache: bool) -> dict[str, str]:
-    """Best-effort request headers (UA spoof + OpenRouter cache breakpoints)."""
+def _extra_headers(
+    provider: str, base_url: str, cache: bool, session_id: str = ""
+) -> dict[str, str]:
+    """Best-effort request headers (UA spoof + OpenRouter cache/session)."""
     headers: dict[str, str] = {}
     if is_opencode(provider, base_url) or _provider_meta(provider).get("ua_spoof"):
         headers["User-Agent"] = OPENCODE_UA
@@ -181,6 +183,13 @@ def _extra_headers(provider: str, base_url: str, cache: bool) -> dict[str, str]:
         # OpenRouter honours cache breakpoints via Anthropic-style headers; we
         # ask it to cache the system prompt + tool definitions + last message.
         headers["x-openrouter-cache"] = "true"
+    if session_id and _provider_meta(provider).get("model_class") == "openrouter":
+        # Sticky routing: OpenRouter derives the cache key from the FIRST
+        # system+user messages by default; agent loops mutate the transcript
+        # every step, so that hash drifts and cache hits vanish. A stable
+        # per-chat session id keeps the prompt cache warm across the whole
+        # conversation (docs: "For agent loops, set session_id").
+        headers["x-session-id"] = session_id
     return headers
 
 
@@ -211,6 +220,14 @@ def _thinking_kwargs(
     return {"reasoning_effort": level}
 
 
+def _is_anthropic_model(model: str) -> bool:
+    """True for Anthropic model ids on OpenRouter (``anthropic/claude-*`` or a
+    bare ``claude-*``). Used to gate Anthropic-only request params (prompt
+    caching) so other models never receive them."""
+    m = (model or "").lower()
+    return m.startswith(("anthropic/", "claude"))
+
+
 def build_chat_model(
     provider: str,
     model: str,
@@ -225,6 +242,7 @@ def build_chat_model(
     model_reasoning: bool = False,
     timeout: float = 0,
     cache: bool = False,
+    session_id: str = "",
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
 
@@ -250,7 +268,7 @@ def build_chat_model(
         )
 
     model_class = meta.get("model_class") or "openai"
-    headers = _extra_headers(provider, base_url, cache)
+    headers = _extra_headers(provider, base_url, cache, session_id)
     to = model_timeout(provider=provider, total=timeout or 900)
     # LangChain's ChatOpenAI only accepts a SCALAR `timeout` (total seconds);
     # passing an `httpx.Timeout` object is silently ignored, leaving the request
@@ -325,6 +343,18 @@ def build_chat_model(
     }
     if reasoning_effort is not None:
         lc_kwargs["reasoning_effort"] = reasoning_effort
+    # ── Anthropic prompt caching on OpenRouter ──────────────────────────
+    # OpenRouter supports automatic caching for Anthropic models via a
+    # TOP-LEVEL `cache_control` field: the breakpoint is applied to the last
+    # cacheable block and moves forward as the conversation converges — no
+    # per-message markers needed. Only enabled for openrouter+anthropic so
+    # local/custom (Qwen, llama.cpp) and Google models are untouched.
+    if (
+        cache
+        and model_class == "openrouter"
+        and _is_anthropic_model(model)
+    ):
+        lc_kwargs["extra_body"] = {"cache_control": {"type": "ephemeral"}}
     # Use the reasoning-normalizing subclass so gateways that stream thinking
     # under delta.reasoning (opencode) don't leak it into the visible content.
     return ReasoningChatOpenAI(**lc_kwargs)
@@ -639,6 +669,79 @@ async def llm_complete(
     return await llm_generate(model, system=system, user=user, images=images)
 
 
+def strip_orphaned_tool_calls(msgs: list, logger: Any = None) -> list:
+    """Drop tool_calls with no matching ToolMessage, in place.
+
+    A provider rejects the transcript with a 400 "missing results for
+    tool_call_id(s)" when an AIMessage carries a tool_calls block whose
+    results are absent (compaction split a step, a resume checkpoint lost
+    tool results, …). This pre-flight guard strips such calls so the text
+    content is still visible to the model.
+
+    The call lives in FOUR places on the message, and every one must be
+    cleared or it leaks back onto the wire:
+
+    * ``tool_calls`` — the normalized list (what most code reads).
+    * ``invalid_tool_calls`` — malformed variants; serialized alongside.
+    * ``tool_call_chunks`` — AIMessageChunk's raw stream fragments; the
+      ``init_tool_calls`` validator re-derives ``tool_calls`` from them on
+      every ``model_copy``, so clearing only ``tool_calls`` is undone.
+    * ``additional_kwargs["tool_calls"]`` — the raw provider-format list;
+      ``_convert_message_to_dict`` falls back to it when ``tool_calls`` is
+      empty, so it silently re-enters the payload.
+
+    Returns the (same) list for convenience.
+    """
+    answered = {
+        m.tool_call_id
+        for m in msgs
+        if isinstance(m, ToolMessage) and m.tool_call_id
+    }
+    for i in range(len(msgs)):
+        m = msgs[i]
+        if not isinstance(m, AIMessage):
+            continue
+        all_tcs = list(m.tool_calls or [])
+        inv_tcs = list(getattr(m, "invalid_tool_calls", None) or [])
+        chunk_tcs = list(getattr(m, "tool_call_chunks", None) or [])
+        all_ids = {tc.get("id") for tc in all_tcs if tc.get("id")}
+        all_ids |= {tc.get("id") for tc in inv_tcs if tc.get("id")}
+        for c in chunk_tcs:
+            cid = getattr(c, "id", None) or (c.get("id") if isinstance(c, dict) else None)
+            if cid:
+                all_ids.add(cid)
+        missing = {tid for tid in all_ids if tid not in answered}
+        if not missing:
+            continue
+        if logger is not None:
+            logger.warning(
+                "pre-flight guard: stripping %d orphaned tool_calls (ids: %s) "
+                "from assistant message",
+                len(missing),
+                sorted(missing),
+            )
+        update: dict[str, Any] = {
+            "tool_calls": [tc for tc in all_tcs if tc.get("id") not in missing],
+        }
+        if inv_tcs:
+            update["invalid_tool_calls"] = [
+                tc for tc in inv_tcs if tc.get("id") not in missing
+            ]
+        chunks = getattr(m, "tool_call_chunks", None) or []
+        if chunks:
+            update["tool_call_chunks"] = [
+                c for c in chunks
+                if (c.get("id") if isinstance(c, dict) else getattr(c, "id", None)) not in missing
+            ]
+        kw = dict(getattr(m, "additional_kwargs", None) or {})
+        if "tool_calls" in kw:
+            update["additional_kwargs"] = {
+                k: v for k, v in kw.items() if k != "tool_calls"
+            }
+        msgs[i] = m.model_copy(update=update)
+    return msgs
+
+
 async def langchain_tool_loop(
     model: Any,
     *,
@@ -712,35 +815,12 @@ async def langchain_tool_loop(
         # summarize instead of burning more reads/searches.
         if steps >= max_steps:
             msgs.append(AIMessage(content=_MAX_STEPS_PROMPT))
-        # ── Pre-flight orphan guard (mirrors graph.py) ──────────────────
-        # Strip tool_calls from any AIMessage whose results are missing,
-        # so the provider never sees a tool_calls block without matching
+        # ── Pre-flight orphan guard (shared with graph.py) ───────────────
+        # Strip tool_calls from any AIMessage whose results are missing, so
+        # the provider never sees a tool_calls block without matching
         # ToolMessages (which causes a 400 "missing results for
         # tool_call_id(s)" validation error).
-        _existing_tcm: set[str] = {
-            m.tool_call_id
-            for m in msgs
-            if isinstance(m, ToolMessage) and m.tool_call_id
-        }
-        for _mi in range(len(msgs)):
-            _mm = msgs[_mi]
-            if (
-                isinstance(_mm, AIMessage)
-                and getattr(_mm, "tool_calls", None)
-            ):
-                _missing = [
-                    tc
-                    for tc in _mm.tool_calls
-                    if tc.get("id") not in _existing_tcm
-                ]
-                if _missing:
-                    _logger.warning(
-                        "pre-flight guard: stripping %d orphaned "
-                        "tool_calls (ids: %s) from assistant message",
-                        len(_missing),
-                        [tc.get("id") for tc in _missing],
-                    )
-                    msgs[_mi] = _mm.model_copy(update={"tool_calls": []})
+        strip_orphaned_tool_calls(msgs, _logger)
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The

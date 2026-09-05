@@ -78,6 +78,7 @@ from llm import (
     build_chat_model,
     chat_model_settings,
     llm_generate,
+    strip_orphaned_tool_calls,
 )
 from mcp_bridge import build_mcp_tools
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
@@ -1174,6 +1175,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         model_reasoning=state.get("model_reasoning", False),
         timeout=model_timeout_for(state),
         cache=settings.get("cache", False),
+        session_id=str(state.get("chat_id") or ""),
     )
 
     tools = make_tool_callbacks(
@@ -2030,10 +2032,18 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
             # system note; fold it into the existing system prompt slot rather
             # than appending a second system message — the model must see the
             # summary to retain context across compaction.
+            #
+            # IMPORTANT: we *replace* any prior summary instead of appending,
+            # to prevent summary stacking.  Without this, each compaction
+            # concatenates another ~4K summary onto the system message,
+            # eventually overflowing the context window.
             if content:
                 prev = rebuilt[0]
+                _marker = "[Compacted earlier context]"
+                _cut = prev.content.find("\n\n" + _marker)
+                _base = prev.content[:_cut] if _cut >= 0 else prev.content
                 rebuilt[0] = prev.model_copy(
-                    update={"content": prev.content + "\n\n" + content}
+                    update={"content": _base + "\n\n" + content}
                 )
             continue
         if role == "assistant":
@@ -2495,34 +2505,7 @@ async def _run_mode_turn(
                 # checkpoint is missing tool results for later calls.
                 # Strip tool_calls from any such assistant messages so the
                 # text content is still visible to the model.
-                _existing_tcm: set[str] = {
-                    m.tool_call_id
-                    for m in msgs
-                    if isinstance(m, ToolMessage) and m.tool_call_id
-                }
-                for _mi in range(len(msgs)):
-                    _mm = msgs[_mi]
-                    if (
-                        isinstance(_mm, AIMessage)
-                        and getattr(_mm, "tool_calls", None)
-                    ):
-                        _missing = [
-                            tc
-                            for tc in _mm.tool_calls
-                            if tc.get("id") not in _existing_tcm
-                        ]
-                        if _missing:
-                            import logging as _log
-
-                            _log.getLogger(__name__).warning(
-                                "pre-flight guard: stripping %d orphaned "
-                                "tool_calls (ids: %s) from assistant message",
-                                len(_missing),
-                                [tc.get("id") for tc in _missing],
-                            )
-                            msgs[_mi] = _mm.model_copy(
-                                update={"tool_calls": []}
-                            )
+                strip_orphaned_tool_calls(msgs)
 
                 async for chunk in bound.astream(msgs):
                     # Check for cancellation at each chunk so the Stop button
@@ -3013,10 +2996,10 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
-                # Persist the completed tool work to LangGraph's checkpointer so a
-                # reconnect/interrupt can resume from here (replaces the old custom
-                # JSONL resume file). Saved once per step, after both the parallel
-                # and sequential batches have run.
+            # Persist the completed parallel tool work ATOMICALLY — save once
+            # after ALL results are appended so a crash never leaves a
+            # half-finished checkpoint that orphans tool_calls on resume.
+            if _parallel:
                 await _save_turn_checkpoint(_resume_thread, msgs)
             for tc in _sequential:
                 name = tc.get("name") or ""
@@ -3123,6 +3106,44 @@ async def _run_mode_turn(
                         with contextlib.suppress(Exception):
                             run_flags["cancelled"] = True
                     break
+                # Context overflow: the transcript exceeds the provider's window.
+                # Compact the history and retry immediately (no blind backoff).
+                if _agents._is_context_overflow(exc):
+                    logger.warning(
+                        "[run_graph] context overflow (chat_id=%s); "
+                        "attempting emergency compact before retry",
+                        state.get("chat_id", ""),
+                    )
+                    try:
+                        if ctx > 0:
+                            await _maybe_auto_compact(
+                                state,
+                                queue,
+                                model,
+                                compact_model,
+                                messages,
+                                ctx,
+                                last_context_tokens=state.get(
+                                    "last_context_tokens"
+                                ),
+                                compact_at_percent=1,  # force: compact if >1% full
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[run_graph] emergency compact failed", exc_info=True
+                        )
+                    # Retry immediately — compaction already fired.
+                    delay = 0
+                    logger.info(
+                        "[run_graph] compacted after overflow, retrying in %ss "
+                        "(chat_id=%s attempt=%d/%d)",
+                        delay,
+                        state.get("chat_id", ""),
+                        attempt + 1,
+                        _agents._RETRY_MAX_ATTEMPTS,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 # Hard, non-recoverable failures: don't retry (would fail identically).
                 if _agents._is_quota_exhausted(exc) or not _agents._is_retryable(exc):
                     queue.put_nowait(

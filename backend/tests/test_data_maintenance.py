@@ -163,3 +163,51 @@ def test_prune_orphan_plans_removes_stale_folders(monkeypatch):
         assert os.path.isdir(state_db._plan_dir(ws, "chat-1"))
         assert not os.path.isdir(orphan_dir)
         assert not os.path.isdir(dead_ws)
+
+
+def test_run_cleanup_purges_expired_result_cache(monkeypatch):
+    """run_cleanup() must purge expired entries from the tool-result cache
+    (cache.sqlite). Lazy purge on read only removes keys that are read again;
+    entries never re-read would otherwise keep the file growing forever."""
+    import time as _time
+
+    import state_db
+    from cache import Cache, cache_path_for
+    from cleanup import run_cleanup
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("CODER_DATA_DIR", tmp)
+        monkeypatch.setattr(state_db, "_root_cache", None, raising=False)
+        state_db.bootstrap()
+
+        c = Cache(cache_path_for(state_db.data_root()))
+        c.set("expired", "old", ttl_seconds=1)
+        c.set("fresh", "new", ttl_seconds=3600)
+        c.close()
+        _time.sleep(1.1)  # let the short TTL lapse
+
+        report = run_cleanup(store=None, root="")
+
+        assert report["cache_purged"] == 1
+        # the fresh entry survives
+        c2 = Cache(cache_path_for(state_db.data_root()))
+        try:
+            assert c2.get("fresh") == "new"
+            assert c2.get("expired") is None
+        finally:
+            c2.close()
+
+
+def test_run_cleanup_cache_purge_never_raises(monkeypatch):
+    """A broken data root (or locked cache.sqlite) must not crash cleanup —
+    the step is best-effort like every other one."""
+    import cleanup
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("cache unavailable")
+
+    # Cache construction fails inside _purge_result_cache; its try/except must
+    # swallow that and report 0 instead of crashing the whole cleanup pass.
+    monkeypatch.setattr("cache.Cache", _boom, raising=False)
+    report = cleanup.run_cleanup(store=None, root="")
+    assert report["cache_purged"] == 0

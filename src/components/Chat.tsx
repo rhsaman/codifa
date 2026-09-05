@@ -4024,6 +4024,57 @@ export function ChatPanel() {
                 })}
               </div>
             )}
+            {(attachments.length > 0 || images.length > 0) && (
+              <div className="attachment-chips" dir="ltr">
+                {attachments.map((a) => {
+                  const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
+                  const name = idx >= 0 ? a.slice(idx + 1) : a;
+                  return (
+                    <span className="attachment-chip file-chip" key={a} title={a}>
+                      <svg
+                        className="chip-file-icon"
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <path d="M14 2v6h6" />
+                        <path d="M9 13h6" />
+                        <path d="M9 17h6" />
+                      </svg>
+                      <span className="chip-file-name">{name}</span>
+                      <button
+                        className="chip-x"
+                        onClick={() => removeAttachment(a)}
+                        title="Remove"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+                {images.map((img) => (
+                  <span className="attachment-chip image-chip" key={img.path}>
+                    {img.dataUrl ? (
+                      <img className="chip-thumb" src={img.dataUrl} alt="" />
+                    ) : (
+                      <span className="chip-thumb placeholder" />
+                    )}
+                    <button
+                      className="chip-x"
+                      onClick={() => removeImage(img.path)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="composer-input-row">
               <textarea
                 className="composer-input"
@@ -4179,59 +4230,6 @@ export function ChatPanel() {
               </div>
             </div>
           </div>
-
-          {(attachments.length > 0 || images.length > 0) && (
-            <div className="attachment-chips" dir="ltr">
-              {attachments.map((a) => {
-                const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
-                const name = idx >= 0 ? a.slice(idx + 1) : a;
-                return (
-                  <span className="attachment-chip file-chip" key={a} title={a}>
-                    <svg
-                      className="chip-file-icon"
-                      width="13"
-                      height="13"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                      <path d="M14 2v6h6" />
-                      <path d="M9 13h6" />
-                      <path d="M9 17h6" />
-                    </svg>
-                    <span className="chip-file-name">{name}</span>
-                    <button
-                      className="chip-x"
-                      onClick={() => removeAttachment(a)}
-                      title="Remove"
-                    >
-                      ×
-                    </button>
-                  </span>
-                );
-              })}
-              {images.map((img) => (
-                <span className="attachment-chip image-chip" key={img.path}>
-                  {img.dataUrl ? (
-                    <img className="chip-thumb" src={img.dataUrl} alt="" />
-                  ) : (
-                    <span className="chip-thumb placeholder" />
-                  )}
-                  <span className="chip-name">{img.name}</span>
-                  <button
-                    className="chip-x"
-                    onClick={() => removeImage(img.path)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
         </div>
 
         <div className="composer-footer">

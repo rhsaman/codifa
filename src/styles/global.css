@@ -3007,8 +3007,8 @@ textarea {
   background: transparent;
   border: none;
   border-radius: 0;
-  padding: 10px 14px 2px;
-  line-height: 1.5;
+  padding: 10px 14px 4px;
+  line-height: 1.4;
   min-height: 40px;
   max-height: 200px;
   outline: none;
@@ -3019,7 +3019,7 @@ textarea {
     color 0.15s,
     background 0.12s;
   font-size: var(--chat-font-size);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   color: var(--text);
   caret-color: var(--accent);
 }
@@ -3031,7 +3031,7 @@ textarea {
 .composer-input::placeholder {
   color: var(--text-dim);
   opacity: 0.6;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
 }
 
 /* Keep the textarea's scrollbar out of sight until the user interacts with

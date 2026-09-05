@@ -65,10 +65,10 @@ def main():
         if t is None:
             print(f"  {slot:8s} {entry:45s} -> None (falls back to parent)")
             continue
-        kind, model, base, key, env, oauth = t
+        kind, model, base, key, env, oauth, _pid = t
         print(f"  {slot:8s} {entry:45s} -> kind={kind} model={model!r} env={env!r}")
         try:
-            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth)
+            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth, provider_id=_pid)
             name = str(getattr(m, "model_name", "") or "")
             print(f"           built OK, model_name={name!r}")
         except Exception as exc:  # noqa: BLE001

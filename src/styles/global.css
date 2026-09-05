@@ -310,7 +310,11 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s,
+    box-shadow 0.12s;
 }
 
 .sidebar-head-btn svg {
@@ -461,6 +465,7 @@ textarea {
 .chat-item:active {
   transform: scale(0.96);
 }
+
 /* When the kebab menu is open, disable the scale-down so that clicking a
    menu button doesn't shift the button out from under the cursor. */
 .chat-item:has(.chat-item-kebab-wrap.open):active {
@@ -676,6 +681,7 @@ textarea {
   order: 2;
   margin-inline-end: 8px;
 }
+
 .chat-select-checkbox {
   flex: 0 0 auto;
   width: 16px;
@@ -683,10 +689,12 @@ textarea {
   accent-color: var(--accent);
   cursor: pointer;
 }
+
 /* In selection mode the 3-dot kebab is replaced by the checkbox. */
 .chat-item.selecting .chat-item-kebab-wrap {
   display: none;
 }
+
 .chat-item.selected {
   background: color-mix(in srgb, var(--accent) 12%, var(--bg));
 }
@@ -699,6 +707,7 @@ textarea {
   gap: 8px;
   padding-inline-start: 2px;
 }
+
 .group-delete-selected {
   display: inline-flex;
   align-items: center;
@@ -712,8 +721,11 @@ textarea {
   cursor: pointer;
   font-size: 11px;
   font-weight: 600;
-  transition: background 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
 }
+
 .group-delete-selected:hover {
   background: color-mix(in srgb, var(--danger) 22%, var(--bg));
 }
@@ -729,8 +741,12 @@ textarea {
   background: var(--bg-input);
   color: var(--text-dim);
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
 }
+
 .group-cancel-select:hover {
   background: color-mix(in srgb, var(--danger) 16%, var(--bg));
   color: var(--danger);
@@ -743,6 +759,7 @@ textarea {
   display: inline-flex;
   align-items: center;
 }
+
 .ws-menu {
   position: fixed;
   z-index: var(--z-ws-menu);
@@ -757,6 +774,7 @@ textarea {
   gap: 2px;
   animation: chat-menu-pop 0.12s ease-out;
 }
+
 .ws-menu-btn {
   display: flex;
   align-items: center;
@@ -771,27 +789,36 @@ textarea {
   font-weight: 500;
   text-align: start;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
 }
+
 .ws-menu-btn svg {
   flex: 0 0 auto;
   color: var(--text-dim);
 }
+
 .ws-menu-btn:hover {
   background: var(--bg-hover);
 }
+
 .ws-menu-btn.active {
   color: var(--accent);
 }
+
 .ws-menu-btn.active svg {
   color: var(--accent);
 }
+
 .ws-menu-btn.danger {
   color: var(--danger);
 }
+
 .ws-menu-btn.danger svg {
   color: var(--danger);
 }
+
 .ws-menu-btn.danger:hover {
   background: color-mix(in srgb, var(--danger) 16%, var(--bg));
 }
@@ -800,6 +827,7 @@ textarea {
   position: fixed;
   z-index: var(--z-ws-menu);
 }
+
 .ws-delete-menu {
   min-width: 180px;
   padding: 8px;
@@ -812,12 +840,14 @@ textarea {
   gap: 4px;
   animation: chat-menu-pop 0.12s ease-out;
 }
+
 .ws-delete-menu-title {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-dim);
   padding: 2px 6px 4px;
 }
+
 .ws-delete-menu-btn {
   display: flex;
   align-items: center;
@@ -832,16 +862,22 @@ textarea {
   font-weight: 500;
   text-align: start;
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
 }
+
 .ws-delete-menu-btn:hover {
   background: var(--bg-hover);
 }
+
 .ws-delete-menu-btn.danger {
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
   background: color-mix(in srgb, var(--danger) 10%, var(--bg));
 }
+
 .ws-delete-menu-btn.danger:hover {
   background: color-mix(in srgb, var(--danger) 20%, var(--bg));
 }
@@ -1214,7 +1250,9 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: border-color 0.12s, color 0.12s;
+  transition:
+    border-color 0.12s,
+    color 0.12s;
 }
 
 .color-none:hover {
@@ -1365,7 +1403,9 @@ textarea {
   font-size: 12px;
   color: var(--text-dim);
   line-height: 1.4;
-  transition: color 0.14s, background 0.14s;
+  transition:
+    color 0.14s,
+    background 0.14s;
 }
 
 .sidebar-todo-item.done {
@@ -1541,7 +1581,9 @@ textarea {
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
-  transition: background 0.2s, box-shadow 0.2s;
+  transition:
+    background 0.2s,
+    box-shadow 0.2s;
 }
 
 /* Per-provider dot colors — matched via data-provider attribute. */
@@ -1549,30 +1591,37 @@ textarea {
   background: var(--provider-opencode);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-opencode) 25%, transparent);
 }
+
 .usage-group[data-provider="openrouter"] .usage-group-dot {
   background: var(--provider-openrouter);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-openrouter) 25%, transparent);
 }
+
 .usage-group[data-provider="google"] .usage-group-dot {
   background: var(--provider-google);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-google) 25%, transparent);
 }
+
 .usage-group[data-provider="nvidia"] .usage-group-dot {
   background: var(--provider-nvidia);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-nvidia) 25%, transparent);
 }
+
 .usage-group[data-provider="cloudflare"] .usage-group-dot {
   background: var(--provider-cloudflare);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-cloudflare) 25%, transparent);
 }
+
 .usage-group[data-provider="ollama"] .usage-group-dot {
   background: var(--provider-ollama);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-ollama) 25%, transparent);
 }
+
 .usage-group[data-provider="tokenrouter"] .usage-group-dot {
   background: var(--provider-tokenrouter);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-tokenrouter) 25%, transparent);
 }
+
 .usage-group[data-provider="custom"] .usage-group-dot {
   background: var(--provider-custom);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-custom) 25%, transparent);
@@ -1767,7 +1816,10 @@ textarea {
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    box-shadow 0.12s;
 }
 
 .titlebar .icon-btn:not(:disabled):active {
@@ -1789,7 +1841,9 @@ textarea {
   background: var(--bg-input);
   color: var(--text);
   font-size: 12px;
-  transition: border-color 0.12s, color 0.12s;
+  transition:
+    border-color 0.12s,
+    color 0.12s;
 }
 
 .workspace-btn:hover {
@@ -2893,17 +2947,14 @@ textarea {
      container below; only the inner card and the anchored ask/perm cards
      capture pointer events. */
   pointer-events: none;
-  /* The composer floats over the conversation: a translucent wash lets the
-     messages scroll behind the input and stay visible through it, fading
-     from a subtle tint at the bottom edge to fully transparent at the top. */
-  background: linear-gradient(to top,
-      color-mix(in srgb, var(--bg-panel) 45%, transparent) 0%,
-      color-mix(in srgb, var(--bg-panel) 18%, transparent) 55%,
-      transparent 100%);
+  /* Top edge fades into the chat; bottom stays solid so the input area is
+     fully opaque. Must use --bg-alt to match .chat-panel background. */
+  background: linear-gradient(to bottom, transparent 0%, var(--bg-alt) 100px);
   transition: box-shadow 0.15s;
 }
 
 .composer-inner,
+.composer-footer,
 .ask-card,
 .perm-card {
   pointer-events: auto;
@@ -2935,31 +2986,19 @@ textarea {
 
 .composer-inner {
   position: relative;
-  max-width: 760px;
+  max-width: 680px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(180deg,
-      color-mix(in srgb, var(--bg-input) 94%, #fff 6%),
-      var(--bg-input));
-  border: none;
-  border-radius: 24px;
-  padding: 16px 18px 14px;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.08),
-    0 14px 34px -14px rgba(0, 0, 0, 0.3);
-  transition:
-    box-shadow 0.18s ease,
-    transform 0.18s ease;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 0;
+  transition: border-color 0.18s ease;
 }
 
 .composer-inner:focus-within {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent),
-    0 16px 44px -14px rgba(0, 0, 0, 0.34);
+  border-color: var(--accent);
 }
 
 .composer-input {
@@ -2968,7 +3007,7 @@ textarea {
   background: transparent;
   border: none;
   border-radius: 0;
-  padding: 10px 12px 8px;
+  padding: 12px 14px 8px;
   line-height: 1.5;
   min-height: 52px;
   max-height: 200px;
@@ -2976,8 +3015,12 @@ textarea {
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
-  transition: color 0.15s, background 0.12s;
+  transition:
+    color 0.15s,
+    background 0.12s;
   font-size: var(--chat-font-size);
+  font-family: var(--font-mono);
+  color: var(--text);
   caret-color: var(--accent);
 }
 
@@ -2987,7 +3030,8 @@ textarea {
 
 .composer-input::placeholder {
   color: var(--text-dim);
-  opacity: 1;
+  opacity: 0.6;
+  font-family: var(--font-mono);
 }
 
 /* Keep the textarea's scrollbar out of sight until the user interacts with
@@ -3020,39 +3064,50 @@ textarea {
   padding-top: 8px;
 }
 
-/* Claude.ai-style composer: a single horizontal row with a `+` attach button
-   on the LEFT of the textarea, the textarea in the middle, and a cluster of
-   mic / capture / mcp / send buttons on the RIGHT. */
+/* Composer input: textarea spans full top row, action buttons below.
+   CSS Grid prevents text from flowing between icons when textarea grows. */
 .composer-input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
+  display: grid;
+  grid-template-rows: 1fr auto;
   width: 100%;
 }
 
 .composer-input-row .composer-input {
-  flex: 1 1 auto;
+  grid-row: 1;
+  grid-column: 1 / -1;
   min-width: 0;
-  padding: 10px 4px 8px;
+  min-height: 40px;
+  max-height: 200px;
+  padding: 10px 14px 4px;
+  resize: none;
 }
 
-.composer-actions-right {
+.composer-bottom-row {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px 8px;
+}
+
+.composer-left-actions {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 0 0 auto;
-  padding: 2px 0 4px;
 }
 
 .plus-btn {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
   border-radius: 50%;
   flex: 0 0 auto;
   color: var(--text-dim);
   background: transparent;
   border: none;
   padding: 0;
+  margin-bottom: 2px;
 }
 
 .plus-btn:not(:disabled):hover {
@@ -3060,17 +3115,19 @@ textarea {
   color: var(--text);
 }
 
-/* Composer footer (Claude.ai-style): a thin row under the input with a muted
-   disclaimer on the left and a small model/mode cluster on the right. */
+/* Composer footer: sits BELOW the composer card — mode, thinking, model cluster */
 .composer-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 4px 4px 2px;
+  justify-content: center;
+  gap: 6px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 6px 8px 0;
   font-size: 11px;
+  font-family: var(--font-mono);
   color: var(--text-dim);
-  opacity: 0.78;
+  opacity: 1;
 }
 
 .composer-disclaimer {
@@ -3087,12 +3144,14 @@ textarea {
   align-items: center;
   gap: 4px;
   flex: 0 0 auto;
+  font-family: var(--font-mono);
 }
 
 .composer-mode {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
+  font-family: var(--font-mono);
 }
 
 .composer-left {
@@ -3152,8 +3211,8 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   border: none;
   cursor: pointer;
@@ -3167,8 +3226,8 @@ textarea {
 }
 
 .icon-btn svg {
-  width: 17px;
-  height: 17px;
+  width: 15px;
+  height: 15px;
 }
 
 .icon-btn:disabled {
@@ -3291,44 +3350,57 @@ textarea {
   }
 }
 
-.send-btn {
-  width: 36px;
-  height: 36px;
-  background: linear-gradient(135deg,
-      var(--accent),
-      color-mix(in srgb, var(--accent) 78%, #000));
-  color: var(--on-accent);
-  box-shadow:
-    0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+/* Claude.ai-style enter icon send button — no background, just the glyph */
+/* Claude.ai-style send button: filled circle + upward arrow */
+.send-circle-btn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: var(--text-dim);
+  color: var(--bg);
   transition:
-    background 0.18s ease,
-    transform 0.12s ease,
-    box-shadow 0.18s ease,
-    opacity 0.15s;
+    background 0.12s,
+    opacity 0.15s,
+    transform 0.12s ease;
 }
 
-.send-btn:not(:disabled):hover {
-  transform: translateY(-1px) scale(1.05);
-  box-shadow:
-    0 5px 14px color-mix(in srgb, var(--accent) 50%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+.send-circle-btn svg {
+  width: 16px;
+  height: 16px;
 }
 
-.send-btn:not(:disabled):active {
-  transform: translateY(0) scale(0.96);
-}
-
-.send-btn:disabled {
-  background: var(--bg-input);
+.send-circle-btn:not(:disabled) {
+  background: transparent;
   color: var(--text-dim);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.send-circle-btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: var(--text);
+  transform: scale(1.05);
+}
+
+.send-circle-btn:not(:disabled):active {
+  transform: scale(0.92);
+}
+
+.send-circle-btn:disabled {
+  background: transparent;
+  color: var(--text-dim);
+  opacity: 0.25;
   cursor: default;
 }
 
 .stop-btn {
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   background: color-mix(in srgb, var(--danger) 16%, var(--bg-input));
   color: var(--danger);
   border: none;
@@ -3400,40 +3472,35 @@ textarea {
   white-space: nowrap;
 }
 
-/* ---- mode select (below composer) ---- */
+/* ---- mode select (below composer) — terminal feel ---- */
 .mode-select {
   position: relative;
   display: flex;
   justify-content: center;
-  padding: 10px 0 2px;
 }
 
 .mode-select-current {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 12px;
-  border: none;
-  border-radius: 999px;
-  background: var(--bg-input);
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  border-radius: 4px;
+  background: var(--bg-alt);
   color: var(--text);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
+  font-family: var(--font-mono);
   cursor: pointer;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.12);
+  box-shadow: none;
   transition:
     background 0.14s,
-    box-shadow 0.14s,
     color 0.14s;
 }
 
 .mode-select-current:hover {
-  background: var(--accent-dim);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 90%, var(--text) 10%);
+  color: var(--text);
 }
 
 .mode-select-icon {
@@ -3588,6 +3655,7 @@ textarea {
 }
 
 /* ---- provider/model picker (composer) ---- */
+/* Provider/model picker — terminal feel */
 .pm-select {
   position: relative;
   display: inline-flex;
@@ -3596,31 +3664,27 @@ textarea {
 .pm-select-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   max-width: 220px;
-  padding: 5px 12px;
-  border: none;
-  border-radius: 999px;
-  background: var(--bg-input);
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  border-radius: 4px;
+  background: var(--bg-alt);
   color: var(--text);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
+  font-family: var(--font-mono);
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.12);
-  transition:
-    background 0.14s,
-    box-shadow 0.14s;
+  box-shadow: none;
+  transition: background 0.14s;
 }
 
 .pm-select-btn:hover {
-  background: var(--accent-dim);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 90%, var(--text) 10%);
+  color: var(--text);
 }
 
 .pm-select-label {
@@ -3798,37 +3862,42 @@ textarea {
 }
 
 /* ---- reasoning-effort picker (composer, shown for reasoning models) ---- */
+/* Thinking pill — terminal feel: flat, monospace, no shadow */
 .thinking-pill {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 30px;
-  padding: 0 6px 0 10px;
-  border-radius: 999px;
-  background: var(--bg-input);
-  color: var(--text-dim);
+  gap: 3px;
+  height: 22px;
+  padding: 0 6px 0 8px;
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--text);
   font-size: 11px;
   font-weight: 600;
+  font-family: var(--font-mono);
   white-space: nowrap;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  box-shadow: none;
   transition:
     background 0.14s,
-    box-shadow 0.14s,
     color 0.14s;
 }
 
 .thinking-pill:hover {
-  background: var(--accent-dim);
+  background: color-mix(in srgb, var(--bg-alt) 85%, var(--text) 15%);
   color: var(--text);
 }
 
 .thinking-pill.on {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 20%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text);
+  background: var(--bg-alt);
+  border-color: var(--hairline, rgba(255, 255, 255, 0.06));
+  box-shadow: none;
+}
+
+.thinking-pill.on:hover {
+  background: color-mix(in srgb, var(--bg-alt) 85%, var(--text) 15%);
 }
 
 .thinking-icon {
@@ -4165,6 +4234,7 @@ textarea {
   color: #c9d1d9;
   background: transparent;
 }
+
 .code-block .hljs-doctag,
 .code-block .hljs-keyword,
 .code-block .hljs-meta .hljs-keyword,
@@ -4174,12 +4244,14 @@ textarea {
 .code-block .hljs-variable.language_ {
   color: #ff7b72;
 }
+
 .code-block .hljs-title,
 .code-block .hljs-title.class_,
 .code-block .hljs-title.class_.inherited__,
 .code-block .hljs-title.function_ {
   color: #d2a8ff;
 }
+
 .code-block .hljs-attr,
 .code-block .hljs-attribute,
 .code-block .hljs-literal,
@@ -4192,48 +4264,59 @@ textarea {
 .code-block .hljs-variable {
   color: #79c0ff;
 }
+
 .code-block .hljs-meta .hljs-string,
 .code-block .hljs-regexp,
 .code-block .hljs-string {
   color: #a5d6ff;
 }
+
 .code-block .hljs-built_in,
 .code-block .hljs-symbol {
   color: #ffa657;
 }
+
 .code-block .hljs-code,
 .code-block .hljs-comment,
 .code-block .hljs-formula {
   color: #8b949e;
 }
+
 .code-block .hljs-name,
 .code-block .hljs-quote,
 .code-block .hljs-selector-pseudo,
 .code-block .hljs-selector-tag {
   color: #7ee787;
 }
+
 .code-block .hljs-subst {
   color: #c9d1d9;
 }
+
 .code-block .hljs-section {
   color: #1f6feb;
   font-weight: 700;
 }
+
 .code-block .hljs-bullet {
   color: #f2cc60;
 }
+
 .code-block .hljs-emphasis {
   color: #c9d1d9;
   font-style: italic;
 }
+
 .code-block .hljs-strong {
   color: #c9d1d9;
   font-weight: 700;
 }
+
 .code-block .hljs-addition {
   color: #aff5b4;
   background-color: #033a16;
 }
+
 .code-block .hljs-deletion {
   color: #ffdcd7;
   background-color: #67060c;
@@ -5782,10 +5865,12 @@ textarea {
   border-radius: 50%;
   flex-shrink: 0;
 }
+
 .provider-tab-dot.ok {
   background: var(--success, #22c55e);
   box-shadow: 0 0 4px color-mix(in srgb, var(--success, #22c55e) 50%, transparent);
 }
+
 .provider-tab-dot.off {
   background: color-mix(in srgb, var(--text-dim) 40%, transparent);
 }
@@ -5794,8 +5879,6 @@ textarea {
   font-weight: 600;
   font-size: 13px;
 }
-
-
 
 .provider-tab.add {
   border-style: dashed;
@@ -6127,7 +6210,9 @@ textarea {
   cursor: pointer;
   font: inherit;
   color: inherit;
-  transition: background 120ms ease, border-color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
 }
 
 .titlebar-balance-clickable:hover {
@@ -6391,7 +6476,9 @@ textarea {
   background: rgba(0, 0, 0, 0.65);
   border-radius: 50%;
   pointer-events: none;
-  transition: background 0.15s ease, transform 0.15s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.15s ease;
 }
 
 .md-video-card:hover .md-video-play {
@@ -6772,7 +6859,6 @@ textarea {
   margin: 14px 0 4px;
 }
 
-
 .queued-bubble {
   position: relative;
   display: flex;
@@ -7082,15 +7168,26 @@ textarea {
 }
 
 /* نقطهٔ اول (سمت راست) زودتر روشن می‌شود، سپس دوم و سوم — پر شدن متوالی از راست. */
-.msg-thinking-dots .dot:nth-child(1) { animation-delay: 0s; }
-.msg-thinking-dots .dot:nth-child(2) { animation-delay: 0.2s; }
-.msg-thinking-dots .dot:nth-child(3) { animation-delay: 0.4s; }
+.msg-thinking-dots .dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.msg-thinking-dots .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.msg-thinking-dots .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
 
 @keyframes msg-thinking-dot {
-  0%, 100% {
+
+  0%,
+  100% {
     opacity: 0.2;
     transform: scale(0.7);
   }
+
   40% {
     opacity: 1;
     transform: scale(1.3);
@@ -7395,10 +7492,13 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
 }
+
 .tool-engine-badge::before {
-  content: '';
+  content: "";
   width: 5px;
   height: 5px;
   border-radius: 50%;
@@ -7569,22 +7669,22 @@ textarea {
   overflow: visible;
 }
 
-.tool-group.open > .trace-head {
+.tool-group.open>.trace-head {
   border: none;
   background: transparent;
   border-radius: 0;
 }
 
-.tool-group.open > .trace-list {
+.tool-group.open>.trace-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
   border: none;
 }
 
-.tool-group.open > .trace-list > .trace-row {
+.tool-group.open>.trace-list>.trace-row {
   /* divider row — no card border */
-  border-top: 1px solid var(--hairline, rgba(255,255,255,0.06));
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
   border-radius: 0;
 }
 
@@ -7756,7 +7856,7 @@ textarea {
   border-top-color: color-mix(in srgb, var(--accent) 18%, var(--border));
 }
 
-.trace-row.expanded > .trace-row-head {
+.trace-row.expanded>.trace-row-head {
   border-bottom: none;
   border-radius: 0;
 }
@@ -7766,7 +7866,7 @@ textarea {
   border: none;
   border-radius: 0;
   background: transparent;
-  border-top: 1px solid var(--hairline, rgba(255,255,255,0.06));
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
 }
 
 .trace-row.running {
@@ -7914,12 +8014,12 @@ textarea {
   overflow: visible;
 }
 
-.trace-row.edit-file + .trace-row.edit-file {
+.trace-row.edit-file+.trace-row.edit-file {
   margin-top: 4px;
 }
 
 /* header هدر edit_file */
-.trace-row.edit-file > .trace-row-head {
+.trace-row.edit-file>.trace-row-head {
   cursor: default;
   gap: 6px;
 }
@@ -8001,7 +8101,7 @@ textarea {
   padding: 6px 0;
 }
 
-.trace-row.edit-file .trace-expand-section + .trace-expand-section {
+.trace-row.edit-file .trace-expand-section+.trace-expand-section {
   border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
   padding-top: 8px;
   margin-top: 4px;
@@ -8108,6 +8208,7 @@ textarea {
   color: var(--text);
   border-color: var(--accent, #e87040);
 }
+
 .trace-row-expand {
   padding: 6px 0;
   border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.08));
@@ -8118,7 +8219,7 @@ textarea {
   padding: 6px 0;
 }
 
-.trace-expand-section + .trace-expand-section {
+.trace-expand-section+.trace-expand-section {
   border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
 }
 
@@ -8438,7 +8539,6 @@ textarea {
   white-space: nowrap;
 }
 
-
 .web-result-text {
   flex: 1 1 auto;
   min-width: 0;
@@ -8585,14 +8685,17 @@ textarea {
   width: 10px;
   height: 10px;
 }
+
 .diff-side::-webkit-scrollbar-track {
   background: transparent;
 }
+
 .diff-side::-webkit-scrollbar-thumb {
   background: var(--text-dim);
   border-radius: 5px;
   border: 2px solid var(--bg-raised);
 }
+
 .diff-side::-webkit-scrollbar-thumb:hover {
   background: var(--text);
 }
@@ -8606,6 +8709,7 @@ textarea {
   flex: 1 1 0;
   min-width: max-content;
 }
+
 .diff-col-before {
   border-right: 1px solid var(--hairline);
 }
@@ -8621,12 +8725,14 @@ textarea {
   font-size: 10.5px;
   padding: 3px 10px;
 }
-.diff-col-before > .diff-side-head {
+
+.diff-col-before>.diff-side-head {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 12%, var(--bg-panel));
   border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
 }
-.diff-col-after > .diff-side-head {
+
+.diff-col-after>.diff-side-head {
   color: var(--success);
   background: color-mix(in srgb, var(--success) 12%, var(--bg-panel));
   border-bottom: 1px solid color-mix(in srgb, var(--success) 24%, transparent);
@@ -8661,6 +8767,7 @@ textarea {
   grid-template-columns: 4.5em minmax(max-content, 1fr);
   min-width: max-content;
 }
+
 .diff-side-row>.diff-side-num:first-child {
   border-right: 1px solid var(--hairline);
 }
@@ -8861,38 +8968,37 @@ textarea {
 
 .mode-select.icon-only .mode-btn {
   width: auto;
-  height: 34px;
-  border-radius: 10px;
-  padding: 0 13px;
-  gap: 7px;
-  background: color-mix(in srgb, var(--accent) 13%, transparent);
-  color: var(--accent);
-  border: none;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 16%, transparent);
-  transition:
-    background 0.14s,
-    box-shadow 0.14s;
+  height: 22px;
+  border-radius: 4px;
+  padding: 0 8px;
+  gap: 5px;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  box-shadow: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  transition: background 0.14s;
 }
 
 .mode-select.icon-only .mode-btn:hover {
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 18%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 90%, var(--text) 10%);
+  box-shadow: none;
   filter: none;
 }
 
 .mode-select.icon-only .mode-btn-dot {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: currentColor;
   flex: 0 0 auto;
 }
 
 .mode-select.icon-only .mode-btn-label {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
+  font-family: var(--font-mono);
   letter-spacing: 0.05em;
   text-transform: uppercase;
   line-height: 1;
@@ -9483,24 +9589,20 @@ textarea {
 .nvim-label {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  margin-top: 8px;
-  align-self: flex-start;
+  gap: 4px;
+  margin-top: 0;
+  align-self: center;
   max-width: 100%;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--success) 18%, var(--bg-panel)),
-      color-mix(in srgb, var(--success) 8%, var(--bg-panel)));
-  border: none;
-  border-radius: 999px;
-  padding: 4px 10px 4px 5px;
+  height: 22px;
+  background: var(--bg-alt);
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
+  border-radius: 4px;
+  padding: 0 8px;
   font-size: 11px;
   font-family: var(--font-mono);
   color: var(--text);
   cursor: pointer;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--success) 24%, transparent),
-    0 1px 3px rgba(0, 0, 0, 0.14),
-    0 4px 12px -6px color-mix(in srgb, var(--success) 45%, transparent);
+  box-shadow: none;
   transition:
     box-shadow 0.15s,
     background 0.15s,
@@ -9508,24 +9610,15 @@ textarea {
 }
 
 .nvim-label:hover {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--success) 26%, var(--bg-panel)),
-      color-mix(in srgb, var(--success) 13%, var(--bg-panel)));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--success) 26%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent),
-    0 4px 14px -6px color-mix(in srgb, var(--success) 55%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 90%, var(--text) 10%);
+  color: var(--text);
 }
 
 .nvim-label.selected {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--success) 34%, var(--bg-input)),
-      color-mix(in srgb, var(--success) 18%, var(--bg-input)));
+  background: color-mix(in srgb, var(--bg-alt) 85%, var(--accent) 15%);
+  border-color: color-mix(in srgb, var(--accent) 25%, transparent);
   color: var(--text);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--success) 30%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent),
-    0 4px 14px -6px color-mix(in srgb, var(--success) 60%, transparent);
+  box-shadow: none;
 }
 
 .nvim-glyph {
@@ -9631,7 +9724,7 @@ textarea {
 /* ---- nvim LSP diagnostics popover (click the counts to open) ---- */
 .nvim-wrap {
   position: relative;
-  align-self: flex-start;
+  align-self: center;
   max-width: 100%;
 }
 
@@ -11141,23 +11234,19 @@ textarea {
 }
 
 .nvim-label {
-  background: var(--bg-input);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+  background: var(--bg-alt);
+  box-shadow: none;
 }
 
 .nvim-label:hover {
-  background: var(--accent-dim);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 90%, var(--text) 10%);
+  box-shadow: none;
 }
 
 .nvim-label.selected {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
-  color: var(--accent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 16%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-alt) 85%, var(--accent) 15%);
+  color: var(--text);
+  box-shadow: none;
 }
 
 .msg-image {
@@ -11711,7 +11800,9 @@ textarea {
   cursor: pointer;
   font-size: 14px;
   line-height: 1;
-  transition: background 0.13s, color 0.13s;
+  transition:
+    background 0.13s,
+    color 0.13s;
 }
 
 .fullscreen-close:hover {
@@ -11875,4 +11966,41 @@ textarea {
   border-color: var(--accent);
 }
 
+/* Diff stats badge in edit_file header: +N/-N */
+.tool-card-head .tool-diff-stats {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
 
+/* Revert button in edit_file header */
+.tool-card-head .tool-revert-inline {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.tool-card-head .tool-revert-inline:hover:not(:disabled) {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: var(--accent);
+}
+
+.tool-card-head .tool-revert-inline:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

@@ -23,6 +23,7 @@ import {
   isToolRunning,
 } from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
+import { bareModelId } from "../lib/provider-fetch";
 import { normalizeUsageModel } from "../lib/usage";
 import { stripLeadingModeTag } from "../lib/modeTag";
 import {
@@ -1232,10 +1233,28 @@ export function ChatPanel() {
         );
       return;
     }
-    const activeProvider = getChatProvider(chat.id);
+    let activeProvider = getChatProvider(chat.id);
     if (!activeProvider.model) {
       s.setSettingsOpen(true);
       return;
+    }
+    // Self-heal a stale per-chat model override: when the chat's model is not
+    // in the provider's REAL catalog (p.models, populated from /models) and the
+    // provider is a built-in gateway (authoritative catalog), fall the chat
+    // back to the provider's own (self-healed) default instead of sending a
+    // request the gateway will 401 ("Model ... is not supported").
+    const catalog = activeProvider.models ?? [];
+    if (
+      catalog.length > 0 &&
+      PROVIDER_META[activeProvider.kind]?.builtin === true &&
+      !catalog.some(
+        (m) =>
+          bareModelId(activeProvider, m) ===
+          bareModelId(activeProvider, activeProvider.model),
+      )
+    ) {
+      s.setChatProvider(chat.id, activeProvider.id, activeProvider.model);
+      activeProvider = getChatProvider(chat.id);
     }
     s.addRecentModel(activeProvider.model, activeProvider.id);
 
@@ -2337,6 +2356,23 @@ export function ChatPanel() {
     // summary and the token-budgeted tail (`keep`) to preserve verbatim — no
     // extra wrapper, and no hardcoded keep=1.
     s.compactChat(ch.id, result.summary, result.keep);
+    // Accrue the summarizer's own token usage (the backend returns it in
+    // `usage`) so the session total counts the compaction too — grouped under
+    // the provider that ACTUALLY ran it (provider_id > kind > chat provider).
+    const cu = result.usage;
+    if (cu) {
+      const pid =
+        cu.provider_id ||
+        cu.provider ||
+        compactProvider.id ||
+        activeProvider.id;
+      s.accrueChatUsage(ch.id, pid, cu.model || compactProvider.model, {
+        input: cu.input_tokens ?? 0,
+        output: cu.output_tokens ?? 0,
+        cacheRead: cu.cache_read_tokens ?? 0,
+        cacheWrite: cu.cache_write_tokens ?? 0,
+      });
+    }
     useStore
       .getState()
       .setChatCompactNotice(
@@ -3989,35 +4025,9 @@ export function ChatPanel() {
               </div>
             )}
             <div className="composer-input-row">
-              <button
-                className="icon-btn plus-btn"
-                onClick={attachFile}
-                disabled={busy}
-                title="Attach files or images"
-                aria-label="Attach"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 8v8M8 12h8" />
-                </svg>
-              </button>
               <textarea
                 className="composer-input"
                 rows={1}
-                // Follows the app-wide dir toggle (same as message bubbles) instead of
-                // auto-detecting per keystroke: switching direction mid-sentence as
-                // soon as a Persian/Latin char appears was the actual "جابه‌جایی"
-                // problem — cursor and text order would jump while typing. A fixed
-                // dir means the textarea's own bidi handling of mixed FA/EN input
-                // stays stable and consistent with the rest of the UI.
                 dir={dir}
                 style={{
                   direction: dir,
@@ -4031,28 +4041,64 @@ export function ChatPanel() {
                 onChange={onInputChange}
                 onKeyDown={onKeyDown}
               />
-              <div className="composer-actions-right">
-                <button
-                  className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
-                  onClick={toggleRecording}
-                  disabled={busy}
-                  title={
-                    transcribing
-                      ? "Transcribing voice…"
-                      : recording
-                        ? "Stop recording (Ctrl+X Space)"
-                        : "Record voice input (Ctrl+X then Space)"
-                  }
-                >
-                  {recording ? (
-                    <span className="wave animate" aria-hidden="true">
-                      <span className="wave-bar" />
-                      <span className="wave-bar" />
-                      <span className="wave-bar" />
-                      <span className="wave-bar" />
-                    </span>
-                  ) : transcribing ? (
-                    <span className="wave transcribing" aria-hidden="true">
+              <div className="composer-bottom-row">
+                <div className="composer-left-actions">
+                  <button
+                    className="icon-btn plus-btn"
+                    onClick={attachFile}
+                    disabled={busy}
+                    title="Attach files or images"
+                    aria-label="Attach"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="10" />
+                      <path d="M12 8v8M8 12h8" />
+                    </svg>
+                  </button>
+                  <button
+                    className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                    onClick={toggleRecording}
+                    disabled={busy}
+                    title={
+                      transcribing
+                        ? "Transcribing voice…"
+                        : recording
+                          ? "Stop recording (Ctrl+X Space)"
+                          : "Record voice input (Ctrl+X then Space)"
+                    }
+                  >
+                    {recording ? (
+                      <span className="wave animate" aria-hidden="true">
+                        <span className="wave-bar" />
+                        <span className="wave-bar" />
+                        <span className="wave-bar" />
+                        <span className="wave-bar" />
+                      </span>
+                    ) : transcribing ? (
+                      <span className="wave transcribing" aria-hidden="true">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <circle cx="12" cy="12" r="10" />
+                          <path d="M8 9l0 6" />
+                          <path d="M12 7l0 10" />
+                          <path d="M16 9l0 6" />
+                        </svg>
+                      </span>
+                    ) : (
                       <svg
                         viewBox="0 0 24 24"
                         fill="none"
@@ -4061,13 +4107,18 @@ export function ChatPanel() {
                         strokeLinecap="round"
                         strokeLinejoin="round"
                       >
-                        <circle cx="12" cy="12" r="10" />
-                        <path d="M8 9l0 6" />
-                        <path d="M12 7l0 10" />
-                        <path d="M16 9l0 6" />
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                        <line x1="12" y1="19" x2="12" y2="22" />
                       </svg>
-                    </span>
-                  ) : (
+                    )}
+                  </button>
+                  <button
+                    className="icon-btn attach-btn"
+                    onClick={captureRegion}
+                    disabled={busy}
+                    title="Capture a region of the screen"
+                  >
                     <svg
                       viewBox="0 0 24 24"
                       fill="none"
@@ -4076,53 +4127,34 @@ export function ChatPanel() {
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                      <line x1="12" y1="19" x2="12" y2="22" />
+                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                      <circle cx="12" cy="13" r="4" />
                     </svg>
-                  )}
-                </button>
-                <button
-                  className="icon-btn attach-btn"
-                  onClick={captureRegion}
-                  disabled={busy}
-                  title="Capture a region of the screen"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
+                  </button>
+                  <button
+                    className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
+                    onClick={() => void openSkillPicker()}
+                    disabled={busy}
+                    title="Add MCP tools to this message"
                   >
-                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-                    <circle cx="12" cy="13" r="4" />
-                  </svg>
-                </button>
-                <button
-                  className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
-                  onClick={() => void openSkillPicker()}
-                  disabled={busy}
-                  title="Add MCP tools to this message"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
-                  </svg>
-                  {mcpEnabled.length > 0 && (
-                    <span className="attach-count">{mcpEnabled.length}</span>
-                  )}
-                </button>
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                    </svg>
+                    {mcpEnabled.length > 0 && (
+                      <span className="attach-count">{mcpEnabled.length}</span>
+                    )}
+                  </button>
+                </div>
                 {busy ? (
                   <button
-                    className="icon-btn stop-btn"
+                    className="send-circle-btn stop-btn"
                     onClick={stop}
                     title="Stop"
                   >
@@ -4132,20 +4164,15 @@ export function ChatPanel() {
                   </button>
                 ) : (
                   <button
-                    className="icon-btn send-btn"
+                    className="send-circle-btn"
                     disabled={!input.trim() && images.length === 0}
                     onClick={submit}
                     title="Send"
                   >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M12 19V5M5 12l7-7 7 7" />
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M19 7v4a2 2 0 01-2 2H5" />
+                      <polyline points="9 17 5 13 9 9" />
+                      <line x1="5" y1="13" x2="14" y2="13" />
                     </svg>
                   </button>
                 )}
@@ -4153,6 +4180,61 @@ export function ChatPanel() {
             </div>
           </div>
 
+          {(attachments.length > 0 || images.length > 0) && (
+            <div className="attachment-chips" dir="ltr">
+              {attachments.map((a) => {
+                const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
+                const name = idx >= 0 ? a.slice(idx + 1) : a;
+                return (
+                  <span className="attachment-chip file-chip" key={a} title={a}>
+                    <svg
+                      className="chip-file-icon"
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 2v6h6" />
+                      <path d="M9 13h6" />
+                      <path d="M9 17h6" />
+                    </svg>
+                    <span className="chip-file-name">{name}</span>
+                    <button
+                      className="chip-x"
+                      onClick={() => removeAttachment(a)}
+                      title="Remove"
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })}
+              {images.map((img) => (
+                <span className="attachment-chip image-chip" key={img.path}>
+                  {img.dataUrl ? (
+                    <img className="chip-thumb" src={img.dataUrl} alt="" />
+                  ) : (
+                    <span className="chip-thumb placeholder" />
+                  )}
+                  <span className="chip-name">{img.name}</span>
+                  <button
+                    className="chip-x"
+                    onClick={() => removeImage(img.path)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="composer-footer">
           {nvimLabel && (
             <div className="nvim-wrap">
               <button
@@ -4274,122 +4356,63 @@ export function ChatPanel() {
               )}
             </div>
           )}
-
-          {(attachments.length > 0 || images.length > 0) && (
-            <div className="attachment-chips" dir="ltr">
-              {attachments.map((a) => {
-                const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
-                const name = idx >= 0 ? a.slice(idx + 1) : a;
-                return (
-                  <span className="attachment-chip file-chip" key={a} title={a}>
-                    <svg
-                      className="chip-file-icon"
-                      width="13"
-                      height="13"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                      <path d="M14 2v6h6" />
-                      <path d="M9 13h6" />
-                      <path d="M9 17h6" />
-                    </svg>
-                    <span className="chip-file-name">{name}</span>
-                    <button
-                      className="chip-x"
-                      onClick={() => removeAttachment(a)}
-                      title="Remove"
-                    >
-                      ×
-                    </button>
-                  </span>
-                );
-              })}
-              {images.map((img) => (
-                <span className="attachment-chip image-chip" key={img.path}>
-                  {img.dataUrl ? (
-                    <img className="chip-thumb" src={img.dataUrl} alt="" />
-                  ) : (
-                    <span className="chip-thumb placeholder" />
-                  )}
-                  <span className="chip-name">{img.name}</span>
-                  <button
-                    className="chip-x"
-                    onClick={() => removeImage(img.path)}
+          <span className="composer-footer-right">
+            <span className="composer-mode">
+              <ModeSelect
+                modes={modes}
+                value={chat.mode}
+                iconOnly
+                onChange={changeMode}
+              />
+              {provider &&
+                (modelReasoning(provider, activeModel) ??
+                  supportsReasoning(activeModel, provider.kind)) && (
+                  <span
+                    className={`thinking-pill${thinkingLevel ? " on" : ""}`}
+                    ref={thinkingRef}
                   >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
-          <div className="composer-footer">
-            <span className="composer-disclaimer">
-              {getMode(settings, chat.mode).label} is AI and can make mistakes. Please double-check responses.
-            </span>
-            <span className="composer-footer-right">
-              <span className="composer-mode">
-                <ModeSelect
-                  modes={modes}
-                  value={chat.mode}
-                  iconOnly
-                  onChange={changeMode}
-                />
-                {provider &&
-                  (modelReasoning(provider, activeModel) ??
-                    supportsReasoning(activeModel, provider.kind)) && (
-                    <span
-                      className={`thinking-pill${thinkingLevel ? " on" : ""}`}
-                      ref={thinkingRef}
+                    <button
+                      type="button"
+                      className="thinking-pill-btn"
+                      onClick={() => setThinkingOpen((o) => !o)}
+                      title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
+                      aria-label="Reasoning effort for this message"
+                      aria-expanded={thinkingOpen}
                     >
-                      <button
-                        type="button"
-                        className="thinking-pill-btn"
-                        onClick={() => setThinkingOpen((o) => !o)}
-                        title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
-                        aria-label="Reasoning effort for this message"
-                        aria-expanded={thinkingOpen}
-                      >
-                        <span className="thinking-label">
-                          {THINKING_LABELS[thinkingLevel] ?? "Medium"}
-                        </span>
-                        <span className="mode-select-caret" aria-hidden="true">
-                          {thinkingOpen ? "▲" : "▼"}
-                        </span>
-                      </button>
-                      {thinkingOpen && (
-                        <div className="mode-menu thinking-menu">
-                          {THINKING_OPTIONS.map(([v, label]) => (
-                            <button
-                              key={v}
-                              type="button"
-                              className={`mode-menu-item thinking-item${thinkingLevel === v ? " active" : ""}`}
-                              onClick={() => {
-                                setThinkingLevel(v);
-                                setThinkingOpen(false);
-                              }}
-                            >
-                              <span className="mode-menu-text">
-                                <span className="mode-menu-label">{label}</span>
-                                <span className="mode-menu-desc">
-                                  {THINKING_DESCS[v]}
-                                </span>
+                      <span className="thinking-label">
+                        {THINKING_LABELS[thinkingLevel] ?? "Medium"}
+                      </span>
+                      <span className="mode-select-caret" aria-hidden="true">
+                        {thinkingOpen ? "▲" : "▼"}
+                      </span>
+                    </button>
+                    {thinkingOpen && (
+                      <div className="mode-menu thinking-menu">
+                        {THINKING_OPTIONS.map(([v, label]) => (
+                          <button
+                            key={v}
+                            type="button"
+                            className={`mode-menu-item thinking-item${thinkingLevel === v ? " active" : ""}`}
+                            onClick={() => {
+                              setThinkingLevel(v);
+                              setThinkingOpen(false);
+                            }}
+                          >
+                            <span className="mode-menu-text">
+                              <span className="mode-menu-label">{label}</span>
+                              <span className="mode-menu-desc">
+                                {THINKING_DESCS[v]}
                               </span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </span>
-                  )}
-              </span>
-              <ProviderModelSelect />
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </span>
+                )}
             </span>
-          </div>
+            <ProviderModelSelect />
+          </span>
         </div>
       </div>
     </div>

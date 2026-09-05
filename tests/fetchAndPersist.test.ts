@@ -128,6 +128,7 @@ function mkStore(initial: ProviderConfig[]): StoreLike & { calls: { method: stri
     setProviderPricingMap: (id, data) => calls.push({ method: 'setProviderPricingMap', args: [id, data] }),
     setProviderReasoningMap: (id, data) => calls.push({ method: 'setProviderReasoningMap', args: [id, data] }),
     setProviderModels: (id, models) => calls.push({ method: 'setProviderModels', args: [id, models] }),
+    updateProvider: (id, patch) => calls.push({ method: 'updateProvider', args: [id, patch] }),
   }
 }
 
@@ -217,6 +218,8 @@ await run(
       'setProviderPricingMap',
       'setProviderReasoningMap',
       'setProviderModels',
+      // provider بدون model → auto-pick اولین مدل کاتالوگ
+      'updateProvider',
     ],
     models: ['llama3', 'mistral'],
   },
@@ -241,6 +244,96 @@ await run(
     return { ok: r.ok, models: models.slice().sort() }
   },
   { ok: true, models: ['custom-model', 'llama3', 'mistral'].sort() },
+)
+
+// --- self-heal: مدل انتخابی از کاتالوگ واقعی provider درمیاد ------------------
+
+await run(
+  'self-heal: builtin + مدل جعلی (laguna) → جایگزینی با اولین مدل واقعی',
+  async () => {
+    // دقیقاً باگ laguna: مدل "laguna-s-2.1-free" روی opencode ثبت شده ولی
+    // در کاتالوگ واقعی نیست → باید با اولین مدل واقعی جایگزین بشه.
+    const store = mkStore([
+      mkProvider({
+        id: 'opencode',
+        kind: 'opencode',
+        baseUrl: 'https://opencode.ai/zen/v1',
+        model: 'laguna-s-2.1-free',
+        models: ['laguna-s-2.1-free'],
+      }),
+    ])
+    const p = mkProvider({
+      id: 'opencode',
+      kind: 'opencode',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      model: 'laguna-s-2.1-free',
+    })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => mkResult(['deepseek-v4-flash-free', 'mimo-v2.5-free']),
+      store: { getState: () => store },
+    })
+    const upd = store.calls.find((c) => c.method === 'updateProvider')
+    return { ok: r.ok, patch: upd?.args[1] ?? null }
+  },
+  { ok: true, patch: { model: 'deepseek-v4-flash-free' } },
+)
+
+await run(
+  'self-heal: مدل خارج از لیست + kind=custom → بدون جایگزینی',
+  async () => {
+    // provider سفارشی ممکنه /models ناقص برگردونه → مدل خارج از لیست نگه
+    // داشته می‌شه (هیچ updateProvider ای صدا زده نمی‌شه).
+    const store = mkStore([
+      mkProvider({
+        id: 'custom',
+        kind: 'custom',
+        baseUrl: 'http://my-gw/v1',
+        model: 'my-private-model',
+        models: ['my-private-model'],
+      }),
+    ])
+    const p = mkProvider({
+      id: 'custom',
+      kind: 'custom',
+      baseUrl: 'http://my-gw/v1',
+      model: 'my-private-model',
+    })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => mkResult(['gpt-x']),
+      store: { getState: () => store },
+    })
+    const hasUpdate = store.calls.some((c) => c.method === 'updateProvider')
+    return { ok: r.ok, hasUpdate }
+  },
+  { ok: true, hasUpdate: false },
+)
+
+await run(
+  'self-heal: مدل معتبر در کاتالوگ → بدون updateProvider',
+  async () => {
+    const store = mkStore([
+      mkProvider({
+        id: 'opencode',
+        kind: 'opencode',
+        baseUrl: 'https://opencode.ai/zen/v1',
+        model: 'mimo-v2.5-free',
+        models: ['deepseek-v4-flash-free', 'mimo-v2.5-free'],
+      }),
+    ])
+    const p = mkProvider({
+      id: 'opencode',
+      kind: 'opencode',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      model: 'mimo-v2.5-free',
+    })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => mkResult(['deepseek-v4-flash-free', 'mimo-v2.5-free']),
+      store: { getState: () => store },
+    })
+    const hasUpdate = store.calls.some((c) => c.method === 'updateProvider')
+    return { ok: r.ok, hasUpdate }
+  },
+  { ok: true, hasUpdate: false },
 )
 
 await run(

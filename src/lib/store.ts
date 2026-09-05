@@ -309,7 +309,7 @@ function defaultProviders(): ProviderConfig[] {
     }
   }
   return [
-    row('opencode', { model: 'deepseek-v4-flash-free' }),
+    row('opencode'),
     row('openrouter'),
     row('ollama'),
     row('google'),

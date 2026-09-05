@@ -576,9 +576,11 @@ def _subagent_target(
     parent_env_var: str,
     parent_oauth_token: str,
     provider_lookup: Callable[[str], dict | None],
-) -> tuple[str, str, str, str, str, str] | None:
+    parent_provider_id: str = "",
+) -> tuple[str, str, str, str, str, str, str] | None:
     """Resolve a subagent model entry to (provider_kind, model, base_url,
-    api_key, env_var, oauth_token), or None to use the parent model.
+    api_key, env_var, oauth_token, provider_id), or None to use the parent
+    model.
 
     ``entry`` may be a bare model id ("Qwen3.5-4B-Q4_K_S.gguf") resolved
     against the parent provider, or a "providerId/model" pair routing the
@@ -656,6 +658,7 @@ def _subagent_target(
             p.get("apiKey") or "",
             p.get("envVar") or "",
             p.get("oauthRefreshToken") or "",
+            str(p.get("id") or pid or kind),
         )
     return (
         parent_provider,
@@ -664,6 +667,7 @@ def _subagent_target(
         parent_api_key,
         parent_env_var,
         parent_oauth_token,
+        parent_provider_id,
     )
 
 

@@ -11,7 +11,7 @@
  */
 import { fetchModels, type ModelsResult } from './api'
 import { useStore } from './store'
-import { isForeignModelId } from './provider-meta'
+import { isForeignModelId, PROVIDER_META } from './provider-meta'
 import type { ProviderConfig } from '../types'
 
 export type FetchSkipReason = 'no-base-url' | 'disabled'
@@ -30,6 +30,7 @@ export interface StoreLike {
   ) => void
   setProviderReasoningMap: (id: string, data: Record<string, boolean>) => void
   setProviderModels: (id: string, models: string[]) => void
+  updateProvider: (id: string, patch: Partial<ProviderConfig>) => void
   settings: { providers: ProviderConfig[] }
 }
 
@@ -54,6 +55,12 @@ export function shouldSkipFetch(p: ProviderConfig): false | FetchSkipReason {
   return false
 }
 
+/** Strip a redundant `${p.id}/` prefix from a stored model id. */
+export function bareModelId(p: { id: string }, m: string): string {
+  const prefix = `${p.id}/`
+  return m.startsWith(prefix) ? m.slice(prefix.length) : m
+}
+
 /**
  * Pure merge: keep fetched models (minus anything the user removed and minus
  * models that belong to a foreign provider), then keep existing models too
@@ -66,17 +73,15 @@ export function mergeFetchedModels(
   removed: string[],
 ): string[] {
   const removedSet = new Set(removed)
-  const prefix = `${p.id}/`
-  const bare = (m: string) => (m.startsWith(prefix) ? m.slice(prefix.length) : m)
 
   return Array.from(
     new Set([
       ...fetched.filter((m) => {
-        const b = bare(m)
+        const b = bareModelId(p, m)
         return !removedSet.has(b) && !isForeignModelId(p, b)
       }),
       ...existing.filter((m) => {
-        const b = bare(m)
+        const b = bareModelId(p, m)
         return !isForeignModelId(p, b)
       }),
     ]),
@@ -113,6 +118,23 @@ export async function fetchAndPersist(
     const removed = fresh?.removedModels ?? []
     const merged = mergeFetchedModels(p, res.models, existing, removed)
     store.setProviderModels(p.id, merged)
+    // Auto-pick / self-heal the selected model from the provider's REAL
+    // catalog (never a hardcoded default):
+    // - empty `model` → adopt the first fetched model;
+    // - a selected model missing from the FETCHED catalog of a BUILT-IN
+    //   gateway (whose /models list is authoritative) is stale/mistyped (e.g.
+    //   "laguna-s-2.1-free" on opencode) → replace with the first real model
+    //   so chats stop failing with 401 "Model ... is not supported". Custom
+    //   providers keep out-of-list models (their /models may be partial);
+    //   user-added ids survive in the LIST because the merge keeps `existing`.
+    const current = fresh?.model ?? ''
+    const inCatalog = res.models.some(
+      (m) => bareModelId(p, m) === bareModelId(p, current),
+    )
+    const builtin = PROVIDER_META[p.kind]?.builtin === true
+    if (fresh && merged.length > 0 && (!current || (builtin && !inCatalog))) {
+      store.updateProvider(p.id, { model: bareModelId(p, merged[0]) })
+    }
     return { ok: true, count: merged.length }
   } catch (err) {
     return {

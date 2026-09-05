@@ -243,6 +243,7 @@ def build_chat_model(
     timeout: float = 0,
     cache: bool = False,
     session_id: str = "",
+    provider_id: str = "",
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
 
@@ -314,14 +315,18 @@ def build_chat_model(
             "high": 32768,
         }
         thinking_budget = google_thinking.get((thinking_level or "").strip())
-        return ChatGoogleGenerativeAI(
-            model=model.removeprefix("models/") or model,
-            google_api_key=key or None,
-            temperature=temperature,
-            max_output_tokens=max_tokens or None,
-            streaming=True,
-            timeout=to if isinstance(to, (int, float)) else None,
-            thinking_budget=thinking_budget,
+        return _stamp_provider(
+            ChatGoogleGenerativeAI(
+                model=model.removeprefix("models/") or model,
+                google_api_key=key or None,
+                temperature=temperature,
+                max_output_tokens=max_tokens or None,
+                streaming=True,
+                timeout=to if isinstance(to, (int, float)) else None,
+                thinking_budget=thinking_budget,
+            ),
+            provider,
+            provider_id,
         )
 
     # stream_chunk_timeout: maximum seconds between two consecutive streaming
@@ -357,7 +362,28 @@ def build_chat_model(
         lc_kwargs["extra_body"] = {"cache_control": {"type": "ephemeral"}}
     # Use the reasoning-normalizing subclass so gateways that stream thinking
     # under delta.reasoning (opencode) don't leak it into the visible content.
-    return ReasoningChatOpenAI(**lc_kwargs)
+    return _stamp_provider(ReasoningChatOpenAI(**lc_kwargs), provider, provider_id)
+
+
+def _stamp_provider(m: Any, kind: str, pid: str) -> Any:
+    """Stamp (kind, id) onto a built model so usage attribution can read them
+    back (``model_provider``) without threading provider params through every
+    caller. ``object.__setattr__`` bypasses pydantic field validation."""
+    try:
+        object.__setattr__(m, "_codifa_provider_kind", kind)
+        object.__setattr__(m, "_codifa_provider_id", pid)
+    except Exception:  # noqa: BLE001, S110 — attribution must never break a build
+        pass
+    return m
+
+
+def model_provider(model: Any) -> tuple[str, str]:
+    """(provider kind, provider id) stamped by ``build_chat_model``; ("", "")
+    when the model was built without one (tests, legacy callers)."""
+    return (
+        str(getattr(model, "_codifa_provider_kind", "") or ""),
+        str(getattr(model, "_codifa_provider_id", "") or ""),
+    )
 
 
 # opencode's OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts):
@@ -605,7 +631,6 @@ async def llm_generate(
     user: str,
     images: list[str] | None = None,
     sub: bool = False,
-    provider: str = "",
 ) -> tuple[str, dict | None]:
     """Run a single LLM completion (no tools).
 
@@ -644,11 +669,13 @@ async def llm_generate(
         text = text or str(content)
     else:
         text = str(content or "")
+    kind, pid = model_provider(model)
     usage = usage_event(
         getattr(res, "usage_metadata", None),
         model=model_name,
         sub=sub,
-        provider=provider,
+        provider=kind,
+        provider_id=pid,
     )
     return text, usage
 
@@ -753,7 +780,6 @@ async def langchain_tool_loop(
     compact_model: Any = None,
     reserved: int | None = None,
     emit: Any = None,
-    provider: str = "",
 ) -> str:
     """Run a bounded tool-calling loop on a LangChain model.
 
@@ -831,11 +857,13 @@ async def langchain_tool_loop(
         if emit is not None:
             _um = getattr(ai, "usage_metadata", None)
             if _um:
+                _kind, _pid = model_provider(model)
                 _ev = usage_event(
                     _um,
                     model=str(getattr(model, "model_name", "") or ""),
                     sub=True,
-                    provider=provider,
+                    provider=_kind,
+                    provider_id=_pid,
                 )
                 if _ev:
                     emit(_ev)
@@ -1063,6 +1091,7 @@ def usage_event(
     sub: bool = False,
     prompt_tokens: int | None = None,
     provider: str = "",
+    provider_id: str = "",
 ) -> dict | None:
     """Build a SSE ``usage`` event from a LangChain ``usage_metadata`` mapping.
 
@@ -1148,6 +1177,7 @@ def usage_event(
             "model": model or "",
             "sub": sub,
             "provider": provider,
+            "provider_id": provider_id,
         }
     except Exception:  # noqa: BLE001 -- usage must never crash a run
         return None

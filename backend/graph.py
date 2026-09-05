@@ -678,6 +678,7 @@ def resolve_subagent_model(
     default_to_parent: bool = True,
     provider_lookup: Any = None,
     timeout: float | None = None,
+    parent_provider_id: str = "",
 ) -> Any:
     """Resolve a single sub-agent slot entry to a LangChain model.
 
@@ -706,6 +707,7 @@ def resolve_subagent_model(
                 temperature=0.2,
                 timeout=timeout,
                 cache=True,
+                provider_id=parent_provider_id,
             )
             if (default_to_parent and parent_model_name)
             else None
@@ -724,6 +726,7 @@ def resolve_subagent_model(
                     temperature=0.2,
                     timeout=timeout,
                     cache=True,
+                    provider_id=parent_provider_id,
                 )
                 if (default_to_parent and parent_model_name)
                 else None
@@ -738,10 +741,11 @@ def resolve_subagent_model(
         env_var,
         oauth_token,
         provider_lookup or (lambda pid: None),
+        parent_provider_id,
     )
     if not target:
         return None
-    kind, model, burl, akey, env, oauth = target
+    kind, model, burl, akey, env, oauth, spid = target
     if not model:
         return None
     return build_chat_model(
@@ -754,6 +758,7 @@ def resolve_subagent_model(
         temperature=0.2,
         timeout=timeout,
         cache=True,
+        provider_id=spid,
     )
 
 
@@ -1109,6 +1114,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["oauth_token"],
         state["model_name"],
         provider_lookup=_provider_lookup,
+        parent_provider_id=state.get("provider_id", ""),
     )
     compact_model = resolve_subagent_model(
         state["provider"],
@@ -1122,6 +1128,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # Bounded so an auto-compact summarizer fails fast (and is skipped)
         # instead of hanging the turn when the provider is slow/unreachable.
         timeout=50,
+        parent_provider_id=state.get("provider_id", ""),
     )
     vision_model = resolve_subagent_model(
         state["provider"],
@@ -1137,6 +1144,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # surfaced to the user) instead of hanging the turn. The retry/backoff
         # in _vision_analyze covers transient blips within this budget.
         timeout=30,
+        parent_provider_id=state.get("provider_id", ""),
     )
     explore_model = resolve_subagent_model(
         state["provider"],
@@ -1148,6 +1156,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["model_name"],
         default_to_parent=True,
         provider_lookup=_provider_lookup,
+        parent_provider_id=state.get("provider_id", ""),
     )
 
     settings = await chat_model_settings(
@@ -1176,6 +1185,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         timeout=model_timeout_for(state),
         cache=settings.get("cache", False),
         session_id=str(state.get("chat_id") or ""),
+        provider_id=state.get("provider_id", ""),
     )
 
     tools = make_tool_callbacks(

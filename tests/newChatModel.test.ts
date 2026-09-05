@@ -39,6 +39,14 @@ const s0 = useStore.getState()
 const activeId = s0.settings.activeProviderId
 const activeDefault = s0.settings.providers.find((p) => p.id === activeId)?.model
 
+// هیچ provider پیش‌فرضی نباید model هاردکد داشته باشه — مدل هر provider از
+// کاتالوگ واقعی خودش درمیاد (fetchAndPersist → updateProvider).
+check(
+  'هیچ provider پیشفرضی model هاردکد ندارد',
+  s0.settings.providers.every((p) => !p.model),
+  s0.settings.providers.map((p) => `${p.id}=${p.model}`).join(', '),
+)
+
 console.log('۱) recentModels خالی → newChat از مدل پیشفرض پرووایدر فعال استفاده میکند:')
 {
   useStore.setState({ recentModels: [] })

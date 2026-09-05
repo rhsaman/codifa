@@ -374,6 +374,10 @@ class CompactRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     oauth_token: str = ""
+    # The user-configured provider id (several rows can share a kind) so the
+    # returned usage event groups under the REAL provider. Mirrors
+    # ChatRequest.provider_id.
+    provider_id: str = ""
     # Fallback summarizer (the active chat model) — mirrors opencode's
     # subagent -> main-model retry when the compact subagent is unavailable.
     fallback_provider: str = ""
@@ -382,6 +386,7 @@ class CompactRequest(BaseModel):
     fallback_api_key: str = ""
     fallback_env_var: str = ""
     fallback_oauth_token: str = ""
+    fallback_provider_id: str = ""
     # Conversation history to compact, as plain {role, content} turns.
     history: list[dict] = []
     context_window: int = 0
@@ -1149,7 +1154,15 @@ async def chat_compact(req: CompactRequest, request: Request):
         _log("empty history -> nothing to do", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "no messages to compact"}
 
-    def _build(provider: str, model: str, base_url: str, api_key: str, env_var: str, oauth: str):
+    def _build(
+        provider: str,
+        model: str,
+        base_url: str,
+        api_key: str,
+        env_var: str,
+        oauth: str,
+        provider_id: str = "",
+    ):
         if not model:
             return None
         try:
@@ -1167,18 +1180,20 @@ async def chat_compact(req: CompactRequest, request: Request):
                 # error instead of hanging until the client disconnects.
                 timeout=50,
                 cache=True,
+                provider_id=provider_id,
             )
         except Exception as exc:  # noqa: BLE001
             _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}", level=logging.WARNING)
             return None
 
-    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.oauth_token)
+    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.oauth_token, req.provider_id)
     if model is None:
         _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "invalid primary model"}
     fallback = _build(
         req.fallback_provider, req.fallback_model, req.fallback_base_url,
         req.fallback_api_key, req.fallback_env_var, req.fallback_oauth_token,
+        req.fallback_provider_id,
     )
     _log(f"primary built={bool(model)} fallback built={bool(fallback)}; running _compact_history")
     ctx = int(req.context_window or 0)

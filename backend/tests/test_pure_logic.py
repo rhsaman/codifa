@@ -110,11 +110,12 @@ def test_subagent_target_openrouter_free_routes_through_openrouter():
     # (env-var auth) while the parent is the opencode gateway.
     t = _subagent_target("openrouter/free", **_parent(), provider_lookup=_no_row)
     assert t is not None, "openrouter/free must resolve"
-    kind, model, base, key, env, oauth = t
+    kind, model, base, key, env, oauth, pid = t
     assert kind == "openrouter", f"kind={kind}"
     assert model == "openrouter/free", f"model={model}"
     assert base == OPENROUTER_BASE, f"base={base}"
     assert key == "" and env == "" and oauth == "", "env-only creds expected"
+    assert pid == "openrouter", f"pid={pid}"
 
 
 def test_subagent_target_saved_row_wins_over_meta_defaults():
@@ -129,19 +130,19 @@ def test_subagent_target_saved_row_wins_over_meta_defaults():
 
 def test_subagent_target_parent_kind_prefix_keeps_parent_creds():
     t = _subagent_target("opencode/free", **_parent(), provider_lookup=_no_row)
-    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", ""), t
+    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
 
 
 def test_subagent_target_bare_model_stays_parent_relative():
     t = _subagent_target("free", **_parent(), provider_lookup=_no_row)
-    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", ""), t
+    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
 
 
 def test_subagent_target_openrouter_parent_keeps_parent_creds():
     t = _subagent_target(
         "openrouter/free", **_parent(parent_provider="openrouter"), provider_lookup=_no_row
     )
-    assert t == ("openrouter", "free", "http://parent.example/v1", "parent-key", "", ""), t
+    assert t == ("openrouter", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
 
 
 # ---------------------------------------------------------------------------

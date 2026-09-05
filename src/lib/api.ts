@@ -575,12 +575,27 @@ export interface CompactProvider {
   apiKey: string
   envVar?: string
   oauthToken?: string
+  /** User-configured provider id — usage attribution groups by this, not kind. */
+  id?: string
+}
+
+/** Token usage of the summarizer model, as reported by the backend. */
+export interface CompactUsage {
+  model?: string
+  provider?: string
+  provider_id?: string
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
 }
 
 export interface CompactResult {
   summary: string | null
   keep: number
   error?: string
+  usage?: CompactUsage
 }
 
 /** Manual ``/compact`` — runs opencode-style compaction on the backend and
@@ -607,12 +622,14 @@ export async function triggerCompact(params: {
       api_key: params.provider.apiKey,
       env_var: params.provider.envVar ?? '',
       oauth_token: params.provider.oauthToken ?? '',
+      provider_id: params.provider.id ?? '',
       fallback_provider: params.fallback.kind,
       fallback_model: params.fallback.model,
       fallback_base_url: params.fallback.baseUrl,
       fallback_api_key: params.fallback.apiKey,
       fallback_env_var: params.fallback.envVar ?? '',
       fallback_oauth_token: params.fallback.oauthToken ?? '',
+      fallback_provider_id: params.fallback.id ?? '',
       history: params.history,
       context_window: params.contextWindow ?? 0,
       compact_at_percent: params.compactAtPercent ?? 80,

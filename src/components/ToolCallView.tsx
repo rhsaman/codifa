@@ -941,9 +941,9 @@ export const ToolSingleRow = memo(function ToolSingleRow({
         <span className="trace-row-end">
           {isEdit && diffStats && <span className="trace-row-diff-stats">{diffStats}</span>}
           {isEdit && (
-            <button className="trace-row-revert" title="Revert this change" onClick={(e) => e.stopPropagation()}>
+            <span className="trace-row-revert" role="button" tabIndex={0} title="Revert this change" onClick={(e) => { e.stopPropagation(); }}>
               Revert
-            </button>
+            </span>
           )}
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
           <IconChevron open={expanded} className="trace-row-chev" />
@@ -1266,6 +1266,28 @@ export const ToolCallView = memo(function ToolCallView({
         {fetchSummary && <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>}
         {activity.args && <ToolArgs args={activity.args} />}
         <span className="tool-ms">{fmtTime(ms)}</span>
+        {isWrite && activity.diff && (() => {
+          const adds = (activity.diff.match(/^\+[^+]/gm) || []).length
+          const dels = (activity.diff.match(/^-[^-]/gm) || []).length
+          return adds + dels > 0 ? (
+            <span className="tool-diff-stats">+{adds}/-{dels}</span>
+          ) : null
+        })()}
+        {isWrite && activity.diff && !activity.reverted && (
+          <button
+            className="tool-revert-inline"
+            disabled={reverting}
+            onClick={(e) => {
+              e.stopPropagation()
+              revert()
+            }}
+          >
+            {reverting ? 'Reverting…' : '↩ Revert'}
+          </button>
+        )}
+        {isWrite && activity.reverted && (
+          <span className="reverted-tag">reverted</span>
+        )}
         {isWrite && (
           <button
             className="tool-fullscreen-btn"
@@ -1287,7 +1309,7 @@ export const ToolCallView = memo(function ToolCallView({
       )}
       {!collapsed && (
       <div className="tool-card-body">
-          {activity.summary && <div className="tool-summary">{fixZwsp(activity.summary)}</div>}
+          {activity.summary && !isWrite && <div className="tool-summary">{fixZwsp(activity.summary)}</div>}
           {activity.tool === 'task' && activity.children && activity.children.length > 0 && (
             <div className="tool-sub-list">
               {activity.children.map((child, i) => (
@@ -1302,18 +1324,6 @@ export const ToolCallView = memo(function ToolCallView({
             <WebResultLinks items={activity.items} />
           )}
           {activity.diff && <DiffView diff={activity.diff} />}
-          {isWrite && activity.diff && !activity.reverted && (
-            <button
-              className="btn secondary revert-btn"
-              disabled={reverting}
-              onClick={revert}
-            >
-              {reverting ? 'Reverting…' : '↩ Revert'}
-            </button>
-          )}
-          {isWrite && activity.reverted && (
-            <span className="reverted-tag">reverted</span>
-          )}
       </div>
       )}
     {fsOpen && (

@@ -402,3 +402,5 @@ def test_usage_event_from_llm_generate_includes_provider():
     assert ev is not None
     assert ev["provider"] == "openrouter"
     assert ev["model"] == "gpt-4o"
+    # provider_id defaults to "" (legacy callers) — never absent.
+    assert ev["provider_id"] == ""

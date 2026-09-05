@@ -66,9 +66,9 @@ async def main():
         if t is None:
             print(f"  {slot:8s} {entry:45s} -> None (falls back to parent)")
             continue
-        kind, model, base, key, env, oauth = t
+        kind, model, base, key, env, oauth, _pid = t
         try:
-            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth)
+            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth, provider_id=_pid)
             out = await asyncio.wait_for(
                 llm_complete(m, user="Reply with exactly: OK"), timeout=90
             )

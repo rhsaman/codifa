@@ -725,3 +725,115 @@ def test_messages_to_dicts_tags_tool_name_for_prune_protection():
     assert skill_msg["content"] == "X" * 200_000
     assert read_msg.get("compacted"), "non-protected tool result should be pruned"
     assert read_msg["content"] == "[Old tool result content cleared]"
+
+
+# ---------------------------------------------------------------------------
+# Orphaned tool-message detection
+# ---------------------------------------------------------------------------
+
+
+def test_compact_removes_orphaned_tool_messages():
+    """Orphaned tool messages (whose assistant is in the summarized older portion)
+    MUST be removed from the tail, otherwise the API 400s with
+    'Tool messages starting at messages[N] are missing results for tool_call_id(s)'.
+    """
+    # Build a history where compaction will split assistant(A,B,C) from its
+    # results: the tail picks up tool(B), tool(C), then more turns — but
+    # assistant(A,B,C) falls into the older (summarized) part.  Tool messages
+    # for A, B, C are orphaned because no assistant with those tool_call_ids
+    # remains in the tail.
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": "first step",
+            "tool_calls": [
+                {"id": "c-a", "name": "tool_a", "args": {}},
+                {"id": "c-b", "name": "tool_b", "args": {}},
+                {"id": "c-c", "name": "tool_c", "args": {}},
+            ],
+        },
+        {"role": "tool", "content": "result_a", "tool_call_id": "c-a", "tool": "tool_a"},
+        {"role": "tool", "content": "result_b", "tool_call_id": "c-b", "tool": "tool_b"},
+        {"role": "tool", "content": "result_c", "tool_call_id": "c-c", "tool": "tool_c"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    tail = [
+        {"role": "tool", "content": "result_b", "tool_call_id": "c-b", "tool": "tool_b"},
+        {"role": "tool", "content": "result_c", "tool_call_id": "c-c", "tool": "tool_c"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    # Simulate what _compact_history does: collect tail_tc_ids then clean.
+    # The tail has NO assistant with tool_calls, so _all_tail_tc_ids is empty.
+    _all_tail_tc_ids: set[str] = set()
+    for _m in tail:
+        if _m.get("role") == "assistant":
+            for _tc in _m.get("tool_calls") or []:
+                _tid = _tc.get("id")
+                if _tid:
+                    _all_tail_tc_ids.add(_tid)
+
+    # All tool messages are orphaned (their assistant is in the older part).
+    orphaned_ids: list[str] = []
+    _cleaned: list[dict] = []
+    for _m in tail:
+        if (
+            _m.get("role") == "tool"
+            and _m.get("tool_call_id") not in _all_tail_tc_ids
+        ):
+            orphaned_ids.append(_m.get("tool_call_id", "?"))
+        else:
+            _cleaned.append(_m)
+    tail = _cleaned
+
+    # Both orphaned tool messages must be removed.
+    assert len(orphaned_ids) == 2, f"expected 2 orphaned, got {orphaned_ids}"
+    assert set(orphaned_ids) == {"c-b", "c-c"}
+    assert all(m.get("role") != "tool" for m in tail), (
+        f"orphaned tool messages still in tail: {tail}"
+    )
+
+
+def test_compact_strips_tool_calls_when_any_result_missing():
+    """When an assistant message has tool_call_ids [A, B, C] but only A and B
+    have results in the tail, the entire tool_calls block must be stripped
+    (otherwise the API 400s on the missing C result).
+    """
+    tail = [
+        {
+            "role": "assistant",
+            "content": "step",
+            "tool_calls": [
+                {"id": "c-a", "name": "ta", "args": {}},
+                {"id": "c-b", "name": "tb", "args": {}},
+                {"id": "c-c", "name": "tc", "args": {}},
+            ],
+        },
+        {"role": "tool", "content": "ok_a", "tool_call_id": "c-a"},
+        {"role": "tool", "content": "ok_b", "tool_call_id": "c-b"},
+        # c-c result is missing (it was in the older/summarized part).
+    ]
+
+    _kept_result_ids: set[str] = {
+        _m.get("tool_call_id")
+        for _m in tail
+        if _m.get("role") == "tool" and _m.get("tool_call_id")
+    }
+    for _m in tail:
+        if _m.get("role") == "assistant" and _m.get("tool_calls"):
+            _own_ids = {
+                _tc.get("id") for _tc in _m["tool_calls"] if _tc.get("id")
+            }
+            if _own_ids - _kept_result_ids:
+                _m.pop("tool_calls", None)
+
+    assistant = tail[0]
+    assert assistant.get("role") == "assistant"
+    assert not assistant.get("tool_calls"), (
+        "tool_calls must be stripped when any result is missing"
+    )

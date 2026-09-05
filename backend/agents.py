@@ -1058,6 +1058,19 @@ def _is_retryable(exc: BaseException) -> bool:
     failure (bad API key, invalid model, bad request) that would just fail
     identically on retry.
     """
+    # ── Hard-fail: transcript / payload validation errors ──────────────
+    # 400 "Validation: missing results for tool_call_id" (and similar) are
+    # *permanent* transcript bugs — retrying burns the full budget (~5 min)
+    # for nothing.  Check BEFORE any status-code path so this works even
+    # when status_code is absent (fallback regex/code-in-text paths).
+    _low = str(exc).lower()
+    _validation_patterns = (
+        "validation",
+        "tool_call_id",
+        "missing results",
+    )
+    if any(p in _low for p in _validation_patterns):
+        return False
     # Prefer the real HTTP status carried on the exception object (openai's
     # APIError sets `.status_code`) — reliable even when the
     # message text omits it.
@@ -3112,20 +3125,78 @@ async def _compact_history(
         tail.append(m)
         tail_tokens += est
     tail.reverse()
-    # --- never split a tool_calls round from its tool results ---------------
-    # The token-budget cutoff above can land right after an EARLIER (not just
-    # the final in-flight) assistant tool_calls step, leaving its ToolMessage
-    # results in `tail` while the assistant message that produced them gets
-    # summarized away into `older`. The provider then sees a `tool` role
-    # message with no matching `tool_calls` before it -- llama.cpp's chat
-    # template renderer (minja) trips on this and 400s ("Unable to generate
-    # parser for this template"). Walk any leading orphaned tool messages back
-    # into `tail` so every round of tool_calls stays paired with its results,
-    # not just the last one (the in-flight guard below only covers that case).
-    _cutoff = len(history) - len(tail)
-    while tail and tail[0].get("role") == "tool" and _cutoff > 0:
-        _cutoff -= 1
-        tail.insert(0, history[_cutoff])
+    # --- clean up orphaned tool messages / assistant tool_calls ---------------
+    # The token-budget cutoff can split an assistant tool_calls step from its
+    # ToolMessage results, landing the assistant in `older` (summarized away)
+    # while the tool results stay in `tail`.  The provider then sees a `tool`
+    # message with no matching `tool_calls` before it and 400s (e.g. Anthropic:
+    # "Tool messages starting at messages[N] are missing results for
+    # tool_call_id(s): …").
+    #
+    # Old approach: walk only leading orphaned tool messages back into `tail`
+    # (broke when orphans appeared after non-tool messages).
+    # New approach: remove orphaned tool messages from `tail` entirely — the
+    # summary contains no structured tool_calls, so there is no way to pair
+    # them.  Also strip tool_calls from assistant messages with ANY missing
+    # result, so the API never sees a tool_calls block without matching tool
+    # results.
+    #
+    # Step 1 — collect ALL tool_call_ids referenced by assistant messages in
+    # the tail (needed for orphan detection).
+    _all_tail_tc_ids: set[str] = set()
+    for _m in tail:
+        if _m.get("role") == "assistant":
+            for _tc in _m.get("tool_calls") or []:
+                _tid = _tc.get("id")
+                if _tid:
+                    _all_tail_tc_ids.add(_tid)
+    # Step 2 — remove tool messages whose tool_call_id is NOT referenced by
+    # any assistant message in the tail (orphaned = their assistant is in
+    # `older` and was summarized away).
+    orphaned_ids: list[str] = []
+    _cleaned: list[dict] = []
+    for _m in tail:
+        if (
+            _m.get("role") == "tool"
+            and _m.get("tool_call_id") not in _all_tail_tc_ids
+        ):
+            orphaned_ids.append(_m.get("tool_call_id", "?"))
+        else:
+            _cleaned.append(_m)
+    tail = _cleaned
+    if orphaned_ids:
+        logger.debug(
+            "_compact_history: removed %d orphaned tool messages (ids: %s)",
+            len(orphaned_ids),
+            orphaned_ids,
+        )
+    # Step 3 — strip tool_calls from assistant messages when ANY of their
+    # results were removed.  We detect this by checking each assistant's
+    # tool_call_ids against the ACTUAL tool results that remain in tail (not
+    # against _all_tail_tc_ids which contains assistant-referenced ids).
+    _kept_result_ids: set[str] = {
+        _m.get("tool_call_id")
+        for _m in tail
+        if _m.get("role") == "tool" and _m.get("tool_call_id")
+    }
+    _stripped_count = 0
+    for _m in tail:
+        if _m.get("role") == "assistant" and _m.get("tool_calls"):
+            _own_ids = {
+                _tc.get("id") for _tc in _m["tool_calls"] if _tc.get("id")
+            }
+            # If any of this message's tool_call_ids have no result in tail,
+            # the API will 400 — strip the entire tool_calls block.  The
+            # assistant text content is still useful context for the model.
+            if _own_ids - _kept_result_ids:
+                _m.pop("tool_calls", None)
+                _stripped_count += 1
+    if _stripped_count:
+        logger.debug(
+            "_compact_history: stripped tool_calls from %d assistant messages "
+            "with missing results",
+            _stripped_count,
+        )
     # --- protect the in-flight step (mid-turn auto-compact) -----------------
     # When auto-compact fires DURING a turn, the transcript ends with the current
     # step: an assistant message carrying tool_calls followed by its tool results.

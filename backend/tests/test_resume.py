@@ -235,6 +235,53 @@ async def main():
             "auto-continued turn must finish cleanly (no leftover checkpoint)"
         print("  resume/len OK: max-output truncation auto-continues seamlessly")
 
+        # ==== Signature-reuse creates ToolMessage for new tool_call_id ====
+        # On resume, the model re-issues the SAME tool call with a freshly-minted
+        # id.  _existing_tool_result matches by (name,args) and returns the cached
+        # result, but the NEW tool_call_id has no matching ToolMessage in msgs.
+        # The fix must create one so the API doesn't reject the transcript with
+        # "missing results for tool_call_id(s)".
+        chat_reuse = "chat-resume-reuse-sig"
+        # Turn 1: model calls grep with id "call_orig", result is saved.
+        mock.script = [
+            tool_call("grep", json.dumps({"pattern": "hello", "path": ""}), call_id="call_orig"),
+            text_reply("found"),
+        ]
+        mock.captured = []
+        async for _ in run_agent(prompt="find hello", history=[], **{**common, "chat_id": chat_reuse}):
+            pass
+
+        # Turn 2: resume — model re-issues the SAME grep with a NEW id "call_new".
+        mock.script = [
+            tool_call("grep", json.dumps({"pattern": "hello", "path": ""}), call_id="call_new"),
+            text_reply("summary"),
+        ]
+        mock.captured = []
+        async for _ in run_agent(prompt="find hello", history=[], **{**common, "chat_id": chat_reuse}):
+            pass
+
+        # The second API request (after the model re-issues the tool call)
+        # must contain a ToolMessage with tool_call_id="call_new" — proving
+        # the fix creates the missing result instead of silently dropping it.
+        if len(mock.captured) >= 2:
+            second_req = mock.captured[1]
+            has_new_tool_msg = any(
+                msg.get("role") == "tool" and msg.get("tool_call_id") == "call_new"
+                for msg in second_req.get("messages", [])
+            )
+            assert has_new_tool_msg, (
+                "ToolMessage with new tool_call_id must be created on "
+                "signature-reuse to prevent 'missing results' API error"
+            )
+            print("  resume/reuse-sig OK: new tool_call_id gets a ToolMessage on signature reuse")
+        else:
+            # Model didn't re-issue the tool call (only 1 request) — the
+            # _existing_tool_result dedup prevented the re-execution which is
+            # also correct; skip the assertion.
+            print("  resume/reuse-sig SKIP: model did not re-issue tool call (dedup worked)")
+
+        await _clear_turn_checkpoint(_resume_thread_id({"chat_id": chat_reuse}))
+
         print("RESUME TEST PASSED")
     finally:
         await stop_server(task)

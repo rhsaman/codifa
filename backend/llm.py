@@ -712,6 +712,35 @@ async def langchain_tool_loop(
         # summarize instead of burning more reads/searches.
         if steps >= max_steps:
             msgs.append(AIMessage(content=_MAX_STEPS_PROMPT))
+        # ── Pre-flight orphan guard (mirrors graph.py) ──────────────────
+        # Strip tool_calls from any AIMessage whose results are missing,
+        # so the provider never sees a tool_calls block without matching
+        # ToolMessages (which causes a 400 "missing results for
+        # tool_call_id(s)" validation error).
+        _existing_tcm: set[str] = {
+            m.tool_call_id
+            for m in msgs
+            if isinstance(m, ToolMessage) and m.tool_call_id
+        }
+        for _mi in range(len(msgs)):
+            _mm = msgs[_mi]
+            if (
+                isinstance(_mm, AIMessage)
+                and getattr(_mm, "tool_calls", None)
+            ):
+                _missing = [
+                    tc
+                    for tc in _mm.tool_calls
+                    if tc.get("id") not in _existing_tcm
+                ]
+                if _missing:
+                    _logger.warning(
+                        "pre-flight guard: stripping %d orphaned "
+                        "tool_calls (ids: %s) from assistant message",
+                        len(_missing),
+                        [tc.get("id") for tc in _missing],
+                    )
+                    msgs[_mi] = _mm.model_copy(update={"tool_calls": []})
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The

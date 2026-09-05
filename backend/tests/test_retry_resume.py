@@ -310,6 +310,24 @@ def test_400_is_retryable():
     assert agents._is_retryable(exc) is True
 
 
+def test_400_validation_is_not_retryable():
+    """A 400 'Validation: missing results for tool_call_id' error is a permanent
+    transcript bug, NOT a transient gateway issue. Retrying wastes the full
+    retry budget (~5 min) for nothing — must fail fast."""
+    exc = RuntimeError(
+        'Error code: 400 - {\'error\': {\'message\': \'Validation: Tool messages '
+        'starting at `messages[321]` are missing results for tool_call_id(s): '
+        'call_8c49cffa436c046f\'}}'
+    )
+    assert agents._is_retryable(exc) is False
+
+    # A "tool_call_id not found" variant
+    exc2 = RuntimeError(
+        "Error code: 400 - tool_call_id not found in transcript"
+    )
+    assert agents._is_retryable(exc2) is False
+
+
 def test_hard_quota_exhausted_still_detected():
     """A genuine usage-quota cap (no transient phrase) is still detected as
     exhausted and skips the retry loop."""

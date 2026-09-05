@@ -2485,6 +2485,45 @@ async def _run_mode_turn(
                 # straight to text (or an auto-think gateway sending no thinking
                 # chunks) shows no indicator. The window closes on the first
                 # answer text (below) and as a safety net at stream end.
+
+                # ── Pre-flight orphan guard ────────────────────────────────
+                # Every AIMessage with tool_calls MUST have a matching
+                # ToolMessage for each tool_call_id, or the provider will
+                # reject the transcript with a 400 "missing results for
+                # tool_call_id(s)" error.  This can happen when compaction
+                # splits a step across older/tail, or when a resume
+                # checkpoint is missing tool results for later calls.
+                # Strip tool_calls from any such assistant messages so the
+                # text content is still visible to the model.
+                _existing_tcm: set[str] = {
+                    m.tool_call_id
+                    for m in msgs
+                    if isinstance(m, ToolMessage) and m.tool_call_id
+                }
+                for _mi in range(len(msgs)):
+                    _mm = msgs[_mi]
+                    if (
+                        isinstance(_mm, AIMessage)
+                        and getattr(_mm, "tool_calls", None)
+                    ):
+                        _missing = [
+                            tc
+                            for tc in _mm.tool_calls
+                            if tc.get("id") not in _existing_tcm
+                        ]
+                        if _missing:
+                            import logging as _log
+
+                            _log.getLogger(__name__).warning(
+                                "pre-flight guard: stripping %d orphaned "
+                                "tool_calls (ids: %s) from assistant message",
+                                len(_missing),
+                                [tc.get("id") for tc in _missing],
+                            )
+                            msgs[_mi] = _mm.model_copy(
+                                update={"tool_calls": []}
+                            )
+
                 async for chunk in bound.astream(msgs):
                     # Check for cancellation at each chunk so the Stop button
                     # properly interrupts the provider call (llama.cpp / local servers).
@@ -2898,14 +2937,30 @@ async def _run_mode_turn(
             # بازسازی‌شده از toolActivity باشد. اگر نتیجهٔ یک tool_call قبلاً
             # در transcript هست، آن را دوباره اجرا نکن — مستقیماً reuse کن
             # (صرفه‌جویی در context و جلوگیری از اجرای تکراریِ کارهای انجام‌شده).
-            _pending = [
-                tc
-                for tc in _tcs
-                if _existing_tool_result(
-                    tc.get("id", ""), tc.get("name"), tc.get("args")
+            # Collect tool_call_ids that already have a ToolMessage in msgs so
+            # we can detect when a reuse-by-signature skipped call is missing
+            # its result.
+            _seen_tc_ids: set[str] = {
+                m.tool_call_id for m in msgs if isinstance(m, ToolMessage)
+            }
+            _pending = []
+            for tc in _tcs:
+                _tc_id = tc.get("id", "")
+                existing = _existing_tool_result(
+                    _tc_id, tc.get("name"), tc.get("args")
                 )
-                is None
-            ]
+                if existing is None:
+                    _pending.append(tc)
+                elif _tc_id not in _seen_tc_ids:
+                    # Signature match found a cached result but the NEW
+                    # tool_call_id has no matching ToolMessage yet.  Create one
+                    # so the API doesn't reject the transcript with "missing
+                    # results for tool_call_id(s)".
+                    msgs.append(
+                        ToolMessage(
+                            content=str(existing), tool_call_id=_tc_id
+                        )
+                    )
             # ── Deduplicate identical tool calls in the main agent loop ──
             # The model sometimes outputs the same (name, args) pair twice in
             # one step. Execute each unique call once and reuse the result for

@@ -288,6 +288,7 @@ export type MessageSegment =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; index: number }
   | { kind: 'user'; id: string }
+  | { kind: 'compact'; id: string }
 
 export interface ChatMessage {
   id: string

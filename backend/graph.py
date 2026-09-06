@@ -1234,7 +1234,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _mcp_servers, lambda ev: queue.put_nowait(ev)
         )
     for t in mcp_tools:
-        filtered[t.name] = t.func
+        filtered[t.name] = t
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
     # image directly to the main model, otherwise the model could never see it.
@@ -1729,7 +1729,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             t
             if isinstance(t, StructuredTool)
             else StructuredTool.from_function(
-                func=t, name=name, description=(t.__doc__ or name)
+                coroutine=t, name=name, description=(t.__doc__ or name)
             )
         )
         for name, t in filtered.items()
@@ -2322,9 +2322,12 @@ async def _run_mode_turn(
         if fn is None:
             return f"ERROR: unknown tool {name!r}"
         try:
-            res = fn(**(args or {}))
-            if inspect.isawaitable(res):
-                res = await res
+            if isinstance(fn, StructuredTool):
+                res = await fn.ainvoke(args or {})
+            else:
+                res = fn(**(args or {}))
+                if inspect.isawaitable(res):
+                    res = await res
             return res
         except Exception as exc:  # noqa: BLE001
             return f"ERROR running {name}: {exc}"

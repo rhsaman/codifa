@@ -3214,19 +3214,19 @@ def make_tool_callbacks(
     async def create_mcp_tool(
         name: str,
         command: str = "",
-        args: list[str] | None = None,
+        cmd_args: list[str] | None = None,
         url: str = "",
         env: dict[str, str] | None = None,
     ) -> str:
-        """Add or update an MCP tool connector in the app database (global). `name` = connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) + `env` (supports ${VAR}). Remote: `url` instead (verified as a real MCP endpoint). Takes effect next message. Connectors live ONLY in the app DB — never write mcp.json/config files; call once per connector."""
+        """Add or update an MCP tool connector in the app database (global). `name` = connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `cmd_args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) + `env` (supports ${VAR}). Remote: `url` instead (verified as a real MCP endpoint). Takes effect next message. Connectors live ONLY in the app DB — never write mcp.json/config files; call once per connector."""
         emit({"kind": "tool", "tool": "create_mcp", "args": {"name": name}})
         cfg: dict = {}
         if url:
             cfg["url"] = url
         else:
             cfg["command"] = command
-            if args:
-                cfg["args"] = args
+            if cmd_args:
+                cfg["args"] = cmd_args
         if env:
             cfg["env"] = env
         if url:

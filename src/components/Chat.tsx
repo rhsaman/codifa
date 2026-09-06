@@ -47,6 +47,7 @@ import {
   respondPermission,
   respondAsk,
   listSkills,
+  listMcp,
   triggerCompact,
   type CompactResult,
   type StreamParams,
@@ -488,6 +489,8 @@ export function ChatPanel() {
    *  it retries on a bounded loop (then escalates to a forced abort) instead of
    *  looping forever on a genuinely dead connection. */
   const watchdogAutoRetriedRef = useRef(0);
+  /** True when a create_mcp tool was called this turn — triggers MCP list refresh on done. */
+  const mcpChangedRef = useRef(false);
   const toggleRecordingRef = useRef<() => void>(() => { });
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
@@ -1192,6 +1195,10 @@ export function ChatPanel() {
     forceScroll = false,
   ) => {
     stoppedRef.current = false;
+    // Per-turn flag: set when a create_mcp tool event arrives, consumed by the
+    // `done` handler. Reset here so a stale flag from a previous turn can't
+    // trigger a spurious refresh.
+    mcpChangedRef.current = false;
     const s = useStore.getState();
     // Use THIS panel's chat (captured at render), never s.activeChatId: a
     // queued turn drained while the user is viewing ANOTHER chat must still
@@ -1696,6 +1703,9 @@ export function ChatPanel() {
         }
       } else if (event.kind === "tool") {
         bumpToolRunning(toolRunningRef);
+        // A create_mcp call this turn means the connector list in the store is
+        // stale — flag it so the `done` handler re-fetches from the sidecar.
+        if (event.tool === "create_mcp") mcpChangedRef.current = true;
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
         // the running task card, not as top-level cards — so a task turn shows
@@ -2042,6 +2052,16 @@ export function ChatPanel() {
         // re-set it after the stream closes.
         lastEventAt.current = Date.now();
         resolveStuckCards();
+        // A create_mcp ran this turn: the connector was saved to the app DB by
+        // the backend, but the store's mcpServers snapshot is only hydrated
+        // once at app startup — re-fetch so Settings → MCP shows it without a
+        // restart. Fire-and-forget: a failure here must not break the turn.
+        if (mcpChangedRef.current) {
+          mcpChangedRef.current = false;
+          void listMcp().then((db) => {
+            useStore.getState().setMcpServers(db.mcpServers ?? {});
+          }).catch(() => { });
+        }
         // A successful completion clears ANY retry banner (not just
         // reconnecting). This ensures the attempt counter resets to 1 on the
         // next turn's first error.
@@ -3920,7 +3940,7 @@ export function ChatPanel() {
                 )}
                 {!skillsLoading && skillsList.length === 0 && (
                   <div className="mention-empty">
-                    No skills — create one with /skill or in Settings → Skills
+                    No skills — create one with /create-skill or in Settings → Skills
                   </div>
                 )}
                 {skillsList.length > 0 && filteredSkills.length === 0 && (

@@ -262,6 +262,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     asyncio.create_task(_bg())
     yield
 
+    # بستن تمام sessionهای MCP cached در هنگام خروج
+    try:
+        from mcp_bridge import shutdown_mcp_sessions
+
+        await shutdown_mcp_sessions()
+    except Exception:
+        logger.warning("shutdown_mcp_sessions failed", exc_info=True)
+
 
 app = FastAPI(title="Codifa agent sidecar", lifespan=lifespan)
 

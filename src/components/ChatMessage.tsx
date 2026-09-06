@@ -980,6 +980,52 @@ function SegSteerBubble({
   );
 }
 
+/** Renders a folded context-summary message: collapsed by default (long dump
+ *  of earlier turns), header toggles it open. Shared by the standalone
+ *  system-message bubble (a compact between turns) and the inline `compact`
+ *  segment (a compact mid-turn, spliced into the still-streaming assistant
+ *  message at the point it happened — see renderSegments). */
+function SummaryBlock({ message }: { message: ChatMessage }) {
+  const dir = useStore((s) => s.dir);
+  const [collapsed, setCollapsed] = useState(true);
+  return (
+    <div className={`summary-block${collapsed ? " collapsed" : ""}`}>
+      <div
+        className="summary-head"
+        onClick={() => setCollapsed((c) => !c)}
+        role="button"
+        tabIndex={0}
+      >
+        <span className={`summary-chevron${collapsed ? "" : " open"}`}>
+          ▶
+        </span>
+        <span className="summary-icon">📎</span>
+        <span className="summary-label">Context summary</span>
+        {collapsed && message.content && (
+          <span className="summary-preview" dir="auto">
+            {cachedPrepare(message.id, message.content, dir)}
+          </span>
+        )}
+        <span className="summary-hint">
+          earlier turns folded into this summary — the agent still
+          receives it
+        </span>
+      </div>
+      {!collapsed && (
+        <div className="summary-body chat-message markdown-body" dir="auto">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+            {cachedPrepare(
+              `${message.id}:summary`,
+              message.content || "(empty summary)",
+              dir,
+            )}
+          </ReactMarkdown>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** A text segment counts as a "caption" (narration the model wrote right
  *  before a tool call, e.g. "بذار ببینم X رو...") rather than a real prose
  *  answer if it's short, single-paragraph, and has no rich formatting the
@@ -1085,6 +1131,26 @@ function renderSegments(
       }
       return;
     }
+    if (seg.kind === "compact") {
+      // A mid-turn auto-compact: fold the checkpoint in AT THE POINT it fired,
+      // same treatment as an interleaved steer message above — the summary
+      // message itself lives in the store (compactChat pushes it there too),
+      // this segment just anchors where it renders.
+      flush(`grp-${i}`);
+      wrapTrace(`trace-${i}`);
+      if (pendingCaption) {
+        renderProse(`cap-${i}`, pendingCaption);
+        pendingCaption = null;
+      }
+      const summaryMsg = useStore
+        .getState()
+        .chats.flatMap((c) => c.messages)
+        .find((m) => m.id === seg.id);
+      if (summaryMsg) {
+        nodes.push(<SummaryBlock key={i} message={summaryMsg} />);
+      }
+      return;
+    }
     if (seg.kind === "text") {
       // Does this text immediately precede a groupable (non-always-visible)
       // tool call? If so, hold it back as that call's caption instead of
@@ -1152,9 +1218,6 @@ export const ChatMessageView = memo(function ChatMessageView({
   const dir = useStore((s) => s.dir);
   const settings = useStore((s) => s.settings);
   const [copied, setCopied] = useState(false);
-  // The context summary is COLLAPSED by default — it's a long folded dump of
-  // earlier turns, so the chat stays compact. Clicking the header expands it.
-  const [summaryCollapsed, setSummaryCollapsed] = useState(true);
 
   const modeLabel = (id: string) => getMode(settings, id).label;
 
@@ -1302,50 +1365,7 @@ export const ChatMessageView = memo(function ChatMessageView({
             {cachedPrepare(message.id, message.content, "ltr")}
           </div>
         ) : isSummary ? (
-          <div
-            className={`summary-block${summaryCollapsed ? " collapsed" : ""}`}
-          >
-            <div
-              className="summary-head"
-              onClick={() => setSummaryCollapsed((c) => !c)}
-              role="button"
-              tabIndex={0}
-            >
-              <span
-                className={`summary-chevron${summaryCollapsed ? "" : " open"}`}
-              >
-                ▶
-              </span>
-              <span className="summary-icon">📎</span>
-              <span className="summary-label">Context summary</span>
-              {summaryCollapsed && message.content && (
-                <span className="summary-preview" dir="auto">
-                  {cachedPrepare(message.id, message.content, dir)}
-                </span>
-              )}
-              <span className="summary-hint">
-                earlier turns folded into this summary — the agent still
-                receives it
-              </span>
-            </div>
-            {!summaryCollapsed && (
-              <div
-                className="summary-body chat-message markdown-body"
-                dir="auto"
-              >
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={mdComponents}
-                >
-                  {cachedPrepare(
-                    `${message.id}:summary`,
-                    message.content || "(empty summary)",
-                    dir,
-                  )}
-                </ReactMarkdown>
-              </div>
-            )}
-          </div>
+          <SummaryBlock message={message} />
         ) : message.segments && message.segments.length > 0 ? (
           /* Claude-style interleaved rendering: text slices and tool cards follow
              each other in the exact order the agent produced them, with runs of

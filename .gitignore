@@ -44,6 +44,12 @@ tests/.tmp-*
 tests/dump-ssr.out.mjs
 .tmp-*.mjs
 
+# Playwright MCP temp files (logs, snapshots)
+backend/.playwright-mcp/
+
+# Literal ~ directory (artifact from shell misparse)
+backend/\~/
+
 # ============================================================
 # Python / uv
 # ============================================================

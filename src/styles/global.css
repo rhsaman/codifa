@@ -2561,6 +2561,14 @@ textarea {
   margin-top: 2px;
 }
 
+/* A mid-turn auto-compact checkpoint, spliced in via a `compact` segment at
+   the exact point it fired — same clear-gap treatment as the steer bubble
+   above so it reads as a distinct event, not glued to the surrounding tool
+   cards (4px each side). */
+.msg-bubble.segmented>.summary-block {
+  margin: 16px 4px;
+}
+
 /* Room for the bubble tail: .msg has content-visibility:auto → contain:paint
    clips at the border box, so the tail (which pokes 7px past the bubble) must
    sit inside this padding to stay fully visible in both LTR and RTL. */
@@ -8288,30 +8296,6 @@ textarea {
 }
 
 .trace-expand-diff {
-  color: var(--text-dim);
-}
-
-.trace-expand-results {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.trace-expand-link {
-  font-size: 12px;
-  color: var(--accent);
-  text-decoration: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.trace-expand-link:hover {
-  text-decoration: underline;
-}
-
-.trace-expand-result-item {
-  font-size: 12px;
   color: var(--text-dim);
 }
 

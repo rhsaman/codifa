@@ -6,6 +6,7 @@ import type {
   ChatDraft,
   ChatMessage,
   McpServerConfig,
+  MessageSegment,
   ProviderConfig,
   ProviderKind,
   QueuedMessage,
@@ -1914,15 +1915,40 @@ export const useStore = create<State>((set, get) => ({
           compacted: false,
           createdAt: Date.now(),
         }
-        // Append the summary at the END of the conversation so it renders AFTER
-        // the agent's message (the user wants the checkpoint below the reply, not
-        // above it). Array order here is fine: the backend normalizes history order
-        // itself (moving system summaries to the head) before compacting, so it
-        // always finds and merges a prior summary regardless of where it sits.
-        messages.push(summaryMsg)
+        // If a message is still streaming (auto-compact fired mid-turn), also
+        // drop a `compact` segment onto it so the checkpoint renders INLINE at
+        // the exact point in the stream where it happened — same mechanism as
+        // an interleaved steer message (`kind: 'user'`) — instead of only
+        // showing up after the whole turn finishes. The summary message itself
+        // is still appended below for the between-turns case (no live message
+        // to attach a segment to) and so the backend/history logic below is
+        // unaffected.
+        const streaming = messages.find((m) => m.streaming)
+        const withSeg = streaming
+          ? messages.map((m) =>
+              m.id === streaming.id
+                ? {
+                    ...m,
+                    segments: [
+                      ...(m.segments ?? []),
+                      { kind: 'compact', id: summaryMsg.id } as MessageSegment,
+                    ],
+                  }
+                : m,
+            )
+          : messages
+        // Append the summary at the END of the conversation. Between turns this
+        // is also where it renders (the user wants the checkpoint below the
+        // reply, not above it). Mid-turn, the inline segment above already
+        // anchors its VISUAL position — this push just keeps it present in the
+        // flat list for folding/history purposes. Array order here is fine
+        // either way: the backend normalizes history order itself (moving
+        // system summaries to the head) before compacting, so it always finds
+        // and merges a prior summary regardless of where it sits.
+        withSeg.push(summaryMsg)
         return {
           ...c,
-          messages,
+          messages: withSeg,
           updatedAt: Date.now(),
         }
       }),

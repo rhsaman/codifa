@@ -12,24 +12,50 @@ Design notes
 * stdio connectors (``command``/``args``) use ``mcp.client.stdio``.
 * HTTP/SSE connectors (``url``) use ``mcp.client.streamable_http`` (falling back
   to ``sse_client`` when the server only speaks SSE).
-* Each server's ``ClientSession`` is kept open for the whole turn and returned
-  alongside the tools so the caller can close it in a ``finally`` block. This is
-  required because ``StructuredTool.func`` is invoked lazily during the tool
-  loop, long after ``build_mcp_tools`` has returned.
+* Sessions are **cached between turns**: once a server connects, its session
+  stays alive across multiple turns so interactive tools (like Playwright) can
+  maintain browser state (open tabs, cookies, DOM).  The cache is keyed by
+  ``(server_name, config_hash)`` — when the user changes a connector's config,
+  the old session is closed and a fresh one is created.
 * Failures are isolated per-server: a broken connector never takes down the
   whole turn — it is skipped and a warning is emitted to the UI.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.tools import StructuredTool
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+
+# ---------------------------------------------------------------------------
+# Session cache — persistent MCP connections between turns
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=False, slots=True)
+class _CachedSession:
+    """A live MCP server session that persists across turns."""
+    stack: AsyncExitStack
+    session: ClientSession
+    raw_tools: list[Any]  # mcp.types.Tool objects
+    config_hash: str
+
+
+# Module-level: server name → _CachedSession
+_session_cache: dict[str, _CachedSession] = {}
+
+
+def _config_hash(cfg: dict) -> str:
+    """Deterministic fingerprint of an MCP server config."""
+    blob = json.dumps(cfg, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def _json_schema_from_input(input_schema: dict | None) -> dict:
@@ -48,6 +74,19 @@ def _json_schema_from_input(input_schema: dict | None) -> dict:
         "properties": props,
         "required": input_schema.get("required", []),
     }
+
+
+def _tool_input_schema(tool: Any) -> dict | None:
+    """Read an MCP tool's input schema, tolerating both attribute spellings.
+
+    The official ``mcp`` Python SDK returns ``Tool.input_schema`` (snake_case),
+    while raw MCP wire payloads and older mocks use ``inputSchema`` (camelCase).
+    """
+    for attr in ("input_schema", "inputSchema"):
+        schema = getattr(tool, attr, None)
+        if isinstance(schema, dict):
+            return schema
+    return None
 
 
 async def _call_mcp_tool(
@@ -117,10 +156,10 @@ def _make_tool(
     )
 
     return StructuredTool.from_function(
-        func=_func,
+        coroutine=_func,
         name=qualified,
         description=_func.__doc__ or qualified,
-        args_schema=_json_schema_from_input(getattr(tool, "inputSchema", None)),
+        args_schema=_json_schema_from_input(_tool_input_schema(tool)),
     )
 
 
@@ -128,19 +167,18 @@ async def _connect_stdio(
     name: str,
     cfg: dict,
     emit: Callable[[dict], None],
-) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
-    """Open a stdio MCP server and return (tools, cleanup).
+) -> tuple[AsyncExitStack, ClientSession, list[Any]]:
+    """Open a stdio MCP server and return (stack, session, raw_tools).
 
-    We use an ``AsyncExitStack`` so the ``stdio_client`` (and its underlying
-    anyio task group) and the ``ClientSession`` are opened and closed in the
-    SAME task. Opening them with a bare ``__aenter__`` and closing elsewhere
-    raises ``RuntimeError: Attempted to exit cancel scope in a different task``
-    because anyio binds the task group to the entering task — so the whole
-    server would silently fail to load. The stack is unwound in ``_cleanup``.
+    The ``AsyncExitStack`` must stay alive as long as the session is in use.
+    Closing it from a different async task than the one that opened it would
+    raise ``RuntimeError: Attempted to exit cancel scope in a different task``
+    (anyio limitation), so the stack is stored in the session cache and only
+    closed when the server config changes or the app shuts down.
     """
     command = cfg.get("command")
     if not command:
-        return [], (lambda: _noop())
+        raise ValueError(f"MCP server {name!r}: no command specified")
 
     params = StdioServerParameters(
         command=str(command),
@@ -153,24 +191,18 @@ async def _connect_stdio(
     session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
     await session.initialize()
     mlist = await session.list_tools()
-    tools = [_make_tool(name, t, session, emit) for t in (mlist.tools or [])]
-
-    async def _cleanup() -> None:
-        with suppress(Exception):
-            await stack.aclose()
-
-    return tools, _cleanup
+    return stack, session, list(mlist.tools or [])
 
 
 async def _connect_http(
     name: str,
     cfg: dict,
     emit: Callable[[dict], None],
-) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
-    """Open an HTTP/SSE MCP server and return (tools, cleanup)."""
+) -> tuple[AsyncExitStack, ClientSession, list[Any]]:
+    """Open an HTTP/SSE MCP server and return (stack, session, raw_tools)."""
     url = cfg.get("url")
     if not url:
-        return [], (lambda: _noop())
+        raise ValueError(f"MCP server {name!r}: no url specified")
 
     # Prefer the modern streamable-http transport; fall back to SSE for legacy
     # servers. Imported lazily so a missing extra doesn't break stdio servers.
@@ -189,32 +221,14 @@ async def _connect_http(
     elif sse_client is not None:
         ctx = sse_client(url)
     else:
-        emit(
-            {
-                "kind": "warn",
-                "content": f"MCP server {name!r}: no HTTP/SSE client available.",
-            }
-        )
-        return [], (lambda: _noop())
+        raise RuntimeError(f"MCP server {name!r}: no HTTP/SSE client available")
 
-    # Same AsyncExitStack pattern as stdio: open and close in the same task so
-    # anyio's cancel scope is never crossed (avoids the "different task" error).
     stack = AsyncExitStack()
     read_stream, write_stream, _ = await stack.enter_async_context(ctx)
     session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
     await session.initialize()
     mlist = await session.list_tools()
-    tools = [_make_tool(name, t, session, emit) for t in (mlist.tools or [])]
-
-    async def _cleanup() -> None:
-        with suppress(Exception):
-            await stack.aclose()
-
-    return tools, _cleanup
-
-
-async def _noop() -> None:
-    return None
+    return stack, session, list(mlist.tools or [])
 
 
 async def build_mcp_tools(
@@ -223,31 +237,59 @@ async def build_mcp_tools(
 ) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
     """Connect to every configured MCP server and return (tools, cleanup).
 
-    ``mcp_servers`` maps a connector name to its config dict (``command``/``args``
-    for stdio, or ``url`` for HTTP/SSE). Returns the flattened list of
-    ``StructuredTool`` instances plus a ``cleanup`` coroutine that closes every
-    opened session — the caller MUST await it in a ``finally`` block when the
-    turn ends.
+    Sessions are **cached** between calls: if a server with the same name and
+    config was already connected, its live ``ClientSession`` is reused — the
+    browser (or other long-running MCP tool) stays open across turns so the
+    model can interact with it incrementally (e.g. navigate → read → click).
 
-    A failure on any single server is isolated: the server is skipped, a warning
-    is emitted, and the remaining servers are still wired up.
+    When the user changes a connector's config the old session is closed and a
+    fresh one is created.  The ``cleanup`` coroutine returned here is a no-op
+    for cached sessions; use ``shutdown_mcp_sessions()`` to close everything
+    on app exit.
     """
     tools: list[StructuredTool] = []
-    cleanups: list[Callable[[], Awaitable[None]]] = []
 
     for name, cfg in (mcp_servers or {}).items():
         if not isinstance(cfg, dict):
             continue
+        h = _config_hash(cfg)
+        cached = _session_cache.get(name)
+
+        # --- cache hit: same config → reuse live session ---
+        if cached and cached.config_hash == h:
+            new_tools = [_make_tool(name, t, cached.session, emit) for t in cached.raw_tools]
+            tools.extend(new_tools)
+            print(
+                f"[coder] MCP server {name!r}: reused session ({len(new_tools)} tool(s))",
+                flush=True,
+            )
+            continue
+
+        # --- cache miss (or config changed): connect fresh ---
+        # Close the old session if the config changed.
+        if cached:
+            print(f"[coder] MCP server {name!r}: config changed, reconnecting", flush=True)
+            with suppress(Exception):
+                await cached.stack.aclose()
+            _session_cache.pop(name, None)
+
         try:
             if cfg.get("url"):
-                srv_tools, cleanup = await _connect_http(name, cfg, emit)
+                stack, session, raw_tools = await _connect_http(name, cfg, emit)
             else:
-                srv_tools, cleanup = await _connect_stdio(name, cfg, emit)
-            if srv_tools:
-                tools.extend(srv_tools)
-                cleanups.append(cleanup)
+                stack, session, raw_tools = await _connect_stdio(name, cfg, emit)
+
+            if raw_tools:
+                _session_cache[name] = _CachedSession(
+                    stack=stack,
+                    session=session,
+                    raw_tools=raw_tools,
+                    config_hash=h,
+                )
+                new_tools = [_make_tool(name, t, session, emit) for t in raw_tools]
+                tools.extend(new_tools)
                 print(
-                    f"[coder] MCP server {name!r}: loaded {len(srv_tools)} tool(s)",
+                    f"[coder] MCP server {name!r}: loaded {len(new_tools)} tool(s)",
                     flush=True,
                 )
             else:
@@ -264,9 +306,17 @@ async def build_mcp_tools(
                 }
             )
 
-    async def _cleanup_all() -> None:
-        for c in cleanups:
-            with suppress(Exception):
-                await c()
+    async def _noop_cleanup() -> None:
+        # Cached sessions persist across turns — nothing to close here.
+        pass
 
-    return tools, _cleanup_all
+    return tools, _noop_cleanup
+
+
+async def shutdown_mcp_sessions() -> None:
+    """Close all cached MCP sessions.  Called on app exit."""
+    for name, cached in list(_session_cache.items()):
+        with suppress(Exception):
+            await cached.stack.aclose()
+        print(f"[coder] MCP server {name!r}: session closed", flush=True)
+    _session_cache.clear()

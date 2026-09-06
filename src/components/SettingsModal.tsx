@@ -1612,7 +1612,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 are stored in the app database and changes apply on the next message in any mode.
                 Env/header values support{' '}
                 <code>{'${VAR}'}</code> and <code>{'${VAR:-default}'}</code> expansion from your shell
-                environment. Add a new connector by typing <code>/mcp &lt;description&gt;</code> in the chat,
+                environment. Add a new connector by typing <code>/create-mcp &lt;description&gt;</code> in the chat,
                 or press <b>+ Add MCP</b> above.
               </div>
               <div className="settings-search">
@@ -1639,7 +1639,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   />
                 )}
                 {Object.entries(mcpServers).length === 0 && !addingMcp && (
-                  <div className="hint">No MCP connectors yet. Add one with <code>/mcp &lt;description&gt;</code> in the chat.</div>
+                  <div className="hint">No MCP connectors yet. Add one with <code>/create-mcp &lt;description&gt;</code> in the chat.</div>
                 )}
                 {Object.entries(mcpServers)
                   .filter(([name, cfg]) => {
@@ -1678,7 +1678,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="hint">
                 Skills are stored in the app database and matched to your messages semantically:
                 when a request matches a skill, the agent follows its instructions. Create new skills
-                by typing <code>/skill &lt;description&gt;</code> in the chat, or add them here.
+                by typing <code>/create-skill &lt;description&gt;</code> in the chat, or add them here.
               </div>
               <div className="settings-search">
                 <input
@@ -1691,7 +1691,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
               <div className="skill-list" ref={skillListRef}>
                 {skills.length === 0 && (
-                  <div className="hint">No skills yet. Create one with <code>/skill &lt;description&gt;</code> in the chat.</div>
+                  <div className="hint">No skills yet. Create one with <code>/create-skill &lt;description&gt;</code> in the chat.</div>
                 )}
                 {expandedSkills.has(NEW_SKILL_KEY) && (
                   <div className="skill-card open">

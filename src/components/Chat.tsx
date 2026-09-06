@@ -128,11 +128,11 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "undo", hint: "Undo the last user/assistant exchange" },
   { name: "redo", hint: "Redo the last undone exchange" },
   {
-    name: "skill",
+    name: "create-skill",
     hint: "Create a skill (describe what you want after the command)",
   },
   {
-    name: "mcp",
+    name: "create-mcp",
     hint: "Create an MCP connector (describe what you want after the command)",
   },
 ];
@@ -2439,17 +2439,18 @@ export function ChatPanel() {
               .join("\n"),
         });
         break;
-      case "/skill":
-      case "/mcp": {
-        const target = word === "/skill" ? "skill" : "MCP connector";
+      case "/create-skill":
+      case "/create-mcp": {
+        const target =
+          word === "/create-skill" ? "skill" : "MCP connector";
         const rest = v.slice(word.length).trim();
         if (!rest) {
           s.addMessage(ch?.id ?? "", {
             role: "assistant",
             content:
-              word === "/skill"
-                ? `Usage: \`/skill <description>\` — describe the skill you want after the command, e.g. \`/skill summarize a project's git log into release notes\`.`
-                : `Usage: \`/mcp <description>\` — describe the tool/connector you want after the command, e.g. \`/mcp a way to search YouTube\`.`,
+              word === "/create-skill"
+                ? `Usage: \`/create-skill <description>\` — describe the skill you want after the command, e.g. \`/create-skill summarize a project's git log into release notes\`.`
+                : `Usage: \`/create-mcp <description>\` — describe the tool/connector you want after the command, e.g. \`/create-mcp a way to search YouTube\`.`,
           });
           return;
         }
@@ -3149,6 +3150,21 @@ export function ChatPanel() {
     stoppedRef.current = true;
     useStore.getState().setChatPendingAsk(chatIdRef.current, null);
     useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+    // Clear any retry banner immediately. The banner's visibility
+    // (`effectiveRetry = retryingMsg?.retry ?? ...`) depends ONLY on
+    // `message.retry`, not on `busy` — so without this, a live "Provider
+    // hiccup / retry in Xs" banner keeps showing (frozen once its local
+    // countdown hits 0 → "retrying…") after Stop, even though busy already
+    // flipped false and the Stop button itself reverted to Send. The async
+    // finally in send() will eventually clear it once streamChat's promise
+    // rejects, but that's not instant — clear it eagerly here so the banner
+    // disappears the moment Stop is clicked, same as dismissRetry does.
+    const msgs = chat?.messages ?? [];
+    const target =
+      retryingMsg ?? [...msgs].reverse().find((m) => m.role === "assistant");
+    if (target?.retry) {
+      useStore.getState().updateMessage(target.id, { retry: null });
+    }
     // Abort both the local controller and the store-level one. The store
     // controller is the "authoritative" one used by the stall watchdog and
     // retryMessage, so always try it. Wrap in try/catch because abort()

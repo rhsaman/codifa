@@ -753,17 +753,14 @@ const TraceRow = memo(function TraceRow({ activity }: { activity: ToolActivity }
           {activity.items && activity.items.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
-              <div className="trace-expand-results">
-                {activity.items.map((it, i) => (
-                  it.url ? (
-                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
-                      {it.title || it.url}
-                    </a>
-                  ) : (
-                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
-                  )
-                ))}
-              </div>
+              {activity.tool === 'web_search' || activity.tool === 'fetch_url' ? (
+                <WebResultLinks items={activity.items} />
+              ) : (
+                <FileResultLinks
+                  tool={activity.tool}
+                  items={activity.items as unknown as Array<Record<string, unknown>>}
+                />
+              )}
             </div>
           )}
         </div>
@@ -994,17 +991,14 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           {activity.items && activity.items.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
-              <div className="trace-expand-results">
-                {activity.items.map((it, i) => (
-                  it.url ? (
-                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
-                      {it.title || it.url}
-                    </a>
-                  ) : (
-                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
-                  )
-                ))}
-              </div>
+              {activity.tool === 'web_search' || activity.tool === 'fetch_url' ? (
+                <WebResultLinks items={activity.items} />
+              ) : (
+                <FileResultLinks
+                  tool={activity.tool}
+                  items={activity.items as unknown as Array<Record<string, unknown>>}
+                />
+              )}
             </div>
           )}
         </div>
@@ -1096,17 +1090,14 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
           {activity.items && activity.items.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
-              <div className="trace-expand-results">
-                {activity.items.map((it, i) => (
-                  it.url ? (
-                    <a key={i} className="trace-expand-link" href={it.url} target="_blank" rel="noreferrer">
-                      {it.title || it.url}
-                    </a>
-                  ) : (
-                    <span key={i} className="trace-expand-result-item">{it.title || it.snippet || ''}</span>
-                  )
-                ))}
-              </div>
+              {activity.tool === 'web_search' || activity.tool === 'fetch_url' ? (
+                <WebResultLinks items={activity.items} />
+              ) : (
+                <FileResultLinks
+                  tool={activity.tool}
+                  items={activity.items as unknown as Array<Record<string, unknown>>}
+                />
+              )}
             </div>
           )}
         </div>

@@ -42,8 +42,7 @@ try {
 }
 
 console.log('2) کلاس و نام پروایدر درست رندر شده‌اند:')
-check('badge پروایدر کلاس tool-engine-badge دارد', html.includes('tool-engine-badge'))
-check('کلاس پایه tool-badge همچنان روی آن است', html.includes('tool-badge'))
+check('badge پروایدر کلاس trace-row-engine دارد', html.includes('trace-row-engine'))
 check('نام پروایدر (tavily) نمایش داده شد', html.includes('tavily'))
 
 console.log('3) بدون engine → badge نمایش داده نمی‌شود:')
@@ -55,7 +54,7 @@ try {
 } catch (e) {
   check('رندر شد', false, e)
 }
-check('بدون engine کلاس tool-engine-badge نمایش داده نشد', !html2.includes('tool-engine-badge'))
+check('بدون engine کلاس trace-row-engine نمایش داده نشد', !html2.includes('trace-row-engine'))
 
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)

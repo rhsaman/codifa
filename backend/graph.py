@@ -83,6 +83,7 @@ from llm import (
     strip_orphaned_tool_calls,
 )
 from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
+from tool_message_projection import project_tool_results
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
 # Tool calls in this set mutate persistent state (files, terminal, saved
@@ -688,6 +689,23 @@ def merge_mcp_tools(
     return browser_live
 
 
+def _mcp_server_of(t: Any) -> str:
+    """نام سرور MCP پشتیبان یک ابزار — از metadata، یا از نام qualified.
+
+    ابزارها معمولاً با نام کوتاه bind می‌شوند (``browser_navigate``) و سرور
+    را در ``metadata["mcp_server"]`` حمل می‌کنند؛ نام qualified
+    (``mcp__<server>__<tool>``) فقط fallback برخورد است. نام کوتاه بدون
+    metadata سرورِ ناشناخته است (نه IndexError).
+    """
+    meta = getattr(t, "metadata", None) or {}
+    if meta.get("mcp_server"):
+        return str(meta["mcp_server"])
+    parts = getattr(t, "name", "").split("__", 2)
+    if len(parts) == 3 and parts[0] == "mcp":
+        return parts[1]
+    return ""
+
+
 def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     """Per-turn note telling the model which MCP connectors are live.
 
@@ -695,17 +713,12 @@ def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     WEB RESEARCH RULE: web_search is disabled this turn and all web research
     must be done by driving the browser tools.
     """
-    servers = sorted(
-        {
-            t.name.split("__", 2)[1]
-            for t in mcp_tools
-            if getattr(t, "name", "").startswith("mcp__")
-        }
-    )
+    servers = sorted({s for s in (_mcp_server_of(t) for t in mcp_tools) if s})
     note = (
         "=== MCP CONNECTORS (live this turn) ===\n"
-        f"Connected: {', '.join(servers)}. Their tools (mcp__<server>__<tool>) "
-        "are bound and callable now."
+        f"Connected: {', '.join(servers)}. Their tools are bound under their SHORT "
+        "names (e.g. browser_navigate, container_list) and callable now; only a "
+        "name collision falls back to mcp__<server>__<tool>."
     )
     if browser_live:
         note += (
@@ -983,41 +996,39 @@ async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | Non
     return result
 
 
-def _build_skills_section(
-    picked_names: list[str],
-    root: str,
-    desc_limit: int = 100,
-) -> str:
+def _build_skills_section(picked_names: list[str], root: str) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
-    Attached/picked skills have their FULL body inlined (so the agent adopts
-    the skill's role and follows its instructions); every other known skill is
-    listed compactly in ``AVAILABLE SKILLS`` (name + description only). When
-    nothing is loaded, returns an empty string.
+    ONLY attached/picked skills are inlined (full body) — there is no
+    general ``AVAILABLE SKILLS`` catalog in the prompt. Skills are selected
+    via @mention in the UI; the model never needs the full list to find or
+    activate one, so an unpicked turn adds zero skill tokens.
 
     This is intentionally independent of ``_skill_names_to_strip``: stripping a
     skill's *name* out of the search-keyword derivation must never prevent its
     *body* from being inlined here — the skill is still fully used."""
+    manual_names = list(dict.fromkeys(
+        n.strip().casefold() for n in picked_names if n and n.strip()
+    ))
+    if not manual_names:
+        return ""
     all_skills = _agents._load_skills(root)
     if not all_skills:
         return ""
+    by_name = {s["name"].casefold(): s for s in all_skills}
     picked: list[dict] = []
-    manual_names = [n.strip() for n in picked_names if n and n.strip()]
-    if manual_names:
-        by_name = {s["name"].lower(): s for s in all_skills}
-        picked = [by_name[n.lower()] for n in manual_names if n.lower() in by_name]
-    section = _agents._skills_section(
-        [s for s in all_skills if s["name"] not in {p["name"] for p in picked}],
-        desc_limit=desc_limit,
+    for n in manual_names:
+        skill = by_name.get(n)
+        if skill is not None and skill not in picked:
+            picked.append(skill)
+    if not picked:
+        return ""
+    bodies = "\n\n".join(
+        f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
+        f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
+        for s in picked
     )
-    if picked:
-        bodies = "\n\n".join(
-            f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
-            f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
-            for s in picked
-        )
-        section = "\n\n=== ATTACHED SKILLS ===\n" + bodies + section
-    return section
+    return "\n\n=== ATTACHED SKILLS ===\n" + bodies
 
 
 def _dedup_code_map(
@@ -1285,8 +1296,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     mcp_cleanup = None
     _mcp_servers = state.get("mcp_servers") or {}
     if _mcp_servers:
+        # Native tool names are reserved: an MCP tool whose short name
+        # collides with one of them falls back to its fully qualified
+        # mcp__<server>__<tool> binding (see _make_tool).
         mcp_tools, mcp_cleanup = await build_mcp_tools(
-            _mcp_servers, lambda ev: queue.put_nowait(ev)
+            _mcp_servers,
+            lambda ev: queue.put_nowait(ev),
+            reserved_names=set(filtered),
         )
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
@@ -1427,14 +1443,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if _ws_summary:
             system_final += _ws_summary
 
-    # Skills. small_ctx → list names only (no description) to save tokens.
-    system_final += _build_skills_section(
-        skills or [],
-        root,
-        desc_limit=(
-            _agents._SMALL_CTX_SKILL_DESC_LIMIT if small_ctx else 100
-        ),
-    )
+    # Skills: only @mentioned skills are inlined (no general catalog).
+    system_final += _build_skills_section(skills or [], root)
 
     if mode in ("plan", "coder"):
         try:
@@ -2574,7 +2584,8 @@ async def _run_mode_turn(
                 # text content is still visible to the model.
                 strip_orphaned_tool_calls(msgs)
 
-                async for chunk in bound.astream(msgs):
+                request_messages = project_tool_results(msgs)
+                async for chunk in bound.astream(request_messages):
                     # Check for cancellation at each chunk so the Stop button
                     # properly interrupts the provider call (llama.cpp / local servers).
                     if asyncio.current_task().cancelled():
@@ -4258,8 +4269,8 @@ def _repo_source_files(root: str, max_files: int = 600) -> list[str]:
 def _is_skill_path(path: str) -> bool:
     """True for skill methodology files (e.g. ``backend/skills/*.md``).
 
-    Skills are already injected via the system prompt (AVAILABLE SKILLS /
-    inlined body), so the explore pipeline must never re-discover or read them
+    Skills are already injected via the system prompt (inlined body of the
+    @mentioned skill), so the explore pipeline must never re-discover or read them
     as project code — that wastes context and can confuse the planner into
     treating a skill's instructions as something to modify."""
     return "skills" in re.split(r"[/\\]", (path or "").strip())

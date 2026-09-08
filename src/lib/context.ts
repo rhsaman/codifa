@@ -158,23 +158,13 @@ export function contextWarn(used: number, usable: number | null): boolean {
 /**
  * Resolve the context-meter token count shown in the sidebar.
  *
- * The meter must show the TRUE context sent to the model this turn — the full
- * non-compacted history (system prompt + every user/assistant exchange) — NOT
- * just the last message's provider-reported `usage`.
- *
- * Some providers are stateful or only surface billable (non-cached) tokens, so
- * their per-turn `usage` can be far smaller than the real context (the meter
- * would then "only show the latest message" and keep shrinking). We therefore
- * estimate the real context directly from the history we actually send
- * (`estimateContextChars`) — provider-independent and always correct — and use
- * that as the baseline. When the provider reports a usage for the latest
- * assistant turn that is at least as large as our estimate (i.e. it reports the
- * full context, cache included), we trust it for precision; otherwise the
- * estimate wins. This is the opencode-faithful behaviour: opencode's TUI shows
- * the last message's `tokens.total`, which already equals the whole context
- * because the full history is re-sent every turn — and when a provider
- * under-reports, our estimate restores that true context instead of collapsing
- * to a single message.
+ * The meter mirrors opencode's TUI: it shows the LATEST assistant turn's
+ * provider-reported token total (`total_tokens`), which already equals the
+ * whole context because the full history is re-sent every turn. When the
+ * provider has not reported a usage event yet (fresh chat, mid-stream before
+ * the first usage arrives, or a usage without input_tokens), we fall back to
+ * the local history estimate (`estimateContextTokens`) so the meter never
+ * collapses to 0.
  *
  * `chat.usage` (per-model SESSION total, only-ever-growing) is intentionally
  * NOT used here — it is a lifetime counter, not the current context window.
@@ -187,13 +177,6 @@ export function computeContextUsed(
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
 
-  // The local history estimate (system prompt + every non-compacted exchange)
-  // reflects the TRUE context sent to the model. It is always computed first
-  // and serves as the baseline.
-  const estimated = Math.round(
-    estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN,
-  )
-
   // Find the latest assistant usage event.
   let last: TokenUsage | null = null
   for (const m of active) {
@@ -201,22 +184,21 @@ export function computeContextUsed(
     if (u && m.role === "assistant") last = u
   }
 
-  // Some providers are stateful or only surface billable (non-cached) tokens,
-  // so their per-turn usage can be far smaller than the real context.  We only
-  // trust the provider value when it is AT LEAST as large as our local
-  // estimate — meaning the provider is reporting the full context (cache
-  // included) — otherwise the estimate wins.
+  // The provider's `totalTokens` (the backend's `total_tokens`) is the real
+  // measured context: it already encodes whether cache is additive (Anthropic)
+  // or a subset of input (OpenAI / OpenRouter / Google). Once it has arrived
+  // and is positive it WINS — even when smaller than the local estimate, since
+  // the estimate's builtin-prompt floor over-estimates tiny turns. When it is
+  // omitted, fall back to just inputTokens (not the hand-sum of breakdown
+  // fields, which can double-count cache for subset providers).
   if (last && (last.inputTokens ?? 0) > 0) {
-    // Prefer the provider's `totalTokens` (the backend's `total_tokens`): it
-    // already encodes whether cache is additive (Anthropic) or a subset of
-    // input (OpenAI / OpenRouter / Google).  When omitted, fall back to just
-    // inputTokens (not the hand-sum of breakdown fields, which can double-count
-    // cache for subset providers).
     const providerTotal = last.totalTokens ?? last.inputTokens ?? 0
-    if (providerTotal >= estimated) return providerTotal
+    if (providerTotal > 0) return providerTotal
   }
-  // No usage yet, or provider under-reports: the local estimate wins.
-  return estimated
+
+  // No usage yet: the local estimate (system prompt + every non-compacted
+  // exchange) approximates the context that will be sent this turn.
+  return estimateContextTokens(chat, systemPrompt, contextWindow)
 }
 
 /** Resolve a model's context window from the provider's contextMap, trying

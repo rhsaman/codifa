@@ -113,10 +113,10 @@ def test_comma_form_excluded_from_patterns():
 
 def test_mentioned_skill_stripped_when_state_skills_empty(monkeypatch):
     # A skill referenced only via an @mention in the text may not land in
-    # state["skills"] (the frontend can send skills: []). The model still knows
-    # the name from the AVAILABLE SKILLS section, so it must still be scrubbed
-    # from search keywords. _skill_names_to_strip pulls every known skill name
-    # from the DB so the @mention form is caught even with empty state["skills"].
+    # state["skills"] (the frontend can send skills: []). The skill's name must
+    # still be scrubbed from search keywords. _skill_names_to_strip pulls every
+    # known skill name from the DB so the @mention form is caught even with
+    # empty state["skills"].
     from graph import _skill_names_to_strip, _strip_skill_mentions
 
     monkeypatch.setattr(
@@ -184,9 +184,9 @@ def test_attached_skill_body_is_inlined(monkeypatch):
 
 
 def test_unattached_skill_body_not_inlined(monkeypatch):
-    # A known but unattached skill must NOT have its body inlined (only listed
-    # compactly) -- keeps the token cost down and proves inlining is gated on
-    # actual attachment, not just presence in the DB.
+    # A known but unattached skill must NOT appear in the prompt at all (no
+    # general catalog, no body) -- keeps the token cost down and proves inlining
+    # is gated on actual attachment, not just presence in the DB.
     monkeypatch.setattr(
         graph._agents, "_load_skills",
         lambda root: [
@@ -195,8 +195,43 @@ def test_unattached_skill_body_not_inlined(monkeypatch):
         ],
     )
     section = graph._build_skills_section([], "/x")
-    assert "=== ATTACHED SKILLS ===" not in section
-    assert "SECRET-BODY" not in section
+    assert section == ""
+
+
+def test_unknown_pick_adds_no_catalog(monkeypatch):
+    # An unknown/renamed skill name must not fall back to listing every other
+    # skill (no general catalog, no fuzzy substitution).
+    monkeypatch.setattr(
+        graph._agents, "_load_skills",
+        lambda root: [
+            {"name": "Anthropic Frontend Design", "description": "UI helper",
+             "content": "SECRET-BODY"},
+        ],
+    )
+    assert graph._build_skills_section(["نام ناشناخته"], "/x") == ""
+
+
+def test_duplicate_picks_inline_once(monkeypatch):
+    # The same skill picked twice (e.g. slug + display name) inlines once.
+    monkeypatch.setattr(
+        graph._agents, "_load_skills",
+        lambda root: [
+            {"name": "Anthropic Frontend Design", "description": "UI helper",
+             "content": "FOLLOW-THESE-INSTRUCTIONS"},
+        ],
+    )
+    section = graph._build_skills_section(
+        ["anthropic frontend design", "Anthropic Frontend Design"], "/x"
+    )
+    assert section.count("===== SKILL: Anthropic Frontend Design =====") == 1
+
+
+def test_no_picks_skip_skill_load(monkeypatch):
+    # With no picks the section must be empty WITHOUT hitting the DB at all.
+    def boom(root):
+        raise AssertionError("DB نباید بارگیری شود")
+    monkeypatch.setattr(graph._agents, "_load_skills", boom)
+    assert graph._build_skills_section([], "/x") == ""
 
 
 def test_skill_used_but_name_excluded_from_search(monkeypatch):

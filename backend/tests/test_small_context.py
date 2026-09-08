@@ -2,8 +2,7 @@
 
 هدف: مطمئن شویم که:
   * تشخیص small_ctx درست است (و مقدار 0 = نامشخص، رفتار فعلی را عوض نمی‌کند)
-  * _skills_section در حالت desc_limit=0 فقط نام برمی‌گرداند (نه description)
-  * _skills_section در حالت desc_limit=100 (پیش‌فرض) رفتار قبلی را حفظ می‌کند
+  * _build_skills_section فقط اسکیل‌های انتخاب‌شده را تزریق می‌کند (بدون فهرست عمومی)
   * _read_project_memory با max_bytes کوچک، متن بلند را trim و marker اضافه می‌کند
   * ثابت‌های آستانه و سقف‌ها مقدار معقول دارند
 """
@@ -16,16 +15,15 @@ import time
 
 import pytest
 
+import graph
 from agents import (
     _PROJECT_MEMORY_MAX_BYTES,
     _SMALL_CTX_CODE_MAP_TOKENS,
     _SMALL_CTX_PROJECT_MEMORY_MAX,
     _SMALL_CTX_RAG_MAX_CHARS,
-    _SMALL_CTX_SKILL_DESC_LIMIT,
     _SMALL_CTX_THRESHOLD,
     _SMALL_CTX_TOOL_OUTPUT_MAX,
     _read_project_memory,
-    _skills_section,
     is_small_context,
 )
 
@@ -63,42 +61,35 @@ def test_is_small_context_handles_garbage():
     assert is_small_context(object()) is False
 
 
-# ---- _skills_section ----------------------------------------------------
+# ---- _build_skills_section (تزریق فقط اسکیل‌های انتخاب‌شده) --------------
 
 
-def test_skills_section_default_includes_description():
-    """پیش‌فرض (desc_limit=100): name + description کوتاه‌شده."""
-    out = _skills_section(
-        [{"name": "alpha", "description": "x" * 200, "content": ""}]
-    )
-    assert "alpha" in out
-    assert "—" in out
-    assert "…" in out  # description کوتاه شد
-
-
-def test_skills_section_desc_limit_zero_lists_names_only():
-    """small_ctx: desc_limit=0 → فقط نام skillها، بدون description و بدون جداکنندهٔ «—»."""
-    out = _skills_section(
-        [
-            {"name": "alpha", "description": "should not appear", "content": ""},
-            {"name": "beta", "description": "nor this", "content": ""},
+def test_skills_section_no_picks_returns_empty(monkeypatch):
+    """بدون انتخاب: خروجی خالی — حتی در کانتکست کوچک فهرست عمومی ساخته نمی‌شود."""
+    monkeypatch.setattr(
+        graph._agents, "_load_skills",
+        lambda root: [
+            {"name": "alpha", "description": "d", "content": "BODY-ALPHA"},
+            {"name": "beta", "description": "d", "content": "BODY-BETA"},
         ],
-        desc_limit=0,
     )
-    assert "- alpha" in out
-    assert "- beta" in out
-    assert "should not appear" not in out
-    assert "nor this" not in out
-    # متن هیچ description اضافه‌ای ندارد (نه «— description» نه description تنها).
-    for line in out.splitlines():
-        if line.startswith("- "):
-            # فرمت «- name — desc» نباید وجود داشته باشد
-            assert "—" not in line, f"name-only line should not contain em-dash: {line!r}"
+    assert graph._build_skills_section([], "/x") == ""
 
 
-def test_skills_section_empty_returns_empty_string():
-    assert _skills_section([]) == ""
-    assert _skills_section([], desc_limit=0) == ""
+def test_skills_section_picked_body_full_even_small_ctx(monkeypatch):
+    """با انتخاب: بدنهٔ کامل همان اسکیل تزریق می‌شود؛ بقیه غایب‌اند —
+    حتی در کانتکست کوچک بدنهٔ اسکیل انتخاب‌شده کامل می‌ماند (کوتاه نمی‌شود)."""
+    monkeypatch.setattr(
+        graph._agents, "_load_skills",
+        lambda root: [
+            {"name": "alpha", "description": "d", "content": "BODY-ALPHA"},
+            {"name": "beta", "description": "d", "content": "BODY-BETA"},
+        ],
+    )
+    out = graph._build_skills_section(["alpha"], "/x")
+    assert "BODY-ALPHA" in out
+    assert "BODY-BETA" not in out
+    assert "AVAILABLE SKILLS" not in out
 
 
 # ---- _read_project_memory ----------------------------------------------
@@ -152,7 +143,6 @@ def test_small_ctx_constants_are_reasonable():
     assert _SMALL_CTX_RAG_MAX_CHARS < 3_600
     assert _SMALL_CTX_TOOL_OUTPUT_MAX < 2_000
     assert _SMALL_CTX_PROJECT_MEMORY_MAX < _PROJECT_MEMORY_MAX_BYTES
-    assert _SMALL_CTX_SKILL_DESC_LIMIT == 0
 
 
 # ---- end-to-end: مسیر کامل ollama/llama.cpp → small_ctx -----------------

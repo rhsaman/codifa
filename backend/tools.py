@@ -54,17 +54,37 @@ SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
 SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
 
-# Parent search cache: avoids re-running ripgrep + re-distilling identical
-# searches. Module-level (NOT per-closure) so it is SHARED across the main
-# agent AND every sub-agent (explore/general) built from this module — and
-# across parallel explore agents in the same turn. This keeps tool-call counts
-# down (no redundant grep/glob) without any quality loss: the cached result is
-# byte-for-byte what a fresh scan would return. Keyed by
-# (tool, pattern, path, include, root) for grep/glob — root is included so two
-# different projects/workspaces sharing a pattern+path never cross-serve each
-# other's cached matches ("read" entries stay 4-tuples: they're keyed by the
-# already-root-resolved absolute path, so they can't collide across roots).
+# Formatted results include output limits in their keys. In-flight sharing
+# covers only raw scans, scoped to a workspace, event loop and edit generation.
 _parent_search_cache: dict[tuple[str, ...], str] = {}
+_search_generations: dict[str, int] = {}
+_search_inflight: dict[tuple, asyncio.Task[dict]] = {}
+
+
+async def _shared_search(
+    root: str,
+    key: tuple[str, ...],
+    generation: int,
+    scan: Callable[..., dict],
+    *args: Any,
+) -> dict:
+    """Share raw I/O only; each caller owns formatting, permissions and events."""
+    flight_key = (asyncio.get_running_loop(), root, generation, key)
+    task = _search_inflight.get(flight_key)
+    if task is None:
+        task = asyncio.create_task(asyncio.to_thread(scan, *args))
+        _search_inflight[flight_key] = task
+
+        def finished(done: asyncio.Task) -> None:
+            if _search_inflight.get(flight_key) is done:
+                del _search_inflight[flight_key]
+            # Retrieve exceptions even if every waiter was cancelled.
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finished)
+    # Cancelling one invocation must not cancel another invocation's scan.
+    return await asyncio.shield(task)
 
 
 def _invalidate_read_cache_for(path: str, root: str) -> None:
@@ -88,6 +108,7 @@ def _invalidate_read_cache_for(path: str, root: str) -> None:
         # Path escapes the sandbox: read_tool never cached it under this path,
         # but grep/glob entries for this root may still exist — fall through.
         norm = None
+    _search_generations[root] = _search_generations.get(root, 0) + 1
     stale = [
         k
         for k in _parent_search_cache
@@ -524,7 +545,15 @@ _SKIP_DIRS = {
 # ripgrep globs that exclude the deny-list dirs even when `--hidden` is passed
 # (rg would otherwise search inside `.git`/`node_modules` once hidden files are
 # enabled). `.DS_Store` is a file, so it needs its own negation glob.
-_RG_EXCLUDE_GLOBS = ["!{" + ",".join(sorted(_SKIP_DIRS)) + "}/**", "!.DS_Store"]
+# `.tmp-*` are the user's own scratch/throwaway files & folders (e.g.
+# `.tmp-codemap.mjs`, `.tmp-dedupe.mjs`) — never real workspace content, so
+# they're excluded the same way; a name-only glob (no leading path) matches
+# at any depth and, for a directory, stops rg from descending into it at all.
+_RG_EXCLUDE_GLOBS = [
+    "!{" + ",".join(sorted(_SKIP_DIRS)) + "}/**",
+    "!.DS_Store",
+    "!.tmp-*",
+]
 
 _TERMINAL_BLOCK = [
     (r"^\s*sudo\b", "sudo (privilege escalation) is blocked"),
@@ -740,9 +769,14 @@ def _walk_files(root: str) -> Sequence[str]:
         # workspace content the agent must see) but skip the deny-list
         # (`.git`, `.cache`, `node_modules`, …) — mirrors the renderer's
         # quick-open walk so Ctrl+P and the agent agree on what is visible.
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        # `.tmp-*` are the user's own scratch/throwaway files & folders (e.g.
+        # `.tmp-codemap.mjs`), never real workspace content — skipped the same
+        # way rg's `!.tmp-*` glob skips them (see _RG_EXCLUDE_GLOBS).
+        dirnames[:] = [
+            d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".tmp-")
+        ]
         for name in filenames:
-            if name == ".DS_Store":
+            if name == ".DS_Store" or name.startswith(".tmp-"):
                 continue
             found.append(os.path.join(dirpath, name))
             if len(found) >= MAX_FILES:
@@ -3355,8 +3389,8 @@ def make_tool_callbacks(
 
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
-        # Parent search cache key
-        cache_key = ("grep", pattern, path, include, root)
+        generation = _search_generations.get(root, 0)
+        cache_key = ("grep", pattern, path, include, root, str(max_results), str(tool_out_chars))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -3386,17 +3420,20 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             }
         )
         try:
-            # Offload the blocking scan to a worker thread so the event loop is
-            # free to run other gathered read-only tools concurrently (the
-            # asyncio.gather in graph.py/llm.py otherwise serializes them because
-            # a sync call freezes the loop until it returns).
-            result = await asyncio.to_thread(
-                search_in_files, root, pattern, path, SNIPPET_CONTEXT, include
+            result = await _shared_search(
+                root, ("grep", pattern, path, include, str(SNIPPET_CONTEXT)),
+                generation, search_in_files, root, pattern, path, SNIPPET_CONTEXT, include,
             )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("grep", msg))
             return f"ERROR searching {path}: {msg}"
+        except asyncio.CancelledError:
+            emit(_error_result("grep", "جست‌وجو لغو شد"))
+            raise
+        except Exception as exc:
+            emit(_error_result("grep", str(exc)))
+            raise
         if result.get("error"):
             msg = result["error"]
             emit(_error_result("grep", msg))
@@ -3445,7 +3482,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         else:
             note = ""
         raw = f"MATCHES for {pattern!r}\n" + "\n\n".join(lines) + note
-        _parent_search_cache[cache_key] = raw
+        if _search_generations.get(root, 0) == generation:
+            _parent_search_cache[cache_key] = raw
         # Send the structured results too (not just the summary) so a reconnect
         # can replay the tool without re-executing it (re-execution wastes
         # context). `items` carries the actual rows the model needs to see.
@@ -3533,8 +3571,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
-        # Parent search cache key
-        cache_key = ("glob", pattern, path, "", root)
+        generation = _search_generations.get(root, 0)
+        cache_key = ("glob", pattern, path, "", root, str(max_results))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -3564,9 +3602,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             }
         )
         try:
-            # Offload the blocking scan to a worker thread (see grep_tool) so
-            # gathered read-only tools actually run in parallel.
-            result = await asyncio.to_thread(glob_files, root, pattern, path)
+            result = await _shared_search(
+                root, ("glob", pattern, path), generation, glob_files, root, pattern, path,
+            )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("glob", msg))
@@ -3593,7 +3631,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             else ""
         )
         raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
-        _parent_search_cache[cache_key] = raw
+        if _search_generations.get(root, 0) == generation:
+            _parent_search_cache[cache_key] = raw
         # Send the structured results too (not just the summary) so a reconnect
         # can replay the tool without re-executing it (re-execution wastes
         # context). `items` carries the actual paths the model needs to see.

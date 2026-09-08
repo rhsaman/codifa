@@ -5,6 +5,8 @@ main agent in every mode (ask/plan/coder) whenever the web capability is not
 explicitly denied — the agent decides on its own when a web lookup is needed.
 They are only stripped when ``cap["web"]`` is explicitly ``False``.
 """
+import pytest
+
 from graph import filter_tools_for_mode
 
 _WEB = {"web_search", "fetch_url", "search_console"}
@@ -14,6 +16,22 @@ _ALL = (
     "grep", "glob", "read", "task", "update_plan", "memory",
     "search_memory", "ask_user", "request_permission",
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_parent_tools_ctx():
+    """``filter_tools_for_mode`` records its result in ``_PARENT_TOOLS_CTX``.
+
+    Reset it after every test so the fake toolset (nameless lambdas) never
+    leaks into later test files — a leaked value makes a `task` sub-agent
+    inherit the lambdas instead of the real tool registry (its `read` calls
+    then emit no events at all).
+    """
+    from tools import _PARENT_TOOLS_CTX
+
+    token = _PARENT_TOOLS_CTX.set(None)
+    yield
+    _PARENT_TOOLS_CTX.reset(token)
 
 
 def _fake_tools():

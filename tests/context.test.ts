@@ -29,30 +29,39 @@ const mkMsg = (role: string, usage: any, content = '') => ({
   compacted: false,
 })
 
-console.log('۱) meter reflects the FULL context (system + all history), not just the latest message:')
+console.log('۱) بدون usage برآورد با تاریخچه رشد می‌کند؛ با usage مقدار provider:')
 {
   const small = {
     messages: [
       mkMsg('user', null, 'x'.repeat(200)),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50 }, 'y'.repeat(200)),
+      mkMsg('assistant', null, 'y'.repeat(200)),
     ],
   }
   const big = {
     messages: [
       mkMsg('user', null, 'x'.repeat(200)),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50 }, 'y'.repeat(200)),
+      mkMsg('assistant', null, 'y'.repeat(200)),
       mkMsg('user', null, 'x'.repeat(200)),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50 }, 'y'.repeat(200)),
+      mkMsg('assistant', null, 'y'.repeat(200)),
       mkMsg('user', null, 'x'.repeat(200)),
-      mkMsg('assistant', { inputTokens: 100, outputTokens: 50 }, 'y'.repeat(200)),
+      mkMsg('assistant', null, 'y'.repeat(200)),
     ],
   }
   const smallUsed = computeContextUsed(small as any, '', 200000)
   const bigUsed = computeContextUsed(big as any, '', 200000)
-  // more history → larger true context; the meter is not "just the last message"
-  check('چت با تاریخچهٔ بیشتر کانتکست بزرگتری نشان می‌دهد', bigUsed > smallUsed, { smallUsed, bigUsed })
-  // the under-reported last-message usage (150) is overridden by the real estimate
-  check('متر زیرِ گزارش پروایدر نمی‌افتد (برآورد واقعی)', bigUsed > 150, bigUsed)
+  // more history → larger estimate; the meter is not "just the last message"
+  check('چت با تاریخچهٔ بیشتر برآورد بزرگتری نشان می‌دهد', bigUsed > smallUsed, { smallUsed, bigUsed })
+  check('برآورد مثبت است (نه 0)', bigUsed > 150, bigUsed)
+
+  // با usage واقعی، متر مقدار provider را نشان می‌دهد — حتی کوچکتر از برآورد
+  const withUsage = {
+    messages: [
+      mkMsg('user', null, 'x'.repeat(200)),
+      mkMsg('assistant', { inputTokens: 100, outputTokens: 50, totalTokens: 150 }, 'y'.repeat(200)),
+    ],
+  }
+  const usedWithUsage = computeContextUsed(withUsage as any, '', 200000)
+  check('با usage مقدار provider نمایش داده می‌شود (150)', usedWithUsage === 150, usedWithUsage)
 }
 
 console.log('۲) contextPercent uses raw window (no reserved subtraction):')

@@ -260,9 +260,26 @@ async def _call_mcp_tool(
 
 
 def is_browser_mcp_tool(name: str) -> bool:
-    """True for browser-control MCP tools (``mcp__<server>__browser_*``)."""
+    """True for browser-control MCP tools.
+
+    Accepts both the short binding (``browser_navigate``) and the fully
+    qualified fallback (``mcp__<server>__browser_*``).
+    """
+    if name.startswith("browser_"):
+        return True
     parts = name.split("__", 2)
     return len(parts) == 3 and parts[0] == "mcp" and parts[2].startswith("browser_")
+
+
+def _short_tool_name(server_name: str, tool_name: str) -> str:
+    """The compact binding name for an MCP tool.
+
+    ``mcp__playwright__browser_navigate`` → ``browser_navigate``. The server
+    prefix is dropped so the model sees short, readable tool names. The
+    qualified name stays available as a collision fallback (see
+    ``_make_tool``) and in the tool's ``mcp_server`` metadata.
+    """
+    return tool_name
 
 
 def _make_tool(
@@ -270,28 +287,41 @@ def _make_tool(
     tool: Any,
     session: ClientSession,
     emit: Callable[[dict], None],
+    reserved_names: set[str] | None = None,
 ) -> StructuredTool:
-    """Wrap a single MCP tool definition into a LangChain ``StructuredTool``."""
+    """Wrap a single MCP tool definition into a LangChain ``StructuredTool``.
+
+    The tool binds under its SHORT name (``browser_navigate``) — shorter names
+    cost fewer tokens and the model calls them more reliably. Only when that
+    short name collides with a native tool (or a tool from another MCP server)
+    does it fall back to the fully qualified ``mcp__<server>__<tool>`` form.
+    """
     tool_name = getattr(tool, "name", None) or "tool"
-    # Prefix to avoid collisions with native tools and across servers.
+    short = _short_tool_name(server_name, tool_name)
     qualified = f"mcp__{server_name}__{tool_name}"
+    # Prefix to avoid collisions with native tools and across servers.
+    binding = short if short not in (reserved_names or set()) else qualified
 
     async def _func(**kwargs: Any) -> str:
         return await _call_mcp_tool(
             session, tool_name, emit, server_name, qualified=qualified, **kwargs
         )
 
-    _func.__name__ = qualified
+    _func.__name__ = binding
     _func.__doc__ = (
         f"[MCP:{server_name}] {getattr(tool, 'description', '') or tool_name}"
     )
 
-    return StructuredTool.from_function(
+    st = StructuredTool.from_function(
         coroutine=_func,
-        name=qualified,
-        description=_func.__doc__ or qualified,
+        name=binding,
+        description=_func.__doc__ or binding,
         args_schema=_json_schema_from_input(_tool_input_schema(tool)),
     )
+    # Metadata for the tool-loop / UI: which MCP server backs this tool and
+    # its fully qualified name (the binding may be the short form).
+    st.metadata = {**(getattr(st, "metadata", None) or {}), "mcp_server": server_name, "mcp_qualified": qualified}
+    return st
 
 
 async def _connect_stdio(
@@ -378,6 +408,7 @@ async def _connect_http(
 async def build_mcp_tools(
     mcp_servers: dict | None,
     emit: Callable[[dict], None],
+    reserved_names: set[str] | None = None,
 ) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
     """Connect to every configured MCP server and return (tools, cleanup).
 
@@ -390,8 +421,14 @@ async def build_mcp_tools(
     fresh one is created.  The ``cleanup`` coroutine returned here is a no-op
     for cached sessions; use ``shutdown_mcp_sessions()`` to close everything
     on app exit.
+
+    ``reserved_names`` are tool names that must NOT be shadowed by an MCP
+    tool's short binding (native tool names + MCP tools already bound this
+    turn). An MCP tool whose short name collides falls back to its fully
+    qualified ``mcp__<server>__<tool>`` name.
     """
     tools: list[StructuredTool] = []
+    reserved = set(reserved_names or set())
 
     for name, cfg in (mcp_servers or {}).items():
         if not isinstance(cfg, dict):
@@ -401,7 +438,10 @@ async def build_mcp_tools(
 
         # --- cache hit: same config → reuse live session ---
         if cached and cached.config_hash == h:
-            new_tools = [_make_tool(name, t, cached.session, emit) for t in cached.raw_tools]
+            new_tools = [
+                _make_tool(name, t, cached.session, emit, reserved_names=reserved)
+                for t in cached.raw_tools
+            ]
             tools.extend(new_tools)
             print(
                 f"[coder] MCP server {name!r}: reused session ({len(new_tools)} tool(s))",
@@ -418,7 +458,10 @@ async def build_mcp_tools(
             # connected while we were waiting.
             cached = _session_cache.get(name)
             if cached and cached.config_hash == h:
-                new_tools = [_make_tool(name, t, cached.session, emit) for t in cached.raw_tools]
+                new_tools = [
+                    _make_tool(name, t, cached.session, emit, reserved_names=reserved)
+                    for t in cached.raw_tools
+                ]
                 tools.extend(new_tools)
                 print(
                     f"[coder] MCP server {name!r}: reused session ({len(new_tools)} tool(s))",
@@ -455,8 +498,15 @@ async def build_mcp_tools(
                         config_hash=h,
                         cfg=dict(cfg),
                     )
-                    new_tools = [_make_tool(name, t, session, emit) for t in raw_tools]
+                    new_tools = [
+                        _make_tool(name, t, session, emit, reserved_names=reserved)
+                        for t in raw_tools
+                    ]
                     tools.extend(new_tools)
+                    # Register every binding this server produced so a later
+                    # server's tool with the same short name falls back to its
+                    # qualified form instead of silently shadowing it.
+                    reserved.update(t.name for t in new_tools)
                     print(
                         f"[coder] MCP server {name!r}: loaded {len(new_tools)} tool(s)",
                         flush=True,

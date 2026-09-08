@@ -1650,7 +1650,6 @@ _MAX_PRESERVE_RECENT_TOKENS = 15_000
 # are unaffected. context_window=0 means "unknown" → safe default (no opt).
 _SMALL_CTX_THRESHOLD = 32_000
 _SMALL_CTX_CODE_MAP_TOKENS = 256  # was 512 (ask) / 1024 (coder/plan)
-_SMALL_CTX_SKILL_DESC_LIMIT = 0  # 0 = no description, only name
 _SMALL_CTX_RAG_MAX_CHARS = 1_500  # half of _DEFAULT_MAX_CHARS=3_600
 _SMALL_CTX_TOOL_OUTPUT_MAX = 1_200  # tighter than _TOOL_OUTPUT_MAX_CHARS=2_000
 _SMALL_CTX_PROJECT_MEMORY_MAX = 4_000  # tighter than _PROJECT_MEMORY_MAX_BYTES=12_000
@@ -3412,54 +3411,6 @@ def _load_skills(root: str) -> list[dict]:
             }
         )
     return skills
-
-
-def _skills_section(skills: list[dict], desc_limit: int = 100) -> str:
-    """Compact skill index for the system prompt (discovery only).
-
-    Skills come from the app database and cannot be reached through the
-    project-sandboxed read tool. This section is the discovery half of the
-    opencode/codex discovery → activation model: every skill stays as a compact
-    name + description line so the agent always knows what exists without paying
-    the token cost of every body on every turn. Full bodies are never inlined
-    here — skills are used only via @mention, which inlines their full
-    instructions.
-
-    ``desc_limit`` controls how much of each description is shown:
-      * default 100 → balanced (matches legacy behaviour)
-      * 0 → drop descriptions entirely, list names only (small-context mode)
-    """
-    if not skills:
-        return ""
-    if desc_limit <= 0:
-        lines = [
-            "\n\n=== AVAILABLE SKILLS ===",
-            (
-                "These skills are available. They are used ONLY when the user "
-                "explicitly attaches one with @mention in the message. Names only "
-                "are listed to keep the system prompt small; @mention inlines the "
-                "full instructions on demand."
-            ),
-        ]
-        for s in skills:
-            lines.append(f"- {s['name']}")
-        return "\n".join(lines)
-    lines = [
-        "\n\n=== AVAILABLE SKILLS ===",
-        (
-            "These skills are available. They are used ONLY when the user "
-            "explicitly attaches one with @mention in the message (the attached "
-            "skill's full instructions are inlined). The rest are listed by "
-            "name + description."
-        ),
-    ]
-    for s in skills:
-        name = s["name"]
-        desc = s["description"] or ""
-        if len(desc) > desc_limit:
-            desc = desc[: desc_limit - 1].rstrip() + "…"
-        lines.append(f"- {name} — {desc}" if desc else f"- {name}")
-    return "\n".join(lines)
 
 
 def _load_saved_plan(root: str, chat_id: str = "") -> str:

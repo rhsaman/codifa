@@ -78,6 +78,25 @@ console.log('6) حساسیت به حروف کوچک/بزرگ ندارد:')
   check('slug با حروف بزرگ هم کار می‌کند', skills[0] === 'Anthropic Frontend Design', skills)
 }
 
+console.log('7) منشن تکراری فقط یک انتخاب می‌سازد:')
+{
+  const { skills } = extractMentionSkills(
+    '@data-analysis و بعد دوباره @data-analysis',
+    SKILLS,
+  )
+  check('اسکیل تکراری یک‌بار انتخاب شد', skills.length === 1 && skills[0] === 'data-analysis', skills)
+}
+
+console.log('8) نام اسکیل بدون @ انتخاب نمی‌شود:')
+{
+  const { skills, cleaned } = extractMentionSkills(
+    'data-analysis رو برام توضیح بده',
+    SKILLS,
+  )
+  check('بدون @ انتخابی ساخته نشد', skills.length === 0, skills)
+  check('متن دست‌نخورده ماند', cleaned === 'data-analysis رو برام توضیح بده', cleaned)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

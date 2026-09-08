@@ -101,8 +101,12 @@ async def test_builds_structured_tools_from_session(monkeypatch):
 
     assert len(tools) == 1
     t = tools[0]
-    assert t.name == "mcp__demo__greet"
+    # Short binding: the server prefix is dropped from the tool name.
+    assert t.name == "greet"
     assert "MCP:demo" in (t.description or "")
+    # Metadata carries the backing server + the qualified name.
+    assert t.metadata["mcp_server"] == "demo"
+    assert t.metadata["mcp_qualified"] == "mcp__demo__greet"
 
     # The tool's schema must carry the MCP input schema's parameters so the
     # model sees the real parameter names (regression: input_schema vs inputSchema).
@@ -114,6 +118,74 @@ async def test_builds_structured_tools_from_session(monkeypatch):
     session.call_tool.assert_awaited_once_with("greet", arguments={"name": "world"})
 
     # Cleanup must be awaitable and not raise.
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_short_name_falls_back_on_collision(monkeypatch):
+    """An MCP tool whose short name collides with a reserved (native) tool
+    name must bind under its fully qualified ``mcp__<server>__<tool>`` name —
+    never shadow the native tool."""
+    tool = _fake_tool("read", "Read something")
+    session = _fake_session([tool])
+
+    monkeypatch.setattr(
+        "mcp_bridge.stdio_client", lambda params: _fake_stdio_client(session)
+    )
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session)
+
+    servers = {"demo": {"command": "echo", "args": ["hi"]}}
+    # "read" is a native tool → the MCP tool must fall back to the qualified name.
+    tools, cleanup = await build_mcp_tools(
+        servers, lambda ev: None, reserved_names={"read", "grep"}
+    )
+
+    assert len(tools) == 1
+    assert tools[0].name == "mcp__demo__read"
+    # Without the collision the same tool binds short.
+    tools2, _ = await build_mcp_tools(servers, lambda ev: None, reserved_names=set())
+    assert tools2[0].name == "read"
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_cross_server_short_name_collision(monkeypatch):
+    """دو سرور MCP با ابزار هم‌نام: اولی نام کوتاه می‌گیرد، دومی به نام
+    qualified برمی‌گردد — هیچ ابزاری دیگری را shadow نمی‌کند."""
+    session_a = _fake_session([_fake_tool("greet", "Greet from A")])
+    session_b = _fake_session([_fake_tool("greet", "Greet from B")])
+
+    def _client_for(session):
+        def _client(params):
+            return _fake_stdio_client(session)
+
+        return _client
+
+    monkeypatch.setattr("mcp_bridge.stdio_client", _client_for(session_a))
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session_a)
+
+    # سرور دوم باید session خودش را بگیرد — بر اساس command تفکیک می‌کنیم.
+    def _stdio_by_command(params):
+        if params.command == "server-b":
+            return _fake_stdio_client(session_b)
+        return _fake_stdio_client(session_a)
+
+    monkeypatch.setattr("mcp_bridge.stdio_client", _stdio_by_command)
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session_a)
+
+    servers = {
+        "a": {"command": "server-a", "args": []},
+        "b": {"command": "server-b", "args": []},
+    }
+    tools, cleanup = await build_mcp_tools(servers, lambda ev: None)
+
+    names = [t.name for t in tools]
+    # یکی کوتاه، دیگری qualified — هر دو قابل فراخوانی، بدون shadow.
+    assert sorted(names) == ["greet", "mcp__b__greet"]
+    # هر دو به سرور خودشان وصل‌اند (metadata درست است).
+    by_name = {t.name: t for t in tools}
+    assert by_name["greet"].metadata["mcp_server"] == "a"
+    assert by_name["mcp__b__greet"].metadata["mcp_server"] == "b"
     await cleanup()
 
 
@@ -206,7 +278,11 @@ async def test_real_docker_mcp_connects(monkeypatch):
         # The gateway advertises GitHub + fetch + hugging-face tools.
         names = {t.name for t in tools}
         assert len(tools) > 0
-        assert any(n.startswith("mcp__docker__") for n in names)
+        # Short bindings (no mcp__ prefix); a collision falls back to the
+        # qualified form, so both spellings are acceptable here.
+        assert any(
+            n.startswith("mcp__docker__") or not n.startswith("mcp__") for n in names
+        )
     finally:
         await cleanup()
 
@@ -248,7 +324,7 @@ async def test_broken_server_is_isolated(monkeypatch):
 
     # The broken server is skipped; the good one still yields its tool.
     assert len(tools) == 1
-    assert tools[0].name == "mcp__good__ok_tool"
+    assert tools[0].name == "ok_tool"
     # A warning event was emitted for the broken server.
     assert any(e.get("kind") == "warn" for e in events)
     await cleanup()

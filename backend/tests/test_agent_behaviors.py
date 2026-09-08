@@ -9,6 +9,7 @@ import json
 
 from mock_openai import text_reply, tool_call
 
+import agents
 from agents import _wrap_no_search_bypass, _wrap_readonly_terminal
 
 
@@ -69,14 +70,20 @@ async def test_agent_rejects_empty_prompt_with_error_event(run_events):
         f"expected an error event, got kinds={sorted({e.get('kind') for e in events})}"
 
 
-async def test_agent_surfaces_provider_failure(run_events, mock_server):
+async def test_agent_surfaces_provider_failure(run_events, mock_server, monkeypatch):
     """A hard provider rejection must surface as an error event, not hang or
     silently succeed — the UI depends on the failure propagating."""
+    # Zero the retry backoff (same pattern as test_retry_resume) so the 10
+    # retry attempts don't sleep 30s each — the test then finishes in seconds.
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
     _base, mock = mock_server
     mock.script = [None] * 20  # every request rejected with HTTP 400
     events = await run_events("سلام")
-    assert any(e.get("kind") == "error" for e in events), (
-        f"expected a provider-failure error event, got kinds="
+    # 400 is deliberately retryable (OpenRouter-style transient throttling),
+    # so the turn burns the full retry budget and then gives up — the UI's
+    # RetryBanner listens for `retry_giveup`, not `error`, on this path.
+    assert any(e.get("kind") == "retry_giveup" for e in events), (
+        f"expected a retry_giveup event after the budget is exhausted, got kinds="
         f"{sorted({e.get('kind') for e in events})}"
     )
 

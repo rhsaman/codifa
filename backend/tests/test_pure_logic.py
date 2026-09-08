@@ -1,15 +1,16 @@
 """Pure-logic tests: no network, no server, no LLM.
 
 These cover the deterministic parts of the agent — keyword extraction, the
-progressive-disclosure skills section, and the sub-agent model resolver. They
-run in milliseconds and are the fastest feedback loop in the suite.
+picked-skills injection, and the sub-agent model resolver. They run in
+milliseconds and are the fastest feedback loop in the suite.
 """
+import agents
+import graph
 from agents import (
     _fts_keywords,
     _is_code_task,
     _is_impl_task,
     _is_test_task,
-    _skills_section,
     _subagent_target,
 )
 from providers import OPENROUTER_BASE
@@ -44,44 +45,50 @@ def test_fts_keywords_dedupes_and_caps_terms():
 
 
 # ---------------------------------------------------------------------------
-# _skills_section (progressive disclosure)
+# _build_skills_section (تزریق فقط اسکیل‌های انتخاب‌شده با @)
 # ---------------------------------------------------------------------------
 
 
-def test_skills_section_empty_for_no_skills():
-    assert _skills_section([]) == ""
+def test_skills_section_no_picks_returns_empty(monkeypatch):
+    """بدون انتخاب: خروجی خالی و بدون بارگیری اسکیل‌ها از پایگاه‌داده."""
+    loaded = []
+
+    def fake_load(_root):
+        loaded.append(_root)
+        return [_skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A")]
+
+    monkeypatch.setattr(agents, "_load_skills", fake_load)
+    assert graph._build_skills_section([], "/x") == ""
+    assert loaded == [], "بدون انتخاب نباید فهرست اسکیل‌ها بارگیری شود"
 
 
-def test_skills_section_compact_when_nothing_picked():
-    a = _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A")
-    b = _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B")
-    section = _skills_section([a, b])
-    assert "Alpha — توضیح آلفا" in section
-    assert "Beta — توضیح بتا" in section
-    assert "BODY-A" not in section and "BODY-B" not in section, \
-        "no picked skill -> no body may be inlined"
+def test_skills_section_picked_skill_body_inlined(monkeypatch):
+    """با انتخاب: فقط بدنهٔ کامل همان اسکیل تزریق می‌شود؛ فهرست عمومی غایب است."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A"),
+        _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B"),
+    ])
+    out = graph._build_skills_section(["Alpha"], "/x")
+    assert "BODY-A" in out
+    assert "BODY-B" not in out, "اسکیل انتخاب‌نشده نباید تزریق شود"
+    assert "AVAILABLE SKILLS" not in out, "فهرست عمومی حذف شده است"
 
 
-def test_skills_section_never_inlines_bodies():
-    # Full bodies are NEVER inlined — they're only attached when the user
-    # @mentions a skill. The section is discovery-only (name + description).
-    a = _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A")
-    b = _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B")
-    section = _skills_section([a, b])
-    assert "BODY-A" not in section and "BODY-B" not in section, \
-        "no skill body may ever be inlined"
-    assert "@mention" in section, "section must tell the agent skills use @mention"
-    assert "read_skill" not in section, "read_skill tool was removed"
+def test_skills_section_duplicate_picks_inlined_once(monkeypatch):
+    """انتخاب تکراری یک اسکیل، فقط یک‌بار تزریق می‌شود."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+    ])
+    out = graph._build_skills_section(["Alpha", "alpha", "ALPHA"], "/x")
+    assert out.count("BODY-A") == 1
 
 
-def test_skills_section_truncates_long_descriptions():
-    long_desc = "این یک توضیح خیلی طولانی است که باید کوتاه شود " * 6
-    a = _skill("file://skills/a/skill.md", "Alpha", long_desc, "BODY-A")
-    section = _skills_section([a])
-    assert "BODY-A" not in section
-    line = next(l for l in section.splitlines() if l.startswith("- Alpha"))
-    assert len(line) <= 110, f"catalog line must be truncated, got {len(line)} chars"
-    assert line.endswith("…")
+def test_skills_section_unknown_pick_returns_empty(monkeypatch):
+    """انتخاب ناشناخته: خروجی خالی — بدون جایگزینی یا فهرست جایگزین."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+    ])
+    assert graph._build_skills_section(["ناموجود"], "/x") == ""
 
 
 # ---------------------------------------------------------------------------

@@ -1066,8 +1066,24 @@ function renderSegments(
     trace = [];
   };
 
-  const flush = (key: string) => {
+  const flush = () => {
     if (pending.length === 0) return;
+    // Keyed by the FIRST activity's own stable index into
+    // message.toolActivity — assigned once and never reused — NOT by the
+    // segment-scan position. A position-based key breaks under streaming:
+    // while a short narration line is still being typed, its FOLLOWING tool
+    // segment hasn't arrived yet, so `nextIsGroupable` below can't tell it
+    // apart from real prose and this run gets flushed early under one
+    // positional key. A moment later the tool call lands, the same line is
+    // correctly reclassified as a caption, and the run keeps accumulating
+    // before flushing again under a DIFFERENT positional key (e.g.
+    // "grp-end"). React sees a different key for what is, to the user, the
+    // same group — unmounts the old ToolGroupView and mounts a fresh one
+    // with open=false, which is the mid-stream "collapses by itself" bug.
+    // The first activity's index survives that reclassification: the group
+    // keeps one identity across renders no matter which scan point ends up
+    // triggering the flush.
+    const key = `grp-${pending[0].index}`;
     if (pending.length === 1) {
       // یک فراخوانی تکی: با caption مدل (اگر بود) در یک بلوکِ واحد رندر می‌شود —
       // به‌جای یک پاراگراف جدا بالای یک ردیف ابزارِ بی‌ربط.
@@ -1114,7 +1130,7 @@ function renderSegments(
   const segs = message.segments ?? [];
   segs.forEach((seg, i) => {
     if (seg.kind === "user") {
-      flush(`grp-${i}`);
+      flush();
       wrapTrace(`trace-${i}`);
       if (pendingCaption) {
         renderProse(`cap-${i}`, pendingCaption);
@@ -1136,7 +1152,7 @@ function renderSegments(
       // same treatment as an interleaved steer message above — the summary
       // message itself lives in the store (compactChat pushes it there too),
       // this segment just anchors where it renders.
-      flush(`grp-${i}`);
+      flush();
       wrapTrace(`trace-${i}`);
       if (pendingCaption) {
         renderProse(`cap-${i}`, pendingCaption);
@@ -1174,7 +1190,7 @@ function renderSegments(
       }
 
       // Genuine prose — flush whatever tool run was accumulating.
-      flush(`grp-${i}`);
+      flush();
       wrapTrace(`trace-${i}`);
       renderProse(String(i), seg.text);
       return;
@@ -1182,7 +1198,7 @@ function renderSegments(
     const activity = message.toolActivity?.[seg.index];
     if (!activity) return;
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
-      flush(`grp-${i}`);
+      flush();
       wrapTrace(`trace-${i}`);
       if (pendingCaption) {
         renderProse(`cap-${i}`, pendingCaption);
@@ -1201,7 +1217,7 @@ function renderSegments(
       pending.push({ activity, index: seg.index });
     }
   });
-  flush("grp-end");
+  flush();
   wrapTrace("trace-end");
   if (pendingCaption) renderProse("cap-end", pendingCaption);
   return nodes;

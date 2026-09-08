@@ -1251,23 +1251,30 @@ _BUILTIN_MCP_SERVERS: dict[str, dict] = {
         "command": "docker",
         "args": ["mcp", "gateway", "run"],
     },
+    "playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+    },
 }
 
 
 def seed_builtin_mcp() -> list[str]:
-    """Install the built-in MCP connectors on first run (no-op afterwards).
+    """Install built-in MCP connectors that are missing (no-op otherwise).
 
-    Seeds only when the ``mcp`` table is empty, so user edits/deletions are
-    never overwritten. Returns the names that were seeded.
+    Seeds every builtin whose name is NOT already in the ``mcp`` table —
+    existing entries (user edits) are never overwritten, and NEW builtins
+    (e.g. playwright added after docker) are seeded on the next start even
+    when the table already has entries.
     """
     try:
         existing = _state_db.list_mcp()
     except Exception:  # noqa: BLE001
         return []
-    if existing:
-        return []
+    existing_names = set(existing or {})
     seeded: list[str] = []
     for name, cfg in _BUILTIN_MCP_SERVERS.items():
+        if name in existing_names:
+            continue
         try:
             _state_db.save_mcp(name, json.dumps(cfg, ensure_ascii=False))
             seeded.append(name)

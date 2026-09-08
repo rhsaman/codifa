@@ -259,6 +259,12 @@ async def _call_mcp_tool(
     return summary
 
 
+def is_browser_mcp_tool(name: str) -> bool:
+    """True for browser-control MCP tools (``mcp__<server>__browser_*``)."""
+    parts = name.split("__", 2)
+    return len(parts) == 3 and parts[0] == "mcp" and parts[2].startswith("browser_")
+
+
 def _make_tool(
     server_name: str,
     tool: Any,

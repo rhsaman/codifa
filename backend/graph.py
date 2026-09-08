@@ -82,7 +82,7 @@ from llm import (
     llm_generate,
     strip_orphaned_tool_calls,
 )
-from mcp_bridge import build_mcp_tools
+from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
 # Tool calls in this set mutate persistent state (files, terminal, saved
@@ -664,6 +664,61 @@ def filter_tools_for_mode(
     return tools
 
 
+def merge_mcp_tools(
+    filtered: dict, mcp_tools: list, cap: dict | None
+) -> bool:
+    """Merge live MCP tools into the mode-filtered tool set.
+
+    Returns True when a browser MCP (Playwright) toolset is live. In that case
+    the built-in ``web_search`` tool is REMOVED — the browser replaces it for
+    web research (a soft preference alone loses to the static prompts that
+    push web_search). When ``cap`` denies web access, browser MCP tools are
+    dropped instead (they are web access too).
+    """
+    cap = cap or {}
+    browser_live = any(is_browser_mcp_tool(getattr(t, "name", "")) for t in mcp_tools)
+    if cap.get("web", True) is False:
+        mcp_tools = [
+            t for t in mcp_tools if not is_browser_mcp_tool(getattr(t, "name", ""))
+        ]
+    for t in mcp_tools:
+        filtered[t.name] = t
+    if browser_live:
+        filtered.pop("web_search", None)
+    return browser_live
+
+
+def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
+    """Per-turn note telling the model which MCP connectors are live.
+
+    When a browser MCP (Playwright) is connected the note also states the
+    WEB RESEARCH RULE: web_search is disabled this turn and all web research
+    must be done by driving the browser tools.
+    """
+    servers = sorted(
+        {
+            t.name.split("__", 2)[1]
+            for t in mcp_tools
+            if getattr(t, "name", "").startswith("mcp__")
+        }
+    )
+    note = (
+        "=== MCP CONNECTORS (live this turn) ===\n"
+        f"Connected: {', '.join(servers)}. Their tools (mcp__<server>__<tool>) "
+        "are bound and callable now."
+    )
+    if browser_live:
+        note += (
+            "\nWEB RESEARCH RULE: a browser MCP (Playwright) is connected, so the "
+            "built-in web_search tool is DISABLED this turn — do NOT call it. Do ALL "
+            "web research by driving the browser: browser_navigate (open a URL or a "
+            "search-engine results page), browser_snapshot / browser_evaluate (read "
+            "the page), browser_click / browser_type / browser_fill_form (interact). "
+            "fetch_url stays available for pulling a KNOWN url as markdown."
+        )
+    return note
+
+
 # ---------------------------------------------------------------------------
 # Sub-agent model resolution (web / compact / vision) -> LangChain models
 # ---------------------------------------------------------------------------
@@ -1233,8 +1288,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         mcp_tools, mcp_cleanup = await build_mcp_tools(
             _mcp_servers, lambda ev: queue.put_nowait(ev)
         )
-    for t in mcp_tools:
-        filtered[t.name] = t
+    browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
     # image directly to the main model, otherwise the model could never see it.
@@ -1645,6 +1699,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             f"{_mode_label}. Fully re-orient to {_mode_label} NOW — ignore the style, length, "
             f"format and constraints of any earlier turns; they are only history."
         )
+    if mcp_tools:
+        user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
     if code_map_block:
         user_parts.append(code_map_block)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated

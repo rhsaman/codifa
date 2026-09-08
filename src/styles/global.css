@@ -7665,22 +7665,32 @@ textarea {
 .tool-trace {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 4px 0;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
 
-/* Children inside .tool-trace: strip any borders so the layout stays clean. */
+/* Children inside .tool-trace: no border/radius/bg of their own — the OUTER
+   .tool-trace card owns the frame. A hairline divider between rows (skipped
+   before the first) is what makes a multi-step turn read as one continuous
+   list instead of a stack of floating rows — matches Claude.ai's own trace
+   panel, where every step in a turn sits inside one bordered card. */
 .tool-trace>.trace-row,
 .tool-trace>.tool-group {
-  border: none;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
   border-radius: 0;
   background: none;
+  margin: 0;
 }
 
-/* edit_file card gets extra spacing for visual separation */
-.tool-trace>.trace-row.edit-file {
-  margin-top: 4px;
-  margin-bottom: 4px;
+.tool-trace>.trace-row:first-child,
+.tool-trace>.tool-group:first-child {
+  border-top: none;
 }
 
 /* ---- grouped read-only tool calls (see ToolGroupView) ---- */
@@ -7750,7 +7760,7 @@ textarea {
   width: 100%;
   background: none;
   border: none;
-  padding: 4px 0;
+  padding: 7px 12px;
   font-size: 12px;
   color: var(--text-dim);
   cursor: pointer;
@@ -7938,35 +7948,54 @@ textarea {
   line-height: 1.3;
 }
 
+/* Claude.ai-style: inside an actual row (single/narrated/sub-row head) the
+   tool label reads as plain leading text on the line, not a separate badge
+   — matches the flat "Edit File", "Ran a command" rows in Claude's own trace
+   UI. Scoped to row heads only; the collapsed multi-call group header
+   (.trace-head-pills) keeps the pill look since it's summarizing several
+   tools by count at once, not a single action line. */
+.trace-row-head>.trace-pill {
+  font-family: inherit;
+  font-weight: 500;
+  font-size: inherit;
+  color: var(--text);
+  padding: 0;
+  border-radius: 0;
+  background: none;
+}
+
 .trace-pill-count {
   font-weight: 400;
   opacity: 0.6;
   font-size: 10px;
 }
 
-/* Detail / args text: muted but readable, fills remaining space after label. */
+/* Detail / args text: fills remaining space after the label, on the same
+   line — e.g. "Edit File" + "ChatMessage.tsx". Slightly muted so the eye
+   still lands on the label first, but no longer clipped to half the row: a
+   real filename or path should get the room it needs. */
 .trace-row-detail {
   flex: 1 1 auto;
   min-width: 0;
-  max-width: 50%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  opacity: 0.8;
-  font-size: 12px;
+  opacity: 0.75;
+  font-size: inherit;
 }
 
-/* Caption text inside a narrated row: the model's narration line, fills space. */
+/* Caption text inside a narrated row: the model's narration line, fills
+   space. Reads as plain text — not italic/washed-out — so it's as legible
+   as the tool rows around it, matching Claude.ai's trace rows. */
 .trace-row-caption {
   flex: 1 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 12px;
-  color: var(--text-dim);
-  font-style: italic;
-  opacity: 0.85;
+  font-size: inherit;
+  color: var(--text);
+  opacity: 0.88;
 }
 
 .trace-row-engine {
@@ -7996,6 +8025,15 @@ textarea {
   opacity: 0.55;
 }
 
+/* Once a call finishes, the row settles to plain text + chevron (Claude.ai
+   style) — no ms badge, no success check. Both still show WHILE running (a
+   live signal that something's happening), and duration reappears as a
+   "Duration" line in the expand panel so it isn't actually lost, just moved
+   out of the resting view. */
+.trace-row.done .trace-row-ms {
+  display: none;
+}
+
 /* Status icons: check/x use SVG, styled inline */
 .status-ok {
   display: inline-flex;
@@ -8011,6 +8049,10 @@ textarea {
   color: var(--danger, #e74c3c);
 }
 
+.trace-row.done .status-ok {
+  display: none;
+}
+
 .trace-row.running .status-ok {
   color: var(--text);
 }
@@ -8023,10 +8065,6 @@ textarea {
   align-items: center;
   line-height: 1;
   transition: opacity 0.15s ease;
-}
-
-.trace-row.single .trace-row-head {
-  padding: 3px 12px;
 }
 
 .trace-row-head:hover .trace-row-chev {

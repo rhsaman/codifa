@@ -88,19 +88,22 @@ function ToolModelSelect({
   // (matching the main composer picker) — not just the ones already saved.
   // Saved entries are filtered by `removed` too so a model the user removed
   // (e.g. via Settings → Providers) doesn't sneak back into the picker just
-  // because it's still in `p.models` from an earlier write. Foreign-provider
-  // ids (e.g. a stale "openrouter/sonnet" that landed here via recentModels
-  // migration or a hand-edited saved list) are also skipped so they don't
-  // render under the wrong provider. The foreign-id check runs on the BARE
-  // id `b` (post-strip), not on the raw `m` — otherwise a doubled-prefix
-  // entry like "local/opencode/big-pickle" would pass the raw check (head
-  // === p.id) but still render as the wrong model.
+  // because it's still in `p.models` from an earlier write.
+  //
+  // The foreign-id check runs only on the PERSISTED list (`p.models`,
+  // `p.model`), not on the live fetch — see ProviderModelSelect.allModels
+  // for why: a live fetch is already scoped to this exact provider, and
+  // aggregator kinds (OpenRouter, TokenRouter) legitimately return
+  // vendor-prefixed ids ("google/...", "nvidia/...") that collide with our
+  // own built-in provider kind ids. The check runs on the BARE id `b`
+  // (post-strip), not on the raw `m` — otherwise a doubled-prefix entry
+  // like "local/opencode/big-pickle" would pass the raw check (head ===
+  // p.id) but still render as the wrong model.
   const modelsFor = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? [])
     const out = new Set<string>()
     for (const m of live[p.id] ?? []) {
       const b = bareModelFor(p, m)
-      if (isForeignModelId(p, b)) continue
       if (!removed.has(b)) out.add(b)
     }
     for (const m of p.models ?? []) {
@@ -838,6 +841,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Fetch & persist the model list for the active provider (merged with any
   // manually added models so they are never overwritten). Models the user
   // explicitly removed stay removed — they are excluded from the merge.
+  //
+  // The freshly-fetched `res.models` are NOT run through isForeignModelId:
+  // they come straight from this exact provider's own /models endpoint, so
+  // they can never actually belong to another provider — and aggregator
+  // kinds (OpenRouter, TokenRouter) legitimately return vendor-prefixed ids
+  // ("google/...", "nvidia/...") that collide with our own built-in provider
+  // kind ids. Filtering the fetch itself used to silently drop those models
+  // from `p.models` on every save, so they never came back even after the
+  // picker-level filters were fixed. The check stays on `existing` (already-
+  // persisted models not in the current fetch), which is exactly the legacy/
+  // migration-contaminated data it was built to guard against.
   useEffect(() => {
     let cancelled = false
     void (async () => {
@@ -854,7 +868,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           setProviderModels(
             active.id,
             Array.from(new Set([
-              ...res.models.filter((m) => !removed.has(m) && !isForeignModelId(active, bareModelFor(active, m))),
+              ...res.models.filter((m) => !removed.has(m)),
               ...existing.filter((m) => fetchedBare.has(bareModelFor(active, m)) && !isForeignModelId(active, bareModelFor(active, m))),
             ])),
           )

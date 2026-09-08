@@ -18,11 +18,12 @@ import { useDragScroll } from "../lib/useDragScroll";
 
 const TOOL_LABEL: Record<string, string> = {
   write_file: "Write File",
+  edit_file: "Edit File",
   list_files: "List Directory",
   grep: "Search Files",
   glob: "Search Files",
   web_search: "Web Search",
-  run_terminal: "Run Command",
+  run_terminal: "Ran a command",
   search_memory: "Search Memory",
   memory: "Memory",
   ask_user: "Ask User",
@@ -877,6 +878,12 @@ const TraceRow = memo(function TraceRow({
       </button>
       {expanded && (
         <div className="trace-row-expand">
+          {ms ? (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Duration</span>
+              <span className="trace-expand-val">{fmtTime(ms)}</span>
+            </div>
+          ) : null}
           {activity.summary && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Summary</span>
@@ -1185,6 +1192,12 @@ export const ToolSingleRow = memo(function ToolSingleRow({
         </div>
       ) : expanded ? (
         <div className="trace-row-expand">
+          {ms ? (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Duration</span>
+              <span className="trace-expand-val">{fmtTime(ms)}</span>
+            </div>
+          ) : null}
           {activity.summary && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Summary</span>
@@ -1311,6 +1324,12 @@ export const ToolNarratedRow = memo(function ToolNarratedRow({
       </button>
       {expanded && (
         <div className="trace-row-expand">
+          {ms ? (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Duration</span>
+              <span className="trace-expand-val">{fmtTime(ms)}</span>
+            </div>
+          ) : null}
           {activity.summary && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Summary</span>

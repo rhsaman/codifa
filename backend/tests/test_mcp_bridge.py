@@ -7,12 +7,19 @@ These verify that ``build_mcp_tools``:
 * isolates a broken server (skips it, emits a warning) without crashing,
 * returns a ``cleanup`` coroutine that is a no-op (sessions are cached),
 * **caches sessions between calls** so interactive tools (Playwright) can
-  maintain browser state across turns.
+  maintain browser state across turns,
+* **reaps orphaned server/browser processes** before a fresh connect so a
+  crashed previous run can't hold the browser profile lock forever,
+* **serialises concurrent connects** per server (no double-spawn).
 
 The MCP ``ClientSession`` is mocked so no real subprocess / network is
 started — we only exercise the bridge's wiring logic.
 """
 
+import asyncio
+import os
+from contextlib import AsyncExitStack
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -120,7 +127,6 @@ async def test_tool_schema_uses_snake_case_input_schema(monkeypatch):
     errors like ``browser_evaluate(expression=...)`` instead of ``function=...``.
     """
     # Simulate the real SDK: a plain object with ONLY the snake_case attribute.
-    from types import SimpleNamespace
 
     tool = SimpleNamespace(
         name="browser_evaluate",
@@ -325,7 +331,6 @@ async def test_session_is_cached_between_calls(monkeypatch):
     """Second call with the same config must reuse the cached session, not
     spawn a new subprocess (call_list_tools tracks how many times
     ``session.list_tools`` is hit)."""
-    from types import SimpleNamespace
 
     tool = SimpleNamespace(
         name="search",
@@ -436,7 +441,6 @@ async def test_config_change_invalidates_cache(monkeypatch):
 @pytest.mark.asyncio
 async def test_shutdown_mcp_sessions_clears_cache(monkeypatch):
     """``shutdown_mcp_sessions`` must close all cached sessions."""
-    from types import SimpleNamespace
 
     tool = SimpleNamespace(
         name="t", description="t",
@@ -471,3 +475,182 @@ async def test_shutdown_mcp_sessions_clears_cache(monkeypatch):
 
     assert close_called
     assert mcp_bridge._session_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests for orphan reaping (leftover server/browser processes)
+# ---------------------------------------------------------------------------
+
+
+def test_distinctive_tokens_filters_generic_words():
+    """Only long tokens with path/package markers qualify — ``docker mcp
+    gateway run`` must match nothing, ``@playwright/mcp@latest`` must."""
+    from mcp_bridge import _distinctive_tokens
+
+    # Generic short words never qualify — a docker config must reap nothing.
+    assert _distinctive_tokens({"command": "docker", "args": ["mcp", "gateway", "run"]}) == []
+
+    # Package/path tokens qualify.
+    tokens = _distinctive_tokens(
+        {"command": "npx", "args": ["-y", "@playwright/mcp@latest", "--browser=chrome"]}
+    )
+    assert tokens == ["@playwright/mcp@latest"]
+
+    # A user-data-dir path qualifies too (it identifies the profile lock).
+    tokens = _distinctive_tokens(
+        {"command": "npx", "args": ["--user-data-dir", "/Users/x/.codifa/playwright-profile"]}
+    )
+    assert tokens == ["/Users/x/.codifa/playwright-profile"]
+
+
+def test_reap_processes_kills_matching_orphans(monkeypatch):
+    """``_reap_processes`` kills only processes whose command line carries a
+    distinctive token — and never the current process's own descendants."""
+    import mcp_bridge as mb
+
+    me = os.getpid()
+    # Two orphans (one carrying the token) + our own process (must survive).
+    fake_ps = (
+        f"  101     1 node /usr/local/bin/npx @playwright/mcp@latest --browser=chrome\n"
+        f"  102     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/x/.codifa/playwright-profile\n"
+        f"  103     1 docker mcp gateway run\n"
+        f"  {me}     1 python server.py --port 18080\n"
+    )
+
+    killed: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(stdout=fake_ps, returncode=0)
+
+    monkeypatch.setattr(mb.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        os, "kill",
+        lambda pid, sig: killed.append(pid),
+    )
+
+    cfg = {
+        "command": "npx",
+        "args": [
+            "-y",
+            "@playwright/mcp@latest",
+            "--browser=chrome",
+            "--user-data-dir",
+            "/Users/x/.codifa/playwright-profile",
+        ],
+    }
+    n = mb._reap_processes(cfg, protect_own=True)
+
+    # The npx server (101) and the Chrome holding the profile (102) die;
+    # docker (103, no token) and our own process (me) survive.
+    assert sorted(killed) == [101, 102]
+    assert n == 2
+
+
+def test_reap_processes_protects_own_descendants(monkeypatch):
+    """With ``protect_own=True`` the current process's own children (e.g. a
+    live cached session's server) are never killed."""
+    import mcp_bridge as mb
+
+    me = os.getpid()
+    child = me + 1  # pretend this is our own child
+    fake_ps = (
+        f"  {child}  {me} node @playwright/mcp@latest\n"
+        f"  201     1 node @playwright/mcp@latest\n"
+    )
+
+    killed: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(stdout=fake_ps, returncode=0)
+
+    monkeypatch.setattr(mb.subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+
+    cfg = {"command": "npx", "args": ["@playwright/mcp@latest"]}
+    mb._reap_processes(cfg, protect_own=True)
+
+    # Only the true orphan (201) dies; our own child survives.
+    assert killed == [201]
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_closes_stack(monkeypatch):
+    """A connect that fails mid-handshake must close its half-open stack —
+    otherwise the spawned subprocess leaks (and holds the profile lock)."""
+    tool = _fake_tool("t", "t")
+
+    class _ExplodingCM:
+        async def __aenter__(self):
+            return (MagicMock(), MagicMock())
+
+        async def __aexit__(self, *exc):
+            return False
+
+    closed = False
+
+    class _TrackingStack:
+        def __init__(self):
+            self._stack = AsyncExitStack()
+
+        async def enter_async_context(self, cm):
+            return await self._stack.enter_async_context(cm)
+
+        async def aclose(self):
+            nonlocal closed
+            closed = True
+            await self._stack.aclose()
+
+    # ClientSession whose initialize() explodes mid-handshake.
+    session = _fake_session([tool])
+    session.initialize = AsyncMock(side_effect=RuntimeError("boom"))
+
+    monkeypatch.setattr("mcp_bridge.stdio_client", lambda params: _ExplodingCM())
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session)
+    monkeypatch.setattr("mcp_bridge.AsyncExitStack", _TrackingStack)
+
+    servers = {"srv": {"command": "echo", "args": ["hi"]}}
+    # Must not raise — the failure is isolated per-server.
+    tools, _ = await build_mcp_tools(servers, lambda ev: None)
+
+    assert tools == []
+    assert closed, "half-open stack must be closed on connect failure"
+    assert "srv" not in mcp_bridge._session_cache
+
+
+@pytest.mark.asyncio
+async def test_concurrent_connects_share_one_session(monkeypatch):
+    """Two turns connecting the same server at once must end up with ONE
+    cached session — the per-server lock serialises the double-spawn."""
+    tool = _fake_tool("search", "search")
+    session = _fake_session([tool])
+
+    init_count = 0
+    _orig_init = session.initialize
+
+    async def _slow_init():
+        nonlocal init_count
+        init_count += 1
+        await asyncio.sleep(0.05)  # widen the race window
+        return await _orig_init()
+
+    session.initialize = _slow_init
+
+    monkeypatch.setattr(
+        "mcp_bridge.stdio_client", lambda params: _fake_stdio_client(session)
+    )
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session)
+
+    servers = {"demo": {"command": "echo", "args": ["hi"]}}
+
+    # Two concurrent build_mcp_tools calls (two turns racing).
+    results = await asyncio.gather(
+        build_mcp_tools(servers, lambda ev: None),
+        build_mcp_tools(servers, lambda ev: None),
+    )
+
+    # Both get the same tools, but only ONE session was initialised.
+    assert init_count == 1, f"double-spawn: initialize ran {init_count} times"
+    assert len(results[0][0]) == 1
+    assert len(results[1][0]) == 1
+    assert results[0][0][0].name == results[1][0][0].name
+    assert len(mcp_bridge._session_cache) == 1

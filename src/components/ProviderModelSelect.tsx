@@ -117,19 +117,28 @@ export function ProviderModelSelect() {
   // current model, minus the models the user explicitly removed. Saved entries
   // are filtered by `removed` too so a model the user removed (e.g. via
   // Settings → Providers) doesn't sneak back into the dropdown just because
-  // it's still in `p.models` from an earlier write. Foreign-provider ids
-  // (e.g. a stale "openrouter/sonnet" that landed in nvidia's `p.models`
-  // via recentModels migration or a custom-row copy) are also skipped so
-  // they don't render under the wrong provider. The foreign-id check runs
-  // on the BARE id `b` (post-strip), not on the raw `m` — otherwise a
-  // doubled-prefix entry like "local/opencode/big-pickle" would pass the
-  // raw check (head === p.id) but still render as the wrong model.
+  // it's still in `p.models` from an earlier write.
+  //
+  // The foreign-id check (isForeignModelId) is applied ONLY to the two
+  // PERSISTED sources below (`p.models`, `p.model`) — e.g. a stale
+  // "openrouter/sonnet" that landed in nvidia's `p.models` via recentModels
+  // migration or a custom-row copy. It must NOT run on the live fetch: that
+  // list comes straight from THIS provider's own /models endpoint (scoped by
+  // its base_url + api_key), so it can never actually contain another
+  // provider's models — and aggregator kinds like OpenRouter/TokenRouter
+  // legitimately return vendor-prefixed ids ("google/gemini-2.5-flash",
+  // "nvidia/llama-3.1-nemotron-70b-instruct") whose vendor name coincides
+  // with one of Coder's own built-in provider kind ids. Applying the check
+  // there used to silently hide every Google/NVIDIA-branded OpenRouter model
+  // from OpenRouter's own list. The foreign-id check runs on the BARE id `b`
+  // (post-strip), not on the raw `m` — otherwise a doubled-prefix entry like
+  // "local/opencode/big-pickle" would pass the raw check (head === p.id) but
+  // still render as the wrong model.
   const allModels = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? []);
     const out = new Set<string>();
     for (const m of live[p.id] ?? []) {
       const b = bareModel(p, m);
-      if (isForeignModelId(p, b)) continue;
       if (!removed.has(b)) out.add(b);
     }
     for (const m of p.models ?? []) {

@@ -38,9 +38,17 @@ export function getSkillsList(): SkillRow[] {
   return skillsCache ?? [];
 }
 
-/** Fetch the list from the backend if not already cached, then return it. */
+/** Fetch the list from the backend if not already cached, then return it.
+ *
+ *  Retries on an empty result (not just `null`): a cold-boot fetch that
+ *  raced the sidecar becoming healthy, or any other transient failure in
+ *  `listSkills()`, would otherwise permanently cache `[]` for the rest of
+ *  the session even though skills exist on disk (skillsCache !== null once
+ *  set, so the old `=== null` guard never retried). */
 export async function ensureSkillsList(): Promise<SkillRow[]> {
-  if (skillsCache === null) skillsCache = await skillsFetcher();
+  if (skillsCache === null || skillsCache.length === 0) {
+    skillsCache = await skillsFetcher();
+  }
   return skillsCache;
 }
 

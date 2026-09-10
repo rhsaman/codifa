@@ -475,6 +475,10 @@ export function ChatPanel() {
   const chatIdRef = useRef(chat?.id ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
+  // Container for the @skill mention popup, so the highlighted row can be
+  // scrolled into view on Ctrl+J/K / arrow navigation (the list scrolls
+  // internally and the highlight can move outside the visible 300px area).
+  const skillMentionPopupRef = useRef<HTMLDivElement>(null);
   const lastEventAt = useRef(0);
   const toolRunningRef = useRef(0);
   /** When the stall hint first turned on (see the watchdog in `send`); null
@@ -2950,6 +2954,18 @@ export function ChatPanel() {
     if (getSkillsList().length === 0) void ensureSkills();
   }, [ensureSkills]);
 
+  // Keep the keyboard-highlighted skill row visible: Ctrl+J/K (and arrow
+  // keys) move `skillMentionIdx` but the popup scrolls independently
+  // (max-height + overflow-y: auto), so without this the highlight can
+  // move past the visible 300px and look like nothing is happening.
+  useEffect(() => {
+    if (!skillMention) return;
+    const row = skillMentionPopupRef.current?.querySelector<HTMLElement>(
+      ".mention-item.kbd",
+    );
+    row?.scrollIntoView({ block: "nearest" });
+  }, [skillMention, skillMentionIdx]);
+
   const startSkillMention = (at: number) => {
     setCmdOpen(null);
     setSkillMention({ at });
@@ -3927,7 +3943,7 @@ export function ChatPanel() {
               </div>
             )}
             {skillMention && (
-              <div className="mention-popup" dir="ltr">
+              <div className="mention-popup" dir="ltr" ref={skillMentionPopupRef}>
                 <div className="mention-head">
                   <span className="mention-head-icon">@</span>
                   <span>Skills</span>

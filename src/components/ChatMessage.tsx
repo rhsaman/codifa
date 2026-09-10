@@ -770,7 +770,15 @@ function localWords(s: string): number {
 }
 
 function fmtElapsed(ms: number): string {
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = ms / 1000;
+  // بیش از ۶۰ ثانیه: دقیقه + ثانیه (هم‌راستا با fmtTime در ToolCallView)
+  if (totalSec >= 60) {
+    const m = Math.floor(totalSec / 60);
+    const s = Math.round(totalSec % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  return `${totalSec.toFixed(1)}s`;
 }
 
 function UsageBadge({
@@ -1047,12 +1055,24 @@ function renderSegments(
 ): ReactNode[] {
   const nodes: ReactNode[] = [];
   let pending: { activity: ToolActivity; index: number }[] = [];
-  // A run of consecutive narration rows / tool rows / groups (no real prose
-  // between them) accumulates here instead of going straight into `nodes`, so
-  // the whole run wraps in ONE card (see wrapTrace) instead of each item
-  // floating as its own bordered box with a gap around it.
+  // A run of consecutive tool rows / groups (no real prose between them)
+  // accumulates here instead of going straight into `nodes`, so the whole run
+  // wraps in ONE card (see wrapTrace) instead of each item floating as its own
+  // bordered box with a gap around it.
   let trace: ReactNode[] = [];
-
+  // The narration line held back to attach to the NEXT tool call (see
+  // isCaptionCandidate). Stored per-call so a narration BETWEEN two calls
+  // (caption, tool, caption, tool) attaches to its own call without breaking
+  // the run into separate groups — the whole run stays ONE group.
+  let pendingCaption: string | null = null;
+  // Per-call captions collected while the run accumulates: caption[i] is the
+  // narration that preceded pending[i]. The LAST one also becomes the group
+  // head's summary title (Claude.ai style).
+  const captions: (string | null)[] = [];
+  // Monotonic counter for orphan-caption prose fallbacks (a held-back caption
+  // with no groupable call after it) — guarantees unique React keys even when
+  // several such captions appear in one message.
+  let orphanCap = 0;
   const wrapTrace = (key: string) => {
     if (trace.length === 0) return;
     nodes.push(
@@ -1064,7 +1084,17 @@ function renderSegments(
   };
 
   const flush = () => {
-    if (pending.length === 0) return;
+    if (pending.length === 0) {
+      // A held-back caption with no groupable call after it (e.g. the run
+      // ended on a narration) renders as plain prose instead of vanishing.
+      if (pendingCaption) {
+        wrapTrace(`trace-cap-${orphanCap}`);
+        renderProse(`cap-${orphanCap}`, pendingCaption);
+        orphanCap++;
+        pendingCaption = null;
+      }
+      return;
+    }
     // Keyed by the FIRST activity's own stable index into
     // message.toolActivity — assigned once and never reused — NOT by the
     // segment-scan position. A position-based key breaks under streaming:
@@ -1082,15 +1112,36 @@ function renderSegments(
     // triggering the flush.
     const key = `grp-${pending[0].index}`;
     if (pending.length === 1) {
-      // یک فراخوانی تکی: ردیف ابزارِ خودش (narration مدل — اگر بود — به‌صورت
-      // ردیف جدا بالای همین ردیف رندر شده، در TraceNarration).
+      // یک فراخوانی تکی: narration مدل — اگر بود — به‌صورت ردیف جدا بالای
+      // همین ردیف رندر می‌شود (TraceNarration) — مثل Claude.ai که کپشنِ
+      // کارِ تکی در کادر جدا بالای ردیف ابزار دیده می‌شود.
+      if (captions[0]) {
+        trace.push(
+          <TraceNarration key={`nar-${key}`} text={captions[0]} />,
+        );
+      }
       const { activity } = pending[0];
       trace.push(<ToolSingleRow key={key} activity={activity} />);
     } else {
-      // 2+ consecutive read-only calls collapse into one trace group.
-      trace.push(<ToolGroupView key={key} activities={pending} />);
+      // 2+ consecutive read-only calls collapse into ONE trace group even
+      // when narrations interleave (caption, tool, caption, tool…): each
+      // caption rides INSIDE the group attached to its own call — the last
+      // one also becomes the head's summary title (Claude.ai style) — so
+      // the run never splits into several floating groups. Pass a COPY:
+      // `captions` is reused (cleared) for the next run, and React reads the
+      // prop at render time — by-reference passing would hand it an empty
+      // array by then.
+      trace.push(
+        <ToolGroupView
+          key={key}
+          activities={pending}
+          captions={captions.slice()}
+        />,
+      );
     }
     pending = [];
+    captions.length = 0;
+    pendingCaption = null;
   };
 
   const renderProse = (key: string, text: string) => {
@@ -1158,12 +1209,12 @@ function renderSegments(
         !isExploreCard(nextActivity);
 
       if (nextIsGroupable && isCaptionCandidate(seg.text)) {
-        // A new narration closes the previous run first, so each narration
-        // stays above ITS OWN call(s) — otherwise a later narration would
-        // silently replace the earlier one (the "caption, tool, caption,
-        // tool" overwrite bug).
-        flush();
-        trace.push(<TraceNarration key={`nar-${i}`} text={seg.text} />);
+        // Hold back as the caption for the call(s) that follow. Do NOT
+        // flush here: a narration BETWEEN two calls (caption, tool,
+        // caption, tool) must attach to its own call while the run keeps
+        // accumulating — flushing would split one logical run into several
+        // floating groups (the "groups came out separate" bug).
+        pendingCaption = seg.text;
         return;
       }
 
@@ -1188,6 +1239,11 @@ function renderSegments(
         />,
       );
     } else {
+      // Attach the held-back narration to THIS call (per-call captions), then
+      // keep accumulating — the run stays one group even with interleaved
+      // narrations.
+      captions.push(pendingCaption);
+      pendingCaption = null;
       pending.push({ activity, index: seg.index });
     }
   });

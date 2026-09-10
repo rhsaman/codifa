@@ -37,6 +37,10 @@ dependencies = [
 # are sorted into their own import section instead of being mixed with
 # third-party packages. Paths are relative to this file's directory.
 src = ["."]
+# pytest's tmp_path fixtures (test_build_tree_excludes_skill0 etc.) create
+# throwaway source files under tests/pytest-of-<user>/ on every run — never
+# lint those.
+exclude = ["tests/pytest-of-*"]
 
 [dependency-groups]
 dev = [

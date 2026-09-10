@@ -804,13 +804,20 @@ export interface SkillSyncResult {
 /** List all skills (file-based storage in the sidecar's skill dir). */
 export async function listSkills(): Promise<SkillRow[]> {
   const url = await ensureSidecar()
-  if (!url) return []
+  if (!url) {
+    console.error('[skills] listSkills: sidecar not available')
+    return []
+  }
   try {
     const res = await fetch(`${url}/skills`)
-    if (!res.ok) return []
+    if (!res.ok) {
+      console.error(`[skills] listSkills: /skills returned ${res.status}`)
+      return []
+    }
     const data = (await res.json()) as { skills?: SkillRow[] }
     return data.skills ?? []
-  } catch {
+  } catch (err) {
+    console.error('[skills] listSkills: fetch failed', err)
     return []
   }
 }

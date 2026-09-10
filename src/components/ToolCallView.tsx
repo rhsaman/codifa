@@ -1,4 +1,5 @@
 import {
+  Fragment,
   memo,
   useEffect,
   useId,
@@ -10,7 +11,7 @@ import {
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { fixZwsp } from "../lib/bidi";
+import { fixZwsp, prepareContent } from "../lib/bidi";
 import { handleLinkClick } from "../lib/link";
 import { FullscreenModal } from "./FullscreenModal";
 import { useFullscreen } from "../lib/fullscreen";
@@ -91,7 +92,15 @@ export const isExploreCard = (a: ToolActivity) =>
 
 function fmtTime(ms?: number): string {
   if (!ms) return "";
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = ms / 1000;
+  // بیش از ۶۰ ثانیه: دقیقه + ثانیه (مثل Claude.ai که «1m 12s» نشان می‌دهد)
+  if (totalSec >= 60) {
+    const m = Math.floor(totalSec / 60);
+    const s = Math.round(totalSec % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  return `${totalSec.toFixed(1)}s`;
 }
 
 /* ——— High-quality SVG icons ——— */
@@ -612,8 +621,15 @@ function applyReverseDiff(diff: string, current: string): string {
  *  full cards, matching Claude.ai's own tool-trace UI. */
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
+  captions,
 }: {
   activities: { activity: ToolActivity; index: number }[];
+  /** Per-call narration lines: captions[i] is the model's narration that
+   *  preceded activities[i]. Rendered as rows inside the expanded panel
+   *  (above their own call), and the LAST non-null one becomes the head's
+   *  summary title (Claude.ai keeps the latest caption as the collapsed
+   *  summary). */
+  captions?: (string | null)[];
 }) {
   const [open, setOpen] = useState(false);
   const running = activities.some((a) => a.activity.status === "running");
@@ -621,14 +637,22 @@ export const ToolGroupView = memo(function ToolGroupView({
     (sum, a) => sum + (a.activity.elapsedMs || 0),
     0,
   );
-  // Always show tool names + counts as the main status text. Any narration
-  // line the model wrote before this run already rendered as its own row
-  // above the group (see renderSegments in ChatMessage.tsx).
+  // Always show tool names + counts as the main status text. The narration
+  // line (if any) rides along as the caption — always in the head, plus the
+  // first row of the expanded panel (see renderSegments in ChatMessage.tsx).
   // Build per-tool pills: [{tool: "read", count: 3}, ...]
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
     acc[a.activity.tool] = (acc[a.activity.tool] || 0) + 1;
     return acc;
   }, {});
+  // The head shows the LAST narration (Claude.ai's collapsed summary title).
+  const headCaption = (() => {
+    if (!captions) return undefined;
+    for (let i = captions.length - 1; i >= 0; i--) {
+      if (captions[i]) return captions[i] as string;
+    }
+    return undefined;
+  })();
 
   return (
     <div
@@ -647,6 +671,11 @@ export const ToolGroupView = memo(function ToolGroupView({
             </span>
           ))}
         </span>
+        {headCaption && (
+          <span className="trace-head-caption" dir="auto" title={prepareContent(headCaption)}>
+            {prepareContent(headCaption)}
+          </span>
+        )}
         <span className="trace-head-right">
           {totalMs > 0 && (
             <span className="trace-time">{fmtTime(totalMs)}</span>
@@ -656,8 +685,15 @@ export const ToolGroupView = memo(function ToolGroupView({
       </button>
       {open && (
         <div className="trace-list">
-          {activities.map(({ activity, index }) => (
-            <TraceRow key={index} activity={activity} />
+          {activities.map(({ activity, index }, i) => (
+            <Fragment key={index}>
+              {captions?.[i] && (
+                <div className="trace-narration" dir="auto">
+                  {prepareContent(captions[i] as string)}
+                </div>
+              )}
+              <TraceRow activity={activity} />
+            </Fragment>
           ))}
         </div>
       )}
@@ -1063,7 +1099,7 @@ export const TraceNarration = memo(function TraceNarration({
 }) {
   return (
     <div className="trace-narration" dir="auto">
-      {fixZwsp(text)}
+      {prepareContent(text)}
     </div>
   );
 });

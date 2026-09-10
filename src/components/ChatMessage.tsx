@@ -27,7 +27,8 @@ import { sanitizeHtml } from "../lib/sanitizeHtml";
 import {
   ToolCallView,
   ToolGroupView,
-  ToolNarratedRow,
+  ToolSingleRow,
+  TraceNarration,
   isExploreCard,
 } from "./ToolCallView";
 import { ReadingMode } from "./ReadingMode";
@@ -1046,14 +1047,10 @@ function renderSegments(
 ): ReactNode[] {
   const nodes: ReactNode[] = [];
   let pending: { activity: ToolActivity; index: number }[] = [];
-  // The narration line held back to attach to the tool call(s) that follow it
-  // (see isCaptionCandidate). Cleared once used or once it turns out nothing
-  // groupable followed it.
-  let pendingCaption: string | null = null;
-  // A run of consecutive narrated rows / groups (no real prose between them)
-  // accumulates here instead of going straight into `nodes`, so the whole run
-  // wraps in ONE card (see wrapTrace) instead of each item floating as its
-  // own bordered box with a gap around it.
+  // A run of consecutive narration rows / tool rows / groups (no real prose
+  // between them) accumulates here instead of going straight into `nodes`, so
+  // the whole run wraps in ONE card (see wrapTrace) instead of each item
+  // floating as its own bordered box with a gap around it.
   let trace: ReactNode[] = [];
 
   const wrapTrace = (key: string) => {
@@ -1085,29 +1082,15 @@ function renderSegments(
     // triggering the flush.
     const key = `grp-${pending[0].index}`;
     if (pending.length === 1) {
-      // یک فراخوانی تکی: با caption مدل (اگر بود) در یک بلوکِ واحد رندر می‌شود —
-      // به‌جای یک پاراگراف جدا بالای یک ردیف ابزارِ بی‌ربط.
+      // یک فراخوانی تکی: ردیف ابزارِ خودش (narration مدل — اگر بود — به‌صورت
+      // ردیف جدا بالای همین ردیف رندر شده، در TraceNarration).
       const { activity } = pending[0];
-      trace.push(
-        <ToolNarratedRow
-          key={key}
-          caption={pendingCaption ?? undefined}
-          activity={activity}
-        />,
-      );
+      trace.push(<ToolSingleRow key={key} activity={activity} />);
     } else {
-      // 2+ consecutive read-only calls collapse into one trace group, headed
-      // by the same caption instead of only the generic count summary.
-      trace.push(
-        <ToolGroupView
-          key={key}
-          activities={pending}
-          caption={pendingCaption ?? undefined}
-        />,
-      );
+      // 2+ consecutive read-only calls collapse into one trace group.
+      trace.push(<ToolGroupView key={key} activities={pending} />);
     }
     pending = [];
-    pendingCaption = null;
   };
 
   const renderProse = (key: string, text: string) => {
@@ -1132,10 +1115,6 @@ function renderSegments(
     if (seg.kind === "user") {
       flush();
       wrapTrace(`trace-${i}`);
-      if (pendingCaption) {
-        renderProse(`cap-${i}`, pendingCaption);
-        pendingCaption = null;
-      }
       const steerMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1154,10 +1133,6 @@ function renderSegments(
       // this segment just anchors where it renders.
       flush();
       wrapTrace(`trace-${i}`);
-      if (pendingCaption) {
-        renderProse(`cap-${i}`, pendingCaption);
-        pendingCaption = null;
-      }
       const summaryMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1169,9 +1144,9 @@ function renderSegments(
     }
     if (seg.kind === "text") {
       // Does this text immediately precede a groupable (non-always-visible)
-      // tool call? If so, hold it back as that call's caption instead of
-      // rendering it as its own paragraph — the run stays inside the same
-      // trace card, it doesn't get wrapped/broken here.
+      // tool call? If so, it's the model's narration for that call: render it
+      // as its own row INSIDE the trace card, right above the call(s) — not a
+      // separate prose paragraph outside the card.
       const next = segs[i + 1];
       const nextActivity =
         next && next.kind === "tool"
@@ -1183,9 +1158,12 @@ function renderSegments(
         !isExploreCard(nextActivity);
 
       if (nextIsGroupable && isCaptionCandidate(seg.text)) {
-        // Hold back as caption — do NOT flush yet so pending tools merge
-        // into the same group as the upcoming tool calls.
-        pendingCaption = seg.text;
+        // A new narration closes the previous run first, so each narration
+        // stays above ITS OWN call(s) — otherwise a later narration would
+        // silently replace the earlier one (the "caption, tool, caption,
+        // tool" overwrite bug).
+        flush();
+        trace.push(<TraceNarration key={`nar-${i}`} text={seg.text} />);
         return;
       }
 
@@ -1200,10 +1178,6 @@ function renderSegments(
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush();
       wrapTrace(`trace-${i}`);
-      if (pendingCaption) {
-        renderProse(`cap-${i}`, pendingCaption);
-        pendingCaption = null;
-      }
       nodes.push(
         <ToolCallView
           key={i}
@@ -1219,7 +1193,6 @@ function renderSegments(
   });
   flush();
   wrapTrace("trace-end");
-  if (pendingCaption) renderProse("cap-end", pendingCaption);
   return nodes;
 }
 

@@ -30,8 +30,8 @@ const LIVE_CACHE = new Map<string, string[]>();
 
 /** Compact provider + model picker shown in the composer. Models are fetched
  *  live from each provider's /models endpoint (never hardcoded) and persisted
- *  to the DB per provider; custom models added in Settings are shown from the
- *  DB. The last 10 used models appear in a "Recent" section on top. */
+ *  to the DB per provider. The last 10 used models appear in a "Recent"
+ *  section on top. */
 export function ProviderModelSelect() {
   const providers = useStore((s) => s.settings.providers);
   const activeId = useStore((s) => s.settings.activeProviderId);
@@ -113,9 +113,9 @@ export function ProviderModelSelect() {
   if (!active) return null;
   const activeModel = chat?.model ?? active.model;
 
-  // Fetched models + the provider's saved list (custom-added, from the DB) +
-  // current model, minus the models the user explicitly removed. Saved entries
-  // are filtered by `removed` too so a model the user removed (e.g. via
+  // Fetched models + the provider's saved list + current model, minus the
+  // models the user explicitly removed. Saved entries are filtered by
+  // `removed` too so a model the user removed (e.g. via
   // Settings → Providers) doesn't sneak back into the dropdown just because
   // it's still in `p.models` from an earlier write.
   //
@@ -287,7 +287,7 @@ export function ProviderModelSelect() {
             {filtered.length === 0 && recentsShown.length === 0 && (
               <div className="pm-empty">
                 <span>No models match “{query}”.</span>
-                <span>Try a different search, or add a custom model in Settings → Providers.</span>
+                <span>Try a different search.</span>
               </div>
             )}
             {filtered.map(({ p, models }) => {
@@ -327,7 +327,7 @@ export function ProviderModelSelect() {
                       })}
                       {!loading && models.length === 0 && (
                         <div className="pm-hint">
-                          No models — check the provider’s base URL &amp; key, or add one in Settings.
+                          No models — check the provider’s base URL &amp; key.
                         </div>
                       )}
                     </div>

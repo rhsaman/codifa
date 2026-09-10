@@ -80,37 +80,35 @@ console.log('\nmergeFetchedModels')
 const mp = { id: 'local', kind: 'ollama' as const, baseUrl: 'http://localhost:11434/v1', models: [] as string[], removedModels: [] as string[] }
 
 {
-  const out = mergeFetchedModels(mp, ['a', 'b'], ['c', 'd'], [])
-  assertEq('disjoint fetched + existing', out.sort(), ['a', 'b', 'c', 'd'].sort())
+  // کاتالوگ زنده معیار قطعی است: لیست ذخیره‌شده‌ی قبلی نگه داشته نمی‌شود
+  // تا مدلی که پروایدر حذف/تغییرنام کرده («No such model») از لیست زنده برود.
+  const out = mergeFetchedModels(mp, ['a', 'b'], [])
+  assertEq('fetched only — existing list is NOT kept', out, ['a', 'b'])
 }
 {
-  const out = mergeFetchedModels(mp, ['a', 'b'], ['b', 'c'], [])
-  assertEq('overlap → dedup (b appears once)', out, ['a', 'b', 'c'])
+  const out = mergeFetchedModels(mp, ['a', 'b', 'a'], [])
+  assertEq('dedup within fetched', out, ['a', 'b'])
 }
 {
-  const out = mergeFetchedModels(mp, ['a', 'b'], ['c'], ['a'])
-  assertEq('removed filters from fetched', out, ['b', 'c'])
+  const out = mergeFetchedModels(mp, ['a', 'b'], ['a'])
+  assertEq('removed filters from fetched', out, ['b'])
 }
 {
-  const out = mergeFetchedModels(mp, [], ['a', 'b'], [])
-  assertEq('empty fetched + existing preserved', out, ['a', 'b'])
+  const out = mergeFetchedModels(mp, [], [])
+  assertEq('empty fetched → empty list', out, [])
 }
 {
-  const out = mergeFetchedModels(mp, ['a', 'b'], ['c', 'd'], ['e'])
-  assertEq('removed that is not in either list → ignored', out.sort(), ['a', 'b', 'c', 'd'].sort())
+  const out = mergeFetchedModels(mp, ['a', 'b'], ['e'])
+  assertEq('removed that is not in the fetched list → ignored', out, ['a', 'b'])
 }
 {
-  const out = mergeFetchedModels(mp, ['a'], ['a', 'b'], [])
-  assertEq('order: fetched first, then existing', out, ['a', 'b'])
-}
-{
-  // Foreign models should be filtered from both fetched and existing
-  const out = mergeFetchedModels(mp, ['openrouter/sonnet', 'local-model'], ['gpt-4', 'qwen-local'], [])
-  assertEq('foreign fetched removed, foreign existing removed', out.sort(), ['gpt-4', 'local-model', 'qwen-local'].sort())
+  // Foreign models (belonging to another provider) are filtered from fetched
+  const out = mergeFetchedModels(mp, ['openrouter/sonnet', 'local-model'], [])
+  assertEq('foreign fetched removed', out, ['local-model'])
 }
 {
   // Doubly-prefixed: m='local/google/gemini' → bareModel → 'google/gemini' → foreign
-  const out = mergeFetchedModels(mp, ['local/google/gemini', 'local/qwen-4b'], [], [])
+  const out = mergeFetchedModels(mp, ['local/google/gemini', 'local/qwen-4b'], [])
   assertEq('doubly-prefixed foreign stripped', out, ['local/qwen-4b'])
 }
 
@@ -128,6 +126,7 @@ function mkStore(initial: ProviderConfig[]): StoreLike & { calls: { method: stri
     setProviderPricingMap: (id, data) => calls.push({ method: 'setProviderPricingMap', args: [id, data] }),
     setProviderReasoningMap: (id, data) => calls.push({ method: 'setProviderReasoningMap', args: [id, data] }),
     setProviderModels: (id, models) => calls.push({ method: 'setProviderModels', args: [id, models] }),
+    healStaleModels: (id, validModels) => calls.push({ method: 'healStaleModels', args: [id, validModels] }),
     updateProvider: (id, patch) => calls.push({ method: 'updateProvider', args: [id, patch] }),
   }
 }
@@ -220,14 +219,18 @@ await run(
       'setProviderModels',
       // provider بدون model → auto-pick اولین مدل کاتالوگ
       'updateProvider',
+      // و ترمیم چت‌ها/recents با مدل stale
+      'healStaleModels',
     ],
     models: ['llama3', 'mistral'],
   },
 )
 
 await run(
-  'merge: keeps existing custom models, drops removed',
+  'merge: live catalog is authoritative — stale saved models are dropped',
   async () => {
+    // مدل ذخیره‌شده‌ی "custom-model" در کاتالوگ زنده نیست → از لیست می‌رود.
+    // مدل "old-model" هم hide شده و حتی اگر پروایدر برگرداندش مخفی می‌ماند.
     const store = mkStore([
       mkProvider({
         id: 'local',
@@ -243,7 +246,7 @@ await run(
     const models = (store.calls.find((c) => c.method === 'setProviderModels')?.args[1] as string[] | undefined) ?? []
     return { ok: r.ok, models: models.slice().sort() }
   },
-  { ok: true, models: ['custom-model', 'llama3', 'mistral'].sort() },
+  { ok: true, models: ['llama3', 'mistral'].sort() },
 )
 
 // --- self-heal: مدل انتخابی از کاتالوگ واقعی provider درمیاد ------------------
@@ -279,10 +282,11 @@ await run(
 )
 
 await run(
-  'self-heal: مدل خارج از لیست + kind=custom → بدون جایگزینی',
+  'self-heal: مدل خارج از لیست + kind=custom → جایگزینی با اولین مدل کاتالوگ',
   async () => {
-    // provider سفارشی ممکنه /models ناقص برگردونه → مدل خارج از لیست نگه
-    // داشته می‌شه (هیچ updateProvider ای صدا زده نمی‌شه).
+    // کاتالوگ زنده برای همه‌ی kindها معیار قطعی است: حتی provider سفارشی که
+    // /models ناقص برمی‌گرداند، مدل stale را از دست می‌دهد — مدل انتخابی به
+    // اولین مدل واقعی کاتالوگ برمی‌گردد تا ارسال بعدی «No such model» ندهد.
     const store = mkStore([
       mkProvider({
         id: 'custom',
@@ -302,10 +306,40 @@ await run(
       fetchFn: async () => mkResult(['gpt-x']),
       store: { getState: () => store },
     })
-    const hasUpdate = store.calls.some((c) => c.method === 'updateProvider')
-    return { ok: r.ok, hasUpdate }
+    const upd = store.calls.find((c) => c.method === 'updateProvider')
+    return { ok: r.ok, patch: upd?.args[1] ?? null }
   },
-  { ok: true, hasUpdate: false },
+  { ok: true, patch: { model: 'gpt-x' } },
+)
+
+await run(
+  'heal: چت‌ها و recents با مدل stale ترمیم می‌شوند',
+  async () => {
+    // بعد از setProviderModels باید healStaleModels با کاتالوگ merge‌شده
+    // صدا زده شود تا چت‌هایی که مدلشان حذف شده به مدل معتبر برگردند.
+    const store = mkStore([
+      mkProvider({
+        id: 'opencode',
+        kind: 'opencode',
+        baseUrl: 'https://opencode.ai/zen/v1',
+        model: 'mimo-v2.5-free',
+        models: ['mimo-v2.5-free'],
+      }),
+    ])
+    const p = mkProvider({
+      id: 'opencode',
+      kind: 'opencode',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      model: 'mimo-v2.5-free',
+    })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => mkResult(['deepseek-v4-flash-free']),
+      store: { getState: () => store },
+    })
+    const heal = store.calls.find((c) => c.method === 'healStaleModels')
+    return { ok: r.ok, healArgs: heal?.args ?? null }
+  },
+  { ok: true, healArgs: ['opencode', ['deepseek-v4-flash-free']] },
 )
 
 await run(

@@ -234,6 +234,14 @@ npx esbuild tests/usageChip.ssr.test.tsx --bundle --platform=node --format=esm \
   --outfile=tests/.tmp-ucp.mjs --external:electron >/dev/null 2>&1
 node tests/.tmp-ucp.mjs
 
-rm -f tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs
+echo ""
+echo "── تست ۳۷: traceNarration (ردیف روایت جدا بالای ابزار — مثل Claude.ai) ──"
+npx esbuild tests/traceNarration.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
+  --outfile=tests/.tmp-tnr.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-tnr.mjs
+
+rm -f tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

@@ -225,9 +225,9 @@ function hostOf(url?: string): string {
 }
 
 /** Shared, beautifully-styled list of web_search result links. Rendered in
- *  EVERY tool view (full card, single row, narrated row, timeline row) so the
- *  links the model found are always visible — not just in the expanded card.
- *  Pure presentational component (no store/fullscreen hooks) so it can be
+ *  EVERY tool view (full card, single row, timeline row) so the links the
+ *  model found are always visible — not just in the expanded card. Pure
+ *  presentational component (no store/fullscreen hooks) so it can be
  *  unit-tested in isolation. */
 export const WebResultLinks = memo(function WebResultLinks({
   items,
@@ -612,15 +612,8 @@ function applyReverseDiff(diff: string, current: string): string {
  *  full cards, matching Claude.ai's own tool-trace UI. */
 export const ToolGroupView = memo(function ToolGroupView({
   activities,
-  caption,
 }: {
   activities: { activity: ToolActivity; index: number }[];
-  /** The short narration line the model wrote right before this run of calls
-   *  (see renderSegments in ChatMessage.tsx). Rendered as a secondary line
-   *  after the tool pills — Claude.ai-style — so the user sees what the model
-   *  is doing while the tools run. */
-  caption?: string;
-  onReverted?: (index: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const running = activities.some((a) => a.activity.status === "running");
@@ -628,8 +621,9 @@ export const ToolGroupView = memo(function ToolGroupView({
     (sum, a) => sum + (a.activity.elapsedMs || 0),
     0,
   );
-  // Always show tool names + counts as the main status text.
-  // Caption (model narration) is shown as a secondary line if present.
+  // Always show tool names + counts as the main status text. Any narration
+  // line the model wrote before this run already rendered as its own row
+  // above the group (see renderSegments in ChatMessage.tsx).
   // Build per-tool pills: [{tool: "read", count: 3}, ...]
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
     acc[a.activity.tool] = (acc[a.activity.tool] || 0) + 1;
@@ -653,11 +647,6 @@ export const ToolGroupView = memo(function ToolGroupView({
             </span>
           ))}
         </span>
-        {/* {caption && ( */}
-        {/*   <span className="trace-head-caption" dir="auto" title={caption}> */}
-        {/*     {fixZwsp(caption)} */}
-        {/*   </span> */}
-        {/* )} */}
         <span className="trace-head-right">
           {totalMs > 0 && (
             <span className="trace-time">{fmtTime(totalMs)}</span>
@@ -1061,6 +1050,24 @@ const ToolCascade = memo(function ToolCascade({
   );
 });
 
+/** The model's short narration line ("what I'm about to do") rendered as its
+ *  OWN row inside the trace card — above the tool call(s) it precedes —
+ *  matching Claude.ai, where narration lines and tool rows interleave inside
+ *  one card instead of the caption being squeezed into the tool row's head.
+ *  See renderSegments in ChatMessage.tsx for how narration lines get
+ *  attached to the call(s) that follow them. */
+export const TraceNarration = memo(function TraceNarration({
+  text,
+}: {
+  text: string;
+}) {
+  return (
+    <div className="trace-narration" dir="auto">
+      {fixZwsp(text)}
+    </div>
+  );
+});
+
 /**
  * A SINGLE read-only tool call rendered as ONE cohesive row — not a header
  * bolted onto an empty body (which is what a lone ToolCallView looks like for
@@ -1248,138 +1255,6 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           )}
         </div>
       ) : null}
-    </div>
-  );
-});
-
-/**
- * A read-only tool call paired with the short narration line the model wrote
- * right before calling it (e.g. "بذار ببینم X رو..."). Instead of stacking a
- * full paragraph text block above a separate, unrelated tool row — which is
- * what made multi-step tool runs feel noisy (every call got its own two-part
- * block) — the caption and the call render as a single quiet row: caption
- * text + status icon + chevron, matching Claude.ai's trace rows. See
- * renderSegments in ChatMessage.tsx for how captions get attached to the
- * call(s) that follow them. Falls back to the plain ToolSingleRow when
- * there's no caption.
- */
-export const ToolNarratedRow = memo(function ToolNarratedRow({
-  caption,
-  activity,
-}: {
-  caption?: string;
-  activity: ToolActivity;
-}) {
-  const [now, setNow] = useState(() => Date.now());
-  const [expanded, setExpanded] = useState(
-    () => activity.tool === "edit_file" || activity.tool === "write_file",
-  );
-  const running = activity.status === "running";
-  useEffect(() => {
-    if (!running) return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [running]);
-  const ms =
-    running && activity.startedAt
-      ? now - activity.startedAt
-      : activity.elapsedMs;
-  if (!caption) return <ToolSingleRow activity={activity} />;
-
-  const label = TOOL_LABEL[activity.tool] ?? activity.tool;
-  const detail = activity.summary
-    ? fixZwsp(activity.summary)
-    : subArgSummary(activity);
-
-  const argsText = activity.args
-    ? Object.entries(activity.args)
-      .map(
-        ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-      )
-      .join("\n")
-    : "";
-
-  const isEdit =
-    activity.tool === "edit_file" || activity.tool === "write_file";
-
-  return (
-    <div
-      className={`trace-row narrated ${activity.status}${running ? " running" : ""}${expanded ? " expanded" : ""}${isEdit ? " edit-file" : ""}`}
-    >
-      <button
-        className="trace-row-head"
-        onClick={() => !isEdit && setExpanded((e) => !e)}
-      >
-        <span className="trace-row-caption" dir="auto">
-          {fixZwsp(caption)}
-        </span>
-        <span className="trace-pill">{label}</span>
-        {isEdit && activity.summary ? (
-          <span className="trace-row-detail trace-row-summary" dir="auto">
-            {activity.summary}
-          </span>
-        ) : null}
-        <span className="trace-row-end">
-          {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
-          <StatusIcon status={activity.status} />
-          {!isEdit && (
-            <IconChevron open={expanded} className="trace-row-chev" />
-          )}
-        </span>
-      </button>
-      {expanded && (
-        <div className="trace-row-expand">
-          {ms ? (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Duration</span>
-              <span className="trace-expand-val">{fmtTime(ms)}</span>
-            </div>
-          ) : null}
-          {activity.summary && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Summary</span>
-              <span className="trace-expand-val" dir="auto">
-                {fixZwsp(activity.summary)}
-              </span>
-            </div>
-          )}
-          {argsText && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Args</span>
-              <pre className="trace-expand-val trace-expand-pre" dir="auto">
-                {argsText}
-              </pre>
-            </div>
-          )}
-          {activity.diff && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Diff</span>
-              <pre
-                className="trace-expand-val trace-expand-pre trace-expand-diff"
-                dir="auto"
-              >
-                {activity.diff}
-              </pre>
-            </div>
-          )}
-          {activity.items && activity.items.length > 0 && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Results</span>
-              {activity.tool === "web_search" ||
-                activity.tool === "fetch_url" ? (
-                <WebResultLinks items={activity.items} />
-              ) : (
-                <FileResultLinks
-                  tool={activity.tool}
-                  items={
-                    activity.items as unknown as Array<Record<string, unknown>>
-                  }
-                />
-              )}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 });

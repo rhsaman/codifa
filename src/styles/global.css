@@ -7806,29 +7806,30 @@ textarea {
   justify-content: center;
 }
 
-/* Container for tool-name pills inside the trace head. Shrinks when space is
-   tight (caption needs the room) but never grows past its natural width. */
+/* Container for tool-name pills inside the trace head. Grows to fill the
+   head; the time/chevron cluster on the right keeps its natural width. */
 .trace-head-pills {
   display: flex;
   align-items: center;
   gap: 5px;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
 }
 
-/* The model's narration line in the group head (Claude.ai-style): fills the
-   space after the pills, single line with ellipsis. Reads as plain text —
-   same treatment as .trace-row-caption so both stay equally legible. */
-.trace-head-caption {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
+/* The model's narration line as its OWN row inside the trace card (above the
+   tool row/group it precedes) — Claude.ai interleaves narration and tool rows
+   inside one card. Quiet plain text, no chrome; a hairline divider separates
+   it from the row below (the .tool-trace frame owns the borders). */
+.trace-narration {
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.5;
   color: var(--text);
-  opacity: 0.88;
+  opacity: 0.85;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
 }
 
 .trace-status-text {
@@ -7997,20 +7998,6 @@ textarea {
   text-overflow: ellipsis;
   opacity: 0.75;
   font-size: inherit;
-}
-
-/* Caption text inside a narrated row: the model's narration line, fills
-   space. Reads as plain text — not italic/washed-out — so it's as legible
-   as the tool rows around it, matching Claude.ai's trace rows. */
-.trace-row-caption {
-  flex: 1 1 auto;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-size: inherit;
-  color: var(--text);
-  opacity: 0.88;
 }
 
 .trace-row-engine {

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
 import { downloadModel, fetchModels, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
+import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
@@ -479,7 +480,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const updateProvider = useStore((s) => s.updateProvider)
   const addProvider = useStore((s) => s.addProvider)
   const removeProvider = useStore((s) => s.removeProvider)
-  const setProviderModels = useStore((s) => s.setProviderModels)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
   const removeMode = useStore((s) => s.removeMode)
@@ -824,36 +824,20 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return () => { cancelled = true }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // فچ و ذخیره‌ی لیست مدل‌های پروایدر فعال. کاتالوگ زنده‌ی /models معیار
-  // قطعی است: مدلی که پروایدر دیگر عرضه نمی‌کند (حذف/تغییرنام‌شده) از لیست
-  // حذف می‌شود و مدل‌های hide‌شده‌ی کاربر هم مخفی می‌مانند. ترمیم مدل
-  // انتخابی و چت‌ها را fetchAndPersist انجام می‌دهد — اینجا فقط لیست
-  // Settings تازه می‌شود.
+  // فچ و ذخیره‌ی لیست مدل‌های پروایدر فعال از طریق fetchAndPersist — همان
+  // مسیر یکسان startup: کاتالوگ زنده‌ی /models معیار قطعی است (مدل حذف/
+  // تغییرنام‌شده از لیست می‌رود)، مدل انتخابی stale ترمیم می‌شود و چت‌ها/
+  // recents هم heal می‌شوند. اینجا فقط placeholder فرم (cfg.model) تازه
+  // می‌شود تا کاربر مدل معتبر را در فرم ببیند.
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      try {
-        const res = await fetchModels(cfg)
-        if (cancelled) return
-        useStore.getState().setProviderContextMap(active.id, res.context)
-        useStore.getState().setProviderReasoningMap(active.id, res.reasoning)
-        if (res.models.length > 0) {
-          const current = useStore.getState().settings.providers.find((p) => p.id === active.id)
-          const removed = new Set(current?.removedModels ?? [])
-          setProviderModels(
-            active.id,
-            Array.from(new Set(
-              res.models.filter((m) => !removed.has(bareModelFor(active, m))),
-            )),
-          )
-        }
-        setCfg((c) => {
-          const first = res.models[0]
-          return { ...c, model: c.model || first }
-        })
-      } catch {
-        /* /models may be unreachable; keep the saved list */
-      }
+      const r = await fetchAndPersist(cfg, { cancelled: () => cancelled })
+      if (cancelled || !r.ok) return
+      setCfg((c) => {
+        const fresh = useStore.getState().settings.providers.find((p) => p.id === active.id)
+        return { ...c, model: fresh?.model || c.model }
+      })
     })()
     return () => {
       cancelled = true

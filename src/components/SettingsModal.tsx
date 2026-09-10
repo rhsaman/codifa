@@ -480,7 +480,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const addProvider = useStore((s) => s.addProvider)
   const removeProvider = useStore((s) => s.removeProvider)
   const setProviderModels = useStore((s) => s.setProviderModels)
-  const removeProviderModel = useStore((s) => s.removeProviderModel)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
   const removeMode = useStore((s) => s.removeMode)
@@ -516,7 +515,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const active = providers.find((p) => p.id === editId) ?? providers[0]
 
   const [cfg, setCfg] = useState<ProviderConfig>({ ...active })
-  const [customModel, setCustomModel] = useState('')
   const [saved, setSaved] = useState(false)
   // Google OAuth sign-in progress: "" idle, "busy" while the consent window is
   // open, "ok"/"error" + message when the flow settles.
@@ -541,17 +539,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     for (const m of allModes(settings)) d[m.id] = settings.systemPrompts?.[m.id] ?? ''
     return d
   })
-
-  // Filter the active provider's model list: strip foreign-provider IDs that
-  // may have leaked in through stale state or cross-provider merge, matching
-  // the filter applied in ToolModelSelect.modelsFor / ProviderModelSelect.allModels.
-  const settingsModelsFor = (p: ProviderConfig): string[] => {
-    const removed = new Set(p.removedModels ?? [])
-    return (p.models ?? []).filter((m) => {
-      const b = bareModelFor(p, m)
-      return !removed.has(b) && !isForeignModelId(p, b)
-    })
-  }
 
   const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
   const googleProvider = providers.find((p) => p.kind === 'google')
@@ -790,7 +777,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Keep the local editor in sync when the edited provider changes.
   useEffect(() => {
     setCfg({ ...active })
-    setCustomModel('')
   }, [editId, active.id])
 
   // Derive the credential method when switching providers: a saved API key wins,
@@ -838,20 +824,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return () => { cancelled = true }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fetch & persist the model list for the active provider (merged with any
-  // manually added models so they are never overwritten). Models the user
-  // explicitly removed stay removed — they are excluded from the merge.
-  //
-  // The freshly-fetched `res.models` are NOT run through isForeignModelId:
-  // they come straight from this exact provider's own /models endpoint, so
-  // they can never actually belong to another provider — and aggregator
-  // kinds (OpenRouter, TokenRouter) legitimately return vendor-prefixed ids
-  // ("google/...", "nvidia/...") that collide with our own built-in provider
-  // kind ids. Filtering the fetch itself used to silently drop those models
-  // from `p.models` on every save, so they never came back even after the
-  // picker-level filters were fixed. The check stays on `existing` (already-
-  // persisted models not in the current fetch), which is exactly the legacy/
-  // migration-contaminated data it was built to guard against.
+  // فچ و ذخیره‌ی لیست مدل‌های پروایدر فعال. کاتالوگ زنده‌ی /models معیار
+  // قطعی است: مدلی که پروایدر دیگر عرضه نمی‌کند (حذف/تغییرنام‌شده) از لیست
+  // حذف می‌شود و مدل‌های hide‌شده‌ی کاربر هم مخفی می‌مانند. ترمیم مدل
+  // انتخابی و چت‌ها را fetchAndPersist انجام می‌دهد — اینجا فقط لیست
+  // Settings تازه می‌شود.
   useEffect(() => {
     let cancelled = false
     void (async () => {
@@ -862,15 +839,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         useStore.getState().setProviderReasoningMap(active.id, res.reasoning)
         if (res.models.length > 0) {
           const current = useStore.getState().settings.providers.find((p) => p.id === active.id)
-          const existing = current?.models ?? []
           const removed = new Set(current?.removedModels ?? [])
-          const fetchedBare = new Set(res.models.map((m) => bareModelFor(active, m)))
           setProviderModels(
             active.id,
-            Array.from(new Set([
-              ...res.models.filter((m) => !removed.has(m)),
-              ...existing.filter((m) => fetchedBare.has(bareModelFor(active, m)) && !isForeignModelId(active, bareModelFor(active, m))),
-            ])),
+            Array.from(new Set(
+              res.models.filter((m) => !removed.has(bareModelFor(active, m))),
+            )),
           )
         }
         setCfg((c) => {
@@ -886,13 +860,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active.id, cfg.baseUrl, cfg.apiKey, cfg.kind])
-
-  const addCustomModel = () => {
-    const m = customModel.trim()
-    if (!m) return
-    setProviderModels(active.id, [...(active.models ?? []), m])
-    setCustomModel('')
-  }
 
   const setPrompt = (mode: string, value: string) =>
     setPromptDrafts((d) => ({ ...d, [mode]: value }))
@@ -1359,48 +1326,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 )}
               </div>
             )}
-
-            <div className="field">
-              <label>Models for this provider</label>
-              <div className="hint">
-                Models are fetched live from this provider’s <code>/models</code> endpoint. Models you
-                pick in the composer and custom ones added below are saved to the database for this
-                provider.
-              </div>
-              {settingsModelsFor(active).length === 0 ? (
-                <div className="hint">No models saved yet — they appear here after fetching or adding one.</div>
-              ) : (
-                <div className="model-tags">
-                  {settingsModelsFor(active).map((m) => (
-                    <span key={m} className={`model-tag ${m === cfg.model ? 'current' : ''}`}>
-                      {m}
-                      <button
-                        className="model-tag-remove"
-                        title="Remove model"
-                        onClick={() => removeProviderModel(active.id, m)}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="model-add-row">
-                <input
-                  className="model-add-input"
-                  value={customModel}
-                  onChange={(e) => setCustomModel(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') addCustomModel()
-                  }}
-                  placeholder="Add a custom model id"
-                  dir="ltr"
-                />
-                <button className="btn tiny" onClick={addCustomModel} disabled={!customModel.trim()}>
-                  Add
-                </button>
-              </div>
-            </div>
 
           </>
         )}

@@ -11,7 +11,7 @@
  */
 import { fetchModels, type ModelsResult } from './api'
 import { useStore } from './store'
-import { isForeignModelId, PROVIDER_META } from './provider-meta'
+import { isForeignModelId } from './provider-meta'
 import type { ProviderConfig } from '../types'
 
 export type FetchSkipReason = 'no-base-url' | 'disabled'
@@ -30,6 +30,7 @@ export interface StoreLike {
   ) => void
   setProviderReasoningMap: (id: string, data: Record<string, boolean>) => void
   setProviderModels: (id: string, models: string[]) => void
+  healStaleModels: (id: string, validModels: string[]) => void
   updateProvider: (id: string, patch: Partial<ProviderConfig>) => void
   settings: { providers: ProviderConfig[] }
 }
@@ -62,29 +63,26 @@ export function bareModelId(p: { id: string }, m: string): string {
 }
 
 /**
- * Pure merge: keep fetched models (minus anything the user removed and minus
- * models that belong to a foreign provider), then keep existing models too
- * (also filtering foreign entries).  Deduplicates.  Does NOT touch the store.
+ * ادغام بر اساس کاتالوگ زنده‌ی /models — معیار قطعی. خروجی فقط همان
+ * مدل‌هایی است که پروایدر الان عرضه می‌کند (منهای مدل‌های hide‌شده‌ی
+ * کاربر و مدل‌های متعلق به پروایدر دیگر)، بدون تکرار. لیست ذخیره‌شده‌ی
+ * قبلی عمداً نگه داشته نمی‌شود تا مدلی که پروایدر حذف یا تغییرنام کرده
+ * («No such model») هرگز در لیست زنده نماند. store را تغییر نمی‌دهد.
  */
 export function mergeFetchedModels(
   p: ProviderConfig,
   fetched: string[],
-  existing: string[],
   removed: string[],
 ): string[] {
   const removedSet = new Set(removed)
 
   return Array.from(
-    new Set([
-      ...fetched.filter((m) => {
+    new Set(
+      fetched.filter((m) => {
         const b = bareModelId(p, m)
         return !removedSet.has(b) && !isForeignModelId(p, b)
       }),
-      ...existing.filter((m) => {
-        const b = bareModelId(p, m)
-        return !isForeignModelId(p, b)
-      }),
-    ]),
+    ),
   )
 }
 
@@ -114,27 +112,26 @@ export async function fetchAndPersist(
     if (res.models.length === 0) return { ok: true, count: 0 }
 
     const fresh = store.settings.providers.find((x) => x.id === p.id)
-    const existing = fresh?.models ?? []
     const removed = fresh?.removedModels ?? []
-    const merged = mergeFetchedModels(p, res.models, existing, removed)
+    const merged = mergeFetchedModels(p, res.models, removed)
     store.setProviderModels(p.id, merged)
-    // Auto-pick / self-heal the selected model from the provider's REAL
-    // catalog (never a hardcoded default):
-    // - empty `model` → adopt the first fetched model;
-    // - a selected model missing from the FETCHED catalog of a BUILT-IN
-    //   gateway (whose /models list is authoritative) is stale/mistyped (e.g.
-    //   "laguna-s-2.1-free" on opencode) → replace with the first real model
-    //   so chats stop failing with 401 "Model ... is not supported". Custom
-    //   providers keep out-of-list models (their /models may be partial);
-    //   user-added ids survive in the LIST because the merge keeps `existing`.
+    // انتخاب/ترمیم خودکار مدل از کاتالوگ واقعی پروایدر (هرگز مقدار
+    // hardcode‌شده):
+    // - `model` خالی → اولین مدل کاتالوگ;
+    // - مدل انتخابی‌ای که در کاتالوگ فچ‌شده نیست stale است (پروایدر آن را
+    //   حذف یا تغییرنام کرده، مثل "mimo-v2.5-free") → با اولین مدل واقعی
+    //   جایگزین می‌شود تا چت‌ها با «No such model» شکست نخورند.
     const current = fresh?.model ?? ''
     const inCatalog = res.models.some(
       (m) => bareModelId(p, m) === bareModelId(p, current),
     )
-    const builtin = PROVIDER_META[p.kind]?.builtin === true
-    if (fresh && merged.length > 0 && (!current || (builtin && !inCatalog))) {
+    if (fresh && merged.length > 0 && (!current || !inCatalog)) {
       store.updateProvider(p.id, { model: bareModelId(p, merged[0]) })
     }
+    // ترمیم همه‌ی چت‌ها و recents که هنوز به مدلی اشاره می‌کنند که پروایدر
+    // دیگر عرضه نمی‌کند — وگرنه ارسال بعدی همان چت با «No such model»
+    // می‌شکند حتی وقتی کاتالوگ بالا تازه است.
+    if (merged.length > 0) store.healStaleModels(p.id, merged)
     return { ok: true, count: merged.length }
   } catch (err) {
     return {

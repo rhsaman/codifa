@@ -752,7 +752,14 @@ _UNIVERSAL_RULES = (
     "a training cutoff. Always call the `current_time` tool when the user asks "
     "about 'today', 'now', 'recent', 'latest', 'what day is it', 'current date', "
     "or any time-sensitive question. Do NOT guess or use your training data for "
-    "the current date."
+    "the current date.\n"
+    "7. TOOL NARRATION: before EVERY tool call (or batch of parallel tool "
+    "calls) write ONE short narration line — in the user's language — saying "
+    "what you are about to do and why (e.g. 'بذار ببینم X کجا تعریف "
+    "شده...'). Keep it under ~15 words, plain text, no markdown/headers/code "
+    "fences. That line renders as the caption of the tool row (Claude.ai-style) "
+    "so the user always sees what you are doing while tools run. Never call a "
+    "tool silently."
 )
 
 # Length rule for plan/coder ONLY — these modes need full, complete deliverables

@@ -433,7 +433,7 @@ interface State {
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
-  removeProviderModel: (id: string, model: string) => void
+  healStaleModels: (providerId: string, validModels: string[]) => void
   setMcpServers: (mcpServers: Record<string, McpServerConfig>) => void
   addMcpServer: (name: string, cfg: McpServerConfig) => void
   updateMcpServer: (name: string, cfg: McpServerConfig) => void
@@ -1094,28 +1094,27 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  removeProviderModel: (id, model) => {
-    set((s) => {
-      const target = s.settings.providers.find((p) => p.id === id)
-      const remaining = (target?.models ?? []).filter((m) => m !== model)
-      return {
-        settings: {
-          ...s.settings,
-          providers: s.settings.providers.map((p) =>
-            p.id === id
-              ? {
-                  ...p,
-                  models: remaining,
-                  removedModels: Array.from(new Set([...(p.removedModels ?? []), model])),
-                  // The main model is chosen in the composer, NOT here — never
-                  // rewrite `model` when a provider model is removed.
-                }
-              : p,
-          ),
-        },
-        recentModels: s.recentModels.filter((r) => !(r.providerId === id && r.model === model)),
-      }
-    })
+  // ترمیم خودکار ارجاع‌های مدلِ ازکاتالوگ‌رفته: وقتی لیست زنده‌ی /models
+  // می‌آید، مدل‌های حذف‌شده/تغییرنام‌یافته‌ی پروایدر دیگر معتبر نیستند.
+  // چت‌هایی که هنوز روی چنین مدلی هستند به اولین مدل معتبر برمی‌گردند و
+  // recents همان پروایدر پاکسازی می‌شوند تا ارسال بعدی هرگز با خطای
+  // «No such model» شکست نخورد. updatedAt عمداً دست نمی‌خورد تا ترتیب
+  // چت‌ها در سایدبار جابه‌جا نشود.
+  healStaleModels: (providerId, validModels) => {
+    if (validModels.length === 0) return
+    const bare = (m: string) => (m.startsWith(`${providerId}/`) ? m.slice(providerId.length + 1) : m)
+    const valid = new Set(validModels.map(bare))
+    const fallback = bare(validModels[0])
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        const owner = c.providerId ?? s.settings.activeProviderId
+        if (owner !== providerId || !c.model || valid.has(bare(c.model))) return c
+        return { ...c, model: fallback }
+      }),
+      recentModels: s.recentModels.filter(
+        (r) => r.providerId !== providerId || valid.has(bare(r.model)),
+      ),
+    }))
     get().persist()
   },
 

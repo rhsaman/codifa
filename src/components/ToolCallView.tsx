@@ -616,9 +616,9 @@ export const ToolGroupView = memo(function ToolGroupView({
 }: {
   activities: { activity: ToolActivity; index: number }[];
   /** The short narration line the model wrote right before this run of calls
-   *  (see renderSegments in ChatMessage.tsx). Used as the trace-head status
-   *  text (Claude.ai-style: ✱ + "Tracing X" + elapsed time), instead of a
-   *  separate caption above the head. */
+   *  (see renderSegments in ChatMessage.tsx). Rendered as a secondary line
+   *  after the tool pills — Claude.ai-style — so the user sees what the model
+   *  is doing while the tools run. */
   caption?: string;
   onReverted?: (index: number) => void;
 }) {
@@ -653,6 +653,11 @@ export const ToolGroupView = memo(function ToolGroupView({
             </span>
           ))}
         </span>
+        {/* {caption && ( */}
+        {/*   <span className="trace-head-caption" dir="auto" title={caption}> */}
+        {/*     {fixZwsp(caption)} */}
+        {/*   </span> */}
+        {/* )} */}
         <span className="trace-head-right">
           {totalMs > 0 && (
             <span className="trace-time">{fmtTime(totalMs)}</span>

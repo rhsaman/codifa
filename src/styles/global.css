@@ -7806,14 +7806,29 @@ textarea {
   justify-content: center;
 }
 
-/* Container for tool-name pills inside the trace head */
+/* Container for tool-name pills inside the trace head. Shrinks when space is
+   tight (caption needs the room) but never grows past its natural width. */
 .trace-head-pills {
   display: flex;
   align-items: center;
   gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The model's narration line in the group head (Claude.ai-style): fills the
+   space after the pills, single line with ellipsis. Reads as plain text —
+   same treatment as .trace-row-caption so both stay equally legible. */
+.trace-head-caption {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.88;
 }
 
 .trace-status-text {

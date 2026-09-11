@@ -30,6 +30,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -309,7 +310,6 @@ def build_chat_model(
         # the UI's thinking slider actually steers Gemini reasoning depth.
         # (Gemini 2.5+ exposes thinking; older models ignore the field.)
         google_thinking: dict[str, int] = {
-            "minimal": 1024,
             "low": 4096,
             "medium": 12288,
             "high": 32768,
@@ -572,6 +572,107 @@ def _strip_temperature(model: Any) -> Any:
     if getattr(clone, "temperature", None) is not None:
         try:
             clone.temperature = None
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return clone
+
+
+# Ordered ladder of reasoning-effort values, weakest to strongest. Used to map
+# the user's chosen thinking level onto the nearest value an always-thinking
+# route accepts (some gateways, e.g. agentrouter, only allow low/high/max).
+_EFFORT_LADDER = ("minimal", "low", "medium", "high", "max")
+
+
+def _is_reasoning_effort_error(exc: Exception) -> bool:
+    """True when a 400 means the route rejects our reasoning_effort value.
+
+    Some always-thinking gateways (e.g. agentrouter's Chinese-language routes)
+    only accept low/high/max and reject minimal/medium/absent with
+    「该模型始终思考，不支持关闭思考；请使用 low、high 或 max」("this model
+    always thinks, disabling thinking is not supported; use low, high or
+    max"). The runner retries once with the effort remapped to the nearest
+    allowed value instead of failing the turn.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    if status is None:
+        m = re.search(r"(?:error\s+code|status_code|code)[:=\s]+(\d{3})", str(exc))
+        if m:
+            try:
+                status = int(m.group(1))
+            except (TypeError, ValueError):
+                status = None
+    if status != 400:
+        return False
+    msg = str(exc).lower()
+    mentions_thinking = any(w in msg for w in ("思考", "thinking", "reasoning"))
+    rejects_value = any(
+        w in msg for w in ("不支持", "not support", "unsupported", "始终", "always")
+    )
+    return mentions_thinking and rejects_value
+
+
+def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
+    """Return a copy of ``model`` with ``reasoning_effort`` remapped to the
+    nearest value the route accepts.
+
+    The allowed set is parsed from the error text itself (「请使用 low、high
+    或 max」 lists it), falling back to low/high/max. The user's current level
+    is mapped onto the nearest allowed rung of ``_EFFORT_LADDER`` — e.g.
+    medium -> high, high -> max when max is allowed, minimal/none -> low — so
+    the retry keeps the user's intent instead of always dropping to "low".
+    Handles BOTH the top-level LangChain field (set by build_chat_model) and
+    model_kwargs. Falls back to the original model if cloning fails.
+    """
+    # Parse the allowed values straight out of the error message.
+    allowed = {w for w in _EFFORT_LADDER if w in str(exc).lower()}
+    if not allowed:
+        allowed = {"low", "high", "max"}
+    current = getattr(model, "reasoning_effort", None)
+    if not current:
+        mk = getattr(model, "model_kwargs", None) or {}
+        current = mk.get("reasoning_effort")
+    # Map the current level to the nearest allowed rung: the closest value by
+    # ladder distance, preferring the stronger one on ties (a user who picked
+    # medium wants real reasoning, not the floor).
+    if current in allowed:
+        # "high" means "the strongest reasoning I can get" — when the route
+        # also allows max, upgrade so the user can actually use it.
+        target = "max" if current == "high" and "max" in allowed else current
+    else:
+        cur_idx = _EFFORT_LADDER.index(current) if current in _EFFORT_LADDER else -1
+        if cur_idx < 0:
+            # No effort set at all (thinking "off"): these routes can't be
+            # turned off, so use the weakest allowed value.
+            target = min(allowed, key=_EFFORT_LADDER.index)
+        else:
+            allowed_sorted = sorted(allowed, key=_EFFORT_LADDER.index)
+            below = [v for v in allowed_sorted if _EFFORT_LADDER.index(v) < cur_idx]
+            above = [v for v in allowed_sorted if _EFFORT_LADDER.index(v) > cur_idx]
+            if below and above:
+                lo, hi = below[-1], above[0]
+                d_lo = cur_idx - _EFFORT_LADDER.index(lo)
+                d_hi = _EFFORT_LADDER.index(hi) - cur_idx
+                target = lo if d_lo < d_hi else hi
+            elif above:
+                target = above[0]
+            else:
+                target = below[-1]
+    try:
+        clone = model.model_copy(deep=False)
+    except Exception:  # noqa: BLE001
+        return model
+    try:
+        clone.reasoning_effort = target
+    except Exception:  # noqa: BLE001, S110
+        pass
+    mk = dict(getattr(clone, "model_kwargs", None) or {})
+    if "reasoning_effort" in mk:
+        mk["reasoning_effort"] = target
+        try:
+            clone.model_kwargs = mk
         except Exception:  # noqa: BLE001, S110
             pass
     return clone

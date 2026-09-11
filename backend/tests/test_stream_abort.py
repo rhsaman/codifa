@@ -227,3 +227,89 @@ async def test_aclose_exception_does_not_break_abort_path():
     out = [c async for c in _stream_drive(agent, chat_id="pytest", model="m", base_url="")]
     assert len(out) == 2
     assert not agent.aclose_called, "clean finish must not call aclose"
+
+
+# ---------------------------------------------------------------------------
+# Mid-stream abort while __anext__ is in flight — the shield/keepalive hole.
+# ---------------------------------------------------------------------------
+
+
+class _BlockingAgent:
+    """Agent whose ``__anext__`` blocks forever after one event.
+
+    Mimics the real ``run_agent`` mid-provider-stream: the in-flight
+    ``__anext__()`` is parked inside ``run_graph``'s ``queue.get()`` waiting
+    for the next token. Records whether that in-flight call was actually
+    cancelled — the whole point of the Stop button.
+    """
+
+    def __init__(self) -> None:
+        self.aclose_awaited = False
+        self.anext_cancelled = False
+        self.anext_started = False
+        self._first_sent = False
+
+    def aclose(self):
+        return _Close(self._aclose())
+
+    async def _aclose(self):
+        self.aclose_awaited = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> dict:
+        if not self._first_sent:
+            self._first_sent = True
+            return {"kind": "token", "content": "a"}
+        self.anext_started = True
+        try:
+            await asyncio.Event().wait()  # blocks forever — like a live stream
+        except asyncio.CancelledError:
+            self.anext_cancelled = True
+            raise
+
+
+async def test_abort_mid_stream_cancels_inflight_anext_task():
+    """Regression: Stop while the agent's ``__anext__()`` is in flight.
+
+    Starlette cancels the response task while it is awaiting the next SSE
+    chunk — i.e. while ``_with_keepalive`` is suspended inside
+    ``await asyncio.wait_for(asyncio.shield(pending), ...)``. ``shield`` does
+    NOT propagate that cancellation into ``pending`` (the in-flight
+    ``agent_iter.__anext__()``), and the old handler only cancelled it on the
+    paths it explicitly caught — any teardown that slipped past left the task
+    orphaned, the later ``agent_gen.aclose()`` failed with "async generator is
+    already running" (silently suppressed), ``run_graph``'s ``finally`` never
+    ran, ``_drive`` was never cancelled, and the LLM provider stream kept
+    token-burning after Stop. The fix cancels ``pending`` in a ``finally``
+    that runs on EVERY exit path.
+    """
+    agent = _BlockingAgent()
+    gen = _stream_drive(agent, chat_id="pytest", model="m", base_url="")
+
+    async def _consume() -> None:
+        async for _ in gen:
+            pass
+
+    consumer = asyncio.create_task(_consume())
+    # Let the consumer pull the first chunk and then park inside the shielded
+    # wait for the next agent event (the agent blocks forever there — like a
+    # live provider stream).
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if agent.anext_started:
+            break
+    assert agent.anext_started, "consumer never reached the live-stream wait"
+
+    # The user presses Stop: Starlette cancels the response task mid-await.
+    consumer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await consumer
+
+    assert agent.anext_cancelled, (
+        "the in-flight agent __anext__() task was NOT cancelled on abort — "
+        "the provider stream is still running orphaned (the 'Stop doesn't "
+        "stop the LLM' bug)"
+    )
+    assert agent.aclose_awaited, "agent_gen.aclose() was never awaited"

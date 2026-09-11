@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore, workspaceKey } from "../lib/store";
 export { useStore };
 import { themeById } from "../lib/themes";
-import type { Chat, ChatMessage, Workspace } from "../types";
+import type { Chat, Workspace } from "../types";
 import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { shouldFocusSearch } from "../lib/shortcuts";
@@ -28,11 +28,10 @@ interface Group {
 }
 
 /** Persisted sidebar UI state (localStorage `coder:sidebarUi`): collapse
- *  toggles + panel heights for workspace groups and Todos, so the
- *  layout the user left comes back exactly as it was after a restart. */
+ *  toggles for workspace groups, so the layout the user left comes back
+ *  exactly as it was after a restart. (Todos moved to the floating
+ *  TodosPanel — its state lives in `coder:todoPanel`.) */
 interface SidebarUiState {
-  todoCollapsed?: boolean;
-  todoHeight?: number;
   collapsedGroups?: string[];
 }
 
@@ -240,39 +239,25 @@ export function Sidebar() {
   const open = useStore((s) => s.sidebarOpen);
   const dir = useStore((s) => s.dir);
 
-  // ---- Footer panel state (todos), VSCode-style: collapsible with a
-  // user-resizable content height via a drag handle. ----
-  const [todoCollapsed, setTodoCollapsed] = useState(
-    () => savedUi.todoCollapsed ?? false,
-  );
-  const [todoHeight, setTodoHeight] = useState(() => savedUi.todoHeight ?? 320);
-  const todoDrag = useRef<{ startY: number; startH: number } | null>(null);
-
   // Persist the panel/group UI state whenever it changes, so collapse toggles
-  // and panel heights survive restarts. Debounced: a height drag fires
-  // setTodoHeight on every mousemove, and writing localStorage per frame
-  // would lag the drag — the write lands 250ms after the drag settles, and
-  // the app-close flush below guarantees the final value.
+  // survive restarts. Debounced: the write lands 250ms after the change
+  // settles, and the app-close flush below guarantees the final value.
   useEffect(() => {
     const t = setTimeout(() => {
       try {
         localStorage.setItem(
           "coder:sidebarUi",
-          JSON.stringify({
-            todoCollapsed,
-            todoHeight,
-            collapsedGroups: [...collapsed],
-          }),
+          JSON.stringify({ collapsedGroups: [...collapsed] }),
         );
       } catch {
         /* quota / serialization errors — the layout just won't persist */
       }
     }, 250);
     return () => clearTimeout(t);
-  }, [todoCollapsed, todoHeight, collapsed]);
+  }, [collapsed]);
 
   // Flush the latest sidebar UI state synchronously on app close, so a toggle
-  // or resize made right before quitting is never lost to the debounce above.
+  // made right before quitting is never lost to the debounce above.
   // Also flushes on the store's `coder:flush-ui` event (dispatched before every
   // store flush, including the main process's `flush-persist` on quit) so the
   // layout survives even when the renderer's beforeunload runs late.
@@ -281,11 +266,7 @@ export function Sidebar() {
       try {
         localStorage.setItem(
           "coder:sidebarUi",
-          JSON.stringify({
-            todoCollapsed,
-            todoHeight,
-            collapsedGroups: [...collapsed],
-          }),
+          JSON.stringify({ collapsedGroups: [...collapsed] }),
         );
       } catch {
         /* quota / serialization errors — the layout just won't persist */
@@ -299,7 +280,7 @@ export function Sidebar() {
       window.removeEventListener("beforeunload", flush);
       window.removeEventListener("pagehide", flush);
     };
-  }, [todoCollapsed, todoHeight, collapsed]);
+  }, [collapsed]);
 
   // Sidebar width — drag-resizable on the right edge (VSCode-style), persisted
   // locally so the layout survives restarts.
@@ -374,22 +355,6 @@ export function Sidebar() {
       }))
       .filter((g) => g.chats.length > 0)
     : groups;
-
-  // Live plan checklist of the ACTIVE chat surfaced in the sidebar footer. Uses
-  // the latest message that carries a non-empty plan; hidden only when no plan
-  // exists. Completed items stay visible with ticks so the finished checklist
-  // remains in view.
-  const activeChat = chats.find((c) => c.id === activeChatId);
-  const todos: ChatMessage["plan"] = [];
-  if (activeChat) {
-    for (let i = activeChat.messages.length - 1; i >= 0; i--) {
-      const plan = activeChat.messages[i].plan;
-      if (plan && plan.length > 0) {
-        todos.push(...plan);
-        break;
-      }
-    }
-  }
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();
@@ -1116,84 +1081,6 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar-footer">
-        {todos.length > 0 && (
-          <div
-            className={`sidebar-panel ${todoCollapsed ? "collapsed" : ""}`}
-            dir={dir}
-          >
-            <div
-              className="sidebar-panel-head"
-              onClick={() => setTodoCollapsed((v) => !v)}
-              title={todoCollapsed ? "Expand Todos" : "Collapse Todos"}
-            >
-              <span className="sidebar-panel-chevron">
-                {todoCollapsed ? "▸" : "▾"}
-              </span>
-              <span className="sidebar-panel-title">Todos</span>
-              <span className="sidebar-panel-count">
-                {todos.filter((t) => t.status === "completed").length}/
-                {todos.length}
-              </span>
-            </div>
-            {!todoCollapsed && (
-              <>
-                <div
-                  className="sidebar-panel-resize"
-                  title="Drag up to grow, down to shrink"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    todoDrag.current = {
-                      startY: e.clientY,
-                      startH: todoHeight,
-                    };
-                    const onMove = (ev: MouseEvent) => {
-                      if (!todoDrag.current) return;
-                      setTodoHeight(
-                        Math.max(
-                          60,
-                          Math.min(
-                            760,
-                            todoDrag.current.startH -
-                            (ev.clientY - todoDrag.current.startY),
-                          ),
-                        ),
-                      );
-                    };
-                    const onUp = () => {
-                      todoDrag.current = null;
-                      window.removeEventListener("mousemove", onMove);
-                      window.removeEventListener("mouseup", onUp);
-                    };
-                    window.addEventListener("mousemove", onMove);
-                    window.addEventListener("mouseup", onUp);
-                  }}
-                />
-                <ul
-                  className="sidebar-todos-list"
-                  style={{ maxHeight: todoHeight }}
-                >
-                  {todos.map((t, i) => (
-                    <li
-                      key={i}
-                      className={`sidebar-todo-item ${t.status === "completed" ? "done" : t.status === "in_progress" ? "running" : ""}`}
-                    >
-                      <span className="sidebar-todo-mark">
-                        {t.status === "completed"
-                          ? "✓"
-                          : t.status === "in_progress"
-                            ? "●"
-                            : "○"}
-                      </span>
-                      <span className="sidebar-todo-content">
-                        {prepareContent(t.content, dir)}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </div>
-        )}
         <button
           className="sidebar-foot-btn"
           title="Settings (⌘,)"

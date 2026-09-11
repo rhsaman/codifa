@@ -41,7 +41,6 @@ import {
 import {
   steerChat,
   streamChat,
-  fetchModels,
   fetchCredits,
   transcribeAudio,
   respondPermission,
@@ -103,7 +102,6 @@ const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
 
 const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
   ["none", "None"],
-  ["minimal", "Minimal"],
   ["low", "Low"],
   ["medium", "Medium"],
   ["high", "High"],
@@ -115,7 +113,6 @@ const THINKING_LABELS = Object.fromEntries(THINKING_OPTIONS) as Record<
 const THINKING_DESCS: Record<ThinkingLevel, string> = {
   "": "Default reasoning",
   none: "No reasoning — fastest replies",
-  minimal: "Minimal reasoning — quick replies",
   low: "Light reasoning — faster replies",
   medium: "Balanced reasoning — default",
   high: "Deep reasoning — better answers",
@@ -707,32 +704,9 @@ export function ChatPanel() {
       images,
     });
   }, [chat?.id, input, attachments, images]);
-  // Keep the model context window (and pricing, when the provider advertises
-  // it) fresh from the provider's live /models list, so the context meter
-  // reflects the model's real capacity and cost (not a hardcoded default).
-  // Refetch only when the provider's identity changes.
-  useEffect(() => {
-    let cancelled = false;
-    if (!provider.kind) return;
-    void fetchModels(provider)
-      .then((res) => {
-        if (cancelled) return;
-        useStore.getState().setProviderContextMap(provider.id, res.context);
-        useStore.getState().setProviderPricingMap(provider.id, res.pricing);
-        useStore.getState().setProviderReasoningMap(provider.id, res.reasoning);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    provider.id,
-    provider.kind,
-    provider.baseUrl,
-    provider.apiKey,
-    provider.envVar,
-  ]);
+  // NOTE: نقشه‌های context/pricing/reasoning هر پروایدر فقط در استارت‌آپ
+  // (App.tsx → fetchAndPersist) و هنگام افزودن/ویرایش پروایدر (SettingsModal)
+  // فچ می‌شوند — تعویض پروایدر در چت دیگر فچ اضافه‌ای انجام نمی‌دهد.
 
   useEffect(() => {
     if (!wroot || attachments.length === 0) {

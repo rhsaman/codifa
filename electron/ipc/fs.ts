@@ -35,13 +35,12 @@ export function resolveSafe(root: string, relPath: string): string {
 
 /** Directories excluded from file listings / quick-open / search. Mirrors
  *  backend/tools.py `_SKIP_DIRS` so the agent, Ctrl+P and the file tree all
- *  agree on what is visible. Hidden dirs NOT in this set (`.config`, `.github`,
- *  …) stay visible — config files are real workspace content. */
+ *  agree on what is visible. */
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.venv', 'venv', '__pycache__', '.next',
   '.nuxt', 'dist', 'dist-electron', 'release', 'build', 'coverage',
   '.cache', '.idea', '.vscode', '.DS_Store', 'target', 'vendor',
-  '.tox', '.mypy_cache', '.pytest_cache', 'out', 'bin', 'obj',
+  '.tox', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.github', '.playwright', '.playwright-mcp', 'out', 'bin', 'obj',
 ])
 
 const MAX_WALK_FILES = 50_000
@@ -87,11 +86,10 @@ function cachedWalk(root: string): string[] {
 }
 
 /** Walk the whole workspace tree in ONE pass and return every file quick-open
- *  should index (relative path + name). Skips dependency/build dirs and
- *  dot-dirs like `.git`/`.cache`, but keeps other dotfiles (`.config`, `.env`,
- *  `.github`) so config files are findable. A single IPC call avoids the old
- *  per-directory round-trips and the 800-file cap that silently dropped whole
- *  subfolders (e.g. the second of two project folders). */
+ *  should index (relative path + name). Skips dependency/build/cache dirs
+ *  (see SKIP_DIRS above). A single IPC call avoids the old per-directory
+ *  round-trips and the 800-file cap that silently dropped whole subfolders
+ *  (e.g. the second of two project folders). */
 export function walkWorkspace(root: string): { rel: string; name: string }[] {
   if (!root || !fs.existsSync(root)) return []
   const out: { rel: string; name: string }[] = []

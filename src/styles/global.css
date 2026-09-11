@@ -57,6 +57,7 @@
   --z-sidebar-resize: 20;
   --z-scroll-jump: 30;
   --z-popover: 40;
+  --z-todos-float: 45;
   --z-modal-overlay: 100;
   --z-reading-mode: 90;
   --z-ws-menu: 110;
@@ -1027,11 +1028,7 @@ textarea {
   padding: 6px 6px 6px 10px;
   border-radius: 10px;
   background: transparent;
-  border: 1px solid transparent;
-  transition:
-    background 0.12s,
-    color 0.12s,
-    border-color 0.12s;
+  transition: background 0.12s, color 0.12s;
 }
 
 /* نوار اکسنت رنگی در سمت چپ — هویت بصری ورک‌اسپیس بدون زمینهٔ سنگین */
@@ -1053,12 +1050,11 @@ textarea {
 }
 
 .sidebar-group-head:hover {
-  background: transparent;
-  border-color: transparent;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
 .sidebar-group-head:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .sidebar-group-toggle {
@@ -1278,9 +1274,7 @@ textarea {
   gap: 3px;
 }
 
-/* Live plan checklist + model usage of the active chat, shown above the
-   theme/settings buttons. Each is a VSCode-style collapsible panel whose
-   content height is user-resizable via a drag handle. */
+/* پنل Todos شناور — استایل پایه که TodosPanel با portal به body رندر می‌کند. */
 .sidebar-panel {
   border: none;
   border-radius: 14px;
@@ -1430,6 +1424,33 @@ textarea {
 .sidebar-todo-content {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* پنل Todos شناور — دیگر در سایدبار نیست؛ با درگ هدر به هر جای صفحه
+   جابه‌جا می‌شود و موقعیتش در coder:todoPanel ذخیره می‌شود. */
+.sidebar-panel.todos-float {
+  position: fixed;
+  z-index: var(--z-todos-float);
+  width: 300px;
+  max-width: calc(100vw - 32px);
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%),
+      var(--bg-input));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 10px 32px rgba(0, 0, 0, 0.3);
+  margin-bottom: 0;
+}
+
+.sidebar-panel.todos-float .sidebar-panel-head {
+  cursor: grab;
+}
+
+.sidebar-panel.todos-float .sidebar-panel-head:active {
+  cursor: grabbing;
 }
 
 /* ---- Titlebar usage chip (total chat tokens; details on hover) ----

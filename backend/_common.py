@@ -312,7 +312,6 @@ def _extract_reasoning_tokens(um: dict) -> int:
 _THINKING_LEVELS = {
     "": None,
     "none": False,
-    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",

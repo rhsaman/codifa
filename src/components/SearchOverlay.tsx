@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { workspaceFiles, api, type WorkspaceFile, type SearchMatch } from '../lib/fs'
+import { workspaceFiles, api, loadFileUsage, bumpFileUsage, type WorkspaceFile, type SearchMatch } from '../lib/fs'
 import { useStore } from '../lib/store'
 import { physicalKey } from '../lib/shortcuts'
 
@@ -28,8 +28,10 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
   const [idx, setIdx] = useState(0)
   const [files, setFiles] = useState<WorkspaceFile[]>([])
   const [grep, setGrep] = useState<SearchMatch[]>([])
+  const [usage, setUsage] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const resultsRef = useRef<HTMLDivElement>(null)
   const grepTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (!root) return
+    setUsage(loadFileUsage(root))
     let cancelled = false
     void workspaceFiles(root).then((f) => {
       if (!cancelled) setFiles(f)
@@ -53,16 +56,25 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
     return { mode: mode as 'file' | 'grep', q }
   }, [q, mode])
 
+  // Most-used files surface first: with no query it's a pure usage-desc sort
+  // (ties keep the underlying alphabetical order — Array#sort is stable); with
+  // a query, usage only nudges the ranking (capped, diminishing) so a strong
+  // text match never loses to a file you happen to open a lot.
   const fileResults = useMemo(() => {
     const t = query.q.trim().toLowerCase()
-    if (!t) return files.slice(0, 20)
+    if (!t) {
+      return [...files].sort((a, b) => (usage[b.rel] ?? 0) - (usage[a.rel] ?? 0)).slice(0, 20)
+    }
     return files
-      .map((f) => ({ f, s: fuzzyScore(t, `${f.rel} ${f.name}`) }))
+      .map((f) => ({
+        f,
+        s: fuzzyScore(t, `${f.rel} ${f.name}`) + Math.min(usage[f.rel] ?? 0, 20) * 0.5,
+      }))
       .filter((x) => x.s > 0)
       .sort((a, b) => b.s - a.s)
       .slice(0, 20)
       .map((x) => x.f)
-  }, [files, query])
+  }, [files, query, usage])
 
   useEffect(() => {
     if (query.mode !== 'grep' || !root || !query.q.trim()) {
@@ -87,7 +99,15 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
 
   useEffect(() => setIdx(0), [query.q, query.mode])
 
+  // Keep the keyboard-highlighted row visible: Ctrl+J/K nav moves `idx` but
+  // `.search-results` scrolls independently, so the highlight can move past
+  // the visible area without this.
+  useEffect(() => {
+    resultsRef.current?.querySelector<HTMLElement>('.search-item.active')?.scrollIntoView({ block: 'nearest' })
+  }, [idx])
+
   const select = (rel: string) => {
+    if (root) bumpFileUsage(root, rel)
     window.dispatchEvent(new CustomEvent('coder:attach-file', { detail: { rel } }))
     onClose()
   }
@@ -159,7 +179,7 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
           />
           <span className="search-mode-badge">{query.mode === 'grep' ? 'content' : 'files'}</span>
         </div>
-        <div className="search-results">
+        <div className="search-results" ref={resultsRef}>
           {!root && <div className="search-empty">No workspace open (⌘O)</div>}
           {root && results.length === 0 && (
             <div className="search-empty">

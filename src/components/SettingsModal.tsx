@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
-import { downloadModel, fetchModels, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
+import { downloadModel, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
@@ -46,7 +46,6 @@ function providerDescription(p: ProviderConfig): string {
 function modelLabelForOpts(kind: ProviderKind, providerId: string, m: string): string {
   return PROVIDER_META[kind]?.unprefixedModelId ? m : `${providerId}/${m}`
 }
-
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
  *  doubled as "openrouter/openrouter/free". */
@@ -54,16 +53,8 @@ function bareModelFor(p: ProviderConfig, m: string): string {
   return m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
 }
 
-// Live model lists fetched from each provider's /models endpoint, cached for
-// the session so reopening the picker doesn't refetch unchanged providers.
-const SUBAGENT_LIVE_CACHE = new Map<string, string[]>()
-
-function providerSig(p: ProviderConfig): string {
-  return [
-    p.id, p.kind, p.baseUrl, p.apiKey, p.envVar,
-    p.authType, p.oauthClientId, p.oauthClientSecret, p.oauthRefreshToken,
-  ].join('|')
-}
+// لیست مدل‌ها فقط از store خوانده می‌شود (پرشده در startup / افزودن
+// پروایدر) — پیکر subagent هیچ فچی هنگام باز شدن انجام نمی‌دهد.
 
 function ToolModelSelect({
   agent, label, desc, current, onSelect,
@@ -78,8 +69,6 @@ function ToolModelSelect({
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
-  const [live, setLive] = useState<Record<string, string[]>>({})
-  const [fetching, setFetching] = useState<Record<string, boolean>>({})
   const wrapRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const q = search.trim().toLowerCase()
@@ -103,10 +92,6 @@ function ToolModelSelect({
   const modelsFor = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? [])
     const out = new Set<string>()
-    for (const m of live[p.id] ?? []) {
-      const b = bareModelFor(p, m)
-      if (!removed.has(b)) out.add(b)
-    }
     for (const m of p.models ?? []) {
       const b = bareModelFor(p, m)
       if (isForeignModelId(p, b)) continue
@@ -118,35 +103,6 @@ function ToolModelSelect({
     }
     return Array.from(out)
   }
-
-  const ensureFetched = (p: ProviderConfig) => {
-    const sig = providerSig(p)
-    if (SUBAGENT_LIVE_CACHE.has(sig)) {
-      const cached = SUBAGENT_LIVE_CACHE.get(sig)!
-      setLive((l) => (l[p.id] === cached ? l : { ...l, [p.id]: cached }))
-      return
-    }
-    if (fetching[p.id]) return
-    setFetching((f) => ({ ...f, [p.id]: true }))
-    fetchModels(p)
-      .then((res) => {
-        SUBAGENT_LIVE_CACHE.set(sig, res.models)
-        setLive((l) => ({ ...l, [p.id]: res.models }))
-      })
-      .catch(() => {
-        /* keep the provider's saved list when /models is unavailable */
-      })
-      .finally(() => {
-        setFetching((f) => ({ ...f, [p.id]: false }))
-      })
-  }
-
-  // Kick off a live /models fetch for every provider when the menu opens.
-  useEffect(() => {
-    if (!open) return
-    for (const p of providers) ensureFetched(p)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
 
   // `current` is stored as "providerId/model" (route through that provider).
   // Legacy values may still be a bare model id or carry an old prefix — resolve
@@ -310,7 +266,7 @@ function ToolModelSelect({
                               onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
                             >
                               {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                                <span className="pm-model-provider">{p.id}/</span>
+                                <span className="pm-model-provider">{p.name}/</span>
                               )}
                               <span className="pm-model-name">{m}</span>
                             </button>

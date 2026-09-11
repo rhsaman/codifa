@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderConfig } from "../types";
 import { useStore } from "../lib/store";
-import { fetchModels } from "../lib/api";
 import { PROVIDER_META, isForeignModelId } from "../lib/provider-meta";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
@@ -12,26 +11,19 @@ function bareModel(p: ProviderConfig, m: string): string {
 }
 
 /** Display label for a model, e.g. "openrouter/gpt-5". Kinds that use
- *  unprefixed ids (opencode) are shown bare. */
+ *  unprefixed ids (opencode) are shown bare. Uses the provider's NAME (not
+ *  its id) so custom rows show a human label like "justwoker/" instead of a
+ *  random "custom-mtwl9t08/" slug. */
 function modelLabel(p: ProviderConfig, m: string): string {
-  return PROVIDER_META[p.kind]?.unprefixedModelId ? m : `${p.id}/${m}`;
+  return PROVIDER_META[p.kind]?.unprefixedModelId ? m : `${p.name}/${m}`;
 }
 
-function providerSig(p: ProviderConfig): string {
-  return [
-    p.id, p.kind, p.baseUrl, p.apiKey, p.envVar,
-    p.authType, p.oauthClientId, p.oauthClientSecret, p.oauthRefreshToken,
-  ].join("|");
-}
-
-// Live model lists fetched from each provider's /models endpoint, cached for
-// the session so reopening the picker doesn't refetch unchanged providers.
-const LIVE_CACHE = new Map<string, string[]>();
-
-/** Compact provider + model picker shown in the composer. Models are fetched
- *  live from each provider's /models endpoint (never hardcoded) and persisted
- *  to the DB per provider. The last 10 used models appear in a "Recent"
- *  section on top. */
+/** Compact provider + model picker shown in the composer. The model list is
+ *  NOT fetched here — it is populated by the startup refresh (App.tsx) and
+ *  whenever a provider is added/edited (SettingsModal), both via
+ *  fetchAndPersist. Opening this popup only reads the persisted list, so it
+ *  never fires a network request. The last 10 used models appear in a
+ *  "Recent" section on top. */
 export function ProviderModelSelect() {
   const providers = useStore((s) => s.settings.providers);
   const activeId = useStore((s) => s.settings.activeProviderId);
@@ -45,43 +37,8 @@ export function ProviderModelSelect() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
-  const [live, setLive] = useState<Record<string, string[]>>({});
-  const [fetching, setFetching] = useState<Record<string, boolean>>({});
   const wrapRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-
-  const ensureFetched = (p: ProviderConfig) => {
-    const sig = providerSig(p);
-    if (LIVE_CACHE.has(sig)) {
-      const cached = LIVE_CACHE.get(sig)!;
-      setLive((l) => (l[p.id] === cached ? l : { ...l, [p.id]: cached }));
-      return;
-    }
-    if (fetching[p.id]) return;
-    setFetching((f) => ({ ...f, [p.id]: true }));
-    fetchModels(p)
-      .then((res) => {
-        LIVE_CACHE.set(sig, res.models);
-        setLive((l) => ({ ...l, [p.id]: res.models }));
-        useStore.getState().setProviderContextMap(p.id, res.context);
-        // Live per-model USD-per-million-token pricing from the provider's
-        // /models endpoint — without this the sidebar "Model usage" panel and
-        // context-meter cost chip have no pricing to look up and always show
-        // "—" / $0, even though the backend already resolved real prices.
-        useStore.getState().setProviderPricingMap(p.id, res.pricing);
-        // Reasoning support per model (from the backend's models.dev catalog
-        // enrichment) — drives the thinking pill in the composer. Kept in sync
-        // with the context/pricing maps so the toggle appears as soon as the
-        // model list loads, even if the Chat.tsx effect hasn't run yet.
-        useStore.getState().setProviderReasoningMap(p.id, res.reasoning);
-      })
-      .catch(() => {
-        /* keep the provider's saved list when /models is unavailable */
-      })
-      .finally(() => {
-        setFetching((f) => ({ ...f, [p.id]: false }));
-      });
-  };
 
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
@@ -93,14 +50,14 @@ export function ProviderModelSelect() {
     return () => document.removeEventListener("mousedown", onDocClick);
   }, []);
 
-  // Fresh state each time the menu opens: empty search, all providers collapsed,
-  // and kick off a live /models fetch for every provider.
+  // Fresh state each time the menu opens: empty search, all providers collapsed.
+  // No model fetch happens here — the list comes from the persisted store
+  // (populated at startup / on provider add-edit via fetchAndPersist).
   useEffect(() => {
     if (open) {
       setQuery("");
       setExpanded(new Set());
       requestAnimationFrame(() => searchRef.current?.focus());
-      for (const p of providers) ensureFetched(p);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -119,28 +76,19 @@ export function ProviderModelSelect() {
   // Settings → Providers) doesn't sneak back into the dropdown just because
   // it's still in `p.models` from an earlier write.
   //
-  // The foreign-id check (isForeignModelId) is applied ONLY to the two
-  // PERSISTED sources below (`p.models`, `p.model`) — e.g. a stale
-  // "openrouter/sonnet" that landed in nvidia's `p.models` via recentModels
-  // migration or a custom-row copy. It must NOT run on the live fetch: that
-  // list comes straight from THIS provider's own /models endpoint (scoped by
-  // its base_url + api_key), so it can never actually contain another
-  // provider's models — and aggregator kinds like OpenRouter/TokenRouter
-  // legitimately return vendor-prefixed ids ("google/gemini-2.5-flash",
+  // The foreign-id check (isForeignModelId) is applied to the PERSISTED
+  // sources below (`p.models`, `p.model`) — e.g. a stale "openrouter/sonnet"
+  // that landed in nvidia's `p.models` via recentModels migration or a
+  // custom-row copy. Aggregator kinds like OpenRouter/TokenRouter
+  // legitimately carry vendor-prefixed ids ("google/gemini-2.5-flash",
   // "nvidia/llama-3.1-nemotron-70b-instruct") whose vendor name coincides
-  // with one of Coder's own built-in provider kind ids. Applying the check
-  // there used to silently hide every Google/NVIDIA-branded OpenRouter model
-  // from OpenRouter's own list. The foreign-id check runs on the BARE id `b`
-  // (post-strip), not on the raw `m` — otherwise a doubled-prefix entry like
-  // "local/opencode/big-pickle" would pass the raw check (head === p.id) but
-  // still render as the wrong model.
+  // with one of Coder's own built-in provider kind ids, so the check runs on
+  // the BARE id `b` (post-strip), not on the raw `m` — otherwise a
+  // doubled-prefix entry like "local/opencode/big-pickle" would pass the raw
+  // check (head === p.id) but still render as the wrong model.
   const allModels = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? []);
     const out = new Set<string>();
-    for (const m of live[p.id] ?? []) {
-      const b = bareModel(p, m);
-      if (!removed.has(b)) out.add(b);
-    }
     for (const m of p.models ?? []) {
       const b = bareModel(p, m);
       if (isForeignModelId(p, b)) continue;
@@ -168,11 +116,7 @@ export function ProviderModelSelect() {
       if (!r.model) continue;
       let p = providers.find((x) => x.id === r.providerId);
       if (!p && !r.providerId) {
-        const owners = providers.filter((x) => {
-          const saved = x.models ?? [];
-          const liveM = live[x.id] ?? [];
-          return saved.includes(r.model) || liveM.includes(r.model);
-        });
+        const owners = providers.filter((x) => (x.models ?? []).includes(r.model));
         if (owners.length === 1) p = owners[0];
       }
       if (!p) continue;
@@ -186,7 +130,7 @@ export function ProviderModelSelect() {
       if (items.length >= 10) break;
     }
     return items;
-  }, [recents, providers, live]);
+  }, [recents, providers]);
 
   const recentsShown = recentList.filter(({ p, model }) => {
     if (!searching) return true;
@@ -209,7 +153,7 @@ export function ProviderModelSelect() {
       })
       .filter((x) => x.visible);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [providers, q, terms, searching, live]);
+  }, [providers, q, terms, searching]);
 
   const toggle = (id: string) => {
     setExpanded((prev) => {
@@ -276,7 +220,7 @@ export function ProviderModelSelect() {
                       onClick={() => pick(p, model)}
                     >
                       {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                        <span className="pm-model-provider">{p.id}/</span>
+                        <span className="pm-model-provider">{p.name}/</span>
                       )}
                       <span className="pm-model-name">{model}</span>
                     </button>
@@ -292,7 +236,6 @@ export function ProviderModelSelect() {
             )}
             {filtered.map(({ p, models }) => {
               const isOpen = searching || expanded.has(p.id);
-              const loading = fetching[p.id] && !live[p.id];
               return (
                 <div key={p.id} className={`pm-provider${isOpen ? " open" : ""}`}>
                   <button
@@ -302,13 +245,10 @@ export function ProviderModelSelect() {
                   >
                     <span className="pm-provider-caret">{isOpen ? "▾" : "▸"}</span>
                     <span className="pm-provider-label">{p.name}</span>
-                    <span className="pm-provider-count">
-                      {loading ? "…" : allModels(p).length}
-                    </span>
+                    <span className="pm-provider-count">{allModels(p).length}</span>
                   </button>
                   {isOpen && (
                     <div className="pm-models">
-                      {loading && <div className="pm-loading">Fetching models…</div>}
                       {models.map((m) => {
                         const isCurrent = p.id === activeProviderId && m === activeModel;
                         return (
@@ -319,13 +259,13 @@ export function ProviderModelSelect() {
                             onClick={() => pick(p, m)}
                           >
                             {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                              <span className="pm-model-provider">{p.id}/</span>
+                              <span className="pm-model-provider">{p.name}/</span>
                             )}
                             <span className="pm-model-name">{m}</span>
                           </button>
                         );
                       })}
-                      {!loading && models.length === 0 && (
+                      {models.length === 0 && (
                         <div className="pm-hint">
                           No models — check the provider’s base URL &amp; key.
                         </div>

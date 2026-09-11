@@ -69,13 +69,38 @@ export const api = {
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'dist-electron',
   'release', 'build', 'coverage', '.idea', '.vscode', '.next', 'out', 'target',
-  'node_modules/.cache', 'vendor',
+  'node_modules/.cache', 'vendor', '.ruff_cache', '.github', '.playwright', '.playwright-mcp',
 ])
 const MAX_INDEXED = 800
 
 export interface WorkspaceFile {
   rel: string
   name: string
+}
+
+/** Per-root usage-frequency counters for quick-open (Ctrl+P), so "most used"
+ *  sort has something to sort by. Persisted in localStorage — renderer-only,
+ *  no IPC round-trip needed, and it's a soft UX preference (not critical
+ *  data), so a quota/parse failure just degrades to alphabetical, not fatal. */
+const FILE_USAGE_PREFIX = 'coder:file-usage:'
+
+export function loadFileUsage(root: string): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(FILE_USAGE_PREFIX + root)
+    return raw ? (JSON.parse(raw) as Record<string, number>) : {}
+  } catch {
+    return {}
+  }
+}
+
+export function bumpFileUsage(root: string, rel: string): void {
+  try {
+    const usage = loadFileUsage(root)
+    usage[rel] = (usage[rel] ?? 0) + 1
+    localStorage.setItem(FILE_USAGE_PREFIX + root, JSON.stringify(usage))
+  } catch {
+    /* ignore */
+  }
 }
 
 /** Per-root quick-open cache (TTL like the Electron walk cache): Ctrl+P re-opens

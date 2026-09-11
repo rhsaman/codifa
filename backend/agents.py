@@ -908,12 +908,12 @@ _MAX_STEPS_PROMPT = (
 # window with thinking tokens and getting cut off. '' (legacy clients) falls
 # back to the provider default / auto-inject behavior.
 # LangChain's ChatOpenAI only accepts the OpenAI-standard effort tokens
-# (minimal / low / medium / high). 'xhigh' is NOT a valid value and 400s on
-# OpenAI-family models, so it is intentionally omitted here.
+# (low / medium / high). 'minimal' is rejected by always-thinking gateways
+# (agentrouter-style 400s) and 'xhigh' is NOT a valid value and 400s on
+# OpenAI-family models, so both are intentionally omitted here.
 _THINKING_LEVELS = {
     "": None,
     "none": False,
-    "minimal": "minimal",
     "low": "low",
     "medium": "medium",
     "high": "high",

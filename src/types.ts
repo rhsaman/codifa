@@ -32,7 +32,6 @@ export interface AgentModeDef {
 export type ThinkingLevel =
   | ''
   | 'none'
-  | 'minimal'
   | 'low'
   | 'medium'
   | 'high'

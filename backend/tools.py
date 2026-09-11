@@ -537,6 +537,10 @@ _SKIP_DIRS = {
     ".tox",
     ".mypy_cache",
     ".pytest_cache",
+    ".ruff_cache",
+    ".github",
+    ".playwright",
+    ".playwright-mcp",
     "out",
     "bin",
     "obj",
@@ -765,10 +769,11 @@ def _walk_files(root: str) -> Sequence[str]:
         return cached[1]
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Keep hidden dirs like `.config`/`.github` (config files are real
-        # workspace content the agent must see) but skip the deny-list
-        # (`.git`, `.cache`, `node_modules`, …) — mirrors the renderer's
-        # quick-open walk so Ctrl+P and the agent agree on what is visible.
+        # Keep hidden config dirs like `.config` visible (real workspace
+        # content the agent must see) but skip the deny-list (`.git`,
+        # `.cache`, `node_modules`, `.github`, `.ruff_cache`, …) — mirrors
+        # the renderer's quick-open walk so Ctrl+P and the agent agree on
+        # what is visible.
         # `.tmp-*` are the user's own scratch/throwaway files & folders (e.g.
         # `.tmp-codemap.mjs`), never real workspace content — skipped the same
         # way rg's `!.tmp-*` glob skips them (see _RG_EXCLUDE_GLOBS).
@@ -1844,8 +1849,9 @@ def _rg_search(
 
     # rg itself skips binary files, respects .gitignore and skips hidden files
     # unless --hidden is passed; exit codes: 0 = matches, 1 = none, 2 = error.
-    # --hidden makes config files (`.config`, `.github`, …) searchable; the
-    # deny-list globs keep `.git`/`node_modules`/… out even when hidden.
+    # --hidden makes hidden config files (`.config`, `.env`, …) searchable;
+    # the deny-list globs keep `.git`/`node_modules`/`.github`/`.ruff_cache`/…
+    # out even when hidden.
     cmd = [
         rg,
         "--json",

@@ -1291,14 +1291,43 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
                 yield {"kind": "_keepalive"}
             except StopAsyncIteration:
                 return
-    except asyncio.CancelledError:
-        # Real disconnect/abort (not a keepalive timeout): cancel the shielded
-        # agent task instead of letting it run orphaned to completion.
+    finally:
+        # Runs on EVERY exit path — CancelledError (Starlette aborts with this
+        # in some paths), GeneratorExit (Starlette aborts with this in others),
+        # or plain exhaustion. Without this, a GeneratorExit raised while
+        # `await asyncio.shield(pending)` is suspended leaves `pending` (the
+        # in-flight agent_iter.__anext__(), i.e. run_graph's queue.get()) alive:
+        # shield deliberately does NOT propagate the cancellation into it, and
+        # the old except-CancelledError-only handler never fired. The orphaned
+        # task then keeps pulling tokens from the LLM provider, and the later
+        # agent_gen.aclose() in _stream_drive fails with "async generator is
+        # already running" (silently suppressed) — so run_graph's finally never
+        # runs, _drive is never cancelled, and the provider stream keeps
+        # token-burning after Stop. Cancel + reap it here so aclose() can
+        # actually unwind the chain.
         if pending is not None and not pending.done():
             pending.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await pending
-        raise
+
+
+async def _abort_close(ka_gen, agent_gen) -> None:
+    """Tear down a stream on abort: close the keepalive wrapper FIRST, then the
+    agent generator.
+
+    Order matters. Closing ``ka_gen`` runs ``_with_keepalive``'s ``finally``,
+    which cancels any in-flight ``agent_iter.__anext__()`` task. Only then is
+    ``agent_gen`` no longer being driven, so ``agent_gen.aclose()`` can actually
+    throw GeneratorExit into ``run_agent`` → ``run_graph``'s ``finally`` →
+    ``_drive`` cancelled → the provider HTTP stream is aborted. Closing the
+    agent first (while the __anext__ task is still driving it) fails with
+    "async generator is already running" and — silently suppressed — leaves the
+    provider stream token-burning after Stop.
+    """
+    with contextlib.suppress(Exception):
+        await ka_gen.aclose()
+    with contextlib.suppress(Exception):
+        await agent_gen.aclose()
 
 
 async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
@@ -1320,8 +1349,9 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
       generic crash event.
     """
     ka_count = 0
+    ka_gen = _with_keepalive(agent_gen)
     try:
-        async for event in _with_keepalive(agent_gen):
+        async for event in ka_gen:
             if event.get("kind") == "_keepalive":
                 ka_count += 1
                 yield ": keepalive\n\n"
@@ -1342,11 +1372,11 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
         )
         _log_memory_snapshot(chat_id)
     except asyncio.CancelledError:
-        # Client disconnected (aborted the stream): close the agent generator
-        # to unwind its background _drive task (which runs graph.astream).
-        # This ensures the LLM provider call is properly interrupted.
-        with contextlib.suppress(Exception):
-            await agent_gen.aclose()
+        # Client disconnected (aborted the stream): close the keepalive wrapper
+        # (cancels the in-flight __anext__ task) then the agent generator, to
+        # unwind its background _drive task (which runs graph.astream). This
+        # ensures the LLM provider call is properly interrupted.
+        await _abort_close(ka_gen, agent_gen)
         # Log the drop with peak RSS so a recurring silent interrupt (crash /
         # OOM) becomes visible in codifa.log instead of going unnoticed.
         logger.warning(
@@ -1361,8 +1391,7 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
         # hides the real trigger. Stderr may not be captured by Electron in
         # packaged mode, so print_exc alone is not enough. The user still sees
         # a readable error over SSE.
-        with contextlib.suppress(Exception):
-            await agent_gen.aclose()
+        await _abort_close(ka_gen, agent_gen)
         logger.exception(
             "agent run failed chat_id=%s rss_mb=%.1f",
             chat_id, _rss_mb() or 0.0,
@@ -1384,11 +1413,14 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
             # stream keeps running orphaned in the background. With every Stop
             # + resend a fresh stream is added on top, so the same chat ends
             # up with N concurrent provider streams still token-burning.
-            with contextlib.suppress(Exception):
-                await agent_gen.aclose()
+            # NOTE: we cannot await inside a GeneratorExit handler of an async
+            # generator reliably, but aclose() on the keepalive wrapper runs
+            # its finally (cancelling the in-flight __anext__ task) — awaited
+            # here is fine because _stream_drive is being closed, not the
+            # inner generator.
+            await _abort_close(ka_gen, agent_gen)
             raise
-        with contextlib.suppress(Exception):
-            await agent_gen.aclose()
+        await _abort_close(ka_gen, agent_gen)
         logger.exception(
             "agent run terminated by non-Exception (silent-interrupt source) chat_id=%s rss_mb=%.1f",
             chat_id,

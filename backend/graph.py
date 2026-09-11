@@ -72,8 +72,10 @@ from _common import (
 from agents import normalize_mode
 from llm import (
     _is_parallel_calls_error,
+    _is_reasoning_effort_error,
     _is_stream_options_error,
     _is_temperature_error,
+    _remap_reasoning_effort,
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
@@ -2481,6 +2483,7 @@ async def _run_mode_turn(
         _no_so = False
         _no_pc = False
         _no_temp = False
+        _no_re = False
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
         # Every completed tool result is persisted to LangGraph's checkpointer
         # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
@@ -2807,6 +2810,15 @@ async def _run_mode_turn(
                 if not _no_temp and _is_temperature_error(exc):
                     _no_temp = True
                     model = _strip_temperature(model)
+                    continue
+                # Always-thinking routes (e.g. agentrouter) reject
+                # reasoning_effort values outside their allowed set with a 400
+                # (「该模型始终思考…请使用 low、high 或 max」). Retry once with
+                # the effort remapped to the nearest allowed value so the turn
+                # survives instead of dying on a thinking-mode mismatch.
+                if not _no_re and _is_reasoning_effort_error(exc):
+                    _no_re = True
+                    model = _remap_reasoning_effort(model, exc)
                     continue
                 # Surface the most common per-step failures as readable SSE
                 # events instead of letting them bubble up to _drive as raw

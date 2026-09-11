@@ -3,6 +3,7 @@ import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
+import { TodosPanel } from './components/TodosPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -11,7 +12,7 @@ import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
-import { fetchModels, invalidateSidecarCache } from './lib/api'
+import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 
 export default function App() {
@@ -97,20 +98,16 @@ export default function App() {
 
   // One-time startup model refresh: for every configured provider, ask the
   // sidecar `/models` endpoint and persist the result (model ids, context
-  // windows, per-model pricing, reasoning support) into the store. Without
-  // this, dropdowns opened BEFORE the user clicks any provider show 0 models
-  // (the picker used to wait for a click / dropdown-open to fetch), and the
-  // local kind (ollama/llama.cpp/lmstudio) never auto-loads its model list
-  // on app start.
+  // windows, per-model pricing, reasoning support) into the store. This is
+  // the ONLY automatic fetch — the model picker popup reads the persisted
+  // list and never refetches on open, so models are fetched exactly at
+  // startup and when a provider is added/edited (SettingsModal).
   //
   // Runs ONCE per session (gated by `loaded` so it only fires after the
   // persisted providers are in the store). Parallel via `allSettled` so a
   // single unreachable provider (e.g. ollama not running) doesn't block the
   // rest. Custom-added and explicitly-removed entries are preserved via the
-  // same merge rule the Settings modal uses. fetchModels already dedupes
-  // in-flight requests by provider-config signature, so opening a dropdown
-  // while this is still running will await the same promise rather than
-  // refetching.
+  // same merge rule the Settings modal uses.
   useEffect(() => {
     if (!loaded) return
     let cancelled = false
@@ -182,6 +179,11 @@ export default function App() {
           break
         }
         case 'p': {
+          // navChord در پیکرهای @mention/پالت فرمان هم "k" و هم "p" را ناوبری
+          // بالا حساب می‌کند و preventDefault می‌زند؛ اگر رویداد با
+          // defaultPrevented به این‌جا رسیده، مالِ یک پیکرِ در فوکوس است و
+          // نباید سرچ فایل را باز کنیم (رگرسیون مشابه Ctrl+K سایدبار).
+          if (e.defaultPrevented) break
           e.preventDefault()
           window.dispatchEvent(new CustomEvent('coder:search'))
           break
@@ -265,6 +267,7 @@ export default function App() {
               }}
             />
           )}
+          <TodosPanel />
         </ErrorBoundary>
       </div>
 

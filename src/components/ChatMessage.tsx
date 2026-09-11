@@ -805,11 +805,20 @@ function UsageBadge({
 }
 
 /**
- * نشانگر «در حال فکر کردن» که در ردیف فوتر پیام (سمت مخالف کپی/usage) نمایش
- * داده می‌شود. ۳ نقطهٔ لودینگ از سمت راست شروع به پر شدن می‌کنند (نقطهٔ اول =
- * سمت راست زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
+ * نشانگر «در حال فکر کردن / در حال کار» که در ردیف فوتر پیام (سمت مخالف
+ * کپی/usage) نمایش داده می‌شود. ۳ نقطهٔ لودینگ از سمت راست شروع به پر شدن
+ * می‌کنند (نقطهٔ اول = سمت راست زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس
+ * چرخه از اول تکرار می‌شود. `label` برچسب حالت را تعیین می‌کند: «Thinking»
+ * وقتی مدل reasoning تولید می‌کند و «Working» وقتی ایجنت مشغول کار است ولی
+ * think نمی‌کند (اجرای ابزار، انتظار برای نتیجه و…).
  */
-export function ThinkingIndicator({ startedAt }: { startedAt?: number }) {
+export function ThinkingIndicator({
+  startedAt,
+  label = "Thinking",
+}: {
+  startedAt?: number;
+  label?: string;
+}) {
   const [elapsed, setElapsed] = useState(() => {
     const base = startedAt ?? Date.now();
     return Date.now() - base;
@@ -821,9 +830,9 @@ export function ThinkingIndicator({ startedAt }: { startedAt?: number }) {
     return () => clearInterval(id);
   }, [startedAt]);
   return (
-    <span className="msg-thinking" aria-label="Thinking">
+    <span className="msg-thinking" aria-label={label}>
       <span className="msg-thinking-inner" dir="ltr">
-        <span className="msg-thinking-text">Thinking</span>
+        <span className="msg-thinking-text">{label}</span>
         <span className="msg-thinking-dots" aria-hidden="true">
           <span className="dot" />
           <span className="dot" />
@@ -1563,7 +1572,12 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
             </>
           )}
-          {message.streaming && message.thinkingActive && <ThinkingIndicator startedAt={message.thinkingStartedAt} />}
+          {message.streaming &&
+            (message.thinkingActive ? (
+              <ThinkingIndicator startedAt={message.thinkingStartedAt} />
+            ) : (
+              <ThinkingIndicator label="Working" startedAt={message.workingStartedAt} />
+            ))}
         </div>
       )}
 

@@ -85,7 +85,7 @@ console.log("۴) loadTodoPanelUi — مهاجرت از x قدیمی (لنگر چ
   const res = loadTodoPanelUi()
   // right = innerWidth(1200) - x(884) - PANEL_W(300) = 16
   check("x → right با کسر عرض پنل", res.right === 16, res)
-  check("y و height دست نمی‌خورند", res.y === 46 && res.height === 320)
+  check("y دست نمی‌خورد و height ۳۲۰ ریست می‌شود", res.y === 46 && res.height === undefined, res)
 }
 
 console.log("۵) loadTodoPanelUi — کلید جدید با right مستقیم:")
@@ -105,6 +105,12 @@ console.log("۶) loadTodoPanelUi — مهاجرت از coder:sidebarUi قدیم�
   const res = loadTodoPanelUi()
   check("todoCollapsed → collapsed", res.collapsed === true)
   check("todoHeight → height", res.height === 200)
+
+  localStorage._d = {
+    "coder:sidebarUi": JSON.stringify({ todoHeight: 320 }),
+  }
+  const res2 = loadTodoPanelUi()
+  check("todoHeight ۳۲۰ (پیش‌فرض قدیمی) ریست می‌شود", res2.height === undefined, res2)
 }
 
 console.log("۷) loadTodoPanelUi — بدون ذخیره → آبجکت خالی:")

@@ -309,6 +309,10 @@ export interface ChatMessage {
   /** Wall-clock timestamp when thinking started — survives remounts so the
    *  elapsed timer doesn't reset when the user switches chats. */
   thinkingStartedAt?: number
+  /** Wall-clock timestamp when the "Working" indicator (streaming without
+   *  active thinking) started — same remount-survival rationale as
+   *  `thinkingStartedAt`: switching chats must not reset the elapsed timer. */
+  workingStartedAt?: number
   /** True when this message was persisted mid-stream (heartbeat snapshot) and
    *  the app died before the turn completed — shown as "interrupted" after a
    *  crash/power cut instead of looking like a complete reply. Cleared by the

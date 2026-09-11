@@ -1324,7 +1324,13 @@ export function ChatPanel() {
       const existing = chat.messages.find((m) => m.id === continueAssistantId);
       if (existing) {
         assistantMsg = existing;
-        s.updateMessage(existing.id, { streaming: true, retry: null });
+        s.updateMessage(existing.id, {
+          streaming: true,
+          retry: null,
+          // Base for the "Working" elapsed timer — stored on the message so
+          // switching chats (unmount/remount) doesn't reset it to zero.
+          workingStartedAt: Date.now(),
+        });
       } else {
         assistantMsg = s.addMessage(chat.id, {
           role: "assistant",
@@ -1333,6 +1339,8 @@ export function ChatPanel() {
           toolActivity: [],
           segments: [],
           streaming: true,
+          // Base for the "Working" elapsed timer (see workingStartedAt in types).
+          workingStartedAt: Date.now(),
         });
       }
     } else {
@@ -1343,6 +1351,7 @@ export function ChatPanel() {
         toolActivity: [],
         segments: [],
         streaming: true,
+        workingStartedAt: Date.now(),
       });
     }
     // User-initiated sends jump to the bottom even if they scrolled up (the
@@ -2188,6 +2197,7 @@ export function ChatPanel() {
       useStore.getState().updateMessage(assistantMsg.id, {
         streaming: false,
         thinkingActive: false,
+        workingStartedAt: undefined,
         ...(keepRetry ? {} : { retry: null }),
       });
       // No auto-refresh of the credit chip here — strictly click-to-refresh

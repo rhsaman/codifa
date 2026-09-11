@@ -37,14 +37,14 @@ export function loadTodoPanelUi(): TodoPanelUi {
     const raw = localStorage.getItem("coder:todoPanel");
     if (raw) {
       const p = JSON.parse(raw) as TodoPanelUi & { x?: number };
-      if (p.right === undefined && p.x !== undefined) {
-        const { x, ...rest } = p;
-        return { ...rest, right: window.innerWidth - x - PANEL_W };
-      }
-      // ارتفاع ۳۲۰ پیش‌فرض قدیمی بود (خیلی بلند) — به پیش‌فرض جدید ریست شود؛
-      // ارتفاع‌های دیگر انتخاب عمدی کاربرند و دست نمی‌خورند.
-      if (p.height === 320) return { ...p, height: undefined };
-      return p;
+      const { x, ...rest } = p;
+      const ui: TodoPanelUi =
+        rest.right === undefined && x !== undefined
+          ? { ...rest, right: window.innerWidth - x - PANEL_W }
+          : rest;
+      // ارتفاع ۳۲۰ پیش‌فرض قدیمی بود (خیلی بلند) — در همهٔ مسیرها به
+      // پیش‌فرض جدید ریست می‌شود؛ ارتفاع‌های دیگر انتخاب عمدی کاربرند.
+      return ui.height === 320 ? { ...ui, height: undefined } : ui;
     }
     const legacy = localStorage.getItem("coder:sidebarUi");
     if (legacy) {
@@ -52,7 +52,10 @@ export function loadTodoPanelUi(): TodoPanelUi {
         todoCollapsed?: boolean;
         todoHeight?: number;
       };
-      return { collapsed: l.todoCollapsed, height: l.todoHeight };
+      return {
+        collapsed: l.todoCollapsed,
+        height: l.todoHeight === 320 ? undefined : l.todoHeight,
+      };
     }
   } catch {
     /* JSON خراب — پیش‌فرض‌ها برمی‌گردند */
@@ -81,11 +84,9 @@ export function TodosPanel() {
     y: ui.y ?? 46,
   }));
   const [collapsed, setCollapsed] = useState(ui.collapsed ?? false);
-  // پیش‌فرض ۱۵۰px؛ ارتفاع ذخیره‌شدهٔ قدیمیِ بزرگ‌تر از ۴۰۰ هم به ۱۵۰ برمی‌گردد
-  // تا پنلِ به‌ارث‌رسیده از نسخه‌های قبل خیلی بلند نباشد.
-  const [height, setHeight] = useState(
-    () => (ui.height && ui.height <= 400 ? ui.height : 150),
-  );
+  // پیش‌فرض ۱۵۰px — ارتفاع ۳۲۰ (پیش‌فرض قدیمی) در loadTodoPanelUi ریست
+  // می‌شود؛ انتخاب‌های عمدی کاربر (تا ۷۶۰) دست نمی‌خورند.
+  const [height, setHeight] = useState(ui.height ?? 150);
 
   // ذخیره با debounce (درگ هر فریم state عوض می‌کند؛ نوشتن localStorage در
   // هر فریم درگ را می‌لرزاند) + flush هم‌زمان روی بستن اپ — همان الگوی

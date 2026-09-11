@@ -20,6 +20,45 @@ export function physicalKey(e: { code: string; key: string }): string {
   return (e.key || "").toLowerCase();
 }
 
+/** کورد ناوبری لیست: +1 یعنی حرکت به پایین، -1 یعنی بالا و 0 یعنی کلید
+ *  ناوبری نیست. ArrowDown/ArrowUp و کوردهای Ctrl/⌘ (J/N پایین، K/P بالا)
+ *  را می‌سنجد — با physicalKey تا چیدمان‌های غیرلاتین (فارسی و…) هم کار
+ *  کند. مشترک بین همه پیکرها (پالت فرمان، @mention اسکیل، ابزارهای MCP)
+ *  تا همه دقیقاً همان کوردها را ببلعند — ببینید onKeyDown در Chat.tsx. */
+export function navChord(e: {
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+}): number {
+  if (e.key === "ArrowDown") return 1;
+  if (e.key === "ArrowUp") return -1;
+  if (e.ctrlKey || e.metaKey) {
+    const k = physicalKey(e);
+    if (k === "j" || k === "n") return 1;
+    if (k === "k" || k === "p") return -1;
+  }
+  return 0;
+}
+
+/** آیا این Cmd/Ctrl+K که به سطح window رسیده باید هنوز سرچ چت سایدبار را
+ *  فوکوس کند؟ پیکرها کورد ناوبری‌شان را با preventDefault + stopPropagation
+ *  (navChord در Chat.tsx) می‌بلعند؛ پس رویدادی که defaultPrevented شده مالِ
+ *  یک پیکرِ در فوکوس است و سایدبار نباید فوکوس را از او بدزدد
+ *  (رگرسیون: Ctrl+K داخل پیکر @mention فوکوس را به سرچ سایدبار می‌برد). */
+export function shouldFocusSearch(e: {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  defaultPrevented: boolean;
+}): boolean {
+  return (
+    !e.defaultPrevented &&
+    (e.metaKey || e.ctrlKey) &&
+    e.key.toLowerCase() === "k"
+  );
+}
+
 export interface PrefixShortcut {
   /** Slash command this key triggers, e.g. "/compact". */
   cmd: string;

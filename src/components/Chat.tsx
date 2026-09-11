@@ -78,7 +78,7 @@ import {
   PREFIX_SHORTCUTS,
   formatGlobalShortcut,
   formatShortcut,
-  physicalKey,
+  navChord,
 } from "../lib/shortcuts";
 import type {
   AgentMode,
@@ -3090,70 +3090,57 @@ export function ChatPanel() {
       }
       return;
     }
-    if (cmdOpen && filteredCmds.length > 0) {
-      if (
-        e.key === "ArrowDown" ||
-        ((e.ctrlKey || e.metaKey) && physicalKey(e) === "j")
-      ) {
+    // پالت فرمان (/): کوردهای ناوبری حتی وقتی هیچ موردی match نشده بلعیده
+    // می‌شوند تا رویداد به شورتکات‌های سراسری (Ctrl+K سرچ سایدبار و…) نریزد.
+    if (cmdOpen) {
+      const d = navChord(e);
+      if (d !== 0) {
         e.preventDefault();
-        setCmdIndex((i) => (i + 1) % filteredCmds.length);
+        e.stopPropagation();
+        if (filteredCmds.length > 0)
+          setCmdIndex(
+            (i) => (i + d + filteredCmds.length) % filteredCmds.length,
+          );
         return;
       }
-      if (
-        e.key === "ArrowUp" ||
-        ((e.ctrlKey || e.metaKey) && physicalKey(e) === "k")
-      ) {
+      if (filteredCmds.length > 0 && (e.key === "Enter" || e.key === "Tab")) {
         e.preventDefault();
-        setCmdIndex((i) => (i - 1 + filteredCmds.length) % filteredCmds.length);
-        return;
-      }
-      if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
+        e.stopPropagation();
         acceptCmd(filteredCmds[cmdIndex].name);
         return;
       }
       if (e.key === "Escape") {
         e.preventDefault();
+        e.stopPropagation();
         setCmdOpen(null);
         return;
       }
     }
-    if (cmdOpen && e.key === "Escape") {
-      e.preventDefault();
-      setCmdOpen(null);
-      return;
-    }
-    if (skillMention && filteredSkills.length > 0) {
-      if (
-        e.key === "ArrowDown" ||
-        ((e.ctrlKey || e.metaKey) &&
-          (physicalKey(e) === "j" || physicalKey(e) === "n"))
-      ) {
+    // پیکر @mention اسکیل: همان بلعیدن — رگرسیون Ctrl+K که رویدادش تا window
+    // حباب می‌کرد و هندلر سایدبار فوکوس را به سرچ چت می‌دزدید.
+    if (skillMention) {
+      const d = navChord(e);
+      if (d !== 0) {
         e.preventDefault();
-        setSkillMentionIdx((i) => (i + 1) % filteredSkills.length);
+        e.stopPropagation();
+        if (filteredSkills.length > 0)
+          setSkillMentionIdx(
+            (i) => (i + d + filteredSkills.length) % filteredSkills.length,
+          );
         return;
       }
-      if (
-        e.key === "ArrowUp" ||
-        ((e.ctrlKey || e.metaKey) &&
-          (physicalKey(e) === "k" || physicalKey(e) === "p"))
-      ) {
+      if (filteredSkills.length > 0 && (e.key === "Tab" || e.key === "Enter")) {
         e.preventDefault();
-        setSkillMentionIdx(
-          (i) => (i - 1 + filteredSkills.length) % filteredSkills.length,
-        );
-        return;
-      }
-      if (e.key === "Tab" || e.key === "Enter") {
-        e.preventDefault();
+        e.stopPropagation();
         acceptSkillMention(filteredSkills[skillMentionIdx]);
         return;
       }
-    }
-    if (skillMention && e.key === "Escape") {
-      e.preventDefault();
-      setSkillMention(null);
-      return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setSkillMention(null);
+        return;
+      }
     }
     if (skillOpen && e.key === "Escape") {
       e.preventDefault();
@@ -4004,32 +3991,11 @@ export function ChatPanel() {
                           (i + d + skillOptions.length) % skillOptions.length,
                       );
                     };
-                    if (
-                      (e.ctrlKey || e.metaKey) &&
-                      (physicalKey(e) === "j" || physicalKey(e) === "n")
-                    ) {
+                    const d = navChord(e);
+                    if (d !== 0) {
                       e.preventDefault();
                       e.stopPropagation();
-                      move(1);
-                      return;
-                    }
-                    if (
-                      (e.ctrlKey || e.metaKey) &&
-                      (physicalKey(e) === "k" || physicalKey(e) === "p")
-                    ) {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      move(-1);
-                      return;
-                    }
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      move(1);
-                      return;
-                    }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      move(-1);
+                      move(d);
                       return;
                     }
                     if (e.key === "Enter") {

@@ -5,6 +5,7 @@ import { themeById } from "../lib/themes";
 import type { Chat, ChatMessage, Workspace } from "../types";
 import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
+import { shouldFocusSearch } from "../lib/shortcuts";
 
 function titleOf(chat: Chat): string {
   if (chat.title && chat.title !== "New chat") return chat.title;
@@ -223,7 +224,11 @@ export function Sidebar() {
   // ⌘K / Ctrl+K focuses the chat search — the natural "find my chat" shortcut.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      // shouldFocusSearch کوردهایی را رد می‌کند که یک پیکرِ در فوکوس قبلاً
+      // بلعیده است (هندلرش preventDefault + stopPropagation زده)؛ پس Ctrl+K
+      // داخل پیکر @mention/پالت فرمان هایلایت را جابه‌جا می‌کند، نه اینکه
+      // فوکوس را از کامپوزر بدزدد.
+      if (shouldFocusSearch(e)) {
         e.preventDefault();
         searchInputRef.current?.focus();
       }

@@ -1,1 +1,0 @@
-def skill_helper(): pass

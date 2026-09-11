@@ -40,6 +40,9 @@ out/
 
 # Test temp artifacts (real test files ARE tracked — see test/ and backend/tests/)
 backend/tests/_tmp_*/
+backend/tests/pytest-of-*/
+backend/tests/coder-test-*/
+pytest_full_result.txt
 tests/.tmp-*
 tests/dump-ssr.out.mjs
 .tmp-*.mjs

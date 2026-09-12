@@ -112,6 +112,36 @@ const mp = { id: 'local', kind: 'ollama' as const, baseUrl: 'http://localhost:11
   assertEq('doubly-prefixed foreign stripped', out, ['local/qwen-4b'])
 }
 
+console.log('\nmergeFetchedModels — addedModels (مدل‌های دستی)')
+
+{
+  // مدل دستی‌اضافه حتی وقتی کاتالوگ زنده آن را برنمی‌گرداند نگه داشته می‌شود
+  const p = { ...mp, addedModels: ['my-manual-model'] }
+  const out = mergeFetchedModels(p, ['a', 'b'], [])
+  assertEq('manual model survives a live fetch', out, ['a', 'b', 'my-manual-model'])
+}
+
+{
+  // مدل دستی که کاربر بعداً hide کرده (removed) مخفی می‌ماند
+  const p = { ...mp, addedModels: ['my-manual-model'] }
+  const out = mergeFetchedModels(p, ['a'], ['my-manual-model'])
+  assertEq('removed manual model stays hidden', out, ['a'])
+}
+
+{
+  // مدل دستی متعلق به پروایدر دیگر (foreign) فیلتر می‌شود
+  const p = { ...mp, addedModels: ['openrouter/sonnet'] }
+  const out = mergeFetchedModels(p, ['a'], [])
+  assertEq('foreign manual model filtered', out, ['a'])
+}
+
+{
+  // مدل دستی که خود کاتالوگ هم برمی‌گرداند → بدون تکرار
+  const p = { ...mp, addedModels: ['a'] }
+  const out = mergeFetchedModels(p, ['a', 'b'], [])
+  assertEq('manual model deduped with catalog', out, ['a', 'b'])
+}
+
 // ---------------------------------------------------------------------------
 // fetchAndPersist
 // ---------------------------------------------------------------------------
@@ -404,6 +434,41 @@ await run(
     }
   },
   { ok: false, error: 'network down', calls: 0 },
+)
+
+await run(
+  'fetch throws + manual models: addedModels are appended to the saved list',
+  async () => {
+    // گیت‌وی فچ را بلاک کرد (401 unauthorized client) — مدل‌های دستی‌اضافه‌ی
+    // کاربر باید به لیست ذخیره‌شده الصاق شوند تا در composer قابل انتخاب بمانند.
+    const store = mkStore([
+      mkProvider({ id: 'local', models: ['llama3'], addedModels: ['my-manual-model'] }),
+    ])
+    const p = mkProvider({ id: 'local' })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => { throw new Error('unauthorized client') },
+      store: { getState: () => store },
+    })
+    const models = (store.calls.find((c) => c.method === 'setProviderModels')?.args[1] as string[] | undefined) ?? null
+    return { ok: r.ok, models }
+  },
+  { ok: false, models: ['llama3', 'my-manual-model'] },
+)
+
+await run(
+  'fetch throws + no manual models: saved list untouched',
+  async () => {
+    // بدون addedModels، شکست فچ نباید لیست ذخیره‌شده را تغییر دهد.
+    const store = mkStore([mkProvider({ id: 'local', models: ['llama3'] })])
+    const p = mkProvider({ id: 'local' })
+    const r = await fetchAndPersist(p, {
+      fetchFn: async () => { throw new Error('network down') },
+      store: { getState: () => store },
+    })
+    const hasSet = store.calls.some((c) => c.method === 'setProviderModels')
+    return { ok: r.ok, hasSet }
+  },
+  { ok: false, hasSet: false },
 )
 
 await run(

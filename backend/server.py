@@ -1059,6 +1059,12 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
             "\n\nThe model returned no usable reply (empty or invalid response). This model/provider"
             " is unreliable for this turn — switch model in Settings and retry."
         )
+    elif "no generation chunks" in low:
+        text = (
+            "The provider returned an empty response (no content was generated). "
+            "This usually means the model's quota/budget pool is exhausted or the "
+            "route is unavailable — switch to another model in Settings and retry."
+        )
     elif "unknown variant" in low and "image_url" in low:
         text += (
             "\n\nThe selected model does not support image/batch attachments (it rejects image"

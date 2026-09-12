@@ -124,3 +124,44 @@ def test_delete_skill_invalidates_cache(skill_env):
     assert any(s["name"] == "Test Skill" for s in state_db.list_skills())
     assert state_db.delete_skill("Test Skill") is True
     assert not any(s["name"] == "Test Skill" for s in state_db.list_skills())
+
+
+# ---------------------------------------------------------------------------
+# ابزار load_skill (افشای تدریجی — مدل بدنه را با tool call لود می‌کند)
+# ---------------------------------------------------------------------------
+
+
+def test_load_skill_tool_returns_body(skill_env):
+    """لود با نام دقیق: بدنهٔ کامل با قالب SKILL برمی‌گردد."""
+    import asyncio
+
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    cbs = tools.make_tool_callbacks(root="/tmp", emit=lambda e: None)
+    assert "load_skill" in cbs, "ابزار باید در رجیستری ثبت شود"
+    out = asyncio.run(cbs["load_skill"]("Test Skill"))
+    assert "===== SKILL: Test Skill =====" in out
+    assert "Body version one." in out
+
+
+def test_load_skill_tool_case_insensitive(skill_env):
+    """تطبیق نام باید casefold باشد (مثل @mention و کاتالوگ)."""
+    import asyncio
+
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    cbs = tools.make_tool_callbacks(root="/tmp", emit=lambda e: None)
+    out = asyncio.run(cbs["load_skill"]("test skill"))
+    assert "===== SKILL: Test Skill =====" in out
+
+
+def test_load_skill_tool_unknown_name_lists_available(skill_env):
+    """نام ناشناخته: خطا + فهرست اسکیل‌های موجود برای خوداصلاحی مدل."""
+    import asyncio
+
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    cbs = tools.make_tool_callbacks(root="/tmp", emit=lambda e: None)
+    out = asyncio.run(cbs["load_skill"]("No Such Skill"))
+    assert out.startswith("ERROR:")
+    assert "Test Skill" in out, "فهرست موجودها باید در خطا باشد"

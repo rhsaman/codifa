@@ -469,3 +469,31 @@ async def test_read_dir_paginated_footer(tmp_path):
     out = await read(filePath=".", offset=1, limit=2)
     assert "Showing 2 of 5 entries" in out
     assert "Use 'offset' parameter to read beyond entry 2" in out
+
+
+@pytest.mark.asyncio
+async def test_read_ranges_per_path_windows(tmp_path):
+    """ranges=['path:offset:limit', ...] → هر فایل با پنجره‌ی خودش در یک فراخوانی.
+
+    رگرسیونِ مصرف توکن: قبلاً مدل برای هر بازه‌ی متفاوت یک read جدا می‌زد
+    (هر کدام کل مکالمه را دوباره به API می‌فرستاد). حالا یک فراخوانی با
+    ranges همه‌ی پنجره‌ها را برمی‌گرداند.
+    """
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 51)))
+    (tmp_path / "b.py").write_text("".join(f"other{i}\n" for i in range(1, 51)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(
+        filePath="a.py",
+        ranges=["a.py:10:5", "b.py:20:3"],
+    )
+    # هر دو فایل در همان خروجی واحد هستند.
+    assert "<path>a.py</path>" in out
+    assert "<path>b.py</path>" in out
+    # پنجره‌ی اختصاصی هر فایل اعمال شده (نه offset/limit سراسری).
+    assert "10 | line10" in out
+    assert "14 | line14" in out
+    assert "15 | line15" not in out  # limit=5 → خطوط 10-14
+    assert "20 | other20" in out
+    assert "22 | other22" in out
+    assert "23 | other23" not in out  # limit=3 → خطوط 20-22

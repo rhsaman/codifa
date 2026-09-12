@@ -5884,6 +5884,36 @@ textarea {
   margin-top: 8px;
 }
 
+/* ردیف «افزودن مدل دستی»: input + دکمه Add در یک خط */
+.manual-model-row {
+  display: flex;
+  gap: 6px;
+}
+
+.manual-model-row input {
+  flex: 1;
+}
+
+.manual-model-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.manual-model-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+  direction: ltr;
+}
+
 .cred-inline-fallback {
   margin: 6px 0 8px;
   padding: 8px 10px;

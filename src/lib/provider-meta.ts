@@ -138,6 +138,18 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     builtin: false,
     editableBaseUrl: true,
   },
+  anthropic: {
+    kind: 'anthropic',
+    label: 'Anthropic-compatible',
+    name: 'Anthropic',
+    defaultEnvVar: 'ANTHROPIC_API_KEY',
+    envVars: ['ANTHROPIC_API_KEY'],
+    requiresKey: true,
+    builtin: false,
+    editableBaseUrl: true,
+    baseUrlHint: 'https://api.anthropic.com',
+    baseUrlDesc: 'Native Anthropic protocol (/v1/messages, x-api-key). Works with any Anthropic-compatible gateway.',
+  },
 }
 
 export function providerMeta(kind: ProviderKind | undefined | null): ProviderKindMeta {

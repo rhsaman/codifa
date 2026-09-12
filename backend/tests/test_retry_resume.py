@@ -16,6 +16,26 @@ import pytest
 from mock_openai import mock, text_reply, tool_call
 
 import agents
+from agents import _friendly_retry_reason
+
+
+def test_friendly_retry_reason_empty_stream():
+    """«No generation chunks» باید به پیام قابل‌فهم ترجمه شود، نه متن خام.
+
+    گیت‌وی‌هایی که سهمیه/کانال مدل را تمام کرده‌اند گاهی به‌جای خطای واضح،
+    استریم ۲۰۰ خالی برمی‌گردانند و LangChain آن را به ValueError ترجمه می‌کند.
+    """
+    reason = _friendly_retry_reason(ValueError("No generation chunks were returned"))
+    assert "empty response" in reason
+    assert "quota" in reason or "budget" in reason
+    # متن خام گیج‌کننده نباید جایی از پیام باشد
+    assert "No generation chunks" not in reason
+
+
+def test_friendly_retry_reason_other_errors_untouched():
+    """خطاهای دیگر نباید تحت‌تأثیر ترجمه‌ی استریم خالی قرار بگیرند."""
+    reason = _friendly_retry_reason(ConnectionError("All connection attempts failed"))
+    assert "empty response" not in reason
 
 
 @pytest.fixture(autouse=True)

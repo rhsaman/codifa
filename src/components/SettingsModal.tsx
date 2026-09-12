@@ -443,6 +443,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const updateProvider = useStore((s) => s.updateProvider)
   const addProvider = useStore((s) => s.addProvider)
   const removeProvider = useStore((s) => s.removeProvider)
+  const addManualModel = useStore((s) => s.addManualModel)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
   const removeMode = useStore((s) => s.removeMode)
@@ -491,6 +492,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const [credMode, setCredMode] = useState<'env' | 'key'>(() => ((cfg.apiKey ?? '').trim() ? 'key' : 'env'))
   // True once Save was blocked for a provider that has no usable credential.
   const [credWarn, setCredWarn] = useState(false)
+  // ورودی «افزودن مدل دستی»: وقتی گیت‌وی فهرست مدل‌هایش را از /models نشان
+  // نمی‌دهد (یا فچ شکست می‌خورد)، کاربر می‌تواند id مدل را مستقیم تایپ کند.
+  const [manualModel, setManualModel] = useState('')
   // Readiness checks for the provider being edited (drives the banner at the
   // top of the form so the problem is visible BEFORE a message is sent).
   const hasSavedKey = !!(cfg.apiKey ?? '').trim()
@@ -877,12 +881,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     const { model: _model, ...cfgPersistFull } = cfg
     // Get live models/removedModels from store to avoid normalizing them to empty arrays
     const liveProvider = useStore.getState().settings.providers.find((p) => p.id === active.id)
-    const { models: _models, removedModels: _removed, ...cfgPersist } = cfgPersistFull
+    const { models: _models, removedModels: _removed, addedModels: _added, ...cfgPersist } = cfgPersistFull
     updateProvider(active.id, {
       ...cfgPersist,
       model: liveProvider?.model ?? active.model,
       models: liveProvider?.models ?? [],
       removedModels: liveProvider?.removedModels ?? [],
+      addedModels: liveProvider?.addedModels ?? [],
     })
     setSaved(true)
     setTimeout(onClose, 300)
@@ -1273,6 +1278,58 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 )}
               </div>
             )}
+
+            <div className="field">
+              <label>Add model manually</label>
+              <div className="manual-model-row">
+                <input
+                  value={manualModel}
+                  onChange={(e) => setManualModel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      if (manualModel.trim()) {
+                        addManualModel(active.id, manualModel)
+                        setManualModel('')
+                      }
+                    }
+                  }}
+                  placeholder="e.g. claude-opus-4-6 — press Enter"
+                  dir="ltr"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  className="btn tiny"
+                  disabled={!manualModel.trim()}
+                  onClick={() => {
+                    addManualModel(active.id, manualModel)
+                    setManualModel('')
+                  }}
+                >
+                  Add
+                </button>
+              </div>
+              <div className="hint">
+                For gateways that don’t list their models (or the fetch fails). The model is kept even
+                when the live catalog is unreachable, and can be picked in the composer.
+              </div>
+              {(() => {
+                const live = useStore.getState().settings.providers.find((p) => p.id === active.id)
+                const manual = live?.addedModels ?? []
+                if (manual.length === 0) return null
+                return (
+                  <div className="manual-model-list">
+                    {manual.map((m) => (
+                      <span key={m} className="manual-model-chip">
+                        {m}
+                      </span>
+                    ))}
+                  </div>
+                )
+              })()}
+            </div>
 
           </>
         )}

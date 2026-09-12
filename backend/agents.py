@@ -159,7 +159,13 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
     path outside the scope) return an error listing the allowed files.
     """
 
-    async def wrapped(pattern: str, path: str = "", include: str = "") -> str:
+    async def wrapped(
+        pattern: str,
+        patterns: list[str] | None = None,
+        path: str = "",
+        include: str = "",
+        **kwargs,
+    ) -> str:
         rel = str(path or "").strip().lstrip("/")
         if not rel:
             return (
@@ -171,7 +177,7 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
                 f"ERROR: `{path}` is not in scope for this request. In-scope files: "
                 + ", ".join(sorted(scoped_paths))
             )
-        return await fn(pattern, rel, include)
+        return await fn(pattern, patterns, rel, include, **kwargs)
 
     return wrapped
 
@@ -179,16 +185,25 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
 def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
     """Wrap read so it only reads the explicitly scoped files."""
 
-    async def wrapped(filePath: str, offset: int = 1, limit: int = 2000) -> str:
-        rel = str(filePath or "").strip().lstrip("/")
-        if rel not in scoped_paths:
-            return (
-                "ERROR: this path is not in scope for this request: "
-                + str(filePath)
-                + ". In-scope files: "
-                + ", ".join(sorted(scoped_paths))
-            )
-        return await fn(rel, offset, limit)
+    async def wrapped(
+        filePath: str,
+        offset: int = 1,
+        limit: int = 2000,
+        filePaths: list[str] | None = None,
+        **kwargs,
+    ) -> str:
+        # همه‌ی مسیرهای batch هم باید در اسکوپ باشند (نه فقط filePath).
+        batch = [filePath, *(filePaths or [])]
+        for p in batch:
+            rel = str(p or "").strip().lstrip("/")
+            if rel not in scoped_paths:
+                return (
+                    "ERROR: this path is not in scope for this request: "
+                    + str(p)
+                    + ". In-scope files: "
+                    + ", ".join(sorted(scoped_paths))
+                )
+        return await fn(filePath, offset, limit, filePaths, **kwargs)
 
     return wrapped
 
@@ -838,7 +853,12 @@ _SEARCH_RULE = (
     "than ONE known file, pass them ALL in a SINGLE read call via the filePaths "
     "list (e.g. filePath='a.ts', filePaths=['b.ts','c.ts']) — NEVER fire one read "
     "per file when you already know several you need. Reading N files in N separate "
-    "read calls is a HARD violation of this rule.\n"
+    "read calls is a HARD violation of this rule. Same for SEARCHES: when you "
+    "need several grep terms (or several globs) that share a path/include, pass "
+    "them ALL in ONE call via the `patterns` list (e.g. pattern='foo', "
+    "patterns=['bar','baz']) — NEVER fire one grep per term. And when different "
+    "files need different windows, pass them in ONE read call via `ranges` "
+    "(e.g. ranges=['a.ts:100:80','b.ts:1:60']) instead of one read per window.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
     "tools (read/grep/glob) in one turn for TARGETED lookups (clause 4), and "
     "(b) launching several explore SUB-AGENTS in parallel for BROAD / multi-file "
@@ -1157,6 +1177,17 @@ def _friendly_retry_reason(exc: BaseException) -> str:
         return (
             "Authentication failed (401) — check the API key in Settings. "
             "Retrying won't help until it's fixed."
+        )
+    # An empty 200 stream (gateway returned no chunks at all — e.g. a
+    # quota-exhausted route that swallows the real error inside the stream).
+    # LangChain surfaces it as ValueError("No generation chunks were returned").
+    # Retrying the same request usually fails identically, so tell the user
+    # what actually happened instead of the cryptic raw text.
+    if "no generation chunks" in low:
+        return (
+            "The provider returned an empty response (no content was generated). "
+            "This usually means the model's quota/budget pool is exhausted or the "
+            "route is unavailable — switch to another model in Settings and retry."
         )
     # Any other recognized status (400, 403, 404, 5xx that wasn't caught by
     # the phrase check, etc.) gets a clean one-liner prefix so the user sees

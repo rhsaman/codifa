@@ -11,6 +11,7 @@
 """
 
 from llm import _extra_headers, build_chat_model
+from providers import OPENCODE_UA, UA_LADDER
 
 
 def test_extra_headers_openrouter_cache_true():
@@ -43,6 +44,32 @@ def test_extra_headers_session_id_other_providers_omitted():
 
 def test_extra_headers_empty_session_id_omits_header():
     assert "x-session-id" not in _extra_headers("openrouter", "", True, session_id="")
+
+
+def test_extra_headers_custom_remote_gateway_gets_ua_ladder():
+    """A custom provider with a REMOTE base URL gets the UA-ladder header so
+    gateways that block unknown HTTP clients (401 "unauthorized client")
+    accept the chat request. No gateway is hardcoded — the header applies to
+    every remote custom endpoint."""
+    headers = _extra_headers("custom", "https://some-gateway.example.com/v1", False)
+    assert headers.get("User-Agent") == UA_LADDER[0]
+
+
+def test_extra_headers_custom_local_server_no_ua_header():
+    """Local custom servers (llama.cpp/Ollama/LM Studio) never UA-filter —
+    sending a spoofed agent-CLI UA there is pointless (and can confuse
+    request logs)."""
+    for base in ("http://localhost:8080/v1", "http://127.0.0.1:11434/v1", ""):
+        headers = _extra_headers("custom", base, False)
+        assert "User-Agent" not in headers
+
+
+def test_extra_headers_builtin_kinds_untouched():
+    """Built-in kinds keep their existing UA behaviour: opencode keeps its
+    own UA, others send none (their gateways don't UA-filter)."""
+    assert _extra_headers("opencode", "", False).get("User-Agent") == OPENCODE_UA
+    for kind in ("google", "openrouter", "nvidia", "cloudflare", "tokenrouter"):
+        assert "User-Agent" not in _extra_headers(kind, "", False)
 
 
 def _capture_model(monkeypatch):

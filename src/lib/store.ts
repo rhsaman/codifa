@@ -351,6 +351,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
       ? p.models.map((m) => (unprefixed ? m.replace(/^opencode\//, '') : m))
       : [],
     removedModels: Array.isArray(p.removedModels) ? p.removedModels : [],
+    addedModels: Array.isArray(p.addedModels) ? p.addedModels : [],
   }
 }
 
@@ -430,6 +431,8 @@ interface State {
   removeProvider: (id: string) => void
   setActiveProvider: (id: string) => void
   setProviderModels: (id: string, models: string[]) => void
+  /** افزودن دستی یک مدل به پروایدر (در addedModels ثبت می‌شود تا فچ‌ها حذفش نکنند). */
+  addManualModel: (id: string, model: string) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
@@ -1058,6 +1061,31 @@ export const useStore = create<State>((set, get) => ({
                 models: Array.from(new Set(models.filter(Boolean))),
                 // Explicitly re-added models are no longer hidden.
                 removedModels: (p.removedModels ?? []).filter((m) => !models.includes(m)),
+                // Manual models survive as long as they are still in the list.
+                addedModels: (p.addedModels ?? []).filter((m) => models.includes(m)),
+              }
+            : p,
+        ),
+      },
+    }))
+    get().persist()
+  },
+
+  // افزودن دستی یک مدل به پروایدر: هم به لیست ظاهری اضافه می‌شود و هم در
+  // addedModels ثبت می‌شود تا فچ‌های بعدی (حتی ناموفق) آن را حذف نکنند.
+  addManualModel: (id, model) => {
+    const m = model.trim()
+    if (!m) return
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) =>
+          p.id === id
+            ? {
+                ...p,
+                models: Array.from(new Set([...(p.models ?? []), m])),
+                addedModels: Array.from(new Set([...(p.addedModels ?? []), m])),
+                removedModels: (p.removedModels ?? []).filter((x) => x !== m),
               }
             : p,
         ),

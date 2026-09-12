@@ -1,4 +1,4 @@
-export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter'
+export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter' | 'anthropic'
 
 export type AgentMode = string
 
@@ -100,6 +100,10 @@ export interface ProviderConfig {
   models?: string[]
   /** Models the user explicitly removed; hidden from the live /models catalog. */
   removedModels?: string[]
+  /** Models the user manually added; always kept even when the live /models
+   *  catalog is unreachable or doesn't list them (e.g. a gateway that hides
+   *  its catalog from unknown clients). */
+  addedModels?: string[]
 }
 
 export interface Settings {

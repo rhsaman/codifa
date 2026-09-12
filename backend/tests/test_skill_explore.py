@@ -184,9 +184,9 @@ def test_attached_skill_body_is_inlined(monkeypatch):
 
 
 def test_unattached_skill_body_not_inlined(monkeypatch):
-    # A known but unattached skill must NOT appear in the prompt at all (no
-    # general catalog, no body) -- keeps the token cost down and proves inlining
-    # is gated on actual attachment, not just presence in the DB.
+    # A known but unattached skill appears ONLY as catalog metadata (name +
+    # description) — its BODY must not be inlined (progressive disclosure:
+    # the model loads it on demand via load_skill).
     monkeypatch.setattr(
         graph._agents, "_load_skills",
         lambda root: [
@@ -195,12 +195,14 @@ def test_unattached_skill_body_not_inlined(monkeypatch):
         ],
     )
     section = graph._build_skills_section([], "/x")
-    assert section == ""
+    assert "=== AVAILABLE SKILLS ===" in section
+    assert "Anthropic Frontend Design" in section
+    assert "SECRET-BODY" not in section
 
 
 def test_unknown_pick_adds_no_catalog(monkeypatch):
     # An unknown/renamed skill name must not fall back to listing every other
-    # skill (no general catalog, no fuzzy substitution).
+    # skill's BODY (no fuzzy substitution) — only the catalog metadata.
     monkeypatch.setattr(
         graph._agents, "_load_skills",
         lambda root: [
@@ -208,7 +210,9 @@ def test_unknown_pick_adds_no_catalog(monkeypatch):
              "content": "SECRET-BODY"},
         ],
     )
-    assert graph._build_skills_section(["نام ناشناخته"], "/x") == ""
+    section = graph._build_skills_section(["نام ناشناخته"], "/x")
+    assert "SECRET-BODY" not in section
+    assert "=== ATTACHED SKILLS ===" not in section
 
 
 def test_duplicate_picks_inline_once(monkeypatch):
@@ -227,11 +231,12 @@ def test_duplicate_picks_inline_once(monkeypatch):
 
 
 def test_no_picks_skip_skill_load(monkeypatch):
-    # With no picks the section must be empty WITHOUT hitting the DB at all.
+    # With no picks AND no catalog (small-context models) the section must be
+    # empty WITHOUT hitting the DB at all.
     def boom(root):
         raise AssertionError("DB نباید بارگیری شود")
     monkeypatch.setattr(graph._agents, "_load_skills", boom)
-    assert graph._build_skills_section([], "/x") == ""
+    assert graph._build_skills_section([], "/x", catalog=False) == ""
 
 
 def test_skill_used_but_name_excluded_from_search(monkeypatch):

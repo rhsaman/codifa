@@ -52,3 +52,14 @@ def test_friendly_error_keeps_outer_when_meaningful():
     )
     result = _friendly_error(exc, model="minimax/minimax-m3:free")
     assert "Rate limit exceeded" in result, result
+
+
+def test_friendly_error_empty_stream_translated():
+    """A gateway that swallows a quota error inside an empty 200 stream makes
+    LangChain raise ValueError('No generation chunks were returned'). The
+    user must see an actionable message, not the cryptic raw text."""
+    exc = ValueError("No generation chunks were returned")
+    result = _friendly_error(exc, model="claude-opus-4-8")
+    assert "empty response" in result.lower(), result
+    assert "quota" in result.lower() or "budget" in result.lower(), result
+    assert "No generation chunks" not in result, result

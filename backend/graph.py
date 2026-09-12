@@ -1002,18 +1002,22 @@ def _build_skills_section(
     picked_names: list[str],
     root: str,
     emit: Callable[[dict], None] | None = None,
+    catalog: bool = True,
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
-    ONLY attached/picked skills are inlined (full body) — there is no
-    general ``AVAILABLE SKILLS`` catalog in the prompt. Skills are selected
-    via @mention in the UI; the model never needs the full list to find or
-    activate one, so an unpicked turn adds zero skill tokens.
+    Codex-style progressive disclosure: a compact ``AVAILABLE SKILLS`` catalog
+    (name + description only) is ALWAYS in the prompt so the model can
+    auto-trigger a skill via the ``load_skill`` tool when the task matches a
+    description. Full bodies are inlined ONLY for @mentioned skills — the
+    model loads any other skill on demand via ``load_skill`` (one tool call
+    instead of a prompt-sized body). An empty catalog adds zero tokens.
 
     When a picked name matches no stored skill (deleted/renamed since the
-    mention was made) a ``warn`` event is emitted via ``emit`` so the user
-    learns why the skill silently did not apply — previously this case was
-    indistinguishable from a turn with no mentions at all.
+    mention was made) a ``skill`` event with a ``note`` is emitted via
+    ``emit`` so the user learns why the skill silently did not apply —
+    previously this case was indistinguishable from a turn with no mentions
+    at all.
 
     This is intentionally independent of ``_skill_names_to_strip``: stripping a
     skill's *name* out of the search-keyword derivation must never prevent its
@@ -1021,9 +1025,29 @@ def _build_skills_section(
     manual_names = list(dict.fromkeys(
         n.strip().casefold() for n in picked_names if n and n.strip()
     ))
-    if not manual_names:
+    # Load the DB only when something needs it: the catalog or a manual pick.
+    # (catalog=False + no picks = zero skill tokens AND zero DB reads.)
+    if not catalog and not manual_names:
         return ""
     all_skills = _agents._load_skills(root)
+    out = ""
+    if catalog and all_skills:
+        lines = [
+            f"- {s['name']}"
+            + (f": {s['description']}" if s.get("description") else "")
+            for s in all_skills
+        ]
+        out += (
+            "\n\n=== AVAILABLE SKILLS ===\n"
+            "Skills are reusable instruction bundles. When the user's task "
+            "matches one of the descriptions below, call the load_skill tool "
+            "with that skill's name FIRST and follow its instructions. When "
+            "the user explicitly @mentions a skill, its full body is already "
+            "inlined below — do NOT load it again.\n"
+            + "\n".join(lines)
+        )
+    if not manual_names:
+        return out
     if not all_skills:
         if emit is not None:
             emit({
@@ -1035,7 +1059,7 @@ def _build_skills_section(
                     f"renamed: {', '.join(manual_names)}. The turn runs without them."
                 ),
             })
-        return ""
+        return out
     by_name = {s["name"].casefold(): s for s in all_skills}
     picked: list[dict] = []
     missing: list[str] = []
@@ -1056,7 +1080,7 @@ def _build_skills_section(
                     f"renamed: {', '.join(missing)}. The turn runs without them."
                 ),
             })
-        return ""
+        return out
     if missing and emit is not None:
         emit({
             "kind": "skill",
@@ -1072,7 +1096,7 @@ def _build_skills_section(
         f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
         for s in picked
     )
-    return "\n\n=== ATTACHED SKILLS ===\n" + bodies
+    return out + "\n\n=== ATTACHED SKILLS ===\n" + bodies
 
 
 def _dedup_code_map(
@@ -1487,9 +1511,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if _ws_summary:
             system_final += _ws_summary
 
-    # Skills: only @mentioned skills are inlined (no general catalog).
+    # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
+    # (name + description) is always in the prompt (except small-context
+    # models, where every token counts) so the model can auto-trigger a skill
+    # via load_skill; @mentioned bodies are inlined in full.
     system_final += _build_skills_section(
-        skills or [], root, emit=lambda ev: queue.put_nowait(ev)
+        skills or [],
+        root,
+        emit=lambda ev: queue.put_nowait(ev),
+        catalog=not small_ctx,
     )
 
     if mode in ("plan", "coder"):

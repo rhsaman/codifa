@@ -68,6 +68,10 @@ export function bareModelId(p: { id: string }, m: string): string {
  * کاربر و مدل‌های متعلق به پروایدر دیگر)، بدون تکرار. لیست ذخیره‌شده‌ی
  * قبلی عمداً نگه داشته نمی‌شود تا مدلی که پروایدر حذف یا تغییرنام کرده
  * («No such model») هرگز در لیست زنده نماند. store را تغییر نمی‌دهد.
+ *
+ * استثنا: مدل‌هایی که کاربر دستی اضافه کرده (addedModels) همیشه نگه
+ * داشته می‌شوند — حتی وقتی کاتالوگ زنده در دسترس نیست یا گیت‌وی فهرست
+ * مدل‌هایش را به کلاینت‌های ناشناس نشان نمی‌دهد.
  */
 export function mergeFetchedModels(
   p: ProviderConfig,
@@ -75,13 +79,17 @@ export function mergeFetchedModels(
   removed: string[],
 ): string[] {
   const removedSet = new Set(removed)
+  const added = new Set((p.addedModels ?? []).map((m) => bareModelId(p, m)))
 
   return Array.from(
     new Set(
-      fetched.filter((m) => {
-        const b = bareModelId(p, m)
-        return !removedSet.has(b) && !isForeignModelId(p, b)
-      }),
+      [
+        ...fetched.filter((m) => {
+          const b = bareModelId(p, m)
+          return !removedSet.has(b) && !isForeignModelId(p, b)
+        }),
+        ...Array.from(added).filter((b) => !removedSet.has(b) && !isForeignModelId(p, b)),
+      ],
     ),
   )
 }
@@ -134,6 +142,20 @@ export async function fetchAndPersist(
     if (merged.length > 0) store.healStaleModels(p.id, merged)
     return { ok: true, count: merged.length }
   } catch (err) {
+    // فچ شکست خورد (گیت‌وی در دسترس نیست یا کلاینت را بلاک کرده). لیست
+    // ذخیره‌شده دست نمی‌خورد؛ فقط مدل‌های دستی‌اضافه‌ی کاربر را که هنوز
+    // در لیست نیستند به آن می‌افزاییم تا همیشه قابل انتخاب بمانند.
+    const store = (options.store ?? useStore).getState()
+    const fresh = store.settings.providers.find((x) => x.id === p.id)
+    if (fresh) {
+      const existing = new Set((fresh.models ?? []).map((m) => bareModelId(p, m)))
+      const missing = (fresh.addedModels ?? [])
+        .map((m) => bareModelId(p, m))
+        .filter((b) => !existing.has(b) && !isForeignModelId(p, b))
+      if (missing.length > 0) {
+        store.setProviderModels(p.id, [...(fresh.models ?? []), ...missing])
+      }
+    }
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),

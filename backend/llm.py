@@ -47,6 +47,7 @@ from _common import (
 )
 from providers import (
     OPENCODE_UA,
+    UA_LADDER,
     _provider_meta,
     env_key,
     is_opencode,
@@ -180,6 +181,12 @@ def _extra_headers(
     headers: dict[str, str] = {}
     if is_opencode(provider, base_url) or _provider_meta(provider).get("ua_spoof"):
         headers["User-Agent"] = OPENCODE_UA
+    elif provider == "custom" and base_url and not _is_local_provider(provider, base_url):
+        # Custom OpenAI-compatible gateways may block "unknown" HTTP clients by
+        # User-Agent (HTTP 401 "unauthorized client") while allowing well-known
+        # agent CLIs — same ladder the models fetch uses. Local servers
+        # (llama.cpp/Ollama/LM Studio) are exempt: they never UA-filter.
+        headers["User-Agent"] = UA_LADDER[0]
     if cache and _provider_meta(provider).get("cache_headers"):
         # OpenRouter honours cache breakpoints via Anthropic-style headers; we
         # ask it to cache the system prompt + tool definitions + last message.
@@ -298,7 +305,7 @@ def build_chat_model(
     # token counts) so the context meter reflects local-model usage. If a server
     # genuinely rejects the param, the runner retries once without it (see the
     # stream_options fallback in graph.py / llm_generate).
-    if model_class != "google":
+    if model_class not in ("google", "anthropic"):
         tkwargs["stream_options"] = {"include_usage": True}
     base = normalize_base_url(provider, base_url)
 
@@ -324,6 +331,30 @@ def build_chat_model(
                 streaming=True,
                 timeout=to if isinstance(to, (int, float)) else None,
                 thinking_budget=thinking_budget,
+            ),
+            provider,
+            provider_id,
+        )
+
+    if model_class == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        # Anthropic-native protocol (/v1/messages, x-api-key). The base URL is
+        # stored WITHOUT /v1 (normalize_base_url strips it) and the SDK appends
+        # its own path, so pass the bare host root. Gateways that block unknown
+        # HTTP clients by User-Agent get a well-known agent-CLI UA.
+        anthropic_headers = dict(headers)
+        anthropic_headers.setdefault("User-Agent", UA_LADDER[0])
+        return _stamp_provider(
+            ChatAnthropic(
+                model=model,
+                api_key=key or None,
+                base_url=base or None,
+                temperature=temperature,
+                max_tokens=max_tokens or 4096,
+                streaming=True,
+                timeout=lc_timeout,
+                default_headers=anthropic_headers or None,
             ),
             provider,
             provider_id,

@@ -2632,6 +2632,18 @@ def _tool_event(ev: dict) -> dict:
     return out
 
 
+def _load_skills_for_tool() -> list[dict]:
+    """Lazy wrapper around ``agents._load_skills``.
+
+    ``agents`` imports ``tools`` at module level, so importing it back must
+    stay inside a function to avoid a circular import. Skills live in the app
+    DB (the ``root`` argument of ``_load_skills`` is API-compat only).
+    """
+    from agents import _load_skills
+
+    return _load_skills("")
+
+
 def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
@@ -3258,6 +3270,47 @@ def make_tool_callbacks(
             "Tell the user the skill was created."
         )
 
+    async def load_skill_tool(name: str) -> str:
+        """Load the full body of a skill from the app database by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
+        emit({"kind": "tool", "tool": "load_skill", "args": {"name": name}})
+        wanted = (name or "").strip().casefold()
+        skills: list[dict] = []
+        try:
+            skills = _agents_load_skills_for_tool()
+        except Exception:  # noqa: BLE001
+            skills = []
+        match = next(
+            (s for s in skills if (s.get("name") or "").strip().casefold() == wanted),
+            None,
+        )
+        if match is None:
+            available = ", ".join(s["name"] for s in skills) or "(none)"
+            summary = f"skill {name!r} not found"
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "load_skill",
+                    "summary": summary,
+                    "status": "error",
+                }
+            )
+            return f"ERROR: skill {name!r} not found. Available skills: {available}"
+        desc = (match.get("description") or "").strip()
+        body = (match.get("content") or "").strip()
+        summary = f"loaded skill {match['name']!r}"
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "load_skill",
+                "summary": summary,
+            }
+        )
+        out = f"===== SKILL: {match['name']} =====\n"
+        if desc:
+            out += f"Description: {desc}\n"
+        out += f"\n{body}\n===== END SKILL: {match['name']} ====="
+        return out
+
     async def create_mcp_tool(
         name: str,
         command: str = "",
@@ -3388,22 +3441,42 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
+    def _dedup_patterns(primary: str, extra: list[str] | None) -> list[str]:
+        """«pattern» + «patterns» را به یک لیست مرتب و بدون تکرار تبدیل می‌کند.
+
+        ورودی‌های خالی حذف می‌شوند؛ اگر همه خالی بودند خودِ primary
+        برمی‌گردد تا رفتار تک‌الگوی فعلی دست‌نخورده بماند.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in (primary, *(extra or [])):
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out or [primary]
+
     async def grep_tool(
-        pattern: str, path: str = "", include: str = "", max_results: int = 50
+        pattern: str,
+        patterns: list[str] | None = None,
+        path: str = "",
+        include: str = "",
+        max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term when they share path/include. `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
+        combined = "|".join(_dedup_patterns(pattern, patterns))
         generation = _search_generations.get(root, 0)
-        cache_key = ("grep", pattern, path, include, root, str(max_results), str(tool_out_chars))
+        cache_key = ("grep", combined, path, include, root, str(max_results), str(tool_out_chars))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "grep",
-                    "args": {"pattern": pattern, "path": path, "include": include},
+                    "args": {"pattern": combined, "path": path, "include": include},
                     "model": _main_name,
                 }
             )
@@ -3421,14 +3494,14 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             {
                 "kind": "tool",
                 "tool": "grep",
-                "args": {"pattern": pattern, "path": path, "include": include},
+                "args": {"pattern": combined, "path": path, "include": include},
                 "model": _main_name,
             }
         )
         try:
             result = await _shared_search(
-                root, ("grep", pattern, path, include, str(SNIPPET_CONTEXT)),
-                generation, search_in_files, root, pattern, path, SNIPPET_CONTEXT, include,
+                root, ("grep", combined, path, include, str(SNIPPET_CONTEXT)),
+                generation, search_in_files, root, combined, path, SNIPPET_CONTEXT, include,
             )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
@@ -3454,7 +3527,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            return f"No matches for {pattern!r} under {path or '/'}"
+            return f"No matches for {combined!r} under {path or '/'}"
         # Output contract (spec §3, revised): each hit shows the match line plus
         # ±SNIPPET_CONTEXT lines of surrounding code (already computed by
         # search_in_files above — previously discarded here, forcing an almost-
@@ -3487,7 +3560,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         else:
             note = ""
-        raw = f"MATCHES for {pattern!r}\n" + "\n\n".join(lines) + note
+        raw = f"MATCHES for {combined!r}\n" + "\n\n".join(lines) + note
         if _search_generations.get(root, 0) == generation:
             _parent_search_cache[cache_key] = raw
         # Send the structured results too (not just the summary) so a reconnect
@@ -3574,18 +3647,26 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # model a hard, unambiguous signal to check before declaring success.
         return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
 
-    async def glob_tool(pattern: str, path: str = "", max_results: int = 100) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+    async def glob_tool(
+        pattern: str,
+        patterns: list[str] | None = None,
+        path: str = "",
+        max_results: int = 100,
+    ) -> str:
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        all_patterns = _dedup_patterns(pattern, patterns)
+        # نمایش تک‌الگویی برای سازگاری پیام‌ها؛ برای batch همه‌ی الگوها با |.
+        disp = all_patterns[0] if len(all_patterns) == 1 else "|".join(all_patterns)
         generation = _search_generations.get(root, 0)
-        cache_key = ("glob", pattern, path, "", root, str(max_results))
+        cache_key = ("glob", "|".join(all_patterns), path, "", root, str(max_results))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "glob",
-                    "args": {"pattern": pattern, "path": path},
+                    "args": {"pattern": disp, "path": path},
                     "model": _main_name,
                 }
             )
@@ -3603,24 +3684,40 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             {
                 "kind": "tool",
                 "tool": "glob",
-                "args": {"pattern": pattern, "path": path},
+                "args": {"pattern": disp, "path": path},
                 "model": _main_name,
             }
         )
         try:
-            result = await _shared_search(
-                root, ("glob", pattern, path), generation, glob_files, root, pattern, path,
+            # glob برخلاف regex عملگر | ندارد، پس هر الگو جداگانه (اما همزمان و
+            # با کش per-pattern در _shared_search) اسکن می‌شود و نتایج merge
+            # می‌شوند — همچنان یک فراخوانی ابزار و یک ToolMessage.
+            results = await asyncio.gather(
+                *(
+                    _shared_search(
+                        root, ("glob", p, path), generation, glob_files, root, p, path,
+                    )
+                    for p in all_patterns
+                )
             )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("glob", msg))
-            return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
-        if "error" in result:
-            msg = result["error"]
-            emit(_error_result("glob", msg))
-            return f"ERROR running glob {pattern!r} under {path or '/'}: {msg}"
-        matches = result.get("matches", [])
+            return f"ERROR running glob {disp!r} under {path or '/'}: {msg}"
+        errors = [r["error"] for r in results if r.get("error")]
+        # merge + dedupe — ترتیب حفظ می‌شود (مثل _clip_glob_results).
+        seen: set[str] = set()
+        matches: list[str] = []
+        for r in results:
+            for m in r.get("matches", []):
+                if m not in seen:
+                    seen.add(m)
+                    matches.append(m)
         if not matches:
+            if errors:
+                # همه‌ی الگوها خطا دادند → مثل حالت تک‌الگویی خطا برگردان.
+                emit(_error_result("glob", errors[0]))
+                return f"ERROR running glob {disp!r} under {path or '/'}: {errors[0]}"
             emit(
                 {
                     "kind": "tool_result",
@@ -3629,14 +3726,16 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            return f"No files match {pattern!r} under {path or '/'}."
+            return f"No files match {disp!r} under {path or '/'}."
         lines = list(matches[:max_results])
         note = (
             f"\n({len(matches)} matches found, showing the first {max_results})"
             if len(matches) > max_results
             else ""
         )
-        raw = f"GLOB MATCHES for {pattern!r}\n" + "\n".join(lines) + note
+        if errors:
+            note += f"\n({len(errors)} pattern(s) failed: {errors[0]})"
+        raw = f"GLOB MATCHES for {disp!r}\n" + "\n".join(lines) + note
         if _search_generations.get(root, 0) == generation:
             _parent_search_cache[cache_key] = raw
         # Send the structured results too (not just the summary) so a reconnect
@@ -3752,19 +3851,35 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         offset: int = 1,
         limit: int = 2000,
         filePaths: list[str] | None = None,
+        ranges: list[str] | None = None,
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; call read_tool again separately for a path that needs a different range. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
+BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
 
 NOTE: very small limits (<30 lines) on a first read of a file are auto-widened to ~60 lines to avoid line-by-line probing — ask for a wide window (limit=100+) if you need more context around a region. Repeated tiny adjacent reads of the same file trigger a hint telling you to read one wide window instead.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        # بازه‌های per-path ("path:offset:limit") → پنجره‌ی اختصاصی هر فایل.
+        # offset/limit سراسری همچنان برای مسیرهای بدون بازه‌ی اختصاصی اعمال می‌شود.
+        windowed: dict[str, tuple[int, int]] = {}
+        for spec in ranges or []:
+            parts = str(spec).split(":")
+            if len(parts) != 3:
+                continue
+            p, o, l = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if not p or not o.isdigit() or not l.isdigit():
+                continue
+            windowed[p] = (int(o), int(l))
         all_paths = [filePath] + [
             p for p in (filePaths or []) if p and p != filePath
         ]
-        if len(all_paths) == 1:
+        # مسیرهای فقط داخل ranges هم به batch اضافه می‌شوند (بدون تکرار).
+        for p in windowed:
+            if p not in all_paths:
+                all_paths.append(p)
+        if len(all_paths) == 1 and not windowed:
             emit(
                 {
                     "kind": "tool",
@@ -3778,7 +3893,12 @@ When you need to read several files, read multiple independent files in parallel
             {
                 "kind": "tool",
                 "tool": "read",
-                "args": {"filePaths": all_paths, "offset": offset, "limit": limit},
+                "args": {
+                    "filePaths": all_paths,
+                    "offset": offset,
+                    "limit": limit,
+                    **({"ranges": list(ranges)} if ranges else {}),
+                },
                 "model": _main_name,
             }
         )
@@ -3786,7 +3906,14 @@ When you need to read several files, read multiple independent files in parallel
         # parallel read-only tool calls elsewhere in the graph, just applied
         # WITHIN one tool call instead of across several parallel tool calls.
         results = await asyncio.gather(
-            *(_read_target(p, offset, limit, _main_name) for p in all_paths)
+            *(
+                _read_target(
+                    p,
+                    *(windowed.get(p) or (offset, limit)),
+                    _main_name,
+                )
+                for p in all_paths
+            )
         )
         return "\n\n".join(results)
 
@@ -5272,6 +5399,8 @@ When you need to read several files, read multiple independent files in parallel
             }
         )
 
+    _agents_load_skills_for_tool = _load_skills_for_tool
+
     _tools = {
         "request_permission": request_permission_tool,
         "confirm_action": confirm_action_tool,
@@ -5280,6 +5409,7 @@ When you need to read several files, read multiple independent files in parallel
         "edit_file": edit_file_tool,
         "update_plan": update_plan,
         "create_skill": create_skill_tool,
+        "load_skill": load_skill_tool,
         "create_mcp": create_mcp_tool,
         "grep": grep_tool,
         "glob": glob_tool,

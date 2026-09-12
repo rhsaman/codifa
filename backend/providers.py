@@ -53,6 +53,16 @@ _google_token_cache: dict[str, tuple[str, float]] = {}
 # (provider client default headers AND model default headers).
 OPENCODE_UA = "opencode/1.18.15 (npm:@opencode-ai/opencode)"
 
+# Some custom OpenAI-compatible gateways block "unknown" HTTP clients by
+# User-Agent (HTTP 401 "unauthorized client") while allowing well-known
+# agent CLIs. When a models fetch 401s, we retry the request with each UA
+# in this ladder until one is accepted — no gateway is hardcoded by name.
+UA_LADDER: tuple[str, ...] = (
+    "claude-cli/2.0.35 (external, cli)",
+    "opencode/1.18.15 (npm:@opencode-ai/opencode)",
+    "Cline/3.0.0",
+)
+
 
 def model_timeout(
     model: object | None = None,
@@ -208,6 +218,17 @@ _PROVIDERS: dict[str, dict] = {
         "base_url": "",
         "editable_base_url": True,
         "parallel_calls": True,
+    },
+    # Anthropic-compatible endpoint (native /v1/messages protocol, x-api-key
+    # auth). Any gateway exposing the Anthropic API — not just api.anthropic.com.
+    "anthropic": {
+        "name": "Anthropic",
+        "requires_key": True,
+        "env_vars": ("ANTHROPIC_API_KEY",),
+        "model_class": "anthropic",
+        "models": "openai",
+        "base_url": "",
+        "editable_base_url": True,
     },
     "nvidia": {
         "name": "NVIDIA",
@@ -398,6 +419,14 @@ def normalize_base_url(provider: str, base_url: str) -> str:
             if base and ("/v1" in base):
                 return base
             return (base or OLLAMA_BASE) + "/v1"
+        if provider == "anthropic":
+            # The Anthropic SDK appends /v1/messages itself, so the stored
+            # base must NOT carry a /v1 (or /v1/messages) suffix — strip it.
+            for suffix in ("/v1/messages", "/v1"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            return base
         return base
     return _expand_base(meta.get("base_url") or "", provider)
 
@@ -436,6 +465,11 @@ def _models_endpoint(provider: str, base_url: str) -> tuple[str, str]:
     meta = _provider_meta(provider)
     if meta.get("models_url"):
         return _expand_base(meta["models_url"], provider), meta.get("models") or "openai"
+    if provider == "anthropic":
+        # Anthropic-native catalog: GET {base}/v1/models with x-api-key.
+        # The base is stored WITHOUT /v1 (see normalize_base_url), so append it.
+        base = normalize_base_url(provider, base_url)
+        return base + "/v1/models", "openai"
     if meta.get("models") == "tags":
         # The "ollama" provider in the UI is the generic LOCAL endpoint
         # (llama.cpp / LM Studio / vLLM / Ollama). A custom base URL means a
@@ -1174,7 +1208,12 @@ async def list_models(
         return cached[1]
 
     headers = {}
-    if oauth_token:
+    if provider == "anthropic":
+        # Anthropic-native auth: x-api-key header, not Authorization Bearer.
+        key = oauth_token or api_key or env_key(provider, env_var)
+        headers["x-api-key"] = key
+        headers["anthropic-version"] = "2023-06-01"
+    elif oauth_token:
         headers["Authorization"] = f"Bearer {oauth_token}"
     elif api_key or env_key(provider, env_var):
         headers["Authorization"] = f"Bearer {api_key or env_key(provider, env_var)}"
@@ -1183,6 +1222,19 @@ async def list_models(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, headers=headers)
+            # Some gateways block unknown HTTP clients by User-Agent (HTTP 401
+            # "unauthorized client") while the credential itself is valid. Retry
+            # the same request with each well-known agent-CLI UA until one is
+            # accepted, so no gateway needs to be hardcoded by name.
+            if (
+                getattr(resp, "status_code", None) == 401
+                and not is_opencode(provider, base_url)
+            ):
+                for ua in UA_LADDER:
+                    retry = await client.get(url, headers={**headers, "User-Agent": ua})
+                    if getattr(retry, "status_code", None) != 401:
+                        resp = retry
+                        break
             resp.raise_for_status()
             data = resp.json()
 

@@ -45,25 +45,41 @@ def test_fts_keywords_dedupes_and_caps_terms():
 
 
 # ---------------------------------------------------------------------------
-# _build_skills_section (تزریق فقط اسکیل‌های انتخاب‌شده با @)
+# _build_skills_section (کاتالوگ AVAILABLE SKILLS + تزریق انتخاب‌شده‌ها با @)
 # ---------------------------------------------------------------------------
 
 
 def test_skills_section_no_picks_returns_empty(monkeypatch):
-    """بدون انتخاب: خروجی خالی و بدون بارگیری اسکیل‌ها از پایگاه‌داده."""
-    loaded = []
-
-    def fake_load(_root):
-        loaded.append(_root)
-        return [_skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A")]
-
-    monkeypatch.setattr(agents, "_load_skills", fake_load)
+    """بدون انتخاب و بدون اسکیل ذخیره‌شده: خروجی خالی."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [])
     assert graph._build_skills_section([], "/x") == ""
-    assert loaded == [], "بدون انتخاب نباید فهرست اسکیل‌ها بارگیری شود"
+
+
+def test_skills_section_catalog_lists_names_and_descriptions(monkeypatch):
+    """کاتالوگ پیش‌فرض: نام + توضیح همهٔ اسکیل‌ها بدون بدنه‌ها."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A"),
+        _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B"),
+    ])
+    out = graph._build_skills_section([], "/x")
+    assert "AVAILABLE SKILLS" in out
+    assert "Alpha" in out and "توضیح آلفا" in out
+    assert "Beta" in out and "توضیح بتا" in out
+    assert "BODY-A" not in out and "BODY-B" not in out, "بدنه‌ها نباید در کاتالوگ باشند"
+    assert "load_skill" in out, "راهنمای auto-trigger باید ابزار را معرفی کند"
+
+
+def test_skills_section_catalog_disabled(monkeypatch):
+    """catalog=False (مدل‌های با کانتکست کوچک): کاتالوگ ساخته نمی‌شود."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+    ])
+    out = graph._build_skills_section([], "/x", catalog=False)
+    assert out == ""
 
 
 def test_skills_section_picked_skill_body_inlined(monkeypatch):
-    """با انتخاب: فقط بدنهٔ کامل همان اسکیل تزریق می‌شود؛ فهرست عمومی غایب است."""
+    """با انتخاب: بدنهٔ کامل همان اسکیل تزریق می‌شود؛ بدنهٔ بقیه غایب است."""
     monkeypatch.setattr(agents, "_load_skills", lambda _r: [
         _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A"),
         _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B"),
@@ -71,7 +87,7 @@ def test_skills_section_picked_skill_body_inlined(monkeypatch):
     out = graph._build_skills_section(["Alpha"], "/x")
     assert "BODY-A" in out
     assert "BODY-B" not in out, "اسکیل انتخاب‌نشده نباید تزریق شود"
-    assert "AVAILABLE SKILLS" not in out, "فهرست عمومی حذف شده است"
+    assert "AVAILABLE SKILLS" in out, "کاتالوگ باید همراه انتخاب دستی باشد"
 
 
 def test_skills_section_duplicate_picks_inlined_once(monkeypatch):
@@ -84,11 +100,13 @@ def test_skills_section_duplicate_picks_inlined_once(monkeypatch):
 
 
 def test_skills_section_unknown_pick_returns_empty(monkeypatch):
-    """انتخاب ناشناخته: خروجی خالی — بدون جایگزینی یا فهرست جایگزین."""
+    """انتخاب ناشناخته: فقط کاتالوگ برمی‌گردد — بدون بدنه و بدون جایگزین."""
     monkeypatch.setattr(agents, "_load_skills", lambda _r: [
         _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
     ])
-    assert graph._build_skills_section(["ناموجود"], "/x") == ""
+    out = graph._build_skills_section(["ناموجود"], "/x")
+    assert "BODY-A" not in out
+    assert "AVAILABLE SKILLS" in out
 
 
 def test_skills_section_missing_pick_emits_skill_event(monkeypatch):
@@ -98,7 +116,7 @@ def test_skills_section_missing_pick_emits_skill_event(monkeypatch):
     ])
     events: list[dict] = []
     out = graph._build_skills_section(["ناموجود"], "/x", emit=events.append)
-    assert out == ""
+    assert "BODY-A" not in out, "بدنهٔ اسکیل گم‌شده نباید تزریق شود"
     assert len(events) == 1
     assert events[0]["kind"] == "skill"
     assert events[0]["skills"] == []

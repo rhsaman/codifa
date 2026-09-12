@@ -227,6 +227,34 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
 // In-flight /models dedup. Keyed by provider config so changing baseUrl /
 // apiKey / OAuth creds always triggers a fresh fetch.
 const modelsInFlight = new Map<string, Promise<ModelsResult>>()
+
+export interface ModelTestResult { ok: boolean; reply: string }
+
+/** Probe a single model with a tiny completion (POST /models/test). Throws
+ *  the server's `detail` on failure so the UI can show the real error. */
+export async function testModel(cfg: ProviderConfig, model: string): Promise<ModelTestResult> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const body: Record<string, string> = {
+    provider: cfg.kind,
+    base_url: cfg.baseUrl ?? '',
+    api_key: cfg.apiKey ?? '',
+    model,
+  }
+  if (cfg.envVar) body.env_var = cfg.envVar
+  for (const [k, v] of oauthParams(cfg)) body[k] = v
+  const res = await fetch(`${url}/models/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(45_000),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error((data as { detail?: string }).detail || `model test failed (${res.status})`)
+  }
+  return (await res.json()) as ModelTestResult
+}
 function providerRequestKey(cfg: ProviderConfig): string {
   return [
     cfg.id,

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderConfig } from "../types";
 import { useStore } from "../lib/store";
 import { PROVIDER_META, isForeignModelId } from "../lib/provider-meta";
+import { ModelTestButton } from "./ModelTestButton";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
@@ -213,17 +214,19 @@ export function ProviderModelSelect() {
                 {recentsShown.map(({ p, model }) => {
                   const isCurrent = p.id === activeProviderId && model === activeModel;
                   return (
-                    <button
-                      key={`${p.id}/${model}`}
-                      type="button"
-                      className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
-                      onClick={() => pick(p, model)}
-                    >
-                      {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                        <span className="pm-model-provider">{p.name}/</span>
-                      )}
-                      <span className="pm-model-name">{model}</span>
-                    </button>
+                    <div key={`${p.id}/${model}`} className="pm-model-row">
+                      <button
+                        type="button"
+                        className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
+                        onClick={() => pick(p, model)}
+                      >
+                        {!PROVIDER_META[p.kind]?.unprefixedModelId && (
+                          <span className="pm-model-provider">{p.name}/</span>
+                        )}
+                        <span className="pm-model-name">{model}</span>
+                      </button>
+                      <ModelTestButton cfg={p} model={model} />
+                    </div>
                   );
                 })}
               </div>
@@ -252,17 +255,19 @@ export function ProviderModelSelect() {
                       {models.map((m) => {
                         const isCurrent = p.id === activeProviderId && m === activeModel;
                         return (
-                          <button
-                            key={m}
-                            type="button"
-                            className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
-                            onClick={() => pick(p, m)}
-                          >
-                            {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                              <span className="pm-model-provider">{p.name}/</span>
-                            )}
-                            <span className="pm-model-name">{m}</span>
-                          </button>
+                          <div key={m} className="pm-model-row">
+                            <button
+                              type="button"
+                              className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
+                              onClick={() => pick(p, m)}
+                            >
+                              {!PROVIDER_META[p.kind]?.unprefixedModelId && (
+                                <span className="pm-model-provider">{p.name}/</span>
+                              )}
+                              <span className="pm-model-name">{m}</span>
+                            </button>
+                            <ModelTestButton cfg={p} model={m} />
+                          </div>
                         );
                       })}
                       {models.length === 0 && (

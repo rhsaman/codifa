@@ -9,6 +9,7 @@ import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
+import { ModelTestButton } from './ModelTestButton'
 import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
 
@@ -259,17 +260,19 @@ function ToolModelSelect({
                             current.slice(current.indexOf('/') + 1) === m ||
                             current.slice(current.indexOf('/') + 1) === `${p.id}/${m}`
                           return (
-                            <button
-                              key={m}
-                              type="button"
-                              className={`mode-menu-item pm-model ${isActive ? 'active' : ''}`}
-                              onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
-                            >
-                              {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                                <span className="pm-model-provider">{p.name}/</span>
-                              )}
-                              <span className="pm-model-name">{m}</span>
-                            </button>
+                            <div key={m} className="pm-model-row">
+                              <button
+                                type="button"
+                                className={`mode-menu-item pm-model ${isActive ? 'active' : ''}`}
+                                onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
+                              >
+                                {!PROVIDER_META[p.kind]?.unprefixedModelId && (
+                                  <span className="pm-model-provider">{p.name}/</span>
+                                )}
+                                <span className="pm-model-name">{m}</span>
+                              </button>
+                              <ModelTestButton cfg={p} model={m} />
+                            </div>
                           )
                         })}
                         {models.length === 0 && (

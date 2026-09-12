@@ -3928,7 +3928,7 @@ textarea {
 
 .pm-model:hover,
 .pm-model.active {
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .pm-model.active .pm-model-name {
@@ -3943,6 +3943,84 @@ textarea {
   font-weight: 700;
   margin-left: auto;
   padding-left: 6px;
+}
+
+/* ---- per-model test button (⚡) in the model pickers ---- */
+.pm-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The pick button fills the row in BOTH pickers: .pm-model (composer popup)
+   and .model-select-item (Tools dropdown) — so the test chip always lands on
+   the far right with even horizontal breathing room. */
+.pm-model-row .pm-model,
+.pm-model-row .model-select-item {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+/* Ghost test button — icon only, no chip surface: it reads as a quiet
+   affordance next to the model name, not a second boxed control. Color alone
+   carries the state (dim → accent hover → green ok / red fail). */
+.pm-model-test {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color 0.12s;
+}
+
+.pm-model-test:hover {
+  color: var(--accent);
+}
+
+/* Hovering the test icon highlights the model row it belongs to — the same
+   accent tint as hovering the row itself, in both pickers (.pm-model in the
+   composer popup, .model-select-item in the Tools dropdown). */
+.pm-model-row:has(.pm-model-test:hover) .pm-model,
+.pm-model-row:has(.pm-model-test:hover) .model-select-item {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.pm-model-row:has(.pm-model-test:hover) .pm-model-name,
+.pm-model-row:has(.pm-model-test:hover) .model-select-item {
+  color: var(--accent);
+}
+
+.pm-model-test.testing {
+  color: var(--accent);
+  animation: pm-test-pulse 1s ease-in-out infinite;
+}
+
+@keyframes pm-test-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pm-model-test.ok {
+  color: var(--success);
+}
+
+.pm-model-test.fail {
+  color: var(--danger);
 }
 
 .pm-loading {

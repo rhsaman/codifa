@@ -198,7 +198,7 @@ from graph import (
     clear_chat_resume_checkpoint,
     prune_stale_resume_checkpoints,
 )
-from llm import build_chat_model
+from llm import build_chat_model, llm_complete
 
 
 def wants_skill_or_mcp(text: str) -> bool:
@@ -416,6 +416,15 @@ class ModelsRequest(BaseModel):
     oauth_refresh_token: str = ""
 
 
+class ModelTestRequest(ModelsRequest):
+    """POST /models/test — probing one model with a tiny completion.
+
+    Inherits every OAuth/key field so `_oauth_access_token` works unchanged.
+    """
+
+    model: str = ""
+
+
 class ModelDownloadRequest(BaseModel):
     """Download a managed on-device model (whisper / embedding)."""
 
@@ -625,6 +634,43 @@ async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/models/test")
+async def models_test(req: ModelTestRequest) -> dict:
+    """Send a tiny one-shot completion to check a model actually works.
+
+    Uses the same build_chat_model + llm_complete path as a real chat turn
+    (the pattern proven in backend/live_test_providers.py) so the probe
+    exercises the exact provider+model the picker shows.
+    """
+    if not req.model:
+        raise HTTPException(status_code=400, detail="no model selected")
+    try:
+        oauth = await _oauth_access_token(req)
+        mo = build_chat_model(
+            req.provider,
+            req.model,
+            req.base_url,
+            req.api_key,
+            req.env_var,
+            oauth_token=oauth,
+            timeout=30,
+        )
+        text, _usage = await asyncio.wait_for(
+            llm_complete(mo, user="Reply with the single word: OK"), timeout=35
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=400, detail="timeout — model did not answer in 35s"
+        ) from exc
+    except providers.ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # the real provider error must reach the UI
+        raise HTTPException(
+            status_code=400, detail=f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return {"ok": True, "reply": (text or "").strip()[:200]}
 
 
 # --- managed on-device models (whisper / embedding) --------------------- #

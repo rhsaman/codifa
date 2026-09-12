@@ -1336,14 +1336,19 @@ textarea {
   color: var(--text-dim);
 }
 
-/* Thin horizontal drag handle at the TOP of each panel body — drag UP to
-   grow the panel (VSCode-style). */
+/* Thin horizontal drag handle — sits ON the panel's edge (VSCode-style):
+   the top handle straddles the top border, the bottom one the bottom
+   border, so the grab area is exactly at the box edge. */
 .sidebar-panel-resize {
   height: 10px;
+  margin-top: -5px;
+  margin-bottom: -5px;
   cursor: ns-resize;
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
+  z-index: 1;
   border-bottom: 1px solid transparent;
 }
 
@@ -1363,10 +1368,37 @@ textarea {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
+/* Bottom variant (Todos float panel) — drag DOWN to grow from the bottom.
+   Straddles the panel's bottom border; same look as the top handle. */
+.sidebar-panel-resize.bottom {
+  border-bottom: none;
+  border-top: 1px solid transparent;
+}
+
+/* در پنل شناور Todos هر دو دستگیره از جریان خارج می‌شوند و دقیقاً روی
+   لبهٔ کادر می‌نشینند: بالایی روی لبهٔ بالا (روی هدر، نه زیر آن) و
+   پایینی روی لبهٔ پایین (زیر لیست) — مثل ریسایز پنجره در VSCode. */
+.sidebar-panel.todos-float .sidebar-panel-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  margin: 0;
+}
+
+.sidebar-panel.todos-float .sidebar-panel-resize:not(.bottom) {
+  top: -5px;
+}
+
+.sidebar-panel.todos-float .sidebar-panel-resize.bottom {
+  top: auto;
+  bottom: -5px;
+}
+
 .sidebar-todos-list {
   list-style: none;
   margin: 0;
-  padding: 0 10px 4px;
+  /* پدینگ افقی روی آیتم‌هاست تا اسکرول‌بار به لبهٔ کادر بچسبد. */
+  padding: 0 0 4px;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -1381,19 +1413,25 @@ textarea {
   background: transparent;
 }
 
+/* thumb باید با پس‌زمینهٔ پنل کنتراست داشته باشد — --border دقیقاً همان
+   رنگ --bg-input است و thumb نامرئی می‌شد. */
 .sidebar-todos-list::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: color-mix(in srgb, var(--text) 35%, transparent);
   border-radius: 4px;
 }
 
 .sidebar-todos-list::-webkit-scrollbar-thumb:hover {
-  background: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 55%, transparent);
 }
 
 .sidebar-todo-item {
   display: flex;
+  /* داخل کانتینر flex لیست: له نشوند تا واقعاً سرریز کنند و اسکرول‌بار
+     ظاهر شود (flex-shrink پیش‌فرض آیتم‌ها را در ارتفاع ثابت جا می‌کرد). */
+  flex: 0 0 auto;
   gap: 7px;
   align-items: flex-start;
+  padding: 0 10px;
   font-size: 12px;
   color: var(--text-dim);
   line-height: 1.4;
@@ -1443,6 +1481,8 @@ textarea {
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 10px 32px rgba(0, 0, 0, 0.3);
   margin-bottom: 0;
+  /* دستگیره‌های بالا/پایین نیمهٔ بیرونی‌شان بیرون کادر است — کلیپ نشود. */
+  overflow: visible;
 }
 
 .sidebar-panel.todos-float .sidebar-panel-head {
@@ -7828,16 +7868,19 @@ textarea {
   justify-content: center;
 }
 
-/* Container for tool-name pills inside the trace head. Keeps its natural
-   width — any narration caption takes the remaining space — while the
-   time/chevron cluster on the right keeps its natural width. */
+/* Container for tool-name pills inside the trace head. Reserved at least
+   1/3 of the head width for the badges (sized to content when they need
+   more), so they never fight a long caption for space. nowrap + visible
+   overflow: pills stay on ONE row and are never clipped — the caption
+   ellipsizes instead. */
 .trace-head-pills {
   display: flex;
   align-items: center;
   gap: 5px;
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
+  flex: 0 0 auto;
+  min-width: 33.33%;
+  flex-wrap: nowrap;
+  overflow: visible;
 }
 
 /* The model's narration line inside the group head — fills the space after

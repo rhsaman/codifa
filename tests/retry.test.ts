@@ -1,7 +1,7 @@
 // Quick sanity test for the retry decision logic (src/lib/retry.ts).
 // Run: node test/retry.test.ts
 import type { ChatMessage } from '../src/types.ts'
-import { planRetry } from '../src/lib/retry.ts'
+import { planRetry, isKeepTextRetry } from '../src/lib/retry.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -151,6 +151,20 @@ console.log('8) planretry helper: message retry با retry state قدیمی:')
   ]
   const plan = planRetry(msgs, 'u12', 'message')
   check('restart حتی اگر assistant retry نداشته باشه', plan?.action === 'restart', plan)
+}
+
+console.log('9) isKeepTextRetry: کدام رویدادهای retry متن استریم‌شده را نگه می‌دارند:')
+{
+  // reconnecting (ریترای خودکار بک‌اند / خودترمیم کلاینت) → متن بماند
+  check('reconnecting=true → keep', isKeepTextRetry(true, undefined) === true)
+  // fallback (اطلاع‌رسانی ساب‌ایجنت) → متن بماند؛ قبلاً این مسیر متن را پاک می‌کرد
+  check('fallback=true → keep', isKeepTextRetry(undefined, true) === true)
+  // هر دو → keep
+  check('reconnecting+fallback → keep', isKeepTextRetry(true, true) === true)
+  // ری‌استارت کاربر (هیچ‌کدام) → متن پاک شود
+  check('بدون reconnecting/fallback → wipe', isKeepTextRetry(undefined, undefined) === false)
+  check('reconnecting=false → wipe', isKeepTextRetry(false, undefined) === false)
+  check('fallback=false → wipe', isKeepTextRetry(undefined, false) === false)
 }
 
 if (failed > 0) {

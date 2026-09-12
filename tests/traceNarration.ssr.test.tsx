@@ -5,7 +5,9 @@
 //  - باگ «گروه‌های جدا»: در الگوی «caption، ابزار، caption، ابزار» همهٔ
 //    فراخوانی‌ها باید در «یک» گروه واحد بمانند (کپشن‌ها per-call داخل پنل)
 //    و ران به چند گروه/کارت جدا شکسته نشود
-//  - متن بلند/فرمت‌دار → پاراگراف prose معمولی (نه narration)
+//  - باگ «narration بلند ران را می‌شکست»: متنِ بلند/چندخطی بین دو دستهٔ
+//    ابزار هم narration است (سقف ۲۶۰ کاراکتر/۲ خط حذف شد) — ران یکی می‌ماند
+//  - متن حاوی بلوک کد (```) → محتوای واقعی است → prose معمولی (نه narration)
 //  - گروه ۲+ فراخوانی بدون narration → فقط سرِ گروه، بدون ردیف narration
 //  - گروه ۲+ فراخوانی با narration → کپشن داخل خود گروه (در سرِ گروه)، نه
 //    ردیف جدا بیرون آن — رفع نمایش تکراری آخرین کپشن
@@ -78,7 +80,7 @@ console.log('1) narration کوتاه قبل از ابزار تکی → ردیف 
   check('کلاس narrated ادغام‌شده حذف شد', !html.includes('narrated'))
 }
 
-console.log('2) باگ «گروه‌های جدا»: caption، ابزار، caption، ابزار → یک گروه واحد:')
+console.log('2) الگوی واقعی داده‌ها: caption، ابزار، caption، ابزار → یک گروه واحد (کپشن‌ها per-call داخل گروه):')
 {
   const msg = makeMessage(
     [
@@ -90,30 +92,52 @@ console.log('2) باگ «گروه‌های جدا»: caption، ابزار، capt
     ['read', 'read'],
   )
   const html = renderToString(<ChatMessageView message={msg} />)
-  // کل ران باید یک گروه واحد بماند — نه دو گروه/کارت جدا:
-  check('فقط یک گروه رندر شد', (html.match(/tool-group/g) || []).length === 1)
+  // باگ «گروه‌های جدا»: caption بین دو ابزار نباید ران را بشکند — هر دو
+  // فراخوانی در «یک» گروه واحد می‌مانند و هر کپشن به فراخوانی خودش می‌چسبد.
+  check('یک گروه واحد رندر شد', (html.match(/tool-group/g) || []).length === 1)
   check('ردیف narration جدا بیرون گروه ندارد', !html.includes('trace-narration'))
-  // آخرین کپشن باید عنوان سرِ گروه باشد (مثل Claude.ai):
-  check('آخرین کپشن عنوان سرِ گروه است', html.includes('trace-head-caption'))
-  check('متن آخرین کپشن در سرِ گروه', html.includes('حالا فایل دوم را می‌خوانم'))
-  // کپشن اول فقط داخل پنل بازشده رندر می‌شود (گروه در SSR بسته است) —
-  // پس در HTML جمع‌شده نباید دیده شود؛ با باز شدن گروه ظاهر می‌شود.
+  // آخرین کپشن عنوان سرِ گروه است (مثل Claude.ai)؛ کپشن اول فقط داخل پنل
+  // بازشده رندر می‌شود (گروه در SSR بسته است) — با باز شدن گروه ظاهر می‌شود.
   check('کپشن اول فقط در پنل بازشده است', !html.includes('اول فایل اول را می‌خوانم'))
+  check('کپشن دوم عنوان سرِ گروه است', html.includes('حالا فایل دوم را می‌خوانم'))
 }
 
-console.log('3) متن بلند/فرمت‌دار → prose معمولی، نه narration:')
+console.log('3) باگ «narration بلند»: متن بلند/چندخطی بین ابزارها → هنوز یک گروه واحد:')
 {
-  const long = 'این یک متن خیلی طولانی است. '.repeat(20)
+  // متن بلند (بیش از سقف قدیمی ۲۶۰ کاراکتر) + چندخطی بین دو دستهٔ ابزار —
+  // باید narration بماند و ران را نشکند (قبلاً flush می‌شد و گروه جدا می‌افتاد).
+  const long = 'این یک متن روایی خیلی طولانی است که مدل قبل از جست‌وجوی بعدی می‌نویسد. '.repeat(6)
   const msg = makeMessage(
     [
-      { kind: 'text', text: long },
       { kind: 'tool', index: 0 },
+      { kind: 'text', text: long },
+      { kind: 'tool', index: 1 },
     ],
-    ['grep'],
+    ['grep', 'grep'],
   )
   const html = renderToString(<ChatMessageView message={msg} />)
-  check('ردیف narration ندارد', !html.includes('trace-narration'))
+  check('فقط یک گروه رندر شد', (html.match(/tool-group/g) || []).length === 1)
+  check('به‌عنوان prose رندر نشد', !html.includes('markdown-body'))
+  check('کپشن بلند عنوان سرِ گروه است', html.includes('trace-head-caption'))
+  check('متن کپشن بلند نمایش داده شد', html.includes('این یک متن روایی خیلی طولانی'))
+}
+
+console.log('3ب) متن حاوی بلوک کد (```) → محتوای واقعی، نه narration:')
+{
+  // بلوک کد محتوای واقعی است — باید prose بماند و ران را بشکند.
+  const withCode = 'نتیجه این است:\n```js\nconsole.log(1)\n```\nادامه.'
+  const msg = makeMessage(
+    [
+      { kind: 'tool', index: 0 },
+      { kind: 'text', text: withCode },
+      { kind: 'tool', index: 1 },
+    ],
+    ['grep', 'grep'],
+  )
+  const html = renderToString(<ChatMessageView message={msg} />)
   check('به‌عنوان prose رندر شد', html.includes('markdown-body'))
+  // ران می‌شکند: هر ابزار در کارت trace جدا می‌افتد (فراخوانی تکی = ToolSingleRow)
+  check('کد ران را شکست (دو کارت trace جدا)', (html.match(/tool-trace/g) || []).length === 2)
 }
 
 console.log('4) گروه ۲+ ابزار بدون narration → فقط سرِ گروه:')
@@ -205,6 +229,96 @@ console.log('8) مدت زمان: بیش از ۶۰ ثانیه → دقیقه + ث
   const html2 = renderToString(<ChatMessageView message={msg2} />)
   check('۹۰ دقیقه به «90m» تبدیل شد', html2.includes('90m'))
   check('ثانیه‌های خام نمایش داده نشد', !html2.includes('5400s'))
+}
+
+console.log('9) badge تعداد (×N) همیشه کامل رندر می‌شود:')
+{
+  // ۶ فراخوانی grep + کپشن بلند که سرِ گروه را پر می‌کند — badge «×6»
+  // باید کامل در HTML باشد (CSS فقط wrap می‌کند، هرگز clip/truncate نمی‌کند).
+  const msg = makeMessage(
+    [
+      { kind: 'text', text: 'کپشن بلندی که فضای سرِ گروه را می‌گیرد…' },
+      { kind: 'tool', index: 0 },
+      { kind: 'tool', index: 1 },
+      { kind: 'tool', index: 2 },
+      { kind: 'tool', index: 3 },
+      { kind: 'tool', index: 4 },
+      { kind: 'tool', index: 5 },
+    ],
+    ['grep', 'grep', 'grep', 'grep', 'grep', 'grep'],
+  )
+  const html = renderToString(<ChatMessageView message={msg} />)
+  // در SSR ری‌اکت بین «×» و عدد کامنت HTML (<!-- -->) می‌گذارد — الگو باید
+  // هر دو حالت (با/بدون کامنت) را بگیرد تا badge کامل رندر شده باشد.
+  check('badge ×6 رندر شد', /×(?:<!-- -->)?6/.test(html))
+  check('کلاس trace-pill-count حذف نشد', html.includes('trace-pill-count'))
+  check('فقط یک گروه رندر شد', (html.match(/tool-group/g) || []).length === 1)
+}
+
+console.log('10) متن فقط-فاصله بین ابزارها → ران نمی‌شکند و prose خالی رندر نمی‌شود:')
+{
+  // مدل گاهی بین دو فراخوانی پشت‌سرهم فقط «\n\n» می‌فرستد (بدون narration).
+  // قبلاً این متن به‌عنوان prose واقعی flush می‌کرد: ران می‌شکست، کارت trace
+  // بسته می‌شد و یک div خالی هم رندر می‌شد — شکستن نامرئی گروه‌ها. حالا
+  // باید کامل نادیده گرفته شود.
+  const msg = makeMessage(
+    [
+      { kind: 'tool', index: 0 },
+      { kind: 'text', text: '\n\n' },
+      { kind: 'tool', index: 1 },
+      { kind: 'text', text: '   \n\t ' },
+      { kind: 'tool', index: 2 },
+    ],
+    ['read', 'read', 'read'],
+  )
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('یک گروه واحد رندر شد', (html.match(/tool-group/g) || []).length === 1)
+  check('سه فراخوانی ادغام شدند (×3)', /×(?:<!-- -->)?3/.test(html))
+  check('prose خالی رندر نشد', !html.includes('markdown-body'))
+  check('فقط یک کارت trace دارد', (html.match(/tool-trace/g) || []).length === 1)
+}
+
+console.log('11) سناریوی عکس ۱: caption/فقط-فاصله بین ابزارها → ۳تای بالا یک گروه؛ prose واقعی → ۲تای پایین یک گروه:')
+{
+  const msg = makeMessage(
+    [
+      { kind: 'text', text: 'بذار ببینم فایل اول کجاست…' },
+      { kind: 'tool', index: 0 },
+      { kind: 'text', text: '\n\n' },
+      { kind: 'tool', index: 1 },
+      { kind: 'text', text: 'حالا سومی را می‌خوانم' },
+      { kind: 'tool', index: 2 },
+      { kind: 'text', text: 'نتیجهٔ بررسی:\n```\nconst x = 1\n```\nادامهٔ تحلیل' },
+      { kind: 'tool', index: 3 },
+      { kind: 'text', text: '  \n ' },
+      { kind: 'tool', index: 4 },
+    ],
+    ['read', 'read', 'read', 'read', 'read'],
+  )
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('دو گروه رندر شد (۳تایی و ۲تایی)', (html.match(/tool-group/g) || []).length === 2)
+  check('گروه اول ×3 دارد', /×(?:<!-- -->)?3/.test(html))
+  check('گروه دوم ×2 دارد', /×(?:<!-- -->)?2/.test(html))
+  check('prose واقعی (بلوک کد) رندر شد', html.includes('markdown-body'))
+}
+
+console.log('12) سناریوی عکس ۲: دو دسته ابزار با فقط-فاصله بین‌شان → یک گروه واحد، نه دو کارت پشت‌سرهم:')
+{
+  const msg = makeMessage(
+    [
+      { kind: 'tool', index: 0 },
+      { kind: 'tool', index: 1 },
+      { kind: 'tool', index: 2 },
+      { kind: 'text', text: '\n\n' },
+      { kind: 'tool', index: 3 },
+      { kind: 'tool', index: 4 },
+    ],
+    ['read', 'run_terminal', 'read', 'run_terminal', 'read'],
+  )
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('یک گروه واحد رندر شد', (html.match(/tool-group/g) || []).length === 1)
+  check('pill های read ×3 و Ran a command ×2 هر دو دارد', /×(?:<!-- -->)?3/.test(html) && /×(?:<!-- -->)?2/.test(html))
+  check('کارت trace دومی وجود ندارد', (html.match(/tool-trace/g) || []).length === 1)
 }
 
 if (failed > 0) {

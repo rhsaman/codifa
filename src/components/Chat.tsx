@@ -10,7 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { resetStreamForRetry } from "../lib/retry";
+import { resetStreamForRetry, isKeepTextRetry } from "../lib/retry";
 import {
   applyToolEvent,
   makeToolActivity,
@@ -1617,6 +1617,26 @@ export function ChatPanel() {
         store.chats
           .find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
+      // A transient retry banner ("Provider hiccup — retrying…") must retire
+      // as soon as the turn shows ANY activity — not only text. After a
+      // successful retry the model often resumes straight into a tool loop
+      // (deduped tool cards, sub-agent events, tool_result / diff updates)
+      // and may not emit text for minutes; without this the banner stayed
+      // frozen at "retrying…" the whole time while cards kept streaming.
+      // Terminal banners (gaveUp / watchdog) and the sub-agent fallback
+      // notice survive: they carry the Retry button / the "which model to
+      // fix" hint.
+      const clearTransientRetry = () => {
+        const r = findMsg()?.retry;
+        if (
+          !r ||
+          r.gaveUp === true ||
+          r.watchdog === true ||
+          r.fallback === true
+        )
+          return;
+        store.updateMessage(assistantMsg.id, { retry: null });
+      };
       if (event.kind === "text") {
         // Keep the current "isThinking" flag untouched — a text chunk must not
         // cancel the composer glow while the model is still reasoning.
@@ -1690,6 +1710,7 @@ export function ChatPanel() {
         }
       } else if (event.kind === "tool") {
         bumpToolRunning(toolRunningRef);
+        clearTransientRetry();
         // A create_mcp call this turn means the connector list in the store is
         // stale — flag it so the `done` handler re-fetches from the sidecar.
         if (event.tool === "create_mcp") mcpChangedRef.current = true;
@@ -1742,12 +1763,13 @@ export function ChatPanel() {
           reconnecting: event.reconnecting,
           startedAt: Date.now(),
         };
-        if (event.reconnecting) {
-          // Backend automatic retry (or client self-heal): keep the
-          // already-streamed text and segments — do NOT reset the message.
-          // Show the retry banner so the user knows a retry is in progress;
-          // once the model resumes (thinking / text / tool events), the
-          // banner is cleared automatically via retry:null in those handlers.
+        if (isKeepTextRetry(event.reconnecting, event.fallback)) {
+          // Backend automatic retry, client self-heal reconnect, OR a
+          // sub-agent fallback notice: keep the already-streamed text and
+          // segments — do NOT reset the message. The banner is informational
+          // (the turn is still alive); once the model resumes (thinking /
+          // text / tool events), the banner is cleared automatically via
+          // retry:null in those handlers.
           resolveStuckCards();
           store.updateMessage(assistantMsg.id, { retry: info });
         } else {
@@ -1785,6 +1807,7 @@ export function ChatPanel() {
         });
       } else if (event.kind === "tool_result") {
         dropToolRunning(toolRunningRef);
+        clearTransientRetry();
         // `resolveToolResult` resolves sub-agent results by branch/call_id even
         // when the parent branch card (or its nested child) is already "done",
         // so late sub-results are never dropped.
@@ -1799,6 +1822,7 @@ export function ChatPanel() {
           void ensureSkills();
         }
       } else if (event.kind === "diff") {
+        clearTransientRetry();
         const current = findMsg()?.toolActivity ?? [];
         const next = current.map((a) => {
           if (a.tool === event.tool && a.status === "running") {

@@ -15,7 +15,12 @@ interface TodoPanelUi {
   right?: number;
   y?: number;
   collapsed?: boolean;
+  /** ارتفاع قدیمی (قبل از per-chat) — فقط به‌عنوان fallback چت‌های
+   *  بدون ارتفاع ذخیره‌شده استفاده می‌شود. */
   height?: number;
+  /** ارتفاع‌های صریحِ ریسایزشده به‌ازای هر چت — کلید = chatId؛ چت بدون
+   *  رکورد پیش‌فرضِ بر اساس تعداد todo می‌گیرد. */
+  heights?: Record<string, number>;
 }
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -72,10 +77,43 @@ export function clampPos(right: number, y: number, vw: number, vh: number) {
   };
 }
 
+/** ارتفاع پیش‌فرض لیست بر اساس تعداد todoها: هر آیتم ~۱۷px (فونت ۱۲ با
+ *  line-height 1.4) + گپ ۵px + پدینگ پایین لیست — تا همهٔ آیتم‌ها بدون
+ *  اسکرول جا شوند. خالص (pure) تا تست بتواند مستقیم صدا بزند. */
+export function defaultHeightFor(count: number): number {
+  return Math.max(60, Math.min(760, Math.round(count * 22 + 6)));
+}
+
+/** ادغام ارتفاع جدید یک چت در نقشهٔ heights بدون از دست دادن ارتفاع
+ *  چت‌های دیگر. خالص (pure) تا تست بتواند مستقیم صدا بزند. */
+export function withChatHeight(
+  heights: Record<string, number> | undefined,
+  chatId: string,
+  height: number,
+): Record<string, number> {
+  return chatId ? { ...heights, [chatId]: height } : { ...heights };
+}
+
+/** ارتفاع مؤثر یک چت: اول ارتفاع صریحِ ریسایزشدهٔ همان چت، بعد ارتفاع قدیمی
+ *  عمومی (fallback ذخیره‌های قدیمی) و در نهایت پیش‌فرض بر اساس تعداد todoها.
+ *  خالص (pure) تا تست بتواند مستقیم صدا بزند. */
+export function heightForChat(
+  heights: Record<string, number> | undefined,
+  legacyHeight: number | undefined,
+  chatId: string,
+  todoCount: number,
+): number {
+  return heights?.[chatId] ?? legacyHeight ?? defaultHeightFor(todoCount);
+}
+
 export function TodosPanel() {
   const chats = useStore((s) => s.chats);
   const activeChatId = useStore((s) => s.activeChatId);
   const dir = useStore((s) => s.dir);
+
+  const todos = latestTodos(
+    chats.find((c) => c.id === activeChatId)?.messages ?? [],
+  );
 
   const [ui] = useState(loadTodoPanelUi);
   // جای پیش‌فرض: گوشهٔ بالا-راست، زیر نوار عنوان (titlebar ۳۸px + ۸px حاشیه).
@@ -84,9 +122,15 @@ export function TodosPanel() {
     y: ui.y ?? 46,
   }));
   const [collapsed, setCollapsed] = useState(ui.collapsed ?? false);
-  // پیش‌فرض ۱۵۰px — ارتفاع ۳۲۰ (پیش‌فرض قدیمی) در loadTodoPanelUi ریست
-  // می‌شود؛ انتخاب‌های عمدی کاربر (تا ۷۶۰) دست نمی‌خورند.
-  const [height, setHeight] = useState(ui.height ?? 150);
+  const chatId = activeChatId || "";
+  // ارتفاع‌های صریحِ ریسایزشدهٔ هر چت (کلید = chatId). ارتفاع مؤثر از همین
+  // نقشه derive می‌شود: چتِ ریسایزشده مقدار خودش را نگه می‌دارد (سوییچ
+  // چت همان مقدار برمی‌گردد) و چتِ بدون ریسایز زنده با تعداد todoهایش
+  // بزرگ/کوچک می‌شود.
+  const [heights, setHeights] = useState<Record<string, number>>(
+    ui.heights ?? {},
+  );
+  const height = heightForChat(heights, ui.height, chatId, todos.length);
 
   // ذخیره با debounce (درگ هر فریم state عوض می‌کند؛ نوشتن localStorage در
   // هر فریم درگ را می‌لرزاند) + flush هم‌زمان روی بستن اپ — همان الگوی
@@ -99,7 +143,11 @@ export function TodosPanel() {
           right: pos.right,
           y: pos.y,
           collapsed,
-          height,
+          // ارتفاع قدیمی فقط pass-through می‌شود (fallback ذخیره‌های قدیمی)؛
+          // ارتفاع‌های صریح فقط از ریسایز می‌آیند — چت‌های بدون ریسایز روی
+          // پیش‌فرضِ بر اساس تعداد todo می‌مانند.
+          height: ui.height,
+          heights,
         }),
       );
     } catch {
@@ -109,7 +157,7 @@ export function TodosPanel() {
   useEffect(() => {
     const t = setTimeout(persist, 250);
     return () => clearTimeout(t);
-  }, [pos, collapsed, height]);
+  }, [pos, collapsed, heights]);
   useEffect(() => {
     window.addEventListener("coder:flush-ui", persist);
     window.addEventListener("beforeunload", persist);
@@ -119,7 +167,7 @@ export function TodosPanel() {
       window.removeEventListener("beforeunload", persist);
       window.removeEventListener("pagehide", persist);
     };
-  }, [pos, collapsed, height]);
+  }, [pos, collapsed, heights]);
 
   // ریسپانسیو: چون لنگر «راست/بالا» است، فاصله از لبه‌ها با تغییر اندازهٔ
   // پنجره خودکار حفظ می‌شود؛ فقط اگر پنل بیرون از viewport بیفتد (مثلاً
@@ -134,10 +182,6 @@ export function TodosPanel() {
     window.addEventListener("resize", clamp);
     return () => window.removeEventListener("resize", clamp);
   }, []);
-
-  const todos = latestTodos(
-    chats.find((c) => c.id === activeChatId)?.messages ?? [],
-  );
 
   // درگ هدر برای جابه‌جایی پنل. کلیکِ بدون حرکت همچنان collapse را toggle
   // می‌کند — با پرچم suppressClick بعد از درگ واقعی، click دور می‌شود.
@@ -204,7 +248,7 @@ export function TodosPanel() {
       if (!drag) return;
       const dy = ev.clientY - drag.startY;
       const h = Math.max(60, Math.min(760, drag.startH - dy));
-      setHeight(h);
+      setHeights((prev) => withChatHeight(prev, chatId, h));
       setPos((p) => ({
         ...p,
         y: Math.max(8, drag.panelY + (drag.startH - h)),
@@ -212,6 +256,24 @@ export function TodosPanel() {
     };
     const onUp = () => {
       heightDrag.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // هندل پایین بدنه: کشیدن به پایین = بزرگ‌شدن از پایین (y ثابت می‌ماند).
+  const startBottomResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = height;
+    const onMove = (ev: MouseEvent) => {
+      const dy = ev.clientY - startY;
+      const h = Math.max(60, Math.min(760, startH + dy));
+      setHeights((prev) => withChatHeight(prev, chatId, h));
+    };
+    const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -247,6 +309,9 @@ export function TodosPanel() {
       </div>
       {!collapsed && (
         <>
+          {/* دستگیرهٔ بالا: با position:absolute روی لبهٔ بالای کادر
+              (روی هدر) — کشیدن به بالا بزرگ می‌کند (y هم‌زمان جابه‌جا
+              می‌شود). */}
           <div
             className="sidebar-panel-resize"
             title="Drag down to shrink from the top, up to grow"
@@ -273,6 +338,13 @@ export function TodosPanel() {
               </li>
             ))}
           </ul>
+          {/* دستگیرهٔ پایین: روی لبهٔ پایین باکس (بعد از لیست) — کشیدن
+              به پایین بزرگ می‌کند. */}
+          <div
+            className="sidebar-panel-resize bottom"
+            title="Drag down to grow, up to shrink from the bottom"
+            onMouseDown={startBottomResize}
+          />
         </>
       )}
     </div>,

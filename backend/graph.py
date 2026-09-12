@@ -2468,10 +2468,16 @@ async def _run_mode_turn(
             # frontend history, or we'd duplicate the prompt.
             state["history"] = []
 
-    _astream_count = 0
+    # Number of agent steps that completed successfully (the model responded)
+    # across ALL retry attempts of this turn. The retry wrapper compares it
+    # against its last-seen value to detect PROGRESS: an attempt that advanced
+    # the turn before failing resets the consecutive-failure counter, so the
+    # retry banner counts fresh attempts after each successful connection
+    # instead of climbing 6/10 → 7/10 across unrelated failures.
+    _step_progress = 0
 
     async def _inner() -> str:
-        nonlocal model
+        nonlocal model, _step_progress
         # NOTE: `msgs` aliases the OUTER `messages` list so completed tool work
         # (tool calls + their results) survives a retry. On a transient throttle
         # we re-run the loop from the SAME accumulated transcript -- the model
@@ -3154,6 +3160,10 @@ async def _run_mode_turn(
                     last_context_tokens=state.get("last_context_tokens"),
                     compact_at_percent=state.get("compact_at_percent", 80),
                 )
+            # This step completed (the model responded and any tool calls
+            # ran) — record the progress so the retry wrapper can tell a
+            # mid-work failure from an idle one.
+            _step_progress += 1
         return reply
 
     # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
@@ -3169,6 +3179,13 @@ async def _run_mode_turn(
         return mode if mode in ("explore", "general") else ""
 
     reply = ""
+    # Whole-turn wall: counts IDLE failures only (attempts that made no
+    # progress since the previous failure). A productive failure — the model
+    # connected and completed real steps before dying — restarts the
+    # consecutive counter instead and does NOT burn this wall, because real
+    # work was done. Idle spinning against a dead provider still gives up
+    # after _RETRY_MAX_ATTEMPTS, so the loop can't retry forever.
+    _total_failures = 0
     # Log every attempt start so the user can verify from the sidecar log
     # that retries are actually firing. The renderer-side Network tab CAN'T
     # see these requests: they originate from the Python sidecar subprocess
@@ -3203,6 +3220,17 @@ async def _run_mode_turn(
                         with contextlib.suppress(Exception):
                             run_flags["cancelled"] = True
                     break
+                # Progress-aware retry reset: if the failed attempt actually
+                # advanced the turn (the model connected and completed steps
+                # before the error), THIS failure counts as 1 of a fresh
+                # consecutive cycle — the user sees "retrying 1/10", not
+                # "7/10" for an unrelated later blip — and does not burn the
+                # idle-failure wall, because real work was done.
+                if _step_progress > 0:
+                    _step_progress = 0
+                    attempt = 1
+                else:
+                    _total_failures += 1
                 # Context overflow: the transcript exceeds the provider's window.
                 # Compact the history and retry immediately (no blind backoff).
                 if _agents._is_context_overflow(exc):
@@ -3260,8 +3288,13 @@ async def _run_mode_turn(
                         except Exception:  # noqa: BLE001, S110
                             pass
                     break
-                # Transient failure: retry up to the budget, 30s apart.
-                if attempt >= _agents._RETRY_MAX_ATTEMPTS:
+                # Transient failure: retry up to the budget, 30s apart. The
+                # give-up fires when EITHER the consecutive-failure budget is
+                # exhausted OR the whole-turn failure wall is hit.
+                if (
+                    attempt >= _agents._RETRY_MAX_ATTEMPTS
+                    or _total_failures >= _agents._RETRY_MAX_ATTEMPTS
+                ):
                     # Budget exhausted — surface the error to the user.
                     # Surface the exhausted retry in codifa.log (not just as an SSE
                     # event) so a cut-off turn is diagnosable without scraping the

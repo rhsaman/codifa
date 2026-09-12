@@ -1045,16 +1045,18 @@ function SummaryBlock({ message }: { message: ChatMessage }) {
 }
 
 /** A text segment counts as a "caption" (narration the model wrote right
- *  before a tool call, e.g. "بذار ببینم X رو...") rather than a real prose
- *  answer if it's short, single-paragraph, and has no rich formatting the
- *  final answer would typically use. Longer/formatted text always renders as
- *  its own markdown block. */
+ *  before a tool call, e.g. "بذار ببینم X رو...") rather than real answer
+ *  prose. Any text immediately preceding a groupable tool call is narration —
+ *  length, line count and headings do NOT disqualify it (the old 260-char /
+ *  2-line cap split one logical run into several floating groups whenever a
+ *  narration ran long — the "چند تا tool group پشت هم" bug). The ONE
+ *  exception: fenced code blocks — those are real content the model is
+ *  showing off, never a "let me check X" line, and rendering them as a raw
+ *  narration row would lose all formatting. */
 function isCaptionCandidate(text: string): boolean {
   const t = text.trim();
-  if (!t || t.length > 260) return false;
+  if (!t) return false;
   if (t.includes("```")) return false;
-  if (/^#{1,6}\s/m.test(t)) return false;
-  if ((t.match(/\n/g) || []).length > 2) return false;
   return true;
 }
 
@@ -1203,6 +1205,15 @@ function renderSegments(
       return;
     }
     if (seg.kind === "text") {
+      // Whitespace-only text (the model often emits a bare "\n\n" between two
+      // tool calls, with no narration around it): pure formatting noise.
+      // Falling through to the prose branch would flush the accumulating run
+      // and close the trace card — the invisible break that split one logical
+      // run into several back-to-back group cards with nothing rendered
+      // between them. Skip it: the run keeps accumulating as if it never
+      // existed.
+      if (!seg.text.trim()) return;
+
       // Does this text immediately precede a groupable (non-always-visible)
       // tool call? If so, it's the model's narration for that call: render it
       // as its own row INSIDE the trace card, right above the call(s) — not a
@@ -1218,10 +1229,10 @@ function renderSegments(
         !isExploreCard(nextActivity);
 
       if (nextIsGroupable && isCaptionCandidate(seg.text)) {
-        // Hold back as the caption for the call(s) that follow. Do NOT
-        // flush here: a narration BETWEEN two calls (caption, tool,
+        // A narration BEFORE a groupable tool: it belongs to the NEXT call.
+        // Do NOT flush here — a narration BETWEEN two calls (caption, tool,
         // caption, tool) must attach to its own call while the run keeps
-        // accumulating — flushing would split one logical run into several
+        // accumulating; flushing would split one logical run into several
         // floating groups (the "groups came out separate" bug).
         pendingCaption = seg.text;
         return;

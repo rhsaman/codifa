@@ -74,3 +74,22 @@ export function resetStreamForRetry(
   const kept = (segments ?? []).filter((s) => s.kind !== 'text')
   return { content: '', segments: kept }
 }
+
+/**
+ * آیا رویداد retry باید متنِ استریم‌شده را پاک کند؟
+ *
+ * رویدادهای retry دو خانواده دارند:
+ *  - «قطع و ازسرگیری» (reconnecting / fallback): پیامِ در حال استریم باید
+ *    دست‌نخورده بماند — فقط بنر اطلاع‌رسانی روی آن می‌نشیند. پاک‌کردن متن
+ *    در این خانواده باعث «ناپدید شدن پاسخ در حالی که ایجنت مشغول کار است»
+ *    می‌شود (باگ گزارش‌شده: هم استریم می‌آمد هم بنر خطا).
+ *  - «ری‌استارت کاربر» (بدون هیچ‌کدام): تلاش جدید از صفر جواب خودش را
+ *    استریم می‌کند، پس متن قدیمی باید پاک شود.
+ *
+ * `fallback` رویدادی صرفاً اطلاع‌رسانی است: مدل ساب‌ایجنت (explore/web)
+ * هارد-فیل شد و همان فراخوانی روی مدل اصلی اجرا شد — استریمِ در جریانِ
+ * پیام دستیار نباید پاک شود.
+ */
+export function isKeepTextRetry(reconnecting: boolean | undefined, fallback: boolean | undefined): boolean {
+  return reconnecting === true || fallback === true
+}

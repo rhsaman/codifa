@@ -289,6 +289,59 @@ async def test_retry_gives_up_at_max_attempts(run_events, monkeypatch):
     assert errors == [], f"retry_giveup should not be paired with an error event: {errors}"
 
 
+async def test_retry_counter_resets_after_progress(run_events, monkeypatch):
+    """وقتی یک attempt قبل از خطا پیشرفت داشته باشد (مدل وصل شده و step کامل
+    کرده)، خطای transient بعدی باید شمارنده را از ۱ بشمارد — نه ادامه‌ی شمارنده‌ی
+    قبلی (مثلاً ۷/۱۰). سناریوی کاربر: استپ ۶ ریترای می‌شود، وصل می‌شود و کار
+    می‌کند؛ دفعهٔ بعد که خطا می‌دهد باید «۱/۱۰» ببیند چون قبلاً success شده.
+
+    سقف کلی (`_total_failures` — فقط شکست‌های idle را می‌شمارد) هم تضمین
+    می‌کند که ریست‌شدن شمارنده، بودجهٔ کل turn را بی‌نهایت نکند: با ۲ خطای
+    idle اول + ۱ پیشرفت + ۱ خطای دارای پیشرفت (شمارنده از ۱) + ۱ خطای idle
+    (سومین idle → دیوار پر می‌شود)، turn باید با giveup تمام شود."""
+    monkeypatch.setattr(agents, "_RETRY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
+    mock.script = [
+        tool_call("write_file", json.dumps({"path": "a.py", "content": "x"})),
+        text_reply("Done"),
+    ]
+    # Request 0: 429 (idle — no progress). Request 1: 429 (idle — no progress).
+    # Request 2: SUCCESS — the model issues a tool call (progress!).
+    # Request 3: 429 AFTER progress → the counter must restart from 1.
+    # Request 4: 429 again (idle — the progress was consumed by request 3's
+    # reset) → this is the 3rd IDLE failure → the whole-turn wall (3) is hit
+    # → giveup instead of another retry event.
+    mock.error_at = {
+        0: (429, "Rate limit exceeded."),
+        1: (429, "Rate limit exceeded."),
+        3: (429, "Rate limit exceeded."),
+        4: (429, "Rate limit exceeded."),
+    }
+
+    events = await run_events("create a.py", mode="coder")
+
+    retries = _retry_events(events)
+    giveups = [e for e in events if e.get("kind") == "retry_giveup"]
+    assert len(giveups) == 1, (
+        f"expected exactly one retry_giveup, got {len(giveups)} (retries={retries})"
+    )
+    # Retry events: two idle failures (attempt 1, 2), then after the
+    # successful tool-call attempt the counter RESETS — the post-progress
+    # failure reports attempt 1 again. The 4th failure is idle and hits the
+    # whole-turn wall, so it gives up instead of emitting "2/3".
+    attempts = [r.get("attempt", 0) for r in retries]
+    assert attempts == [1, 2, 1], (
+        f"counter must reset to 1 after a progress attempt, got {attempts}"
+    )
+    # The give-up fires via the whole-turn idle-failure wall. Its `attempt`
+    # is the CONSECUTIVE counter (which was reset to 1 after the progress
+    # attempt), so it can legitimately be below MAX here — the important
+    # contract is that the give-up happened and reports the budget size.
+    g = giveups[0]
+    assert g.get("attempt", 0) >= 1, g
+    assert g.get("max_attempts") == agents._RETRY_MAX_ATTEMPTS, g
+
+
 def test_free_usage_limit_is_transient_not_quota():
     """A free-tier gateway's ``FreeUsageLimitError`` carrying a "Rate limit
     exceeded. Please try again later." message is a BRIEF 429 throttle, not a

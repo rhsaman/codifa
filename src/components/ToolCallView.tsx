@@ -640,9 +640,13 @@ export const ToolGroupView = memo(function ToolGroupView({
   // Always show tool names + counts as the main status text. The narration
   // line (if any) rides along as the caption — always in the head, plus the
   // first row of the expanded panel (see renderSegments in ChatMessage.tsx).
-  // Build per-tool pills: [{tool: "read", count: 3}, ...]
+  // Build per-LABEL pills (not per-tool): grep and glob share the label
+  // "Search Files", so counting by raw tool name produced TWO identical
+  // "Search Files" pills side by side (one with ×N, one without) instead of
+  // a single merged "Search Files ×N".
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
-    acc[a.activity.tool] = (acc[a.activity.tool] || 0) + 1;
+    const label = TOOL_LABEL[a.activity.tool] ?? a.activity.tool;
+    acc[label] = (acc[label] || 0) + 1;
     return acc;
   }, {});
   // The head shows the LAST narration (Claude.ai's collapsed summary title).
@@ -664,9 +668,9 @@ export const ToolGroupView = memo(function ToolGroupView({
       >
         <IconSparkle className="trace-sparkle" />
         <span className="trace-head-pills">
-          {Object.entries(toolCounts).map(([tool, n]) => (
-            <span key={tool} className="trace-pill">
-              {TOOL_LABEL[tool] ?? tool}
+          {Object.entries(toolCounts).map(([label, n]) => (
+            <span key={label} className="trace-pill">
+              {label}
               {n > 1 && <span className="trace-pill-count">×{n}</span>}
             </span>
           ))}

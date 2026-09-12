@@ -1,50 +1,47 @@
-import { useState, type MouseEvent } from "react";
+import type { MouseEvent } from "react";
 import type { ProviderConfig } from "../types";
-import { testModel } from "../lib/api";
+import { useModelTests } from "../lib/useModelTests";
 
-/** دکمهٔ تست کنار هر مدل: یک تکمیل کوچک می‌فرستد و نتیجه را نشان می‌دهد.
- *  idle (رعد SVG) → testing (…) → ok (✓ سبز) / fail (✕ قرمز + tooltip خطا).
- *  فقط با کلیک کاربر فایر می‌شود — پاپ‌آپ هنگام باز شدن هیچ درخواستی نمی‌زند.
- *  آیکون رعد عمداً SVG است: کاراکتر ⚡ در macOS به‌صورت ایموجی زرد رندر می‌شود
- *  و color در CSS را نادیده می‌گیرد؛ SVG با currentColor همیشه رنگ CSS (سفید) را می‌گیرد. */
+/** آیکون رعد مشترک بین دکمهٔ تست تکی مدل و دکمهٔ تست پروایدر. عمداً SVG
+ *  است: کاراکتر ⚡ در macOS به‌صورت ایموجی زرد رندر می‌شود و color در CSS
+ *  را نادیده می‌گیرد؛ SVG با currentColor همیشه رنگ CSS (سفید) را می‌گیرد. */
+export function TestBoltIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg
+      className="pm-test-bolt"
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z" />
+    </svg>
+  );
+}
+
+/** دکمهٔ تست کنار هر مدل — کنترل‌شده از استور مشترک useModelTests تا
+ *  «تست همهٔ مدل‌های پروایدر» بتواند همین دکمه را هم پیش ببرد.
+ *  idle (رعد) → testing (…) → ok (✓ سبز) / fail (✕ قرمز + tooltip خطا).
+ *  فقط با کلیک کاربر فایر می‌شود — پاپ‌آپ هنگام باز شدن هیچ درخواستی نمی‌زند. */
 export function ModelTestButton({ cfg, model }: { cfg: ProviderConfig; model: string }) {
-  const [state, setState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
-  const [msg, setMsg] = useState("");
-  const run = async (e: MouseEvent) => {
+  const { getStatus, run } = useModelTests();
+  const st = getStatus(cfg, model);
+  const onClick = (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
-    if (state === "testing") return;
-    setState("testing");
-    setMsg("");
-    try {
-      const r = await testModel(cfg, model);
-      setState("ok");
-      setMsg(r.reply ? `OK — ${r.reply}` : "OK");
-    } catch (err) {
-      setState("fail");
-      setMsg(err instanceof Error ? err.message : String(err));
-    }
+    if (st.status === "testing") return;
+    run(cfg, model);
   };
   return (
     <button
       type="button"
-      className={`pm-model-test ${state}`}
-      onClick={run}
-      title={msg || `Test ${model}`}
+      className={`pm-model-test ${st.status}`}
+      onClick={onClick}
+      title={st.msg || `Test ${model}`}
       aria-label={`Test ${model}`}
     >
-      {state === "testing" ? "…" : state === "ok" ? "✓" : state === "fail" ? "✕" : (
-        <svg
-          className="pm-test-bolt"
-          viewBox="0 0 24 24"
-          width="12"
-          height="12"
-          fill="currentColor"
-          aria-hidden="true"
-        >
-          <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z" />
-        </svg>
-      )}
+      {st.status === "testing" ? "…" : st.status === "ok" ? "✓" : st.status === "fail" ? "✕" : <TestBoltIcon />}
     </button>
   );
 }

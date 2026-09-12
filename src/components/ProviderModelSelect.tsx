@@ -3,6 +3,7 @@ import type { ProviderConfig } from "../types";
 import { useStore } from "../lib/store";
 import { PROVIDER_META, isForeignModelId } from "../lib/provider-meta";
 import { ModelTestButton } from "./ModelTestButton";
+import { ProviderTestButton } from "./ProviderTestButton";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
@@ -241,15 +242,18 @@ export function ProviderModelSelect() {
               const isOpen = searching || expanded.has(p.id);
               return (
                 <div key={p.id} className={`pm-provider${isOpen ? " open" : ""}`}>
-                  <button
-                    type="button"
-                    className={`pm-provider-name ${p.id === activeProviderId ? "active" : ""}`}
-                    onClick={() => toggle(p.id)}
-                  >
-                    <span className="pm-provider-caret">{isOpen ? "▾" : "▸"}</span>
-                    <span className="pm-provider-label">{p.name}</span>
-                    <span className="pm-provider-count">{allModels(p).length}</span>
-                  </button>
+                  <div className="pm-provider-row">
+                    <button
+                      type="button"
+                      className={`pm-provider-name ${p.id === activeProviderId ? "active" : ""}`}
+                      onClick={() => toggle(p.id)}
+                    >
+                      <span className="pm-provider-caret">{isOpen ? "▾" : "▸"}</span>
+                      <span className="pm-provider-label">{p.name}</span>
+                      <span className="pm-provider-count">{allModels(p).length}</span>
+                    </button>
+                    <ProviderTestButton cfg={p} models={models} />
+                  </div>
                   {isOpen && (
                     <div className="pm-models">
                       {models.map((m) => {

@@ -10,6 +10,7 @@ import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { ModelTestButton } from './ModelTestButton'
+import { ProviderTestButton } from './ProviderTestButton'
 import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
 
@@ -237,16 +238,19 @@ function ToolModelSelect({
                 const isOpen = q ? true : expanded.has(p.id)
                 return (
                   <div key={p.id} className={`pm-provider${isOpen ? ' open' : ''}`}>
-                    <button
-                      type="button"
-                      className="pm-provider-name"
-                      onClick={() => toggle(p.id)}
-                    >
-                      <span className="pm-provider-caret">{isOpen ? '▾' : '▸'}</span>
-                      <span className="pm-provider-dot" aria-hidden />
-                      <span className="pm-provider-label">{p.name}</span>
-                      <span className="pm-provider-count">{modelsFor(p).length}</span>
-                    </button>
+                    <div className="pm-provider-row">
+                      <button
+                        type="button"
+                        className="pm-provider-name"
+                        onClick={() => toggle(p.id)}
+                      >
+                        <span className="pm-provider-caret">{isOpen ? '▾' : '▸'}</span>
+                        <span className="pm-provider-dot" aria-hidden />
+                        <span className="pm-provider-label">{p.name}</span>
+                        <span className="pm-provider-count">{modelsFor(p).length}</span>
+                      </button>
+                      <ProviderTestButton cfg={p} models={models} />
+                    </div>
                     {isOpen && (
                       <div className="pm-models">
                         {models.map((m) => {

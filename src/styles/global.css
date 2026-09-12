@@ -3843,7 +3843,8 @@ textarea {
 }
 
 .pm-provider-name {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3855,6 +3856,17 @@ textarea {
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
+}
+
+/* سربرگ هر پروایدر: دکمهٔ باز/بسته + دکمهٔ «تست همهٔ مدل‌ها» کنار هم. */
+.pm-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pm-provider-row .pm-provider-name {
+  width: auto;
 }
 
 .pm-provider-caret {
@@ -3889,6 +3901,43 @@ textarea {
 .pm-provider-name:hover,
 .pm-provider-name.active {
   color: var(--accent);
+}
+
+/* دکمهٔ «تست همهٔ مدل‌های پروایدر» — همان زبان بصری دکمهٔ تست تکی
+ *  (ghost، فقط رنگ) اما کمی بزرگ‌تر چون در سربرگ پروایدر می‌نشیند. */
+.pm-provider-test {
+  flex: 0 0 auto;
+  margin-right: 8px;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color 0.12s;
+}
+
+.pm-provider-test:hover {
+  color: var(--accent);
+}
+
+.pm-provider-test.testing {
+  color: var(--accent);
+  animation: pm-test-pulse 1s ease-in-out infinite;
+}
+
+.pm-provider-test.ok {
+  color: var(--success);
+}
+
+.pm-provider-test.fail {
+  color: var(--danger);
 }
 
 .pm-models {

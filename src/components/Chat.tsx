@@ -507,6 +507,7 @@ export function ChatPanel() {
   const compactError = chat?.compactError ?? null;
   const compacting = chat?.compacting ?? false;
   const cmdError = chat?.cmdError ?? null;
+  const skillNotice = chat?.skillNotice ?? null;
   const stalled = chat?.stalled ?? false;
   /** The Ctrl+X prefix is app-wide (managed in App.tsx), so its hint lives at
    *  the store root — it survives chat switches too. */
@@ -1368,6 +1369,9 @@ export function ChatPanel() {
       if (m.retry) s.updateMessage(m.id, { retry: null });
       if (m.streaming) s.updateMessage(m.id, { streaming: false });
     }
+    // A skill warning from the previous turn (e.g. an @mention that resolved to
+    // nothing) is stale by now — the new turn re-resolves its own mentions.
+    if (chat.skillNotice) s.setChatSkillNotice(chat.id, null);
 
     const allHistory = chat.messages
       .filter(
@@ -1663,10 +1667,17 @@ export function ChatPanel() {
           retry: null,
         });
       } else if (event.kind === "skill") {
-        // Deliberately NOT rendered into the chat — the user asked for the
-        // "Attached skills" / MCP notes to stay out of the transcript. The
-        // attached skills are still inlined in the system prompt, so the
-        // model follows them; only the visible note is dropped.
+        // Successful @mention attachments are deliberately NOT rendered into
+        // the chat — the user asked for the "Attached skills" notes to stay out
+        // of the transcript. The attached skills are still inlined in the
+        // system prompt, so the model follows them; only the visible note is
+        // dropped. The `note` field is different: it warns that an attached
+        // skill was NOT found (deleted/renamed) — without it the user never
+        // learns why the skill silently didn't apply. Stored per-chat (like
+        // compactNotice) so it survives a chat switch mid-turn.
+        if (event.note) {
+          useStore.getState().setChatSkillNotice(chat.id, event.note);
+        }
       } else if (event.kind === "mcp") {
         // Deliberately NOT rendered into the chat (same reason as "skill"
         // above): the active MCP servers are already listed in the prompt's
@@ -3558,6 +3569,7 @@ export function ChatPanel() {
           {(cmdError ||
             compactError ||
             compactNotice ||
+            skillNotice ||
             prefixNotice ||
             compacting) && (
               <div className="chat-notices">
@@ -3639,6 +3651,22 @@ export function ChatPanel() {
                       className="notice-dismiss"
                       onClick={() =>
                         useStore.getState().setChatCompactNotice(chat.id, null)
+                      }
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {skillNotice && (
+                  <div className="notice-banner notice-error" dir="ltr">
+                    <span className="notice-icon">⚠</span>
+                    <span className="notice-text">{skillNotice}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatSkillNotice(chat.id, null)
                       }
                       title="Dismiss"
                     >
@@ -3976,19 +4004,6 @@ export function ChatPanel() {
             {skillOpen && (
               <div className="mention-popup" ref={skillPopupRef} dir="ltr">
                 <div className="mention-head">
-                  <span className="mention-head-icon">
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-                    </svg>
-                  </span>
                   <span>MCP tools</span>
                   <span className="mention-head-count">
                     {filteredMcp.length}
@@ -4038,40 +4053,37 @@ export function ChatPanel() {
                     No MCP connectors — add them in Settings → MCP
                   </div>
                 )}
-                {filteredMcp.map((name, i) => {
-                  const on = mcpEnabled.includes(name);
-                  return (
-                    <div
-                      key={name}
-                      className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
-                      onMouseEnter={() => setSkillIdx(i)}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        setMcpEnabled(name, !on);
-                      }}
-                    >
-                      <span className="mention-icon-badge mcp">
-                        <svg
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-                        </svg>
-                      </span>
-                      <span className="mention-rel">{name}</span>
-                      <span className="mcp-switch">
-                        <span className="mcp-switch-track">
-                          <span className="mcp-switch-knob" />
-                        </span>
-                      </span>
+                {Object.keys(mcpConnectors).length > 0 &&
+                  filteredMcp.length === 0 && (
+                    <div className="mention-empty">
+                      No connectors match “{skillQuery.trim()}”
                     </div>
-                  );
-                })}
+                  )}
+                {filteredMcp.length > 0 && (
+                  <div className="mcp-grid">
+                    {filteredMcp.map((name, i) => {
+                      const on = mcpEnabled.includes(name);
+                      return (
+                        <div
+                          key={name}
+                          className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
+                          onMouseEnter={() => setSkillIdx(i)}
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            setMcpEnabled(name, !on);
+                          }}
+                        >
+                          <span className="mention-rel">{name}</span>
+                          <span className="mcp-switch">
+                            <span className="mcp-switch-track">
+                              <span className="mcp-switch-knob" />
+                            </span>
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
             {(attachments.length > 0 || images.length > 0) && (

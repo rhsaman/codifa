@@ -998,13 +998,22 @@ async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | Non
     return result
 
 
-def _build_skills_section(picked_names: list[str], root: str) -> str:
+def _build_skills_section(
+    picked_names: list[str],
+    root: str,
+    emit: Callable[[dict], None] | None = None,
+) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
     ONLY attached/picked skills are inlined (full body) — there is no
     general ``AVAILABLE SKILLS`` catalog in the prompt. Skills are selected
     via @mention in the UI; the model never needs the full list to find or
     activate one, so an unpicked turn adds zero skill tokens.
+
+    When a picked name matches no stored skill (deleted/renamed since the
+    mention was made) a ``warn`` event is emitted via ``emit`` so the user
+    learns why the skill silently did not apply — previously this case was
+    indistinguishable from a turn with no mentions at all.
 
     This is intentionally independent of ``_skill_names_to_strip``: stripping a
     skill's *name* out of the search-keyword derivation must never prevent its
@@ -1016,15 +1025,48 @@ def _build_skills_section(picked_names: list[str], root: str) -> str:
         return ""
     all_skills = _agents._load_skills(root)
     if not all_skills:
+        if emit is not None:
+            emit({
+                "kind": "skill",
+                "skills": [],
+                "manual": True,
+                "note": (
+                    "Attached skills not found — they may have been deleted or "
+                    f"renamed: {', '.join(manual_names)}. The turn runs without them."
+                ),
+            })
         return ""
     by_name = {s["name"].casefold(): s for s in all_skills}
     picked: list[dict] = []
+    missing: list[str] = []
     for n in manual_names:
         skill = by_name.get(n)
         if skill is not None and skill not in picked:
             picked.append(skill)
+        elif skill is None:
+            missing.append(n)
     if not picked:
+        if emit is not None:
+            emit({
+                "kind": "skill",
+                "skills": [],
+                "manual": True,
+                "note": (
+                    "Attached skills not found — they may have been deleted or "
+                    f"renamed: {', '.join(missing)}. The turn runs without them."
+                ),
+            })
         return ""
+    if missing and emit is not None:
+        emit({
+            "kind": "skill",
+            "skills": [s["name"] for s in picked],
+            "manual": True,
+            "note": (
+                "Attached skills not found — they may have been deleted or "
+                f"renamed: {', '.join(missing)}. The turn runs without them."
+            ),
+        })
     bodies = "\n\n".join(
         f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
         f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
@@ -1446,7 +1488,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             system_final += _ws_summary
 
     # Skills: only @mentioned skills are inlined (no general catalog).
-    system_final += _build_skills_section(skills or [], root)
+    system_final += _build_skills_section(
+        skills or [], root, emit=lambda ev: queue.put_nowait(ev)
+    )
 
     if mode in ("plan", "coder"):
         try:

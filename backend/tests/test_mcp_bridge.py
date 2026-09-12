@@ -17,6 +17,7 @@ started — we only exercise the bridge's wiring logic.
 """
 
 import asyncio
+import json
 import os
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
@@ -730,3 +731,103 @@ async def test_concurrent_connects_share_one_session(monkeypatch):
     assert len(results[1][0]) == 1
     assert results[0][0][0].name == results[1][0][0].name
     assert len(mcp_bridge._session_cache) == 1
+
+
+# ---------------------------------------------------------------------------
+# فشرده‌سازی تعریف ابزارها (کاهش مصرف توکن در هر turn)
+# ---------------------------------------------------------------------------
+
+
+def test_compact_description_truncates_at_sentence_boundary():
+    """توضیح بلند باید در مرز جمله و زیر سقف بریده شود، نه وسط کلمه."""
+    long_desc = (
+        "Navigate to a URL. "
+        "This is a very long second sentence with lots of detail that the "
+        "model does not need to pick the tool. " * 5
+    ).strip()
+    out = mcp_bridge._compact_description(long_desc)
+    assert len(out) <= mcp_bridge._DESC_MAX_CHARS + 2
+    assert out.startswith("Navigate to a URL.")
+    assert out.endswith("."), "برش باید در مرز جمله باشد"
+
+
+def test_compact_description_short_text_untouched():
+    """توضیح کوتاه‌تر از سقف باید دست‌نخورده بماند."""
+    short = "List running containers."
+    assert mcp_bridge._compact_description(short) == short
+
+
+def test_compact_description_no_sentence_falls_back_to_word_boundary():
+    """بدون مرز جمله، برش در مرز کلمه انجام می‌شود (با نشانگر …)."""
+    long_desc = "x" * 400  # یک «کلمه» پیوسته بدون فاصله
+    out = mcp_bridge._compact_description(long_desc)
+    assert out.endswith("…")
+    assert len(out) <= mcp_bridge._DESC_MAX_CHARS + 2
+
+
+def test_compact_schema_strips_titles_and_caps_field_descriptions():
+    """title حذف و description فیلدها به سقف محدود می‌شود؛ ساختار دست‌نخورده."""
+    schema = {
+        "type": "object",
+        "title": "Big Title",
+        "properties": {
+            "url": {
+                "type": "string",
+                "title": "Url",
+                "description": "d" * 200,
+            },
+            "opts": {
+                "type": "object",
+                "title": "Opts",
+                "properties": {
+                    "headless": {
+                        "type": "boolean",
+                        "description": "short",
+                    },
+                },
+            },
+        },
+        "required": ["url"],
+    }
+    out = mcp_bridge._compact_schema(schema)
+    assert "title" not in out
+    assert out["required"] == ["url"]
+    url_desc = out["properties"]["url"]["description"]
+    assert len(url_desc) <= mcp_bridge._FIELD_DESC_MAX_CHARS + 2
+    assert url_desc.endswith("…")
+    # تو در تو هم پاک می‌شود
+    assert "title" not in out["properties"]["opts"]
+    assert out["properties"]["opts"]["properties"]["headless"]["description"] == "short"
+
+
+def test_compact_schema_does_not_mutate_input():
+    """ورودی نباید تغییر کند — اسکیمای خامِ کش‌شده در session دست‌نخورده بماند."""
+    schema = {"type": "object", "title": "T", "properties": {"a": {"type": "string", "title": "A"}}}
+    before = json.dumps(schema, sort_keys=True)
+    mcp_bridge._compact_schema(schema)
+    assert json.dumps(schema, sort_keys=True) == before
+
+
+@pytest.mark.asyncio
+async def test_make_tool_compacts_description_and_schema():
+    """_make_tool باید توضیح و schema فشرده‌شده به مدل بدهد."""
+    long_desc = "Does one thing well. " + "extra prose " * 40
+    schema = {
+        "type": "object",
+        "title": "T",
+        "properties": {
+            "q": {"type": "string", "description": "d" * 200},
+        },
+    }
+    tool = _fake_tool("search", long_desc, schema)
+    session = _fake_session([tool])
+    st = mcp_bridge._make_tool("srv", tool, session, lambda ev: None)
+
+    assert st.name == "search"
+    assert len(st.description) < len(long_desc)
+    assert st.description.startswith("[MCP:srv] Does one thing well.")
+    # schema فشرده شده: بدون title، description فیلد سقف خورده
+    args = st.args_schema.model_json_schema() if hasattr(st.args_schema, "model_json_schema") else st.args_schema
+    dumped = json.dumps(args)
+    assert '"title": "T"' not in dumped
+    assert "d" * 100 not in dumped

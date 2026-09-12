@@ -91,6 +91,41 @@ def test_skills_section_unknown_pick_returns_empty(monkeypatch):
     assert graph._build_skills_section(["ناموجود"], "/x") == ""
 
 
+def test_skills_section_missing_pick_emits_skill_event(monkeypatch):
+    """اسکیل گم‌شده: رویداد skill با note هشدار صادر می‌شود تا کاربر بفهمد چرا اعمال نشد."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+    ])
+    events: list[dict] = []
+    out = graph._build_skills_section(["ناموجود"], "/x", emit=events.append)
+    assert out == ""
+    assert len(events) == 1
+    assert events[0]["kind"] == "skill"
+    assert events[0]["skills"] == []
+    assert events[0]["manual"] is True
+    assert "ناموجود" in events[0]["note"]
+
+
+def test_skills_section_partial_missing_still_inlines_found(monkeypatch):
+    """جفت (پیدا‌شده + گم‌شده): بدنهٔ پیدا‌شده تزریق و رویداد skill نام‌های گم‌شده را می‌دهد."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+    ])
+    events: list[dict] = []
+    out = graph._build_skills_section(["Alpha", "Beta"], "/x", emit=events.append)
+    assert "BODY-A" in out
+    assert len(events) == 1
+    assert events[0]["kind"] == "skill"
+    assert events[0]["skills"] == ["Alpha"]
+    assert "beta" in events[0]["note"]
+
+
+def test_skills_section_no_emit_backward_compatible(monkeypatch):
+    """بدون emit (فراخوانی‌های قدیمی/تست‌ها): رفتار قبلی حفظ می‌شود."""
+    monkeypatch.setattr(agents, "_load_skills", lambda _r: [])
+    assert graph._build_skills_section(["Alpha"], "/x") == ""
+
+
 # ---------------------------------------------------------------------------
 # _subagent_target (sub-agent model resolver)
 # ---------------------------------------------------------------------------

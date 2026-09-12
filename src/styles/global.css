@@ -6726,7 +6726,7 @@ textarea {
   left: 0;
   right: 0;
   z-index: 30;
-  max-height: 300px;
+  max-height: 340px;
   overflow-y: auto;
   background: color-mix(in srgb, var(--bg-alt) 92%, transparent);
   border: none;
@@ -6792,6 +6792,7 @@ textarea {
   outline: none;
   position: sticky;
   top: 0;
+  z-index: 1;
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
   transition: box-shadow 0.14s;
 }
@@ -6834,9 +6835,9 @@ textarea {
   font-weight: 700;
 }
 
-/* Circular tinted badge in front of each mention/skill/mcp row, colour-coded
-   by kind so the three sources (commands, skills, MCP tools) read apart at a
-   glance without needing to parse the hint text. */
+/* Circular tinted badge in front of each command/skill row, colour-coded by
+   kind so the two sources read apart at a glance without needing to parse
+   the hint text. */
 .mention-icon-badge {
   display: inline-flex;
   align-items: center;
@@ -6857,16 +6858,6 @@ textarea {
   background: color-mix(in srgb, var(--accent) 14%, var(--bg-input));
 }
 
-.mention-icon-badge.mcp {
-  background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
-  color: var(--link);
-}
-
-.mention-icon-badge.mcp svg {
-  width: 14px;
-  height: 14px;
-}
-
 .mention-rel {
   direction: ltr;
   text-align: left;
@@ -6884,33 +6875,56 @@ textarea {
   color: var(--link);
 }
 
-/* MCP connector row rendered as a persistent on/off switch. */
-.mention-item.mcp-toggle {
-  justify-content: space-between;
-  padding: 9px 10px;
+/* MCP connector cards rendered as a grid of on/off toggles. */
+.mcp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+  gap: 8px;
+  padding: 4px 2px 2px;
 }
 
-/* MCP connector rows are toggles, not menu items — no hover highlight, no
-   border, no keyboard outline. They must read as plain tool rows. */
+.mention-item.mcp-toggle {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 4%, var(--bg-input));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+  transition: background 0.15s;
+}
+
+/* MCP connector cards are toggles, not menu items — hover feedback is a
+   subtle surface lift only (no border, no keyboard outline), so they still
+   read as plain tool cards rather than menu rows. */
 .mention-item.mcp-toggle:hover,
 .mention-item.mcp-toggle.kbd {
-  background: transparent;
+  background: color-mix(in srgb, var(--text) 7%, var(--bg-input));
 }
 
 .mention-item.mcp-toggle.kbd:not(:hover) {
   outline: none;
 }
 
-/* Hairline divider between connector rows (not a border on the tools). */
-.mention-item.mcp-toggle + .mention-item.mcp-toggle {
-  border-top: 1px solid color-mix(in srgb, var(--border) 35%, transparent);
-}
-
 .mention-item.mcp-toggle .mention-rel {
-  flex: 1;
+  width: 100%;
   min-width: 0;
   font-weight: 600;
+  font-size: 13px;
+  line-height: 1.25;
+  /* Card titles may wrap to two lines instead of overflowing the grid cell. */
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   color: var(--text);
+}
+
+/* Card footer row: switch sits at the bottom-right of the card. */
+.mention-item.mcp-toggle .mcp-switch {
+  align-self: flex-end;
 }
 
 .mcp-switch {
@@ -6921,24 +6935,25 @@ textarea {
 .mcp-switch-track {
   position: relative;
   display: block;
-  width: 34px;
-  height: 18px;
+  width: 36px;
+  height: 20px;
   border-radius: 999px;
-  background: var(--border);
-  transition: background 0.16s;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  transition: background 0.18s;
 }
 
 .mcp-switch-knob {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
-  background: var(--text-dim);
+  background: var(--text);
+  box-shadow: 0 1px 3px color-mix(in srgb, #000 45%, transparent);
   transition:
-    left 0.16s,
-    background 0.16s;
+    left 0.18s,
+    background 0.18s;
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-track {
@@ -6948,6 +6963,12 @@ textarea {
 .mention-item.mcp-toggle.on .mcp-switch-knob {
   left: 18px;
   background: #fff;
+}
+
+/* Enabled cards get a subtle link-tinted surface so the on-state reads at a
+   glance across the grid, without any border on the tool itself. */
+.mention-item.mcp-toggle.on {
+  background: color-mix(in srgb, var(--link) 9%, var(--bg-input));
 }
 
 .mention-empty {

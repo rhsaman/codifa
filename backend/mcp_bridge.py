@@ -24,6 +24,9 @@ Design notes
   lock) are reaped before every fresh connect and again on shutdown.
 * A per-server lock serialises connects so two concurrent turns never
   double-spawn the same server.
+* تعریف ابزارها قبل از رسیدن به مدل فشرده می‌شود: توضیحات به جمله(های)
+  اول بریده و description فیلدهای schema سقف می‌خورند تا سرورهای پرحرف
+  (مثل Playwright) با هر turn پاراگراف‌ها را دوباره نفرستند.
 """
 
 from __future__ import annotations
@@ -214,6 +217,60 @@ def _tool_input_schema(tool: Any) -> dict | None:
     return None
 
 
+# سقف‌های فشرده‌سازی تعریف ابزارها قبل از رسیدن به مدل — هر کاراکتر اضافه با
+# هر turn دوباره فرستاده می‌شود، پس توضیحات چندپاراگرافی سرورهایی مثل
+# Playwright باید کوتاه شوند.
+_DESC_MAX_CHARS = 300
+_FIELD_DESC_MAX_CHARS = 80
+
+
+def _compact_description(text: str, max_chars: int = _DESC_MAX_CHARS) -> str:
+    """توضیح ابزار MCP را به جمله(های) اولش محدود می‌کند.
+
+    مدل برای انتخاب ابزار فقط جملهٔ اول را لازم دارد؛ بقیهٔ توضیحات هدر
+    توکن است. برش در آخرین مرز جمله داخل سقف انجام می‌شود و وقتی جمله‌ای
+    نیست، در مرز کلمه."""
+    text = str(text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    for sep in (". ", ".\n", "\n"):
+        idx = window.rfind(sep)
+        if idx >= 24:
+            return text[: idx + 1].rstrip()
+    idx = window.rfind(" ")
+    if idx > 24:
+        return text[:idx] + " …"
+    return window + " …"
+
+
+def _compact_schema(schema: Any) -> Any:
+    """JSON Schema ابزار را قبل از ساخت StructuredTool لاغر می‌کند.
+
+    ساختار (type/properties/required/items) دست‌نخورده می‌ماند تا اعتبارسنجی
+    فراخوانی‌ها کار کند، ولی کلیدهای ``title`` حذف و ``description`` فیلدها
+    به سقف کوتاه محدود می‌شوند — نثر طولانیِ هر پارامتر هزینهٔ توکنش از خودِ
+    پارامتر بیشتر است. دیکتهای جدید برمی‌گرداند و ورودی را تغییر نمی‌دهد
+    (اسکیمای خامِ کش‌شده در session نباید دست بخورد)."""
+    if isinstance(schema, dict):
+        out: dict = {}
+        for key, value in schema.items():
+            if key == "title":
+                continue
+            if (
+                key == "description"
+                and isinstance(value, str)
+                and len(value) > _FIELD_DESC_MAX_CHARS
+            ):
+                out[key] = value[:_FIELD_DESC_MAX_CHARS].rstrip() + " …"
+                continue
+            out[key] = _compact_schema(value)
+        return out
+    if isinstance(schema, list):
+        return [_compact_schema(item) for item in schema]
+    return schema
+
+
 async def _call_mcp_tool(
     session: ClientSession,
     tool_name: str,
@@ -295,6 +352,8 @@ def _make_tool(
     cost fewer tokens and the model calls them more reliably. Only when that
     short name collides with a native tool (or a tool from another MCP server)
     does it fall back to the fully qualified ``mcp__<server>__<tool>`` form.
+    توضیح و schema هم قبل از ساخت فشرده می‌شوند (``_compact_description`` /
+    ``_compact_schema``) تا هزینهٔ توکن فهرست ابزارها در هر turn کم بماند.
     """
     tool_name = getattr(tool, "name", None) or "tool"
     short = _short_tool_name(server_name, tool_name)
@@ -309,14 +368,17 @@ def _make_tool(
 
     _func.__name__ = binding
     _func.__doc__ = (
-        f"[MCP:{server_name}] {getattr(tool, 'description', '') or tool_name}"
+        f"[MCP:{server_name}] "
+        f"{_compact_description(getattr(tool, 'description', '') or tool_name)}"
     )
 
     st = StructuredTool.from_function(
         coroutine=_func,
         name=binding,
         description=_func.__doc__ or binding,
-        args_schema=_json_schema_from_input(_tool_input_schema(tool)),
+        args_schema=_compact_schema(
+            _json_schema_from_input(_tool_input_schema(tool))
+        ),
     )
     # Metadata for the tool-loop / UI: which MCP server backs this tool and
     # its fully qualified name (the binding may be the short form).

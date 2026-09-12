@@ -525,6 +525,7 @@ interface State {
   setChatCompactNotice: (id: string, notice: string | null) => void
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
+  setChatSkillNotice: (id: string, notice: string | null) => void
   /** Per-chat scroll restoration anchor (see Chat.scrollPos). */
   setChatScrollPos: (id: string, pos: { id: string; offset: number; atBottom: boolean } | null) => void
   /** In-memory-only scroll anchor update (no persist) — used by the
@@ -759,6 +760,7 @@ export const useStore = create<State>((set, get) => ({
       delete clean.compactNotice
       delete clean.compactError
       delete clean.cmdError
+      delete clean.skillNotice
       delete clean.stalled
       // Migrate legacy keyed usage → explicit (providerId, model) entries once,
       // on load. New usage is written directly as entries, so the live path
@@ -1785,6 +1787,12 @@ export const useStore = create<State>((set, get) => ({
   setChatCmdError: (id, cmdError) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, cmdError } : c)),
+    }))
+  },
+
+  setChatSkillNotice: (id, skillNotice) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, skillNotice } : c)),
     }))
   },
 

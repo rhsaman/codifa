@@ -81,3 +81,46 @@ def test_shipped_anthropic_skill_is_clean():
     assert name == "Anthropic Frontend Design"
     assert "---name: frontend-design" not in body, "stray frontmatter leaked into body"
     assert body.lstrip().startswith("# Anthropic Frontend Design")
+
+
+# ---------------------------------------------------------------------------
+# کش list_skills (اثر انگشت mtime/حجم پوشه)
+# ---------------------------------------------------------------------------
+
+
+def test_list_skills_caches_between_calls(skill_env, monkeypatch):
+    """فراخوانی دوم نباید دوباره از دیسک بخواند تا وقتی اثر انگشت تغییر نکند."""
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    calls = {"n": 0}
+    orig = state_db._list_skills_uncached
+
+    def counting():
+        calls["n"] += 1
+        return orig()
+
+    monkeypatch.setattr(state_db, "_list_skills_uncached", counting)
+    first = state_db.list_skills()
+    second = state_db.list_skills()
+    assert first is second, "خروجی کش باید همان شیء باشد"
+    assert calls["n"] == 1, "خواندن دومی باید از کش بیاید"
+
+
+def test_save_skill_invalidates_cache(skill_env):
+    """بعد از save_skill، list_skills باید skill جدید را بلافاصله ببیند."""
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    before = {s["name"] for s in state_db.list_skills()}
+    state_db.save_skill("Fresh Skill", "fresh-skill", "d", "", "BODY-FRESH")
+    after = {s["name"] for s in state_db.list_skills()}
+    assert "Fresh Skill" in after
+    assert "Fresh Skill" not in before
+
+
+def test_delete_skill_invalidates_cache(skill_env):
+    """بعد از delete_skill، list_skills نباید skill حذف‌شده را نشان دهد."""
+    tools.sync_builtin_skills()
+    state_db.invalidate_skills_cache()
+    assert any(s["name"] == "Test Skill" for s in state_db.list_skills())
+    assert state_db.delete_skill("Test Skill") is True
+    assert not any(s["name"] == "Test Skill" for s in state_db.list_skills())

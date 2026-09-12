@@ -549,10 +549,55 @@ def save_skill(name: str, slug: str, description: str, path: str, content: str) 
             "---\n\n"
         )
         _atomic_write(os.path.join(d, "skill.md"), front + content)
+    invalidate_skills_cache()
+
+
+def _skills_fingerprint() -> tuple:
+    """اثر انگشت ارزان پوشهٔ skills: (mtime پوشه، تعداد entryها).
+
+    mtime دایرکتوری روی هر ایجاد/حذف/تغییر نام entry به‌روز می‌شود و تعداد
+    entryها تغییر محتوای فایل داخل دایرکتوری بدون تغییر تعداد را پوشش
+    نمی‌دهد — برای آن مورد، نویسنده‌ها (save_skill/delete_skill) خودشان کش
+    را invalidate می‌کنند. این فقط گاردِ تغییرات بیرونی (ویرایش دستی فایل)
+    است، پس دقت کامل لازم نیست؛ ارزان بودنش مهم است چون هر turn صدا زده
+    می‌شود."""
+    base = skills_dir()
+    try:
+        st = os.stat(base)
+        return (st.st_mtime_ns, len(os.listdir(base)))
+    except OSError:
+        return (0, -1)
+
+
+# کش list_skills: خروجی + اثر انگشتی که اعتبارش را می‌سنجد. هر turn چند
+# بار (build_turn_context، _skill_names_to_strip، sync_builtin_skills) به
+# این لیست نیاز است و هر بار خواندن همهٔ skill.mdها لازم نیست.
+_skills_cache: tuple[tuple, list[dict]] | None = None
+
+
+def invalidate_skills_cache() -> None:
+    """کش list_skills را خالی می‌کند — بعد از هر نوشتن/حذف skill."""
+    global _skills_cache
+    _skills_cache = None
 
 
 def list_skills() -> list[dict]:
-    """Return all skills as ``{name, slug, description, path, content}``."""
+    """Return all skills as ``{name, slug, description, path, content}``.
+
+    نتیجه تا وقتی اثر انگشت پوشهٔ skills تغییر نکرده کش می‌شود؛ نویسنده‌های
+    داخلی (save_skill/delete_skill) کش را invalidate می‌کنند تا تغییرات
+    بلافاصله دیده شوند."""
+    global _skills_cache
+    fp = _skills_fingerprint()
+    if _skills_cache is not None and _skills_cache[0] == fp:
+        return _skills_cache[1]
+    out = _list_skills_uncached()
+    _skills_cache = (fp, out)
+    return out
+
+
+def _list_skills_uncached() -> list[dict]:
+    """خواندن واقعی همهٔ skill.mdها از دیسک (بدون کش)."""
     base = skills_dir()
     if not os.path.isdir(base):
         return []
@@ -594,6 +639,7 @@ def delete_skill(name: str) -> bool:
             import shutil
 
             shutil.rmtree(d, ignore_errors=True)
+            invalidate_skills_cache()
             return True
         except OSError:
             return False

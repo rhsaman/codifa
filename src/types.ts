@@ -408,6 +408,10 @@ export interface Chat {
   compactNotice?: string | null
   compactError?: string | null
   cmdError?: string | null
+  /** Warning that an @mentioned skill was not found (deleted/renamed) — the
+   *  'skill' event's `note` field. Per-chat so it survives the ChatPanel
+   *  remount on chat switch (same rationale as compactNotice). */
+  skillNotice?: string | null
   stalled?: boolean
   /** Per-chat scroll restoration anchor: the message id at the top of the
    *  viewport when the user last scrolled, plus the pixel offset from that

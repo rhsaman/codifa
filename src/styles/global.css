@@ -3932,14 +3932,6 @@ textarea {
   animation: pm-test-pulse 1s ease-in-out infinite;
 }
 
-.pm-provider-test.ok {
-  color: var(--success);
-}
-
-.pm-provider-test.fail {
-  color: var(--danger);
-}
-
 .pm-models {
   display: flex;
   flex-direction: column;
@@ -6749,8 +6741,8 @@ textarea {
 .mention-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 8px 6px;
+  gap: 9px;
+  padding: 6px 8px 9px;
   font-size: 10.5px;
   font-weight: 700;
   text-transform: uppercase;
@@ -6759,27 +6751,41 @@ textarea {
 }
 
 .mention-head-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--link) 16%, var(--bg-input));
+  color: var(--link);
   font-size: 11px;
   line-height: 1;
+}
+
+.mention-head-icon svg {
+  width: 13px;
+  height: 13px;
 }
 
 .mention-head-count {
   margin-left: auto;
   font-size: 10px;
-  font-weight: 600;
-  color: var(--text-dim);
-  background: var(--bg-input);
+  font-weight: 700;
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
   border-radius: 999px;
-  padding: 1px 7px;
+  padding: 2px 8px;
 }
 
 .mention-search {
   width: 100%;
   box-sizing: border-box;
   padding: 9px 12px;
-  margin: 0 0 6px;
+  margin: 0 0 4px;
   border: none;
-  border-radius: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+  border-radius: 12px 12px 0 0;
   background: var(--bg-input);
   color: var(--text);
   font-size: 13px;
@@ -6856,6 +6862,11 @@ textarea {
   color: var(--link);
 }
 
+.mention-icon-badge.mcp svg {
+  width: 14px;
+  height: 14px;
+}
+
 .mention-rel {
   direction: ltr;
   text-align: left;
@@ -6876,11 +6887,30 @@ textarea {
 /* MCP connector row rendered as a persistent on/off switch. */
 .mention-item.mcp-toggle {
   justify-content: space-between;
+  padding: 9px 10px;
+}
+
+/* MCP connector rows are toggles, not menu items — no hover highlight, no
+   border, no keyboard outline. They must read as plain tool rows. */
+.mention-item.mcp-toggle:hover,
+.mention-item.mcp-toggle.kbd {
+  background: transparent;
+}
+
+.mention-item.mcp-toggle.kbd:not(:hover) {
+  outline: none;
+}
+
+/* Hairline divider between connector rows (not a border on the tools). */
+.mention-item.mcp-toggle + .mention-item.mcp-toggle {
+  border-top: 1px solid color-mix(in srgb, var(--border) 35%, transparent);
 }
 
 .mention-item.mcp-toggle .mention-rel {
   flex: 1;
   min-width: 0;
+  font-weight: 600;
+  color: var(--text);
 }
 
 .mcp-switch {
@@ -6891,8 +6921,8 @@ textarea {
 .mcp-switch-track {
   position: relative;
   display: block;
-  width: 30px;
-  height: 16px;
+  width: 34px;
+  height: 18px;
   border-radius: 999px;
   background: var(--border);
   transition: background 0.16s;
@@ -6902,8 +6932,8 @@ textarea {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   background: var(--text-dim);
   transition:
@@ -6916,7 +6946,7 @@ textarea {
 }
 
 .mention-item.mcp-toggle.on .mcp-switch-knob {
-  left: 16px;
+  left: 18px;
   background: #fff;
 }
 

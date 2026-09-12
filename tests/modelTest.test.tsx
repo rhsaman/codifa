@@ -161,6 +161,8 @@ console.log('۴) رندر SSR دکمه‌ها:')
   const phtml = renderToString(<ProviderTestButton cfg={cfg} models={['a', 'b']} />)
   check('کلاس pm-provider-test در HTML است', phtml.includes('pm-provider-test'), phtml)
   check('دکمهٔ پروایدر هم آیکون رعد دارد', phtml.includes('pm-test-bolt'), phtml)
+  check('دکمهٔ پروایدر در حالت idle هیچ ✓ ندارد', !phtml.includes('✓'), phtml)
+  check('دکمهٔ پروایدر در حالت idle هیچ ✕ ندارد', !phtml.includes('✕'), phtml)
 }
 
 if (failed > 0) {

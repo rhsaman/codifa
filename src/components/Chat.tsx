@@ -3976,7 +3976,19 @@ export function ChatPanel() {
             {skillOpen && (
               <div className="mention-popup" ref={skillPopupRef} dir="ltr">
                 <div className="mention-head">
-                  <span className="mention-head-icon">⚡</span>
+                  <span className="mention-head-icon">
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                    </svg>
+                  </span>
                   <span>MCP tools</span>
                   <span className="mention-head-count">
                     {filteredMcp.length}
@@ -4038,7 +4050,19 @@ export function ChatPanel() {
                         setMcpEnabled(name, !on);
                       }}
                     >
-                      <span className="mention-icon-badge mcp">⚡</span>
+                      <span className="mention-icon-badge mcp">
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                        </svg>
+                      </span>
                       <span className="mention-rel">{name}</span>
                       <span className="mcp-switch">
                         <span className="mcp-switch-track">
@@ -4141,6 +4165,24 @@ export function ChatPanel() {
                     </svg>
                   </button>
                   <button
+                    className="icon-btn attach-btn"
+                    onClick={captureRegion}
+                    disabled={busy}
+                    title="Capture a region of the screen"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                      <circle cx="12" cy="13" r="4" />
+                    </svg>
+                  </button>
+                  <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onClick={toggleRecording}
                     disabled={busy}
@@ -4191,24 +4233,6 @@ export function ChatPanel() {
                     )}
                   </button>
                   <button
-                    className="icon-btn attach-btn"
-                    onClick={captureRegion}
-                    disabled={busy}
-                    title="Capture a region of the screen"
-                  >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-                      <circle cx="12" cy="13" r="4" />
-                    </svg>
-                  </button>
-                  <button
                     className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
                     onClick={() => void openSkillPicker()}
                     disabled={busy}
@@ -4222,7 +4246,10 @@ export function ChatPanel() {
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                      <path d="M9 2v6" />
+                      <path d="M15 2v6" />
+                      <path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
+                      <path d="M12 17v5" />
                     </svg>
                     {mcpEnabled.length > 0 && (
                       <span className="attach-count">{mcpEnabled.length}</span>

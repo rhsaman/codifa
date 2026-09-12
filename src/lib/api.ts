@@ -247,7 +247,9 @@ export async function testModel(cfg: ProviderConfig, model: string): Promise<Mod
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(45_000),
+    // > backend's 65s cap so the server's real error message surfaces
+    // instead of a client-side abort.
+    signal: AbortSignal.timeout(75_000),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))

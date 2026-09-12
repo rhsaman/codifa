@@ -5,14 +5,11 @@ import { TestBoltIcon } from "./ModelTestButton";
 
 /** دکمهٔ تست کنار نام هر پروایدر: با یک کلیک همهٔ مدل‌های آن پروایدر با
  *  استخر همزمانی محدود تست می‌شوند و نتیجهٔ هر مدل روی دکمهٔ تکی خودش
- *  می‌نشیند. خود دکمه جمع‌بندی را نشان می‌دهد:
- *  idle (رعد) → testing (…) → همهٔ OK (✓ سبز) / هر خطا (✕ قرمز + tooltip). */
+ *  می‌نشیند. خود دکمه فقط دو حالت دارد: idle (رعد) و testing (…) —
+ *  ✓/✕ عمداً فقط روی دکمهٔ تک‌تک مدل‌ها دیده می‌شود؛ جمع‌بندی در tooltip. */
 export function ProviderTestButton({ cfg, models }: { cfg: ProviderConfig; models: string[] }) {
   const { getSummary, runAll } = useModelTests();
   const s = getSummary(cfg, models);
-  let state: "idle" | "testing" | "ok" | "fail" = "idle";
-  if (s.running) state = "testing";
-  else if (s.total > 0 && s.done === s.total) state = s.fail === 0 ? "ok" : "fail";
 
   const onClick = (e: MouseEvent) => {
     e.stopPropagation();
@@ -35,12 +32,12 @@ export function ProviderTestButton({ cfg, models }: { cfg: ProviderConfig; model
   return (
     <button
       type="button"
-      className={`pm-provider-test ${state}`}
+      className={`pm-provider-test${s.running ? " testing" : ""}`}
       onClick={onClick}
       title={title}
       aria-label={`Test all models of ${cfg.name}`}
     >
-      {state === "testing" ? "…" : state === "ok" ? "✓" : state === "fail" ? "✕" : <TestBoltIcon />}
+      {s.running ? "…" : <TestBoltIcon />}
     </button>
   );
 }

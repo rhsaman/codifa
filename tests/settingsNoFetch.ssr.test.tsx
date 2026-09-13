@@ -55,6 +55,52 @@ console.log('2) تب Providers (پیکر مدل subagent) بدون فچ:')
   check('رندر بدون خطا انجام شد', html.length > 0)
 }
 
+console.log('3) تب Tools: لیبل مدل ابزارها اسم پراویدر است نه id/kind خام:')
+{
+  const { toolModelLabel } = await import('../src/components/SettingsModal')
+  const { useStore } = await import('../src/lib/store')
+  const s = useStore.getState()
+  useStore.setState({
+    settings: {
+      ...s.settings,
+      providers: [
+        {
+          id: 'custom-abc123',
+          name: 'justwoker',
+          kind: 'custom',
+          apiKey: '',
+          baseUrl: 'http://localhost:8080/v1',
+          model: 'main-m',
+          pricingMap: {},
+        },
+      ],
+    },
+    subagentModels: {
+      // مقدار جدید: پیشوند id پراویدر
+      web: 'custom-abc123/my-model',
+      // مقدار قدیمی: پیشوند kind (قبل از id های صریح)
+      vision: 'custom/legacy-model',
+    },
+  })
+  const st = useStore.getState()
+  const providers = st.settings.providers
+  // تست مستقیم تابع خالص لیبل (در SSR رندر React از getServerSnapshot
+  // استفاده می‌کند و state seed شده را نمی‌بیند — به همین دلیل تست‌های SSR
+  // قبلی فقط «بدون فچ» را چک می‌کردند).
+  check(
+    'لیبل مقدار جدید: justwoker/my-model',
+    toolModelLabel('custom-abc123/my-model', providers) === 'justwoker/my-model',
+  )
+  check(
+    'لیبل مقدار قدیمی (kind): justwoker/legacy-model',
+    toolModelLabel('custom/legacy-model', providers) === 'justwoker/legacy-model',
+  )
+  check('پیشوند تکراری جمع می‌شود', toolModelLabel('custom-abc123/custom-abc123/my-model', providers) === 'justwoker/my-model')
+  check('مقدار خالی → Main model', toolModelLabel('', providers) === 'Main model')
+  check('id ناشناخته به‌صورت خام برمی‌گردد', toolModelLabel('other/m', providers) === 'other/m')
+  check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0, networkCalls)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} test(s) failed`)
   process.exit(1)

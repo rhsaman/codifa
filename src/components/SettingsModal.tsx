@@ -55,8 +55,31 @@ function bareModelFor(p: ProviderConfig, m: string): string {
   return m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
 }
 
-// لیست مدل‌ها فقط از store خوانده می‌شود (پرشده در startup / افزودن
-// پروایدر) — پیکر subagent هیچ فچی هنگام باز شدن انجام نمی‌دهد.
+// `current` is stored as "providerId/model" (route through that provider).
+// Legacy values may still be a bare model id, a kind-prefixed id ("custom/…")
+// or a doubled prefix — resolve a readable label in every case. The label
+// shows the provider's DISPLAY NAME (like the composer picker), never the
+// raw provider id / kind ("custom-xyz/model" → "My Provider/model").
+export function toolModelLabel(current: string, providers: ReadonlyArray<ProviderConfig>): string {
+  if (!current) return 'Main model'
+  const slash = current.indexOf('/')
+  if (slash > 0) {
+    const pid = current.slice(0, slash)
+    let modelPart = current.slice(slash + 1)
+    // Match by provider id first, then by kind (legacy "custom/model" values
+    // written before explicit ids existed).
+    const p =
+      providers.find((x) => x.id === pid) ??
+      (pid === 'custom' ? providers.find((x) => x.kind === 'custom') : undefined)
+    if (p) {
+      // Collapse a doubled prefix from a previously saved value
+      // ("providerId/providerId/model") before labelling.
+      if (modelPart.startsWith(`${p.id}/`)) modelPart = modelPart.slice(p.id.length + 1)
+      return `${p.name}/${modelPart}`
+    }
+  }
+  return current
+}
 
 function ToolModelSelect({
   agent, label, desc, current, onSelect,
@@ -106,23 +129,9 @@ function ToolModelSelect({
     return Array.from(out)
   }
 
-  // `current` is stored as "providerId/model" (route through that provider).
-  // Legacy values may still be a bare model id or carry an old prefix — resolve
-  // a readable label in every case.
-  const currentLabel = (() => {
-    if (!current) return 'Main model'
-    const slash = current.indexOf('/')
-    if (slash > 0) {
-      const pid = current.slice(0, slash)
-      const p = providers.find((x) => x.id === pid)
-      // "providerId/model": show it only when the provider is NOT the active
-      // one (the subagent runs on a different provider), else show the bare
-      // model id. Legacy bare ids are shown as-is. A doubled prefix from a
-      // previously saved value ("providerId/providerId/model") is collapsed.
-      if (p) return current.startsWith(`${p.id}/${p.id}/`) ? current.slice(p.id.length + 1) : current
-    }
-    return current
-  })()
+  // `current` is stored as "providerId/model" — resolve a readable label via
+  // the shared helper (shows the provider's display name, not the raw id/kind).
+  const currentLabel = toolModelLabel(current, providers)
 
   // Opening the combo box always starts from a clean search box — past
   // selection stays visible via the "active" checkmark in the list below,

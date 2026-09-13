@@ -151,7 +151,7 @@ def test_skills_section_no_emit_backward_compatible(monkeypatch):
 
 def _parent(**over):
     base = {
-        "parent_provider": "opencode",
+        "parent_provider": "custom",
         "parent_base_url": "http://parent.example/v1",
         "parent_api_key": "parent-key",
         "parent_env_var": "",
@@ -167,7 +167,7 @@ def _no_row(_pid):
 
 def test_subagent_target_openrouter_free_routes_through_openrouter():
     # User's exact case: openrouter/free with NO saved OpenRouter row
-    # (env-var auth) while the parent is the opencode gateway.
+    # (env-var auth) while the parent is a custom gateway.
     t = _subagent_target("openrouter/free", **_parent(), provider_lookup=_no_row)
     assert t is not None, "openrouter/free must resolve"
     kind, model, base, key, env, oauth, pid = t
@@ -189,13 +189,13 @@ def test_subagent_target_saved_row_wins_over_meta_defaults():
 
 
 def test_subagent_target_parent_kind_prefix_keeps_parent_creds():
-    t = _subagent_target("opencode/free", **_parent(), provider_lookup=_no_row)
-    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
+    t = _subagent_target("custom/free", **_parent(), provider_lookup=_no_row)
+    assert t == ("custom", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
 
 
 def test_subagent_target_bare_model_stays_parent_relative():
     t = _subagent_target("free", **_parent(), provider_lookup=_no_row)
-    assert t == ("opencode", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
+    assert t == ("custom", "free", "http://parent.example/v1", "parent-key", "", "", ""), t
 
 
 def test_subagent_target_openrouter_parent_keeps_parent_creds():

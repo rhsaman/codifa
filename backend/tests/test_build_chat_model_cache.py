@@ -11,7 +11,7 @@
 """
 
 from llm import _extra_headers, build_chat_model
-from providers import OPENCODE_UA, UA_LADDER
+from providers import UA_LADDER
 
 
 def test_extra_headers_openrouter_cache_true():
@@ -26,7 +26,7 @@ def test_extra_headers_openrouter_cache_false():
 
 def test_extra_headers_non_caching_provider_omits_header():
     # google/ollama/custom do not advertise cache_headers -> no cache header.
-    for provider in ("google", "ollama", "custom", "opencode"):
+    for provider in ("google", "ollama", "custom"):
         assert "x-openrouter-cache" not in _extra_headers(provider, "", True)
 
 
@@ -37,7 +37,7 @@ def test_extra_headers_session_id_openrouter():
 
 def test_extra_headers_session_id_other_providers_omitted():
     # Sticky routing is an OpenRouter feature; other providers must not see it.
-    for provider in ("google", "ollama", "custom", "opencode"):
+    for provider in ("google", "ollama", "custom"):
         headers = _extra_headers(provider, "", True, session_id="chat-42")
         assert "x-session-id" not in headers
 
@@ -65,9 +65,8 @@ def test_extra_headers_custom_local_server_no_ua_header():
 
 
 def test_extra_headers_builtin_kinds_untouched():
-    """Built-in kinds keep their existing UA behaviour: opencode keeps its
-    own UA, others send none (their gateways don't UA-filter)."""
-    assert _extra_headers("opencode", "", False).get("User-Agent") == OPENCODE_UA
+    """Built-in kinds send no UA header (their gateways don't UA-filter); only
+    remote custom gateways get the ladder."""
     for kind in ("google", "openrouter", "nvidia", "cloudflare", "tokenrouter"):
         assert "User-Agent" not in _extra_headers(kind, "", False)
 

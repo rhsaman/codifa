@@ -1113,7 +1113,8 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     elif "403" in low or "access denied" in low or "security policy" in low:
         text += (
             "\n\nThis looks like an OpenRouter gateway block (some regions/keys can't reach it). "
-            "Try the 'opencode' provider instead — it uses its own gateway (opencode.ai/zen)."
+            "Try a different provider (Settings → Providers), or a custom OpenAI-compatible "
+            "gateway with your own base URL and key."
         )
     elif "thought_signature" in low:
         text = (

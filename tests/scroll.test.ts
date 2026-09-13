@@ -1,4 +1,4 @@
-import { isAtBottom } from "../src/lib/scroll";
+import { isAtBottom, distanceFromBottom } from "../src/lib/scroll";
 
 let failed = 0;
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -25,6 +25,20 @@ check(
 check(
   "با eps سفارشی (آستانهٔ تنگ‌تر)",
   isAtBottom({ scrollHeight: 1000, scrollTop: 890, clientHeight: 100 }, 5) === false,
+);
+
+console.log("distanceFromBottom:");
+check(
+  "در پایین → 0",
+  distanceFromBottom({ scrollHeight: 1000, scrollTop: 900, clientHeight: 100 }) === 0,
+);
+check(
+  "اسکرول به بالا → فاصلهٔ مثبت",
+  distanceFromBottom({ scrollHeight: 1000, scrollTop: 500, clientHeight: 100 }) === 400,
+);
+check(
+  "چند پیکسل از پایین → همان چند پیکسل",
+  distanceFromBottom({ scrollHeight: 1000, scrollTop: 895, clientHeight: 100 }) === 5,
 );
 
 if (failed > 0) {

@@ -6,7 +6,7 @@
 
 اجرا (پروایدر واقعی):
 
-    uv run python agent_eval.py --provider opencode --model qwen3-coder-480b
+    uv run python agent_eval.py --provider openrouter --model qwen3-coder-480b
 
 اجرا با mock درون‌پردازشی (بدون هزینه، برای خودآزمایی harness):
 
@@ -325,7 +325,7 @@ def results_to_json(results: list[TaskResult]) -> dict:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="آزمونگاه ارزیابی ایجنت")
-    p.add_argument("--provider", default="opencode", help="نوع پروایدر (پیش‌فرض: opencode)")
+    p.add_argument("--provider", default="openrouter", help="نوع پروایدر (پیش‌فرض: openrouter)")
     p.add_argument("--model", default="qwen3-coder-480b", help="نام مدل")
     p.add_argument("--base-url", default="", help="base_url دلخواه (برای پروایدر custom)")
     p.add_argument("--api-key", default="", help="کلید API (پیش‌فرض: از env_key)")

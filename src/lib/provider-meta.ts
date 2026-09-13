@@ -36,26 +36,11 @@ export interface ProviderKindMeta {
   defaultBaseUrl?: string
   /** True = supports Google-style OAuth sign-in. */
   oauth?: boolean
-  /** True = model ids carry no provider prefix (opencode). */
-  unprefixedModelId?: boolean
   /** Extra hint line (e.g. an account id env var also required). */
   extraHint?: string
 }
 
 export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
-  opencode: {
-    kind: 'opencode',
-    label: 'opencode gateway',
-    name: 'opencode',
-    defaultEnvVar: 'OPENCODE_API_KEY',
-    envVars: ['OPENCODE_API_KEY', 'OPENCODE_ZEN_API_KEY'],
-    requiresKey: false,
-    builtin: true,
-    unprefixedModelId: true,
-    baseUrlHint: 'https://opencode.ai/zen/v1',
-    baseUrlDesc: 'Routed via the opencode gateway.',
-    defaultBaseUrl: 'https://opencode.ai/zen/v1',
-  },
   openrouter: {
     kind: 'openrouter',
     label: 'OpenRouter',
@@ -157,8 +142,8 @@ export function providerMeta(kind: ProviderKind | undefined | null): ProviderKin
 }
 
 /** Built-in provider kind ids that are known to act as a model-id prefix
- *  on the wire (e.g. OpenRouter returns "openai/gpt-4o", opencode exposes
- *  "opencode/..."). A model id that starts with `${kind}/` therefore
+ *  on the wire (e.g. OpenRouter returns "openai/gpt-4o"). A model id that
+ *  starts with `${kind}/` therefore
  *  belongs to THAT provider's catalog and must not be rendered under a
  *  different provider — even if it has been persisted into the wrong
  *  provider row (e.g. a stale recentModels entry migrated onto another
@@ -177,7 +162,7 @@ export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
  *  provider kind, and therefore must not be rendered under this provider.
  *
  *  Examples (all under p.id = "local"):
- *    "opencode/big-pickle"   → head = "opencode" ∈ prefixes, head !== p.id → FOREIGN
+ *    "google/gemini-2.5"     → head = "google" ∈ prefixes, head !== p.id → FOREIGN
  *    "nvidia/foo"            → head = "nvidia"   ∈ prefixes, head !== p.id → FOREIGN
  *    "llama3"                → no slash                              → INTERNAL
  *    "meta-llama/llama-3.1"  → head = "meta-llama", unknown kind     → INTERNAL
@@ -185,10 +170,10 @@ export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
  *
  *  Why run on `b` (after bareModel) and not on the raw `m`? Because a
  *  stored entry may carry a doubled prefix that the raw check would miss:
- *    m = "local/opencode/big-pickle", p.id = "local"
+ *    m = "local/google/gemini-2.5", p.id = "local"
  *    raw:   head = "local"   === p.id → not foreign (WRONG, leaks through)
- *    b  = "opencode/big-pickle"
- *    bare:  head = "opencode" ∈ prefixes, head !== p.id → foreign ✓
+ *    b  = "google/gemini-2.5"
+ *    bare:  head = "google" ∈ prefixes, head !== p.id → foreign ✓
  *
  *  This is intentionally stricter than "starts with any `${providerId}/`":
  *  we only flag KNOWN kind prefixes, so nvidia's own catalog entries like

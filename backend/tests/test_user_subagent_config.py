@@ -1,7 +1,7 @@
 """Diagnostic: resolve the USER's exact sub-agent model config (from their
 settings.json) and verify each entry builds a model on the right provider.
 
-Parent = opencode (deepseek-v4-flash-free). Sub-agent entries:
+Parent = custom gateway at opencode.ai/zen (deepseek-v4-flash-free). Sub-agent entries:
   explore  nvidia/nemotron-3-super-120b-a12b
   search   nvidia/nemotron-3-ultra-550b-a55b
   web      openrouter/free
@@ -24,8 +24,8 @@ from agents import _subagent_target
 from llm import build_chat_model
 
 PROVIDERS = {
-    "opencode": {
-        "id": "opencode", "kind": "opencode",
+    "opencode-gw": {
+        "id": "opencode-gw", "kind": "custom",
         "baseUrl": "https://opencode.ai/zen/v1", "apiKey": "",
         "envVar": "OPENCODE_ZEN_API_KEY", "oauthRefreshToken": "",
     },
@@ -42,7 +42,7 @@ PROVIDERS = {
 }
 
 PARENT = {
-    "parent_provider": "opencode",
+    "parent_provider": "custom",
     "parent_base_url": "https://opencode.ai/zen/v1",
     "parent_api_key": "",
     "parent_env_var": "OPENCODE_ZEN_API_KEY",

@@ -282,14 +282,14 @@ await run(
 // --- self-heal: مدل انتخابی از کاتالوگ واقعی provider درمیاد ------------------
 
 await run(
-  'self-heal: builtin + مدل جعلی (laguna) → جایگزینی با اولین مدل واقعی',
+  'self-heal: ردیف custom + مدل جعلی (laguna) → جایگزینی با اولین مدل واقعی',
   async () => {
-    // دقیقاً باگ laguna: مدل "laguna-s-2.1-free" روی opencode ثبت شده ولی
+    // دقیقاً باگ laguna: مدل "laguna-s-2.1-free" روی گیت‌وی opencode ثبت شده ولی
     // در کاتالوگ واقعی نیست → باید با اولین مدل واقعی جایگزین بشه.
     const store = mkStore([
       mkProvider({
         id: 'opencode',
-        kind: 'opencode',
+        kind: 'custom',
         baseUrl: 'https://opencode.ai/zen/v1',
         model: 'laguna-s-2.1-free',
         models: ['laguna-s-2.1-free'],
@@ -297,7 +297,7 @@ await run(
     ])
     const p = mkProvider({
       id: 'opencode',
-      kind: 'opencode',
+      kind: 'custom',
       baseUrl: 'https://opencode.ai/zen/v1',
       model: 'laguna-s-2.1-free',
     })
@@ -350,7 +350,7 @@ await run(
     const store = mkStore([
       mkProvider({
         id: 'opencode',
-        kind: 'opencode',
+        kind: 'custom',
         baseUrl: 'https://opencode.ai/zen/v1',
         model: 'mimo-v2.5-free',
         models: ['mimo-v2.5-free'],
@@ -358,7 +358,7 @@ await run(
     ])
     const p = mkProvider({
       id: 'opencode',
-      kind: 'opencode',
+      kind: 'custom',
       baseUrl: 'https://opencode.ai/zen/v1',
       model: 'mimo-v2.5-free',
     })
@@ -378,7 +378,7 @@ await run(
     const store = mkStore([
       mkProvider({
         id: 'opencode',
-        kind: 'opencode',
+        kind: 'custom',
         baseUrl: 'https://opencode.ai/zen/v1',
         model: 'mimo-v2.5-free',
         models: ['deepseek-v4-flash-free', 'mimo-v2.5-free'],
@@ -386,7 +386,7 @@ await run(
     ])
     const p = mkProvider({
       id: 'opencode',
-      kind: 'opencode',
+      kind: 'custom',
       baseUrl: 'https://opencode.ai/zen/v1',
       model: 'mimo-v2.5-free',
     })

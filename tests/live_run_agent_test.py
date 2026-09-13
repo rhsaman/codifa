@@ -20,7 +20,8 @@ from agents import run_agent  # noqa: E402
 async def main() -> None:
     settings = get_settings() or {}
     providers = [p for p in (settings.get("providers") or []) if isinstance(p, dict)]
-    parent = next((p for p in providers if p.get("id") == "opencode"), providers[0])
+    # اولین provider فعال (ترتیب ذخیره‌شده) — دیگر kind built-in به نام opencode وجود ندارد.
+    parent = providers[0] if providers else {}
     kind = parent.get("kind") or "custom"
     model = parent.get("model") or ""
     base = parent.get("baseUrl") or ""

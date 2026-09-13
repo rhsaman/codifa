@@ -1,4 +1,4 @@
-export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter' | 'anthropic'
+export type ProviderKind = 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter' | 'anthropic'
 
 export type AgentMode = string
 

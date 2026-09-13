@@ -35,9 +35,9 @@ def test_stamp_provider_survives_pydantic_models(monkeypatch):
     monkeypatch.setattr("llm.ReasoningChatOpenAI", FakeOpenAI)
 
     m = build_chat_model(
-        "opencode", "m", "", "", "", "", provider_id="opencode"
+        "custom", "m", "", "", "", "", provider_id="custom"
     )
-    assert model_provider(m) == ("opencode", "opencode")
+    assert model_provider(m) == ("custom", "custom")
 
 
 def test_stamp_provider_defaults_to_empty_id(monkeypatch):
@@ -137,7 +137,7 @@ def test_langchain_tool_loop_emits_stamped_usage():
 
 def _parent(**over):
     base = {
-        "parent_provider": "opencode",
+        "parent_provider": "custom",
         "parent_base_url": "http://parent.example/v1",
         "parent_api_key": "parent-key",
         "parent_env_var": "",
@@ -176,10 +176,10 @@ def test_subagent_target_builtin_kind_returns_kind_as_id():
 def test_subagent_target_parent_path_returns_parent_provider_id():
     t = _subagent_target(
         "free", **_parent(), provider_lookup=lambda _pid: None,
-        parent_provider_id="opencode",
+        parent_provider_id="custom",
     )
     assert t is not None
-    assert t[6] == "opencode"
+    assert t[6] == "custom"
 
 
 def test_subagent_target_parent_path_defaults_empty_id():
@@ -196,7 +196,7 @@ def test_subagent_target_parent_path_defaults_empty_id():
 def test_resolve_subagent_model_stamps_cross_provider_id(monkeypatch):
     # The explore slot routed to a saved openrouter row must carry that row's
     # id on the built model, so its usage groups under openrouter — not the
-    # parent (opencode) chat provider.
+    # parent (custom) chat provider.
     import graph
 
     row = {
@@ -212,7 +212,7 @@ def test_resolve_subagent_model_stamps_cross_provider_id(monkeypatch):
     monkeypatch.setattr("llm.ReasoningChatOpenAI", FakeOpenAI)
 
     m = graph.resolve_subagent_model(
-        "opencode",
+        "custom",
         "my-or/vendor/model",
         "http://parent.example/v1",
         "parent-key",
@@ -220,7 +220,7 @@ def test_resolve_subagent_model_stamps_cross_provider_id(monkeypatch):
         "",
         "parent-model",
         provider_lookup=lambda pid: row if pid == "my-or" else None,
-        parent_provider_id="opencode",
+        parent_provider_id="custom",
     )
     assert m is not None
     assert model_provider(m) == ("openrouter", "my-or")
@@ -238,24 +238,24 @@ def test_resolve_subagent_model_parent_default_stamps_parent_id(monkeypatch):
     monkeypatch.setattr("llm.ReasoningChatOpenAI", FakeOpenAI)
 
     m = graph.resolve_subagent_model(
-        "opencode",
+        "custom",
         "",
         "http://parent.example/v1",
         "parent-key",
         "",
         "",
         "parent-model",
-        parent_provider_id="opencode",
+        parent_provider_id="custom",
     )
     assert m is not None
-    assert model_provider(m) == ("opencode", "opencode")
+    assert model_provider(m) == ("custom", "custom")
 
 
 def test_resolve_subagent_model_none_entry_vision_slot(monkeypatch):
     import graph
 
     m = graph.resolve_subagent_model(
-        "opencode",
+        "custom",
         None,
         "http://parent.example/v1",
         "parent-key",
@@ -263,6 +263,6 @@ def test_resolve_subagent_model_none_entry_vision_slot(monkeypatch):
         "",
         "parent-model",
         default_to_parent=False,
-        parent_provider_id="opencode",
+        parent_provider_id="custom",
     )
     assert m is None

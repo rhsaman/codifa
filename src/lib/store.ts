@@ -310,7 +310,6 @@ function defaultProviders(): ProviderConfig[] {
     }
   }
   return [
-    row('opencode'),
     row('openrouter'),
     row('ollama'),
     row('google'),
@@ -321,13 +320,12 @@ function defaultProviders(): ProviderConfig[] {
 }
 
 function normalizeProvider(p: ProviderConfig): ProviderConfig {
-  const kind = p.kind || 'custom'
+  // 'opencode' rows from older builds: the kind no longer exists — keep the
+  // row alive as a custom provider (id, baseUrl, envVar unchanged) so saved
+  // chats and the active-provider pointer keep resolving.
+  const rawKind = (p.kind || '') as string
+  const kind: ProviderKind = rawKind === 'opencode' ? 'custom' : p.kind || 'custom'
   const meta = PROVIDER_META[kind]
-  // Kinds that use unprefixed model ids (opencode) — drop any stale provider
-  // prefix if present.
-  const unprefixed = meta?.unprefixedModelId
-  let model = p.model || ''
-  if (unprefixed && model.startsWith('opencode/')) model = model.slice('opencode/'.length)
   return {
     // The local llama.cpp provider's id was historically 'ollama'; keep it
     // stable by migrating any legacy rows to the canonical 'local' id.
@@ -338,7 +336,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     envVar: p.envVar ?? defaultEnvVar(kind),
     // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
     baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
-    model,
+    model: p.model || '',
     authType: p.authType ?? '',
     oauthClientId: p.oauthClientId || '',
     oauthClientSecret: p.oauthClientSecret || '',
@@ -347,9 +345,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
     thinkingLevel: p.thinkingLevel ?? '',
-    models: Array.isArray(p.models)
-      ? p.models.map((m) => (unprefixed ? m.replace(/^opencode\//, '') : m))
-      : [],
+    models: Array.isArray(p.models) ? p.models : [],
     removedModels: Array.isArray(p.removedModels) ? p.removedModels : [],
     addedModels: Array.isArray(p.addedModels) ? p.addedModels : [],
   }
@@ -677,7 +673,7 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80 },
+  settings: { providers: defaultProviders(), activeProviderId: 'openrouter', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80 },
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
@@ -799,9 +795,7 @@ export const useStore = create<State>((set, get) => ({
       // Migrate the old single-provider shape.
       const oldP = raw.provider
       const kind: ProviderKind =
-        oldP.id === 'openrouter' || oldP.id === 'ollama' || oldP.id === 'opencode'
-          ? oldP.id
-          : 'custom'
+        oldP.id === 'openrouter' || oldP.id === 'ollama' ? oldP.id : 'custom'
       const name = PROVIDER_NAMES[kind]
       const legacy = normalizeProvider({
         id: oldP.id || 'custom',

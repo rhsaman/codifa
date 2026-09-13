@@ -6,13 +6,13 @@ through one interface.
 
 It reuses the SAME provider configuration that the rest of the app already
 reads (``providers._provider_meta``, ``normalize_base_url``, ``env_key``,
-``OPENCODE_UA``, ``model_timeout``, ...), so the user's Settings → Providers
+``model_timeout``, ...), so the user's Settings → Providers
 entries keep working unchanged.
 
 Reasoning / User-Agent / cache handling is reproduced with the equivalents
 LangChain supports:
 
-* opencode zen gateway UA spoof -> ``default_headers``.
+* custom-gateway UA spoof -> ``default_headers``.
 * OpenRouter prompt-cache breakpoints -> ``default_headers`` (best-effort).
 * DeepSeek reasoning round-trip -> LangChain's OpenAI client already handles
   ``reasoning_content`` natively, so no custom backfill is needed.
@@ -46,11 +46,9 @@ from _common import (
     _strip_think_tags,
 )
 from providers import (
-    OPENCODE_UA,
     UA_LADDER,
     _provider_meta,
     env_key,
-    is_opencode,
     model_timeout,
     normalize_base_url,
     qualify_model_id,
@@ -179,9 +177,7 @@ def _extra_headers(
 ) -> dict[str, str]:
     """Best-effort request headers (UA spoof + OpenRouter cache/session)."""
     headers: dict[str, str] = {}
-    if is_opencode(provider, base_url) or _provider_meta(provider).get("ua_spoof"):
-        headers["User-Agent"] = OPENCODE_UA
-    elif provider == "custom" and base_url and not _is_local_provider(provider, base_url):
+    if provider == "custom" and base_url and not _is_local_provider(provider, base_url):
         # Custom OpenAI-compatible gateways may block "unknown" HTTP clients by
         # User-Agent (HTTP 401 "unauthorized client") while allowing well-known
         # agent CLIs — same ladder the models fetch uses. Local servers
@@ -947,6 +943,69 @@ def strip_orphaned_tool_calls(msgs: list, logger: Any = None) -> list:
     return msgs
 
 
+# ── Batchable-call detection (shared by both tool loops) ──────────────────
+# The model keeps firing one grep/glob/read per turn even though the tools
+# accept batch parameters (grep `patterns=[...]`, read `filePaths=[...]` /
+# `ranges=[...]`). Prompt instructions alone don't break that habit, so this
+# detector runs mechanically: when a step contains ≥2 calls of the SAME
+# batchable tool that could have been ONE call, a short reminder is appended
+# to the LAST result of that tool so the model sees it with its own results
+# and self-corrects on the next step. Advisory only — never blocks a call.
+_BATCHABLE_TOOLS = {"grep", "glob", "read"}
+
+
+def _batchable_nudge(tcs: list) -> str:
+    """Return a reminder suffix when a step's tool calls could be merged.
+
+    Detects, per batchable tool name, whether ≥2 calls share the same
+    non-batch parameters (path/include for grep/glob; offset/limit for read)
+    — i.e. they differ only in the primary argument (pattern / filePath) and
+    would have been a single call with `patterns=[...]` / `filePaths=[...]`.
+    Calls that ALREADY pass a batch parameter are ignored (the model is
+    already batching). Returns "" when nothing is mergeable.
+    """
+    per_tool: dict[str, list[dict]] = {}
+    for tc in tcs or []:
+        name = (tc.get("name") or "").lower()
+        if name not in _BATCHABLE_TOOLS:
+            continue
+        args = tc.get("args") or {}
+        if "patterns" in args or "filePaths" in args or "ranges" in args:
+            continue  # already a batch call
+        # The primary argument distinguishes the calls; everything else must
+        # match for a merge to be valid (same scope / same window).
+        primary = "filePath" if name == "read" else "pattern"
+        if not args.get(primary):
+            continue
+        rest = {k: v for k, v in args.items() if k != primary}
+        per_tool.setdefault(name, []).append(rest)
+    hints: list[str] = []
+    for name, rests in per_tool.items():
+        if len(rests) < 2:
+            continue
+        # A merge is only valid when the non-primary args are IDENTICAL —
+        # e.g. two greps with different paths must stay separate calls.
+        if any(r != rests[0] for r in rests[1:]):
+            continue
+        if name == "read":
+            hints.append(
+                "read: pass all files in ONE call — filePaths=[...] (same window) "
+                "or ranges=['path:offset:limit', ...] (per-file windows)"
+            )
+        else:
+            hints.append(
+                f"{name}: pass all terms in ONE call — patterns=[...] "
+                "(combines them into a single scan)"
+            )
+    if not hints:
+        return ""
+    return (
+        "\n\n💡 BATCHING REMINDER: these calls could have been ONE tool call:\n"
+        + "\n".join(f"- {h}" for h in hints)
+        + "\nDo that from now on to save tokens and round-trips."
+    )
+
+
 async def langchain_tool_loop(
     model: Any,
     *,
@@ -1112,12 +1171,21 @@ async def langchain_tool_loop(
             tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
         ]
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
+        # Advisory batching reminder: when this step's calls could have been
+        # merged into one batch call, append the hint to the LAST result so
+        # the model sees it alongside the results it just got.
+        _batch_hint = _batchable_nudge(tcs)
         if len(_parallel) > 1:
             _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
         else:
             _results = [await _exec(tc) for tc in _parallel]
-        for tc, result in zip(_parallel, _results):
-            msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
+        for _i, (tc, result) in enumerate(zip(_parallel, _results)):
+            _suffix = _batch_hint if (_batch_hint and _i == len(_parallel) - 1) else ""
+            msgs.append(
+                ToolMessage(
+                    content=str(result) + _suffix, tool_call_id=tc.get("id", "")
+                )
+            )
         for tc in _sequential:
             result = await _exec(tc)
             msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
@@ -1152,9 +1220,10 @@ async def langchain_tool_loop(
                         f"(soft limit: {_TOOL_CALL_SOFT_LIMIT}). "
                         "If you have enough information, STOP calling tools and "
                         "summarize your findings now. "
-                        "If not, batch remaining searches: combine patterns with "
-                        "'|' in a single grep, use filePaths=[...] for multiple "
-                        "reads, and fire them all in ONE parallel turn."
+                        "If not, batch remaining searches: pass all terms via "
+                        "patterns=[...] in a single grep, use filePaths=[...] or "
+                        "ranges=['path:offset:limit', ...] for multiple reads, "
+                        "and fire them all in ONE parallel turn."
                     )
                 )
             )

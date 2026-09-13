@@ -24,7 +24,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 
 from graph import resolve_subagent_model
 
-PROVIDER = "opencode"
+PROVIDER = "custom"
 BASE = "https://opencode.ai/zen/v1"
 KEY = ""
 ENV = "OPENCODE_ZEN_API_KEY"
@@ -32,7 +32,7 @@ OAUTH = ""
 
 
 def _build(entry: str, parent_name: str = "main-model"):
-    """Call resolve_subagent_model with the opencode parent + given entry.
+    """Call resolve_subagent_model with the custom parent + given entry.
 
     Uses ``default_to_parent=False`` to mirror the single-model builder
     semantics: an empty/unset entry yields ``None`` (the resolver is what
@@ -151,7 +151,7 @@ def test_cross_provider_routing():
 
     # head == saved row id -> routes to that provider.
     t = _agents._subagent_target(
-        "local/gemma-4-E2B-it-Q4_K_M.gguf", "opencode",
+        "local/gemma-4-E2B-it-Q4_K_M.gguf", "custom",
         "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY", "",
         lookup,
     )
@@ -165,11 +165,11 @@ def test_cross_provider_routing():
     # Unrecognized prefix -> prefix dropped, routed to the parent provider with
     # just the model id (never the full "provider/model" string).
     t2 = _agents._subagent_target(
-        "unknown/gemma.gguf", "opencode",
+        "unknown/gemma.gguf", "custom",
         "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY", "",
         lambda pid: None,
     )
     assert t2 is not None
-    assert t2[0] == "opencode"
+    assert t2[0] == "custom"
     assert t2[1] == "gemma.gguf"
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderConfig } from "../types";
 import { useStore } from "../lib/store";
-import { PROVIDER_META, isForeignModelId } from "../lib/provider-meta";
+import { isForeignModelId } from "../lib/provider-meta";
 import { ModelTestButton } from "./ModelTestButton";
 import { ProviderTestButton } from "./ProviderTestButton";
 
@@ -12,12 +12,11 @@ function bareModel(p: ProviderConfig, m: string): string {
   return m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m;
 }
 
-/** Display label for a model, e.g. "openrouter/gpt-5". Kinds that use
- *  unprefixed ids (opencode) are shown bare. Uses the provider's NAME (not
- *  its id) so custom rows show a human label like "justwoker/" instead of a
- *  random "custom-mtwl9t08/" slug. */
+/** Display label for a model, e.g. "openrouter/gpt-5". Uses the provider's
+ *  NAME (not its id) so custom rows show a human label like "justwoker/"
+ *  instead of a random "custom-mtwl9t08/" slug. */
 function modelLabel(p: ProviderConfig, m: string): string {
-  return PROVIDER_META[p.kind]?.unprefixedModelId ? m : `${p.name}/${m}`;
+  return `${p.name}/${m}`;
 }
 
 /** Compact provider + model picker shown in the composer. The model list is
@@ -221,9 +220,7 @@ export function ProviderModelSelect() {
                         className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
                         onClick={() => pick(p, model)}
                       >
-                        {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                          <span className="pm-model-provider">{p.name}/</span>
-                        )}
+                        <span className="pm-model-provider">{p.name}/</span>
                         <span className="pm-model-name">{model}</span>
                       </button>
                       <ModelTestButton cfg={p} model={model} />
@@ -265,9 +262,7 @@ export function ProviderModelSelect() {
                               className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
                               onClick={() => pick(p, m)}
                             >
-                              {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                                <span className="pm-model-provider">{p.name}/</span>
-                              )}
+                              <span className="pm-model-provider">{p.name}/</span>
                               <span className="pm-model-name">{m}</span>
                             </button>
                             <ModelTestButton cfg={p} model={m} />

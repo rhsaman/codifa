@@ -124,11 +124,12 @@ async def _run_models_dev_cases() -> None:
         131072,
     )
 
-    # opencode: bare ids stay bare, no spurious prefix key.
-    keys = _models_dev_keys("opencode", "", "deepseek-v4-flash-free")
-    ok &= check("opencode keys", keys, ["opencode"])
+    # custom provider pointed at opencode's gateway: bare ids stay bare, no
+    # spurious prefix key (is_opencode detects the base URL).
+    keys = _models_dev_keys("custom", "https://opencode.ai/zen/v1", "deepseek-v4-flash-free")
+    ok &= check("opencode-gateway keys", keys, ["opencode"])
     ok &= check(
-        "opencode ctx (unknown in this catalog)",
+        "opencode-gateway ctx (unknown in this catalog)",
         _models_dev_context(CATALOG, keys, "deepseek-v4-flash-free"),
         None,
     )

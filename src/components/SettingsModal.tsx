@@ -45,8 +45,8 @@ function providerDescription(p: ProviderConfig): string {
   return KIND_LABELS[p.kind] || p.kind
 }
 
-function modelLabelForOpts(kind: ProviderKind, providerId: string, m: string): string {
-  return PROVIDER_META[kind]?.unprefixedModelId ? m : `${providerId}/${m}`
+function modelLabelForOpts(providerId: string, m: string): string {
+  return `${providerId}/${m}`
 }
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
@@ -119,8 +119,7 @@ function ToolModelSelect({
       // one (the subagent runs on a different provider), else show the bare
       // model id. Legacy bare ids are shown as-is. A doubled prefix from a
       // previously saved value ("providerId/providerId/model") is collapsed.
-      if (p && p.id !== 'opencode') return current.startsWith(`${p.id}/${p.id}/`) ? current.slice(p.id.length + 1) : current
-      if (p) return current.slice(slash + 1)
+      if (p) return current.startsWith(`${p.id}/${p.id}/`) ? current.slice(p.id.length + 1) : current
     }
     return current
   })()
@@ -185,7 +184,7 @@ function ToolModelSelect({
     const terms = q.split(/\s+/).filter(Boolean)
     const models = terms.length
       ? all.filter((m) => {
-          const hay = `${p.name} ${modelLabelForOpts(p.kind, p.id, m)}`.toLowerCase()
+          const hay = `${p.name} ${modelLabelForOpts(p.id, m)}`.toLowerCase()
           return terms.every((t) => hay.includes(t))
         })
       : all
@@ -270,9 +269,7 @@ function ToolModelSelect({
                                 className={`mode-menu-item pm-model ${isActive ? 'active' : ''}`}
                                 onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
                               >
-                                {!PROVIDER_META[p.kind]?.unprefixedModelId && (
-                                  <span className="pm-model-provider">{p.name}/</span>
-                                )}
+                                <span className="pm-model-provider">{p.name}/</span>
                                 <span className="pm-model-name">{m}</span>
                               </button>
                               <ModelTestButton cfg={p} model={m} />

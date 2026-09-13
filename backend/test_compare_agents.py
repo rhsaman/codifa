@@ -42,7 +42,7 @@ class AgentResult:
 async def run_our_agent(
     task: str,
     workspace: str,
-    provider: str = "opencode",
+    provider: str = "openrouter",
     model: str = "qwen3-coder-480b",
     mode: str = "coder",
 ) -> AgentResult:
@@ -375,7 +375,7 @@ async def main():
             print(f"Workspace: {workspace}")
             
             # Run our agent
-            our_result = await run_our_agent(task, workspace, provider="opencode", model="qwen3-coder-480b")
+            our_result = await run_our_agent(task, workspace, provider="openrouter", model="qwen3-coder-480b")
             
             # Create fresh workspace for opencode (to avoid interference)
             with tempfile.TemporaryDirectory(prefix=f"opencode_test_{i}_") as oc_workspace:

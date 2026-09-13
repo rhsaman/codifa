@@ -69,8 +69,8 @@ import {
   sendQueuedNext,
   uid2,
 } from "../lib/chatSends";
-import { composerScrollPadding } from "../lib/scrollPadding";
-import { isAtBottom } from "../lib/scroll";
+import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
+import { isAtBottom, distanceFromBottom, classifyScrollEvent } from "../lib/scroll";
 import {
   GLOBAL_SHORTCUTS,
   PREFIX_LABEL,
@@ -413,6 +413,12 @@ export function ChatPanel() {
   const [initialScrollPos] = useState(() => chat?.scrollPos ?? null);
   const stickToBottom = useRef(!initialScrollPos || initialScrollPos.atBottom);
   const [showJump, setShowJump] = useState(false);
+  /** آستانهٔ نمایش فلش «پرش به پایین»: صفر یعنی محتوای چت هنوز پشت UI شناور
+   *  پنهان نشده (کامپوزر روی فضای رزروشدهٔ انتهای چت شناور است)؛ تا وقتی
+   *  فاصلهٔ اسکرول از پایین از این مقدار نگذرد فلش نمایش داده نمی‌شود. با
+   *  رشد/کوچک شدن کامپوزر یا باز/بسته شدن کارت ask/perm در افکت padding به‌روز
+   *  می‌شود. */
+  const jumpThresholdRef = useRef(0);
   /** Lazy transcript: only the last MSG_PAGE messages render on mount (and on
    *  every chat switch — the panel is keyed by activeChatId). Older messages
    *  load progressively on scroll-to-top or via the "load older" button, so a
@@ -458,9 +464,16 @@ export function ChatPanel() {
    *  → real heights, images, code blocks). Cleared once stable or when the user
    *  scrolls away. */
   const restoreTargetRef = useRef<{ id: string; offset: number } | null>(null);
-  /** The scrollTop the restore last set — used to tell programmatic re-anchors
-   *  apart from a real user scroll (which cancels the restore). */
-  const restoreScrollRef = useRef<number | null>(null);
+  /** True while a programmatic scrollTop set (restore / re-anchor) is "in
+   *  flight": the scroll events it fires must be ignored (they are not user
+   *  scrolls). Raised right before setting scrollTop and lowered on the next
+   *  animation frame — per spec, the scroll events of one set fire in the same
+   *  frame, before the rAF callback, so the flag window exactly covers them.
+   *  Unlike comparing the set value against the event's scrollTop, this is
+   *  immune to the browser clamping the requested value to the scroll range
+   *  (content-visibility placeholders make the requested restore position
+   *  exceed scrollHeight - clientHeight on a fresh mount). */
+  const programmaticScrollRef = useRef(false);
   /** Bumped to force the transcript to the bottom even when the user scrolled
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
   const [scrollTick, setScrollTick] = useState(0);
@@ -772,24 +785,49 @@ export function ChatPanel() {
     if (pos) lastScrollPosRef.current = pos;
   };
 
+  /** Set scrollTop programmatically (restore / re-anchor) while marking the
+   *  resulting scroll events as non-user: raise the flag, set, and lower it on
+   *  the next animation frame — per spec the scroll events of one set fire in
+   *  the same frame, before the rAF callback, so the window exactly covers
+   *  them. Immune to the browser clamping the requested value (which broke the
+   *  old value-comparison approach). */
+  const setProgrammaticScroll = (el: HTMLDivElement, top: number) => {
+    programmaticScrollRef.current = true;
+    el.scrollTop = top;
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  };
+
   const onChatScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     // If the user scrolls away from the position the restore set, stop
     // re-anchoring (the restore is only for the initial viewport).
-    if (
-      restoreTargetRef.current &&
-      restoreScrollRef.current !== null &&
-      el.scrollTop !== restoreScrollRef.current
-    ) {
+    // A programmatic re-anchor (the restore itself re-setting scrollTop as
+    // content-visibility placeholders settle) must NOT be treated as a user
+    // scroll: it fires a scroll event at the clamped position, where
+    // isAtBottom can wrongly report "at bottom" and flip stickToBottom on —
+    // the first message update would then yank the viewport to the end and
+    // overwrite the saved position with atBottom (the "returned to the chat
+    // at the bottom of the page" regression).
+    const { cancelRestore, fromReanchor } = classifyScrollEvent(
+      restoreTargetRef.current,
+      programmaticScrollRef.current,
+    );
+    if (cancelRestore) {
       restoreTargetRef.current = null;
-      restoreScrollRef.current = null;
     }
+    if (fromReanchor) return;
     const atBottom = isAtBottom(el);
     stickToBottom.current = atBottom;
     // Bail out when unchanged so scrolling doesn't re-render the whole panel on
     // every tick — the jump button only flips once per boundary crossing.
-    setShowJump((prev) => (prev === !atBottom ? prev : !atBottom));
+    // آستانهٔ نمایش: محتوا باید واقعاً پشت کامپوزر پنهان شده باشد، نه فقط
+    // چند پیکسل از انتهای محتوا فاصله داشته باشیم (اگر نه، فلش «داخل اینپوت»
+    // به نظر می‌رسد چون کامپوزر روی فضای رزروشدهٔ انتهای چت شناور است).
+    const jumpVisible = distanceFromBottom(el) > jumpThresholdRef.current;
+    setShowJump((prev) => (prev === jumpVisible ? prev : jumpVisible));
     // Reached the top with older messages still unrendered → load the previous
     // page. Anchored via prependAnchorRef so the viewport doesn't jump.
     if (el.scrollTop < 40 && chat && chat.messages.length > msgLimit) {
@@ -851,16 +889,19 @@ export function ChatPanel() {
           const desired =
             el.scrollTop + (aRect.top - cRect.top - target.offset);
           if (Math.abs(desired - el.scrollTop) > 1) {
-            restoreScrollRef.current = desired;
-            el.scrollTop = desired;
-          } else {
-            restoreTargetRef.current = null;
-            restoreScrollRef.current = null;
+            setProgrammaticScroll(el, desired);
+            return;
           }
-        } else {
-          restoreTargetRef.current = null;
-          restoreScrollRef.current = null;
         }
+        // بازیابی تثبیت شد (لنگر پایدار شد یا حذف شد): هم‌زمان با پاک کردن
+        // هدف، وضعیت pin و فلشِ پرش‌به‌پایین را با ویوپورتِ بازیابی‌شده
+        // همگام کن — onChatScroll رویدادهای برنامه‌ای را نادیده می‌گیرد، پس
+        // بدون این همگام‌سازی فلش تا اولین اسکرولِ کاربر مخفی می‌ماند.
+        restoreTargetRef.current = null;
+        const atBottom = isAtBottom(el);
+        stickToBottom.current = atBottom;
+        const jumpVisible = distanceFromBottom(el) > jumpThresholdRef.current;
+        setShowJump((prev) => (prev === jumpVisible ? prev : jumpVisible));
         return;
       }
       const atBottom = isAtBottom(el);
@@ -870,7 +911,8 @@ export function ChatPanel() {
       } else if (atBottom) {
         setShowJump(false);
       } else {
-        setShowJump(true);
+        const jumpVisible = distanceFromBottom(el) > jumpThresholdRef.current;
+        setShowJump((prev) => (prev === jumpVisible ? prev : jumpVisible));
       }
     };
     const ro = new ResizeObserver(reconcile);
@@ -897,7 +939,11 @@ export function ChatPanel() {
       const card = composer.querySelector<HTMLElement>(".ask-card, .perm-card");
       const composerH = composer.getBoundingClientRect().height;
       const cardH = card ? card.getBoundingClientRect().height : null;
-      el.style.paddingBottom = `${composerScrollPadding(composerH, cardH)}px`;
+      const padding = composerScrollPadding(composerH, cardH);
+      el.style.paddingBottom = `${padding}px`;
+      // فلش فقط وقتی معنا دارد که متن‌های چت واقعاً پشت کامپوزر پنهان شده
+      // باشند؛ آستانه = فضای رزروشدهٔ انتهای محتوا منهای ارتفاع UI شناور.
+      jumpThresholdRef.current = jumpVisibleThreshold(padding, composerH + (cardH ?? 0));
     };
     update();
     const ro = new ResizeObserver(update);
@@ -978,7 +1024,7 @@ export function ChatPanel() {
     restoredRef.current = true;
     const containerRect = el.getBoundingClientRect();
     const anchorRect = anchor.getBoundingClientRect();
-    el.scrollTop += anchorRect.top - containerRect.top - pos.offset;
+    setProgrammaticScroll(el, el.scrollTop + (anchorRect.top - containerRect.top - pos.offset));
     setShowJump(false);
     // content-visibility: auto skips off-screen messages on a fresh mount, so
     // the first pass lands near the anchor using 140px placeholders — the
@@ -987,7 +1033,6 @@ export function ChatPanel() {
     // as the browser actually renders the content around the anchor, until the
     // position stabilizes or the user scrolls away.
     restoreTargetRef.current = { id: anchorId, offset: pos.offset };
-    restoreScrollRef.current = el.scrollTop;
   }, [initialScrollPos, msgLimit, chat]);
 
   // Flush the saved scroll position on unmount (chat switch) and on app close
@@ -3683,33 +3728,7 @@ export function ChatPanel() {
               </div>
             )}
         </div>
-        {showJump && (
-          <button
-            className="scroll-jump"
-            title="Scroll to bottom"
-            onClick={() => {
-              stickToBottom.current = true;
-              setShowJump(false);
-              scrollRef.current?.scrollTo({
-                top: scrollRef.current.scrollHeight,
-                behavior: "smooth",
-              });
-            }}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M6 5.5l6 6 6-6" />
-              <path d="M6 12.5l6 6 6-6" />
-            </svg>
-          </button>
-        )}
-      </div>
+        </div>
 
       <div
         ref={composerRef}
@@ -3939,6 +3958,32 @@ export function ChatPanel() {
             );
           })()}
         <div className="composer-inner">
+          {showJump && (
+            <button
+              className="scroll-jump"
+              title="Scroll to bottom"
+              onClick={() => {
+                stickToBottom.current = true;
+                setShowJump(false);
+                scrollRef.current?.scrollTo({
+                  top: scrollRef.current.scrollHeight,
+                  behavior: "smooth",
+                });
+              }}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M6 5.5l6 6 6-6" />
+                <path d="M6 12.5l6 6 6-6" />
+              </svg>
+            </button>
+          )}
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}

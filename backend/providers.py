@@ -18,7 +18,6 @@ import time
 import httpx
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-OPENCODE_BASE = "https://opencode.ai/zen/v1"
 OLLAMA_BASE = "http://localhost:11434"
 # Gemini's OpenAI-compatible endpoint. Both API keys and OAuth access tokens
 # authenticate here via `Authorization: Bearer <credential>`.
@@ -44,14 +43,6 @@ GOOGLE_TOKEN_LEEWAY = 120  # seconds
 # In-memory cache of (access_token, expiry_ts) keyed by the refresh token so a
 # long tool-loop turn doesn't mint a fresh token per request.
 _google_token_cache: dict[str, tuple[str, float]] = {}
-
-# opencode's zen gateway misclassifies plain python/httpx clients as
-# rate-limited: the default `python-httpx/...` User-Agent gets a bogus HTTP
-# 429 `FreeUsageLimitError` even on a healthy free-tier account, while a UA
-# that looks like the real opencode client streams normally. This constant
-# is the hammer used everywhere a request to the zen gateway is built
-# (provider client default headers AND model default headers).
-OPENCODE_UA = "opencode/1.18.15 (npm:@opencode-ai/opencode)"
 
 # Some custom OpenAI-compatible gateways block "unknown" HTTP clients by
 # User-Agent (HTTP 401 "unauthorized client") while allowing well-known
@@ -94,9 +85,12 @@ def model_timeout(
 
 
 def is_opencode(provider: str = "", base_url: str = "") -> bool:
-    """True for the opencode zen gateway (which needs the spoofed UA)."""
-    if _provider_meta(provider).get("ua_spoof"):
-        return True
+    """True for a custom provider pointed at the opencode zen gateway.
+
+    The gateway is no longer a built-in provider kind, but a user-added custom
+    row with an ``opencode.ai`` base URL still needs the gateway's quirks
+    handled (models.dev as the authoritative context source, UA spoofing).
+    """
     return "opencode.ai" in (base_url or "")
 
 # opencode's own /models endpoint does NOT advertise a context window. Rather
@@ -105,8 +99,9 @@ def is_opencode(provider: str = "", base_url: str = "") -> bool:
 # community-maintained, machine-readable catalog that opencode's own docs
 # point to ("Standard providers pull these from models.dev automatically").
 # Cached for MODELS_DEV_CACHE_TTL since the catalog changes rarely. ONLY
-# consulted for provider == "opencode" — openrouter/ollama/custom already
-# report real context via their own APIs.
+# consulted for opencode-compatible gateways (a custom provider pointed at
+# opencode.ai) — openrouter/ollama/custom already report real context via
+# their own APIs.
 MODELS_DEV_API = "https://models.dev/api.json"
 MODELS_DEV_CACHE_TTL = 3600  # seconds
 _models_dev_cache: tuple[float, dict] | None = None
@@ -140,15 +135,11 @@ class ProviderError(RuntimeError):
 #   models_url           Optional override for the model-list URL (cloudflare
 #                        has no /models under /ai/v1).
 #   models_timeout       Optional HTTP timeout for the model-list request.
-#   ua_spoof             Spoof the opencode User-Agent (opencode zen gateway).
-#   continuous_usage     Provider streams cumulative usage per chunk (opencode).
 #   cache_headers        Set openrouter_cache_* breakpoints (openrouter).
 #   auto_think           Gate auto-thinking level by context size (cloud LLMs).
 #   id_prefix            Provider prefix re-added to bare model ids on the
-#                        request (nvidia, openrouter, opencode). opencode's zen
-#                        gateway requires the prefixed form ("opencode/...").
+#                        request (nvidia, openrouter).
 #   strip_models_prefix  Strip a leading `models/` from model ids (google).
-#   free_ctx_fallback    Treat `-free` models as 200K context (opencode).
 #   editable_base_url    User can enter a custom base URL (custom/ollama).
 #   local                Runs locally, no network credential (ollama).
 #   parallel_calls       OpenAI-compatible gateway that honors `parallel_tool_calls`
@@ -176,27 +167,6 @@ _PROVIDERS: dict[str, dict] = {
         "id_prefix": "openrouter",
         "cache_headers": True,
         "auto_think": True,
-        "parallel_calls": True,
-    },
-    "opencode": {
-        "name": "opencode",
-        "requires_key": False,  # free-tier may work keyless; never hard-block
-        "env_vars": ("OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"),
-        "model_class": "openai",
-        "models": "openai",
-        # opencode is its OWN gateway (never routed through OpenRouter) —
-        # configurable via env OPENCODE_BASE_URL, defaulting to opencode.ai.
-        "base_url": OPENCODE_BASE,
-        "env_base_url": "OPENCODE_BASE_URL",
-        "ua_spoof": True,
-        "continuous_usage": True,
-        "auto_think": True,
-        # opencode.ai/zen takes the model id EXACTLY as stored — both bare ids
-        # ("hy3-free") and provider-prefixed ids ("opencode/claude-3.5-sonnet")
-        # are accepted in the form the UI saves them. Do NOT add or strip a
-        # prefix here: qualifying a bare id to "opencode/<id>" is rejected with
-        # HTTP 401 "Model is not supported" (observed for "hy3-free").
-        "free_ctx_fallback": True,
         "parallel_calls": True,
     },
     "ollama": {
@@ -272,7 +242,7 @@ _PROVIDERS: dict[str, dict] = {
 
 # Fallback for kinds without a table entry (custom endpoints) so a machine that
 # only exports one gateway key still works everywhere.
-_ENV_FALLBACK = ("OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENROUTER_API_KEY")
+_ENV_FALLBACK = ("OPENROUTER_API_KEY",)
 
 
 def _provider_meta(provider: str) -> dict:
@@ -294,10 +264,9 @@ def _provider_account(provider: str) -> str:
 def qualify_model_id(provider: str, model: str) -> str:
     """Re-add a provider's model-id prefix when the stored id lost it.
 
-    Some gateways (nvidia, openrouter, opencode) prefix their OWN models with
-    the provider name — ``nvidia/nemotron-mini-4b-instruct``,
-    ``opencode/claude-3.5-sonnet`` — and the API rejects a bare id (opencode
-    responds with HTTP 401 "Model is not supported"). The UI stores the bare
+    Some gateways (nvidia, openrouter) prefix their OWN models with
+    the provider name — ``nvidia/nemotron-mini-4b-instruct`` — and the
+    API rejects a bare id. The UI stores the bare
     form (its picker strips the ``providerId/`` prefix), so put it back when the
     id no longer carries a vendor/model separator. Ids with a slash (e.g.
     ``meta/llama-3.3-70b`` on NVIDIA, ``deepseek/deepseek-chat`` on OpenRouter)
@@ -316,8 +285,7 @@ def env_key(provider: str = "", env_var: str = "") -> str:
 
     When an explicit ``env_var`` name is given (per-provider setting), it is
     read directly from the environment; if that exact variable isn't set we fall
-    back to the provider's other known names (e.g. a machine that only exports
-    OPENCODE_ZEN_API_KEY still works when the app asks for OPENCODE_API_KEY).
+    back to the provider's other known names.
     """
     if env_var and env_var.strip():
         val = os.environ.get(env_var.strip())
@@ -702,7 +670,8 @@ def _models_dev_id(provider: str, model_id: str, base_url: str = "") -> str:
 
     Google's OpenAI-compatible /models returns ids prefixed with ``models/``
     (``models/gemini-2.5-flash``) while models.dev keys them bare; opencode-
-    compatible gateways are cataloged under bare ids too, but the UI can hand
+    compatible gateways (a custom provider pointed at opencode.ai) are
+    cataloged under bare ids too, but the UI can hand
     us ``opencode/deepseek-v4-flash-free`` (the gateway's own /models returns
     the bare ``deepseek-v4-flash-free``). Stripping the ``models/`` prefix for
     google and the ``opencode/`` prefix for opencode lets one catalog lookup
@@ -1303,12 +1272,6 @@ async def list_models(
                     if _is_oc:
                         if dev_ctx:
                             m["context"] = dev_ctx
-                        elif (
-                            not m["context"]
-                            and _provider_meta(provider).get("free_ctx_fallback")
-                            and m["id"].endswith("-free")
-                        ):
-                            m["context"] = 200_000
                     else:
                         # Provider /models context_length is primary; models.dev
                         # only fills the gaps (and still supplies pricing /
@@ -1412,8 +1375,6 @@ async def model_context(
     ctx = _models_dev_context(catalog, _models_dev_keys(provider, base_url, dev_id), dev_id)
     if ctx:
         return ctx
-    if _provider_meta(provider).get("free_ctx_fallback") and model.endswith("-free"):
-        return 200_000
     try:
         enlisted = await list_models(
             provider, base_url, api_key, env_var, oauth_token=oauth_token

@@ -134,6 +134,30 @@ console.log('5) flushNow حین استریم سیو فوری موقعیت را �
   s.setStreaming(false, false)
 }
 
+console.log('6) classifyScrollEvent (تفکیک re-anchor برنامه‌ای از اسکرول کاربر حین بازیابی):')
+{
+  const { classifyScrollEvent } = await import('../src/lib/scroll.ts')
+  const target = { id: 'm1', offset: -20 }
+
+  // رویداد اسکرولِ ناشی از ستِ برنامهَایِ scrollTop (پرچم programmatic):
+  const re = classifyScrollEvent(target, true)
+  check('re-anchor برنامه‌ای نادیده گرفته میشود (stickToBottom دست نمیخورد)', re.fromReanchor === true && re.cancelRestore === false, re)
+
+  // کاربر خودش اسکرول کرده (پرچم پایین) → بازیابی لغو شود:
+  const user = classifyScrollEvent(target, false)
+  check('اسکرول واقعی کاربر بازیابی را لغو میکند', user.cancelRestore === true && user.fromReanchor === false, user)
+
+  // بدون بازیابی فعال → رویداد عادی:
+  const plain = classifyScrollEvent(null, false)
+  check('بدون بازیابی فعال رویداد عادی است', plain.cancelRestore === false && plain.fromReanchor === false, plain)
+
+  // رگرسیون: حین بازیابی، ستِ برنامه‌ایِ scrollTop به انتها clamp میشود
+  // (placeholderهای content-visibility) — چون تفکیک با پرچم است (نه مقایسهٔ
+  // مقداری)، این رویداد همچنان برنامهَای تلقی میشود و «در پایین» نیست:
+  const clamped = classifyScrollEvent(target, true)
+  check('clamp شدنِ re-anchor به انتها همچنان نادیده گرفته میشود', clamped.fromReanchor === true && clamped.cancelRestore === false, clamped)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست ناموفق`)
   process.exit(1)

@@ -56,13 +56,15 @@ console.log('3) prefix همان provider اشتباه گرفته نمی‌شود
 }
 
 console.log('')
-console.log('4) opencode (unprefixedModelId=true): idهای خام داخلی هستند:')
+console.log('4) ردیف custom با نام "opencode" (id دلخواه کاربر): idهای خام داخلی هستند:')
 {
+  // کاربر می‌تواند ردیف custom خودش را "opencode" نام‌گذاری کند؛ idهای خام
+  // بدون اسلش داخلی‌اند و self-prefix هم strip می‌شود.
   const oc = { id: 'opencode' }
   check('big-pickle داخلی است (id خام)', !isForeignModelId(oc, bareModel(oc, 'big-pickle')))
   check('gpt-5 داخلی است (id خام)', !isForeignModelId(oc, bareModel(oc, 'gpt-5')))
-  // self-prefix در عمل بی‌ضرر است چون bareModel/opencode prefix را strip
-  // می‌کند، و helper نباید entry دستی کاربر را حذف کند.
+  // self-prefix در عمل بی‌ضرر است چون bareModel prefix را strip می‌کند،
+  // و helper نباید entry دستی کاربر را حذف کند.
   check('opencode/big-pickle (self-prefix) داخلی است چون head===p.id', !isForeignModelId(oc, bareModel(oc, 'opencode/big-pickle')))
 }
 
@@ -93,7 +95,7 @@ console.log('6) سناریوی کلیدی: p.id=local با entry doubly-prefixed
 console.log('')
 console.log('7) FOREIGN_PROVIDER_PREFIXES همه kindهای built-in را شامل می‌شود:')
 {
-  for (const k of ['opencode', 'openrouter', 'google', 'nvidia', 'cloudflare', 'tokenrouter', 'ollama', 'custom']) {
+  for (const k of ['openrouter', 'google', 'nvidia', 'cloudflare', 'tokenrouter', 'ollama', 'custom', 'anthropic']) {
     check(`kind "${k}" در مجموعه است`, FOREIGN_PROVIDER_PREFIXES.has(k))
   }
 }

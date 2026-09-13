@@ -63,6 +63,9 @@ async def run_scenario(monkeypatch, scenario):
         "model": Model(), "lc_tools": [], "tools": {"grep": grep},
         "messages": initial,
     }))
+    # نادجِ batching مشاوره‌ای است و مستقل از projection — برای ایزوله‌کردن
+    # رفتار projection، اینجا خاموش می‌شود تا محتوای ToolMessageها دست‌نخورده بماند.
+    monkeypatch.setattr(graph, "_batchable_nudge", lambda tcs: "")
     monkeypatch.setattr(graph, "_load_turn_checkpoint_valid", AsyncMock(return_value=resumed))
     monkeypatch.setattr(graph, "_save_turn_checkpoint", save_checkpoint)
     monkeypatch.setattr(graph, "_clear_turn_checkpoint", AsyncMock())

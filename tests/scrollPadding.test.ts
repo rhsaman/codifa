@@ -1,5 +1,5 @@
 // Quick sanity test for src/lib/scrollPadding.ts (run: node test/scrollPadding.test.ts)
-import { composerScrollPadding } from '../src/lib/scrollPadding.ts'
+import { composerScrollPadding, jumpVisibleThreshold } from '../src/lib/scrollPadding.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -35,6 +35,18 @@ console.log('3) تکستاریای بزرگ (کامپوزر بلند):')
 console.log('4) کارت با ارتفاع صفر مثل نبودن کارت رفتار میکند:')
 {
   check('cardH=0 → بدون فاصله 10px', composerScrollPadding(142, 0) === 210)
+}
+
+console.log('5) آستانهٔ نمایش فلش پرش به پایین (jumpVisibleThreshold):')
+{
+  // حالت عادی: padding=210، کامپوزر=142 → محتوا از 68px فاصله از پایین پنهان میشود
+  const idle = jumpVisibleThreshold(210, 142)
+  check('حالت عادی → padding منهای ارتفاع کامپوزر', idle === 68, idle)
+  // با کارت باز: padding=376، کامپوزر+کارت=342 → آستانهٔ بزرگتر
+  const withCard = jumpVisibleThreshold(376, 342)
+  check('کارت باز → آستانهٔ بزرگتر (محتوا دیرتر پنهان میشود)', withCard === 34, withCard)
+  // کامپوزر بلندتر از padding (نمی‌شود منفی)
+  check('هرگز منفی نمیشود', jumpVisibleThreshold(100, 300) === 0)
 }
 
 if (failed > 0) {

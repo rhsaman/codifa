@@ -1,6 +1,6 @@
 """Unit test: list_models reasoning resolution for auto_think providers.
 
-Cloud gateways flagged `auto_think` (opencode, openrouter, nvidia, cloudflare,
+Cloud gateways flagged `auto_think` (openrouter, nvidia, cloudflare,
 tokenrouter) support steering a reasoning effort regardless of the model id.
 When neither the /models payload nor the models.dev catalog says otherwise,
 list_models must treat them as reasoning-capable (True) instead of falling back
@@ -30,23 +30,23 @@ def _empty_catalog():
 
 
 async def test_auto_think_provider_unknown_model_is_reasoning():
-    """opencode model with no reasoning signal → True (auto_think)."""
+    """openrouter model with no reasoning signal → True (auto_think)."""
     _model_cache.clear()
     client = _make_client({"data": [{"id": "hy3-free"}]})
     with mock.patch("providers.httpx.AsyncClient", return_value=client), \
          mock.patch("providers._models_dev_catalog", return_value=_empty_catalog()):
-        models = await list_models("opencode", "http://x/v1", "key")
+        models = await list_models("openrouter", "http://x/v1", "key")
     assert models[0]["id"] == "hy3-free"
     assert models[0]["reasoning"] is True
 
 
 async def test_auto_think_provider_explicit_false_is_respected():
-    """opencode model with explicit reasoning=False → False (payload wins)."""
+    """openrouter model with explicit reasoning=False → False (payload wins)."""
     _model_cache.clear()
     client = _make_client({"data": [{"id": "some-model", "reasoning": False}]})
     with mock.patch("providers.httpx.AsyncClient", return_value=client), \
          mock.patch("providers._models_dev_catalog", return_value=_empty_catalog()):
-        models = await list_models("opencode", "http://x/v1", "key")
+        models = await list_models("openrouter", "http://x/v1", "key")
     assert models[0]["reasoning"] is False
 
 
@@ -61,12 +61,12 @@ async def test_non_auto_think_provider_unknown_model_is_none():
 
 
 async def test_auto_think_provider_explicit_true_is_respected():
-    """opencode model with explicit reasoning=True → True."""
+    """openrouter model with explicit reasoning=True → True."""
     _model_cache.clear()
     client = _make_client({"data": [{"id": "weird-model", "reasoning": True}]})
     with mock.patch("providers.httpx.AsyncClient", return_value=client), \
          mock.patch("providers._models_dev_catalog", return_value=_empty_catalog()):
-        models = await list_models("opencode", "http://x/v1", "key")
+        models = await list_models("openrouter", "http://x/v1", "key")
     assert models[0]["reasoning"] is True
 
 

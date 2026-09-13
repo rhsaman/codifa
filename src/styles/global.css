@@ -2,6 +2,11 @@
   --bg: #1e1e2e;
   --bg-alt: #181825;
   --bg-panel: #313244;
+  /* Inset "well" surface for expanded tool bodies (DURATION/SUMMARY/ARGS):
+     derived from the theme itself — sits between the chat background (--bg)
+     and the card frame (--bg-panel), so the body reads as recessed vs the
+     frame without leaving the theme palette. */
+  --bg-inset: color-mix(in srgb, var(--bg) 60%, var(--bg-panel) 40%);
   /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs). */
   --bg-raised: #45475a;
   --bg-input: #45475a;
@@ -19,7 +24,6 @@
      badge in the Model usage panel -- Catppuccin Mocha peach. */
   --fresh: #fab387;
   /* Per-provider dot colors for the Model usage panel — fallback (Catppuccin). */
-  --provider-opencode: #f38ba8;
   --provider-openrouter: #fab387;
   --provider-google: #f9e2af;
   --provider-nvidia: #94e2d5;
@@ -1648,11 +1652,6 @@ textarea {
 }
 
 /* Per-provider dot colors — matched via data-provider attribute. */
-.usage-group[data-provider="opencode"] .usage-group-dot {
-  background: var(--provider-opencode);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-opencode) 25%, transparent);
-}
-
 .usage-group[data-provider="openrouter"] .usage-group-dot {
   background: var(--provider-openrouter);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-openrouter) 25%, transparent);
@@ -2400,23 +2399,35 @@ textarea {
   position: relative;
 }
 
-/* Floating "jump to bottom" pill. Was `position: absolute` — which anchors it
-   to the bottom of the CONTENT, so scrolling up carried it out of view (the
-   exact moment you need it). `position: sticky` pins it to the bottom of the
-   scrollport instead, so it floats above the last visible message. */
+/* Floating "jump to bottom" pill, Claude-style: floats centered fully ABOVE
+   the composer card with a small gap (no overlap). Anchored to .composer-inner
+   (position: relative) so it tracks the card, not the scroll content. */
+/* Dedicated entrance animation for .scroll-jump: fade-only so the button's
+   own translate(-50%, -100%) transform is never overridden — any keyframe
+   transform would render the button un-centered INSIDE the card while the
+   animation runs (it "pops" above the composer only after it finishes). */
+@keyframes scroll-jump-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
 .scroll-jump {
-  position: sticky;
-  bottom: 14px;
-  align-self: flex-end;
-  flex: 0 0 auto;
-  margin-inline-end: 4px;
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translate(-50%, -100%);
   z-index: 30;
-  width: 36px;
-  height: 36px;
-  min-width: 36px;
-  min-height: 36px;
-  max-width: 36px;
-  max-height: 36px;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  max-width: 32px;
+  max-height: 32px;
   padding: 0;
   border-radius: 50%;
   border: 1px solid var(--border);
@@ -2431,7 +2442,7 @@ textarea {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.07),
     0 8px 22px rgba(0, 0, 0, 0.3);
-  animation: popover-in 0.15s ease;
+  animation: scroll-jump-in 0.15s ease;
   transition:
     background 0.15s ease,
     transform 0.15s ease,
@@ -2440,15 +2451,15 @@ textarea {
 }
 
 .scroll-jump svg {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   transition: transform 0.15s ease;
 }
 
 .scroll-jump:hover {
   background: var(--accent-dim);
   color: var(--text);
-  transform: translateY(-1px);
+  transform: translate(-50%, calc(-100% - 1px));
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.09),
     0 10px 26px rgba(0, 0, 0, 0.35);
@@ -2459,7 +2470,7 @@ textarea {
 }
 
 .scroll-jump:active {
-  transform: translateY(0) scale(0.94);
+  transform: translate(-50%, -100%) scale(0.94);
 }
 
 .chat-messages {
@@ -7919,8 +7930,12 @@ textarea {
 }
 
 .tool-card-body {
-  padding: 9px 10px 10px;
+  /* هم‌تراز با .tool-card-head (12px افقی) */
+  padding: 9px 12px 10px;
   border-top: 1px solid var(--border);
+  /* چاهک فرورفتهٔ مشتق از خود تم: کمی تیره‌تر از قاب کارت تا نوشته‌ها
+     (SUMMARY/ARGS) از head متمایز شوند، بدون هاردکد رنگ خارج از پالت */
+  background: var(--bg-inset);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -8409,8 +8424,9 @@ textarea {
 
 /* پنل expanded */
 .trace-row.edit-file .trace-row-expand {
-  padding: 0;
-  background: transparent;
+  /* هم‌تراز با .trace-row-head (12px) — نه صفر، تا SUMMARY/ARGS/DIFF
+     به لبهٔ کارت نچسبند */
+  padding: 0 12px;
 }
 
 /* بخش‌های SUMMARY / ARGS / DIFF */
@@ -8580,9 +8596,13 @@ textarea {
 }
 
 .trace-row-expand {
-  padding: 6px 0;
+  /* هم‌تراز با .trace-row-head (12px) تا محتوای DURATION/SUMMARY/ARGS
+     به لبهٔ کارت نچسبد */
+  padding: 6px 12px;
   border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.08));
-  background: color-mix(in srgb, var(--bg, #1a1a1a) 50%, transparent);
+  /* سطح بدنه مشتق از خود تم (--bg-inset): نوشته‌ها (DURATION/SUMMARY/ARGS)
+     از head و پس‌زمینهٔ چت متمایز می‌شوند */
+  background: var(--bg-inset);
 }
 
 .trace-expand-section {

@@ -71,6 +71,7 @@ from _common import (
 )
 from agents import normalize_mode
 from llm import (
+    _batchable_nudge,
     _is_parallel_calls_error,
     _is_reasoning_effort_error,
     _is_stream_options_error,
@@ -3157,6 +3158,11 @@ async def _run_mode_turn(
             _sequential = [
                 tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS
             ]
+            # Advisory batching reminder (same detector as the sub-agent loop):
+            # when this step's calls could have been ONE batch call, append the
+            # hint to the LAST parallel result so the model sees it with its
+            # own results and self-corrects on the next step.
+            _batch_hint = _batchable_nudge(_pending)
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
                     *[
@@ -3169,9 +3175,14 @@ async def _run_mode_turn(
                     await _execute_tool(tc.get("name") or "", tc.get("args") or {})
                     for tc in _parallel
                 ]
-            for tc, result in zip(_parallel, _results):
+            for _i, (tc, result) in enumerate(zip(_parallel, _results)):
+                _suffix = (
+                    _batch_hint if (_batch_hint and _i == len(_parallel) - 1) else ""
+                )
                 msgs.append(
-                    ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
+                    ToolMessage(
+                        content=str(result) + _suffix, tool_call_id=tc.get("id", "")
+                    )
                 )
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a

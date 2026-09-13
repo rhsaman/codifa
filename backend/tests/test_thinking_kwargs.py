@@ -26,7 +26,7 @@ def test_xhigh_is_no_longer_a_valid_level():
 
 
 def test_auto_think_cloud_provider_gets_reasoning_effort():
-    for provider in ("openrouter", "opencode", "nvidia", "cloudflare", "tokenrouter"):
+    for provider in ("openrouter", "nvidia", "cloudflare", "tokenrouter"):
         kw = _thinking_kwargs(provider, "some-model", "high")
         assert kw == {"reasoning_effort": "high"}, provider
 

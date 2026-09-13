@@ -15,9 +15,9 @@ console.log('1) مدل‌های hy3 (مثل hy3-free) دیگر از روی نا�
 {
   // هیوریستیک نام‌محور نباید مدل‌هایی مثل hy3-free را بدون سیگنال بک‌اند تشخیص دهد
   // (هارد‌کد حذف شد — شناسایی از فیلد reasoning اندپوینت /models می‌آید).
-  check('hy3-free بدون پرچم reasoning رد می‌شود', supportsReasoning('hy3-free', 'opencode') === false)
-  check('opencode/hy3-free (فرم پیشوند‌دار) بدون پرچم رد می‌شود', supportsReasoning('opencode/hy3-free', 'opencode') === false)
-  check('HY3-FREE (حساس به بزرگی/کوچکی نیست) بدون پرچم رد می‌شود', supportsReasoning('HY3-FREE', 'opencode') === false)
+  check('hy3-free بدون پرچم reasoning رد می‌شود', supportsReasoning('hy3-free', 'custom') === false)
+  check('opencode/hy3-free (فرم پیشوند‌دار) بدون پرچم رد می‌شود', supportsReasoning('opencode/hy3-free', 'custom') === false)
+  check('HY3-FREE (حساس به بزرگی/کوچکی نیست) بدون پرچم رد می‌شود', supportsReasoning('HY3-FREE', 'custom') === false)
 }
 
 console.log('')
@@ -32,14 +32,14 @@ console.log('')
 console.log('3) مدل‌های غیر-reasoning رد می‌شوند:')
 {
   check('gpt-4o رد می‌شود', supportsReasoning('gpt-4o', 'openai') === false)
-  check('مدل خالی رد می‌شود', supportsReasoning('', 'opencode') === false)
+  check('مدل خالی رد می‌شود', supportsReasoning('', 'custom') === false)
 }
 
 console.log('')
 console.log('4) پرچم صریح reasoning بر هیوریستیک اولویت دارد:')
 {
-  check('reasoning=false رد می‌شود حتی برای مدل ناشناخته', supportsReasoning('weird-model', 'opencode', false) === false)
-  check('reasoning=true تایید می‌شود حتی برای مدل ناشناخته', supportsReasoning('weird-model', 'opencode', true) === true)
+  check('reasoning=false رد می‌شود حتی برای مدل ناشناخته', supportsReasoning('weird-model', 'custom', false) === false)
+  check('reasoning=true تایید می‌شود حتی برای مدل ناشناخته', supportsReasoning('weird-model', 'custom', true) === true)
 }
 
 if (failed > 0) {

@@ -23,7 +23,7 @@ const REASONING_PATTERNS: RegExp[] = [
 
 export function supportsReasoning(
   modelId: string,
-  kind: ProviderKind = 'opencode',
+  kind: ProviderKind = 'openrouter',
   reasoning?: boolean | null,
 ): boolean {
   const id = (modelId || '').trim()

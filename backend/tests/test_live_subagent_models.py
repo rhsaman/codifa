@@ -25,8 +25,8 @@ from llm import (
 )
 
 PROVIDERS = {
-    "opencode": {
-        "id": "opencode", "kind": "opencode",
+    "opencode-gw": {
+        "id": "opencode-gw", "kind": "custom",
         "baseUrl": "https://opencode.ai/zen/v1", "apiKey": "",
         "envVar": "OPENCODE_ZEN_API_KEY", "oauthRefreshToken": "",
     },
@@ -43,7 +43,7 @@ PROVIDERS = {
 }
 
 PARENT = {
-    "parent_provider": "opencode",
+    "parent_provider": "custom",
     "parent_base_url": "https://opencode.ai/zen/v1",
     "parent_api_key": "",
     "parent_env_var": "OPENCODE_ZEN_API_KEY",

@@ -13,3 +13,14 @@ export function composerScrollPadding(composerH: number, cardH: number | null): 
   const card = cardH ? cardH + 10 : 0;
   return Math.max(210, composerH + card + 24);
 }
+
+/** آستانهٔ نمایش فلش «پرش به پایین»: فاصلهٔ اسکرول از پایین که در آن محتوای
+ *  چت شروع به پنهان شدن پشت UI شناور (کامپوزر + کارت ask/perm) می‌کند.
+ *
+ *  آخرین پیام `paddingBottom` بالاتر از انتهای محتوا می‌نشیند و UI شناور
+ *  `floatingH` پایینِ ویوپورت را می‌پوشاند؛ پس محتوا فقط وقتی پشت آن پنهان
+ *  می‌شود که فاصله از پایین از همین شکاف بگذرد. کمتر از آن، کامپوزر فقط روی
+ *  فضای رزروشدهٔ انتهای چت شناور است و فلش نباید نمایش داده شود. */
+export function jumpVisibleThreshold(paddingBottom: number, floatingH: number): number {
+  return Math.max(0, paddingBottom - floatingH);
+}

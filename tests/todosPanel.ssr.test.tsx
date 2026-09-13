@@ -85,32 +85,53 @@ console.log("۴) loadTodoPanelUi — مهاجرت از x قدیمی (لنگر چ
   const res = loadTodoPanelUi()
   // right = innerWidth(1200) - x(884) - PANEL_W(300) = 16
   check("x → right با کسر عرض پنل", res.right === 16, res)
-  check("y دست نمی‌خورد و height ۳۲۰ ریست می‌شود", res.y === 46 && res.height === undefined, res)
+  check("y دست نمی‌خورد و height قدیمی حذف می‌شود", res.y === 46 && res.height === undefined, res)
 }
 
-console.log("۵) loadTodoPanelUi — کلید جدید با right مستقیم:")
+console.log("۵) loadTodoPanelUi — کلید جدید با right مستقیم (v2):")
 {
   localStorage._d = {
-    "coder:todoPanel": JSON.stringify({ right: 100, y: 200, collapsed: true, height: 400 }),
+    "coder:todoPanel": JSON.stringify({
+      v: 2,
+      right: 100,
+      y: 200,
+      collapsed: true,
+      heights: { "chat-a": 400 },
+    }),
   }
   const res = loadTodoPanelUi()
-  check("مقادیر کلید جدید استفاده می‌شوند", res.right === 100 && res.y === 200 && res.collapsed === true && res.height === 400)
+  check("مقادیر کلید جدید استفاده می‌شوند", res.right === 100 && res.y === 200 && res.collapsed === true, res)
+  check("heights خوانده می‌شود", res.heights?.["chat-a"] === 400, res)
 }
 
-console.log("۶) loadTodoPanelUi — مهاجرت از coder:sidebarUi قدیمی:")
+console.log("۶) loadTodoPanelUi — مهاجرت v2: ذخیرهٔ قدیمی بدون v → heights ریست:")
+{
+  localStorage._d = {
+    "coder:todoPanel": JSON.stringify({
+      right: 16,
+      y: 46,
+      height: 300,
+      heights: { "chat-a": 400, "chat-b": 250 },
+    }),
+  }
+  const res = loadTodoPanelUi()
+  // نسخهٔ باگ‌دار قبلی ارتفاع جاریِ چت فعال را هم در heights می‌نوشت؛
+  // رکوردهای آلوده از ریسایز واقعی قابل تفکیک نیستند → همه ریست.
+  check("heights آلوده حذف می‌شود", res.heights === undefined, res)
+  check("height قدیمی حذف می‌شود", res.height === undefined, res)
+  check("موقعیت و collapsed حفظ می‌شوند", res.right === 16 && res.y === 46, res)
+}
+
+console.log("۷) loadTodoPanelUi — مهاجرت از coder:sidebarUi قدیمی:")
 {
   localStorage._d = {
     "coder:sidebarUi": JSON.stringify({ todoCollapsed: true, todoHeight: 200 }),
   }
   const res = loadTodoPanelUi()
   check("todoCollapsed → collapsed", res.collapsed === true)
-  check("todoHeight → height", res.height === 200)
-
-  localStorage._d = {
-    "coder:sidebarUi": JSON.stringify({ todoHeight: 320 }),
-  }
-  const res2 = loadTodoPanelUi()
-  check("todoHeight ۳۲۰ (پیش‌فرض قدیمی) ریست می‌شود", res2.height === undefined, res2)
+  // todoHeight سراسری بود و زیر مدل per-chat جا نمی‌شود → نادیده گرفته
+  // می‌شود تا پیش‌فرضِ بر اساس تعداد todo اعمال شود.
+  check("todoHeight نادیده گرفته می‌شود", res.height === undefined && res.heights === undefined, res)
 }
 
 console.log("۷) loadTodoPanelUi — بدون ذخیره → آبجکت خالی:")
@@ -137,45 +158,46 @@ console.log("۹) clampPos — مقادیر سالم دست نمی‌خورند:"
   check("بدون تغییر", res.right === 16 && res.y === 46)
 }
 
-console.log("۱۰) ارتفاع per-chat — خواندن از heights و fallback به height عمومی:")
+console.log("۱۰) ارتفاع per-chat — خواندن heights در ذخیرهٔ v2:")
 {
   localStorage._d = {
     "coder:todoPanel": JSON.stringify({
+      v: 2,
       right: 16,
       y: 46,
       heights: { "chat-a": 400 },
-      height: 200,
     }),
   }
   const res = loadTodoPanelUi()
   check("heights برای chat-a خوانده می‌شود", res.heights?.["chat-a"] === 400, res)
-  check("height عمومی به‌عنوان fallback حفظ می‌شود", res.height === 200, res)
 }
 
-console.log("۱۱) ارتفاع per-chat — چت بدون رکورد → fallback به height عمومی:")
+console.log("۱۱) ارتفاع per-chat — چت بدون رکورد → پیش‌فرضِ تعداد (نه height عمومی):")
 {
+  const { heightForChat } = await import("../src/components/TodosPanel")
   localStorage._d = {
     "coder:todoPanel": JSON.stringify({
+      v: 2,
       right: 16,
       y: 46,
       heights: { "chat-a": 400 },
-      height: 220,
     }),
   }
   const res = loadTodoPanelUi()
-  // chat-b رکورد ندارد → کامپوننت باید height عمومی (۲۲۰) را بردارد
   check("heights بدون chat-b", res.heights?.["chat-b"] === undefined, res)
-  check("height عمومی ۲۲۰ موجود است", res.height === 220, res)
+  // chat-b رکورد ندارد → ارتفاع مؤثر از پیش‌فرضِ تعداد می‌آید
+  check("ارتفاع مؤثر chat-b = پیش‌فرضِ تعداد", heightForChat(res.heights, "chat-b", 5) === 116)
 }
 
-console.log("۱۲) ارتفاع per-chat — بدون heights اصلاً (ذخیرهٔ قدیمی):")
+console.log("۱۲) ارتفاع per-chat — ذخیرهٔ v2 بدون heights اصلاً:")
 {
   localStorage._d = {
-    "coder:todoPanel": JSON.stringify({ right: 16, y: 46, height: 300 }),
+    "coder:todoPanel": JSON.stringify({ v: 2, right: 16, y: 46 }),
   }
   const res = loadTodoPanelUi()
   check("heights تعریف نمی‌شود", res.heights === undefined, res)
-  check("height عمومی ۳۰۰ خوانده می‌شود", res.height === 300, res)
+  const { heightForChat } = await import("../src/components/TodosPanel")
+  check("ارتفاع مؤثر = پیش‌فرضِ تعداد", heightForChat(res.heights, "chat-x", 10) === 226)
 }
 
 console.log("۱۳) defaultHeightFor — ارتفاع پیش‌فرض بر اساس تعداد todoها:")
@@ -204,10 +226,10 @@ console.log("۱۴) withChatHeight — ادغام ارتفاع بدون از دس
 console.log("۱۵) heightForChat — زنجیرهٔ fallback ارتفاع مؤثر یک چت:")
 {
   const { heightForChat } = await import("../src/components/TodosPanel")
-  check("ارتفاع صریح چت برنده می‌شود", heightForChat({ "chat-a": 400 }, 200, "chat-a", 5) === 400)
-  check("چت بدون رکورد → ارتفاع قدیمی عمومی", heightForChat({ "chat-a": 400 }, 200, "chat-b", 5) === 200)
-  check("بدون رکورد و بدون قدیمی → پیش‌فرضِ تعداد", heightForChat(undefined, undefined, "chat-b", 5) === 116)
-  check("heights خالی → حداقل پیش‌فرض", heightForChat({}, undefined, "chat-x", 0) === 60)
+  check("ارتفاع صریح چت برنده می‌شود", heightForChat({ "chat-a": 400 }, "chat-a", 5) === 400)
+  check("چت بدون رکورد → پیش‌فرضِ تعداد", heightForChat({ "chat-a": 400 }, "chat-b", 5) === 116)
+  check("بدون رکورد → پیش‌فرضِ تعداد", heightForChat(undefined, "chat-b", 5) === 116)
+  check("heights خالی → حداقل پیش‌فرض", heightForChat({}, "chat-x", 0) === 60)
 }
 
 if (failed > 0) {

@@ -8,16 +8,13 @@ import type { ChatMessage } from "../types";
 const PANEL_W = 300;
 
 /** وضعیت ذخیره‌شدهٔ پنل Todos (localStorage با کلید `coder:todoPanel`):
- *  فاصله از لبهٔ راست پنجره، فاصله از بالا، حالت جمع‌شده و ارتفاع محتوا.
- *  لنگرِ «راست» یعنی با بزرگ/کوچک‌شدن پنجره، فاصله از لبهٔ راست خودکار
- *  حفظ می‌شود و پنل از گوشه نمی‌پرد. */
+ *  فاصله از لبهٔ راست پنجره، فاصله از بالا، حالت جمع‌شده و ارتفاع‌های
+ *  per-chat. لنگرِ «راست» یعنی با بزرگ/کوچک‌شدن پنجره، فاصله از لبهٔ
+ *  راست خودکار حفظ می‌شود و پنل از گوشه نمی‌پرد. */
 interface TodoPanelUi {
   right?: number;
   y?: number;
   collapsed?: boolean;
-  /** ارتفاع قدیمی (قبل از per-chat) — فقط به‌عنوان fallback چت‌های
-   *  بدون ارتفاع ذخیره‌شده استفاده می‌شود. */
-  height?: number;
   /** ارتفاع‌های صریحِ ریسایزشده به‌ازای هر چت — کلید = chatId؛ چت بدون
    *  رکورد پیش‌فرضِ بر اساس تعداد todo می‌گیرد. */
   heights?: Record<string, number>;
@@ -41,26 +38,25 @@ export function loadTodoPanelUi(): TodoPanelUi {
   try {
     const raw = localStorage.getItem("coder:todoPanel");
     if (raw) {
-      const p = JSON.parse(raw) as TodoPanelUi & { x?: number };
-      const { x, ...rest } = p;
+      const p = JSON.parse(raw) as TodoPanelUi & { x?: number; v?: number };
+      const { x, v, ...rest } = p;
       const ui: TodoPanelUi =
         rest.right === undefined && x !== undefined
           ? { ...rest, right: window.innerWidth - x - PANEL_W }
           : rest;
-      // ارتفاع ۳۲۰ پیش‌فرض قدیمی بود (خیلی بلند) — در همهٔ مسیرها به
-      // پیش‌فرض جدید ریست می‌شود؛ ارتفاع‌های دیگر انتخاب عمدی کاربرند.
-      return ui.height === 320 ? { ...ui, height: undefined } : ui;
+      // مهاجرت یک‌بارهٔ v2: نسخهٔ باگ‌دار قبلی ارتفاع جاریِ چت فعال (حتی
+      // پیش‌فرضِ) را در heights می‌نوشت؛ رکوردهای آلوده از ریسایز واقعی
+      // قابل تفکیک نیستند → با اولین اجرای v2 همهٔ ارتفاع‌ها ریست
+      // می‌شوند تا پیش‌فرضِ بر اساس تعداد todo دوباره حاکم شود.
+      if (v !== 2) return { right: ui.right, y: ui.y, collapsed: ui.collapsed };
+      return ui;
     }
     const legacy = localStorage.getItem("coder:sidebarUi");
     if (legacy) {
-      const l = JSON.parse(legacy) as {
-        todoCollapsed?: boolean;
-        todoHeight?: number;
-      };
-      return {
-        collapsed: l.todoCollapsed,
-        height: l.todoHeight === 320 ? undefined : l.todoHeight,
-      };
+      const l = JSON.parse(legacy) as { todoCollapsed?: boolean };
+      // todoHeight قدیمی سراسری بود و زیر مدل per-chat جا نمی‌شود —
+      // نادیده گرفته می‌شود تا پیش‌فرضِ بر اساس تعداد todo اعمال شود.
+      return { collapsed: l.todoCollapsed };
     }
   } catch {
     /* JSON خراب — پیش‌فرض‌ها برمی‌گردند */
@@ -94,16 +90,14 @@ export function withChatHeight(
   return chatId ? { ...heights, [chatId]: height } : { ...heights };
 }
 
-/** ارتفاع مؤثر یک چت: اول ارتفاع صریحِ ریسایزشدهٔ همان چت، بعد ارتفاع قدیمی
- *  عمومی (fallback ذخیره‌های قدیمی) و در نهایت پیش‌فرض بر اساس تعداد todoها.
- *  خالص (pure) تا تست بتواند مستقیم صدا بزند. */
+/** ارتفاع مؤثر یک چت: ارتفاع صریحِ ریسایزشدهٔ همان چت و در غیر این صورت
+ *  پیش‌فرض بر اساس تعداد todoها. خالص (pure) تا تست مستقیم صدا بزند. */
 export function heightForChat(
   heights: Record<string, number> | undefined,
-  legacyHeight: number | undefined,
   chatId: string,
   todoCount: number,
 ): number {
-  return heights?.[chatId] ?? legacyHeight ?? defaultHeightFor(todoCount);
+  return heights?.[chatId] ?? defaultHeightFor(todoCount);
 }
 
 export function TodosPanel() {
@@ -130,7 +124,7 @@ export function TodosPanel() {
   const [heights, setHeights] = useState<Record<string, number>>(
     ui.heights ?? {},
   );
-  const height = heightForChat(heights, ui.height, chatId, todos.length);
+  const height = heightForChat(heights, chatId, todos.length);
 
   // ذخیره با debounce (درگ هر فریم state عوض می‌کند؛ نوشتن localStorage در
   // هر فریم درگ را می‌لرزاند) + flush هم‌زمان روی بستن اپ — همان الگوی
@@ -143,10 +137,9 @@ export function TodosPanel() {
           right: pos.right,
           y: pos.y,
           collapsed,
-          // ارتفاع قدیمی فقط pass-through می‌شود (fallback ذخیره‌های قدیمی)؛
-          // ارتفاع‌های صریح فقط از ریسایز می‌آیند — چت‌های بدون ریسایز روی
-          // پیش‌فرضِ بر اساس تعداد todo می‌مانند.
-          height: ui.height,
+          // v2 = ارتفاع‌ها per-chat و فقط از ریسایز صریح می‌آیند؛
+          // مهاجرتِ loadTodoPanelUi ذخیره‌های قدیمی‌تر را یک‌بار پاک می‌کند.
+          v: 2,
           heights,
         }),
       );

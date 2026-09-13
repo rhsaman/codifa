@@ -953,6 +953,43 @@ def strip_orphaned_tool_calls(msgs: list, logger: Any = None) -> list:
 # and self-corrects on the next step. Advisory only — never blocks a call.
 _BATCHABLE_TOOLS = {"grep", "glob", "read"}
 
+# Same-batch signature: the tool name + every arg EXCEPT the primary one
+# (pattern / filePath). Calls sharing this signature differ only in the
+# primary argument, so they merge into one `patterns=[...]` / `filePaths=[...]`
+# call. (Same rule the per-step detector uses for its pair check.)
+
+
+def _batch_sig(name: str, args: dict) -> tuple | None:
+    """Signature of a batchable call ignoring its primary argument.
+
+    Returns None when the call is not batchable (unknown tool, missing
+    primary argument, or already a batch call — those are ignored so the
+    tracker never nags a model that is already batching).
+    """
+    name = (name or "").lower()
+    if name not in _BATCHABLE_TOOLS:
+        return None
+    args = args or {}
+    if "patterns" in args or "filePaths" in args or "ranges" in args:
+        return None  # already a batch call
+    primary = "filePath" if name == "read" else "pattern"
+    if not args.get(primary):
+        return None
+    rest = {k: v for k, v in args.items() if k != primary}
+    return (name, json.dumps(rest, sort_keys=True, ensure_ascii=False))
+
+
+def _batch_hint_text(name: str) -> str:
+    if name == "read":
+        return (
+            "read: pass all files in ONE call — filePaths=[...] (same window) "
+            "or ranges=['path:offset:limit', ...] (per-file windows)"
+        )
+    return (
+        f"{name}: pass all terms in ONE call — patterns=[...] "
+        "(combines them into a single scan)"
+    )
+
 
 def _batchable_nudge(tcs: list) -> str:
     """Return a reminder suffix when a step's tool calls could be merged.
@@ -987,16 +1024,7 @@ def _batchable_nudge(tcs: list) -> str:
         # e.g. two greps with different paths must stay separate calls.
         if any(r != rests[0] for r in rests[1:]):
             continue
-        if name == "read":
-            hints.append(
-                "read: pass all files in ONE call — filePaths=[...] (same window) "
-                "or ranges=['path:offset:limit', ...] (per-file windows)"
-            )
-        else:
-            hints.append(
-                f"{name}: pass all terms in ONE call — patterns=[...] "
-                "(combines them into a single scan)"
-            )
+        hints.append(_batch_hint_text(name))
     if not hints:
         return ""
     return (
@@ -1004,6 +1032,78 @@ def _batchable_nudge(tcs: list) -> str:
         + "\n".join(f"- {h}" for h in hints)
         + "\nDo that from now on to save tokens and round-trips."
     )
+
+
+class _BatchStreakTracker:
+    """Cross-step detector for one-at-a-time batchable calls.
+
+    The per-step detector above only fires when the model puts ≥2 mergeable
+    calls in ONE step. But most models (especially via gateways where
+    ``parallel_tool_calls`` is not sent) emit exactly ONE tool call per step —
+    so the per-step detector never fires and the model burns 6+ round-trips
+    on 6 separate reads. This tracker watches CONSECUTIVE steps: when the
+    same batchable tool is called one-at-a-time with the SAME non-primary
+    args (same scope/window) for ``threshold`` steps in a row, it returns a
+    reminder so the model batches the remaining calls.
+
+    A different tool, a batch call, or a changed scope/window resets the
+    streak — genuine varied work is never nagged.
+    """
+
+    __slots__ = ("_streaks", "_threshold")
+
+    def __init__(self, threshold: int = 3):
+        self._streaks: dict[tuple, int] = {}
+        self._threshold = max(2, threshold)
+
+    def observe(self, tcs: list) -> str:
+        """Record this step's calls; return a reminder when a streak fires.
+
+        Call once per step with ALL of that step's tool calls (before
+        execution). Returns "" most steps; on the threshold-crossing step it
+        returns the reminder text (which the loop appends to the last tool
+        result of that step, same as the per-step nudge).
+        """
+        sigs = {}
+        for tc in tcs or []:
+            sig = _batch_sig(tc.get("name") or "", tc.get("args") or {})
+            if sig is not None:
+                sigs[sig] = sigs.get(sig, 0) + 1
+        if not sigs:
+            # No batchable call this step — reset every streak (the model
+            # moved on to other work or finished).
+            self._streaks.clear()
+            return ""
+        fired: list[str] = []
+        for sig in list(self._streaks):
+            if sig not in sigs:
+                del self._streaks[sig]  # streak broken by a different call
+        for sig, count in sigs.items():
+            if count >= 2:
+                # The model DID batch ≥2 mergeable calls into one step — the
+                # per-step detector handles that; don't also count it here.
+                self._streaks[sig] = 0
+                continue
+            n = self._streaks.get(sig, 0) + 1
+            self._streaks[sig] = n
+            if n == self._threshold:
+                fired.append(_batch_hint_text(sig[0]))
+        if not fired:
+            return ""
+        # Reset the fired streaks so the reminder is not repeated every step
+        # (the model gets one reminder per streak, then a fresh count).
+        for sig in list(self._streaks):
+            if self._streaks[sig] >= self._threshold:
+                self._streaks[sig] = 0
+        return (
+            "\n\n💡 BATCHING REMINDER: you have called {tool} one-at-a-time "
+            "{n} steps in a row with the same scope. Batch the remaining "
+            "calls into ONE tool call:\n".format(
+                tool=fired[0].split(":")[0], n=self._threshold
+            )
+            + "\n".join(f"- {h}" for h in fired)
+            + "\nDo that from now on to save tokens and round-trips."
+        )
 
 
 async def langchain_tool_loop(
@@ -1071,6 +1171,10 @@ async def langchain_tool_loop(
     _DOOM_LOOP_LIMIT = 3
     _TOOL_CALL_SOFT_LIMIT = 8
     _tool_call_count = 0
+    # Cross-step batching tracker: catches the model firing ONE batchable
+    # call per step (the common case when parallel_tool_calls is not sent)
+    # and reminds it to batch after a few consecutive same-scope steps.
+    _streak = _BatchStreakTracker()
     while steps < max_steps:
         steps += 1
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -1173,8 +1277,10 @@ async def langchain_tool_loop(
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
         # Advisory batching reminder: when this step's calls could have been
         # merged into one batch call, append the hint to the LAST result so
-        # the model sees it alongside the results it just got.
-        _batch_hint = _batchable_nudge(tcs)
+        # the model sees it alongside the results it just got. The streak
+        # tracker adds the cross-step variant (one-at-a-time calls across
+        # consecutive steps) — either reminder lands on the last result.
+        _batch_hint = _batchable_nudge(tcs) or _streak.observe(tcs)
         if len(_parallel) > 1:
             _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
         else:

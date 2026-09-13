@@ -72,6 +72,7 @@ from _common import (
 from agents import normalize_mode
 from llm import (
     _batchable_nudge,
+    _BatchStreakTracker,
     _is_parallel_calls_error,
     _is_reasoning_effort_error,
     _is_stream_options_error,
@@ -2586,6 +2587,11 @@ async def _run_mode_turn(
         _last_tool_sig = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
+        # Cross-step batching tracker: catches the model firing ONE batchable
+        # call per step (the common case when parallel_tool_calls is not
+        # sent) and reminds it to batch after a few consecutive same-scope
+        # steps — the per-step detector alone never sees those.
+        _streak = _BatchStreakTracker()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
         # the HumanMessage is appended AFTER the tool results (keeping the
@@ -3166,8 +3172,10 @@ async def _run_mode_turn(
             # Advisory batching reminder (same detector as the sub-agent loop):
             # when this step's calls could have been ONE batch call, append the
             # hint to the LAST parallel result so the model sees it with its
-            # own results and self-corrects on the next step.
-            _batch_hint = _batchable_nudge(_pending)
+            # own results and self-corrects on the next step. The streak
+            # tracker adds the cross-step variant (one-at-a-time calls across
+            # consecutive steps) — either reminder lands on the last result.
+            _batch_hint = _batchable_nudge(_pending) or _streak.observe(_pending)
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
                     *[

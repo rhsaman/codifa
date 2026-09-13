@@ -226,7 +226,12 @@ def _parse_checkpoint_ts(ts_raw) -> float | None:
 # useful: resuming it would re-execute already-done tool calls and could
 # produce a silently broken first reply. Drop and start fresh instead.
 _RESUME_MAX_AGE_S = 30 * 60  # 30 minutes
-_RESUME_MAX_TOOL_CALLS = 8
+# سیاست حد ابزار: این حد فقط «تعداد فراخوانی» را می‌شمارد، نه حجم توکن را؛
+# پنجرهٔ کانتکست را auto-compact (آستانهٔ درصدی) محافظت می‌کند. یک turn واقعی
+# coder به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد، پس حدِ پایین (مثل ۸) عملاً
+# چک‌پوینت را همیشه می‌انداخت و رزومهٔ واقعی بی‌استفاده می‌شد — همان
+# «کانتکست کم می‌شود بعد از استپ» که کاربر می‌دید.
+_RESUME_MAX_TOOL_CALLS = 25
 
 
 async def _load_turn_checkpoint_valid(

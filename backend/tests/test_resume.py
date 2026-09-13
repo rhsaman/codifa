@@ -33,8 +33,10 @@ from mock_openai import (
 
 from agents import run_agent
 from graph import (
+    _RESUME_MAX_TOOL_CALLS,
     _clear_turn_checkpoint,
     _load_turn_checkpoint,
+    _load_turn_checkpoint_valid,
     _resume_checkpoint_path,
     _resume_thread_id,
     _save_turn_checkpoint,
@@ -48,6 +50,58 @@ async def run_turn(**kw):
     async for ev in run_agent(**kw):
         events.append(ev)
     return events
+
+
+def _tool_transcript(n: int) -> list:
+    """A transcript with ``n`` completed tool calls (AI call + ToolMessage pairs)."""
+    msgs = [HumanMessage(content="do things")]
+    for i in range(n):
+        cid = f"c{i}"
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "grep", "args": {"pattern": f"p{i}"}, "id": cid}],
+            )
+        )
+        msgs.append(ToolMessage(content=f"MATCHES p{i}", tool_call_id=cid))
+    return msgs
+
+
+async def test_resume_guard_allows_realistic_tool_counts():
+    """گارد تعداد ابزارِ چک‌پوینت رزومه نباید turnهای واقعی را دور بیندازد.
+
+    یک turn معمولی coder به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد؛ اگر حد
+    (``_RESUME_MAX_TOOL_CALLS``) از آن پایین‌تر باشد، چک‌پوینت تقریباً همیشه
+    حذف می‌شود و ادامهٔ کار فقط با خلاصهٔ فشردهٔ فرانت‌اند پیش می‌رود —
+    یعنی «کانتکست کم می‌شود بعد از استپ». این تست حد فعلی را روی یک
+    ترنسکریپت واقع‌گرایانه (۲۰ فراخوانی) قفل می‌کند.
+    """
+    assert _RESUME_MAX_TOOL_CALLS >= 20, (
+        "حد فراخوانی ابزار برای رزومه باید حداقل یک turn واقعی (۲۰ فراخوانی) را پوشش دهد"
+    )
+    tid = _resume_thread_id({"chat_id": "guard-realistic"})
+    try:
+        await _save_turn_checkpoint(tid, _tool_transcript(20))
+        loaded = await _load_turn_checkpoint_valid(tid)
+        assert loaded is not None, (
+            "چک‌پوینت با ۲۰ فراخوانی ابزار (turn واقعی) باید رزومه شود، نه حذف"
+        )
+        assert any(getattr(m, "type", "") == "tool" for m in loaded)
+    finally:
+        await _clear_turn_checkpoint(tid)
+
+
+async def test_resume_guard_still_drops_oversized_loops():
+    """حد همچنان باید حلقه‌های گیرکرده را حذف کند تا رزومه لوپ نکند."""
+    tid = _resume_thread_id({"chat_id": "guard-loop"})
+    try:
+        await _save_turn_checkpoint(tid, _tool_transcript(_RESUME_MAX_TOOL_CALLS + 5))
+        loaded = await _load_turn_checkpoint_valid(tid)
+        assert loaded is None, "چک‌پوینتِ بیش از حد مجاز باید حذف شود (حفاظت حلقه)"
+        assert await _load_turn_checkpoint(tid) is None, \
+            "چک‌پوینت ردشده باید از دیسک هم پاک شود"
+    finally:
+        await _clear_turn_checkpoint(tid)
 
 
 def make_workspace():

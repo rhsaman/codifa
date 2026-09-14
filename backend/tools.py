@@ -666,6 +666,10 @@ def _escapes_root(command: str, root: str) -> str | None:
     _SAFE_ABS = ("/dev/null", _os_tmp, "/tmp/", "/dev/std", "/dev/fd")
     for m in re.finditer(r"(?:^|[\s;|&])(/[^\s;|&'\"`]*)", command):
         p = m.group(1)
+        # توکنِ فقط-اسلش (مثل `//` در `width // 2`) عملگر تقسیم صحیح پایتون
+        # است، نه مسیر — realpath آن می‌شود `/` و به‌دروغ بلاک می‌کند.
+        if not p.strip("/"):
+            continue
         if p == "/tmp" or p.rstrip("/\\") == _os_tmp.rstrip("/\\") or p.startswith(_SAFE_ABS):
             continue
         try:
@@ -674,6 +678,41 @@ def _escapes_root(command: str, root: str) -> str | None:
             real = p
         if real != root_real and not real.startswith(root_real + os.sep):
             return f"references path outside the project root: {p}"
+    return None
+
+
+def _writes_outside_root(command: str) -> str | None:
+    """Return a reason string if ``command`` installs/modifies system state.
+
+    Package managers (brew/apt/port/pip --user/npm -g/...) write OUTSIDE the
+    workspace even though the command text itself contains no outside path —
+    so ``_escapes_root`` alone can't catch them. Without this guard the agent
+    could run e.g. ``brew install tree-sitter`` right after the user DENIED
+    ``request_permission`` for it, because the bare command text looks
+    workspace-local.
+    """
+    _INSTALLERS = [
+        (r"(^|[\s;|&])(brew|apt|apt-get|port|nix-env|pacman|dnf|yum|zypper)\b", "system package manager"),
+        (r"(^|[\s;|&])pip3?\s+install\b", "pip install"),
+        (r"(^|[\s;|&])uv\s+(pip|tool)\s+install\b", "uv install"),
+        (r"(^|[\s;|&])npm\s+(-\S+\s+)*install\s+(-\S+\s+)*-g\b", "global npm install"),
+        (r"(^|[\s;|&])npm\s+(-\S+\s+)*i\s+(-\S+\s+)*-g\b", "global npm install"),
+        (r"(^|[\s;|&])pnpm\s+(-\S+\s+)*(-g|--global)\b", "global pnpm install"),
+        (r"(^|[\s;|&])yarn\s+global\b", "global yarn install"),
+        (r"(^|[\s;|&])cargo\s+install\b", "cargo install"),
+        (r"(^|[\s;|&])gem\s+install\b", "gem install"),
+        (r"(^|[\s;|&])go\s+install\b", "go install"),
+        (r"(^|[\s;|&])rustup\b", "rustup"),
+        (r"(^|[\s;|&])choco\b", "choco"),
+        (r"(^|[\s;|&])winget\b", "winget"),
+        (r"(^|[\s;|&])scoop\b", "scoop"),
+    ]
+    for pattern, label in _INSTALLERS:
+        if re.search(pattern, command):
+            return (
+                f"runs {label}, which installs/modifies state outside the workspace. "
+                "Ask the user for permission (request_permission) before installing anything."
+            )
     return None
 
 
@@ -686,6 +725,8 @@ def run_terminal(
         return {"command": command, "error": reason}
     if not (permit or {}).get("outside"):
         reason = _escapes_root(command, root)
+        if reason is None:
+            reason = _writes_outside_root(command)
         if reason:
             return {
                 "command": command,
@@ -3455,28 +3496,46 @@ def make_tool_callbacks(
                 out.append(p)
         return out or [primary]
 
+    def _dedup_scopes(primary: str, extra: list[str] | None) -> list[str]:
+        """«path» + «paths» را به لیست scope های یکتا تبدیل می‌کند.
+
+        «» یعنی کل workspace؛ اگر کنار scope های مشخص بیاید حذف می‌شود
+        (کل workspace بقیه را در بر می‌گیرد). خروجی هیچ‌وقت خالی نیست.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in (str(primary or "").strip(), *(str(x or "").strip() for x in (extra or []))):
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out or [""]
+
     async def grep_tool(
         pattern: str,
         patterns: list[str] | None = None,
         path: str = "",
+        paths: list[str] | None = None,
         include: str = "",
         max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term when they share path/include. `path` optionally restricts to a subdirectory (omit = whole workspace). `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
         combined = "|".join(_dedup_patterns(pattern, patterns))
+        # چند scope در همان فراخوانی: path + paths=[...] → یک grep برای همه.
+        all_paths = _dedup_patterns(path, paths)
+        scope = "|".join(all_paths) if len(all_paths) > 1 else path
         generation = _search_generations.get(root, 0)
-        cache_key = ("grep", combined, path, include, root, str(max_results), str(tool_out_chars))
+        cache_key = ("grep", combined, scope, include, root, str(max_results), str(tool_out_chars))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "grep",
-                    "args": {"pattern": combined, "path": path, "include": include},
+                    "args": {"pattern": combined, "path": scope, "include": include},
                     "model": _main_name,
                 }
             )
@@ -3494,30 +3553,44 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             {
                 "kind": "tool",
                 "tool": "grep",
-                "args": {"pattern": combined, "path": path, "include": include},
+                "args": {"pattern": combined, "path": scope, "include": include},
                 "model": _main_name,
             }
         )
         try:
-            result = await _shared_search(
-                root, ("grep", combined, path, include, str(SNIPPET_CONTEXT)),
-                generation, search_in_files, root, combined, path, SNIPPET_CONTEXT, include,
+            results = await asyncio.gather(
+                *(
+                    _shared_search(
+                        root, ("grep", combined, p, include, str(SNIPPET_CONTEXT)),
+                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, include,
+                    )
+                    for p in all_paths
+                )
             )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("grep", msg))
-            return f"ERROR searching {path}: {msg}"
+            return f"ERROR searching {scope}: {msg}"
         except asyncio.CancelledError:
             emit(_error_result("grep", "جست‌وجو لغو شد"))
             raise
         except Exception as exc:
             emit(_error_result("grep", str(exc)))
             raise
-        if result.get("error"):
-            msg = result["error"]
-            emit(_error_result("grep", msg))
-            return f"ERROR searching {path}: {msg}"
-        matches = result.get("matches", [])
+        errors = [r["error"] for r in results if r.get("error")]
+        if results and len(errors) == len(results):
+            # همه‌ی scope ها خطا دادند → مثل حالت تک‌اسکوپی خطا برگردان.
+            emit(_error_result("grep", errors[0]))
+            return f"ERROR searching {scope}: {errors[0]}"
+        # merge + dedupe بر اساس (file, line) — ترتیب حفظ می‌شود.
+        seen: set[tuple[str, int]] = set()
+        matches: list[dict] = []
+        for r in results:
+            for m in r.get("matches", []):
+                key = (m["file"], m["line"])
+                if key not in seen:
+                    seen.add(key)
+                    matches.append(m)
         if not matches:
             emit(
                 {
@@ -3527,7 +3600,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            return f"No matches for {combined!r} under {path or '/'}"
+            return f"No matches for {combined!r} under {scope or '/'}"
         # Output contract (spec §3, revised): each hit shows the match line plus
         # ±SNIPPET_CONTEXT lines of surrounding code (already computed by
         # search_in_files above — previously discarded here, forcing an almost-
@@ -3651,22 +3724,26 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         pattern: str,
         patterns: list[str] | None = None,
         path: str = "",
+        paths: list[str] | None = None,
         max_results: int = 100,
     ) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace). `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         all_patterns = _dedup_patterns(pattern, patterns)
         # نمایش تک‌الگویی برای سازگاری پیام‌ها؛ برای batch همه‌ی الگوها با |.
         disp = all_patterns[0] if len(all_patterns) == 1 else "|".join(all_patterns)
+        # چند scope در همان فراخوانی: path + paths=[...] → یک glob برای همه.
+        all_paths = _dedup_patterns(path, paths)
+        scope = "|".join(all_paths) if len(all_paths) > 1 else path
         generation = _search_generations.get(root, 0)
-        cache_key = ("glob", "|".join(all_patterns), path, "", root, str(max_results))
+        cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "glob",
-                    "args": {"pattern": disp, "path": path},
+                    "args": {"pattern": disp, "path": scope},
                     "model": _main_name,
                 }
             )
@@ -3684,26 +3761,27 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             {
                 "kind": "tool",
                 "tool": "glob",
-                "args": {"pattern": disp, "path": path},
+                "args": {"pattern": disp, "path": scope},
                 "model": _main_name,
             }
         )
         try:
-            # glob برخلاف regex عملگر | ندارد، پس هر الگو جداگانه (اما همزمان و
-            # با کش per-pattern در _shared_search) اسکن می‌شود و نتایج merge
-            # می‌شوند — همچنان یک فراخوانی ابزار و یک ToolMessage.
+            # glob برخلاف regex عملگر | ندارد، پس هر ترکیبِ الگو×اسکوپ جداگانه
+            # (اما همزمان و با کش per-key در _shared_search) اسکن می‌شود و
+            # نتایج merge می‌شوند — همچنان یک فراخوانی ابزار و یک ToolMessage.
             results = await asyncio.gather(
                 *(
                     _shared_search(
-                        root, ("glob", p, path), generation, glob_files, root, p, path,
+                        root, ("glob", p, sp), generation, glob_files, root, p, sp,
                     )
                     for p in all_patterns
+                    for sp in all_paths
                 )
             )
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("glob", msg))
-            return f"ERROR running glob {disp!r} under {path or '/'}: {msg}"
+            return f"ERROR running glob {disp!r} under {scope or '/'}: {msg}"
         errors = [r["error"] for r in results if r.get("error")]
         # merge + dedupe — ترتیب حفظ می‌شود (مثل _clip_glob_results).
         seen: set[str] = set()
@@ -3715,9 +3793,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     matches.append(m)
         if not matches:
             if errors:
-                # همه‌ی الگوها خطا دادند → مثل حالت تک‌الگویی خطا برگردان.
+                # همه‌ی الگوها/اسکوپ‌ها خطا دادند → مثل حالت تک‌الگویی خطا برگردان.
                 emit(_error_result("glob", errors[0]))
-                return f"ERROR running glob {disp!r} under {path or '/'}: {errors[0]}"
+                return f"ERROR running glob {disp!r} under {scope or '/'}: {errors[0]}"
             emit(
                 {
                     "kind": "tool_result",
@@ -3726,7 +3804,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            return f"No files match {disp!r} under {path or '/'}."
+            return f"No files match {disp!r} under {scope or '/'}."
         lines = list(matches[:max_results])
         note = (
             f"\n({len(matches)} matches found, showing the first {max_results})"
@@ -5399,6 +5477,317 @@ When you need to read several files, read multiple independent files in parallel
             }
         )
 
+    async def computer_tool(
+        action: str,
+        app: str = "",
+        selector: str = "",
+        do: str = "",
+        value: str = "",
+        x: int = 0,
+        y: int = 0,
+        x2: int = 0,
+        y2: int = 0,
+        key: str = "",
+        held: str = "",
+        text: str = "",
+        dx: int = 0,
+        dy: int = 0,
+        depth: int = 14,
+        steps: list | None = None,
+        annotate: bool = False,
+    ) -> str:
+        """Control desktop apps on macOS/Windows/Linux through the OS Accessibility Tree (the same approach the Codex app uses — element-based, not screenshots). Read actions need no permission; MUTATING actions (act / input / sequence) ask the user once per turn.
+
+        ACTIONS:
+          - "read_screen": dump the accessibility tree of the target app as an
+            indented, model-readable text. Use ``app`` to target a named app;
+            default = the foreground app. ``depth`` caps tree depth (default 14)
+            to keep the output lean. Read this FIRST when you don't know where
+            an element is; the dump stays in context so one read serves many
+            later actions on the same screen.
+          - "read_element": dump ONLY the subtree of the element matched by
+            ``selector`` (``depth`` caps subtree depth, default 6) — much
+            cheaper than read_screen when you already know the container.
+          - "list_apps": list running apps (to pick an ``app`` target).
+          - "open_app": activate (or launch) the app named ``app`` — brings
+            its window to front without moving the mouse.
+          - "act": run a semantic action on an element matched by ``selector``.
+            ``do`` is one of: press, focus, toggle, expand, collapse, select,
+            show_menu, scroll_into_view, increment, decrement, set_value,
+            set_numeric_value, type_text, minimize, maximize, restore, close.
+            ``set_value``/``type_text`` need ``value``.
+          - "input": coordinate/keyboard fallback via synthesized input — use
+            ONLY when no semantic action fits (drag, scroll, global shortcut).
+            ``do`` is one of: click, double_click, right_click, move_to, drag,
+            scroll, press_key, chord, type_text. Non-ASCII text (e.g. Persian)
+            is typed via the clipboard automatically.
+          - "sequence": run MULTIPLE input steps back-to-back in ONE call —
+            click then type then press Enter, without losing focus between
+            steps. ``steps`` is a list of dicts, each with "kind" (click,
+            double_click, right_click, move_to, drag, scroll, press_key,
+            chord, type_text, wait) plus that kind's params (x/y/x2/y2/key/
+            held/text/dx/dy, "ms" for wait). A 150ms gap is inserted between
+            steps by default; override per-step with "gap_ms". If a step
+            fails, the rest are skipped and "failed_at" is returned.
+            IMPORTANT: multiple input steps must go through ONE sequence call
+            — separate calls lose focus between steps.
+          - "see": capture a screenshot (full screen, ``selector`` element, or
+            ``region``) and analyze it with the user's vision model (Settings
+            → Tools → Vision model). ``value`` is the analysis prompt
+            (default: describe visible text, UI elements and positions).
+            ``annotate=True`` draws numbered boxes over buttons/text fields
+            and returns a legend mapping each number to its selector — use it
+            to bridge pixel view and the accessibility tree. Use "see" when
+            the tree cannot answer (terminals, canvases, images, video).
+          - "check_access": verify accessibility permissions; returns a
+            per-OS setup hint when access is missing.
+
+        SELECTORS are CSS-like (xa11y syntax), scoped to the target app:
+          button[name='OK']          — button named exactly OK
+          textfield[name^='Search']  — text field whose name starts with Search
+          window >> tab              — descendant combinator
+          listitem:nth(2)            — 2nd match (1-based)
+
+        STRATEGY (important):
+          1. If you can guess the element (e.g. "click the OK button"), call
+             "act" DIRECTLY with a selector — no read_screen needed first.
+          2. Only read_screen when you don't know the app's structure, or
+             after a failed/errored action.
+          3. Prefer semantic "act" over coordinate "input" — it is precise and
+             doesn't move the user's mouse.
+          4. Multiple input steps (click → type → Enter) MUST go through ONE
+             "sequence" call — separate calls lose focus between steps.
+          5. Use "see" when the tree cannot answer: terminals, canvases,
+             images, video, or when a visual check is needed.
+        """
+        import computer_use as cu
+
+        emit(
+            {
+                "kind": "tool",
+                "tool": "computer",
+                "args": {
+                    "action": action,
+                    "app": app,
+                    "selector": selector,
+                    "do": do,
+                    "x": x,
+                    "y": y,
+                    "key": key,
+                    "value": value[:100],
+                    "steps": (
+                        [s.get("kind", "") for s in steps] if steps else []
+                    ),
+                    "annotate": annotate,
+                },
+            }
+        )
+
+        async def _ask_permission(desc: str) -> bool:
+            """نمایش دیالوگ تأیید و انتظار برای پاسخ کاربر (یک‌بار در هر turn)."""
+            if permission_gates is None:
+                return False
+            pid = f"cp{uuid.uuid4().hex[:8]}"
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            permission_gates[pid] = fut
+            emit(
+                {
+                    "kind": "permission",
+                    "id": pid,
+                    "action": desc,
+                    "reason": "اجازهٔ کنترل اپ‌های دسکتاپ از طریق Accessibility Tree",
+                    "scope": "computer",
+                }
+            )
+            try:
+                return await fut
+            finally:
+                permission_gates.pop(pid, None)
+
+        result: dict = {}
+        try:
+            if action == "check_access":
+                result = await asyncio.to_thread(cu.check_access)
+            elif action == "read_screen":
+                result = await asyncio.to_thread(
+                    cu.read_screen, app_name=app, max_depth=depth
+                )
+            elif action == "read_element":
+                if not selector.strip():
+                    result = {"error": "read_element needs a selector."}
+                else:
+                    result = await asyncio.to_thread(
+                        cu.read_element,
+                        selector=selector,
+                        app_name=app,
+                        max_depth=depth,
+                    )
+            elif action == "list_apps":
+                result = await asyncio.to_thread(cu.list_apps)
+            elif action == "open_app":
+                if not app.strip():
+                    result = {"error": "open_app needs an app name."}
+                else:
+                    result = await asyncio.to_thread(cu.open_app, app_name=app)
+            elif action == "see":
+                from llm import llm_generate
+
+                _vmodel = vision_model if vision_model is not None else main_model
+                _vname = (
+                    str(getattr(_vmodel, "model_name", "") or "")
+                    if _vmodel is not None
+                    else ""
+                )
+                question = (
+                    value.strip()
+                    or "Describe this screen precisely: visible text, UI "
+                    "elements, their approximate positions."
+                )
+                if _vmodel is None:
+                    result = {
+                        "error": (
+                            "No vision model configured — set a vision-capable "
+                            "model in Settings → Tools → Vision model."
+                        )
+                    }
+                else:
+                    shot = await asyncio.to_thread(
+                        cu.capture_screenshot,
+                        app_name=app,
+                        selector=selector,
+                        annotate=annotate,
+                    )
+                    if "error" in shot:
+                        result = shot
+                    else:
+                        _sys = (
+                            "You are a screen-analysis sub-agent. The main agent "
+                            "captured a screenshot of the user's screen and needs "
+                            "your analysis. Reply with a precise, concise "
+                            "description (under ~300 words): exact visible text, "
+                            "UI elements, their approximate positions, colors, "
+                            "errors — the details the main agent needs to act."
+                        )
+                        try:
+                            _output, usage = await llm_generate(
+                                _vmodel,
+                                system=_sys,
+                                user=question,
+                                images=[shot["data_uri"]],
+                                sub=True,
+                            )
+                            if usage:
+                                emit(usage)
+                        except Exception as exc:  # noqa: BLE001
+                            result = {
+                                "error": f"vision analysis failed: {exc} — "
+                                "check Settings → Tools → Vision model."
+                            }
+                            _output = ""
+                        if "error" not in result:
+                            _output = (_output or "").strip()
+                            if not _output:
+                                result = {
+                                    "error": "the vision model produced no analysis."
+                                }
+                            else:
+                                result = {
+                                    "ok": True,
+                                    "analysis": _output,
+                                    "image_width": shot.get("width"),
+                                    "image_height": shot.get("height"),
+                                }
+                                if shot.get("legend"):
+                                    result["legend"] = shot["legend"]
+            elif action == "act":
+                if not selector.strip():
+                    result = {"error": "act needs a selector — see read_screen output."}
+                elif not (permit and permit.get("computer")):
+                    granted = await _ask_permission(
+                        f"computer: {do} {selector}" + (f" = {value[:80]}" if value else "")
+                    )
+                    if not granted:
+                        result = {
+                            "error": "permission denied — the user declined desktop control."
+                        }
+                if "error" not in result and selector.strip():
+                    result = await asyncio.to_thread(
+                        cu.find_and_act,
+                        selector=selector,
+                        action=do,
+                        value=value,
+                        app_name=app,
+                    )
+                    if "error" not in result and permit is not None:
+                        permit["computer"] = True
+            elif action == "input":
+                if not (permit and permit.get("computer")):
+                    granted = await _ask_permission(
+                        f"computer: {do} at ({x},{y})"
+                        + (f" = {key or text[:60]}" if key or text else "")
+                    )
+                    if not granted:
+                        result = {
+                            "error": "permission denied — the user declined desktop control."
+                        }
+                if "error" not in result:
+                    result = await asyncio.to_thread(
+                        cu.input_action,
+                        kind=do,
+                        x=x,
+                        y=y,
+                        x2=x2,
+                        y2=y2,
+                        key=key,
+                        held=held,
+                        text=text,
+                        dx=dx,
+                        dy=dy,
+                    )
+                    if "error" not in result and permit is not None:
+                        permit["computer"] = True
+            elif action == "sequence":
+                if not steps:
+                    result = {"error": "sequence needs a non-empty steps list."}
+                else:
+                    kinds = [s.get("kind", "") for s in steps]
+                    desc = f"sequence of {len(steps)} steps: {', '.join(kinds)}"
+                    if not (permit and permit.get("computer")):
+                        granted = await _ask_permission(desc)
+                        if not granted:
+                            result = {
+                                "error": "permission denied — the user declined desktop control."
+                            }
+                    if "error" not in result:
+                        result = await asyncio.to_thread(
+                            cu.run_sequence, steps=steps, app_name=app
+                        )
+                        if "error" not in result and permit is not None:
+                            permit["computer"] = True
+            else:
+                result = {
+                    "error": (
+                        f"Unknown action {action!r} — use read_screen, "
+                        "read_element, list_apps, open_app, act, input, "
+                        "sequence, see or check_access."
+                    )
+                }
+        except Exception as exc:  # noqa: BLE001
+            result = {"error": f"computer tool failed: {exc}"}
+        text_result = json.dumps(result, ensure_ascii=False, default=str)
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "computer",
+                "summary": (
+                    (text_result[:400] + "…") if len(text_result) > 400 else text_result
+                ),
+                "status": "error" if "error" in result else "done",
+            }
+        )
+        return text_result
+
     _agents_load_skills_for_tool = _load_skills_for_tool
 
     _tools = {
@@ -5420,6 +5809,7 @@ When you need to read several files, read multiple independent files in parallel
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
         "current_time": current_time_tool,
+        "computer": computer_tool,
     }
     # The `vision` tool is only meaningful when a dedicated vision model is
     # configured AND this turn actually carries images — otherwise the main

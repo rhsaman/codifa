@@ -114,6 +114,47 @@ async def test_grep_patterns_dedup_and_empty():
     assert single.startswith("MATCHES for 'TARGET'"), single
 
 
+def _make_multi_scope_ws():
+    d = tempfile.mkdtemp()
+    root = os.path.join(d, "ws")
+    os.makedirs(os.path.join(root, "src"))
+    os.makedirs(os.path.join(root, "backend"))
+    with open(os.path.join(root, "src", "a.py"), "w") as f:
+        f.write("def alpha():\n    return 1  # TARGET\n")
+    with open(os.path.join(root, "backend", "b.py"), "w") as f:
+        f.write("def beta():\n    return 2  # TARGET\n")
+    return root
+
+
+async def test_grep_paths_batch_scans_multiple_scopes():
+    """چند scope در یک فراخوانی grep → یک ToolMessage با نتایج هر دو scope.
+
+    رگرسیونِ گزارش‌شده: مدل برای هر scope یک grep جدا می‌زد (۹ فراخوانی
+    پشت‌سرهم). حالا path + paths=[...] همه را در یک فراخوانی اسکن می‌کند.
+    """
+    root = _make_multi_scope_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]("TARGET", path="src", paths=["backend"])
+    assert out.startswith("MATCHES for 'TARGET'"), out
+    assert "src/a.py" in out
+    assert "backend/b.py" in out
+    # بدون paths رفتار تک‌اسکوپی می‌ماند.
+    single = await cbs["grep"]("TARGET", path="src")
+    assert "backend/b.py" not in single
+
+
+async def test_glob_paths_batch_scans_multiple_scopes():
+    """چند scope در یک فراخوانی glob → نتایج merge و بدون تکرار."""
+    root = _make_multi_scope_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["glob"]("*.py", path="src", paths=["backend"])
+    assert out.startswith("GLOB MATCHES for '*.py'"), out
+    assert "src/a.py" in out
+    assert "backend/b.py" in out
+    single = await cbs["glob"]("*.py", path="src")
+    assert "backend/b.py" not in single
+
+
 def _make_glob_ws():
     d = tempfile.mkdtemp()
     root = os.path.join(d, "ws")

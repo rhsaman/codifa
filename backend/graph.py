@@ -109,6 +109,7 @@ _SEQUENTIAL_TOOLS = {
     "create_skill",
     "create_mcp",
     "ask_user",
+    "computer",
 }
 
 # ---------------------------------------------------------------------------
@@ -403,6 +404,7 @@ class AgentState(TypedDict, total=False):
     permission_gates: dict
     ask_gates: dict
     allow_outside: bool
+    allow_computer: bool
     allow_create: bool
     nvim_file: str
     nvim_diagnostics: list
@@ -1343,7 +1345,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         reserved=state.get("reserved"),
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
-        permit={"outside": allow_outside},
+        permit={"outside": allow_outside, "computer": bool(state.get("allow_computer"))},
         chat_id=chat_id,
         history=state.get("history") or [],
     )
@@ -1794,6 +1796,28 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
     if mcp_tools:
         user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
+    # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
+    # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
+    if filtered.get("computer") is not None:
+        user_parts.append(
+            "=== COMPUTER USE ===\n"
+            "The `computer` tool is live: it reads and controls desktop apps via "
+            "the OS Accessibility Tree (macOS/Windows/Linux). Use it when the user "
+            "asks to interact with OTHER apps (not this workspace's files).\n"
+            "STRATEGY: if you can guess the target element, call computer with "
+            "action='act' and a selector directly; only read the tree "
+            "(action='read_screen') when you don't know the app's structure or an "
+            "action failed. Prefer semantic 'act' over coordinate 'input'. One "
+            "read_screen serves many later actions — don't re-read after every "
+            "step. Multiple input steps (click → type → Enter) MUST go through "
+            "ONE action='sequence' call — separate calls lose focus between "
+            "steps. Use action='open_app' to bring an app to front, "
+            "action='read_element' for a cheap subtree read, and action='see' "
+            "(screenshot + the user's vision model) when the tree cannot answer: "
+            "terminals, canvases, images, video. If it reports PermissionDenied, "
+            "tell the user to grant Accessibility access (the tool's check_access "
+            "action has the per-OS instructions) and stop."
+        )
     if code_map_block:
         user_parts.append(code_map_block)
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
@@ -2496,11 +2520,17 @@ async def _run_mode_turn(
         freshly-minted id. An id-only match would miss it and the tool would
         re-run every time — re-producing (and re-looping on) identical greps.
         Matching on the signature reuses the prior result instead.
+
+        Mutating tools (``_SEQUENTIAL_TOOLS``) are exempt from the signature
+        match: re-issuing e.g. ``computer(type_text, "ls")`` is a REAL new
+        action on the desktop, not a duplicate read — reusing a stale cached
+        result would silently skip the action (and once returned a corrupted
+        cached blob). Only the exact tool_call_id match applies to them.
         """
         for m in messages:
             if isinstance(m, ToolMessage) and m.tool_call_id == tool_call_id:
                 return m.content
-        if name:
+        if name and name not in _SEQUENTIAL_TOOLS:
             _sig = json.dumps(
                 {"n": name, "a": args or {}}, sort_keys=True, ensure_ascii=False
             )
@@ -4251,7 +4281,10 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         image_uris=image_uris,
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
-        permit={"outside": bool(state.get("allow_outside"))},
+        permit={
+            "outside": bool(state.get("allow_outside")),
+            "computer": bool(state.get("allow_computer")),
+        },
         chat_id=state.get("chat_id", ""),
         history=state.get("history") or [],
     )

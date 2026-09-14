@@ -163,21 +163,24 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
         pattern: str,
         patterns: list[str] | None = None,
         path: str = "",
+        paths: list[str] | None = None,
         include: str = "",
         **kwargs,
     ) -> str:
-        rel = str(path or "").strip().lstrip("/")
-        if not rel:
-            return (
-                "ERROR: this request is scoped to specific files — grep "
-                "requires a `path`. In-scope files: " + ", ".join(sorted(scoped_paths))
-            )
-        if rel not in scoped_paths:
-            return (
-                f"ERROR: `{path}` is not in scope for this request. In-scope files: "
-                + ", ".join(sorted(scoped_paths))
-            )
-        return await fn(pattern, patterns, rel, include, **kwargs)
+        # همه‌ی مسیرهای batch هم باید در اسکوپ باشند (نه فقط path).
+        for p in [path, *(paths or [])]:
+            rel = str(p or "").strip().lstrip("/")
+            if not rel:
+                return (
+                    "ERROR: this request is scoped to specific files — grep "
+                    "requires a `path`. In-scope files: " + ", ".join(sorted(scoped_paths))
+                )
+            if rel not in scoped_paths:
+                return (
+                    f"ERROR: `{p}` is not in scope for this request. In-scope files: "
+                    + ", ".join(sorted(scoped_paths))
+                )
+        return await fn(pattern, patterns, path, paths, include, **kwargs)
 
     return wrapped
 
@@ -854,9 +857,10 @@ _SEARCH_RULE = (
     "list (e.g. filePath='a.ts', filePaths=['b.ts','c.ts']) — NEVER fire one read "
     "per file when you already know several you need. Reading N files in N separate "
     "read calls is a HARD violation of this rule. Same for SEARCHES: when you "
-    "need several grep terms (or several globs) that share a path/include, pass "
-    "them ALL in ONE call via the `patterns` list (e.g. pattern='foo', "
-    "patterns=['bar','baz']) — NEVER fire one grep per term. And when different "
+    "need several grep terms (or several globs), pass them ALL in ONE call via "
+    "the `patterns` list (e.g. pattern='foo', patterns=['bar','baz']) — NEVER "
+    "fire one grep per term. Different scopes merge in the SAME call via "
+    "`paths` (e.g. path='src', paths=['backend','tools']). And when different "
     "files need different windows, pass them in ONE read call via `ranges` "
     "(e.g. ranges=['a.ts:100:80','b.ts:1:60']) instead of one read per window.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
@@ -3949,6 +3953,7 @@ async def run_agent(
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
     allow_outside: bool = False,
+    allow_computer: bool = False,
     nvim_file: str = "",
     nvim_diagnostics: list | None = None,
     vector_db_path: str = "",
@@ -4002,6 +4007,7 @@ async def run_agent(
         "permission_gates": permission_gates,
         "ask_gates": ask_gates,
         "allow_outside": allow_outside,
+        "allow_computer": allow_computer,
         "nvim_file": nvim_file,
         "nvim_diagnostics": _to_list(nvim_diagnostics),
         "vector_db_path": vector_db_path,

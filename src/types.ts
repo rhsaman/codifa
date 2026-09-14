@@ -487,7 +487,7 @@ export interface SidecarEvent {
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
   action?: string
-  /** 'confirm' for a generic confirm_action request; absent/'outside' for the original outside-workspace permission prompt */
+  /** 'confirm' for a generic confirm_action request; 'computer' for desktop-app control; absent/'outside' for the original outside-workspace permission prompt */
   scope?: string
   /** ask_user: the question text and, when multiple-choice, its options */
   question?: string

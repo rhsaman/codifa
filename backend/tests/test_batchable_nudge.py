@@ -11,10 +11,14 @@ Covers:
 1. Two greps with different patterns, same path/include → nudge fires.
 2. Two reads with different filePaths, same offset/limit → nudge fires.
 3. A call that already passes patterns=[...] → NO nudge (already batching).
-4. Two greps with DIFFERENT paths → NO nudge (merge would change scope).
-5. Mixed tools (grep + read) → nudge mentions both.
-6. Single call per tool → NO nudge.
-7. End-to-end: the sub-agent loop appends the nudge to the LAST result only.
+4. Two greps with DIFFERENT paths (same include) → nudge fires with a
+   concrete merged example using paths=[...] (scopes merge in one call).
+5. Two greps with DIFFERENT includes → NO nudge (no valid merge).
+6. Mixed tools (grep + read) → nudge mentions both.
+7. Single call per tool → NO nudge.
+8. End-to-end: the sub-agent loop appends the nudge to the LAST result only.
+9. Cross-step streak tracker: per-TOOL counting, threshold=2, repeated
+   reminders with a concrete merged example built from the model's own calls.
 """
 
 import asyncio
@@ -44,7 +48,8 @@ def test_two_greps_same_scope_nudge_fires():
     ]
     out = _batchable_nudge(tcs)
     assert "BATCHING REMINDER" in out
-    assert "patterns=[...]" in out
+    # نمونه‌ی ترکیبی دقیق از خود آرگومان‌های مدل ساخته می‌شود.
+    assert "pattern='alpha'" in out and "patterns=['beta']" in out
 
 
 def test_two_reads_same_window_nudge_fires():
@@ -54,7 +59,8 @@ def test_two_reads_same_window_nudge_fires():
     ]
     out = _batchable_nudge(tcs)
     assert "BATCHING REMINDER" in out
-    assert "filePaths=[...]" in out
+    # پنجره‌ی یکسان → filePaths=[...]؛ پنجره‌های متفاوت → ranges=[...].
+    assert "filePaths=" in out and "a.py" in out and "b.py" in out
 
 
 def test_already_batched_call_no_nudge():
@@ -65,10 +71,24 @@ def test_already_batched_call_no_nudge():
     assert _batchable_nudge(tcs) == ""
 
 
-def test_different_paths_no_nudge():
+def test_different_paths_now_merge_via_paths():
+    """Scopes merge via paths=[...] — two greps with different paths (same
+    include) SHOULD nudge with a concrete merged example."""
     tcs = [
         {"name": "grep", "args": {"pattern": "alpha", "path": "src"}, "id": "a"},
         {"name": "grep", "args": {"pattern": "beta", "path": "backend"}, "id": "b"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "BATCHING REMINDER" in out
+    assert "paths=" in out
+    assert "pattern='alpha'" in out and "patterns=['beta']" in out
+
+
+def test_different_includes_do_not_merge():
+    """Two greps with different includes CANNOT merge — no nudge."""
+    tcs = [
+        {"name": "grep", "args": {"pattern": "alpha", "include": "*.ts"}, "id": "a"},
+        {"name": "grep", "args": {"pattern": "beta", "include": "*.py"}, "id": "b"},
     ]
     assert _batchable_nudge(tcs) == ""
 
@@ -103,62 +123,78 @@ def _read_tc(path: str, i: int) -> dict:
     return {"name": "read", "args": {"filePath": path, "offset": 1, "limit": 100}, "id": f"c{i}"}
 
 
-def test_streak_fires_after_consecutive_single_reads():
-    """The reported regression: the model fires ONE read per step, 6 steps in
-    a row, same window — the per-step detector never fires (each step has a
-    single call). The streak tracker must catch it on the 3rd step."""
-    t = _BatchStreakTracker(threshold=3)
+def test_streak_fires_across_different_windows():
+    """The reported regression: the model fires ONE read per step, each with
+    a DIFFERENT window (70/140/80/... lines) — a batch expresses differing
+    windows via ranges=['path:offset:limit', ...], so the streak must still
+    build and fire on the 2nd step (threshold=2)."""
+    t = _BatchStreakTracker(threshold=2)
     assert t.observe([_read_tc("a.py", 1)]) == ""
-    assert t.observe([_read_tc("b.py", 2)]) == ""
-    out = t.observe([_read_tc("c.py", 3)])
+    out = t.observe([
+        {"name": "read", "args": {"filePath": "b.py", "offset": 50, "limit": 140}, "id": "c2"}
+    ])
     assert "BATCHING REMINDER" in out
-    assert "filePaths=[...]" in out
-    assert "3 steps in a row" in out
+    # نمونه‌ی ترکیبی دقیق ساخته‌شده از خود فراخوانی‌های مدل:
+    assert "ranges=" in out
+    assert "a.py:1:100" in out and "b.py:50:140" in out
 
 
-def test_streak_resets_on_scope_change():
-    """Different offset/limit = different window = a fresh streak."""
-    t = _BatchStreakTracker(threshold=3)
-    t.observe([_read_tc("a.py", 1)])
-    t.observe([_read_tc("b.py", 2)])
-    # different window → streak broken
+def test_streak_fires_across_different_scopes():
+    """The reported regression (screenshot): 9 greps with DIFFERENT scopes —
+    one grep per step. Scopes merge via paths=[...], so the per-tool count
+    must build and fire with a concrete merged example."""
+    t = _BatchStreakTracker(threshold=2)
     assert t.observe([
-        {"name": "read", "args": {"filePath": "c.py", "offset": 50, "limit": 100}, "id": "c3"}
+        {"name": "grep", "args": {"pattern": "alpha", "path": "src"}, "id": "a"}
     ]) == ""
-    assert t.observe([_read_tc("d.py", 4)]) == ""
+    out = t.observe([
+        {"name": "grep", "args": {"pattern": "beta", "path": "backend"}, "id": "b"}
+    ])
+    assert "BATCHING REMINDER" in out
+    assert "paths=" in out
+    assert "pattern='alpha'" in out and "patterns=['beta']" in out
+
+
+def test_streak_survives_interleaved_non_batchable_work():
+    """Real turns interleave reads with searches/commands (see the reported
+    screenshot: read, read, Search Files, run_terminal, read...). A step with
+    no batchable call must NOT wipe the streak."""
+    t = _BatchStreakTracker(threshold=2)
+    t.observe([_read_tc("a.py", 1)])
+    t.observe([{"name": "run_terminal", "args": {"command": "uv add xa11y"}, "id": "x"}])
+    out = t.observe([_read_tc("b.py", 2)])
+    assert "BATCHING REMINDER" in out
 
 
 def test_streak_resets_on_batch_call():
     """A step that already batches (filePaths=[...]) resets the streak."""
-    t = _BatchStreakTracker(threshold=3)
+    t = _BatchStreakTracker(threshold=2)
     t.observe([_read_tc("a.py", 1)])
-    t.observe([_read_tc("b.py", 2)])
     assert t.observe([
-        {"name": "read", "args": {"filePath": "a.py", "filePaths": ["b.py", "c.py"]}, "id": "c3"}
+        {"name": "read", "args": {"filePath": "a.py", "filePaths": ["b.py", "c.py"]}, "id": "c2"}
     ]) == ""
-    assert t.observe([_read_tc("d.py", 4)]) == ""
+    assert t.observe([_read_tc("d.py", 3)]) == ""
 
 
-def test_streak_not_repeated_every_step():
-    """After firing once, the reminder is not re-emitted on every following
-    step (the model gets one reminder per streak, then a fresh count)."""
-    t = _BatchStreakTracker(threshold=3)
+def test_streak_keeps_reminding_until_model_batches():
+    """A single reminder demonstrably gets ignored (the reported regression:
+    9 consecutive greps). The reminder must repeat on EVERY further
+    one-at-a-time step, with the merged example growing."""
+    t = _BatchStreakTracker(threshold=2)
     t.observe([_read_tc("a.py", 1)])
-    t.observe([_read_tc("b.py", 2)])
-    assert t.observe([_read_tc("c.py", 3)]) != ""
-    assert t.observe([_read_tc("d.py", 4)]) == ""
-    # a fresh streak fires again after another threshold steps
-    assert t.observe([_read_tc("e.py", 5)]) == ""
-    assert t.observe([_read_tc("f.py", 6)]) != ""
+    assert t.observe([_read_tc("b.py", 2)]) != ""
+    out = t.observe([_read_tc("c.py", 3)])
+    assert "BATCHING REMINDER" in out
+    assert "c.py" in out  # نمونه‌ی ترکیبی شامل آخرین فراخوانی است
 
 
 def test_streak_ignores_varied_work():
     """Different tools / non-batchable calls never build a streak."""
-    t = _BatchStreakTracker(threshold=3)
+    t = _BatchStreakTracker(threshold=2)
     t.observe([{"name": "run_terminal", "args": {"command": "ls"}, "id": "a"}])
     t.observe([{"name": "grep", "args": {"pattern": "x"}, "id": "b"}])
-    t.observe([{"name": "read", "args": {"filePath": "a.py"}, "id": "c"}])
-    assert t.observe([{"name": "glob", "args": {"pattern": "*.py"}, "id": "d"}]) == ""
+    out = t.observe([{"name": "glob", "args": {"pattern": "*.py"}, "id": "d"}])
+    assert out == ""
 
 
 # ── end-to-end: sub-agent loop appends the nudge to the LAST result ────────
@@ -290,6 +326,70 @@ def test_loop_nudges_one_at_a_time_reads():
     )
 
 
+class _OneGrepPerStepModel:
+    """The reported regression (screenshot): ONE grep per step, each with a
+    DIFFERENT scope — 9 round-trips that should have been 1-2 calls."""
+
+    model_name = "fake-one-grep-per-step"
+
+    def __init__(self, steps: int = 4):
+        self._step = 0
+        self._max = steps
+        self.saw_nudge = False
+
+    def bind_tools(self, tools):
+        class _Bound:
+            def __init__(self, model):
+                self._model = model
+
+            async def ainvoke(self, msgs):
+                m = self._model
+                m._step += 1
+                for msg in msgs:
+                    if isinstance(msg, ToolMessage) and "BATCHING REMINDER" in str(
+                        getattr(msg, "content", "")
+                    ):
+                        m.saw_nudge = True
+                if m._step <= m._max:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "grep",
+                                "args": {
+                                    "pattern": f"term{m._step}",
+                                    "path": f"dir{m._step}",
+                                },
+                                "id": f"call_{m._step}",
+                            }
+                        ],
+                    )
+                return AIMessage(content="done")
+
+        return _Bound(self)
+
+
+def test_loop_nudges_one_at_a_time_greps_different_scopes():
+    """End-to-end: consecutive single-grep steps with DIFFERENT scopes must
+    produce a streak reminder the model actually sees."""
+    model = _OneGrepPerStepModel(steps=4)
+    result = asyncio.run(
+        _tool_loop(
+            model,
+            system="",
+            user="search dir1..dir4",
+            tools=_make_tools(),
+            max_steps=10,
+            ctx=0,
+            emit=None,
+        )
+    )
+    assert result == "done"
+    assert model.saw_nudge, (
+        "the cross-step streak reminder must reach the model via a ToolMessage"
+    )
+
+
 if __name__ == "__main__":
     test_two_greps_same_scope_nudge_fires()
     print("  ✅ two greps same scope")
@@ -297,14 +397,32 @@ if __name__ == "__main__":
     print("  ✅ two reads same window")
     test_already_batched_call_no_nudge()
     print("  ✅ already batched → no nudge")
-    test_different_paths_no_nudge()
-    print("  ✅ different paths → no nudge")
+    test_different_paths_now_merge_via_paths()
+    print("  ✅ different paths → merge via paths")
+    test_different_includes_do_not_merge()
+    print("  ✅ different includes → no nudge")
     test_mixed_tools_nudge_mentions_both()
     print("  ✅ mixed tools")
     test_single_call_per_tool_no_nudge()
     print("  ✅ single call per tool")
     test_empty_and_none_safe()
     print("  ✅ empty/None safe")
+    test_streak_fires_across_different_windows()
+    print("  ✅ streak across different windows")
+    test_streak_fires_across_different_scopes()
+    print("  ✅ streak across different scopes")
+    test_streak_survives_interleaved_non_batchable_work()
+    print("  ✅ streak survives interleaved work")
+    test_streak_resets_on_batch_call()
+    print("  ✅ streak resets on batch call")
+    test_streak_keeps_reminding_until_model_batches()
+    print("  ✅ streak keeps reminding")
+    test_streak_ignores_varied_work()
+    print("  ✅ streak ignores varied work")
     test_loop_appends_nudge_to_last_result()
     print("  ✅ loop appends nudge to last result")
+    test_loop_nudges_one_at_a_time_reads()
+    print("  ✅ loop nudges one-at-a-time reads")
+    test_loop_nudges_one_at_a_time_greps_different_scopes()
+    print("  ✅ loop nudges one-at-a-time greps (different scopes)")
     print("\n🎉 همه تست‌های batching nudge رد شد")

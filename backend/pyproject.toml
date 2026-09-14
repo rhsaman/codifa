@@ -30,6 +30,7 @@ dependencies = [
     "ruff>=0.16.2",
     "tree-sitter-language-pack>=1.15.8",
     "langchain-anthropic",
+    "xa11y",
 ]
 
 [tool.ruff]

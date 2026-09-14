@@ -337,6 +337,9 @@ class ChatRequest(BaseModel):
     cap: dict = {}
     # User pre-approved outside-workspace access for this session (workspace).
     allow_outside: bool = False
+    # User pre-approved desktop-app control (the `computer` tool's mutating
+    # actions) for this session — set by "Always allow" in the UI.
+    allow_computer: bool = False
     # Absolute path of the file currently open in Neovim (auto-mentioned unless
     # the user disabled it). Resolved against the workspace root; ignored if it
     # escapes the root or the auto-mention is off.
@@ -1532,6 +1535,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             permission_gates=PERMISSION_GATES,
             ask_gates=ASK_GATES,
             allow_outside=req.allow_outside,
+            allow_computer=req.allow_computer,
             nvim_file=req.nvim_file,
             nvim_diagnostics=req.nvim_diagnostics,
             vector_db_path=req.vector_db_path,

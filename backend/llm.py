@@ -959,36 +959,68 @@ _BATCHABLE_TOOLS = {"grep", "glob", "read"}
 # call. (Same rule the per-step detector uses for its pair check.)
 
 
-def _batch_sig(name: str, args: dict) -> tuple | None:
-    """Signature of a batchable call ignoring its primary argument.
+def _batch_rest(name: str, args: dict) -> dict:
+    """Non-primary args that must match for two calls to merge into one.
 
-    Returns None when the call is not batchable (unknown tool, missing
-    primary argument, or already a batch call — those are ignored so the
-    tracker never nags a model that is already batching).
+    For grep/glob, ``include`` defines the file filter and MUST match; the
+    scan scope (``path``) may DIFFER — a merge via ``paths=[...]`` scans
+    several scopes in one call. For read, ``offset``/``limit`` are per-file
+    windows — a batch expresses differing windows via
+    ``ranges=['path:offset:limit', ...]`` — so they are excluded and reads
+    of different files with different windows still merge.
     """
-    name = (name or "").lower()
-    if name not in _BATCHABLE_TOOLS:
-        return None
-    args = args or {}
-    if "patterns" in args or "filePaths" in args or "ranges" in args:
-        return None  # already a batch call
     primary = "filePath" if name == "read" else "pattern"
-    if not args.get(primary):
-        return None
     rest = {k: v for k, v in args.items() if k != primary}
-    return (name, json.dumps(rest, sort_keys=True, ensure_ascii=False))
-
-
-def _batch_hint_text(name: str) -> str:
     if name == "read":
+        rest.pop("offset", None)
+        rest.pop("limit", None)
+    else:
+        rest.pop("path", None)  # scope merges via paths=[...]
+    return rest
+
+
+def _batch_example(name: str, calls: list[dict]) -> str:
+    """Build a CONCRETE merged call from the model's own recent calls.
+
+    ``calls`` are the raw arg dicts of the one-at-a-time calls (most recent
+    last). Models follow a literal example far better than an abstract rule,
+    so the reminder shows the exact merged call they should have made.
+    """
+    if name == "read":
+        windows = {
+            str(c.get("filePath")): (int(c.get("offset") or 1), int(c.get("limit") or 2000))
+            for c in calls
+        }
+        if len({w for w in windows.values()}) == 1:
+            off, lim = next(iter(windows.values()))
+            return (
+                f"read(filePath={next(iter(windows))!r}, filePaths="
+                f"{sorted(windows)[1:]!r}, offset={off}, limit={lim})"
+            )
         return (
-            "read: pass all files in ONE call — filePaths=[...] (same window) "
-            "or ranges=['path:offset:limit', ...] (per-file windows)"
+            "read(filePath="
+            + repr(next(iter(windows)))
+            + ", ranges=["
+            + ", ".join(
+                f"{p}:{o}:{l}" for p, (o, l) in sorted(windows.items())
+            )
+            + "])"
         )
-    return (
-        f"{name}: pass all terms in ONE call — patterns=[...] "
-        "(combines them into a single scan)"
-    )
+    # grep / glob — scope (path) may differ; merge via paths=[...].
+    scopes = [str(c.get("path") or "") for c in calls]
+    primary = "filePath" if name == "read" else "pattern"
+    terms = [str(c.get(primary) or "") for c in calls]
+    extra = {k: v for k, v in calls[-1].items() if k not in ("path", primary)}
+    arg_bits = [f"{primary}={terms[0]!r}"]
+    if len(terms) > 1:
+        arg_bits.append(f"patterns={terms[1:]!r}")
+    if any(scopes):
+        arg_bits.append(f"path={scopes[0]!r}")
+        if len(set(scopes)) > 1:
+            arg_bits.append(f"paths={sorted(set(scopes) - {scopes[0]})!r}")
+    for k, v in extra.items():
+        arg_bits.append(f"{k}={v!r}")
+    return f"{name}(" + ", ".join(arg_bits) + ")"
 
 
 def _batchable_nudge(tcs: list) -> str:
@@ -1007,24 +1039,22 @@ def _batchable_nudge(tcs: list) -> str:
         if name not in _BATCHABLE_TOOLS:
             continue
         args = tc.get("args") or {}
-        if "patterns" in args or "filePaths" in args or "ranges" in args:
+        if "patterns" in args or "filePaths" in args or "ranges" in args or "paths" in args:
             continue  # already a batch call
-        # The primary argument distinguishes the calls; everything else must
-        # match for a merge to be valid (same scope / same window).
         primary = "filePath" if name == "read" else "pattern"
         if not args.get(primary):
             continue
-        rest = {k: v for k, v in args.items() if k != primary}
-        per_tool.setdefault(name, []).append(rest)
+        per_tool.setdefault(name, []).append(args)
     hints: list[str] = []
-    for name, rests in per_tool.items():
-        if len(rests) < 2:
+    for name, calls in per_tool.items():
+        if len(calls) < 2:
             continue
         # A merge is only valid when the non-primary args are IDENTICAL —
-        # e.g. two greps with different paths must stay separate calls.
+        # e.g. two greps with different includes must stay separate calls.
+        rests = [_batch_rest(name, a) for a in calls]
         if any(r != rests[0] for r in rests[1:]):
             continue
-        hints.append(_batch_hint_text(name))
+        hints.append(_batch_example(name, calls))
     if not hints:
         return ""
     return (
@@ -1041,67 +1071,85 @@ class _BatchStreakTracker:
     calls in ONE step. But most models (especially via gateways where
     ``parallel_tool_calls`` is not sent) emit exactly ONE tool call per step —
     so the per-step detector never fires and the model burns 6+ round-trips
-    on 6 separate reads. This tracker watches CONSECUTIVE steps: when the
-    same batchable tool is called one-at-a-time with the SAME non-primary
-    args (same scope/window) for ``threshold`` steps in a row, it returns a
-    reminder so the model batches the remaining calls.
+    on 6 separate reads/greps. This tracker counts PER TOOL (not per scope —
+    the reported regression showed 9 greps with different scopes that never
+    built a streak): when the same batchable tool is called one-at-a-time for
+    ``threshold`` steps in a row, it returns a reminder built from the
+    model's OWN recent calls (a concrete merged-call example) so the model
+    batches the remaining calls.
 
-    A different tool, a batch call, or a changed scope/window resets the
-    streak — genuine varied work is never nagged.
+    A batch call resets that tool's streak; steps with no batchable call
+    leave streaks intact (real turns interleave reads with searches and
+    commands). Genuine varied work is never nagged.
     """
 
-    __slots__ = ("_streaks", "_threshold")
+    __slots__ = ("_counts", "_recent", "_threshold")
 
-    def __init__(self, threshold: int = 3):
-        self._streaks: dict[tuple, int] = {}
+    def __init__(self, threshold: int = 2):
+        # شمارش per-tool + فراخوانی‌های اخیر برای ساخت نمونه‌ی ترکیبی.
+        self._counts: dict[str, int] = {}
+        self._recent: dict[str, list[dict]] = {}
         self._threshold = max(2, threshold)
+
+    def _batch_args(self, args: dict) -> bool:
+        return any(
+            k in (args or {}) for k in ("patterns", "filePaths", "ranges", "paths")
+        )
 
     def observe(self, tcs: list) -> str:
         """Record this step's calls; return a reminder when a streak fires.
 
         Call once per step with ALL of that step's tool calls (before
-        execution). Returns "" most steps; on the threshold-crossing step it
-        returns the reminder text (which the loop appends to the last tool
-        result of that step, same as the per-step nudge).
+        execution). Returns "" most steps; once the per-tool count reaches
+        the threshold it returns the reminder text — and keeps reminding
+        (with the growing merged example) on EVERY further one-at-a-time
+        step, because a single reminder demonstrably gets ignored.
         """
-        sigs = {}
+        step_calls: dict[str, dict] = {}
+        batched: set[str] = set()
         for tc in tcs or []:
-            sig = _batch_sig(tc.get("name") or "", tc.get("args") or {})
-            if sig is not None:
-                sigs[sig] = sigs.get(sig, 0) + 1
-        if not sigs:
-            # No batchable call this step — reset every streak (the model
-            # moved on to other work or finished).
-            self._streaks.clear()
-            return ""
-        fired: list[str] = []
-        for sig in list(self._streaks):
-            if sig not in sigs:
-                del self._streaks[sig]  # streak broken by a different call
-        for sig, count in sigs.items():
-            if count >= 2:
-                # The model DID batch ≥2 mergeable calls into one step — the
-                # per-step detector handles that; don't also count it here.
-                self._streaks[sig] = 0
+            name = (tc.get("name") or "").lower()
+            if name not in _BATCHABLE_TOOLS:
                 continue
-            n = self._streaks.get(sig, 0) + 1
-            self._streaks[sig] = n
-            if n == self._threshold:
-                fired.append(_batch_hint_text(sig[0]))
+            args = tc.get("args") or {}
+            if self._batch_args(args):
+                batched.add(name)  # already a batch call
+                continue
+            primary = "filePath" if name == "read" else "pattern"
+            if not args.get(primary):
+                continue
+            step_calls.setdefault(name, args)
+        if not step_calls and not batched:
+            # No batchable call this step — leave the streaks alone. Real
+            # turns interleave reads with searches/commands; wiping here
+            # meant the streak never reached the threshold.
+            return ""
+        for name in batched:
+            # The model IS batching this tool now — restart its count.
+            self._counts.pop(name, None)
+            self._recent.pop(name, None)
+        fired: list[tuple[str, list[dict]]] = []
+        for name, args in step_calls.items():
+            n = self._counts.get(name, 0) + 1
+            self._counts[name] = n
+            recent = self._recent.setdefault(name, [])
+            recent.append(dict(args))
+            if len(recent) > 6:
+                del recent[: len(recent) - 6]
+            if n >= self._threshold:
+                fired.append((name, recent))
         if not fired:
             return ""
-        # Reset the fired streaks so the reminder is not repeated every step
-        # (the model gets one reminder per streak, then a fresh count).
-        for sig in list(self._streaks):
-            if self._streaks[sig] >= self._threshold:
-                self._streaks[sig] = 0
+        lines = [
+            f"- {_batch_example(name, calls)}"
+            for name, calls in fired
+        ]
         return (
             "\n\n💡 BATCHING REMINDER: you have called {tool} one-at-a-time "
-            "{n} steps in a row with the same scope. Batch the remaining "
-            "calls into ONE tool call:\n".format(
-                tool=fired[0].split(":")[0], n=self._threshold
+            "{n} times. Batch the remaining calls into ONE tool call:\n".format(
+                tool=" + ".join(name for name, _ in fired), n=self._threshold
             )
-            + "\n".join(f"- {h}" for h in fired)
+            + "\n".join(lines)
             + "\nDo that from now on to save tokens and round-trips."
         )
 

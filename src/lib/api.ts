@@ -365,6 +365,9 @@ export interface StreamParams {
   cap?: ModeCapabilities
   /** User pre-approved outside-workspace access for this session/workspace. */
   allowOutside?: boolean
+  /** User pre-approved desktop-app control (the `computer` tool's mutating
+   *  actions) for this session/workspace — set by "Always allow". */
+  allowComputer?: boolean
   /** Absolute path of the file currently open in Neovim (auto-mentioned). */
   nvimFile?: string
   /** LSP diagnostics for the Neovim file, so the agent can see its issues. */
@@ -495,6 +498,7 @@ export async function streamChat(
           allow_create: params.allowCreate ?? false,
           cap: params.cap ?? {},
           allow_outside: params.allowOutside ?? false,
+          allow_computer: params.allowComputer ?? false,
           nvim_file: params.nvimFile ?? "",
           nvim_diagnostics: params.nvimDiagnostics ?? [],
           vector_db_path: params.vectorDbPath ?? "",

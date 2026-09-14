@@ -63,8 +63,9 @@ EXPLORE_SYSTEM = (
     "  Turn 2: grep(pattern='_DOOM_LOOP', include='*.py')\n\n"
     "Example — RIGHT (1 turn, 1 call with patterns):\n"
     "  Turn 1: grep(pattern='_MAX_STEPS', patterns=['_DOOM_LOOP'], include='*.py')\n\n"
-    "When you have 2+ related patterns for the same path/include, merge them "
-    "into a single grep call (pattern + patterns=[...], or '|' inside pattern) "
+    "When you have 2+ related patterns, merge them into a single grep call "
+    "(pattern + patterns=[...], or '|' inside pattern). Different scopes merge "
+    "in the SAME call via paths=[...] (e.g. path='src', paths=['backend','tools']) "
     "instead of firing separate greps.\n"
     # search_memory is NOT useful for exploration — the CODE MAP above already
     # gives you the symbol layout, and web/fetch recall is handled by the main

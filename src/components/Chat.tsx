@@ -2196,6 +2196,7 @@ export function ChatPanel() {
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
+          allowComputer: s.computerAllowed,
           nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
           nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
           vectorDbPath: s.vectorDbPath,
@@ -3847,20 +3848,29 @@ export function ChatPanel() {
           (() => {
             const fa = detectDir(permissionReq.action) === "rtl";
             const isConfirm = permissionReq.scope === "confirm";
+            const isComputer = permissionReq.scope === "computer";
             const title = isConfirm
               ? fa
                 ? "تأیید عملیات"
                 : "Confirm action"
-              : fa
-                ? "دسترسی بیرون از ورکاسپیس"
-                : "Outside workspace access";
+              : isComputer
+                ? fa
+                  ? "کنترل اپ‌های دسکتاپ"
+                  : "Desktop app control"
+                : fa
+                  ? "دسترسی بیرون از ورکاسپیس"
+                  : "Outside workspace access";
             const note = isConfirm
               ? fa
                 ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
                 : "The agent flagged this as important or hard to undo, and is waiting for you."
-              : fa
-                ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
-                : "This lets the agent work outside your current workspace.";
+              : isComputer
+                ? fa
+                  ? "این به عامل اجازه می‌دهد اپ‌های دیگر را از طریق Accessibility Tree ببیند و کنترل کند."
+                  : "This lets the agent see and control other apps via the Accessibility Tree."
+                : fa
+                  ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
+                  : "This lets the agent work outside your current workspace.";
             const denyLabel = fa ? "رد کردن" : "Deny";
             return (
               <div className="perm-card" dir={fa ? "rtl" : "ltr"}>
@@ -3943,7 +3953,13 @@ export function ChatPanel() {
                         className="btn perm-allow-always"
                         onClick={() => {
                           void respondPermission(permissionReq.id, true);
-                          useStore.getState().setOutsideAllowed(true);
+                          // scope-aware: "Always allow" persists the grant matching
+                          // the dialog's scope — computer vs outside-workspace.
+                          if (permissionReq.scope === "computer") {
+                            useStore.getState().setComputerAllowed(true);
+                          } else {
+                            useStore.getState().setOutsideAllowed(true);
+                          }
                           useStore
                             .getState()
                             .setChatPendingPermission(chatIdRef.current, null);

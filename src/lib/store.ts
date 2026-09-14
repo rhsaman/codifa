@@ -410,6 +410,10 @@ interface State {
   isThinking: boolean
   /** Session-scoped "allow outside-workspace" (reset when the root changes). */
   outsideAllowed: boolean
+  /** Session-scoped "allow desktop-app control" (the `computer` tool's mutating
+   *  actions). Set by "Always allow" on the computer permission dialog; reset
+   *  when the workspace root changes, same lifecycle as outsideAllowed. */
+  computerAllowed: boolean
   /** Global "Ctrl+X prefix armed" hint. The prefix is app-wide (managed in
    *  App.tsx), so this lives at the store root, not per-chat. */
   prefixNotice: string | null
@@ -580,6 +584,7 @@ interface State {
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
   setOutsideAllowed: (allowed: boolean) => void
+  setComputerAllowed: (allowed: boolean) => void
   /** Whether any chat currently has a streaming assistant message (persist gate
    *  and multi-chat "busy" indication). */
   anyStreaming: () => boolean
@@ -710,6 +715,7 @@ export const useStore = create<State>((set, get) => ({
   isStreaming: false,
   isThinking: false,
   outsideAllowed: false,
+  computerAllowed: false,
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
@@ -1210,7 +1216,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setRoot: (root) => {
-    set({ root, outsideAllowed: false })
+    set({ root, outsideAllowed: false, computerAllowed: false })
     get().persist()
   },
 
@@ -2036,6 +2042,8 @@ export const useStore = create<State>((set, get) => ({
     }),
 
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
+
+  setComputerAllowed: (allowed) => set({ computerAllowed: allowed }),
 
   anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
 

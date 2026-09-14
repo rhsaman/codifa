@@ -124,7 +124,7 @@ async def test_explore_grep_searches_run_concurrently(monkeypatch):
     calls: list[dict] = []
     loop_tid = threading.get_ident()
 
-    def fake_search_in_files(root, pattern, path, snippet, include):
+    def fake_search_in_files(root, pattern, path, snippet, include, permit=None):
         rec = {"tid": threading.get_ident(), "start": time.time(), "end": 0.0}
         calls.append(rec)  # capture the reference; update OUR OWN record below
         time.sleep(0.08)  # simulate a heavy, blocking filesystem scan

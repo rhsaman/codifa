@@ -778,3 +778,18 @@ def test_shared_permit_session_floor():
     p3.pop("outside")
     p4 = graph_mod._shared_permit(state2, allow_outside=True)
     assert p4.get("outside") is True  # کف session دوباره اعمال شد
+
+
+def test_shared_permit_session_folder_floor():
+    """پوشه‌های pre-approved از UI (دکمه «همیشه اجازه» روی دیالوگ per-folder)
+    هم مثل پرچم‌ها کف‌اند: rebuild ابزار نباید آن‌ها را از permit بپراند."""
+    import graph as graph_mod
+
+    state: dict = {"allow_outside_folders": ["/tmp/pre-approved"]}
+    p1 = graph_mod._shared_permit(state, allow_outside=False)
+    assert p1.get("folders") == ["/tmp/pre-approved"]
+    # شبیه‌سازی rebuild: dict همان می‌ماند ولی فرض کن پوشه‌ها پاک شده باشند
+    p1["folders"] = []
+    p2 = graph_mod._shared_permit(state, allow_outside=False)
+    assert p2 is p1
+    assert "/tmp/pre-approved" in p2["folders"]  # کف دوباره تزریق شد

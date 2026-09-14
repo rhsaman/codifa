@@ -46,9 +46,6 @@ def subagent_provider(pid: str, settings: dict):
     return {
         **match,
         "apiKey": match.get("apiKey") or "",
-        "oauthClientId": match.get("oauthClientId") or "",
-        "oauthClientSecret": match.get("oauthClientSecret") or "",
-        "oauthRefreshToken": match.get("oauthRefreshToken") or "",
     }
 
 
@@ -61,13 +58,12 @@ async def main() -> None:
     base = parent.get("baseUrl") or ""
     key = parent.get("apiKey") or ""
     env = parent.get("envVar") or ""
-    oauth = parent.get("oauthRefreshToken") or ""
 
-    main_model = build_model(kind, model, base, key, env, oauth_token=oauth)
+    main_model = build_model(kind, model, base, key, env)
     print(f"MAIN model: {getattr(main_model, 'model_name', '?')!r}")
 
     # Deliberately broken search model → forces fallback to main.
-    broken = build_model(kind, "openrouter/nonexistent-model-xyz", base, key, env, oauth_token=oauth)
+    broken = build_model(kind, "openrouter/nonexistent-model-xyz", base, key, env)
     print(f"BROKEN search model: {getattr(broken, 'model_name', '?')!r}")
 
     events: list[dict] = []

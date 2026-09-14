@@ -187,29 +187,90 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
 
 
 def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
-    """Wrap read so it only reads the explicitly scoped files."""
+    """Wrap read so it only reads the explicitly scoped files.
+
+    Per-file filtering (NOT whole-batch rejection): a batch read with one
+    out-of-scope file used to fail ENTIRELY — the model then fell back to
+    one-read-per-file round-trips (the reported regression). Now in-scope
+    files are read normally and out-of-scope ones return a per-file error,
+    so the batch still succeeds for the allowed subset.
+    """
 
     async def wrapped(
         filePath: str,
         offset: int = 1,
         limit: int = 2000,
         filePaths: list[str] | None = None,
+        ranges: list[str] | None = None,
         **kwargs,
     ) -> str:
-        # همه‌ی مسیرهای batch هم باید در اسکوپ باشند (نه فقط filePath).
+        # همه‌ی مسیرهای batch (filePath + filePaths + مسیرهای داخل ranges)
+        # باید در اسکوپ باشند — مسیر خارج از اسکوپ حذف می‌شود نه اینکه کل
+        # batch را رد کند.
         batch = [filePath, *(filePaths or [])]
+        for spec in ranges or []:
+            _p = str(spec).split(":", 1)[0].strip()
+            if _p and _p not in batch:
+                batch.append(_p)
+        in_scope: list[str] = []
+        rejected: list[str] = []
         for p in batch:
             rel = str(p or "").strip().lstrip("/")
-            if rel not in scoped_paths:
-                return (
-                    "ERROR: this path is not in scope for this request: "
-                    + str(p)
-                    + ". In-scope files: "
-                    + ", ".join(sorted(scoped_paths))
-                )
-        return await fn(filePath, offset, limit, filePaths, **kwargs)
+            if rel in scoped_paths:
+                in_scope.append(p)
+            else:
+                rejected.append(str(p))
+        if not in_scope:
+            return (
+                "ERROR: none of the requested paths are in scope for this "
+                "request. In-scope files: " + ", ".join(sorted(scoped_paths))
+            )
+        # فراخوانی اصلی فقط با مسیرهای مجاز؛ مسیرهای رد‌شده به‌صورت فوتر
+        # گزارش می‌شوند.
+        _fp = in_scope[0]
+        _rest = in_scope[1:]
+        _kept_ranges = [
+            str(s)
+            for s in (ranges or [])
+            if str(s).split(":", 1)[0].strip() in {str(x).strip().lstrip("/") for x in in_scope}
+        ]
+        out = await _call_scoped_read(
+            fn, _fp, offset, limit, _rest, _kept_ranges, **kwargs
+        )
+        if rejected:
+            out += (
+                "\n\n[scope] skipped out-of-scope paths: "
+                + ", ".join(rejected)
+                + ". In-scope files: "
+                + ", ".join(sorted(scoped_paths))
+            )
+        return out
 
     return wrapped
+
+
+async def _call_scoped_read(
+    fn: Callable,
+    primary: str,
+    offset: int,
+    limit: int,
+    rest: list[str],
+    kept_ranges: list[str],
+    **kwargs,
+) -> str:
+    """Call the underlying read with only the in-scope paths/ranges."""
+    try:
+        return await fn(
+            primary,
+            offset,
+            limit,
+            rest or None,
+            kept_ranges or None,
+            **kwargs,
+        )
+    except TypeError:
+        # ابزار زیرین ranges را نمی‌پذیرد (امضای قدیمی) — بدون آن فراخوانی کن.
+        return await fn(primary, offset, limit, rest or None, **kwargs)
 
 
 _TERMIN_TOKENS = re.compile(r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|(\S+)')
@@ -593,12 +654,11 @@ def _subagent_target(
     parent_base_url: str,
     parent_api_key: str,
     parent_env_var: str,
-    parent_oauth_token: str,
     provider_lookup: Callable[[str], dict | None],
     parent_provider_id: str = "",
-) -> tuple[str, str, str, str, str, str, str] | None:
+) -> tuple[str, str, str, str, str, str] | None:
     """Resolve a subagent model entry to (provider_kind, model, base_url,
-    api_key, env_var, oauth_token, provider_id), or None to use the parent
+    api_key, env_var, provider_id), or None to use the parent
     model.
 
     ``entry`` may be a bare model id ("Qwen3.5-4B-Q4_K_S.gguf") resolved
@@ -626,10 +686,10 @@ def _subagent_target(
         if head and tail:
             row = provider_lookup(head)
             if row is not None:
-                # Saved provider row wins (its stored key/base/oauth apply).
+                # Saved provider row wins (its stored key/base apply).
                 pid, model_part, p = head, tail, row
             elif head == parent_provider:
-                # Parent-kind prefix: keep the PARENT's own base/key/oauth.
+                # Parent-kind prefix: keep the PARENT's own base/key.
                 model_part = tail
             elif _provider_meta(head).get("base_url"):
                 # Known built-in gateway kind with no saved row (env-var-only
@@ -643,7 +703,6 @@ def _subagent_target(
                     "baseUrl": _expand_base(meta.get("base_url") or "", head),
                     "apiKey": "",
                     "envVar": "",
-                    "oauthRefreshToken": "",
                 }
             else:
                 # Unrecognized provider prefix: drop it and fall back to the
@@ -676,7 +735,6 @@ def _subagent_target(
             p.get("baseUrl") or "",
             p.get("apiKey") or "",
             p.get("envVar") or "",
-            p.get("oauthRefreshToken") or "",
             str(p.get("id") or pid or kind),
         )
     return (
@@ -685,7 +743,6 @@ def _subagent_target(
         parent_base_url,
         parent_api_key,
         parent_env_var,
-        parent_oauth_token,
         parent_provider_id,
     )
 
@@ -3948,7 +4005,6 @@ async def run_agent(
     model_reasoning: bool = False,
     context_window: int = 0,
     env_var: str = "",
-    oauth_token: str = "",
     mcp_servers: dict | None = None,
     skills: list[str] | None = None,
     allow_create: bool = False,
@@ -3957,6 +4013,7 @@ async def run_agent(
     ask_gates: dict | None = None,
     allow_outside: bool = False,
     allow_computer: bool = False,
+    allow_outside_folders: list[str] | None = None,
     nvim_file: str = "",
     nvim_diagnostics: list | None = None,
     vector_db_path: str = "",
@@ -4002,7 +4059,6 @@ async def run_agent(
         "model_reasoning": model_reasoning,
         "context_window": int(context_window or 0),
         "env_var": env_var,
-        "oauth_token": oauth_token,
         "mcp_servers": mcp_servers or {},
         "skills": _to_list(skills),
         "allow_create": allow_create,
@@ -4011,6 +4067,7 @@ async def run_agent(
         "ask_gates": ask_gates,
         "allow_outside": allow_outside,
         "allow_computer": allow_computer,
+        "allow_outside_folders": list(allow_outside_folders or []),
         "nvim_file": nvim_file,
         "nvim_diagnostics": _to_list(nvim_diagnostics),
         "vector_db_path": vector_db_path,
@@ -4028,13 +4085,15 @@ async def run_agent(
         # passed straight into run_graph — because LangGraph hands nodes a copy
         # of the state, so a setdefault inside run_graph would never reach them.
         "_run_flags": {"hard_error": False},
-        # Shared permit dict ({"outside", "computer"}) — seeded here for the
-        # same reason as _run_flags: LangGraph copies state per node, so the
-        # shared dict must exist on the original `initial` before the graph
-        # runs, letting grants survive coder-node re-entry within a turn.
+        # Shared permit dict ({"outside", "computer", "folders"}) — seeded
+        # here for the same reason as _run_flags: LangGraph copies state per
+        # node, so the shared dict must exist on the original `initial` before
+        # the graph runs, letting grants survive coder-node re-entry within a
+        # turn. "folders" holds the per-folder outside-workspace grants.
         "_permit": {
             "outside": bool(allow_outside),
             "computer": bool(allow_computer),
+            "folders": list(allow_outside_folders or []),
         },
     }
     async for event in run_graph(initial):

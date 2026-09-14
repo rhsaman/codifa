@@ -1978,6 +1978,7 @@ export function ChatPanel() {
           path: event.path,
           reason: event.reason,
           scope: event.scope,
+          folder: event.folder,
         });
       } else if (event.kind === "ask") {
         setAskFreeText("");
@@ -2196,6 +2197,7 @@ export function ChatPanel() {
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
+          allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerAllowed,
           nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
           nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
@@ -3871,6 +3873,12 @@ export function ChatPanel() {
                 : fa
                   ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
                   : "This lets the agent work outside your current workspace.";
+            const folderNote =
+              !isConfirm && !isComputer && permissionReq.folder
+                ? fa
+                  ? "اجازه فقط برای همین پوشه و زیرپوشه‌هایش ثبت می‌شود؛ سایر مسیرهای بیرون از ورک‌اسپیس همچنان مجوز جداگانه می‌خواهند."
+                  : "The grant applies only to this folder and its subfolders; other outside-workspace paths still need a fresh permission."
+                : null;
             const denyLabel = fa ? "رد کردن" : "Deny";
             return (
               <div className="perm-card" dir={fa ? "rtl" : "ltr"}>
@@ -3908,6 +3916,7 @@ export function ChatPanel() {
                   </div>
                 ) : null}
                 <div className="perm-note">{note}</div>
+                {folderNote ? <div className="perm-note">{folderNote}</div> : null}
                 <div className="perm-buttons">
                   <button
                     type="button"
@@ -3957,6 +3966,14 @@ export function ChatPanel() {
                           // the dialog's scope — computer vs outside-workspace.
                           if (permissionReq.scope === "computer") {
                             useStore.getState().setComputerAllowed(true);
+                          } else if (permissionReq.folder) {
+                            // Per-folder grant: only the requested folder's
+                            // subtree stays approved for the session — NOT the
+                            // whole outside-workspace space. The folder is
+                            // backend-normalized (nearest existing parent).
+                            useStore
+                              .getState()
+                              .addOutsideFolder(permissionReq.folder);
                           } else {
                             useStore.getState().setOutsideAllowed(true);
                           }

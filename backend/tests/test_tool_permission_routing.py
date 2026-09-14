@@ -71,6 +71,54 @@ async def test_request_permission_gates_outside_workspace():
     assert any(e.get("kind") == "permission" for e in emitted)
 
 
+async def test_request_permission_grants_only_requested_folder():
+    """تأیید کاربر فقط پوشه‌ی درخواستی را به permit["folders"] اضافه می‌کند —
+    نه permit["outside"] (کل فضای بیرون) و نه پوشه‌های دیگر."""
+    ws = tempfile.mkdtemp()
+    gates: dict = {}
+    permit: dict = {"outside": False, "folders": []}
+    emitted: list[dict] = []
+    tools = make_tool_callbacks(
+        ws,
+        lambda ev: emitted.append(ev),
+        permission_gates=gates,
+        permit=permit,
+    )
+    allowed_dir = os.path.join(tempfile.gettempdir(), "permitted-by-dialog")
+    os.makedirs(allowed_dir, exist_ok=True)
+    target = os.path.join(allowed_dir, "cfg.toml")
+
+    async def _grant():
+        # پاسخ کاربر را شبیه‌سازی می‌کنیم: به‌محض ظاهرشدن دیالوگ، GRANT.
+        for _ in range(50):
+            if gates:
+                pid, fut = next(iter(gates.items()))
+                if not fut.done():
+                    fut.set_result(True)
+                del pid
+                return
+            await asyncio.sleep(0.01)
+
+    task = asyncio.ensure_future(_grant())
+    out = await asyncio.wait_for(
+        tools["request_permission"](action="write config", path=target),
+        timeout=2,
+    )
+    task.cancel()
+    assert "GRANTED" in out
+    # فقط پوشه‌ی درخواستی مجاز شده — نه کل فضای بیرون از ریشه.
+    assert permit.get("outside") is not True
+    assert permit["folders"] == [os.path.realpath(allowed_dir)]
+    # رویداد permission باید پوشه‌ی نرمال‌شده را برای «همیشه اجازه» بفرستد.
+    perm_events = [e for e in emitted if e.get("kind") == "permission"]
+    assert perm_events and perm_events[0].get("folder") == os.path.realpath(allowed_dir)
+    # درخواست بعدی برای همان پوشه باید بی‌دیالوگ auto-grant شود.
+    emitted.clear()
+    out2 = await tools["request_permission"](action="read config", path=target)
+    assert "GRANTED" in out2
+    assert not any(e.get("kind") == "permission" for e in emitted)
+
+
 if __name__ == "__main__":
     import pytest
 

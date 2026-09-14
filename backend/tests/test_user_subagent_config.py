@@ -27,17 +27,17 @@ PROVIDERS = {
     "opencode-gw": {
         "id": "opencode-gw", "kind": "custom",
         "baseUrl": "https://opencode.ai/zen/v1", "apiKey": "",
-        "envVar": "OPENCODE_ZEN_API_KEY", "oauthRefreshToken": "",
+        "envVar": "OPENCODE_ZEN_API_KEY"
     },
     "nvidia": {
         "id": "nvidia", "kind": "nvidia",
         "baseUrl": "https://integrate.api.nvidia.com/v1", "apiKey": "",
-        "envVar": "NVIDIA_API_KEY", "oauthRefreshToken": "",
+        "envVar": "NVIDIA_API_KEY"
     },
     "openrouter": {
         "id": "openrouter", "kind": "openrouter",
         "baseUrl": "https://openrouter.ai/api/v1", "apiKey": "",
-        "envVar": "OPENROUTER_API_KEY", "oauthRefreshToken": "",
+        "envVar": "OPENROUTER_API_KEY"
     },
 }
 
@@ -46,7 +46,6 @@ PARENT = {
     "parent_base_url": "https://opencode.ai/zen/v1",
     "parent_api_key": "",
     "parent_env_var": "OPENCODE_ZEN_API_KEY",
-    "parent_oauth_token": "",
 }
 
 ENTRIES = {
@@ -65,10 +64,10 @@ def main():
         if t is None:
             print(f"  {slot:8s} {entry:45s} -> None (falls back to parent)")
             continue
-        kind, model, base, key, env, oauth, _pid = t
+        kind, model, base, key, env, _pid = t
         print(f"  {slot:8s} {entry:45s} -> kind={kind} model={model!r} env={env!r}")
         try:
-            m = build_chat_model(kind, model, base, key, env, oauth_token=oauth, provider_id=_pid)
+            m = build_chat_model(kind, model, base, key, env, provider_id=_pid)
             name = str(getattr(m, "model_name", "") or "")
             print(f"           built OK, model_name={name!r}")
         except Exception as exc:  # noqa: BLE001

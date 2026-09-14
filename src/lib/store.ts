@@ -337,10 +337,6 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
     baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
     model: p.model || '',
-    authType: p.authType ?? '',
-    oauthClientId: p.oauthClientId || '',
-    oauthClientSecret: p.oauthClientSecret || '',
-    oauthRefreshToken: p.oauthRefreshToken || '',
     contextMap: p.contextMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
@@ -410,6 +406,10 @@ interface State {
   isThinking: boolean
   /** Session-scoped "allow outside-workspace" (reset when the root changes). */
   outsideAllowed: boolean
+  /** Session-scoped outside-workspace folders approved per-folder ("Always
+   *  allow" on the per-folder permission dialog). Reset when the root changes,
+   *  same lifecycle as outsideAllowed. */
+  outsideFolders: string[]
   /** Session-scoped "allow desktop-app control" (the `computer` tool's mutating
    *  actions). Set by "Always allow" on the computer permission dialog; reset
    *  when the workspace root changes, same lifecycle as outsideAllowed. */
@@ -572,7 +572,7 @@ interface State {
    *  remount on chat switch. */
   setChatPendingPermission: (
     chatId: string,
-    req: { id: string; action: string; path?: string; reason?: string; scope?: string } | null,
+    req: { id: string; action: string; path?: string; reason?: string; scope?: string; folder?: string } | null,
   ) => void
   markToolReverted: (messageId: string, index: number) => void
   truncateTo: (messageId: string) => boolean
@@ -584,6 +584,9 @@ interface State {
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
   setOutsideAllowed: (allowed: boolean) => void
+  /** Add a per-folder outside-workspace grant ("Always allow" on the per-folder
+   *  permission dialog). Idempotent; session-scoped like outsideAllowed. */
+  addOutsideFolder: (folder: string) => void
   setComputerAllowed: (allowed: boolean) => void
   /** Whether any chat currently has a streaming assistant message (persist gate
    *  and multi-chat "busy" indication). */
@@ -715,6 +718,7 @@ export const useStore = create<State>((set, get) => ({
   isStreaming: false,
   isThinking: false,
   outsideAllowed: false,
+  outsideFolders: [],
   computerAllowed: false,
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
@@ -817,6 +821,23 @@ export const useStore = create<State>((set, get) => ({
     } else {
       providers = defaultProviders()
       activeProviderId = providers[0].id
+    }
+
+    // Migration: OAuth was removed from the Google provider (Gemini = API key
+    // only, like every other provider). A legacy google provider row that was
+    // signed in via OAuth carries the Search Console OAuth trio — move it to
+    // the searchConsole config so the tool keeps working without a re-login.
+    const legacyGoogle = (raw.providers as Array<Record<string, unknown>> | undefined)?.find(
+      (p) => p && (p as { kind?: string }).kind === 'google',
+    ) as
+      | { oauthClientId?: string; oauthClientSecret?: string; oauthRefreshToken?: string }
+      | undefined
+    const legacySc = raw.searchConsole
+    const migratedSc: SearchConsoleConfig = {
+      clientId: legacySc?.clientId ?? legacyGoogle?.oauthClientId ?? '',
+      clientSecret: legacySc?.clientSecret ?? legacyGoogle?.oauthClientSecret ?? '',
+      refreshToken: legacySc?.refreshToken ?? legacyGoogle?.oauthRefreshToken ?? '',
+      siteUrl: legacySc?.siteUrl ?? '',
     }
 
     const loadedSettings: Settings = {
@@ -941,12 +962,7 @@ export const useStore = create<State>((set, get) => ({
       searchPlugins: searchPlugins.length > 0
         ? searchPlugins
         : [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
-      searchConsole: {
-        clientId: typeof raw.searchConsole?.clientId === 'string' ? raw.searchConsole.clientId : '',
-        clientSecret: typeof raw.searchConsole?.clientSecret === 'string' ? raw.searchConsole.clientSecret : '',
-        refreshToken: typeof raw.searchConsole?.refreshToken === 'string' ? raw.searchConsole.refreshToken : '',
-        siteUrl: typeof raw.searchConsole?.siteUrl === 'string' ? raw.searchConsole.siteUrl : '',
-      },
+      searchConsole: migratedSc,
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
       codeMapPanelOpen: raw.codeMapPanelOpen === true,
@@ -1216,7 +1232,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setRoot: (root) => {
-    set({ root, outsideAllowed: false, computerAllowed: false })
+    set({ root, outsideAllowed: false, outsideFolders: [], computerAllowed: false })
     get().persist()
   },
 
@@ -2042,6 +2058,14 @@ export const useStore = create<State>((set, get) => ({
     }),
 
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
+
+  addOutsideFolder: (folder) =>
+    set((s) => ({
+      outsideFolders:
+        folder && !s.outsideFolders.includes(folder)
+          ? [...s.outsideFolders, folder]
+          : s.outsideFolders,
+    })),
 
   setComputerAllowed: (allowed) => set({ computerAllowed: allowed }),
 

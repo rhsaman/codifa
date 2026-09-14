@@ -1,6 +1,6 @@
 ---
 name: Frontend Design Principles
-description: اصول طراحی فرانت‌اند با قصد و دقت (joshuadavidthomas/agent-skills) — برای ساخت/بازبینی داشبورد، ادمین‌پنل، لندینگ و وب‌اپ؛ تصمیم‌های طراحی domain-specific به‌جای دیفالت‌های AI؛ مسیریابی به app.md یا marketing.md بر اساس بافت.
+description: Intentional, precise frontend design principles (joshuadavidthomas/agent-skills) — for building and reviewing dashboards, admin panels, landing pages and web apps; domain-specific design decisions instead of generic AI defaults; routes to app.md or marketing.md by context.
 ---
 
 # Frontend Design Principles

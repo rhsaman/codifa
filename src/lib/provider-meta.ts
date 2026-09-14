@@ -1,7 +1,7 @@
 /**
  * Single source of truth for per-provider-kind metadata, shared by the store
  * (defaults), the Settings UI (labels / env-var hints / credential banner /
- * base-URL hints / OAuth) and — mirrored on the Python side by
+ * base-URL hints) and — mirrored on the Python side by
  * `backend/providers.py::_PROVIDERS` — the sidecar.
  *
  * Adding a new provider kind is ONE entry here (plus its twin in
@@ -34,8 +34,6 @@ export interface ProviderKindMeta {
   baseUrlDesc?: string
   /** Default base URL for built-in providers (used when user doesn't override). */
   defaultBaseUrl?: string
-  /** True = supports Google-style OAuth sign-in. */
-  oauth?: boolean
   /** Extra hint line (e.g. an account id env var also required). */
   extraHint?: string
 }
@@ -60,7 +58,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     envVars: ['GOOGLE_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY'],
     requiresKey: true,
     builtin: true,
-    oauth: true,
     baseUrlHint: 'https://generativelanguage.googleapis.com/v1beta/openai',
     baseUrlDesc: 'Gemini models via Google.',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',

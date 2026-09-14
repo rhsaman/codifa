@@ -85,12 +85,6 @@ export interface ProviderConfig {
   baseUrl: string
   model: string
   enabled?: boolean
-  /** OAuth login (Google "google" kind): auth_type = "oauth" turns the provider
-   *  into a token-based connection resolved from oauthRefreshToken. */
-  authType?: string
-  oauthClientId?: string
-  oauthClientSecret?: string
-  oauthRefreshToken?: string
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
@@ -401,8 +395,9 @@ export interface Chat {
   pendingAsk?: { id: string; question: string; options: string[] } | null
   /** A pending `permission` request from a RUNNING agent turn. Same rationale
    *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
-   *  on chat switch. */
-  pendingPermission?: { id: string; action: string; path?: string; reason?: string; scope?: string } | null
+   *  on chat switch. `folder` = the backend-normalized approved folder (the
+   *  nearest existing parent of `path`) — what "Always allow" registers. */
+  pendingPermission?: { id: string; action: string; path?: string; reason?: string; scope?: string; folder?: string } | null
   /** Transient compact/command/stall banners, kept on the chat (not local
    *  component state) for the same reason as `pendingAsk`: `<ChatPanel
    *  key={activeChatId} />` remounts on every chat switch, so local state would
@@ -489,6 +484,10 @@ export interface SidecarEvent {
   action?: string
   /** 'confirm' for a generic confirm_action request; 'computer' for desktop-app control; absent/'outside' for the original outside-workspace permission prompt */
   scope?: string
+  /** Outside-workspace permission: the backend-normalized folder the grant
+   *  applies to (nearest existing parent of `path`). Empty when the request
+   *  has no path or the path could not be normalized. */
+  folder?: string
   /** ask_user: the question text and, when multiple-choice, its options */
   question?: string
   options?: string[]

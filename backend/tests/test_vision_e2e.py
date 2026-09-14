@@ -216,7 +216,7 @@ async def test_vision_model_timeout_is_bounded():
     # The vision model must be built with a bounded timeout (30s) so a slow
     # provider fails fast instead of hanging the turn for minutes.
     model = graph.resolve_subagent_model(
-        "custom", "mock-model", "http://localhost:1", "test", "", None, "",
+        "custom", "mock-model", "http://localhost:1", "test", "", "",
         default_to_parent=False, timeout=30,
     )
     # LangChain stores the scalar timeout as `request_timeout` on the model.

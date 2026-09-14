@@ -27,7 +27,6 @@ async def main() -> None:
     base = parent.get("baseUrl") or ""
     key = parent.get("apiKey") or ""
     env = parent.get("envVar") or ""
-    oauth = parent.get("oauthRefreshToken") or ""
 
     print(f"PARENT: kind={kind} model={model} base={base}")
     print(f"subagentModels: {settings.get('subagentModels')}")
@@ -44,7 +43,6 @@ async def main() -> None:
         prompt="Say OK.",
         history=[],
         env_var=env,
-        oauth_token=oauth,
         max_history=3,
         subagent_models=settings.get("subagentModels") or {},
     ):

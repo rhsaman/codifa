@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchPluginConfig, SearchPluginKind } from '../types'
+import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
 import { downloadModel, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
@@ -28,7 +28,6 @@ const NEW_SKILL_KEY = '__new_skill__'
 function isProviderConfigured(p: ProviderConfig, envVarVerified?: boolean | null): boolean {
   if (providerMeta(p.kind).local) return true
   if (p.apiKey) return true
-  if (p.authType === 'oauth' && p.oauthRefreshToken) return true
   if (p.envVar) {
     // فقط وقتی سبز باش که env var واقعاً وجود داشته باشه
     if (envVarVerified !== undefined) return envVarVerified === true
@@ -540,7 +539,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // top of the form so the problem is visible BEFORE a message is sent).
   const hasSavedKey = !!(cfg.apiKey ?? '').trim()
   const credentialReady = envVarValue === true || hasSavedKey
-  const oauthReady = providerMeta(cfg.kind).oauth && cfg.authType === 'oauth' && !!(cfg.oauthRefreshToken ?? '')
   const requiresKey = providerMeta(cfg.kind).requiresKey
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>(() => {
     const d: Record<string, string> = {}
@@ -549,17 +547,20 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   })
 
   const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
-  const googleProvider = providers.find((p) => p.kind === 'google')
+  // Search Console OAuth (Settings → Auth) — the ONLY Google sign-in. Gemini
+  // models authenticate with an API key like every other provider.
+  const searchConsole = useStore((s) => s.searchConsole)
+  const setSearchConsole = useStore((s) => s.setSearchConsole)
   const [googleAuthDraft, setGoogleAuthDraft] = useState<{ clientId: string; clientSecret: string }>({
-    clientId: googleProvider?.oauthClientId ?? '',
-    clientSecret: googleProvider?.oauthClientSecret ?? '',
+    clientId: searchConsole.clientId,
+    clientSecret: searchConsole.clientSecret,
   })
   useEffect(() => {
     setGoogleAuthDraft({
-      clientId: googleProvider?.oauthClientId ?? '',
-      clientSecret: googleProvider?.oauthClientSecret ?? '',
+      clientId: searchConsole.clientId,
+      clientSecret: searchConsole.clientSecret,
     })
-  }, [googleProvider?.oauthClientId, googleProvider?.oauthClientSecret])
+  }, [searchConsole.clientId, searchConsole.clientSecret])
 
   // Close the whole settings window with Escape (unless focus is in a text
   // field, where Escape is used by the inner dropdowns/search boxes).
@@ -856,8 +857,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setPrompt = (mode: string, value: string) =>
     setPromptDrafts((d) => ({ ...d, [mode]: value }))
 
-  const persistGoogleAuth = (patch: Partial<ProviderConfig>) => {
-    if (googleProvider) updateProvider(googleProvider.id, patch)
+  const persistGoogleAuth = (patch: Partial<SearchConsoleConfig>) => {
+    setSearchConsole(patch)
   }
 
   const signInGoogle = async () => {
@@ -870,10 +871,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     try {
       const res = await api.googleSignIn(cid, googleAuthDraft.clientSecret)
       persistGoogleAuth({
-        authType: 'oauth',
-        oauthClientId: cid,
-        oauthClientSecret: googleAuthDraft.clientSecret,
-        oauthRefreshToken: res.refreshToken,
+        clientId: cid,
+        clientSecret: googleAuthDraft.clientSecret,
+        refreshToken: res.refreshToken,
       })
       setOauthState({ status: 'ok', msg: 'Signed in — Google account connected.' })
     } catch (err) {
@@ -885,7 +885,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   }
 
   const disconnectGoogle = () => {
-    persistGoogleAuth({ authType: '', oauthRefreshToken: '' })
+    persistGoogleAuth({ refreshToken: '' })
     setOauthState({ status: 'ok', msg: 'Google account disconnected.' })
   }
 
@@ -899,11 +899,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const save = async () => {
     // Providers that REQUIRE a credential must not be saved in a broken state
-    // (empty env var + no saved key + no OAuth) — that is exactly how a user
+    // (empty env var + no saved key) — that is exactly how a user
     // ends up with the "Set the GOOGLE_API_KEY environment variable" error.
     if (
       requiresKey &&
-      !oauthReady &&
       !credentialReady
     ) {
       setCredWarn(true)
@@ -1099,7 +1098,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (tab === 'auth') {
       const cid = googleAuthDraft.clientId.trim()
       const csec = googleAuthDraft.clientSecret.trim()
-      if (cid || csec) persistGoogleAuth({ oauthClientId: cid, oauthClientSecret: csec })
+      if (cid || csec) persistGoogleAuth({ clientId: cid, clientSecret: csec })
       flushStateNow()
       setSaved(true)
       setTimeout(onClose, 300)
@@ -1189,11 +1188,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="env-key-hint ok">
                 <span className="status-dot ok" />
                 Local provider — no API key needed.
-              </div>
-            ) : oauthReady ? (
-              <div className="env-key-hint ok">
-                <span className="status-dot ok" />
-                Ready — connected via your Google account (Settings → Auth).
               </div>
             ) : credentialReady ? (
               <div className="env-key-hint ok">
@@ -1384,10 +1378,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <label>Google account</label>
             </div>
             <div className="hint">
-              One sign-in connects Gemini models (Settings → Providers) and the Search
-              Console tool (Settings → Plugins). Create an OAuth 2.0 Desktop client in the
-              Google Cloud Console (APIs &amp; Services → Credentials), paste its id and
-              secret below, then sign in.
+              This sign-in connects ONLY the Search Console tool (site analytics).
+              Gemini models authenticate with an API key under Settings → Providers →
+              Google, like every other provider. Create an OAuth 2.0 Desktop client in
+              the Google Cloud Console (APIs &amp; Services → Credentials), paste its id
+              and secret below, then sign in.
             </div>
             <details className="guided-steps">
               <summary>How to create your Google OAuth client id &amp; secret</summary>
@@ -1400,7 +1395,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   (signed in to the same Google account you want to use).
                 </li>
                 <li>If you don't have a project yet, click <strong>Select a project → New Project</strong> and create one.</li>
-                <li>If prompted, enable the APIs: <strong>Generative Language API</strong> and <strong>Google Search Console API</strong> (APIs &amp; Services → Library → search each → Enable).</li>
+                <li>If prompted, enable the API: <strong>Google Search Console API</strong> (APIs &amp; Services → Library → search → Enable).</li>
                 <li>
                   Click <strong>Create Credentials → OAuth client ID</strong>.
                 </li>
@@ -1416,8 +1411,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </li>
               </ol>
               <p className="hint">
-                One client is enough for both Gemini and Search Console — the sign-in below asks
-                for all the needed permissions in a single Google consent.
+                The sign-in asks only for the Search Console (webmasters.readonly)
+                permission in a single Google consent.
               </p>
             </details>
             <label className="field-label">Google OAuth client id</label>
@@ -1436,7 +1431,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               type="password"
             />
             <div className="oauth-actions">
-              {googleProvider?.authType === 'oauth' && googleProvider?.oauthRefreshToken ? (
+              {searchConsole.refreshToken ? (
                 <button className="btn tiny danger" onClick={disconnectGoogle}>
                   Disconnect
                 </button>
@@ -1473,9 +1468,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
             )}
             <div className="hint">
-              Connected: {googleProvider?.authType === 'oauth' && googleProvider?.oauthRefreshToken ? 'yes' : 'no'}. The
-              same sign-in also powers the Search Console tool automatically — you don't need a
-              separate connection.
+              Connected: {searchConsole.refreshToken ? 'yes' : 'no'}. This sign-in powers the
+              Search Console tool (Settings → Plugins). Gemini models use an API key
+              (Settings → Providers → Google), like every other provider.
             </div>
           </div>
         </>

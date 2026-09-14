@@ -640,14 +640,18 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
     return code, output
 
 
-def _escapes_root(command: str, root: str) -> str | None:
+def _escapes_root(command: str, root: str, permit: dict | None = None) -> str | None:
     """Return a reason string if ``command`` references paths outside ``root``.
 
     The file tools are already sandboxed through ``resolve_safe``; this gives the
     terminal the same guarantee so the agent can't drift into ``~/.config``,
     ``/Users/...`` or any other path outside the selected workspace on its own.
+
+    Per-folder grants (``permit["folders"]``) allow paths under the exact
+    folders the user approved; ``permit["outside"]`` allows everything.
     """
     root_real = os.path.realpath(os.path.abspath(root))
+    folders = _permit_folders(permit)
     # Home / $HOME expansions point outside the workspace.
     # Home / $HOME expansions point outside the workspace. `$` is not a word
     # char, so a leading `\b` can't anchor `$HOME` after a space/`=` — anchor on
@@ -657,11 +661,15 @@ def _escapes_root(command: str, root: str) -> str | None:
         command,
         re.IGNORECASE,
     ):
-        return "references paths outside the project root (~ / $HOME)"
+        # `~`/`$HOME` alone can't tell WHICH folder is meant — allow only when
+        # the home dir itself (or everything) is granted, else block.
+        home = os.path.realpath(os.path.expanduser("~"))
+        if not _path_in_folders(home, folders):
+            return "references paths outside the project root (~ / $HOME)"
     # `..` can climb out of root.
     if re.search(r"(^|[\s;|&])\.\.(/|\s|$)", command):
         return "references paths outside the project root (..)"
-    # Absolute paths must lie inside the workspace (or be a safe system sink).
+    # Absolute paths must lie inside the workspace (or a safe system sink).
     _os_tmp = tempfile.gettempdir().rstrip("/\\") + os.sep
     _SAFE_ABS = ("/dev/null", _os_tmp, "/tmp/", "/dev/std", "/dev/fd")
     for m in re.finditer(r"(?:^|[\s;|&])(/[^\s;|&'\"`]*)", command):
@@ -677,6 +685,8 @@ def _escapes_root(command: str, root: str) -> str | None:
         except Exception:  # noqa: BLE001
             real = p
         if real != root_real and not real.startswith(root_real + os.sep):
+            if _path_in_folders(real, folders):
+                continue
             return f"references path outside the project root: {p}"
     return None
 
@@ -724,7 +734,7 @@ def run_terminal(
     if reason:
         return {"command": command, "error": reason}
     if not (permit or {}).get("outside"):
-        reason = _escapes_root(command, root)
+        reason = _escapes_root(command, root, permit)
         if reason is None:
             reason = _writes_outside_root(command)
         if reason:
@@ -743,7 +753,61 @@ class PathEscapeError(ValueError):
     """Raised when a path attempts to escape the sandboxed root."""
 
 
-def resolve_safe(root: str, rel_path: str, allow_coder: bool = False) -> str:
+def _permit_folders(permit: dict | None) -> list[str]:
+    """پوشه‌های مجازِ خارج از ریشه (realpath شده) از permit.
+
+    permit["folders"] لیست پوشه‌هایی است که کاربر برایشان مجوز داده؛
+    permit["outside"] = True یعنی مجوز کامل خارج از ریشه (legacy /
+    «Always allow» قدیمی) — در آن حالت همه‌جا مجاز است.
+    """
+    if not isinstance(permit, dict):
+        return []
+    if permit.get("outside"):
+        return []
+    folders = permit.get("folders")
+    if not isinstance(folders, list):
+        return []
+    out: list[str] = []
+    for f in folders:
+        if isinstance(f, str) and f:
+            out.append(f)
+    return out
+
+
+def _path_in_folders(target: str, folders: list[str]) -> bool:
+    """آیا ``target`` (realpath شده) زیر یکی از ``folders`` است؟"""
+    for f in folders:
+        if target == f or target.startswith(f + os.sep):
+            return True
+    return False
+
+
+def _requested_folder(path: str) -> str:
+    """نزدیک‌ترین والدِ موجودِ ``path`` — پوشه‌ای که مجوز برایش ثبت می‌شود.
+
+    مسیر درخواستی ممکن است هنوز وجود نداشته باشد (مثلاً فایلی که قرار است
+    ساخته شود)؛ مجوز باید روی پوشه‌ی موجودِ والدش ثبت شود تا realpath معتبر
+    باشد و resolve_safe بتواند عضویت را چک کند.
+    """
+    raw = path.strip()
+    if raw.startswith("~"):
+        raw = os.path.expanduser(raw)
+    if not os.path.isabs(raw):
+        return ""
+    cur = os.path.realpath(raw)
+    while cur and cur != os.sep:
+        if os.path.isdir(cur):
+            return cur
+        cur = os.path.dirname(cur)
+    return ""
+
+
+def resolve_safe(
+    root: str,
+    rel_path: str,
+    allow_coder: bool = False,
+    permit: dict | None = None,
+) -> str:
     """Resolve ``rel_path`` against ``root`` and reject any escape.
 
     Accepts both relative paths (``src/main.py``) and absolute paths that lie
@@ -751,6 +815,11 @@ def resolve_safe(root: str, rel_path: str, allow_coder: bool = False) -> str:
     user-level data folder (``user_coder_dir()`` — Data path in Settings) are
     also allowed when ``allow_coder`` is set — reading them must never require
     a permission prompt (writing still goes through the strict path).
+
+    Paths OUTSIDE the root are allowed only when they lie under one of the
+    per-folder grants in ``permit["folders"]`` (the user approved that exact
+    folder via request_permission) — or when ``permit["outside"]`` is set
+    (full outside-workspace permission).
     """
     root_real = os.path.realpath(os.path.abspath(root))
     if not os.path.isdir(root_real):
@@ -770,6 +839,10 @@ def resolve_safe(root: str, rel_path: str, allow_coder: bool = False) -> str:
             coder = os.path.realpath(user_coder_dir())
             if target == coder or target.startswith(coder + os.sep):
                 return target
+        if permit is not None and _path_in_folders(
+            target, _permit_folders(permit)
+        ):
+            return target
         raise PathEscapeError(f"path escapes project root: {rel_path}")
 
     return target
@@ -849,9 +922,9 @@ def _display_path(root: str, file: str) -> str:
     return os.path.relpath(file, root_real).replace(os.sep, "/")
 
 
-def list_files(root: str, path: str = "") -> dict:
+def list_files(root: str, path: str = "", permit: dict | None = None) -> dict:
     """List the directory contents of ``path`` (relative to root)."""
-    target = resolve_safe(root, path, allow_coder=True)
+    target = resolve_safe(root, path, allow_coder=True, permit=permit)
     if not os.path.isdir(target):
         return {"path": path, "error": "not a directory"}
 
@@ -883,12 +956,12 @@ def list_files(root: str, path: str = "") -> dict:
     return {"path": path, "entries": entries}
 
 
-def read_file(root: str, path: str) -> dict:
+def read_file(root: str, path: str, permit: dict | None = None) -> dict:
     """Read the text content of ``path`` (relative to root).
 
     Paths under the user data folder are readable without permission.
     """
-    target = resolve_safe(root, path, allow_coder=True)
+    target = resolve_safe(root, path, allow_coder=True, permit=permit)
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
     if os.path.isdir(target):
@@ -980,9 +1053,9 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
     }
 
 
-def write_file(root: str, path: str, content: str) -> dict:
+def write_file(root: str, path: str, content: str, permit: dict | None = None) -> dict:
     """Write ``content`` to ``path`` (relative to root). Creates parent dirs."""
-    target = resolve_safe(root, path)
+    target = resolve_safe(root, path, permit=permit)
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
@@ -1297,10 +1370,11 @@ def sync_builtin_skills() -> list[str]:
     """Seed/re-sync built-in skills from ``backend/skills/*.md`` on every startup.
 
     Scans the shipped skills folder and seeds any skill that is not already in
-    the user's skill store, and re-seeds a built-in whose shipped ``.md`` has changed
-    (so official fixes propagate without manual deletion). Adding a new ``.md``
-    file to the folder makes it a built-in skill on the next startup, with no
-    code change required. Returns the names that were seeded or re-synced.
+    the user's skill store, and re-seeds a built-in whose shipped ``.md`` has
+    changed — body OR frontmatter (e.g. an updated description) — so official
+    fixes propagate without manual deletion. Adding a new ``.md`` file to the
+    folder makes it a built-in skill on the next startup, with no code change
+    required. Returns the names that were seeded or re-synced.
 
     Note: built-ins are superseded by shipped updates even if a user edited the
     stored copy — personal edits should live in user-created skills, not
@@ -1315,15 +1389,19 @@ def sync_builtin_skills() -> list[str]:
         existing = []
     existing_slugs = {s.get("slug") for s in existing}
     existing_names = {s.get("name") for s in existing}
-    # Map name/slug -> stored body (frontmatter already stripped by list_skills),
-    # so we can compare against the shipped ``.md`` body below.
-    existing_body: dict[str, str] = {}
+    # Map name/slug -> (description, body) — the stored content is frontmatter-
+    # stripped by list_skills — so a shipped change to EITHER the body or the
+    # frontmatter (e.g. description) triggers a re-sync below.
+    existing_meta: dict[str, tuple[str, str]] = {}
     for s in existing:
-        body = (s.get("content") or "").strip()
+        meta = (
+            (s.get("description") or "").strip(),
+            (s.get("content") or "").strip(),
+        )
         if s.get("name"):
-            existing_body[s["name"]] = body
+            existing_meta[s["name"]] = meta
         if s.get("slug"):
-            existing_body[s["slug"]] = body
+            existing_meta[s["slug"]] = meta
     seeded: list[str] = []
     for path in sorted(_pyglob.glob(os.path.join(folder, "*.md"))):
         try:
@@ -1331,20 +1409,42 @@ def sync_builtin_skills() -> list[str]:
                 raw = fh.read()
         except OSError:
             continue
-        name, _description, body = _parse_skill_markdown(raw)
+        name, description, body = _parse_skill_markdown(raw)
         if not name:
             name = os.path.splitext(os.path.basename(path))[0]
         if name in existing_names or slugify(name) in existing_slugs:
             # Built-in already present: re-sync only when the shipped file
             # changed, so official updates take effect. Identical copies are
             # left untouched.
-            stored = existing_body.get(name) or existing_body.get(slugify(name), "")
-            if stored == body.strip():
+            stored = existing_meta.get(name) or existing_meta.get(slugify(name))
+            if stored == (description.strip(), body.strip()):
                 continue
         result = persist_skill(raw, fallback_name=name)
         if result.get("ok"):
             seeded.append(result.get("name") or name)
+    _retire_renamed_builtins()
     return seeded
+
+
+# Built-ins whose shipped display name changed in an update (old -> new).
+# ``sync_builtin_skills`` retires a stored copy still carrying the old name
+# once the renamed skill is in the store, so the catalog never lists both.
+_RENAMED_BUILTINS: dict[str, str] = {
+    # Persian-named builtin from before skill names were required to be
+    # English/ASCII.
+    "یادگیری زبان از روی داکیومنت": "Learn from Docs",
+}
+
+
+def _retire_renamed_builtins() -> None:
+    """Delete stored relics of renamed built-ins (see ``_RENAMED_BUILTINS``)."""
+    try:
+        stored = {s.get("name") for s in _state_db.list_skills()}
+    except Exception:  # noqa: BLE001
+        return
+    for old_name, new_name in _RENAMED_BUILTINS.items():
+        if old_name in stored and new_name in stored:
+            _state_db.delete_skill(old_name)
 
 
 # Built-in MCP connectors shipped with the app. They are seeded on first run
@@ -1558,6 +1658,7 @@ def edit_file(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
+    permit: dict | None = None,
 ) -> dict:
     """Replace an exact substring in ``path`` (relative to root).
 
@@ -1571,7 +1672,7 @@ def edit_file(
     more than once while ``replace_all`` is False (the caller must supply
     enough surrounding context to make the match unique).
     """
-    target = resolve_safe(root, path)
+    target = resolve_safe(root, path, permit=permit)
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
@@ -1743,7 +1844,7 @@ def _verify_typescript(root: str) -> str | None:
     return f"{count} TypeScript error(s):\n{preview}{more}"
 
 
-def verify_edit(root: str, path: str) -> str | None:
+def verify_edit(root: str, path: str, permit: dict | None = None) -> str | None:
     """Best-effort post-write verification for Coder mode's write_file/edit_file.
 
     Dispatches by extension: .py gets an instant AST syntax check; .json gets an
@@ -1754,7 +1855,7 @@ def verify_edit(root: str, path: str) -> str | None:
     """
     ext = os.path.splitext(path)[1].lower()
     try:
-        target = resolve_safe(root, path)
+        target = resolve_safe(root, path, permit=permit)
     except PathEscapeError:
         return None
     if ext == ".py":
@@ -1792,7 +1893,7 @@ def _format_plan_nudge_suffix(due: bool) -> str:
 
 
 def _search_python(
-    root: str, query: str, path: str, ctx: int, include: str = ""
+    root: str, query: str, path: str, ctx: int, include: str = "", permit: dict | None = None
 ) -> dict:
     """Python fallback for ``search_in_files`` when ripgrep is unavailable.
 
@@ -1800,7 +1901,7 @@ def _search_python(
     case-insensitive regex, ``ctx`` lines of surrounding context. Slower and
     does not honour ``.gitignore``, but returns the same result shape.
     """
-    target = resolve_safe(root, path, allow_coder=True)
+    target = resolve_safe(root, path, allow_coder=True, permit=permit)
     if not os.path.isdir(target) and not os.path.isfile(target):
         return {
             "query": query,
@@ -1879,13 +1980,13 @@ def _include_glob_to_re(include: str) -> re.Pattern | None:
 
 
 def _rg_search(
-    root: str, query: str, path: str, ctx: int, include: str = ""
+    root: str, query: str, path: str, ctx: int, include: str = "", permit: dict | None = None
 ) -> dict | None:
     """Claude-Code-style ripgrep search; returns None when rg is unusable."""
     rg = shutil.which("rg")
     if not rg:
         return None
-    target = resolve_safe(root, path, allow_coder=True)
+    target = resolve_safe(root, path, allow_coder=True, permit=permit)
     root_real = os.path.realpath(os.path.abspath(root))
     coder = os.path.realpath(user_coder_dir())
     in_coder = target == coder or target.startswith(coder + os.sep)
@@ -2029,7 +2130,12 @@ def _rg_search(
 
 
 def search_in_files(
-    root: str, query: str, path: str = "", context: int = 0, include: str = ""
+    root: str,
+    query: str,
+    path: str = "",
+    context: int = 0,
+    include: str = "",
+    permit: dict | None = None,
 ) -> dict:
     """Search for ``query`` (case-insensitive regex) under ``path``.
 
@@ -2042,10 +2148,10 @@ def search_in_files(
     ``*.ts`` / ``*.{ts,tsx}``).
     """
     ctx = max(0, int(context or 0))
-    result = _rg_search(root, query, path, ctx, include)
+    result = _rg_search(root, query, path, ctx, include, permit)
     if result is not None:
         return result
-    return _search_python(root, query, path, ctx, include)
+    return _search_python(root, query, path, ctx, include, permit)
 
 
 def _glob_python(root: str, pattern: str, target: str, path: str) -> dict:
@@ -2130,7 +2236,7 @@ def _rg_glob(root: str, pattern: str, target: str, path: str) -> dict | None:
     }
 
 
-def glob_files(root: str, pattern: str, path: str = "") -> dict:
+def glob_files(root: str, pattern: str, path: str = "", permit: dict | None = None) -> dict:
     """Find files by glob pattern under ``path`` (relative to root).
 
     Matches opencode's ``glob`` tool: ``pattern`` is a glob like ``**/*.js`` or
@@ -2139,7 +2245,7 @@ def glob_files(root: str, pattern: str, path: str = "") -> dict:
     list of relative paths (``matches``), sorted.
     """
     pattern = (pattern or "").strip()
-    target = resolve_safe(root, path, allow_coder=True)
+    target = resolve_safe(root, path, allow_coder=True, permit=permit)
     if not os.path.isdir(target):
         return {"pattern": pattern, "matches": [], "error": "not a directory"}
     if not pattern:
@@ -3034,12 +3140,12 @@ def make_tool_callbacks(
         # diff of what changed for the Code Writer UI.
         old: str | None = None
         try:
-            before = read_file(root, path)
+            before = read_file(root, path, permit)
             old = before.get("content")
         except (PathEscapeError, OSError):
             old = None
         try:
-            result = write_file(root, path, content)
+            result = write_file(root, path, content, permit)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("write_file", msg))
@@ -3085,7 +3191,7 @@ def make_tool_callbacks(
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
         _invalidate_read_cache_for(path, root)
-        verify_note = await asyncio.to_thread(verify_edit, root, path)
+        verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
             + _format_verify_suffix(verify_note)
@@ -3457,7 +3563,7 @@ def make_tool_callbacks(
             }
         )
         try:
-            result = edit_file(root, path, old_string, new_string, replace_all)
+            result = edit_file(root, path, old_string, new_string, replace_all, permit)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("edit_file", msg))
@@ -3501,7 +3607,7 @@ def make_tool_callbacks(
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
         _invalidate_read_cache_for(path, root)
-        verify_note = await asyncio.to_thread(verify_edit, root, path)
+        verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         return (
             f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
             + _format_verify_suffix(verify_note)
@@ -3592,7 +3698,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 *(
                     _shared_search(
                         root, ("grep", combined, p, inc, str(SNIPPET_CONTEXT)),
-                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, inc,
+                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, inc, permit,
                     )
                     for p in all_paths
                     for inc in all_includes
@@ -3803,7 +3909,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             results = await asyncio.gather(
                 *(
                     _shared_search(
-                        root, ("glob", p, sp), generation, glob_files, root, p, sp,
+                        root, ("glob", p, sp), generation, glob_files, root, p, sp, permit,
                     )
                     for p in all_patterns
                     for sp in all_paths
@@ -3872,7 +3978,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         concurrently instead of the caller looping one read_tool call at a
         time."""
         try:
-            target = resolve_safe(root, filePath, allow_coder=True)
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("read", msg))
@@ -4024,6 +4130,24 @@ When you need to read several files, read multiple independent files in parallel
                 for p in all_paths
             )
         )
+        # فوتر خلاصه: اگر بعضی فایل‌ها خطا داده‌اند ولی بقیه موفق بوده‌اند،
+        # مدل نباید فکر کند کل batch شکست خورده (رفع «خواندن دسته‌ای خطا
+        # داد» — مدل به read های جدا برمی‌گشت). خطاها جدا و موفق‌ها عادی
+        # برمی‌گردند + یک خط خلاصه در انتها.
+        _errs = [
+            (p, r)
+            for p, r in zip(all_paths, results)
+            if str(r).startswith("ERROR")
+        ]
+        if _errs and len(_errs) < len(results):
+            _ok = [
+                r for r in results if not str(r).startswith("ERROR")
+            ]
+            _foot = (
+                f"[batch] {len(_ok)}/{len(results)} files read OK; "
+                + "; ".join(f"{p}: {str(r).split(':', 1)[-1].strip()}" for p, r in _errs)
+            )
+            return "\n\n".join(_ok) + "\n\n" + _foot
         return "\n\n".join(results)
 
     async def _read_dir_tool(
@@ -4919,7 +5043,7 @@ When you need to read several files, read multiple independent files in parallel
         # permission prompt — grant silently with no UI card at all.
         if path:
             try:
-                target = resolve_safe(root, path, allow_coder=True)
+                target = resolve_safe(root, path, allow_coder=True, permit=permit)
                 coder = os.path.realpath(user_coder_dir())
                 if target == coder or target.startswith(coder + os.sep):
                     return (
@@ -4938,6 +5062,12 @@ When you need to read several files, read multiple independent files in parallel
                         f"permission is needed — you may read/search/act on it directly without calling "
                         f"request_permission."
                     )
+                # resolve_safe با permit موفق شد یعنی مسیر زیر یکی از پوشه‌های
+                # مجازِ قبلی است — دیالوگ تکراری نشان نده، بی‌صدا مجاز کن.
+                return (
+                    f"PERMISSION GRANTED for {path!r}. The user already approved this folder — you may "
+                    f"read/search/act under it without asking again."
+                )
             except PathEscapeError:
                 pass
         emit(
@@ -4954,6 +5084,9 @@ When you need to read several files, read multiple independent files in parallel
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         permission_gates[pid] = fut
+        # پوشه‌ی نرمال‌شده‌ی درخواست (نزدیک‌ترین والد موجود) از سمت بک‌اند
+        # محاسبه و ارسال می‌شود — فرانت‌اند به فایل‌سیستم دسترسی ندارد و
+        # «همیشه اجازه» باید دقیقاً همین پوشه را ثبت کند.
         emit(
             {
                 "kind": "permission",
@@ -4961,6 +5094,7 @@ When you need to read several files, read multiple independent files in parallel
                 "action": action,
                 "path": path,
                 "reason": reason,
+                "folder": _requested_folder(path) if path else "",
             }
         )
         try:
@@ -4968,8 +5102,15 @@ When you need to read several files, read multiple independent files in parallel
         finally:
             permission_gates.pop(pid, None)
         if granted:
-            if permit is not None:
-                permit["outside"] = True
+            # مجوز per-folder: به‌جای باز کردن کل فضای بیرون از ریشه، فقط
+            # پوشه‌ی درخواستی (نزدیک‌ترین والد موجودِ مسیر) به لیست پوشه‌های
+            # مجاز اضافه می‌شود. پوشه‌های دیگر همچنان مجوز جداگانه می‌خواهند.
+            if permit is not None and path:
+                folder = _requested_folder(path)
+                if folder:
+                    folders = permit.setdefault("folders", [])
+                    if folder not in folders:
+                        folders.append(folder)
             emit(
                 {
                     "kind": "tool_result",
@@ -4977,8 +5118,14 @@ When you need to read several files, read multiple independent files in parallel
                     "summary": "granted",
                 }
             )
+            if path:
+                return (
+                    f"PERMISSION GRANTED for {path!r}. The user approved THIS folder — you may now "
+                    f"read/write/edit/search and run commands under it. Other outside-workspace "
+                    f"folders still need a fresh request_permission."
+                )
             return (
-                f"PERMISSION GRANTED for {path or action!r}. The user approved it — you may now "
+                f"PERMISSION GRANTED for {action!r}. The user approved it — you may now "
                 f"complete this outside-workspace action (other outside actions still need a fresh "
                 f"permission)."
             )
@@ -5165,9 +5312,8 @@ When you need to read several files, read multiple independent files in parallel
           - "inspect hamemigan.com/about" -> action="inspect", url="https://hamemigan.com/about", site="hamemigan.com"
           - "چه سایت‌هایی وصله؟"          -> action="sites"
 
-        Uses the Google account signed in under Settings → Auth (the same OAuth
-        client as the Gemini model). Without a signed-in account this returns a
-        setup hint instead of failing."""
+        Uses the Google account signed in under Settings → Auth. Without a
+        signed-in account this returns a setup hint instead of failing."""
         client_id = ""
         client_secret = ""
         refresh = ""
@@ -5175,31 +5321,13 @@ When you need to read several files, read multiple independent files in parallel
             settings = _state_db.get_settings() or {}
         except Exception:  # noqa: BLE001
             settings = {}
-        # Primary source: the legacy Search Console config. New installs leave it
-        # empty and fall back to the unified google provider OAuth creds.
+        # The Search Console config under Settings → Auth (searchConsole) is
+        # the single source of the OAuth trio. Gemini models authenticate with
+        # an API key only, so no provider fallback exists.
         sc_cfg = settings.get("searchConsole") or {}
         client_id = decrypt_secret(sc_cfg.get("clientId") or "")
         client_secret = decrypt_secret(sc_cfg.get("clientSecret") or "")
         refresh = decrypt_secret(sc_cfg.get("refreshToken") or "")
-        if not (client_id and client_secret and refresh):
-            # Fall back to the google provider's OAuth trio WHOLESALE. A client
-            # id/secret and a refresh token must come from the SAME OAuth client —
-            # mixing the legacy Search Console client with the provider's refresh
-            # token yields Google's "OAuth client was not found" 401.
-            for p in settings.get("providers") or []:
-                if isinstance(p, dict) and p.get("kind") == "google":
-                    pc_id = decrypt_secret(p.get("oauthClientId") or "")
-                    pc_secret = decrypt_secret(p.get("oauthClientSecret") or "")
-                    pc_refresh = decrypt_secret(p.get("oauthRefreshToken") or "")
-                    if pc_id and pc_secret and pc_refresh:
-                        client_id, client_secret, refresh = pc_id, pc_secret, pc_refresh
-                        sc_cfg = {
-                            **sc_cfg,
-                            "clientId": client_id,
-                            "clientSecret": client_secret,
-                            "refreshToken": refresh,
-                        }
-                    break
         if not (client_id and client_secret and refresh):
             return "Google Search Console is not signed in — connect your Google account in Settings → Auth."
         try:

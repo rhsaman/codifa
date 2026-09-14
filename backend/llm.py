@@ -166,10 +166,9 @@ def resolve_key(
     provider: str,
     api_key: str,
     env_var: str = "",
-    oauth_token: str = "",
 ) -> str:
-    """Resolve the effective credential (OAuth > api_key > env chain)."""
-    return oauth_token or api_key or env_key(provider=provider, env_var=env_var) or ""
+    """Resolve the effective credential (api_key > env chain)."""
+    return api_key or env_key(provider=provider, env_var=env_var) or ""
 
 
 def _extra_headers(
@@ -238,7 +237,6 @@ def build_chat_model(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
-    oauth_token: str = "",
     *,
     temperature: float = 0.0,
     max_tokens: int = 0,
@@ -251,8 +249,8 @@ def build_chat_model(
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
 
-    Mirrors ``providers.build_model``'s resolution (qualify id, credential
-    chain, UA spoof, reasoning) but returns a ``BaseChatModel``.
+    Resolves the credential chain (qualify id, api key > env var, UA spoof,
+    reasoning) and returns a ``BaseChatModel``.
 
     ``model_reasoning`` is the per-model capability flag (from the provider's
     ``/models`` ``reasoning`` field). It lets local / custom providers that
@@ -264,7 +262,7 @@ def build_chat_model(
         raise ProviderError("no model selected")
     meta = _provider_meta(provider)
     model = qualify_model_id(provider, model)
-    key = resolve_key(provider, api_key, env_var, oauth_token)
+    key = resolve_key(provider, api_key, env_var)
     if meta.get("requires_key") and not key:
         raise ProviderError(
             f"No {meta.get('name', provider)} credential configured. Open Settings "
@@ -770,7 +768,6 @@ async def chat_model_settings(
     base_url: str,
     api_key: str,
     env_var: str = "",
-    oauth_token: str = "",
     scope: str = "",
 ) -> dict[str, Any]:
     """Compute LangChain-compatible model kwargs from mode + context window.
@@ -787,7 +784,7 @@ async def chat_model_settings(
         from providers import model_max_output
 
         max_output = await model_max_output(
-            provider, model_name, base_url, api_key, env_var, oauth_token=oauth_token
+            provider, model_name, base_url, api_key, env_var
         )
     except Exception:  # noqa: BLE001
         max_output = 0
@@ -1154,18 +1151,46 @@ class _BatchStreakTracker:
     commands). Genuine varied work is never nagged.
     """
 
-    __slots__ = ("_counts", "_recent", "_threshold")
+    __slots__ = ("_counts", "_recent", "_rejected", "_threshold")
 
     def __init__(self, threshold: int = 2):
         # شمارش per-tool + فراخوانی‌های اخیر برای ساخت نمونه‌ی ترکیبی.
         self._counts: dict[str, int] = {}
         self._recent: dict[str, list[dict]] = {}
         self._threshold = max(2, threshold)
+        # ابزارهایی که تذکرشان نادیده گرفته شد — فراخوانی تکِ بعدی همان
+        # ابزار یک بار رد می‌شود (enforcement) تا مدل به‌جای نادیده‌گرفتنِ
+        # متن تذکر، خطای واقعی ابزار را ببیند و واکنش نشان دهد.
+        self._rejected: set[str] = set()
 
     def _batch_args(self, args: dict) -> bool:
         return any(
             k in (args or {})
             for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+        )
+
+    def should_reject(self, name: str) -> str:
+        """Enforcement: a one-at-a-time call AFTER an ignored reminder.
+
+        Returns the rejection text for this call (the tool is NOT run — the
+        model gets an error result instead), or "" when the call may run.
+        Fires ONCE per tool per turn: the next one-at-a-time call after the
+        rejection runs normally, so a model that keeps ignoring the reminder
+        still makes progress (worst case: 1 wasted round-trip per tool).
+        """
+        if name not in self._rejected:
+            return ""
+        self._rejected.discard(name)
+        recent = self._recent.get(name) or []
+        example = _batch_example(name, recent) if recent else ""
+        return (
+            f"NOT RUN — batching enforcement: you already received a BATCHING "
+            f"REMINDER for {name} but fired another single {name} call. This "
+            f"call was NOT executed.\n"
+            + (f"Merge your next calls into ONE tool call shaped exactly like "
+               f"this:\n{example}\n" if example else "")
+            + "Do NOT re-issue the calls that already ran — their results are "
+            "already in this conversation. Batch only your NEXT calls."
         )
 
     def observe(self, tcs: list) -> str:
@@ -1197,9 +1222,11 @@ class _BatchStreakTracker:
             # meant the streak never reached the threshold.
             return ""
         for name in batched:
-            # The model IS batching this tool now — restart its count.
+            # The model IS batching this tool now — restart its count and
+            # cancel any pending enforcement (the reminder was obeyed).
             self._counts.pop(name, None)
             self._recent.pop(name, None)
+            self._rejected.discard(name)
         fired: list[tuple[str, list[dict], int]] = []
         for name, args in step_calls.items():
             n = self._counts.get(name, 0) + 1
@@ -1212,6 +1239,10 @@ class _BatchStreakTracker:
                 fired.append((name, recent, n))
         if not fired:
             return ""
+        # تذکر شلیک کرد — ابزارهای مربوطه را برای enforcement علامت بزن:
+        # اگر مدل در step بعدی باز فراخوانی تک بزند، رد می‌شود.
+        for name, _, _ in fired:
+            self._rejected.add(name)
         lines = [
             f"- {_batch_example(name, calls)}"
             for name, calls, _ in fired
@@ -1270,6 +1301,10 @@ async def langchain_tool_loop(
             return r
         except Exception as exc:  # noqa: BLE001
             return f"ERROR running {name}: {exc}"
+
+    async def _noop_reject(tc, rejects: dict[str, str]):
+        """Enforcement: return the rejection text WITHOUT running the tool."""
+        return rejects.get(tc.get("id", ""), "NOT RUN — batching enforcement")
 
     msgs: list[Any] = []
     # Safety net: some chat templates (e.g. Qwen3.5 / llama.cpp) crash with
@@ -1409,10 +1444,39 @@ async def langchain_tool_loop(
         _step_hint = _batchable_nudge(tcs)
         _streak_hint = _streak.observe(tcs)
         _batch_hint = _step_hint or _streak_hint
+        # Enforcement: فراخوانی‌های تکِ بعد از تذکرِ نادیده‌گرفته‌شده یک بار
+        # رد می‌شوند (اجرا نمی‌شوند) — خطای ابزار سیگنال قوی‌تری از متن
+        # تذکر است و مدل مجبور است واکنش نشان دهد. فقط فراخوانی‌های تکِ
+        # batchable رد می‌شوند؛ فراخوانی batch شده همیشه اجرا می‌شود.
+        _rejects: dict[str, str] = {}
+        for tc in tcs:
+            _rn = (tc.get("name") or "").lower()
+            _ra = tc.get("args") or {}
+            if (
+                _rn in _BATCHABLE_TOOLS
+                and not any(
+                    k in _ra
+                    for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+                )
+                and (_ra.get("filePath") if _rn == "read" else _ra.get("pattern"))
+            ):
+                _rej = _streak.should_reject(_rn)
+                if _rej:
+                    _rejects[tc.get("id", "")] = _rej
         if len(_parallel) > 1:
-            _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
+            _results = await asyncio.gather(
+                *(
+                    _exec(tc)
+                    if tc.get("id", "") not in _rejects
+                    else _noop_reject(tc, _rejects)
+                    for tc in _parallel
+                )
+            )
         else:
-            _results = [await _exec(tc) for tc in _parallel]
+            _results = [
+                await (_exec(tc) if tc.get("id", "") not in _rejects else _noop_reject(tc, _rejects))
+                for tc in _parallel
+            ]
         for tc, result in zip(_parallel, _results):
             msgs.append(
                 ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))

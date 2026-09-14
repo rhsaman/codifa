@@ -93,17 +93,6 @@ export interface ModelPricing {
   cacheWrite?: number
 }
 
-/** Query params / body fields carrying a provider's OAuth credentials. Empty for
- *  key-based providers so the request shape is unchanged. */
-function oauthParams(cfg: ProviderConfig): Array<[string, string]> {
-  if (cfg.authType !== 'oauth') return []
-  const out: Array<[string, string]> = [['auth_type', 'oauth']]
-  if (cfg.oauthClientId) out.push(['oauth_client_id', cfg.oauthClientId])
-  if (cfg.oauthClientSecret) out.push(['oauth_client_secret', cfg.oauthClientSecret])
-  if (cfg.oauthRefreshToken) out.push(['oauth_refresh_token', cfg.oauthRefreshToken])
-  return out
-}
-
 export interface ModelsResult {
   models: string[]
   context: Record<string, number>
@@ -191,7 +180,6 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
     api_key: cfg.apiKey,
   })
   if (cfg.envVar) params.set('env_var', cfg.envVar)
-  for (const [k, v] of oauthParams(cfg)) params.set(k, v)
   const p = (async () => {
     const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
     if (!res.ok) {
@@ -225,7 +213,7 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
 }
 
 // In-flight /models dedup. Keyed by provider config so changing baseUrl /
-// apiKey / OAuth creds always triggers a fresh fetch.
+// apiKey always triggers a fresh fetch.
 const modelsInFlight = new Map<string, Promise<ModelsResult>>()
 
 export interface ModelTestResult { ok: boolean; reply: string }
@@ -242,7 +230,6 @@ export async function testModel(cfg: ProviderConfig, model: string): Promise<Mod
     model,
   }
   if (cfg.envVar) body.env_var = cfg.envVar
-  for (const [k, v] of oauthParams(cfg)) body[k] = v
   const res = await fetch(`${url}/models/test`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -264,10 +251,6 @@ function providerRequestKey(cfg: ProviderConfig): string {
     cfg.baseUrl ?? "",
     cfg.apiKey ?? "",
     cfg.envVar ?? "",
-    cfg.authType ?? "",
-    cfg.oauthClientId ?? "",
-    cfg.oauthClientSecret ?? "",
-    cfg.oauthRefreshToken ?? "",
   ].join("|")
 }
 
@@ -294,7 +277,6 @@ export async function fetchCredits(cfg: ProviderConfig): Promise<Partial<Credits
     api_key: cfg.apiKey,
   })
   if (cfg.envVar) params.set('env_var', cfg.envVar)
-  for (const [k, v] of oauthParams(cfg)) params.set(k, v)
   const p = (async () => {
     try {
       const res = await fetch(`${url}/credits?${params}`, { signal: AbortSignal.timeout(15_000) })
@@ -365,6 +347,9 @@ export interface StreamParams {
   cap?: ModeCapabilities
   /** User pre-approved outside-workspace access for this session/workspace. */
   allowOutside?: boolean
+  /** Outside-workspace folders the user pre-approved per-folder ("Always
+   *  allow" on the per-folder permission dialog) — absolute realpaths. */
+  allowOutsideFolders?: string[]
   /** User pre-approved desktop-app control (the `computer` tool's mutating
    *  actions) for this session/workspace — set by "Always allow". */
   allowComputer?: boolean
@@ -478,10 +463,6 @@ export async function streamChat(
           api_key: params.provider.apiKey,
           env_var: params.provider.envVar ?? '',
           base_url: params.provider.baseUrl,
-          auth_type: params.provider.authType ?? '',
-          oauth_client_id: params.provider.oauthClientId ?? '',
-          oauth_client_secret: params.provider.oauthClientSecret ?? '',
-          oauth_refresh_token: params.provider.oauthRefreshToken ?? '',
           model: params.provider.model,
           root: params.root,
           mode: params.mode,
@@ -498,6 +479,7 @@ export async function streamChat(
           allow_create: params.allowCreate ?? false,
           cap: params.cap ?? {},
           allow_outside: params.allowOutside ?? false,
+          allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
           nvim_file: params.nvimFile ?? "",
           nvim_diagnostics: params.nvimDiagnostics ?? [],
@@ -608,7 +590,6 @@ export interface CompactProvider {
   baseUrl: string
   apiKey: string
   envVar?: string
-  oauthToken?: string
   /** User-configured provider id — usage attribution groups by this, not kind. */
   id?: string
 }
@@ -655,14 +636,12 @@ export async function triggerCompact(params: {
       base_url: params.provider.baseUrl,
       api_key: params.provider.apiKey,
       env_var: params.provider.envVar ?? '',
-      oauth_token: params.provider.oauthToken ?? '',
       provider_id: params.provider.id ?? '',
       fallback_provider: params.fallback.kind,
       fallback_model: params.fallback.model,
       fallback_base_url: params.fallback.baseUrl,
       fallback_api_key: params.fallback.apiKey,
       fallback_env_var: params.fallback.envVar ?? '',
-      fallback_oauth_token: params.fallback.oauthToken ?? '',
       fallback_provider_id: params.fallback.id ?? '',
       history: params.history,
       context_window: params.contextWindow ?? 0,

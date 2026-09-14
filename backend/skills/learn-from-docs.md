@@ -1,14 +1,7 @@
 ---
-name: یادگیری زبان از روی داکیومنت
+name: Learn from Docs
 slug: learn-from-docs
-description: When the user wants to learn a programming language (or framework/tool) directly from its official documentation; provides a structured learning path, hands-on exercises, and spaced-repetition flashcards. Triggered with @یادگیری-زبان-از-روی-داکیومنت.
----
-
-# یادگیری زبان از روی داکیومنت
-
----
-name: learn-from-docs
-description: Learn any programming language, framework, or tool directly from its official documentation. Produces a structured learning path, hands-on exercises, and Anki/Obsidian flashcards.
+description: When the user wants to learn a programming language (or framework/tool) directly from its official documentation; provides a structured learning path, hands-on exercises, and spaced-repetition flashcards. Triggered with @learn-from-docs.
 ---
 
 # Learn a Language from Official Documentation

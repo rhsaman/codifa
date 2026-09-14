@@ -215,21 +215,6 @@ def wants_skill_or_mcp(text: str) -> bool:
     return bool(action and target)
 
 
-async def _oauth_access_token(req: ModelsRequest | ChatRequest) -> str:
-    """Resolve a live OAuth access token when the request uses OAuth (Google).
-
-    Returns "" for the plain API-key path so key-based flows are untouched.
-    """
-    if (req.auth_type or "").strip() != "oauth":
-        return ""
-    client_id = (req.oauth_client_id or "").strip()
-    client_secret = (req.oauth_client_secret or "").strip()
-    refresh = (req.oauth_refresh_token or "").strip()
-    if not client_id or not refresh:
-        return ""
-    return await providers.google_access_token(client_id, client_secret, refresh)
-
-
 # Sidecar's own listening port, set in main(). Used to build the loopback
 # redirect_uri for Google OAuth (the consent page lands back on this process).
 _SIDECAR_PORT = 0
@@ -300,13 +285,6 @@ class ChatRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
-    # Google OAuth login (provider kind "google"): resolve a live access token
-    # from a stored refresh token instead of using an API key. Empty strings =
-    # key-based path unchanged.
-    auth_type: str = ""
-    oauth_client_id: str = ""
-    oauth_client_secret: str = ""
-    oauth_refresh_token: str = ""
     model: str = ""
     root: str = ""
     mode: str = "chat"
@@ -337,6 +315,10 @@ class ChatRequest(BaseModel):
     cap: dict = {}
     # User pre-approved outside-workspace access for this session (workspace).
     allow_outside: bool = False
+    # Outside-workspace folders the user pre-approved per-folder ("Always
+    # allow" on the per-folder permission dialog). Each entry is an absolute
+    # realpath; grants are scoped to exactly that folder subtree.
+    allow_outside_folders: list[str] = []
     # User pre-approved desktop-app control (the `computer` tool's mutating
     # actions) for this session — set by "Always allow" in the UI.
     allow_computer: bool = False
@@ -384,7 +366,6 @@ class CompactRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     env_var: str = ""
-    oauth_token: str = ""
     # The user-configured provider id (several rows can share a kind) so the
     # returned usage event groups under the REAL provider. Mirrors
     # ChatRequest.provider_id.
@@ -396,7 +377,6 @@ class CompactRequest(BaseModel):
     fallback_base_url: str = ""
     fallback_api_key: str = ""
     fallback_env_var: str = ""
-    fallback_oauth_token: str = ""
     fallback_provider_id: str = ""
     # Conversation history to compact, as plain {role, content} turns.
     history: list[dict] = []
@@ -413,17 +393,10 @@ class ModelsRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
-    auth_type: str = ""
-    oauth_client_id: str = ""
-    oauth_client_secret: str = ""
-    oauth_refresh_token: str = ""
 
 
 class ModelTestRequest(ModelsRequest):
-    """POST /models/test — probing one model with a tiny completion.
-
-    Inherits every OAuth/key field so `_oauth_access_token` works unchanged.
-    """
+    """POST /models/test — probing one model with a tiny completion."""
 
     model: str = ""
 
@@ -522,10 +495,8 @@ class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""
     # Optional override of the requested OAuth scopes. Empty = the default
-    # Gemini scopes (GOOGLE_OAUTH_SCOPES). Non-empty = e.g. the Search Console
-    # scope (GOOGLE_SEARCH_CONSOLE_SCOPES) for the search_console tool, so the
-    # same OAuth flow signs in to different Google APIs with the open
-    # consent that its own scope set.
+    # Search Console scope (GOOGLE_SEARCH_CONSOLE_SCOPES) for the
+    # search_console tool.
     scope: str = ""
 
 
@@ -539,7 +510,7 @@ async def oauth_google_start(req: OAuthStartRequest) -> dict:
         raise HTTPException(status_code=400, detail="missing Google OAuth client id")
     state = secrets.token_urlsafe(24)
     redirect_uri = _oauth_redirect_uri()
-    scope = (req.scope or "").strip() or providers.GOOGLE_OAUTH_SCOPES
+    scope = (req.scope or "").strip() or providers.GOOGLE_SEARCH_CONSOLE_SCOPES
     url = (
         f"{providers.GOOGLE_OAUTH_AUTH_URL}"
         f"?client_id={quote(client_id, safe='')}"
@@ -619,9 +590,8 @@ async def oauth_google_result(state: str = "") -> dict:
 @app.get("/models")
 async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
-        oauth = await _oauth_access_token(req)
         ids = await providers.list_models(
-            req.provider, req.base_url, req.api_key, req.env_var, oauth_token=oauth
+            req.provider, req.base_url, req.api_key, req.env_var
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -631,9 +601,8 @@ async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
 @app.get("/credits")
 async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
-        oauth = await _oauth_access_token(req)
         return await providers.fetch_credits(
-            req.provider, req.base_url, req.api_key, req.env_var, oauth_token=oauth
+            req.provider, req.base_url, req.api_key, req.env_var
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -650,14 +619,12 @@ async def models_test(req: ModelTestRequest) -> dict:
     if not req.model:
         raise HTTPException(status_code=400, detail="no model selected")
     try:
-        oauth = await _oauth_access_token(req)
         mo = build_chat_model(
             req.provider,
             req.model,
             req.base_url,
             req.api_key,
             req.env_var,
-            oauth_token=oauth,
             timeout=25,
         )
         text, _usage = await asyncio.wait_for(
@@ -1224,7 +1191,6 @@ async def chat_compact(req: CompactRequest, request: Request):
         base_url: str,
         api_key: str,
         env_var: str,
-        oauth: str,
         provider_id: str = "",
     ):
         if not model:
@@ -1236,7 +1202,6 @@ async def chat_compact(req: CompactRequest, request: Request):
                 base_url,
                 api_key,
                 env_var,
-                oauth,
                 temperature=0.0,
                 thinking_level="off",
                 max_tokens=8192,
@@ -1250,13 +1215,13 @@ async def chat_compact(req: CompactRequest, request: Request):
             _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}", level=logging.WARNING)
             return None
 
-    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.oauth_token, req.provider_id)
+    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.provider_id)
     if model is None:
         _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "invalid primary model"}
     fallback = _build(
         req.fallback_provider, req.fallback_model, req.fallback_base_url,
-        req.fallback_api_key, req.fallback_env_var, req.fallback_oauth_token,
+        req.fallback_api_key, req.fallback_env_var,
         req.fallback_provider_id,
     )
     _log(f"primary built={bool(model)} fallback built={bool(fallback)}; running _compact_history")
@@ -1535,6 +1500,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             permission_gates=PERMISSION_GATES,
             ask_gates=ASK_GATES,
             allow_outside=req.allow_outside,
+            allow_outside_folders=req.allow_outside_folders,
             allow_computer=req.allow_computer,
             nvim_file=req.nvim_file,
             nvim_diagnostics=req.nvim_diagnostics,

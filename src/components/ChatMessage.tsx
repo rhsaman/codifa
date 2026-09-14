@@ -1060,7 +1060,10 @@ function isCaptionCandidate(text: string): boolean {
   return true;
 }
 
-function renderSegments(
+/** برای تست واحد export شده (الگوی filterCodeMap در CodeMapPanel): بازرسی
+ *  مستقیم کلیدهای عناصر — پایداری هویت کارت trace حین استریم — بدون
+ *  نیاز به render. */
+export function renderSegments(
   message: ChatMessage,
   onRetry?: (id: string) => void,
 ): ReactNode[] {
@@ -1084,14 +1087,26 @@ function renderSegments(
   // with no groupable call after it) — guarantees unique React keys even when
   // several such captions appear in one message.
   let orphanCap = 0;
-  const wrapTrace = (key: string) => {
+  // هویت پایدار کارت trace (والد گروه‌ها): ایندکس اولین فعالیتِ رانِ جاری —
+  // نه نقطه‌ای که ران بسته می‌شود. کلید پوزیشنال («trace-{i}» / «trace-end»)
+  // همان باگ کلید گروه را برای والدِ آن هم زنده نگه می‌داشت: حین استریم،
+  // narration نیمه‌تایپ‌شده هنوز فراخوانیِ بعدی را ندارد و موقتاً prose
+  // حساب می‌شود؛ ران زیر یک کلید flush می‌شود. لحظه‌ای بعد فراخوانی می‌رسد،
+  // همان متن caption می‌شود و ران زیر کلید دیگری دوباره flush می‌شود —
+  // تغییر کلید والد یعنی unmount کل زیردرخت و از دست رفتن state باز/بسته
+  // بودن گروهی که کاربر باز کرده بود. لنگر به اولین فعالیتِ ران (مثل
+  // grp-… فقط یک‌بار ثبت می‌شود) کلید را در همهٔ رندرها ثابت نگه می‌دارد؛
+  // گروهِ باز فقط با کلیک خود کاربر بسته می‌شود.
+  let traceAnchor: number | null = null;
+  const wrapTrace = () => {
     if (trace.length === 0) return;
     nodes.push(
-      <div key={key} className="tool-trace">
+      <div key={`trace-${traceAnchor}`} className="tool-trace">
         {trace}
       </div>,
     );
     trace = [];
+    traceAnchor = null;
   };
 
   const flush = () => {
@@ -1099,7 +1114,7 @@ function renderSegments(
       // A held-back caption with no groupable call after it (e.g. the run
       // ended on a narration) renders as plain prose instead of vanishing.
       if (pendingCaption) {
-        wrapTrace(`trace-cap-${orphanCap}`);
+        wrapTrace();
         renderProse(`cap-${orphanCap}`, pendingCaption);
         orphanCap++;
         pendingCaption = null;
@@ -1176,7 +1191,7 @@ function renderSegments(
   segs.forEach((seg, i) => {
     if (seg.kind === "user") {
       flush();
-      wrapTrace(`trace-${i}`);
+      wrapTrace();
       const steerMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1194,7 +1209,7 @@ function renderSegments(
       // message itself lives in the store (compactChat pushes it there too),
       // this segment just anchors where it renders.
       flush();
-      wrapTrace(`trace-${i}`);
+      wrapTrace();
       const summaryMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1240,7 +1255,7 @@ function renderSegments(
 
       // Genuine prose — flush whatever tool run was accumulating.
       flush();
-      wrapTrace(`trace-${i}`);
+      wrapTrace();
       renderProse(String(i), seg.text);
       return;
     }
@@ -1248,7 +1263,7 @@ function renderSegments(
     if (!activity) return;
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush();
-      wrapTrace(`trace-${i}`);
+      wrapTrace();
       nodes.push(
         <ToolCallView
           key={i}
@@ -1265,10 +1280,13 @@ function renderSegments(
       captions.push(pendingCaption);
       pendingCaption = null;
       pending.push({ activity, index: seg.index });
+      // لنگر wrapper = اولین فعالیتِ ران؛ فقط یک‌بار ثبت می‌شود (توضیح
+      // traceAnchor بالا) تا کلید کارت trace در همهٔ رندرها ثابت بماند.
+      if (traceAnchor === null) traceAnchor = seg.index;
     }
   });
   flush();
-  wrapTrace("trace-end");
+  wrapTrace();
   return nodes;
 }
 

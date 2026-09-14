@@ -19,8 +19,7 @@ import httpx
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OLLAMA_BASE = "http://localhost:11434"
-# Gemini's OpenAI-compatible endpoint. Both API keys and OAuth access tokens
-# authenticate here via `Authorization: Bearer <credential>`.
+# Gemini's OpenAI-compatible endpoint (API-key authentication).
 GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 TOKENROUTER_BASE = "https://api.tokenrouter.com/v1"
@@ -29,14 +28,9 @@ TOKENROUTER_BASE = "https://api.tokenrouter.com/v1"
 CLOUDFLARE_ACCOUNTS_BASE = "https://api.cloudflare.com/client/v4/accounts"
 GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_OAUTH_SCOPES = (
-    "https://www.googleapis.com/auth/cloud-platform "
-    "https://www.googleapis.com/auth/generative-language.retriever "
-    "https://www.googleapis.com/auth/webmasters.readonly"
-)
-# Search Console API (webmasters) scope for the search_console tool. Now merged
-# into GOOGLE_OAUTH_SCOPES so ONE Google sign-in (Gemini + Search Console)
-# covers everything with a single consent / refresh token.
+# Search Console API (webmasters) scope — the default consent scope for the
+# Google sign-in flow (Settings → Auth). Gemini models authenticate with an
+# API key only, so OAuth exists solely for the search_console tool.
 GOOGLE_SEARCH_CONSOLE_SCOPES = "https://www.googleapis.com/auth/webmasters.readonly"
 # Access tokens from the OAuth flow live ~1h; refresh before expiry.
 GOOGLE_TOKEN_LEEWAY = 120  # seconds
@@ -763,16 +757,16 @@ GOOGLE_MODEL_CACHE_TTL = 300.0  # seconds
 
 
 async def _google_model_limits(
-    api_key: str = "", oauth_token: str = "",
+    api_key: str = "",
 ) -> dict[str, tuple[int | None, int | None]]:
     """Fetch Google's per-model (input_token_limit, output_token_limit) map.
 
-    Authenticates with whatever credential the caller resolved (API key or
-    OAuth access token) via the ``key`` query param / ``x-goog-api-key``
-    header, falling back to the env chain. Never raises — returns the last
-    good cache or an empty dict so a blip means "no extra context" only.
+    Authenticates with the caller's API key via the ``key`` query param /
+    ``x-goog-api-key`` header, falling back to the env chain. Never raises —
+    returns the last good cache or an empty dict so a blip means "no extra
+    context" only.
     """
-    key = oauth_token or api_key or env_key("google", "")
+    key = api_key or env_key("google", "")
     if not key:
         return {}
     global _google_model_cache
@@ -1058,7 +1052,6 @@ async def fetch_credits(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
-    oauth_token: str = "",
 ) -> dict:
     """Fetch the provider account's remaining credit balance.
 
@@ -1069,7 +1062,7 @@ async def fetch_credits(
         return {}
     url = f"{OPENROUTER_BASE}/credits"
     headers: dict[str, str] = {}
-    key = oauth_token or api_key or env_key(provider, env_var)
+    key = api_key or env_key(provider, env_var)
     if key:
         headers["Authorization"] = f"Bearer {key}"
     try:
@@ -1088,66 +1081,11 @@ async def fetch_credits(
         raise ProviderError(f"credits lookup failed: {exc}") from exc
 
 
-async def _list_google_models_native(oauth_token: str) -> list[dict]:
-    """List Google models via the native ``/v1beta/models`` endpoint using an
-    OAuth access token. Used by ``list_models`` when the caller authenticated
-    with OAuth (the OpenAI-compat ``/v1beta/openai/models`` rejects OAuth
-    tokens with 400 — API keys only).
-
-    Returns the same ``[{"id", "context", "max_output", "reasoning"}, ...]``
-    shape as ``list_models`` does for the OpenAI-compat path. Cached under a
-    separate cache key so an API-key request and an OAuth request don't share
-    a (potentially empty) payload. Best-effort: any HTTP error falls back to
-    an empty list, mirroring the graceful-degradation behavior of
-    ``_google_model_limits`` — the user still gets a working chat, they just
-    don't see a populated model list in the picker.
-    """
-    cache_key = ("google-oauth", oauth_token)
-    cached = _model_cache.get(cache_key)
-    if cached and time.monotonic() - cached[0] < _MODEL_CACHE_TTL:
-        return cached[1]
-    headers = {"Authorization": f"Bearer {oauth_token}"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://generativelanguage.googleapis.com/v1beta/models",
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        raise ProviderError(f"google oauth /models failed: {exc}") from exc
-    out: list[dict] = []
-    for m in data.get("models") or []:
-        name = m.get("name") or ""
-        if not name:
-            continue
-        # Native ids are "models/gemini-1.5-pro"; strip the leading segment
-        # so the picker shows the same id as the OpenAI-compat path would.
-        name = name.removeprefix("models/")
-        ctx = m.get("inputTokenLimit")
-        out.append(
-            {
-                "id": name,
-                "context": int(ctx) if ctx else None,
-                "max_output": (
-                    int(m["outputTokenLimit"]) if m.get("outputTokenLimit") else None
-                ),
-                "pricing": None,
-                "reasoning": None,
-            }
-        )
-    out.sort(key=lambda m: m["id"])
-    _model_cache[cache_key] = (time.monotonic(), out)
-    return out
-
-
 async def list_models(
     provider: str,
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
-    oauth_token: str = "",
 ) -> list[dict]:
     """Fetch available models for a provider (cached for 120s).
 
@@ -1161,15 +1099,7 @@ async def list_models(
     * ollama     -> per-model ``/api/show`` (tags carry no context)
     * custom     -> ``max_model_len`` per model, else llama.cpp/LM Studio
                     ``/props`` ``n_ctx`` as a server-wide default
-
-    Google with OAuth tokens is a special case: the OpenAI-compat endpoint at
-    ``/v1beta/openai/models`` only accepts API keys (an OAuth access token
-    there returns 400). For OAuth we hit the native ``/v1beta/models`` and
-    parse its ``{models: [{name, inputTokenLimit, ...}]}`` shape instead,
-    stripping the leading ``models/`` from each id (Google convention).
     """
-    if provider == "google" and oauth_token:
-        return await _list_google_models_native(oauth_token)
     url, fmt = _models_endpoint(provider, base_url)
     cache_key = (provider, url)
     cached = _model_cache.get(cache_key)
@@ -1179,11 +1109,9 @@ async def list_models(
     headers = {}
     if provider == "anthropic":
         # Anthropic-native auth: x-api-key header, not Authorization Bearer.
-        key = oauth_token or api_key or env_key(provider, env_var)
+        key = api_key or env_key(provider, env_var)
         headers["x-api-key"] = key
         headers["anthropic-version"] = "2023-06-01"
-    elif oauth_token:
-        headers["Authorization"] = f"Bearer {oauth_token}"
     elif api_key or env_key(provider, env_var):
         headers["Authorization"] = f"Bearer {api_key or env_key(provider, env_var)}"
 
@@ -1300,7 +1228,7 @@ async def list_models(
                     # context (inputTokenLimit) / output (outputTokenLimit) —
                     # more complete than models.dev and never stale. Fill any
                     # gaps the OpenAI-compatible /models payload left behind.
-                    limits = await _google_model_limits(api_key, oauth_token)
+                    limits = await _google_model_limits(api_key)
                     for m in models:
                         pair = limits.get(m["id"]) or (None, None)
                         if not m["context"] and pair[0]:
@@ -1350,7 +1278,6 @@ async def model_context(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
-    oauth_token: str = "",
 ) -> int:
     """Resolve a specific model's context-window length (tokens).
 
@@ -1377,7 +1304,7 @@ async def model_context(
         return ctx
     try:
         enlisted = await list_models(
-            provider, base_url, api_key, env_var, oauth_token=oauth_token
+            provider, base_url, api_key, env_var
         )
         for entry in enlisted:
             if entry.get("id") == model and entry.get("context"):
@@ -1399,7 +1326,6 @@ async def model_max_output(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
-    oauth_token: str = "",
 ) -> int:
     """Resolve a specific model's max output tokens (best-effort).
 
@@ -1428,7 +1354,7 @@ async def model_max_output(
         return 0
     try:
         enlisted = await list_models(
-            provider, base_url, api_key, env_var, oauth_token=oauth_token
+            provider, base_url, api_key, env_var
         )
         for entry in enlisted:
             if entry.get("id") == model and entry.get("max_output"):

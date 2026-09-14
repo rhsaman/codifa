@@ -1,4 +1,5 @@
 import os
+import shutil
 
 import pytest
 
@@ -214,3 +215,50 @@ def test_save_skill_non_ascii_name_gets_distinct_folder(skill_env):
     # هیچ پوشهٔ «skill» خالی/مشترکی نباید ساخته شود.
     entries = os.listdir(state_db.skills_dir())
     assert "skill" not in entries, entries
+
+
+# ---------------------------------------------------------------------------
+# اسکیل‌های built-in باید انگلیسی باشند + پاکسازی relic تغییرنام‌یافته
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_skills_have_english_names():
+    """همهٔ اسکیل‌های shipped باید نام انگلیسی (ASCII) داشته باشند."""
+    folder = tools._builtin_skills_dir()
+    shipped = [f for f in os.listdir(folder) if f.endswith(".md")]
+    assert shipped, "پوشهٔ اسکیل‌های shipped نباید خالی باشد"
+    for fn in shipped:
+        with open(os.path.join(folder, fn), encoding="utf-8") as fh:
+            raw = fh.read()
+        name, _desc, _body = tools._parse_skill_markdown(raw)
+        assert name and name.isascii(), f"{fn}: نام باید انگلیسی باشد، نه {name!r}"
+        assert tools.slugify(name), f"{fn}: نام باید حروف/ارقام انگلیسی داشته باشد"
+
+
+def test_sync_retires_renamed_builtin_relic(skill_env):
+    """بعد از تغییر نام یک built-in، نسخهٔ ذخیره‌شدهٔ قدیمی باید پاک شود."""
+    # دادهٔ قدیمی کاربر: نسخهٔ با نام فارسی (پیش از تغییر نام به انگلیسی)
+    state_db.save_skill("یادگیری زبان از روی داکیومنت", "", "d", "OLD BODY")
+    # فایل shipped جدید را در پوشهٔ built-in موقت قرار بده
+    shutil.copy(
+        os.path.join(os.path.dirname(tools.__file__), "skills", "learn-from-docs.md"),
+        skill_env / "learn-from-docs.md",
+    )
+    seeded = tools.sync_builtin_skills()
+    assert "Learn from Docs" in seeded
+    names = {s["name"] for s in state_db.list_skills()}
+    assert "Learn from Docs" in names
+    assert "یادگیری زبان از روی داکیومنت" not in names, "relic باید پاک شود"
+
+
+def test_sync_reseeds_when_description_changes(skill_env):
+    """تغییر توصیف shipped (حتی بدون تغییر بدنه) باید re-sync شود."""
+    tools.sync_builtin_skills()
+    changed = BUILTIN_V1.replace(
+        "description: a test skill", "description: a NEW description"
+    )
+    (skill_env / "test-skill.md").write_text(changed, encoding="utf-8")
+    seeded = tools.sync_builtin_skills()
+    assert "Test Skill" in seeded
+    skill = next(s for s in state_db.list_skills() if s["name"] == "Test Skill")
+    assert skill["description"] == "a NEW description"

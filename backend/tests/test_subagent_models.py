@@ -28,7 +28,6 @@ PROVIDER = "custom"
 BASE = "https://opencode.ai/zen/v1"
 KEY = ""
 ENV = "OPENCODE_ZEN_API_KEY"
-OAUTH = ""
 
 
 def _build(entry: str, parent_name: str = "main-model"):
@@ -39,7 +38,7 @@ def _build(entry: str, parent_name: str = "main-model"):
     applies the web/compact parent default).
     """
     return resolve_subagent_model(
-        PROVIDER, entry, BASE, KEY, ENV, OAUTH, parent_name,
+        PROVIDER, entry, BASE, KEY, ENV, parent_name,
         default_to_parent=False,
     )
 
@@ -67,7 +66,7 @@ def test_main_model_literal_returns_parent():
 def test_main_model_literal_in_resolve():
     # "main model" literal in a slot -> that slot runs on the parent model.
     resolved = resolve_subagent_model(
-        PROVIDER, "main_model", BASE, KEY, ENV, OAUTH, "main-model"
+        PROVIDER, "main_model", BASE, KEY, ENV, "main-model"
     )
     assert _name(resolved) == "main-model"
 
@@ -89,7 +88,7 @@ def test_slots_use_parent_when_entry_equals_parent():
     # to the parent.
     for slot in ("web", "compact", "vision"):
         resolved = resolve_subagent_model(
-            PROVIDER, "main-model", BASE, KEY, ENV, OAUTH, "main-model"
+            PROVIDER, "main-model", BASE, KEY, ENV, "main-model"
         )
         assert _name(resolved) == "main-model"
 
@@ -97,10 +96,10 @@ def test_slots_use_parent_when_entry_equals_parent():
 def test_slots_defaults_without_entries():
     # Without entries every slot resolves to the parent (web/compact) and
     # vision stays None (it has no parent default).
-    web = resolve_subagent_model(PROVIDER, "", BASE, KEY, ENV, OAUTH, "main-model")
-    compact = resolve_subagent_model(PROVIDER, "", BASE, KEY, ENV, OAUTH, "main-model")
+    web = resolve_subagent_model(PROVIDER, "", BASE, KEY, ENV, "main-model")
+    compact = resolve_subagent_model(PROVIDER, "", BASE, KEY, ENV, "main-model")
     vision = resolve_subagent_model(
-        PROVIDER, "", BASE, KEY, ENV, OAUTH, "main-model", default_to_parent=False
+        PROVIDER, "", BASE, KEY, ENV, "main-model", default_to_parent=False
     )
     assert _name(web) == "main-model"
     assert _name(compact) == "main-model"
@@ -110,10 +109,10 @@ def test_slots_defaults_without_entries():
 def test_web_compact_default_to_parent_when_unset():
     # web/compact fall back to the PARENT model when unset (the explore slot no
     # longer exists, so there is no separate explore model to inherit).
-    web = resolve_subagent_model(PROVIDER, None, BASE, KEY, ENV, OAUTH, "main-model")
-    compact = resolve_subagent_model(PROVIDER, None, BASE, KEY, ENV, OAUTH, "main-model")
+    web = resolve_subagent_model(PROVIDER, None, BASE, KEY, ENV, "main-model")
+    compact = resolve_subagent_model(PROVIDER, None, BASE, KEY, ENV, "main-model")
     vision = resolve_subagent_model(
-        PROVIDER, None, BASE, KEY, ENV, OAUTH, "main-model", default_to_parent=False
+        PROVIDER, None, BASE, KEY, ENV, "main-model", default_to_parent=False
     )
     assert _name(web) == "main-model"
     assert _name(compact) == "main-model"
@@ -145,18 +144,17 @@ def test_cross_provider_routing():
                 "baseUrl": "http://localhost:1234/v1",
                 "apiKey": "sk-local",
                 "envVar": "",
-                "oauthRefreshToken": "",
             }
         return None
 
     # head == saved row id -> routes to that provider.
     t = _agents._subagent_target(
         "local/gemma-4-E2B-it-Q4_K_M.gguf", "custom",
-        "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY", "",
+        "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY",
         lookup,
     )
     assert t is not None
-    kind, model, base_url, api_key, _, _, _ = t
+    kind, model, base_url, api_key, _, _ = t
     assert kind == "local"
     assert model == "gemma-4-E2B-it-Q4_K_M.gguf"
     assert base_url == "http://localhost:1234/v1"
@@ -166,7 +164,7 @@ def test_cross_provider_routing():
     # just the model id (never the full "provider/model" string).
     t2 = _agents._subagent_target(
         "unknown/gemma.gguf", "custom",
-        "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY", "",
+        "https://opencode.ai/zen/v1", "", "OPENCODE_ZEN_API_KEY",
         lambda pid: None,
     )
     assert t2 is not None

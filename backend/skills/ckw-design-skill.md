@@ -1,6 +1,6 @@
 ---
 name: CKW Design Skill
-description: اسکیل طراحی فرانت‌اند Conner K. Ward (connerkward/ckw-design-skill) — نقطه ورود برای طراحی UI با زیراسکیل‌های design-thinking، design-system، design-spatial، design-ux و design-philosophy؛ خروجی متمایز و production-grade بدون زیبایی‌شناسی AI ژنریک.
+description: Frontend design skill by Conner K. Ward (connerkward/ckw-design-skill) — entry point for UI design with the design-thinking, design-system, design-spatial, design-ux and design-philosophy sub-skills; distinctive, production-grade output without generic AI aesthetics.
 ---
 
 # CKW Design Skill

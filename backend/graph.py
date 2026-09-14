@@ -390,7 +390,6 @@ class AgentState(TypedDict, total=False):
     base_url: str
     api_key: str
     env_var: str
-    oauth_token: str
     context_window: int
     thinking_level: str
     # Whether the selected model is reasoning-capable (from the /models
@@ -405,6 +404,9 @@ class AgentState(TypedDict, total=False):
     ask_gates: dict
     allow_outside: bool
     allow_computer: bool
+    # پوشه‌های خارج از ریشه که کاربر از UI برایشان «همیشه اجازه» داده —
+    # کفِ permit["folders"] در هر rebuild ابزار دوباره تزریق می‌شود.
+    allow_outside_folders: list[str]
     allow_create: bool
     nvim_file: str
     nvim_diagnostics: list
@@ -759,7 +761,6 @@ def resolve_subagent_model(
     base_url: str,
     api_key: str,
     env_var: str,
-    oauth_token: str,
     parent_model_name: str = "",
     default_to_parent: bool = True,
     provider_lookup: Any = None,
@@ -789,7 +790,6 @@ def resolve_subagent_model(
                 base_url,
                 api_key,
                 env_var,
-                oauth_token,
                 temperature=0.2,
                 timeout=timeout,
                 cache=True,
@@ -808,7 +808,6 @@ def resolve_subagent_model(
                     base_url,
                     api_key,
                     env_var,
-                    oauth_token,
                     temperature=0.2,
                     timeout=timeout,
                     cache=True,
@@ -825,13 +824,12 @@ def resolve_subagent_model(
         base_url,
         api_key,
         env_var,
-        oauth_token,
         provider_lookup or (lambda pid: None),
         parent_provider_id,
     )
     if not target:
         return None
-    kind, model, burl, akey, env, oauth, spid = target
+    kind, model, burl, akey, env, spid = target
     if not model:
         return None
     return build_chat_model(
@@ -840,7 +838,6 @@ def resolve_subagent_model(
         burl,
         akey,
         env,
-        oauth,
         temperature=0.2,
         timeout=timeout,
         cache=True,
@@ -1233,7 +1230,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 state["base_url"],
                 state["api_key"],
                 state["env_var"],
-                oauth_token=state["oauth_token"],
             )
         except Exception:  # noqa: BLE001
             ctx = 0
@@ -1261,7 +1257,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         state["model_name"],
         provider_lookup=_provider_lookup,
         parent_provider_id=state.get("provider_id", ""),
@@ -1272,7 +1267,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         state["model_name"],
         provider_lookup=_provider_lookup,
         # Bounded so an auto-compact summarizer fails fast (and is skipped)
@@ -1286,7 +1280,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         state["model_name"],
         default_to_parent=False,
         provider_lookup=_provider_lookup,
@@ -1302,7 +1295,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         state["model_name"],
         default_to_parent=True,
         provider_lookup=_provider_lookup,
@@ -1318,7 +1310,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         _agents._detect_scope(prompt),
     )
     model = build_chat_model(
@@ -1327,7 +1318,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         temperature=settings["temperature"],
         max_tokens=settings["max_tokens"],
         thinking_level=settings["thinking_level"],
@@ -3228,18 +3218,40 @@ async def _run_mode_turn(
             _step_hint = _batchable_nudge(_pending)
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
+            # Enforcement: فراخوانی‌های تکِ بعد از تذکرِ نادیده‌گرفته‌شده یک
+            # بار رد می‌شوند (اجرا نمی‌شوند) — خطای ابزار سیگنال قوی‌تری از
+            # متن تذکر است و مدل مجبور است واکنش نشان دهد. فقط فراخوانی‌های
+            # تکِ batchable رد می‌شوند؛ فراخوانی batch شده همیشه اجرا می‌شود.
+            _rejects: dict[str, str] = {}
+            for tc in _pending:
+                _rn = (tc.get("name") or "").lower()
+                _ra = tc.get("args") or {}
+                if (
+                    _rn in ("grep", "glob", "read")
+                    and not any(
+                        k in _ra
+                        for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+                    )
+                    and (_ra.get("filePath") if _rn == "read" else _ra.get("pattern"))
+                ):
+                    _rej = _streak.should_reject(_rn)
+                    if _rej:
+                        _rejects[tc.get("id", "")] = _rej
+            async def _run_or_reject(tc, _rej: dict[str, str]) -> str:
+                """Run the tool — or return the enforcement rejection text."""
+                _rid = tc.get("id", "")
+                if _rid in _rej:
+                    return _rej[_rid]
+                return await _execute_tool(
+                    tc.get("name") or "", tc.get("args") or {}
+                )
+
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
-                    *[
-                        _execute_tool(tc.get("name") or "", tc.get("args") or {})
-                        for tc in _parallel
-                    ]
+                    *(_run_or_reject(tc, _rejects) for tc in _parallel)
                 )
             else:
-                _results = [
-                    await _execute_tool(tc.get("name") or "", tc.get("args") or {})
-                    for tc in _parallel
-                ]
+                _results = [await _run_or_reject(tc, _rejects) for tc in _parallel]
             for tc, result in zip(_parallel, _results):
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
@@ -3787,7 +3799,7 @@ async def coder_node(state: AgentState) -> dict:
 
 
 def _shared_permit(state: dict, allow_outside: bool) -> dict:
-    """پرچم‌های مجوز مشترک بین rebuildهای ابزار در طول یک turn.
+    """پرچم‌ها و پوشه‌های مجاز مشترک بین rebuildهای ابزار در طول یک turn.
 
     گره‌ی coder در LangGraph در هر step دوباره اجرا می‌شود و
     ``make_tool_callbacks`` با dict تازه ساخته می‌شود؛ بدون این dict
@@ -3805,6 +3817,11 @@ def _shared_permit(state: dict, allow_outside: bool) -> dict:
         permit["outside"] = True
     if state.get("allow_computer"):
         permit["computer"] = True
+    # پوشه‌های pre-approved از UI (دکمه «همیشه اجازه» روی دیالوگ per-folder)
+    # هم کف‌اند: هر rebuild دوباره به permit["folders"] تزریق می‌شوند.
+    for folder in state.get("allow_outside_folders") or []:
+        if isinstance(folder, str) and folder and folder not in permit.setdefault("folders", []):
+            permit["folders"].append(folder)
     return permit
 
 
@@ -4319,7 +4336,6 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
-        state["oauth_token"],
         cache=True,
     )
     tools = make_tool_callbacks(

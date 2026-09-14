@@ -42,8 +42,8 @@ async def test_compact(mock_server) -> None:
 
     # Two DISTINCT model objects pointing at the same mock server: the
     # "compact subagent" (primary) and the "main model" (fallback).
-    compact_model = build_chat_model("custom", "mock-model", base, "test", "", "")
-    main_model = build_chat_model("custom", "mock-model", base, "test", "", "")
+    compact_model = build_chat_model("custom", "mock-model", base, "test", "")
+    main_model = build_chat_model("custom", "mock-model", base, "test", "")
     history = make_history()
 
     # 1. Compact subagent FAILS (hard 400) -> fall back to the main model.

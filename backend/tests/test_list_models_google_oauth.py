@@ -1,95 +1,88 @@
-"""Unit test: list_models for Google with OAuth access tokens.
+"""Unit tests: Google model listing authenticates with an API key ONLY.
 
-Google's OpenAI-compat endpoint at ``/v1beta/openai/models`` only accepts API
-keys; passing an OAuth access token there returns 400. ``list_models`` must
-detect the OAuth path for the ``google`` provider and route to the native
-``/v1beta/models`` endpoint with ``Authorization: Bearer <token>`` instead,
-parsing the ``{models: [{name, inputTokenLimit, outputTokenLimit}]}`` shape
-and stripping the leading ``models/`` from each id.
+OAuth was removed from the model path (Gemini = API key, like every other
+provider; OAuth exists solely for the Search Console tool). These tests pin
+that contract: list_models("google", ...) sends the API key as a Bearer token
+on the OpenAI-compat /models endpoint and never an OAuth access token.
+
+Run: cd backend && uv run python -m pytest tests/test_list_models_google_oauth.py -q
 """
-
 import asyncio
 from unittest import mock
 
-from providers import _list_google_models_native, _model_cache
+import providers
+from providers import _model_cache, list_models
 
 
 def _make_client(payload: dict, status_code: int = 200):
-    resp = mock.Mock()
-    resp.json.return_value = payload
-    resp.raise_for_status.return_value = None
-    if status_code >= 400:
-        resp.raise_for_status.side_effect = RuntimeError(f"HTTP {status_code}")
-    client = mock.AsyncMock()
-    client.get.return_value = resp
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = False
-    return client
+    """Fake httpx.AsyncClient serving per-URL payloads.
+
+    ``list_models`` also consults the models.dev catalog and Google's native
+    ``/v1beta/models`` (context limits) through the same client — those get
+    inert payloads so only the OpenAI-compat /models call carries the payload.
+    """
+
+    class _Resp:
+        def __init__(self, body):
+            self.status_code = status_code
+            self._body = body
+
+        def raise_for_status(self):
+            if status_code >= 400:
+                raise RuntimeError(f"HTTP {status_code}")
+
+        def json(self):
+            return self._body
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.calls: list[tuple[str, dict | None]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            self.calls.append((url, headers))
+            if "models.dev" in url:
+                return _Resp({})
+            if url.endswith("/v1beta/models"):
+                return _Resp({"models": []})
+            return _Resp(payload)
+
+    return _Client()
 
 
-async def test_google_oauth_strips_models_prefix():
-    """Native ids like 'models/gemini-1.5-pro' come back bare ('gemini-1.5-pro')
-    so the picker shows the same id as the OpenAI-compat path would."""
+def _models_call_headers(client) -> dict:
+    """Headers of the (single) OpenAI-compat /models request."""
+    hits = [h for url, h in client.calls if url.endswith("/v1beta/openai/models")]
+    assert hits, "the OpenAI-compat /models endpoint was never hit"
+    return hits[0] or {}
+
+
+def test_google_models_use_api_key_bearer():
+    """The /models request authenticates with the API key, not an OAuth token."""
     _model_cache.clear()
-    payload = {
-        "models": [
-            {
-                "name": "models/gemini-1.5-pro",
-                "inputTokenLimit": 1000000,
-                "outputTokenLimit": 8192,
-            },
-            {
-                "name": "models/gemini-2.0-flash",
-                "inputTokenLimit": 1048576,
-            },
-        ]
-    }
-    client = _make_client(payload)
+    providers._models_dev_cache = None
+    client = _make_client({"data": [{"id": "gemini-2.5-flash"}]})
     with mock.patch("providers.httpx.AsyncClient", return_value=client):
-        models = await _list_google_models_native("fake-oauth-token")
-    assert [m["id"] for m in models] == ["gemini-1.5-pro", "gemini-2.0-flash"]
-    assert models[0]["context"] == 1000000
-    assert models[0]["max_output"] == 8192
-    # No outputTokenLimit advertised → None (not 0 / not raised).
-    assert models[1]["max_output"] is None
+        models = asyncio.run(list_models("google", "", "AIza-fake-api-key", ""))
+    assert [m["id"] for m in models] == ["gemini-2.5-flash"]
+    # API-key auth: Bearer <api_key> on the OpenAI-compat endpoint.
+    assert _models_call_headers(client).get("Authorization") == "Bearer AIza-fake-api-key"
 
 
-async def test_google_oauth_uses_bearer_header():
-    """Verify the native endpoint is called with ``Authorization: Bearer <token>``
-    (NOT ``x-goog-api-key``, which is API-key-only)."""
+def test_google_models_env_var_fallback():
+    """With no explicit key, the env chain (GOOGLE_API_KEY) authenticates."""
     _model_cache.clear()
-    client = _make_client({"models": []})
-    with mock.patch("providers.httpx.AsyncClient", return_value=client) as factory:
-        await _list_google_models_native("ya29.fake-access-token")
-    # factory() → client; client.get(url, headers=…) captured the kwargs.
-    factory.assert_called_once()
-    call = factory.return_value.get.call_args
-    url = call.args[0]
-    headers = call.kwargs.get("headers") or {}
-    assert url == "https://generativelanguage.googleapis.com/v1beta/models"
-    assert headers.get("Authorization") == "Bearer ya29.fake-access-token"
-    assert "x-goog-api-key" not in headers
-
-
-async def test_google_oauth_error_is_wrapped_as_provider_error():
-    """A 4xx from the native endpoint must surface as ``ProviderError`` so the
-    FastAPI route handler in server.py can convert it to a 400 response
-    (same as the rest of the providers)."""
-    from providers import ProviderError
-
-    _model_cache.clear()
-    client = _make_client({}, status_code=401)
-    with mock.patch("providers.httpx.AsyncClient", return_value=client):
-        try:
-            await _list_google_models_native("expired-token")
-        except ProviderError as exc:
-            assert "google oauth /models failed" in str(exc)
-        else:
-            raise AssertionError("expected ProviderError to be raised")
-
-
-if __name__ == "__main__":
-    asyncio.run(test_google_oauth_strips_models_prefix())
-    asyncio.run(test_google_oauth_uses_bearer_header())
-    asyncio.run(test_google_oauth_error_is_wrapped_as_provider_error())
-    print("\u2705 google oauth /models tests passed")
+    providers._models_dev_cache = None
+    client = _make_client({"data": [{"id": "gemini-2.5-pro"}]})
+    with (
+        mock.patch("providers.httpx.AsyncClient", return_value=client),
+        mock.patch.dict("os.environ", {"GOOGLE_API_KEY": "env-key"}, clear=False),
+    ):
+        models = asyncio.run(list_models("google", "", "", ""))
+    assert [m["id"] for m in models] == ["gemini-2.5-pro"]
+    assert _models_call_headers(client).get("Authorization") == "Bearer env-key"

@@ -98,7 +98,6 @@ async def run_our_agent(
             thinking_level="medium",
             context_window=0,
             env_var="",
-            oauth_token="",
             mcp_servers=None,
             skills=None,
             allow_create=False,

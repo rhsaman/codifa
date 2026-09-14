@@ -36,7 +36,8 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage, HumanMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from llm import _batchable_nudge, _BatchStreakTracker
 from llm import langchain_tool_loop as _tool_loop
@@ -243,6 +244,46 @@ def test_streak_ignores_varied_work():
     t.observe([{"name": "grep", "args": {"pattern": "x"}, "id": "b"}])
     out = t.observe([{"name": "glob", "args": {"pattern": "*.py"}, "id": "d"}])
     assert out == ""
+
+
+# ── enforcement: رد فراخوانی تکِ بعد از تذکر نادیده‌گرفته‌شده ─────────────
+
+def test_enforcement_rejects_next_single_call_once():
+    """بعد از شلیک تذکر (streak)، فراخوانی تکِ بعدی همان ابزار یک بار رد
+    می‌شود — اجرا نمی‌شود و متن رد حاوی نمونه‌ی ترکیبی است. فراخوانی تکِ
+    بعد از رد، دوباره عادی اجرا می‌شود (بدترین حالت: ۱ رفت‌وبرگشت هدر)."""
+    t = _BatchStreakTracker(threshold=2)
+    t.observe([_read_tc("a.py", 1)])
+    assert t.observe([_read_tc("b.py", 2)]) != ""  # تذکر شلیک کرد
+    # فراخوانی تکِ بعدی → رد
+    rej = t.should_reject("read")
+    assert rej.startswith("NOT RUN"), rej
+    assert "ranges=" in rej or "filePaths=" in rej  # نمونه‌ی ترکیبی
+    assert "do NOT re-issue" in rej.lower() or "Do NOT re-issue" in rej
+    # رد فقط یک بار است — فراخوانی تکِ بعدیِ بعدی عادی اجرا می‌شود
+    assert t.should_reject("read") == ""
+    # ابزار دیگر تحت تأثیر نیست
+    assert t.should_reject("grep") == ""
+
+
+def test_enforcement_not_triggered_without_reminder():
+    """بدون شلیک تذکر، هیچ فراخوانی‌ای رد نمی‌شود."""
+    t = _BatchStreakTracker(threshold=2)
+    t.observe([_read_tc("a.py", 1)])
+    assert t.should_reject("read") == ""
+
+
+def test_enforcement_batch_call_never_rejected():
+    """فراخوانی batch شده (filePaths=[...]) هرگز رد نمی‌شود — رد فقط
+    فراخوانی‌های تک را می‌گیرد (سیم‌کشی در حلقه‌ها این شرط را چک می‌کند)."""
+    t = _BatchStreakTracker(threshold=2)
+    t.observe([_read_tc("a.py", 1)])
+    t.observe([_read_tc("b.py", 2)])  # تذکر شلیک کرد
+    # فراخوانی batch بعدی streak را ریست می‌کند و ردی هم نمی‌گیرد
+    assert t.observe([
+        {"name": "read", "args": {"filePath": "a.py", "filePaths": ["c.py"]}, "id": "c3"}
+    ]) == ""
+    assert t.should_reject("read") == ""
 
 
 # ── end-to-end: sub-agent loop appends the nudge to the LAST result ────────
@@ -506,6 +547,98 @@ def test_loop_streak_counts_through_per_step_nudge_step():
     )
 
 
+class _IgnoringModel:
+    """The reported regression: the model IGNORES the batching reminder and
+    keeps firing one read per step. Enforcement must reject exactly ONE of
+    those calls (the tool is not run — the model sees a NOT RUN error)."""
+
+    model_name = "fake-ignoring-reminder"
+
+    def __init__(self, steps: int = 5):
+        self._step = 0
+        self._max = steps
+        self.saw_nudge = False
+        self.saw_rejection = False
+
+    def bind_tools(self, tools):
+        class _Bound:
+            def __init__(self, model):
+                self._model = model
+
+            async def ainvoke(self, msgs):
+                m = self._model
+                m._step += 1
+                for msg in msgs:
+                    _c = str(getattr(msg, "content", ""))
+                    if isinstance(msg, HumanMessage) and "BATCHING REMINDER" in _c:
+                        m.saw_nudge = True
+                    if isinstance(msg, ToolMessage) and "NOT RUN" in _c:
+                        m.saw_rejection = True
+                if m._step <= m._max:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "read",
+                                "args": {
+                                    "filePath": f"f{m._step}.py",
+                                    "offset": 1,
+                                    "limit": 100,
+                                },
+                                "id": f"call_{m._step}",
+                            }
+                        ],
+                    )
+                return AIMessage(content="done")
+
+        return _Bound(self)
+
+
+def test_loop_enforcement_rejects_ignored_reminder():
+    """End-to-end: a model that keeps firing single reads after the reminder
+    gets ONE rejected call (NOT RUN) — the tool is not executed for it."""
+    model = _IgnoringModel(steps=5)
+    result = asyncio.run(
+        _tool_loop(
+            model,
+            system="",
+            user="read f1..f5",
+            tools=_make_tools(),
+            max_steps=10,
+            ctx=0,
+            emit=None,
+        )
+    )
+    assert result == "done"
+    assert model.saw_nudge, "the reminder must reach the model first"
+    assert model.saw_rejection, (
+        "the ignored reminder must trigger a NOT RUN rejection the model sees"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_read_batch_partial_scope():
+    """رگرسیون wrapper اسکوپ‌شده: یک مسیر خارج از اسکوپ در batch نباید کل
+    batch را رد کند — مسیرهای مجاز خوانده می‌شوند و مسیر رد‌شده در فوتر
+    گزارش می‌شود (رفع «خواندن دسته‌ای خطا داد» → برگشت به read های جدا)."""
+    import agents as _agents
+
+    async def fake_read(filePath, offset=1, limit=2000, filePaths=None, ranges=None, **kw):
+        paths = [filePath, *(filePaths or [])]
+        return "\n\n".join(f"<path>{p}</path>\nOK" for p in paths)
+
+    wrapped = _agents._wrap_scoped_read(fake_read, {"a.py", "b.py"})
+    # یک مسیر خارج از اسکوپ (c.py) — بقیه باید خوانده شوند.
+    out = await wrapped(filePath="a.py", filePaths=["b.py", "c.py"])
+    assert "<path>a.py</path>" in out
+    assert "<path>b.py</path>" in out
+    assert "<path>c.py</path>" not in out  # مسیر خارج از اسکوپ اجرا نشد
+    assert "c.py" in out  # اما در فوتر گزارش شد
+    # همه‌ی مسیرها خارج از اسکوپ → خطای واضح (نه سکوت).
+    out2 = await wrapped(filePath="x.py")
+    assert out2.startswith("ERROR")
+
+
 if __name__ == "__main__":
     test_two_greps_same_scope_nudge_fires()
     print("  ✅ two greps same scope")
@@ -549,4 +682,12 @@ if __name__ == "__main__":
     print("  ✅ loop nudges one-at-a-time greps (different scopes)")
     test_loop_streak_counts_through_per_step_nudge_step()
     print("  ✅ streak counts through per-step-nudge steps")
+    test_enforcement_rejects_next_single_call_once()
+    print("  ✅ enforcement rejects next single call once")
+    test_enforcement_not_triggered_without_reminder()
+    print("  ✅ enforcement not triggered without reminder")
+    test_enforcement_batch_call_never_rejected()
+    print("  ✅ enforcement never rejects batch calls")
+    test_loop_enforcement_rejects_ignored_reminder()
+    print("  ✅ loop enforcement rejects ignored reminder")
     print("\n🎉 همه تست‌های batching nudge رد شد")

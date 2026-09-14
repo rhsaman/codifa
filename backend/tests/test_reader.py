@@ -283,7 +283,6 @@ async def test_reader_read_targets_only_matching_lines(tmp_path, monkeypatch):
         "base_url": "",
         "api_key": "",
         "env_var": "",
-        "oauth_token": "",
         "request": "explain TARGET_FUNCTION in backend/graph.py",
     }
     result = await reader_read(state)
@@ -318,7 +317,6 @@ async def test_reader_read_line_ref_window(tmp_path, monkeypatch):
         "base_url": "",
         "api_key": "",
         "env_var": "",
-        "oauth_token": "",
         "request": "show backend/graph.py:50",
     }
     result = await reader_read(state)
@@ -497,3 +495,21 @@ async def test_read_ranges_per_path_windows(tmp_path):
     assert "20 | other20" in out
     assert "22 | other22" in out
     assert "23 | other23" not in out  # limit=3 → خطوط 20-22
+
+
+@pytest.mark.asyncio
+async def test_read_batch_partial_failure_footer(tmp_path):
+    """رگرسیون «خواندن دسته‌ای خطا داد»: یک فایل خطادار در batch نباید کل
+    نتیجه را ERROR جلوه دهد — فایل‌های سالم عادی خوانده می‌شوند و خطاها
+    به‌صورت فوتر خلاصه در انتها می‌آیند تا مدل به read های جدا برنگردد."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 21)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py", filePaths=["missing.py"])
+    # فایل سالم عادی خوانده شده است.
+    assert "<path>a.py</path>" in out
+    assert "1 | line1" in out
+    # خطای فایل غایب به‌صورت فوتر خلاصه آمده — نه به‌صورت شروعِ کل خروجی.
+    assert not out.startswith("ERROR")
+    assert "missing.py" in out
+    assert "1/2 files read OK" in out

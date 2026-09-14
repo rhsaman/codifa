@@ -1,6 +1,6 @@
 ---
 name: UI/UX Pro Max
-description: هوش طراحی UI/UX برای وب، موبایل و دسکتاپ (nextlevelbuilder/ui-ux-pro-max-skill) — طراحی، ساخت، بازبینی و اصلاح رابطها: استایلها، پالتها، تایپوگرافی، اکسسibilité، چیدمان واکنشگرا، چارتها و پیادهسازی stack-specific.
+description: UI/UX design intelligence for web, mobile and desktop (nextlevelbuilder/ui-ux-pro-max-skill) — design, build, review and fix interfaces: styles, palettes, typography, accessibility, responsive layout, charts and stack-specific implementation.
 ---
 
 # UI/UX Pro Max

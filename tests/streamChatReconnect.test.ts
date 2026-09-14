@@ -80,7 +80,6 @@ const baseParams = {
     model: 'gpt-4o',
     apiKey: 'k',
     baseUrl: '',
-    authType: '',
   } as any,
   root: '/tmp',
   mode: 'ask' as const,

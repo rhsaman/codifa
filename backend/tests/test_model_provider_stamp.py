@@ -35,7 +35,7 @@ def test_stamp_provider_survives_pydantic_models(monkeypatch):
     monkeypatch.setattr("llm.ReasoningChatOpenAI", FakeOpenAI)
 
     m = build_chat_model(
-        "custom", "m", "", "", "", "", provider_id="custom"
+        "custom", "m", "", "", "", provider_id="custom"
     )
     assert model_provider(m) == ("custom", "custom")
 
@@ -132,7 +132,7 @@ def test_langchain_tool_loop_emits_stamped_usage():
     assert usage[0]["sub"] is True
 
 
-# --- _subagent_target returns the 7th element (provider id) ------------------
+# --- _subagent_target returns the 6th element (provider id) ------------------
 
 
 def _parent(**over):
@@ -141,7 +141,6 @@ def _parent(**over):
         "parent_base_url": "http://parent.example/v1",
         "parent_api_key": "parent-key",
         "parent_env_var": "",
-        "parent_oauth_token": "",
     }
     base.update(over)
     return base
@@ -150,16 +149,16 @@ def _parent(**over):
 def test_subagent_target_saved_row_returns_row_id():
     row = {
         "id": "my-or", "kind": "openrouter", "baseUrl": "https://openrouter.ai/api/v1",
-        "apiKey": "sk", "envVar": "", "oauthRefreshToken": "",
+        "apiKey": "sk", "envVar": "",
     }
     t = _subagent_target(
         "my-or/vendor/model", **_parent(),
         provider_lookup=lambda pid: row if pid == "my-or" else None,
     )
     assert t is not None
-    assert len(t) == 7
+    assert len(t) == 6
     assert t[0] == "openrouter"
-    assert t[6] == "my-or"
+    assert t[5] == "my-or"
 
 
 def test_subagent_target_builtin_kind_returns_kind_as_id():
@@ -170,7 +169,7 @@ def test_subagent_target_builtin_kind_returns_kind_as_id():
     )
     assert t is not None
     assert t[0] == "openrouter"
-    assert t[6] == "openrouter"
+    assert t[5] == "openrouter"
 
 
 def test_subagent_target_parent_path_returns_parent_provider_id():
@@ -179,7 +178,7 @@ def test_subagent_target_parent_path_returns_parent_provider_id():
         parent_provider_id="custom",
     )
     assert t is not None
-    assert t[6] == "custom"
+    assert t[5] == "custom"
 
 
 def test_subagent_target_parent_path_defaults_empty_id():
@@ -187,7 +186,7 @@ def test_subagent_target_parent_path_defaults_empty_id():
         "free", **_parent(), provider_lookup=lambda _pid: None
     )
     assert t is not None
-    assert t[6] == ""
+    assert t[5] == ""
 
 
 # --- resolve_subagent_model stamps the built model ---------------------------
@@ -201,7 +200,7 @@ def test_resolve_subagent_model_stamps_cross_provider_id(monkeypatch):
 
     row = {
         "id": "my-or", "kind": "openrouter", "baseUrl": "https://openrouter.ai/api/v1",
-        "apiKey": "sk", "envVar": "", "oauthRefreshToken": "",
+        "apiKey": "sk", "envVar": "",
     }
     captured = {}
 
@@ -216,7 +215,6 @@ def test_resolve_subagent_model_stamps_cross_provider_id(monkeypatch):
         "my-or/vendor/model",
         "http://parent.example/v1",
         "parent-key",
-        "",
         "",
         "parent-model",
         provider_lookup=lambda pid: row if pid == "my-or" else None,
@@ -243,7 +241,6 @@ def test_resolve_subagent_model_parent_default_stamps_parent_id(monkeypatch):
         "http://parent.example/v1",
         "parent-key",
         "",
-        "",
         "parent-model",
         parent_provider_id="custom",
     )
@@ -259,7 +256,6 @@ def test_resolve_subagent_model_none_entry_vision_slot(monkeypatch):
         None,
         "http://parent.example/v1",
         "parent-key",
-        "",
         "",
         "parent-model",
         default_to_parent=False,

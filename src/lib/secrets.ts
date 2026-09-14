@@ -77,7 +77,7 @@ export async function decryptSecret(val: string): Promise<string> {
   }
 }
 
-const SECRET_KEYS = ['apiKey', 'oauthClientId', 'oauthClientSecret', 'oauthRefreshToken'] as const
+const SECRET_KEYS = ['apiKey'] as const
 
 async function encryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
   const out: ProviderConfig = { ...p }

@@ -61,3 +61,49 @@ def test_local_package_commands_not_blocked(tmp_path) -> None:
     for cmd in ("npm install", "npm i --no-audit", "uv run pytest -q"):
         res = run_terminal(root, cmd, timeout=5)
         assert "error" not in res, f"{cmd} نباید بلاک شود: {res.get('error')}"
+
+
+def test_permit_folder_allows_terminal_outside(tmp_path) -> None:
+    """مجوز per-folder: با پوشه‌ی مجاز، دستور بیرونیِ همان زیردرخت رد می‌شود؛
+    پوشه‌ی خواهری همچنان بلاک است."""
+    from tools import run_terminal
+
+    root = str(tmp_path)
+    allowed_dir = tmp_path.parent / "permitted-area"
+    allowed_dir.mkdir(exist_ok=True)
+    (allowed_dir / "note.txt").write_text("x")
+    sibling_dir = tmp_path.parent / "other-area"
+    sibling_dir.mkdir(exist_ok=True)
+    (sibling_dir / "note.txt").write_text("x")
+
+    permit = {"folders": [str(allowed_dir)]}
+    ok = run_terminal(root, f"cat {allowed_dir / 'note.txt'}", permit=permit)
+    assert "error" not in ok, f"مسیر زیر پوشه‌ی مجاز باید رد شود: {ok.get('error')}"
+
+    blocked = run_terminal(root, f"cat {sibling_dir / 'note.txt'}", permit=permit)
+    assert "error" in blocked
+    assert "request_permission" in blocked["error"]
+
+
+def test_permit_folder_allows_file_tools(tmp_path) -> None:
+    """مجوز per-folder در ابزارهای فایل: read/write/edit زیر پوشه‌ی مجاز
+    کار می‌کند؛ مسیر بیرونیِ دیگر همچنان PathEscapeError می‌دهد."""
+    from tools import PathEscapeError, read_file, write_file
+
+    root = str(tmp_path)
+    allowed_dir = tmp_path.parent / "permitted-files"
+    allowed_dir.mkdir(exist_ok=True)
+
+    permit = {"folders": [str(allowed_dir)]}
+    target = allowed_dir / "cfg.toml"
+    res = write_file(root, str(target), "k = 1\n", permit=permit)
+    assert res.get("ok") is True, f"write زیر پوشه‌ی مجاز باید رد شود: {res}"
+    out = read_file(root, str(target), permit=permit)
+    assert "k = 1" in out.get("content", "")
+
+    other = tmp_path.parent / "not-permitted" / "x.txt"
+    try:
+        write_file(root, str(other), "no\n", permit=permit)
+        raise AssertionError("مسیر خارج از پوشه‌های مجاز باید PathEscapeError بدهد")
+    except PathEscapeError:
+        pass

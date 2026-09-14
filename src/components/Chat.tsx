@@ -2119,8 +2119,8 @@ export function ChatPanel() {
         // re-set it after the stream closes.
         lastEventAt.current = Date.now();
         resolveStuckCards();
-        // A create_mcp ran this turn: the connector was saved to the app DB by
-        // the backend, but the store's mcpServers snapshot is only hydrated
+        // A create_mcp ran this turn: the connector was saved to the app's user
+        // data folder by the backend, but the store's mcpServers snapshot is only hydrated
         // once at app startup — re-fetch so Settings → MCP shows it without a
         // restart. Fire-and-forget: a failure here must not break the turn.
         if (mcpChangedRef.current) {

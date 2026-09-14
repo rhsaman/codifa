@@ -468,7 +468,7 @@ interface State {
   /** TTL for web/fetch text cache + RAG storage (days). */
   ragWebTtlDays: number
   setRagWebTtlDays: (d: number) => void
-  /** User-level data root (app DB + skills/plans/mcp + vector stores). */
+  /** User-level data root (skills/plans/mcp + vector stores). */
   dataPath: string
   setDataPath: (p: string) => void
   /** On-device model preferences (Settings → Models). */
@@ -860,9 +860,9 @@ export const useStore = create<State>((set, get) => ({
       }
     }
 
-    // Merge MCP connectors from the sidecar's app database into the UI
-    // settings so they show up in Settings → MCP (DB wins, since it also holds
-    // agent-created connectors not in the persisted settings).
+    // Merge MCP connectors from the sidecar's user data folder into the UI
+    // settings so they show up in Settings → MCP (the folder wins, since it
+    // also holds agent-created connectors not in the persisted settings).
     const root = typeof raw.root === 'string' ? raw.root : ''
     const dbMcp = await listMcp()
     const mergedMcp = { ...(loadedSettings.mcpServers ?? {}), ...(dbMcp.mcpServers ?? {}) }

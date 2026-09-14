@@ -165,6 +165,7 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
         path: str = "",
         paths: list[str] | None = None,
         include: str = "",
+        includes: list[str] | None = None,
         **kwargs,
     ) -> str:
         # همه‌ی مسیرهای batch هم باید در اسکوپ باشند (نه فقط path).
@@ -180,7 +181,7 @@ def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
                     f"ERROR: `{p}` is not in scope for this request. In-scope files: "
                     + ", ".join(sorted(scoped_paths))
                 )
-        return await fn(pattern, patterns, path, paths, include, **kwargs)
+        return await fn(pattern, patterns, path, paths, include, includes, **kwargs)
 
     return wrapped
 
@@ -860,8 +861,10 @@ _SEARCH_RULE = (
     "need several grep terms (or several globs), pass them ALL in ONE call via "
     "the `patterns` list (e.g. pattern='foo', patterns=['bar','baz']) — NEVER "
     "fire one grep per term. Different scopes merge in the SAME call via "
-    "`paths` (e.g. path='src', paths=['backend','tools']). And when different "
-    "files need different windows, pass them in ONE read call via `ranges` "
+    "`paths` (e.g. path='src', paths=['backend','tools']). Different file "
+    "filters merge in the SAME call via `includes` (e.g. include='*.ts', "
+    "includes=['*.py']). And when different files need different windows, "
+    "pass them in ONE read call via `ranges` "
     "(e.g. ranges=['a.ts:100:80','b.ts:1:60']) instead of one read per window.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
     "tools (read/grep/glob) in one turn for TARGETED lookups (clause 4), and "
@@ -3420,13 +3423,13 @@ async def _compact_history(
 
 
 def _load_skills(root: str) -> list[dict]:
-    """Load all user skills from the app database (single source of truth).
+    """Load all user skills from the app's skill store (single source of truth).
 
-    Skills are stored in ``coder.db`` (managed in-app via Settings or the
-    ``/skill`` tool) and shared across all workspaces — there is no filesystem
-    scan. Each result is ``{"name", "description", "path", "content"}`` where
-    ``path`` is the synthetic ``db://skills/<slug>`` id used by the vector
-    store. The ``root`` argument is kept for API compatibility.
+    Skills are stored as ``skills/<slug>/skill.md`` files in the user data
+    folder (managed in-app via Settings or the ``/skill`` tool) and shared
+    across all workspaces. Each result is ``{"name", "description", "path",
+    "content"}`` where ``path`` is the on-disk ``skill.md`` location. The
+    ``root`` argument is kept for API compatibility.
     """
     skills: list[dict] = []
     try:
@@ -3448,7 +3451,7 @@ def _load_skills(root: str) -> list[dict]:
             {
                 "name": name,
                 "description": str(row.get("description") or "").strip(),
-                "path": str(row.get("path") or f"db://skills/{slugify(name)}"),
+                "path": str(row.get("path") or ""),
                 "content": body or content,
             }
         )

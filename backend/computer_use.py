@@ -224,6 +224,14 @@ def find_and_act(
             + ", ".join(sorted(ELEMENT_ACTIONS))
         }
     try:
+        # type_text رویداد کیبورد سنتز می‌کند و به اپِ فوکوس‌شدهٔ سیستم
+        # می‌رود — مثل InputSim. بدون فعال‌سازی اپ هدف، متن به اپ اشتباه
+        # (مثلاً خودِ ایجنت) تایپ می‌شود.
+        if action == "type_text" and app_name.strip():
+            activated = open_app(app_name)
+            if "error" in activated:
+                return activated
+            time.sleep(0.3)
         app = _resolve_app(app_name)
         loc = app.locator(selector)
         if action == "set_value":
@@ -270,9 +278,12 @@ def _paste_via_clipboard(sim, text: str) -> None:
         subprocess.run(
             [copy_cmd], input=text.encode("utf-8"), check=True, timeout=2
         )
-        time.sleep(0.05)
+        time.sleep(0.1)
         sim.chord(paste_key, held=held)
-        time.sleep(0.05)
+        # paste یک رویداد غیرهمگام است: اپ متن را زمانِ رسیدنِ کلید
+        # از کلیپ‌بورد می‌خواند. اگر زودتر restore کنیم، اپ محتوای
+        # قبلی کلیپ‌بورد را می‌خواند و متن اشتباه paste می‌شود.
+        time.sleep(0.4)
     finally:
         if saved is not None:
             try:  # بازگردانی کلیپ‌بورد کاربر
@@ -333,6 +344,14 @@ def run_sequence(steps: list[dict[str, Any]], app_name: str = "") -> dict[str, A
                 + ", ".join(sorted(SEQUENCE_STEP_KINDS))
             }
     try:
+        # فعال‌سازی اپ هدف قبل از رویدادها — InputSim ورودی را به اپِ
+        # فوکوس‌شدهٔ سیستم می‌فرستد؛ بدون این، کلیدها به اپ اشتباه
+        # (مثلاً خودِ ایجنت) می‌روند.
+        if app_name.strip():
+            activated = open_app(app_name)
+            if "error" in activated:
+                return activated
+            time.sleep(0.3)  # فرصت برای جلو آمدن پنجره قبل از اولین رویداد
         sim = xa11y.input_sim()
         ran = 0
         for i, step in enumerate(steps):
@@ -521,11 +540,13 @@ def input_action(
     text: str = "",
     dx: int = 0,
     dy: int = 0,
+    app_name: str = "",
 ) -> dict[str, Any]:
     """fallback مختصاتی با InputSim — فقط وقتی اکشن معنایی ممکن نیست.
 
     ``kind`` یکی از ``INPUT_ACTIONS`` است. مختصات‌ها در فضای logical screen
-    هستند (همان فضای bounds عناصر در درخت).
+    هستند (همان فضای bounds عناصر در درخت). اگر ``app_name`` داده شود،
+    اپ هدف قبل از رویدادها فعال می‌شود تا ورودی به اپ اشتباه نرود.
     """
     if not _XA11Y_AVAILABLE:
         return {"error": "xa11y is not installed."}
@@ -535,6 +556,12 @@ def input_action(
             + ", ".join(sorted(INPUT_ACTIONS))
         }
     try:
+        # فعال‌سازی اپ هدف قبل از رویدادها — همان ریشه‌ی run_sequence
+        if app_name.strip():
+            activated = open_app(app_name)
+            if "error" in activated:
+                return activated
+            time.sleep(0.3)
         sim = xa11y.input_sim()
         _sim_do(
             sim, kind, x=x, y=y, x2=x2, y2=y2, key=key, held=held, text=text,

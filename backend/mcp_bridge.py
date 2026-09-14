@@ -1,7 +1,7 @@
 """Bridge that connects configured MCP servers to the agent's tool set.
 
 The agent stores MCP connector configs in ``state["mcp_servers"]`` (seeded from
-the app database / settings). This module turns each live server into a set of
+the app's user data folder / settings). This module turns each live server into a set of
 LangChain ``StructuredTool`` instances so the model can actually call them —
 previously the runtime never opened a connection, so MCP tools (e.g. the Docker
 MCP connector) were unreachable and the frontend only injected a no-op text

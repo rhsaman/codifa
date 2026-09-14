@@ -1018,9 +1018,10 @@ _BATCHABLE_TOOLS = {"grep", "glob", "read"}
 def _batch_rest(name: str, args: dict) -> dict:
     """Non-primary args that must match for two calls to merge into one.
 
-    For grep/glob, ``include`` defines the file filter and MUST match; the
-    scan scope (``path``) may DIFFER — a merge via ``paths=[...]`` scans
-    several scopes in one call. For read, ``offset``/``limit`` are per-file
+    For grep/glob, the scan scope (``path``) may DIFFER — a merge via
+    ``paths=[...]`` scans several scopes in one call — and the file filter
+    (``include``) may differ too — a merge via ``includes=[...]`` scans
+    several filters in one call. For read, ``offset``/``limit`` are per-file
     windows — a batch expresses differing windows via
     ``ranges=['path:offset:limit', ...]`` — so they are excluded and reads
     of different files with different windows still merge.
@@ -1032,6 +1033,7 @@ def _batch_rest(name: str, args: dict) -> dict:
         rest.pop("limit", None)
     else:
         rest.pop("path", None)  # scope merges via paths=[...]
+        rest.pop("include", None)  # file filter merges via includes=[...]
     return rest
 
 
@@ -1049,24 +1051,29 @@ def _batch_example(name: str, calls: list[dict]) -> str:
         }
         if len({w for w in windows.values()}) == 1:
             off, lim = next(iter(windows.values()))
+            primary = next(iter(windows))
             return (
-                f"read(filePath={next(iter(windows))!r}, filePaths="
-                f"{sorted(windows)[1:]!r}, offset={off}, limit={lim})"
+                f"read(filePath={primary!r}, filePaths="
+                f"{[p for p in windows if p != primary]!r}, offset={off}, limit={lim})"
             )
         return (
             "read(filePath="
             + repr(next(iter(windows)))
             + ", ranges=["
             + ", ".join(
-                f"{p}:{o}:{l}" for p, (o, l) in sorted(windows.items())
+                repr(f"{p}:{o}:{l}") for p, (o, l) in sorted(windows.items())
             )
             + "])"
         )
-    # grep / glob — scope (path) may differ; merge via paths=[...].
+    # grep / glob — scope (path) and file filter (include) may differ; merge
+    # via paths=[...] / includes=[...].
     scopes = [str(c.get("path") or "") for c in calls]
+    includes = [str(c.get("include") or "") for c in calls]
     primary = "filePath" if name == "read" else "pattern"
     terms = [str(c.get(primary) or "") for c in calls]
-    extra = {k: v for k, v in calls[-1].items() if k not in ("path", primary)}
+    extra = {
+        k: v for k, v in calls[-1].items() if k not in ("path", "include", primary)
+    }
     arg_bits = [f"{primary}={terms[0]!r}"]
     if len(terms) > 1:
         arg_bits.append(f"patterns={terms[1:]!r}")
@@ -1074,6 +1081,10 @@ def _batch_example(name: str, calls: list[dict]) -> str:
         arg_bits.append(f"path={scopes[0]!r}")
         if len(set(scopes)) > 1:
             arg_bits.append(f"paths={sorted(set(scopes) - {scopes[0]})!r}")
+    if any(includes):
+        arg_bits.append(f"include={includes[0]!r}")
+        if len(set(includes)) > 1:
+            arg_bits.append(f"includes={sorted(set(includes) - {includes[0]})!r}")
     for k, v in extra.items():
         arg_bits.append(f"{k}={v!r}")
     return f"{name}(" + ", ".join(arg_bits) + ")"
@@ -1095,7 +1106,10 @@ def _batchable_nudge(tcs: list) -> str:
         if name not in _BATCHABLE_TOOLS:
             continue
         args = tc.get("args") or {}
-        if "patterns" in args or "filePaths" in args or "ranges" in args or "paths" in args:
+        if any(
+            k in args
+            for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+        ):
             continue  # already a batch call
         primary = "filePath" if name == "read" else "pattern"
         if not args.get(primary):
@@ -1106,7 +1120,7 @@ def _batchable_nudge(tcs: list) -> str:
         if len(calls) < 2:
             continue
         # A merge is only valid when the non-primary args are IDENTICAL —
-        # e.g. two greps with different includes must stay separate calls.
+        # e.g. two greps with different max_results must stay separate calls.
         rests = [_batch_rest(name, a) for a in calls]
         if any(r != rests[0] for r in rests[1:]):
             continue
@@ -1116,7 +1130,8 @@ def _batchable_nudge(tcs: list) -> str:
     return (
         "\n\n💡 BATCHING REMINDER: these calls could have been ONE tool call:\n"
         + "\n".join(f"- {h}" for h in hints)
-        + "\nDo that from now on to save tokens and round-trips."
+        + "\nThose calls already ran — do NOT repeat them. Use this exact "
+        "shape for your NEXT calls to save tokens and round-trips."
     )
 
 
@@ -1149,7 +1164,8 @@ class _BatchStreakTracker:
 
     def _batch_args(self, args: dict) -> bool:
         return any(
-            k in (args or {}) for k in ("patterns", "filePaths", "ranges", "paths")
+            k in (args or {})
+            for k in ("patterns", "filePaths", "ranges", "paths", "includes")
         )
 
     def observe(self, tcs: list) -> str:
@@ -1184,7 +1200,7 @@ class _BatchStreakTracker:
             # The model IS batching this tool now — restart its count.
             self._counts.pop(name, None)
             self._recent.pop(name, None)
-        fired: list[tuple[str, list[dict]]] = []
+        fired: list[tuple[str, list[dict], int]] = []
         for name, args in step_calls.items():
             n = self._counts.get(name, 0) + 1
             self._counts[name] = n
@@ -1193,20 +1209,22 @@ class _BatchStreakTracker:
             if len(recent) > 6:
                 del recent[: len(recent) - 6]
             if n >= self._threshold:
-                fired.append((name, recent))
+                fired.append((name, recent, n))
         if not fired:
             return ""
         lines = [
             f"- {_batch_example(name, calls)}"
-            for name, calls in fired
+            for name, calls, _ in fired
         ]
         return (
             "\n\n💡 BATCHING REMINDER: you have called {tool} one-at-a-time "
             "{n} times. Batch the remaining calls into ONE tool call:\n".format(
-                tool=" + ".join(name for name, _ in fired), n=self._threshold
+                tool=" + ".join(name for name, _, _ in fired),
+                n=max(n for _, _, n in fired),
             )
             + "\n".join(lines)
-            + "\nDo that from now on to save tokens and round-trips."
+            + "\nThe example is built from calls that ALREADY ran — do NOT "
+            "re-issue them. Use this exact shape for your NEXT calls."
         )
 
 
@@ -1380,21 +1398,24 @@ async def langchain_tool_loop(
         ]
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
         # Advisory batching reminder: when this step's calls could have been
-        # merged into one batch call, append the hint to the LAST result so
-        # the model sees it alongside the results it just got. The streak
-        # tracker adds the cross-step variant (one-at-a-time calls across
-        # consecutive steps) — either reminder lands on the last result.
-        _batch_hint = _batchable_nudge(tcs) or _streak.observe(tcs)
+        # merged into one batch call — or the streak tracker sees
+        # one-at-a-time calls across consecutive steps — build the reminder
+        # now. It is delivered AFTER the tool results as a standalone
+        # HumanMessage (below): a suffix buried at the end of a huge result
+        # demonstrably never reached the model.
+        # Always observe — `or` would short-circuit the tracker whenever the
+        # per-step detector fires, so that step would never be recorded and
+        # the cross-step count would restart from zero.
+        _step_hint = _batchable_nudge(tcs)
+        _streak_hint = _streak.observe(tcs)
+        _batch_hint = _step_hint or _streak_hint
         if len(_parallel) > 1:
             _results = await asyncio.gather(*(_exec(tc) for tc in _parallel))
         else:
             _results = [await _exec(tc) for tc in _parallel]
-        for _i, (tc, result) in enumerate(zip(_parallel, _results)):
-            _suffix = _batch_hint if (_batch_hint and _i == len(_parallel) - 1) else ""
+        for tc, result in zip(_parallel, _results):
             msgs.append(
-                ToolMessage(
-                    content=str(result) + _suffix, tool_call_id=tc.get("id", "")
-                )
+                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
             )
         for tc in _sequential:
             result = await _exec(tc)
@@ -1412,6 +1433,12 @@ async def langchain_tool_loop(
                             ToolMessage(content=_m.content, tool_call_id=_dup_id)
                         )
                         break
+        # Batching reminder: delivered as its OWN HumanMessage AFTER the tool
+        # results (same placement as the steering messages below) — a
+        # standalone message is impossible to miss, unlike a suffix at the
+        # end of a huge result.
+        if _batch_hint:
+            msgs.append(HumanMessage(content=_batch_hint.strip()))
         # --- soft tool-call budget nudge ---
         # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or
         # summarizing — mirrors the doom-loop guard but for "too many calls" rather

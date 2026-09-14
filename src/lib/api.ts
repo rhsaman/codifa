@@ -817,7 +817,7 @@ export async function removeModel(
   })
 }
 
-// ---- Skills & MCP connectors (skills are file-based; MCP in app db) -------- //
+// ---- Skills & MCP connectors (file-based in the app's user data folder) ---- //
 
 export interface SkillRow {
   name: string
@@ -888,7 +888,7 @@ export async function syncSkill(params: {
   }
 }
 
-/** List MCP connectors (+ builtin names) from the app database. */
+/** List MCP connectors (+ builtin names) from the app's user data folder. */
 export async function listMcp(): Promise<{
   mcpServers: Record<string, McpServerConfig>
   builtins: string[]
@@ -911,7 +911,7 @@ export async function listMcp(): Promise<{
   }
 }
 
-/** Save an MCP connector to the app database. */
+/** Save an MCP connector to the app's user data folder. */
 export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void> {
   const url = await ensureSidecar()
   if (!url) return
@@ -926,7 +926,7 @@ export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void>
   }
 }
 
-/** Remove an MCP connector from the app database. */
+/** Remove an MCP connector from the app's user data folder. */
 export async function deleteMcp(name: string): Promise<void> {
   const url = await ensureSidecar()
   if (!url) return

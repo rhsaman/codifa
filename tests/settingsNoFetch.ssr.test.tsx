@@ -101,6 +101,56 @@ console.log('3) تب Tools: لیبل مدل ابزارها اسم پراویدر
   check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0, networkCalls)
 }
 
+console.log('4) toolModelTarget: هایلایت فقط روی ردیف provider/model واقعی می‌افتد:')
+{
+  const { toolModelTarget } = await import('../src/components/SettingsModal')
+  const { useStore } = await import('../src/lib/store')
+  const s = useStore.getState()
+  useStore.setState({
+    settings: {
+      ...s.settings,
+      activeProviderId: 'kiraai',
+      // دو provider که هر دو مدل همنام «mimo-v2.5» را دارند — دقیقاً
+      // سناریوی باگ: قبلاً انتخاب یکی، هر دو ردیف را هایلایت می‌کرد.
+      providers: [
+        { id: 'kiraai', name: 'KiraAI', kind: 'custom', apiKey: '', baseUrl: 'https://a/v1', model: 'mimo-v2.5', pricingMap: {} },
+        { id: 'exp-labs', name: 'ExperientialLabs', kind: 'custom', apiKey: '', baseUrl: 'https://b/v1', model: 'mimo-v2.5', pricingMap: {} },
+      ],
+    },
+  })
+  const st = useStore.getState()
+  const providers = st.settings.providers
+  const active = st.settings.activeProviderId
+
+  // باگ قبلی: «kiraai/mimo-v2.5» بعد از strip شدن پیشوند، با «mimo-v2.5»
+  // زیر هر provider ای مطابق می‌شد. حالا هدف فقط همان provider ای است که
+  // پیشوندش را دارد.
+  const t = toolModelTarget('kiraai/mimo-v2.5', providers, active)
+  check('kiraai/mimo-v2.5 → kiraai/mimo-v2.5', t?.providerId === 'kiraai' && t?.model === 'mimo-v2.5', JSON.stringify(t))
+  check(
+    'exp-labs/mimo-v2.5 → exp-labs (نه kiraai)',
+    toolModelTarget('exp-labs/mimo-v2.5', providers, active)?.providerId === 'exp-labs',
+  )
+
+  // مقدار legacy بدون پیشوند → provider فعال (رفتار resolver بک‌اند)
+  const bare = toolModelTarget('mimo-v2.5', providers, active)
+  check('bare «mimo-v2.5» → provider فعال (kiraai)', bare?.providerId === 'kiraai' && bare?.model === 'mimo-v2.5', JSON.stringify(bare))
+
+  // پیشوند kind قدیمی و پیشوند دوچندان
+  check(
+    'custom/legacy-model → اولین provider با kind=custom',
+    toolModelTarget('custom/legacy-model', providers, active)?.providerId === 'kiraai',
+  )
+  const dbl = toolModelTarget('kiraai/kiraai/mimo-v2.5', providers, active)
+  check('پیشوند دوچندان جمع می‌شود', dbl?.providerId === 'kiraai' && dbl?.model === 'mimo-v2.5', JSON.stringify(dbl))
+
+  // حالت‌های بدون ردیف متناظر
+  check('مقدار خالی → null', toolModelTarget('', providers, active) === null)
+  check('«main model» → null', toolModelTarget('main model', providers, active) === null)
+  check('provider ناشناخته → null', toolModelTarget('other/mimo-v2.5', providers, active) === null)
+  check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} test(s) failed`)
   process.exit(1)

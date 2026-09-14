@@ -25,6 +25,7 @@ module lock, so a crash can never corrupt a file mid-write.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -159,9 +160,28 @@ def cache_path() -> str:
 # -- small helpers ---------------------------------------------------------- #
 
 
+def _raw_slug(name: str) -> str:
+    """Slugify without any fallback ("" when no ASCII letters/digits remain)."""
+    return re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
+
+
 def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "workspace"
+    return _raw_slug(name) or "workspace"
+
+
+def _skill_slug(name: str) -> str:
+    """Storage slug for a skill name: the slugified name, or a stable hash
+    when it has no ASCII letters (e.g. a Persian name).
+
+    The hash keeps two different non-ASCII names from collapsing into the
+    same shared ``skills/skill/`` folder (which silently overwrote earlier
+    skills). The normal create path rejects non-English names outright; this
+    is the safety net for direct callers and the legacy-DB migration."""
+    slug = _raw_slug(name)
+    if slug:
+        return slug
+    digest = hashlib.sha1(str(name).strip().encode("utf-8")).hexdigest()[:8]
+    return f"skill-{digest}"
 
 
 def _safe_file(name: str, fallback: str = "item") -> str:
@@ -502,11 +522,15 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
     name_or_slug = str(name_or_slug or "").strip()
     if not name_or_slug:
         return None
-    slug = _slugify(name_or_slug)
-    # Prefer exact slug dir.
-    d = _skill_dir(slug)
-    if os.path.isdir(d) and os.path.isfile(os.path.join(d, "skill.md")):
-        return d
+    # Prefer the exact slug dir (hash-based for non-ASCII names) — but only
+    # when the name slugifies to something. A non-ASCII name must never match
+    # the shared legacy ``skills/skill/`` folder; if its own hash dir is
+    # missing it is found by the frontmatter name scan below.
+    slug = _raw_slug(name_or_slug)
+    if slug:
+        d = _skill_dir(slug)
+        if os.path.isdir(d) and os.path.isfile(os.path.join(d, "skill.md")):
+            return d
     # Fall back to matching the stored name inside the skill.md frontmatter.
     base = skills_dir()
     if os.path.isdir(base):
@@ -523,16 +547,17 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
     return None
 
 
-def save_skill(name: str, slug: str, description: str, path: str, content: str) -> None:
+def save_skill(name: str, slug: str, description: str, content: str) -> None:
     """Persist a skill as ``skills/<slug>/skill.md`` with YAML frontmatter.
 
     The frontmatter carries ``name``/``slug``/``description``; the rest of the
-    file is the skill body. ``path`` is informational (the on-disk location).
+    file is the skill body. An empty ``slug`` falls back to the slugified
+    name and then to a stable hash, so distinct names never share a folder.
     """
     with _LOCK:
         _migrate_legacy_db()
         name = str(name or "").strip()
-        slug = str(slug or "").strip() or _slugify(name) or "skill"
+        slug = str(slug or "").strip() or _skill_slug(name)
         content = str(content or "")
         d = _skill_dir(slug)
         os.makedirs(d, exist_ok=True)
@@ -1054,7 +1079,7 @@ def _migrate_legacy_db() -> None:
                 "SELECT name, slug, description, path, content FROM skill"
             ):
                 name = str(name or "").strip()
-                slug = str(slug or "").strip() or _slugify(name) or "skill"
+                slug = str(slug or "").strip() or _skill_slug(name)
                 d = _skill_dir(slug)
                 os.makedirs(d, exist_ok=True)
                 front = (

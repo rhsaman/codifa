@@ -5,7 +5,8 @@ accept batch parameters (grep ``patterns=[...]``, read ``filePaths=[...]`` /
 ``ranges=[...]``). ``_batchable_nudge`` detects, per step, whether ≥2 calls
 of the same batchable tool differ only in their primary argument (pattern /
 filePath) — i.e. they could have been ONE call — and returns a reminder
-that the loops append to the LAST tool result of that step.
+that the loops deliver as a standalone HumanMessage AFTER the tool results
+(a suffix buried at the end of a huge result never reached the model).
 
 Covers:
 1. Two greps with different patterns, same path/include → nudge fires.
@@ -13,10 +14,11 @@ Covers:
 3. A call that already passes patterns=[...] → NO nudge (already batching).
 4. Two greps with DIFFERENT paths (same include) → nudge fires with a
    concrete merged example using paths=[...] (scopes merge in one call).
-5. Two greps with DIFFERENT includes → NO nudge (no valid merge).
+5. Two greps with DIFFERENT includes → nudge fires with includes=[...]
+   (file filters merge in one call); ranges members are always quoted.
 6. Mixed tools (grep + read) → nudge mentions both.
 7. Single call per tool → NO nudge.
-8. End-to-end: the sub-agent loop appends the nudge to the LAST result only.
+8. End-to-end: the sub-agent loop delivers the nudge as a HumanMessage.
 9. Cross-step streak tracker: per-TOOL counting, threshold=2, repeated
    reminders with a concrete merged example built from the model's own calls.
 """
@@ -34,7 +36,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from llm import _batchable_nudge, _BatchStreakTracker
 from llm import langchain_tool_loop as _tool_loop
@@ -84,13 +86,28 @@ def test_different_paths_now_merge_via_paths():
     assert "pattern='alpha'" in out and "patterns=['beta']" in out
 
 
-def test_different_includes_do_not_merge():
-    """Two greps with different includes CANNOT merge — no nudge."""
+def test_different_includes_now_merge_via_includes():
+    """File filters merge via includes=[...] — two greps with different
+    includes (same path) SHOULD nudge with a concrete merged example."""
     tcs = [
         {"name": "grep", "args": {"pattern": "alpha", "include": "*.ts"}, "id": "a"},
         {"name": "grep", "args": {"pattern": "beta", "include": "*.py"}, "id": "b"},
     ]
-    assert _batchable_nudge(tcs) == ""
+    out = _batchable_nudge(tcs)
+    assert "BATCHING REMINDER" in out
+    assert "includes=" in out
+    assert "include='*.ts'" in out and "includes=['*.py']" in out
+
+
+def test_ranges_members_are_quoted():
+    """The merged example must be a VALID literal call — every ranges member
+    quoted, so a model copying it verbatim doesn't send broken args."""
+    tcs = [
+        {"name": "read", "args": {"filePath": "a.py", "offset": 1, "limit": 100}, "id": "a"},
+        {"name": "read", "args": {"filePath": "b.py", "offset": 50, "limit": 140}, "id": "b"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "'a.py:1:100'" in out and "'b.py:50:140'" in out, out
 
 
 def test_mixed_tools_nudge_mentions_both():
@@ -110,6 +127,21 @@ def test_single_call_per_tool_no_nudge():
         {"name": "read", "args": {"filePath": "a.py"}, "id": "b"},
     ]
     assert _batchable_nudge(tcs) == ""
+
+
+def test_nudge_text_warns_against_reissuing():
+    """The merged example is built from calls that ALREADY ran — a literal
+    model copying it verbatim would re-read the same files and double the
+    context cost. Both reminder texts must say so explicitly."""
+    tcs = [
+        {"name": "grep", "args": {"pattern": "alpha"}, "id": "a"},
+        {"name": "grep", "args": {"pattern": "beta"}, "id": "b"},
+    ]
+    assert "do NOT repeat" in _batchable_nudge(tcs)
+    t = _BatchStreakTracker(threshold=2)
+    t.observe([_read_tc("a.py", 1)])
+    out = t.observe([_read_tc("b.py", 2)])
+    assert "do NOT re-issue" in out
 
 
 def test_empty_and_none_safe():
@@ -136,7 +168,7 @@ def test_streak_fires_across_different_windows():
     assert "BATCHING REMINDER" in out
     # نمونه‌ی ترکیبی دقیق ساخته‌شده از خود فراخوانی‌های مدل:
     assert "ranges=" in out
-    assert "a.py:1:100" in out and "b.py:50:140" in out
+    assert "'a.py:1:100'" in out and "'b.py:50:140'" in out
 
 
 def test_streak_fires_across_different_scopes():
@@ -153,6 +185,22 @@ def test_streak_fires_across_different_scopes():
     assert "BATCHING REMINDER" in out
     assert "paths=" in out
     assert "pattern='alpha'" in out and "patterns=['beta']" in out
+
+
+def test_streak_fires_across_different_includes():
+    """The reported regression (screenshot): consecutive greps with DIFFERENT
+    file filters (include='tools.py' vs include='graph.py'). Filters merge via
+    includes=[...], so the per-tool count must build and fire."""
+    t = _BatchStreakTracker(threshold=2)
+    assert t.observe([
+        {"name": "grep", "args": {"pattern": "alpha", "include": "tools.py"}, "id": "a"}
+    ]) == ""
+    out = t.observe([
+        {"name": "grep", "args": {"pattern": "beta", "include": "graph.py"}, "id": "b"}
+    ])
+    assert "BATCHING REMINDER" in out
+    assert "includes=" in out
+    assert "include='tools.py'" in out and "includes=['graph.py']" in out
 
 
 def test_streak_survives_interleaved_non_batchable_work():
@@ -216,7 +264,7 @@ class _TwoGrepModel:
             async def ainvoke(self, msgs):
                 self._model._step += 1
                 for m in msgs:
-                    if isinstance(m, ToolMessage) and "BATCHING REMINDER" in str(
+                    if isinstance(m, HumanMessage) and "BATCHING REMINDER" in str(
                         getattr(m, "content", "")
                     ):
                         self._model.saw_nudge = True
@@ -243,7 +291,7 @@ def _make_tools():
     return {"grep": grep, "read": read}
 
 
-def test_loop_appends_nudge_to_last_result():
+def test_loop_delivers_nudge_as_human_message():
     model = _TwoGrepModel()
     result = asyncio.run(
         _tool_loop(
@@ -257,7 +305,7 @@ def test_loop_appends_nudge_to_last_result():
         )
     )
     assert result == "done"
-    assert model.saw_nudge, "the nudge must reach the model via the last ToolMessage"
+    assert model.saw_nudge, "the nudge must reach the model as a HumanMessage"
 
 
 class _OneReadPerStepModel:
@@ -281,7 +329,7 @@ class _OneReadPerStepModel:
                 m = self._model
                 m._step += 1
                 for msg in msgs:
-                    if isinstance(msg, ToolMessage) and "BATCHING REMINDER" in str(
+                    if isinstance(msg, HumanMessage) and "BATCHING REMINDER" in str(
                         getattr(msg, "content", "")
                     ):
                         m.saw_nudge = True
@@ -322,7 +370,7 @@ def test_loop_nudges_one_at_a_time_reads():
     )
     assert result == "done"
     assert model.saw_nudge, (
-        "the cross-step streak reminder must reach the model via a ToolMessage"
+        "the cross-step streak reminder must reach the model as a HumanMessage"
     )
 
 
@@ -346,7 +394,7 @@ class _OneGrepPerStepModel:
                 m = self._model
                 m._step += 1
                 for msg in msgs:
-                    if isinstance(msg, ToolMessage) and "BATCHING REMINDER" in str(
+                    if isinstance(msg, HumanMessage) and "BATCHING REMINDER" in str(
                         getattr(msg, "content", "")
                     ):
                         m.saw_nudge = True
@@ -386,7 +434,75 @@ def test_loop_nudges_one_at_a_time_greps_different_scopes():
     )
     assert result == "done"
     assert model.saw_nudge, (
-        "the cross-step streak reminder must reach the model via a ToolMessage"
+        "the cross-step streak reminder must reach the model as a HumanMessage"
+    )
+
+
+class _TwoThenOneGrepModel:
+    """Step 1: TWO mergeable greps (the per-step detector fires — the old
+    ``or`` short-circuit skipped observe() on such steps). Step 2: ONE grep.
+    The streak must have kept counting through step 1, so step 2 crosses
+    the threshold and delivers the one-at-a-time reminder."""
+
+    model_name = "fake-two-then-one-grep"
+
+    def __init__(self):
+        self._step = 0
+        self.saw_streak_nudge = False
+
+    def bind_tools(self, tools):
+        class _Bound:
+            def __init__(self, model):
+                self._model = model
+
+            async def ainvoke(self, msgs):
+                m = self._model
+                m._step += 1
+                for msg in msgs:
+                    if (
+                        isinstance(msg, HumanMessage)
+                        and "one-at-a-time" in str(getattr(msg, "content", ""))
+                    ):
+                        m.saw_streak_nudge = True
+                if m._step == 1:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "grep", "args": {"pattern": "alpha"}, "id": "c1"},
+                            {"name": "grep", "args": {"pattern": "beta"}, "id": "c2"},
+                        ],
+                    )
+                if m._step == 2:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "grep", "args": {"pattern": "gamma"}, "id": "c3"}
+                        ],
+                    )
+                return AIMessage(content="done")
+
+        return _Bound(self)
+
+
+def test_loop_streak_counts_through_per_step_nudge_step():
+    """Regression (``or`` short-circuit): when the per-step detector fires,
+    the streak tracker must STILL observe that step — otherwise its count
+    restarts and the following one-at-a-time step gets no reminder."""
+    model = _TwoThenOneGrepModel()
+    result = asyncio.run(
+        _tool_loop(
+            model,
+            system="",
+            user="search",
+            tools=_make_tools(),
+            max_steps=5,
+            ctx=0,
+            emit=None,
+        )
+    )
+    assert result == "done"
+    assert model.saw_streak_nudge, (
+        "the streak must keep counting even on a step where the per-step detector fired"
     )
 
 
@@ -399,8 +515,10 @@ if __name__ == "__main__":
     print("  ✅ already batched → no nudge")
     test_different_paths_now_merge_via_paths()
     print("  ✅ different paths → merge via paths")
-    test_different_includes_do_not_merge()
-    print("  ✅ different includes → no nudge")
+    test_different_includes_now_merge_via_includes()
+    print("  ✅ different includes → merge via includes")
+    test_ranges_members_are_quoted()
+    print("  ✅ ranges members quoted")
     test_mixed_tools_nudge_mentions_both()
     print("  ✅ mixed tools")
     test_single_call_per_tool_no_nudge()
@@ -411,6 +529,8 @@ if __name__ == "__main__":
     print("  ✅ streak across different windows")
     test_streak_fires_across_different_scopes()
     print("  ✅ streak across different scopes")
+    test_streak_fires_across_different_includes()
+    print("  ✅ streak across different includes")
     test_streak_survives_interleaved_non_batchable_work()
     print("  ✅ streak survives interleaved work")
     test_streak_resets_on_batch_call()
@@ -419,10 +539,14 @@ if __name__ == "__main__":
     print("  ✅ streak keeps reminding")
     test_streak_ignores_varied_work()
     print("  ✅ streak ignores varied work")
-    test_loop_appends_nudge_to_last_result()
-    print("  ✅ loop appends nudge to last result")
+    test_nudge_text_warns_against_reissuing()
+    print("  ✅ nudge text warns against re-issuing")
+    test_loop_delivers_nudge_as_human_message()
+    print("  ✅ loop delivers nudge as HumanMessage")
     test_loop_nudges_one_at_a_time_reads()
     print("  ✅ loop nudges one-at-a-time reads")
     test_loop_nudges_one_at_a_time_greps_different_scopes()
     print("  ✅ loop nudges one-at-a-time greps (different scopes)")
+    test_loop_streak_counts_through_per_step_nudge_step()
+    print("  ✅ streak counts through per-step-nudge steps")
     print("\n🎉 همه تست‌های batching nudge رد شد")

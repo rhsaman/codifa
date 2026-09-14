@@ -735,7 +735,7 @@ async def system_prompts() -> dict:
     return {key: SYSTEM_PROMPTS[canonical] for key, canonical in MODE_ALIASES.items()}
 
 
-# --- skills (stored in the app database) ---------------------------------- #
+# --- skills (file-based store in the user data folder) ---------------------- #
 
 
 class SkillSyncRequest(BaseModel):
@@ -783,7 +783,7 @@ async def skills_sync(req: SkillSyncRequest) -> dict:
     return result
 
 
-# --- MCP connectors (stored in the app database) --------------------------- #
+# --- MCP connectors (file-based store in the user data folder) ------------- #
 
 
 class McpSaveRequest(BaseModel):

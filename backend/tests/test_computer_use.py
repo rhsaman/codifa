@@ -250,6 +250,12 @@ def tool_env(monkeypatch: pytest.MonkeyPatch):
     mod.input_sim = lambda: _FakeSim()  # type: ignore[attr-defined]
     monkeypatch.setattr(cu, "xa11y", mod, raising=False)
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    # فعال‌سازی اپ باید mock شود: input/sequence/act با app_name از این
+    # مسیر می‌گذرند و بدون mock، pytest روی مک واقعاً اپ را با osascript
+    # باز می‌کند (همان بازشدن Notes هنگام تست).
+    monkeypatch.setattr(
+        cu, "open_app", lambda name: {"ok": True, "app": name}
+    )
 
     import tools as tools_mod
 
@@ -328,14 +334,57 @@ def test_preset_allow_computer_flag_skips_dialog(tool_env):
     """«Always allow» کاربر: پرچم computer از ابتدای turn ست شده (از طریق
     allow_computer در درخواست چت) → هیچ دیالوگی نمایش داده نمی‌شود."""
     cbs, events, _gates, permit = tool_env
-    # شبیه‌سازی allow_computer=True که server از UI دریافت می‌کند
-    permit["computer"] = True
+    permit["computer"] = True  # شبیه‌سازی allow_computer=True که server از UI دریافت می‌کند
     result = asyncio.run(
-        cbs["computer"](action="input", do="type_text", text="hello")
+        cbs["computer"](action="input", do="type_text", text="hello", app="Notes")
     )
     parsed = json.loads(result)
     assert parsed["ok"] is True
     assert not [e for e in events if e["kind"] == "permission"]
+
+
+def test_failed_action_keeps_grant_no_new_dialog(tool_env):
+    """اکشن شکست‌خورده بعد از تأیید کاربر نباید گرانت را باطل کند.
+
+    ریشه‌ی باگ «Always allow زدم باز هم اجازه می‌خواد»: قبلاً گرانت فقط
+    بعد از موفقیت اکشن کش می‌شد؛ در جلسه‌ای که اکشن‌ها مدام خطا می‌دادند
+    (AXPress -25205 و…) هر تأیید کاربر بی‌اثر می‌ماند و اکشن بعدی دوباره
+    دیالوگ می‌آورد. حالا گرانت بلافاصله بعد از تأیید کش می‌شود."""
+    cbs, events, gates, permit = tool_env
+
+    # اکشن اول: find_and_act را طوری mock می‌کنیم که شکست بخورد (مثل
+    # AXPress -25205 در جلسهٔ Word) — ولی گرانت باید بعد از تأیید کش شود
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        cu, "find_and_act", lambda **kw: {"error": "PlatformError: AXPress failed"}
+    )
+
+    async def _run_failing():
+        task = asyncio.ensure_future(
+            cbs["computer"](action="act", selector="button", do="press")
+        )
+        await asyncio.sleep(0.05)
+        perm_events = [e for e in events if e["kind"] == "permission"]
+        assert perm_events, "permission event should have been emitted"
+        gates[perm_events[-1]["id"]].set_result(True)
+        return await task
+
+    result = asyncio.run(_run_failing())
+    parsed = json.loads(result)
+    # اکشن شکست خورد ولی گرانت کش شد
+    assert "error" in parsed
+    assert permit["computer"] is True
+
+    # اکشن دوم: نباید دیالوگ جدید بیاورد — گرانت زنده است
+    perm_count_before = len([e for e in events if e["kind"] == "permission"])
+    result2 = asyncio.run(cbs["computer"](action="act", selector="button", do="press"))
+    parsed2 = json.loads(result2)
+    assert "error" in parsed2  # باز هم شکست می‌خورد (همان mock)
+    perm_count_after = len([e for e in events if e["kind"] == "permission"])
+    assert perm_count_after == perm_count_before, (
+        "after a failed-but-granted action, no new permission dialog"
+    )
+    monkeypatch.undo()
 
 
 def test_input_needs_permission(tool_env):
@@ -422,6 +471,101 @@ def test_sequence_unknown_kind_rejected(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
     result = cu.run_sequence([{"kind": "explode"}])
     assert "error" in result
+
+
+def test_sequence_activates_target_app_first(monkeypatch: pytest.MonkeyPatch):
+    """sequence با app_name باید اول اپ هدف را فعال کند، بعد رویدادها را بفرستد.
+
+    ریشه‌ی باگ «Ctrl+O در اپ اشتباه زده شد»: InputSim رویدادها را به اپِ
+    فوکوس‌شدهٔ سیستم می‌فرستد؛ اگر sequence اپ هدف را فعال نکند، کلیدها به
+    اپ دیگری (مثلاً خودِ ایجنت) می‌روند."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu.time, "sleep", lambda _s: None)
+    activated: list[str] = []
+    monkeypatch.setattr(
+        cu, "open_app", lambda name: activated.append(name) or {"ok": True}
+    )
+
+    result = cu.run_sequence(
+        [{"kind": "press_key", "key": "o", "held": "Meta"}], app_name="Safari"
+    )
+    assert result["ok"] is True
+    assert activated == ["Safari"]
+
+
+def test_input_action_activates_target_app(monkeypatch: pytest.MonkeyPatch):
+    """input با app_name باید اول اپ هدف را فعال کند — همان ریشه‌ی sequence."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu.time, "sleep", lambda _s: None)
+    activated: list[str] = []
+    monkeypatch.setattr(
+        cu, "open_app", lambda name: activated.append(name) or {"ok": True}
+    )
+
+    result = cu.input_action("type_text", text="hello", app_name="Notes")
+    assert result["ok"] is True
+    assert activated == ["Notes"]
+    assert ("type_text", "hello") in sim.calls
+
+
+def test_find_and_act_type_text_activates_app(monkeypatch: pytest.MonkeyPatch):
+    """act با do='type_text' باید اول اپ هدف را فعال کند.
+
+    ریشه‌ی باگ «به جای Word در Codifa تایپ می‌شود»: Locator.type_text رویداد
+    کیبورد سنتز می‌کند و به اپِ فوکوس‌شدهٔ سیستم می‌رود. مسیر act (برخلاف
+    input/sequence) هیچ فعال‌سازی‌ای نداشت؛ اگر Codifa فوکوس داشت، متن
+    تایپی به آن می‌رفت."""
+    field = _FakeElement("text_field", "Body")
+    app = _FakeApp("Microsoft Word", elements=[field])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu.time, "sleep", lambda _s: None)
+    activated: list[str] = []
+    monkeypatch.setattr(
+        cu, "open_app", lambda name: activated.append(name) or {"ok": True}
+    )
+
+    result = cu.find_and_act(
+        selector="text_field[name='Body']", action="type_text",
+        value="سلام", app_name="Microsoft Word",
+    )
+    assert result["ok"] is True
+    assert activated == ["Microsoft Word"]
+
+
+def test_keyboard_actions_without_app_rejected(tool_env):
+    """اکشن‌های کیبوردی بدون پارامتر app باید خطای راهنما بدهند.
+
+    بدون این گاردریل، کلیدها به اپِ فوکوس‌شدهٔ سیستم (خودِ ایجنت/Codifa)
+    می‌روند — همان باگی که Ctrl+O و تایپ‌ها به اشتباه در Codifa می‌رفتند."""
+    cbs, _events, _gates, permit = tool_env
+    permit["computer"] = True  # پرمیشن از قبل داده شده — گاردریل مستقل از آن
+
+    # act + type_text بدون app
+    r1 = asyncio.run(
+        cbs["computer"](action="act", selector="text_field", do="type_text", value="hi")
+    )
+    assert "app" in json.loads(r1)["error"]
+
+    # input + press_key بدون app
+    r2 = asyncio.run(cbs["computer"](action="input", do="press_key", key="enter"))
+    assert "app" in json.loads(r2)["error"]
+
+    # sequence با step کیبوردی بدون app
+    r3 = asyncio.run(
+        cbs["computer"](
+            action="sequence", steps=[{"kind": "type_text", "text": "ls"}]
+        )
+    )
+    assert "app" in json.loads(r3)["error"]
 
 
 def test_type_text_unicode_via_clipboard(monkeypatch: pytest.MonkeyPatch):
@@ -535,6 +679,7 @@ def test_sequence_permission_gate(tool_env):
         task = asyncio.ensure_future(
             cbs["computer"](
                 action="sequence",
+                app="Notes",
                 steps=[
                     {"kind": "click", "x": 1, "y": 2},
                     {"kind": "type_text", "text": "ls"},

@@ -111,7 +111,7 @@ def test_save_skill_invalidates_cache(skill_env):
     tools.sync_builtin_skills()
     state_db.invalidate_skills_cache()
     before = {s["name"] for s in state_db.list_skills()}
-    state_db.save_skill("Fresh Skill", "fresh-skill", "d", "", "BODY-FRESH")
+    state_db.save_skill("Fresh Skill", "fresh-skill", "d", "BODY-FRESH")
     after = {s["name"] for s in state_db.list_skills()}
     assert "Fresh Skill" in after
     assert "Fresh Skill" not in before
@@ -165,3 +165,52 @@ def test_load_skill_tool_unknown_name_lists_available(skill_env):
     out = asyncio.run(cbs["load_skill"]("No Such Skill"))
     assert out.startswith("ERROR:")
     assert "Test Skill" in out, "فهرست موجودها باید در خطا باشد"
+
+
+# ---------------------------------------------------------------------------
+# نام اسکیل باید انگلیسی باشد (slug پوشه از نام ساخته می‌شود)
+# ---------------------------------------------------------------------------
+
+
+def test_persist_skill_rejects_non_english_name(skill_env):
+    """نام فارسی باید رد شود، نه اینکه در پوشهٔ fallback مشترک ذخیره شود."""
+    result = tools.persist_skill(
+        "---\nname: قرارداد نویسی\n---\n\n# قرارداد نویسی\n\nbody\n",
+    )
+    assert not result.get("ok"), "نام غیرانگلیسی باید رد شود"
+    assert "English" in result.get("note", "")
+    # هیچ پوشهٔ fallback مشترکی نباید ساخته شود.
+    assert not any(s["name"] == "قرارداد نویسی" for s in state_db.list_skills())
+
+
+def test_persist_skill_english_name_gets_real_path(skill_env):
+    """نام انگلیسی: مسیر واقعی فایل روی دیسک برگردانده می‌شود، نه db://."""
+    result = tools.persist_skill(
+        "---\nname: Code Review\n---\n\n# Code Review\n\nbody\n",
+    )
+    assert result.get("ok"), result
+    assert result["slug"] == "code-review"
+    assert result["path"].endswith(os.path.join("skills", "code-review", "skill.md"))
+    assert os.path.isfile(result["path"]), "فایل باید واقعاً روی دیسک باشد"
+
+
+def test_create_skill_tool_rejects_non_english_name(skill_env):
+    """ابزار create_skill باید نام فارسی را با خطای روشن رد کند."""
+    import asyncio
+
+    cbs = tools.make_tool_callbacks(root="/tmp", emit=lambda e: None)
+    out = asyncio.run(cbs["create_skill"]("قرارداد نویسی", "d", "body"))
+    assert out.startswith("ERROR"), out
+    assert "English" in out
+
+
+def test_save_skill_non_ascii_name_gets_distinct_folder(skill_env):
+    """ایمنی state_db: نام غیر ASCII نباید در پوشهٔ مشترک «skill» بریزد."""
+    state_db.save_skill("قرارداد نویسی", "", "d", "BODY-FA")
+    state_db.save_skill("خلاصه‌سازی", "", "d", "BODY-SUM")
+    skills = {s["name"]: s["content"] for s in state_db.list_skills()}
+    assert skills.get("قرارداد نویسی") == "BODY-FA"
+    assert skills.get("خلاصه‌سازی") == "BODY-SUM", "دو اسکیل نباید همدیگر را overwrite کنند"
+    # هیچ پوشهٔ «skill» خالی/مشترکی نباید ساخته شود.
+    entries = os.listdir(state_db.skills_dir())
+    assert "skill" not in entries, entries

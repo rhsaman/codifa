@@ -143,6 +143,22 @@ async def test_grep_paths_batch_scans_multiple_scopes():
     assert "backend/b.py" not in single
 
 
+async def test_grep_includes_batch_scans_multiple_filters():
+    """چند فیلتر فایل در یک فراخوانی grep → یک ToolMessage با نتایج هر دو فیلتر.
+
+    رگرسیونِ گزارش‌شده (اسکرین‌شات): مدل برای هر include یک grep جدا می‌زد
+    (include='tools.py'، include='graph.py'، ...). حالا include + includes=[...]
+    همه را در یک فراخوانی اسکن می‌کند.
+    """
+    root = _make_multi_scope_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]("TARGET", include="*.py", includes=["*.ts"])
+    assert out.startswith("MATCHES for 'TARGET'"), out
+    # بدون includes رفتار تک‌فیلتری می‌ماند.
+    single = await cbs["grep"]("TARGET", include="*.py")
+    assert "MATCHES for 'TARGET'" in single
+
+
 async def test_glob_paths_batch_scans_multiple_scopes():
     """چند scope در یک فراخوانی glob → نتایج merge و بدون تکرار."""
     root = _make_multi_scope_ws()

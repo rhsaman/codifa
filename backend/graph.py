@@ -1397,7 +1397,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         f"ROOT is:\n{root}\nUse paths RELATIVE to this folder (e.g. 'src/main.py'), "
         "never absolute paths. You operate ONLY inside this workspace. NEVER read, "
         "search or act on anything outside it. Skills, plans and MCP connectors are "
-        "stored in the app database and are given to you inline."
+        "given to you inline."
     )
     if nvim_file:
         with contextlib.suppress(Exception):
@@ -1816,7 +1816,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "read_screen serves many later actions — don't re-read after every "
             "step. Multiple input steps (click → type → Enter) MUST go through "
             "ONE action='sequence' call — separate calls lose focus between "
-            "steps. Use action='open_app' to bring an app to front, "
+            "steps. input/sequence activate ``app`` first when given, so "
+            "keyboard/mouse events reach the right app. Use action='open_app' "
+            "to bring an app to front, "
             "action='read_element' for a cheap subtree read, and action='see' "
             "(screenshot + the user's vision model) when the tree cannot answer: "
             "terminals, canvases, images, video. If it reports PermissionDenied, "
@@ -2633,6 +2635,8 @@ async def _run_mode_turn(
         # transcript valid: a tool_calls AIMessage must be followed by its
         # ToolMessages before any new HumanMessage).
         _nudge_pending = False
+        # رویداد warn تذکر batching فقط یک بار در هر نوبت به UI می‌رود.
+        _batch_warned = False
         # Auto-continue guard for max-output truncation (mirrors opencode, which
         # treats finish_reason=="length" as a normal partial stop and keeps
         # generating until the answer is complete instead of ending the turn).
@@ -3212,12 +3216,18 @@ async def _run_mode_turn(
                 tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS
             ]
             # Advisory batching reminder (same detector as the sub-agent loop):
-            # when this step's calls could have been ONE batch call, append the
-            # hint to the LAST parallel result so the model sees it with its
-            # own results and self-corrects on the next step. The streak
-            # tracker adds the cross-step variant (one-at-a-time calls across
-            # consecutive steps) — either reminder lands on the last result.
-            _batch_hint = _batchable_nudge(_pending) or _streak.observe(_pending)
+            # when this step's calls could have been ONE batch call — or the
+            # streak tracker sees one-at-a-time calls across consecutive
+            # steps — build the reminder now. It is delivered AFTER the tool
+            # results as a standalone HumanMessage (below): a suffix buried
+            # at the end of a multi-thousand-char result demonstrably never
+            # reached the model.
+            # Always observe — `or` would short-circuit the tracker whenever
+            # the per-step detector fires, so that step would never be
+            # recorded and the cross-step count would restart from zero.
+            _step_hint = _batchable_nudge(_pending)
+            _streak_hint = _streak.observe(_pending)
+            _batch_hint = _step_hint or _streak_hint
             if len(_parallel) > 1:
                 _results = await asyncio.gather(
                     *[
@@ -3230,14 +3240,9 @@ async def _run_mode_turn(
                     await _execute_tool(tc.get("name") or "", tc.get("args") or {})
                     for tc in _parallel
                 ]
-            for _i, (tc, result) in enumerate(zip(_parallel, _results)):
-                _suffix = (
-                    _batch_hint if (_batch_hint and _i == len(_parallel) - 1) else ""
-                )
+            for tc, result in zip(_parallel, _results):
                 msgs.append(
-                    ToolMessage(
-                        content=str(result) + _suffix, tool_call_id=tc.get("id", "")
-                    )
+                    ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
@@ -3269,6 +3274,18 @@ async def _run_mode_turn(
                                 ToolMessage(content=_m.content, tool_call_id=_dup_id)
                             )
                             break
+            # Batching reminder: delivered as its OWN HumanMessage AFTER the
+            # tool results (same placement as the repetition warning below) —
+            # a standalone message is impossible to miss, unlike a suffix at
+            # the end of a huge result. Surfaced to the user once per turn so
+            # the UI shows the nudge is actually firing.
+            if _batch_hint:
+                if not _batch_warned:
+                    _batch_warned = True
+                    queue.put_nowait(
+                        {"kind": "warn", "content": _batch_hint.strip()}
+                    )
+                msgs.append(HumanMessage(content=_batch_hint.strip()))
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
             # transcript stays valid (a tool_calls AIMessage must be followed by its
             # ToolMessages before any new HumanMessage). Gives the model a chance to

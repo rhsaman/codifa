@@ -81,6 +81,37 @@ export function toolModelLabel(current: string, providers: ReadonlyArray<Provide
   return current
 }
 
+/** Resolve a stored subagent value to the ONE picker row the backend really
+ *  routes it through — the targeting counterpart of `toolModelLabel`.
+ *  Returns null when no row corresponds (empty value, "main model" sentinel,
+ *  unknown provider prefix). Legacy shapes resolve exactly like the backend
+ *  resolver: "providerId/model" → that provider (id first, then the legacy
+ *  "custom" kind), a bare model id → the ACTIVE provider. Comparing this
+ *  resolved target — instead of a stripped model name — is what keeps
+ *  same-named models under OTHER providers from lighting up as active. */
+export function toolModelTarget(
+  current: string,
+  providers: ReadonlyArray<ProviderConfig>,
+  activeProviderId: string,
+): { providerId: string; model: string } | null {
+  if (!current) return null
+  if (current === 'main model' || current === 'main_model' || current === 'main') return null
+  const slash = current.indexOf('/')
+  if (slash > 0) {
+    const pid = current.slice(0, slash)
+    let modelPart = current.slice(slash + 1)
+    const p =
+      providers.find((x) => x.id === pid) ??
+      (pid === 'custom' ? providers.find((x) => x.kind === 'custom') : undefined)
+    if (p) {
+      if (modelPart.startsWith(`${p.id}/`)) modelPart = modelPart.slice(p.id.length + 1)
+      return { providerId: p.id, model: modelPart }
+    }
+    return null
+  }
+  return { providerId: activeProviderId, model: current }
+}
+
 function ToolModelSelect({
   agent, label, desc, current, onSelect,
 }: {
@@ -91,6 +122,7 @@ function ToolModelSelect({
   onSelect: (agent: string, model: string) => void
 }) {
   const providers = useStore((s) => s.settings.providers)
+  const activeProviderId = useStore((s) => s.settings.activeProviderId)
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
@@ -132,6 +164,11 @@ function ToolModelSelect({
   // `current` is stored as "providerId/model" — resolve a readable label via
   // the shared helper (shows the provider's display name, not the raw id/kind).
   const currentLabel = toolModelLabel(current, providers)
+
+  // The single row the stored value really routes through — drives the active
+  // highlight below (legacy bare ids land on the active provider, matching
+  // the backend resolver).
+  const target = toolModelTarget(current, providers, activeProviderId)
 
   // Opening the combo box always starts from a clean search box — past
   // selection stays visible via the "active" checkmark in the list below,
@@ -262,15 +299,13 @@ function ToolModelSelect({
                     {isOpen && (
                       <div className="pm-models">
                         {models.map((m) => {
-                          // Highlight the active subagent model: current is
-                          // stored as "providerId/model" now (bare model ids
-                          // from legacy configs still match via the stripped
-                          // comparison).
+                          // Highlight ONLY the row the stored value really
+                          // routes through: provider AND model must both match
+                          // (legacy bare ids highlight under the active
+                          // provider) — never same-named models sitting under
+                          // other providers.
                           const isActive =
-                            current === `${p.id}/${m}` ||
-                            current === m ||
-                            current.slice(current.indexOf('/') + 1) === m ||
-                            current.slice(current.indexOf('/') + 1) === `${p.id}/${m}`
+                            target !== null && target.providerId === p.id && target.model === m
                           return (
                             <div key={m} className="pm-model-row">
                               <button
@@ -1558,7 +1593,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
               <div className="hint">
                 MCP servers expose extra tools to the agent (filesystem, databases, APIs…). Connectors
-                are stored in the app database and changes apply on the next message in any mode.
+                are stored in the app's user data folder and changes apply on the next message in any mode.
                 Env/header values support{' '}
                 <code>{'${VAR}'}</code> and <code>{'${VAR:-default}'}</code> expansion from your shell
                 environment. Add a new connector by typing <code>/create-mcp &lt;description&gt;</code> in the chat,
@@ -1625,7 +1660,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <button className="btn tiny" onClick={newSkill}>+ New skill</button>
               </div>
               <div className="hint">
-                Skills are stored in the app database and matched to your messages semantically:
+                Skills are stored in the app's user data folder and matched to your messages semantically:
                 when a request matches a skill, the agent follows its instructions. Create new skills
                 by typing <code>/create-skill &lt;description&gt;</code> in the chat, or add them here.
               </div>

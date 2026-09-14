@@ -39,7 +39,7 @@ export type ThinkingLevel =
 /** Transport type for an MCP tool connector. */
 export type McpTransport = 'stdio' | 'http' | 'sse'
 
-/** One MCP server connector (stored in the app database). */
+/** One MCP server connector (stored in the app's user data folder). */
 export interface McpServerConfig {
   command?: string
   args?: string[]
@@ -128,7 +128,7 @@ export interface Settings {
   /** Directory for the per-workspace RAG vector store (memory + web chunks).
    *  Empty string = default ({dataPath}/vector-db). */
   vectorDbPath?: string
-  /** User-level data root: app DB (coder.db), skills/plans/mcp files and the
+  /** User-level data root: skills/plans/mcp files and the
    *  vector store all live under this folder. Default: ~/.codifa. */
   dataPath?: string
   /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */

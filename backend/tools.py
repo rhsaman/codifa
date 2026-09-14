@@ -840,8 +840,7 @@ def _display_path(root: str, file: str) -> str:
 
     Files under the workspace root show as their tree-relative path (``src/a``);
     files under the user data folder show their real absolute path. Skills,
-    plans and MCP connectors live in the app database and are given to the agent
-    inline instead.
+    plans and MCP connectors are given to the agent inline instead.
     """
     root_real = os.path.realpath(os.path.abspath(root))
     coder = os.path.realpath(user_coder_dir())
@@ -987,7 +986,7 @@ def write_file(root: str, path: str, content: str) -> dict:
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
-            "error": "the workspace .coder/ folder is reserved for the agent's own config (plans) and is stored in the app database instead — do not write here",
+            "error": "the workspace .coder/ folder is reserved — the agent's config (plans, skills, MCP) lives in the user data folder (Settings → Data path), not in the project — do not write here",
         }
     if os.path.isdir(target):
         return {"path": path, "error": "path is a directory"}
@@ -1003,11 +1002,11 @@ def write_file(root: str, path: str, content: str) -> dict:
 def user_coder_dir() -> str:
     """Return the user-level data root (default ``~/.codifa``), creating it.
 
-    The state DB (settings, chats, skills, MCP connectors) and the vector
+    App data (settings, chats, skills, MCP connectors, plans) and the vector
     stores live here (global, shared across all workspaces), not inside each
     project's ``.coder/`` folder. The root is configurable from
     Settings → Data path: Electron sets ``CODER_DATA_DIR`` on the sidecar env,
-    which the desktop app reads to locate the same folder the state DB lives in.
+    which the desktop app reads to locate the same folder the app data lives in.
     """
     # Single source of truth for the data root: state_db.data_root() reads the
     # same CODER_DATA_DIR (set by Electron) and owns the whole file layout.
@@ -1134,8 +1133,8 @@ def _is_workspace_coder_dir(root: str, target: str) -> bool:
     """True if ``target`` resolves inside ``<root>/.coder``.
 
     The workspace ``.coder/`` folder is reserved/forbidden: the agent's user-level
-    config lives in the user data folder, and skills/plans/MCP connectors live in
-    the app database — never in the project.
+    config lives in the user data folder, and skills/plans/MCP connectors live
+    there too — never in the project.
     """
     root_real = os.path.realpath(os.path.abspath(root))
     coder_dir = os.path.join(root_real, ".coder")
@@ -1143,9 +1142,33 @@ def _is_workspace_coder_dir(root: str, target: str) -> bool:
 
 
 def slugify(name: str) -> str:
-    """Turn a skill name into a safe folder slug (e.g. 'Code Review' -> 'code-review')."""
-    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "skill"
+    """Turn a name into a safe folder slug (e.g. 'Code Review' -> 'code-review').
+
+    Returns "" when nothing slugifiable remains (e.g. a fully non-ASCII
+    name); every caller applies its own fallback (workspace/note/...).
+    """
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+
+def _skill_name_error(name: str) -> str:
+    """Return an error message when ``name`` is not a valid English skill name.
+
+    Skill names must be English (ASCII): the storage folder slug is derived
+    from the name, and a non-ASCII (e.g. Persian) name used to collapse into
+    the shared fallback folder ``skills/skill/``, silently overwriting earlier
+    skills. Returns "" when the name is fine.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "skill needs a name"
+    if not name.isascii():
+        return (
+            f"skill name must be English (ASCII) — got {name!r}. "
+            "Use an English name and retry"
+        )
+    if not slugify(name):
+        return f"skill name must contain English letters or digits — got {name!r}"
+    return ""
 
 
 MEMORY_SEARCH_MAX_RESULTS = 15
@@ -1224,23 +1247,24 @@ def persist_skill(
     fallback_name: str = "",
     previous_name: str = "",
 ) -> dict:
-    """Persist a skill to the app database.
+    """Persist a skill as ``skills/<slug>/skill.md`` in the user data folder.
 
-    ``raw`` is the full skill markdown (frontmatter + body). The name and
-    description are parsed from the frontmatter. The id is a virtual key —
-    skills live in the app database, never as files on disk.
+    ``raw`` is the full skill markdown (frontmatter + body); the name and
+    description are parsed from the frontmatter. The name must be English
+    (ASCII) — it becomes the storage folder slug. Returns
+    ``{"ok", "name", "slug", "path", "note"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
     if not name:
         name = fallback_name.strip()
-    if not name:
-        return {"ok": False, "note": "skill needs a name"}
+    error = _skill_name_error(name)
+    if error:
+        return {"ok": False, "note": error}
     slug = slugify(name)
-    path = f"db://skills/{slug}"
     if not body:
         body = f"Write step-by-step instructions for {name}."
     try:
-        _state_db.save_skill(name, slug, description, path, raw or body)
+        _state_db.save_skill(name, slug, description, raw or body)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
@@ -1249,12 +1273,13 @@ def persist_skill(
         "ok": True,
         "name": name,
         "slug": slug,
-        "note": f"skill '{name}' saved to the app database",
+        "path": os.path.join(_state_db.skills_dir(), slug, "skill.md"),
+        "note": f"skill '{name}' saved",
     }
 
 
 def remove_skill(name: str) -> dict:
-    """Delete a skill from the app database."""
+    """Delete a skill from the app's skill store."""
     try:
         removed = _state_db.delete_skill(name)
     except Exception as exc:  # noqa: BLE001
@@ -1272,7 +1297,7 @@ def sync_builtin_skills() -> list[str]:
     """Seed/re-sync built-in skills from ``backend/skills/*.md`` on every startup.
 
     Scans the shipped skills folder and seeds any skill that is not already in
-    the app database, and re-seeds a built-in whose shipped ``.md`` has changed
+    the user's skill store, and re-seeds a built-in whose shipped ``.md`` has changed
     (so official fixes propagate without manual deletion). Adding a new ``.md``
     file to the folder makes it a built-in skill on the next startup, with no
     code change required. Returns the names that were seeded or re-synced.
@@ -1341,7 +1366,7 @@ _BUILTIN_MCP_SERVERS: dict[str, dict] = {
 def seed_builtin_mcp() -> list[str]:
     """Install built-in MCP connectors that are missing (no-op otherwise).
 
-    Seeds every builtin whose name is NOT already in the ``mcp`` table —
+    Seeds every builtin whose name is NOT already stored under ``mcp/`` —
     existing entries (user edits) are never overwritten, and NEW builtins
     (e.g. playwright added after docker) are seeded on the next start even
     when the table already has entries.
@@ -1391,13 +1416,13 @@ def search_web_docs(
 
 
 def create_skill(root: str, name: str, description: str, content: str) -> dict:
-    """Create or overwrite a user skill in the app database (global, shared).
+    """Create or overwrite a user skill (global, shared across workspaces).
 
-    ``name`` is the display name, ``description`` is indexed for the system
-    prompt, and ``content`` is the full markdown body (step-by-step
-    instructions). The skill is stored in the state DB; an existing skill of
-    the same name is replaced. The ``root`` argument is kept for API
-    compatibility and is not used.
+    ``name`` is the display name — it must be English (ASCII) because the
+    storage folder slug is derived from it. ``description`` is indexed for
+    the system prompt, and ``content`` is the full markdown body. The skill
+    is stored as ``skills/<slug>/skill.md`` in the user data folder. The
+    ``root`` argument is kept for API compatibility and is not used.
     """
     body = content.strip()
     if not body:
@@ -1411,12 +1436,9 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
     )
     result = persist_skill(markdown, fallback_name=name)
     if not result.get("ok"):
-        return {
-            "path": f"db://skills/{slugify(name)}",
-            "error": result.get("note", "save failed"),
-        }
+        return {"error": result.get("note", "save failed")}
     return {
-        "path": f"db://skills/{slugify(name)}",
+        "path": result["path"],
         "name": result["name"],
         "ok": True,
         "note": result["note"],
@@ -1424,7 +1446,7 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
 
 
 def _format_skill_body(row: dict) -> str:
-    """Format a skill DB row as the full body ``read_skill`` returns: name,
+    """Format a skill record as the full body ``read_skill`` returns: name,
     description, and the markdown body with frontmatter stripped."""
     body = str(row.get("content") or "").strip()
     if body.startswith("---"):
@@ -1440,10 +1462,10 @@ def _format_skill_body(row: dict) -> str:
 
 
 def upsert_mcp_server(root: str, name: str, cfg: dict) -> dict:
-    """Add or replace one MCP server entry in the app database (shared globally).
+    """Add or replace one MCP connector (shared globally).
 
-    Stores ``cfg`` under ``name`` in the ``mcp`` table. ``root`` is kept for
-    API compatibility and is not used.
+    Stores ``cfg`` as ``mcp/<name>.json`` in the user data folder. ``root``
+    is kept for API compatibility and is not used.
     """
     try:
         _state_db.save_mcp(name, json.dumps(cfg or {}, ensure_ascii=False))
@@ -1491,7 +1513,7 @@ def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
 
 
 def validate_mcp_servers() -> list[str]:
-    """Check every stdio connector in the app database and remove the ones
+    """Check every stdio connector in the app data folder and remove the ones
     that fail to start (bad command, wrong flags, immediate crash).
 
     Returns the names of the servers that were removed so the app can warn the
@@ -1553,7 +1575,7 @@ def edit_file(
     if _is_workspace_coder_dir(root, target):
         return {
             "path": path,
-            "error": "the workspace .coder/ folder is reserved for the agent's own config (plans) and is stored in the app database instead — do not write here",
+            "error": "the workspace .coder/ folder is reserved — the agent's config (plans, skills, MCP) lives in the user data folder (Settings → Data path), not in the project — do not write here",
         }
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
@@ -3144,7 +3166,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
     ) -> str:
-        """Create or update a reusable skill in the app database (global). `name` display name; `description` one-line when-to-use; `content` full markdown body. Skills live ONLY in the app DB — never write skill files to disk; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or update a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use; `content` full markdown body. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",
@@ -3152,6 +3174,10 @@ def make_tool_callbacks(
                 "args": {"name": name, "description": description},
             }
         )
+        error = _skill_name_error(name)
+        if error:
+            emit(_error_result("create_skill", error))
+            return f"ERROR creating skill {name!r}: {error}"
         body = (content or "").strip()
         source_note = ""
         src_url = (source_url or "").strip()
@@ -3296,7 +3322,7 @@ def make_tool_callbacks(
             msg = result["error"]
             emit(_error_result("create_skill", msg))
             return f"ERROR creating skill {name!r}: {msg}"
-        summary = f"saved to the app database as skill {name!r}"
+        summary = f"saved skill {name!r}"
         emit(
             {
                 "kind": "tool_result",
@@ -3312,7 +3338,7 @@ def make_tool_callbacks(
         )
 
     async def load_skill_tool(name: str) -> str:
-        """Load the full body of a skill from the app database by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
+        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
         emit({"kind": "tool", "tool": "load_skill", "args": {"name": name}})
         wanted = (name or "").strip().casefold()
         skills: list[dict] = []
@@ -3359,7 +3385,7 @@ def make_tool_callbacks(
         url: str = "",
         env: dict[str, str] | None = None,
     ) -> str:
-        """Add or update an MCP tool connector in the app database (global). `name` = connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `cmd_args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) + `env` (supports ${VAR}). Remote: `url` instead (verified as a real MCP endpoint). Takes effect next message. Connectors live ONLY in the app DB — never write mcp.json/config files; call once per connector."""
+        """Add or update an MCP tool connector (global). `name` = connector id shown in Settings → MCP. Local server: `command` (e.g. "npx") + optional `cmd_args` (e.g. ["-y", "@modelcontextprotocol/server-filesystem", "/path"]) + `env` (supports ${VAR}). Remote: `url` instead (verified as a real MCP endpoint). Takes effect next message. The tool stores the connector itself (mcp/<name>.json in the app's user data folder) — never write mcp.json/config files yourself; call once per connector."""
         emit({"kind": "tool", "tool": "create_mcp", "args": {"name": name}})
         cfg: dict = {}
         if url:
@@ -3409,12 +3435,12 @@ def make_tool_callbacks(
             {
                 "kind": "tool_result",
                 "tool": "create_mcp",
-                "summary": f"updated {name} in the app database",
+                "summary": f"updated {name} in the app's user data folder",
             }
         )
         return (
-            f"MCP connector {name!r} saved to the app database (user-level, "
-            "shared across all workspaces). It will be loaded on "
+            f"MCP connector {name!r} saved to the app's user data folder "
+            "(user-level, shared across all workspaces). It will be loaded on "
             "the next message. Tell the user it was added and what tools it exposes."
             f"{auth_note}"
         )
@@ -3516,9 +3542,10 @@ def make_tool_callbacks(
         path: str = "",
         paths: list[str] | None = None,
         include: str = "",
+        includes: list[str] | None = None,
         max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -3527,15 +3554,18 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # چند scope در همان فراخوانی: path + paths=[...] → یک grep برای همه.
         all_paths = _dedup_patterns(path, paths)
         scope = "|".join(all_paths) if len(all_paths) > 1 else path
+        # چند فیلتر فایل در همان فراخوانی: include + includes=[...].
+        all_includes = _dedup_patterns(include, includes)
+        inc_disp = "|".join(all_includes) if len(all_includes) > 1 else include
         generation = _search_generations.get(root, 0)
-        cache_key = ("grep", combined, scope, include, root, str(max_results), str(tool_out_chars))
+        cache_key = ("grep", combined, scope, inc_disp, root, str(max_results), str(tool_out_chars))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
                 {
                     "kind": "tool",
                     "tool": "grep",
-                    "args": {"pattern": combined, "path": scope, "include": include},
+                    "args": {"pattern": combined, "path": scope, "include": inc_disp},
                     "model": _main_name,
                 }
             )
@@ -3553,7 +3583,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             {
                 "kind": "tool",
                 "tool": "grep",
-                "args": {"pattern": combined, "path": scope, "include": include},
+                "args": {"pattern": combined, "path": scope, "include": inc_disp},
                 "model": _main_name,
             }
         )
@@ -3561,10 +3591,11 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             results = await asyncio.gather(
                 *(
                     _shared_search(
-                        root, ("grep", combined, p, include, str(SNIPPET_CONTEXT)),
-                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, include,
+                        root, ("grep", combined, p, inc, str(SNIPPET_CONTEXT)),
+                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, inc,
                     )
                     for p in all_paths
+                    for inc in all_includes
                 )
             )
         except PathEscapeError as exc:
@@ -4883,7 +4914,7 @@ When you need to read several files, read multiple independent files in parallel
     async def request_permission_tool(
         action: str, path: str = "", reason: str = ""
     ) -> str:
-        """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors live in the app DB and come inline — never read them from disk, never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
+        """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors come inline — never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
         # Paths under the always-readable user data folder never need a
         # permission prompt — grant silently with no UI card at all.
         if path:
@@ -5515,18 +5546,25 @@ When you need to read several files, read multiple independent files in parallel
             ``do`` is one of: press, focus, toggle, expand, collapse, select,
             show_menu, scroll_into_view, increment, decrement, set_value,
             set_numeric_value, type_text, minimize, maximize, restore, close.
-            ``set_value``/``type_text`` need ``value``.
+            ``set_value``/``type_text`` need ``value``. For do='type_text' you
+            MUST set ``app`` (keyboard events go to the focused app); prefer
+            do='set_value' when the element accepts direct value writes.
           - "input": coordinate/keyboard fallback via synthesized input — use
             ONLY when no semantic action fits (drag, scroll, global shortcut).
             ``do`` is one of: click, double_click, right_click, move_to, drag,
-            scroll, press_key, chord, type_text. Non-ASCII text (e.g. Persian)
-            is typed via the clipboard automatically. KEY NAMES: single
+            scroll, press_key, chord, type_text. If ``app`` is set it is
+            activated first so events reach the right app; for keyboard kinds
+            (type_text/press_key/chord) ``app`` is REQUIRED. Non-ASCII text
+            (e.g. Persian) is typed via the clipboard automatically. KEY NAMES:
+            single
             lowercase keys only ('enter', 'tab', 'escape', 'a', '1') — NEVER
             'command+t' or 'cmd+n'. For combos use do='chord' with key='t' and
             held='Meta' (valid modifiers: Meta, Control, Alt, Shift).
           - "sequence": run MULTIPLE input steps back-to-back in ONE call —
             click then type then press Enter, without losing focus between
-            steps. ``steps`` is a list of dicts, each with "kind" (click,
+            steps. If ``app`` is set it is activated first so events reach the
+            right app; for keyboard steps (type_text/press_key/chord) ``app``
+            is REQUIRED. ``steps`` is a list of dicts, each with "kind" (click,
             double_click, right_click, move_to, drag, scroll, press_key,
             chord, type_text, wait) plus that kind's params (x/y/x2/y2/key/
             held/text/dx/dy, "ms" for wait). Key names are single lowercase
@@ -5709,6 +5747,15 @@ When you need to read several files, read multiple independent files in parallel
             elif action == "act":
                 if not selector.strip():
                     result = {"error": "act needs a selector — see read_screen output."}
+                elif do == "type_text" and not app.strip():
+                    # type_text رویداد کیبورد است و به اپِ فوکوس‌شده می‌رود؛
+                    # بدون app مشخص، متن به اپ اشتباه (مثلاً خودِ ایجنت) می‌رود.
+                    result = {
+                        "error": "act with do='type_text' needs the target app "
+                        "in ``app`` — keyboard events go to the focused app. "
+                        "Set app (e.g. app='Microsoft Word') or use "
+                        "do='set_value' which writes directly into the element."
+                    }
                 elif not (permit and permit.get("computer")):
                     granted = await _ask_permission(
                         f"computer: {do} {selector}" + (f" = {value[:80]}" if value else "")
@@ -5717,6 +5764,10 @@ When you need to read several files, read multiple independent files in parallel
                         result = {
                             "error": "permission denied — the user declined desktop control."
                         }
+                    elif permit is not None:
+                        # کش بلافاصله بعد از تأیید کاربر — نه بعد از موفقیت اکشن؛
+                        # اکشن شکست‌خورده نباید گرانت «Always allow» را باطل کند.
+                        permit["computer"] = True
                 if "error" not in result and selector.strip():
                     result = await asyncio.to_thread(
                         cu.find_and_act,
@@ -5725,10 +5776,16 @@ When you need to read several files, read multiple independent files in parallel
                         value=value,
                         app_name=app,
                     )
-                    if "error" not in result and permit is not None:
-                        permit["computer"] = True
             elif action == "input":
-                if not (permit and permit.get("computer")):
+                if do in ("type_text", "press_key", "chord") and not app.strip():
+                    # ورودی کیبورد به اپِ فوکوس‌شدهٔ سیستم می‌رود؛ بدون app
+                    # مشخص، کلیدها به اپ اشتباه (مثلاً خودِ ایجنت) می‌روند.
+                    result = {
+                        "error": f"input with do={do!r} needs the target app in "
+                        "``app`` — keyboard events go to the focused app. "
+                        "Set app (e.g. app='Notes') so the tool activates it first."
+                    }
+                elif not (permit and permit.get("computer")):
                     granted = await _ask_permission(
                         f"computer: {do} at ({x},{y})"
                         + (f" = {key or text[:60]}" if key or text else "")
@@ -5737,6 +5794,8 @@ When you need to read several files, read multiple independent files in parallel
                         result = {
                             "error": "permission denied — the user declined desktop control."
                         }
+                    elif permit is not None:
+                        permit["computer"] = True
                 if "error" not in result:
                     result = await asyncio.to_thread(
                         cu.input_action,
@@ -5750,12 +5809,23 @@ When you need to read several files, read multiple independent files in parallel
                         text=text,
                         dx=dx,
                         dy=dy,
+                        app_name=app,
                     )
-                    if "error" not in result and permit is not None:
-                        permit["computer"] = True
             elif action == "sequence":
                 if not steps:
                     result = {"error": "sequence needs a non-empty steps list."}
+                elif not app.strip() and any(
+                    s.get("kind") in ("type_text", "press_key", "chord")
+                    for s in steps
+                ):
+                    # هر step کیبوردی به اپِ فوکوس‌شدهٔ سیستم می‌رود؛ بدون app
+                    # مشخص، کلیدها به اپ اشتباه (مثلاً خودِ ایجنت) می‌روند.
+                    result = {
+                        "error": "sequence with keyboard steps (type_text/"
+                        "press_key/chord) needs the target app in ``app`` — "
+                        "keyboard events go to the focused app. Set app so the "
+                        "tool activates it first."
+                    }
                 else:
                     kinds = [s.get("kind", "") for s in steps]
                     desc = f"sequence of {len(steps)} steps: {', '.join(kinds)}"
@@ -5765,12 +5835,12 @@ When you need to read several files, read multiple independent files in parallel
                             result = {
                                 "error": "permission denied — the user declined desktop control."
                             }
+                        elif permit is not None:
+                            permit["computer"] = True
                     if "error" not in result:
                         result = await asyncio.to_thread(
                             cu.run_sequence, steps=steps, app_name=app
                         )
-                        if "error" not in result and permit is not None:
-                            permit["computer"] = True
             else:
                 result = {
                     "error": (

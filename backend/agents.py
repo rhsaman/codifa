@@ -4025,6 +4025,14 @@ async def run_agent(
         # passed straight into run_graph — because LangGraph hands nodes a copy
         # of the state, so a setdefault inside run_graph would never reach them.
         "_run_flags": {"hard_error": False},
+        # Shared permit dict ({"outside", "computer"}) — seeded here for the
+        # same reason as _run_flags: LangGraph copies state per node, so the
+        # shared dict must exist on the original `initial` before the graph
+        # runs, letting grants survive coder-node re-entry within a turn.
+        "_permit": {
+            "outside": bool(allow_outside),
+            "computer": bool(allow_computer),
+        },
     }
     async for event in run_graph(initial):
         yield event

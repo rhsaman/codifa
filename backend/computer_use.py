@@ -126,7 +126,18 @@ def _friendly_error(exc: Exception) -> str:
         "InvalidSelectorError": "Invalid selector syntax.",
     }
     hint = mapping.get(name)
-    return f"{name}: {exc}" + (f" — {hint}" if hint else "")
+    out = f"{name}: {exc}"
+    if hint:
+        out += f" — {hint}"
+    # کلیدهای ترکیبی با نام اشتباه (command+t، cmd+n، ctrl، …) — راهنمای فرمت درست
+    if isinstance(exc, ValueError) and "unknown key name" in str(exc).lower():
+        out += (
+            " — key names are lowercase single keys ('enter', 'tab', 'a'); for "
+            "combos use chord with held modifiers, e.g. press_key 't' after "
+            "chord 't' with held='Meta', or one step kind='chord' key='t' "
+            "held='Meta'. Valid modifiers: Meta, Control, Alt, Shift."
+        )
+    return out
 
 
 def check_access() -> dict[str, Any]:
@@ -165,11 +176,19 @@ def read_screen(app_name: str = "", max_depth: int = DEFAULT_MAX_DEPTH) -> dict[
         app = _resolve_app(app_name)
         dump = app.dump(max_depth=max_depth)
         truncated = len(dump) > MAX_DUMP_CHARS
-        return {
+        result: dict[str, Any] = {
             "app": app.name,
             "tree": dump[:MAX_DUMP_CHARS],
             "truncated": truncated,
         }
+        # درخت خالی = اپ اجراست ولی پنجره‌ای ندارد (مثلاً فقط آیکون در Dock)
+        if len(dump.strip().splitlines()) <= 1:
+            result["hint"] = (
+                "The app is running but has NO open window (empty tree). "
+                "Use action='open_app' to bring it to front / open a window, "
+                "then read_screen again."
+            )
+        return result
     except Exception as exc:  # noqa: BLE001
         return {"error": _friendly_error(exc)}
 

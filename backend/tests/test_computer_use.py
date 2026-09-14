@@ -576,3 +576,60 @@ def test_open_app_action_via_tool(tool_env, monkeypatch: pytest.MonkeyPatch):
     assert parsed.get("ok") is True
     # فعال‌سازی اپ فقط پنجره جلو می‌آورد — گیت پرمیشن نمی‌زند
     assert not [e for e in events if e["kind"] == "permission"]
+
+
+def test_shared_permit_survives_tool_rebuild():
+    """گرانت پرمیشن باید بین rebuildهای ابزار در طول یک turn زنده بماند.
+
+    ریشه‌ی باگ «Always allow که باز هم اجازه می‌خواد»: گره‌ی coder در
+    LangGraph در هر step دوباره اجرا می‌شود و ``make_tool_callbacks`` با
+    dict تازه‌ی ``permit`` ساخته می‌شد؛ گرانتِ ست‌شده در step قبل می‌پرید.
+    ``_shared_permit`` همان dict موجود در ``state["_permit"]`` را
+    برمی‌گرداند و پرچم‌های session را به‌عنوان کف اعمال می‌کند."""
+    import graph as graph_mod
+
+    state: dict = {}
+    p1 = graph_mod._shared_permit(state, allow_outside=False)
+    p1["computer"] = True  # شبیه‌سازی تأیید کاربر («Allow once» / «Always allow»)
+
+    # rebuild بعدی (step جدید از گره coder) باید همان dict را ببیند
+    p2 = graph_mod._shared_permit(state, allow_outside=False)
+    assert p2 is p1
+    assert p2.get("computer") is True
+
+
+def test_unknown_key_name_hint():
+    """خطای Unknown key name باید راهنمای فرمت درست کلیدها را بدهد.
+
+    ریشه‌ی گیج‌شدن ایجنت: مدل 'command+t'/'cmd+n'/'ctrl' می‌فرستاد و ۸ بار
+    پشت‌سرهم خطای خام ValueError می‌گرفت. حالا خطا می‌گوید کلید تکی lowercase
+    و ترکیب‌ها از مسیر chord با held بروند."""
+    exc = ValueError("Unknown key name: command+t")
+    msg = cu._friendly_error(exc)
+    assert "Unknown key name" in msg
+    assert "chord" in msg
+    assert "held" in msg
+    # خطای غیرکلیدیِ ValueError نباید هینت کلید بگیرد
+    plain = cu._friendly_error(ValueError("some other error"))
+    assert "chord" not in plain
+
+
+def test_read_screen_empty_tree_hint(monkeypatch: pytest.MonkeyPatch):
+    """درخت خالی (اپ بدون پنجره) باید هینت open_app بدهد نه فقط درخت خالی."""
+    app = types.SimpleNamespace(name="Chrome", dump=lambda max_depth: 'application "Chrome"\n')
+    monkeypatch.setattr(cu, "_resolve_app", lambda name: app)
+    result = cu.read_screen("Chrome")
+    assert result["app"] == "Chrome"
+    assert "open_app" in result["hint"]
+
+
+def test_shared_permit_session_floor():
+    """پرچم‌های session (از UI) کف هستند و هر rebuild دوباره اعمال می‌شوند."""
+    import graph as graph_mod
+
+    state2: dict = {}
+    p3 = graph_mod._shared_permit(state2, allow_outside=True)
+    assert p3.get("outside") is True
+    p3.pop("outside")
+    p4 = graph_mod._shared_permit(state2, allow_outside=True)
+    assert p4.get("outside") is True  # کف session دوباره اعمال شد

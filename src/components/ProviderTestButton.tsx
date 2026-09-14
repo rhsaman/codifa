@@ -1,7 +1,7 @@
 import type { MouseEvent } from "react";
 import type { ProviderConfig } from "../types";
 import { useModelTests } from "../lib/useModelTests";
-import { TestBoltIcon } from "./ModelTestButton";
+import { TestBoltsIcon } from "./ModelTestButton";
 
 /** دکمهٔ تست کنار نام هر پروایدر: با یک کلیک همهٔ مدل‌های آن پروایدر با
  *  استخر همزمانی محدود تست می‌شوند و نتیجهٔ هر مدل روی دکمهٔ تکی خودش
@@ -37,7 +37,7 @@ export function ProviderTestButton({ cfg, models }: { cfg: ProviderConfig; model
       title={title}
       aria-label={`Test all models of ${cfg.name}`}
     >
-      {s.running ? "…" : <TestBoltIcon />}
+      {s.running ? "…" : <TestBoltsIcon />}
     </button>
   );
 }

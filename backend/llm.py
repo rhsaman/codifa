@@ -606,8 +606,49 @@ def _strip_temperature(model: Any) -> Any:
 
 # Ordered ladder of reasoning-effort values, weakest to strongest. Used to map
 # the user's chosen thinking level onto the nearest value an always-thinking
-# route accepts (some gateways, e.g. agentrouter, only allow low/high/max).
-_EFFORT_LADDER = ("minimal", "low", "medium", "high", "max")
+# route accepts. Providers disagree on the top rung: some use 'max' (agentrouter,
+# some OpenRouter routes), others 'xhigh' (e.g. gpt-5.1 style routes), so both
+# sit above 'high' and the remapper picks whichever the route actually allows.
+_EFFORT_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+# Values that mean "reasoning off" — never a valid remap target on
+# always-thinking routes, but some gateways list them in "supported values".
+_EFFORT_OFF = {"none", "minimal"}
+
+
+def _parse_allowed_efforts(exc: Exception) -> set[str] | None:
+    """Parse the allowed reasoning-effort values from a 400's error text.
+
+    Handles both shapes seen in the wild:
+      * English: "does not support 'max' ... Supported values are: 'none',
+        'low', 'medium', 'high', and 'xhigh'."
+      * Chinese (agentrouter): 「请使用 low、high 或 max」
+
+    The REJECTED value (e.g. 'max' in "does not support 'max'") is excluded so
+    it can never be mistaken for an allowed one — the bug that caused infinite
+    max→max retry loops. Returns None when no explicit list is found.
+    """
+    text = str(exc)
+    low = text.lower()
+    # English "Supported values are: 'a', 'b', and 'c'" (quotes optional).
+    m = re.search(
+        r"supported values(?:\s+are)?:?\s*(.+?)(?:\.|$)", low, re.IGNORECASE
+    )
+    if m:
+        words = re.findall(r"[a-z]+", m.group(1))
+        # The rejected value appears as "does not support 'max'" — grab THAT,
+        # not the param name quoted in "Unsupported value: 'reasoning_effort'".
+        rejected = re.search(r"does not support\s*'(\w+)'", low) or re.search(
+            r"unsupported value\s*:\s*'(\w+)'", low
+        )
+        bad = rejected.group(1) if rejected else None
+        allowed = {w for w in words if w in _EFFORT_LADDER and w != bad}
+        return allowed or None
+    # Chinese 「请使用 low、high 或 max」 — list the bare ladder words.
+    allowed = {w for w in _EFFORT_LADDER if w in low}
+    if allowed:
+        return allowed
+    return None
 
 
 def _is_reasoning_effort_error(exc: Exception) -> bool:
@@ -645,16 +686,18 @@ def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
     """Return a copy of ``model`` with ``reasoning_effort`` remapped to the
     nearest value the route accepts.
 
-    The allowed set is parsed from the error text itself (「请使用 low、high
-    或 max」 lists it), falling back to low/high/max. The user's current level
-    is mapped onto the nearest allowed rung of ``_EFFORT_LADDER`` — e.g.
-    medium -> high, high -> max when max is allowed, minimal/none -> low — so
-    the retry keeps the user's intent instead of always dropping to "low".
-    Handles BOTH the top-level LangChain field (set by build_chat_model) and
-    model_kwargs. Falls back to the original model if cloning fails.
+    The allowed set is parsed from the error text itself (both the English
+    "Supported values are: ..." shape and the Chinese 「请使用 low、high 或
+    max」 one), falling back to low/high/max. The REJECTED value quoted in
+    "does not support 'max'" is excluded so we never remap onto the very value
+    the route just refused. The user's current level is mapped onto the nearest
+    allowed rung of ``_EFFORT_LADDER`` — e.g. medium -> high, high -> xhigh/max
+    when the route allows it, none -> low — so the retry keeps the user's
+    intent instead of always dropping to "low". Handles BOTH the top-level
+    LangChain field (set by build_chat_model) and model_kwargs. Falls back to
+    the original model if cloning fails.
     """
-    # Parse the allowed values straight out of the error message.
-    allowed = {w for w in _EFFORT_LADDER if w in str(exc).lower()}
+    allowed = _parse_allowed_efforts(exc)
     if not allowed:
         allowed = {"low", "high", "max"}
     current = getattr(model, "reasoning_effort", None)
@@ -665,15 +708,28 @@ def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
     # ladder distance, preferring the stronger one on ties (a user who picked
     # medium wants real reasoning, not the floor).
     if current in allowed:
-        # "high" means "the strongest reasoning I can get" — when the route
-        # also allows max, upgrade so the user can actually use it.
-        target = "max" if current == "high" and "max" in allowed else current
+        # "high" is the strongest level the user can pick — when the route
+        # allows something even stronger (xhigh or max), upgrade so the user
+        # can actually use it. Lower picks (low/medium) keep the user's choice.
+        if current == "high":
+            stronger_above = [
+                v
+                for v in _EFFORT_LADDER
+                if v in allowed and _EFFORT_LADDER.index(v) > _EFFORT_LADDER.index(current)
+            ]
+            target = stronger_above[0] if stronger_above else current
+        else:
+            target = current
     else:
         cur_idx = _EFFORT_LADDER.index(current) if current in _EFFORT_LADDER else -1
         if cur_idx < 0:
             # No effort set at all (thinking "off"): these routes can't be
             # turned off, so use the weakest allowed value.
-            target = min(allowed, key=_EFFORT_LADDER.index)
+            target = min(
+                (v for v in allowed if v not in _EFFORT_OFF),
+                key=_EFFORT_LADDER.index,
+                default="low",
+            )
         else:
             allowed_sorted = sorted(allowed, key=_EFFORT_LADDER.index)
             below = [v for v in allowed_sorted if _EFFORT_LADDER.index(v) < cur_idx]

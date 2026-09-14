@@ -446,6 +446,11 @@ class AgentState(TypedDict, total=False):
     # run_graph._drive (decides whether to clear the durable resume file). MUST
     # be declared on the state or LangGraph drops it before the node runs.
     _run_flags: dict
+    # Shared in-memory permit dict ({"outside", "computer"}) — survives coder
+    # node re-entry within a turn. Rebuilding tools with a fresh dict would
+    # lose grants made via "Always allow" / an in-turn Allow-once, re-prompting
+    # the user on every agent step.
+    _permit: dict
 
 
 # ---------------------------------------------------------------------------
@@ -1345,7 +1350,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         reserved=state.get("reserved"),
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
-        permit={"outside": allow_outside, "computer": bool(state.get("allow_computer"))},
+        permit=_shared_permit(state, allow_outside),
         chat_id=chat_id,
         history=state.get("history") or [],
     )
@@ -2600,7 +2605,7 @@ async def _run_mode_turn(
         _no_so = False
         _no_pc = False
         _no_temp = False
-        _no_re = False
+        _no_re = 0
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
         # Every completed tool result is persisted to LangGraph's checkpointer
         # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
@@ -2935,13 +2940,20 @@ async def _run_mode_turn(
                     continue
                 # Always-thinking routes (e.g. agentrouter) reject
                 # reasoning_effort values outside their allowed set with a 400
-                # (「该模型始终思考…请使用 low、high 或 max」). Retry once with
-                # the effort remapped to the nearest allowed value so the turn
-                # survives instead of dying on a thinking-mode mismatch.
-                if not _no_re and _is_reasoning_effort_error(exc):
-                    _no_re = True
-                    model = _remap_reasoning_effort(model, exc)
-                    continue
+                # (「该模型始终思考…请使用 low、high 或 max」 or the English
+                # "does not support 'max'; supported values are: ..."). Retry
+                # with the effort remapped to the nearest allowed value so the
+                # turn survives instead of dying on a thinking-mode mismatch.
+                # Up to 3 remaps: providers disagree on the top rung ('max' vs
+                # 'xhigh'), so one hop may lead to another (high -> max -> xhigh).
+                if _no_re < 3 and _is_reasoning_effort_error(exc):
+                    _remapped = _remap_reasoning_effort(model, exc)
+                    if _remapped is not model and getattr(
+                        _remapped, "reasoning_effort", None
+                    ) != getattr(model, "reasoning_effort", None):
+                        _no_re += 1
+                        model = _remapped
+                        continue
                 # Surface the most common per-step failures as readable SSE
                 # events instead of letting them bubble up to _drive as raw
                 # tracebacks (the old behavior looked like a silent
@@ -3757,6 +3769,28 @@ async def coder_node(state: AgentState) -> dict:
     return {"coder_result": reply, "final_response": reply}
 
 
+def _shared_permit(state: dict, allow_outside: bool) -> dict:
+    """پرچم‌های مجوز مشترک بین rebuildهای ابزار در طول یک turn.
+
+    گره‌ی coder در LangGraph در هر step دوباره اجرا می‌شود و
+    ``make_tool_callbacks`` با dict تازه ساخته می‌شود؛ بدون این dict
+    مشترک، گرانت «Always allow» یا تأیید درون-turn در step بعدی می‌پرود
+    و دیالوگ پرمیشن برای هر فراخوانی دوباره ظاهر می‌شود. dict تازه فقط
+    اولین بار (یا وقتی state هنوز مقدار ندارد) ساخته می‌شود.
+    """
+    permit = state.get("_permit")
+    if not isinstance(permit, dict):
+        permit = {}
+        state["_permit"] = permit
+    # Pre-approved session flags (from the UI) re-applied on every rebuild —
+    # they are the floor, never cleared by a rebuild.
+    if allow_outside:
+        permit["outside"] = True
+    if state.get("allow_computer"):
+        permit["computer"] = True
+    return permit
+
+
 def review_node(state: AgentState) -> dict:
     """Verify the implementation against the request / plan.
 
@@ -4281,10 +4315,7 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         image_uris=image_uris,
         permission_gates=state.get("permission_gates"),
         ask_gates=state.get("ask_gates"),
-        permit={
-            "outside": bool(state.get("allow_outside")),
-            "computer": bool(state.get("allow_computer")),
-        },
+        permit=_shared_permit(state, bool(state.get("allow_outside"))),
         chat_id=state.get("chat_id", ""),
         history=state.get("history") or [],
     )

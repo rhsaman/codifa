@@ -658,14 +658,14 @@ async def models_test(req: ModelTestRequest) -> dict:
             req.api_key,
             req.env_var,
             oauth_token=oauth,
-            timeout=60,
+            timeout=25,
         )
         text, _usage = await asyncio.wait_for(
-            llm_complete(mo, user="Reply with the single word: OK"), timeout=65
+            llm_complete(mo, user="Reply with the single word: OK"), timeout=30
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(
-            status_code=400, detail="timeout — model did not answer in 65s"
+            status_code=400, detail="timeout — model did not answer in 30s"
         ) from exc
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

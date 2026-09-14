@@ -5520,13 +5520,19 @@ When you need to read several files, read multiple independent files in parallel
             ONLY when no semantic action fits (drag, scroll, global shortcut).
             ``do`` is one of: click, double_click, right_click, move_to, drag,
             scroll, press_key, chord, type_text. Non-ASCII text (e.g. Persian)
-            is typed via the clipboard automatically.
+            is typed via the clipboard automatically. KEY NAMES: single
+            lowercase keys only ('enter', 'tab', 'escape', 'a', '1') — NEVER
+            'command+t' or 'cmd+n'. For combos use do='chord' with key='t' and
+            held='Meta' (valid modifiers: Meta, Control, Alt, Shift).
           - "sequence": run MULTIPLE input steps back-to-back in ONE call —
             click then type then press Enter, without losing focus between
             steps. ``steps`` is a list of dicts, each with "kind" (click,
             double_click, right_click, move_to, drag, scroll, press_key,
             chord, type_text, wait) plus that kind's params (x/y/x2/y2/key/
-            held/text/dx/dy, "ms" for wait). A 150ms gap is inserted between
+            held/text/dx/dy, "ms" for wait). Key names are single lowercase
+            keys ('enter', 't'); combos go through kind='chord' with key='t'
+            held='Meta' (modifiers: Meta, Control, Alt, Shift). A 150ms gap is
+            inserted between
             steps by default; override per-step with "gap_ms". If a step
             fails, the rest are skipped and "failed_at" is returned.
             IMPORTANT: multiple input steps must go through ONE sequence call

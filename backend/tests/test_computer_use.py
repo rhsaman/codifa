@@ -21,10 +21,39 @@ import computer_use as cu
 # ---------------------------------------------------------------------------
 
 
+class _FakeRect:
+    """Rect ساختگی — مختصات logical screen، همان شکل واقعی xa11y."""
+
+    def __init__(self, x: int, y: int, width: int, height: int):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+
+
 class _FakeElement:
-    def __init__(self, role: str, name: str | None = None):
+    """Element ساختگی — با children lazy و bounds، همان شکل واقعی xa11y."""
+
+    def __init__(
+        self,
+        role: str,
+        name: str | None = None,
+        bounds: _FakeRect | None = None,
+        children: list[_FakeElement] | None = None,
+        value: str | None = None,
+    ):
         self.role = role
         self.name = name
+        self.bounds = bounds
+        self.value = value
+        self._children = children or []
+
+    def children(self) -> list[_FakeElement]:
+        return list(self._children)
+
+    def dump(self, max_depth: int | None = None) -> str:
+        # مسیر fallback (درخت بیش از بودجه): xa11y خودش بدون bounds رندر می‌کند
+        return f"{self.role} {self.name or ''}".strip()
 
 
 class _FakeLocator:
@@ -40,6 +69,9 @@ class _FakeLocator:
             raise RuntimeError("no element")
         return self._elements[0]
 
+    def elements(self) -> list[_FakeElement]:
+        return list(self._elements)
+
     def __getattr__(self, name: str):
         # اکشن‌های بدون آرگومان (press, focus, toggle, ...)
         def _no_arg(*_args: Any, **_kwargs: Any):
@@ -52,12 +84,25 @@ class _FakeApp:
     def __init__(self, name: str, elements: list[_FakeElement] | None = None):
         self.name = name
         self._elements = elements or []
+        self.is_foreground = True
 
     def dump(self, max_depth: int | None = None) -> str:
-        return "window 'Main'\n  button 'OK'\n  textfield 'Search'"
+        return "window 'Main'\n  button 'OK'\n  text_field 'Search'"
+
+    def as_element(self) -> _FakeElement:
+        # اپ ریشهٔ درخت است و عناصرش فرزند مستقیمش (پنجره‌ها در xa11y همین‌جا
+        # می‌آیند) — read_screen از این مسیر با bounds هر گره رندر می‌کند
+        return _FakeElement("application", self.name, children=list(self._elements))
 
     def locator(self, selector: str) -> _FakeLocator:
-        return _FakeLocator(selector, self._elements)
+        # فیلتر سبک‌وزن روی roleِ آخرین جزء ترکیب: «button[name=...]» و
+        # «group >> button» هر دو به عناصر هم‌نقش می‌رسند — تا
+        # _actionable_targets (که selector با پیشوند scope می‌سازد) در
+        # تست‌ها رفتار واقعی داشته باشد.
+        last = selector.strip().split(">>")[-1].strip()
+        role = last.split("[", 1)[0].split(" ", 1)[0]
+        matched = [e for e in self._elements if not role or e.role == role]
+        return _FakeLocator(selector, matched)
 
 
 class _FakeSim:
@@ -151,12 +196,66 @@ def test_check_access_denied_hint(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_read_screen_named_app(monkeypatch: pytest.MonkeyPatch):
-    apps = [_FakeApp("Notes"), _FakeApp("Safari")]
+    ok = _FakeElement("button", "OK", _FakeRect(100, 200, 80, 24))
+    apps = [_FakeApp("Notes"), _FakeApp("Safari", elements=[ok])]
     monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=apps), raising=False)
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
     result = cu.read_screen(app_name="Safari")
     assert result["app"] == "Safari"
     assert "button 'OK'" in result["tree"]
+
+
+def test_read_screen_prints_bounds_on_every_line(monkeypatch: pytest.MonkeyPatch):
+    """هر خط درخت باید bounds خودش را داشته باشد — مرجع مختصاتی بدون حدس پیکسل.
+
+    ریشه‌ی سوم «کلیک دور از هدف»: dump xa11y فقط role/name/value می‌دهد، پس
+    مدل هیچ نقطهٔ مرجعی نداشت و مجبور بود مکان را از روی اسکرین‌شات حدس بزند
+    (که با مقیاس رتینا و downscale خراب می‌شود)."""
+    ok = _FakeElement("button", "OK", _FakeRect(100, 200, 80, 24))
+    win = _FakeElement("window", "Main", _FakeRect(0, 0, 800, 600), children=[ok])
+    app = _FakeApp("Notes", elements=[win])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_screen(app_name="Notes")
+    assert result["bounds_in_tree"] is True
+    lines = result["tree"].splitlines()
+    assert "window 'Main' bounds=(0,0,800,600)" in lines[1]
+    # فرزند تورفته است و bounds خودش را دارد
+    assert lines[2].startswith("  ")
+    assert "button 'OK' bounds=(100,200,80,24)" in lines[2]
+
+
+def test_tree_without_bounds_is_marked_not_assumed_zero(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """عنصر بی‌bounds باید بدون suffix چاپ شود، نه bounds=(0,0).
+
+    اگر صفر پیش‌فرض بگیریم، مدل فکر می‌کند عنصر در گوشهٔ صفحه است و همان‌جا
+    کلیک می‌کند."""
+    ghost = _FakeElement("group", "Ghost")
+    app = _FakeApp("Notes", elements=[ghost])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_screen(app_name="Notes")
+    assert "group 'Ghost'" in result["tree"]
+    assert "bounds=(0,0" not in result["tree"]
+
+
+def test_dump_with_bounds_falls_back_over_budget(monkeypatch: pytest.MonkeyPatch):
+    """درخت خیلی بزرگ: به dump سریع xa11y برمی‌گردیم و flag می‌زند.
+
+    پیمایش lazy برای هر گره چند فراخوانی native دارد؛ بدون سقف، read_screen
+    روی IDE/مرورگر چند ثانیه طول می‌کشید."""
+    kids = [_FakeElement("button", f"b{i}") for i in range(cu.MAX_BOUNDED_TREE_NODES + 5)]
+    root = _FakeElement("application", "Big", children=kids)
+    root.dump = lambda max_depth=None: "FAST DUMP"  # type: ignore[method-assign]
+    app = _FakeApp("Big")
+    app.as_element = lambda: root  # type: ignore[method-assign]
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_screen(app_name="Big")
+    assert result["tree"] == "FAST DUMP"
+    assert result["bounds_in_tree"] is False
 
 
 def test_read_screen_foreground_default(monkeypatch: pytest.MonkeyPatch):
@@ -167,13 +266,11 @@ def test_read_screen_foreground_default(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_read_screen_truncates_large_dump(monkeypatch: pytest.MonkeyPatch):
-    class _BigApp(_FakeApp):
-        def dump(self, max_depth: int | None = None) -> str:
-            return "x" * (cu.MAX_DUMP_CHARS + 100)
-
-    monkeypatch.setattr(
-        cu, "xa11y", _make_xa11y(apps=[_BigApp("Big")]), raising=False
-    )
+    """درخت بلندتر از سقف کاراکتر باید برش بخورد و truncated بزند."""
+    wide = cu.MAX_DUMP_CHARS // 40
+    kids = [_FakeElement("group", "x" * wide) for _ in range(60)]
+    app = _FakeApp("Big", elements=kids)
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
     result = cu.read_screen(app_name="Big")
     assert result["truncated"] is True
@@ -234,6 +331,160 @@ def test_input_action_click(monkeypatch: pytest.MonkeyPatch):
     result = cu.input_action(kind="click", x=10, y=20)
     assert result["ok"] is True
     assert clicks == [(10, 20)]
+    # نقطهٔ کلیک گزارش شود تا مدل بداند کجا نشست
+    assert result["at"] == (10, 20)
+
+
+def test_input_action_click_by_selector_uses_element(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """با selector باید خودِ Element به InputSim برود، نه مختصات.
+
+    ریشه‌ی اصلی «کلیک در جای اشتباه»: هر تبدیل مختصاتی (پیکسل فیزیکی،
+    downscale، رتینا) منبع خطاست. xa11y روی Element خودش مرکز bounds را
+    انتخاب می‌کند، پس این مسیر اصلاً مختصاتی ندارد."""
+    clicks: list[Any] = []
+
+    class _Sim:
+        def click(self, target):
+            clicks.append(target)
+
+    btn = _FakeElement("button", "OK", _FakeRect(100, 200, 80, 24))
+    app = _FakeApp("Notes", elements=[btn])
+    mod = _make_xa11y(apps=[app])
+    mod.input_sim = lambda: _Sim()  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.input_action("click", selector="button[name='OK']")
+    assert result["ok"] is True
+    assert clicks == [btn]
+    # مختصات گزارش نمی‌شود چون هدف عنصر بود
+    assert "at" not in result
+
+
+def test_input_action_selector_scrolls_into_view_first(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """عنصر بیرون viewport bounds نامعتبر دارد؛ باید اول اسکرول شود."""
+    btn = _FakeElement("button", "OK", _FakeRect(1, 2, 3, 4))
+    app = _FakeApp("Notes", elements=[btn])
+    loc = _FakeLocator("button", [btn])
+    app.locator = lambda sel: loc  # type: ignore[method-assign]
+    mod = _make_xa11y(apps=[app])
+    mod.input_sim = lambda: _FakeSim()  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.input_action("click", selector="button")
+    assert result["ok"] is True
+    assert ("scroll_into_view", None) in loc.calls
+
+
+def test_input_action_missing_coords_is_an_error(monkeypatch: pytest.MonkeyPatch):
+    """مختصات غایب نباید بی‌صدا (0,0) شود — کلیک روی گوشهٔ صفحه.
+
+    ریشه‌ی باگ: قبلاً x/y پیش‌فرض 0 داشتند، پس هر step فراموش‌شده یک کلیک
+    واقعی در گوشهٔ بالا-چپ تولید می‌کرد و کاربر جای اشتباه را می‌دید."""
+    mod = _make_xa11y()
+    mod.input_sim = lambda: _FakeSim()  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.input_action("click")
+    assert "error" in result
+    assert "selector" in result["error"]
+    # خطای راهنما باید پیشنهاد درست بدهد، نه فقط «نیاز به x دارد»
+    assert "LOGICAL" in result["error"]
+
+
+def test_sequence_missing_coords_fails_at_step(monkeypatch: pytest.MonkeyPatch):
+    """step بی‌مختصات باید در همان index شکست بخورد، نه کلیک در (0,0)."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu.time, "sleep", lambda _s: None)
+    result = cu.run_sequence([{"kind": "wait", "ms": 1}, {"kind": "click"}])
+    assert result["ok"] is False
+    assert result["failed_at"] == 1
+    assert result["ran"] == 1
+    assert not sim.clicks
+
+
+def test_normalize_key_aliases():
+    """نام‌های متعارف مدل باید به امضای Pascal xa11y تبدیل شوند."""
+    assert cu._normalize_key("enter") == "Enter"
+    assert cu._normalize_key("ESC") == "Escape"
+    assert cu._normalize_key("arrow up") == "ArrowUp"
+    assert cu._normalize_key("page_down") == "PageDown"
+    assert cu._normalize_key("f12") == "F12"
+    assert cu._normalize_key("a") == "a"  # حرفی عیناً
+    with pytest.raises(ValueError):
+        cu._normalize_key("  ")
+
+
+def test_normalize_modifiers_aliases():
+    assert cu._normalize_modifiers("cmd") == ["Meta"]
+    assert cu._normalize_modifiers("control") == ["Ctrl"]
+    assert cu._normalize_modifiers("meta, shift") == ["Meta", "Shift"]
+    assert cu._normalize_modifiers(["option"]) == ["Alt"]
+    assert cu._normalize_modifiers("") == []
+    with pytest.raises(ValueError):
+        cu._normalize_modifiers("hyper")
+
+
+def test_press_key_with_held_becomes_chord(monkeypatch: pytest.MonkeyPatch):
+    """press_key با held نباید مودیفایر را دور بیندازد."""
+    sim = _FakeSim()
+    cu._sim_do(sim, "press_key", key="o", held="cmd")
+    assert ("chord", ("o", ["Meta"])) in sim.calls
+    sim2 = _FakeSim()
+    cu._sim_do(sim2, "press_key", key="enter")
+    assert ("press", "Enter") in sim2.calls
+
+
+def test_read_screen_lists_targets_with_logical_centers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """read_screen باید مرکز منطقی عناصر تعاملی را بدهد تا حدس پیکلی لازم نشود."""
+    btn = _FakeElement("button", "OK", _FakeRect(100, 200, 80, 24))
+    field = _FakeElement("text_field", "Search", _FakeRect(10, 20, 200, 30))
+    app = _FakeApp("Notes", elements=[btn, field])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_screen(app_name="Notes")
+    assert result["targets"] == [
+        "button[name='OK'] -> center=(140,212)",
+        "text_field[name='Search'] -> center=(110,35)",
+    ]
+    assert "LOGICAL" in result["targets_hint"]
+
+
+def test_read_screen_dedupes_same_name_targets(monkeypatch: pytest.MonkeyPatch):
+    """عناصر هم‌نام باید با :nth یکتا شوند، وگرنه selector دوسو دارد."""
+    a = _FakeElement("button", "OK", _FakeRect(0, 0, 10, 10))
+    b = _FakeElement("button", "OK", _FakeRect(100, 100, 10, 10))
+    app = _FakeApp("Notes", elements=[a, b])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    targets = cu.read_screen(app_name="Notes")["targets"]
+    assert targets[0].startswith("button[name='OK']:nth(1)")
+    assert targets[1].startswith("button[name='OK']:nth(2)")
+
+
+def test_read_element_scopes_targets(monkeypatch: pytest.MonkeyPatch):
+    """targets در read_element باید scoped به همان selector باشند."""
+    btn = _FakeElement("button", "OK", _FakeRect(300, 400, 20, 10))
+    field = _FakeElement("group", "Container", _FakeRect(50, 60, 20, 10), children=[btn])
+    app = _FakeApp("Notes", elements=[field, btn])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_element(selector="group", app_name="Notes")
+    assert "button" in result["tree"]
+    assert "button" in result["tree"]
+    # مرکز خود عنصر هم گزارش شود
+    assert result["center"] == "(60,65)"
+    # targets با پیشوند scope برمی‌گردند تا مستقیم قابل استفاده باشند
+    assert result["targets"][0].startswith("group >> button")
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +507,9 @@ def tool_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         cu, "open_app", lambda name: {"ok": True, "app": name}
     )
+    # صبر foreground هم mock می‌شود: در تست‌ها اپ هدف همیشه در فهرست fake
+    # نیست و poll واقعی تا ACTIVATE_TIMEOUT_S زمان می‌برد.
+    monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
 
     import tools as tools_mod
 
@@ -285,7 +539,7 @@ def test_act_denied_before_permission(tool_env):
 
     async def _run():
         task = asyncio.ensure_future(
-            cbs["computer"](action="act", selector="button", do="press")
+            cbs["computer"](action="act", selector="button", do="press", app="Notes")
         )
         # اجازه بده ابزار تا گیت پرمیشن برسد
         await asyncio.sleep(0.05)
@@ -306,7 +560,7 @@ def test_act_granted_then_runs(tool_env):
 
     async def _run():
         task = asyncio.ensure_future(
-            cbs["computer"](action="act", selector="button", do="press")
+            cbs["computer"](action="act", selector="button", do="press", app="Notes")
         )
         await asyncio.sleep(0.05)
         perm_events = [e for e in events if e["kind"] == "permission"]
@@ -324,7 +578,7 @@ def test_act_granted_then_runs(tool_env):
 def test_second_act_needs_no_new_permission(tool_env):
     cbs, events, _gates, permit = tool_env
     permit["computer"] = True
-    result = asyncio.run(cbs["computer"](action="act", selector="button", do="press"))
+    result = asyncio.run(cbs["computer"](action="act", selector="button", do="press", app="Notes"))
     parsed = json.loads(result)
     assert parsed["ok"] is True
     assert not [e for e in events if e["kind"] == "permission"]
@@ -361,7 +615,7 @@ def test_failed_action_keeps_grant_no_new_dialog(tool_env):
 
     async def _run_failing():
         task = asyncio.ensure_future(
-            cbs["computer"](action="act", selector="button", do="press")
+            cbs["computer"](action="act", selector="button", do="press", app="Notes")
         )
         await asyncio.sleep(0.05)
         perm_events = [e for e in events if e["kind"] == "permission"]
@@ -377,7 +631,7 @@ def test_failed_action_keeps_grant_no_new_dialog(tool_env):
 
     # اکشن دوم: نباید دیالوگ جدید بیاورد — گرانت زنده است
     perm_count_before = len([e for e in events if e["kind"] == "permission"])
-    result2 = asyncio.run(cbs["computer"](action="act", selector="button", do="press"))
+    result2 = asyncio.run(cbs["computer"](action="act", selector="button", do="press", app="Notes"))
     parsed2 = json.loads(result2)
     assert "error" in parsed2  # باز هم شکست می‌خورد (همان mock)
     perm_count_after = len([e for e in events if e["kind"] == "permission"])
@@ -392,7 +646,7 @@ def test_input_needs_permission(tool_env):
 
     async def _run():
         task = asyncio.ensure_future(
-            cbs["computer"](action="input", do="click", x=5, y=5)
+            cbs["computer"](action="input", do="click", x=5, y=5, app="Notes")
         )
         await asyncio.sleep(0.05)
         perm_events = [e for e in events if e["kind"] == "permission"]
@@ -489,12 +743,15 @@ def test_sequence_activates_target_app_first(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         cu, "open_app", lambda name: activated.append(name) or {"ok": True}
     )
+    monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
 
     result = cu.run_sequence(
         [{"kind": "press_key", "key": "o", "held": "Meta"}], app_name="Safari"
     )
     assert result["ok"] is True
     assert activated == ["Safari"]
+    # مودیفایر به امضای xa11y نرمال شده: Meta (نه meta/cmd) و کلید حرفی عیناً
+    assert ("chord", ("o", ["Meta"])) in sim.calls
 
 
 def test_input_action_activates_target_app(monkeypatch: pytest.MonkeyPatch):
@@ -602,6 +859,8 @@ def test_open_app_macos(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(cu.subprocess, "run", _fake_run)
     monkeypatch.setattr(cu.platform, "system", lambda: "Darwin")
+    # poll foreground mock می‌شود — در تست‌ها اپ fake در فهرست واقعی نیست
+    monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
     result = cu.open_app("Google Chrome")
     assert result["ok"] is True
     # osascript با نام اپ درست صدا زده شود
@@ -611,29 +870,40 @@ def test_open_app_macos(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_read_element_subtree(monkeypatch: pytest.MonkeyPatch):
-    field = _FakeElement("group", "Container")
+    ok = _FakeElement("button", "OK")
+    field = _FakeElement(
+        "group",
+        "Container",
+        _FakeRect(10, 20, 300, 200),
+        children=[ok, _FakeElement("text_field", "Search", value="q")],
+    )
     app = _FakeApp("Notes", elements=[field])
-
-    class _TreeLocator(_FakeLocator):
-        def tree(self, max_depth: int | None = None) -> dict:
-            return {
-                "role": "group",
-                "name": "Container",
-                "value": "",
-                "children": [
-                    {"role": "button", "name": "OK", "value": "", "children": []},
-                    {"role": "textfield", "name": "Search", "value": "q", "children": []},
-                ],
-            }
-
-    app.locator = lambda sel: _TreeLocator(sel, [field])  # type: ignore[method-assign]
     monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
     result = cu.read_element(selector="group", app_name="Notes")
-    assert result["ok"] != "error" if "ok" in result else True
-    assert "button" in result["tree"]
-    assert "textfield" in result["tree"]
+    assert "error" not in result
+    assert "button 'OK'" in result["tree"]
+    assert "text_field 'Search'" in result["tree"]
     assert "value='q'" in result["tree"]
+    # ریشه با bounds خودش، فرزندان تورفته (یک indent بیشتر)
+    assert "group 'Container' bounds=(10,20,300,200)" in result["tree"]
+    assert result["bounds_in_tree"] is True
+    assert result["center"] == "(160,120)"
+
+
+def test_read_element_respects_max_depth(monkeypatch: pytest.MonkeyPatch):
+    """``depth`` باید پیمایش را قطع کند — وگرنه هر read_element کل صفحه را می‌خواند."""
+    deep = _FakeElement(
+        "group",
+        "L1",
+        children=[_FakeElement("group", "L2", children=[_FakeElement("button", "L3")])],
+    )
+    app = _FakeApp("Notes", elements=[deep])
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.read_element(selector="group", app_name="Notes", max_depth=1)
+    assert "L2" in result["tree"]
+    assert "L3" not in result["tree"]
 
 
 def test_screenshot_to_data_uri():
@@ -641,11 +911,21 @@ def test_screenshot_to_data_uri():
     assert uri.startswith("data:image/png;base64,")
 
 
-def test_capture_screenshot_full(monkeypatch: pytest.MonkeyPatch):
+def test_capture_screenshot_reports_all_coordinate_spaces(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """هر سه فضای مختصات باید گزارش شود — ریشه‌ی «کلیک دور از هدف».
+
+    xa11y عرض/قد را در پیکسل فیزیکی می‌دهد (روی رتینا ۲×) ولی InputSim در
+    نقطهٔ منطقی کلیک می‌کند؛ قبلاً فقط همان عدد فیزیکی به مدل برمی‌گشت، پس
+    هر مختصاتی که مدل از روی تصویر می‌خواند دو برابر خطا داشت."""
+
     class _Shot:
-        width = 100
-        height = 50
+        width = 3000
+        height = 2000
+        scale = 2.0
         legend: ClassVar[list] = []
+        omitted: ClassVar[list] = []
 
         def to_png(self):
             return b"\x89PNG fake"
@@ -654,10 +934,185 @@ def test_capture_screenshot_full(monkeypatch: pytest.MonkeyPatch):
     mod.screenshot = lambda **kw: _Shot()  # type: ignore[attr-defined]
     monkeypatch.setattr(cu, "xa11y", mod, raising=False)
     monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    # downscale را جداگانه mock می‌کنیم تا نسبت معلوم تست شود
+    monkeypatch.setattr(cu, "_downscale_png", lambda png: (png, 1.0))
     result = cu.capture_screenshot()
     assert result["ok"] is True
     assert result["data_uri"].startswith("data:image/png;base64,")
-    assert result["width"] == 100
+    assert result["physical_width"] == 3000
+    assert result["display_scale"] == 2.0
+    # فضای واقعی کلیک = logical point
+    assert result["logical_width"] == 1500
+    assert result["image_width"] == 3000
+    # تبدیل: pixel_in_image / image_scale = logical
+    assert result["image_scale"] == 2.0
+    assert "image_scale" in result["hint"]
+
+
+def test_capture_screenshot_accounts_for_downscale(monkeypatch: pytest.MonkeyPatch):
+    """اگر تصویر کوچک شد، image_scale باید هر دو ضریب را یکجا بدهد.
+
+    ریشه‌ی دوم خطای مکان کلیک: تصویری که به مدل می‌رسد downscale شده، ولی
+    ابعاد گزارش‌شده خام بود — یعنی مدل روی ۱۶۰۰ پیکسل حدس می‌زد در حالی که
+    صفحه ۳۰۲۴ پیکسل فیزیکی بود."""
+
+    class _Shot:
+        width = 3024
+        height = 1964
+        scale = 2.0
+        legend: ClassVar[list] = []
+        omitted: ClassVar[list] = []
+
+        def to_png(self):
+            return b"\x89PNG fake"
+
+    mod = _make_xa11y()
+    mod.screenshot = lambda **kw: _Shot()  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    ratio = cu.MAX_IMAGE_WIDTH / 3024
+    monkeypatch.setattr(cu, "_downscale_png", lambda png: (png, ratio))
+    result = cu.capture_screenshot()
+    assert result["image_width"] == cu.MAX_IMAGE_WIDTH
+    # logical = 3024/2 = 1512؛ image_scale = 1600/1512 ≈ 1.058
+    assert result["logical_width"] == 1512
+    assert abs(result["image_scale"] - cu.MAX_IMAGE_WIDTH / 1512) < 1e-6
+    # نقطهٔ وسط تصویر ارسالی باید به وسط صفحهٔ منطقی برسد
+    assert round(result["image_width"] / result["image_scale"]) == result[
+        "logical_width"
+    ]
+
+
+def test_capture_screenshot_region_passes_logical_rect(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """``region`` باید به همان مستطیل منطقی برود و مبدأ گزارش شود.
+
+    docstring ابزار «full screen, selector element, or region» را تبلیغ
+    می‌کرد ولی پارامتر region اصلاً وجود نداشت — تبلیغ بی‌پشتوانه."""
+    captured: dict[str, Any] = {}
+
+    class _Shot:
+        width = 800
+        height = 600
+        scale = 2.0
+        legend: ClassVar[list] = []
+        omitted: ClassVar[list] = []
+
+        def to_png(self):
+            return b"\x89PNG fake"
+
+    mod = _make_xa11y()
+    mod.screenshot = lambda **kw: captured.update(kw) or _Shot()  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu, "_downscale_png", lambda png: (png, 1.0))
+    result = cu.capture_screenshot(region=[120, 40, 400, 300])
+    assert captured["region"] == (120, 40, 400, 300)
+    # مختصاتِ روی این تصویر نسبی به برش است؛ مبدأ باید گزارش شود
+    assert result["origin_x"] == 120
+    assert result["origin_y"] == 40
+
+
+def test_capture_screenshot_rejects_selector_and_region(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """همزمان selector و region خطاست (xa11y هم ValueError می‌دهد)."""
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    result = cu.capture_screenshot(selector="window", region=[0, 0, 10, 10])
+    assert "not both" in result["error"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [10, 20, 30],  # کم‌عضو
+        "not a list",  # نوع اشتباه
+        [0, 0, 0, 10],  # عرض صفر
+        [0, 0, 10, -5],  # ارتفاع منفی
+        ["a", "b", "c", "d"],  # غیرعددی
+    ],
+)
+def test_normalize_region_rejects_bad_input(bad):
+    """region باید همین‌جا خطای خوانا بدهد، نه داخل پل Rust."""
+    with pytest.raises(ValueError):
+        cu._normalize_region(bad)
+
+
+def test_normalize_region_accepts_floats_and_tuple():
+    assert cu._normalize_region((1.0, 2.0, 3.0, 4.0)) == (1, 2, 3, 4)
+    assert cu._normalize_region([10, 20, 30, 40]) == (10, 20, 30, 40)
+
+
+def test_see_forwards_region_through_tool(tool_env, monkeypatch: pytest.MonkeyPatch):
+    """ابزار باید region را به capture_screenshot برساند و مبدأ را برگرداند."""
+    _cbs, events, gates, permit = tool_env
+    import tools as tools_mod
+
+    # see بدون مدل بینایی در همان ابتدای شاخه خطا می‌دهد — برای این تست یک
+    # فیک کافی است (llm_generate پایین‌تر mock می‌شود).
+    cbs = tools_mod.make_tool_callbacks(
+        root=".",
+        emit=events.append,
+        vision_model=object(),
+        permission_gates=gates,
+        permit=permit,
+    )
+    seen: dict[str, Any] = {}
+
+    def _fake_capture(**kw):
+        seen.update(kw)
+        return {
+            "ok": True,
+            "data_uri": "data:image/png;base64,AA==",
+            "image_width": 100,
+            "image_height": 80,
+            "image_scale": 1.0,
+            "logical_width": 100,
+            "logical_height": 80,
+            "origin_x": 5,
+            "origin_y": 6,
+            "hint": "h",
+        }
+
+    monkeypatch.setattr(cu, "capture_screenshot", _fake_capture)
+
+    async def _generate(*_a, **_k):
+        return "canvas shows a chart", None
+
+    import llm
+
+    monkeypatch.setattr(llm, "llm_generate", _generate)
+    result = asyncio.run(
+        cbs["computer"](action="see", region=[5, 6, 100, 80], value="what?")
+    )
+    parsed = json.loads(result)
+    assert seen["region"] == (5, 6, 100, 80)
+    assert parsed["origin_x"] == 5
+    assert parsed["origin_y"] == 6
+
+
+def test_downscale_png_returns_ratio():
+    """_downscale_png باید نسبت واقعی ارسالی را برگرداند (۱.۰ = دست‌نخورده)."""
+    import io as _io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (400, 200), "white")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    _out, ratio = cu._downscale_png(buf.getvalue())
+    assert ratio == 1.0  # زیر سقف، پس تغییر نمی‌کند
+
+    big = Image.new("RGB", (cu.MAX_IMAGE_WIDTH * 2, 800), "white")
+    buf2 = _io.BytesIO()
+    big.save(buf2, format="PNG")
+    out2, ratio2 = cu._downscale_png(buf2.getvalue())
+    assert 0 < ratio2 < 1.0
+    small = Image.open(_io.BytesIO(out2))
+    assert small.width == cu.MAX_IMAGE_WIDTH
+    assert abs(small.width - 2 * cu.MAX_IMAGE_WIDTH * ratio2) <= 1
 
 
 def test_see_no_vision_model_hint(tool_env):
@@ -761,7 +1216,15 @@ def test_unknown_key_name_hint():
 
 def test_read_screen_empty_tree_hint(monkeypatch: pytest.MonkeyPatch):
     """درخت خالی (اپ بدون پنجره) باید هینت open_app بدهد نه فقط درخت خالی."""
-    app = types.SimpleNamespace(name="Chrome", dump=lambda max_depth: 'application "Chrome"\n')
+    root = types.SimpleNamespace(
+        role="application",
+        name="Chrome",
+        value=None,
+        bounds=None,
+        children=list,
+        dump=lambda max_depth=None: 'application "Chrome"',
+    )
+    app = types.SimpleNamespace(name="Chrome", as_element=lambda: root)
     monkeypatch.setattr(cu, "_resolve_app", lambda name: app)
     result = cu.read_screen("Chrome")
     assert result["app"] == "Chrome"

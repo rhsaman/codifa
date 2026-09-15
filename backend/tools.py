@@ -2941,6 +2941,53 @@ def make_tool_callbacks(
     _cur_call_id: contextvars.ContextVar[int] = contextvars.ContextVar(
         "coder_tool_call_id", default=0
     )
+    # آخرین شاتِ see برای تبدیل خودکار پیکسلِ تصویر → نقطه‌ی منطقی.
+    # هر اپ/هر ناحیه (window/selector/region) را پوشش می‌دهد؛ بدون آن، مدل
+    # باید دستی origin+pixel/scale حساب می‌کرد و روی رتینا/ downscale خطا می‌داد.
+    _computer_last_shot: dict[str, Any] = {}
+
+    def _convert_pixel_to_logical(x: int | None, y: int | None) -> tuple[int | None, int | None]:
+        """اگر x,y داخل آخرین تصویرِ see باشد، به فضای منطقی تبدیل کن.
+
+        مدل بینایی مختصات را داخل تصویرِ ارسالی (image_width×image_height) می‌دهد؛
+        InputSim در فضای logical (bounds عناصر) کار می‌کند. این تابع با
+        origin+pixel/scale تبدیل را اتومات می‌کند تا LLM نیاز به محاسبه نداشته
+        باشد. اگر x,y خارج از تصویر یا شاتی ثبت نشده، دست‌نخورده برمی‌گردد
+        (پس کلیک‌های منطقی از targets هم سالم می‌مانند).
+        """
+        if x is None or y is None:
+            return x, y
+        # LLM گاهی عدد را به‌صورت رشته می‌فرستد ("342") — به عدد تبدیل کن وگرنه مقایسه <= خطا می‌دهد
+        try:
+            xv: int | float = int(float(str(x).strip())) if isinstance(x, str) else x
+            yv: int | float = int(float(str(y).strip())) if isinstance(y, str) else y
+        except Exception:  # noqa: BLE001
+            return x, y
+        if not isinstance(xv, (int, float)) or not isinstance(yv, (int, float)):
+            return x, y
+        if not _computer_last_shot:
+            return xv, yv
+        iw = _computer_last_shot.get("image_width")
+        ih = _computer_last_shot.get("image_height")
+        if not isinstance(iw, int) or not isinstance(ih, int):
+            return xv, yv
+        if not (0 <= xv <= iw and 0 <= yv <= ih):
+            return xv, yv
+        # از اینجا به بعد با xv/yv کار می‌کنیم
+        x, y = xv, yv
+        # خارج از تصویر → فرض بر منطقی بودن؛ تبدیل نکن
+        ox = int(_computer_last_shot.get("origin_x", 0) or 0)
+        oy = int(_computer_last_shot.get("origin_y", 0) or 0)
+        sx = _computer_last_shot.get("image_scale_x", _computer_last_shot.get("image_scale", 1.0))
+        sy = _computer_last_shot.get("image_scale_y", sx)
+        try:
+            sx_f = float(sx or 1.0)
+            sy_f = float(sy or 1.0)
+        except Exception:  # noqa: BLE001
+            return x, y
+        if sx_f == 0 or sy_f == 0:
+            return x, y
+        return round(ox + x / sx_f), round(oy + y / sy_f)
 
     def _emit(event: dict) -> None:
         nonlocal _call_seq
@@ -5708,10 +5755,10 @@ When you need to read several files, read multiple independent files in parallel
         selector: str = "",
         do: str = "",
         value: str = "",
-        x: int = 0,
-        y: int = 0,
-        x2: int = 0,
-        y2: int = 0,
+        x: int | None = None,
+        y: int | None = None,
+        x2: int | None = None,
+        y2: int | None = None,
         key: str = "",
         held: str = "",
         text: str = "",
@@ -5720,6 +5767,8 @@ When you need to read several files, read multiple independent files in parallel
         depth: int = 14,
         steps: list | None = None,
         annotate: bool = False,
+        selector2: str = "",
+        region: list | None = None,
     ) -> str:
         """Control desktop apps on macOS/Windows/Linux through the OS Accessibility Tree (the same approach the Codex app uses — element-based, not screenshots). Read actions need no permission; MUTATING actions (act / input / sequence) ask the user once per turn.
 
@@ -5743,48 +5792,75 @@ When you need to read several files, read multiple independent files in parallel
             ``set_value``/``type_text`` need ``value``. For do='type_text' you
             MUST set ``app`` (keyboard events go to the focused app); prefer
             do='set_value' when the element accepts direct value writes.
-          - "input": coordinate/keyboard fallback via synthesized input — use
-            ONLY when no semantic action fits (drag, scroll, global shortcut).
+          - "input": synthesized mouse/keyboard fallback — use ONLY when no
+            semantic action fits (drag, scroll, global shortcut, canvas).
             ``do`` is one of: click, double_click, right_click, move_to, drag,
-            scroll, press_key, chord, type_text. If ``app`` is set it is
-            activated first so events reach the right app; for keyboard kinds
-            (type_text/press_key/chord) ``app`` is REQUIRED. Non-ASCII text
-            (e.g. Persian) is typed via the clipboard automatically. KEY NAMES:
-            single
-            lowercase keys only ('enter', 'tab', 'escape', 'a', '1') — NEVER
+            scroll, press_key, chord, type_text. For click/double_click/
+            right_click/move_to/drag/scroll pass ``selector`` — the element's
+            OWN bounds centre is used, so it lands exactly on target with no
+            coordinate math at all (WORKS FOR ANY APP with an AX tree). Coordinates
+            are only for points that are not an element (a canvas pixel, empty
+            desktop, or any app's arbitrary point): x/y are LOGICAL screen points
+            (same space as element bounds and the ``center=`` values in
+            read_screen/read_element output). If you just called ``see``, you may
+            ALSO pass raw pixels from that image — they are auto-converted via
+            ``origin + pixel/image_scale_x/y`` using the last screenshot's metadata,
+            so no manual division is needed. Omitting a needed target is an
+            error, never a silent click at (0,0). For ``drag`` the end point is
+            ``selector2`` or x2/y2. If ``app`` is set it is activated first so
+            events reach the right app; for keyboard kinds (type_text/
+            press_key/chord) ``app`` is REQUIRED. Non-ASCII text (e.g. Persian)
+            is typed via the clipboard automatically. KEY NAMES: named keys use
+            their Pascal name ('Enter', 'Tab', 'Escape', 'ArrowUp', 'F5');
+            printable characters are literal and lowercase ('a', '1') — NEVER
             'command+t' or 'cmd+n'. For combos use do='chord' with key='t' and
-            held='Meta' (valid modifiers: Meta, Control, Alt, Shift).
+            held='Meta' (valid modifiers: Meta, Ctrl, Alt, Shift).
           - "sequence": run MULTIPLE input steps back-to-back in ONE call —
             click then type then press Enter, without losing focus between
-            steps. If ``app`` is set it is activated first so events reach the
-            right app; for keyboard steps (type_text/press_key/chord) ``app``
-            is REQUIRED. ``steps`` is a list of dicts, each with "kind" (click,
-            double_click, right_click, move_to, drag, scroll, press_key,
-            chord, type_text, wait) plus that kind's params (x/y/x2/y2/key/
-            held/text/dx/dy, "ms" for wait). Key names are single lowercase
-            keys ('enter', 't'); combos go through kind='chord' with key='t'
-            held='Meta' (modifiers: Meta, Control, Alt, Shift). A 150ms gap is
-            inserted between
-            steps by default; override per-step with "gap_ms". If a step
-            fails, the rest are skipped and "failed_at" is returned.
-            IMPORTANT: multiple input steps must go through ONE sequence call
-            — separate calls lose focus between steps.
-          - "see": capture a screenshot (full screen, ``selector`` element, or
-            ``region``) and analyze it with the user's vision model (Settings
-            → Tools → Vision model). ``value`` is the analysis prompt
-            (default: describe visible text, UI elements and positions).
-            ``annotate=True`` draws numbered boxes over buttons/text fields
-            and returns a legend mapping each number to its selector — use it
-            to bridge pixel view and the accessibility tree. Use "see" when
-            the tree cannot answer (terminals, canvases, images, video).
+            steps. Works for ANY app/window. If ``app`` is set it is activated
+            first so events reach the right app; for keyboard steps
+            (type_text/press_key/chord) ``app`` is REQUIRED. ``steps`` is a list
+            of dicts, each with "kind" (click, double_click, right_click,
+            move_to, drag, scroll, press_key, chord, type_text, wait) plus that
+            kind's params — pointer kinds take "selector" (preferred; "selector2"
+            for the drag end) or x/y (x2/y2 for drag) in LOGICAL points OR raw
+            pixels from the last ``see`` (auto-converted as in ``input``);
+            keyboard kinds take key/held/text; scroll takes dx/dy; wait takes
+            "ms". Key names are Pascal for named keys ('Enter', 'ArrowUp') and
+            literal lowercase for characters ('t'); combos go through
+            kind='chord' with key='t' held='Meta' (modifiers: Meta, Ctrl, Alt,
+            Shift). A 150ms gap is inserted between steps by default; override
+            per-step with "gap_ms". If a step fails, the rest are skipped and
+            "failed_at" is returned. IMPORTANT: multiple input steps must go
+            through ONE sequence call — separate calls lose focus between steps.
+          - "see": capture a screenshot and analyze it with the user's vision
+            model (Settings → Tools → Vision model). With no ``selector``/``region``,
+            ``app`` alone captures that app's window (works for ANY app — Finder,
+            Chrome, VSCode, Terminal, Word — via window/dialog fallback); otherwise
+            captures the selector element or ``region``. ``value`` is the analysis
+            prompt (default: describe visible text, UI elements and positions).
+            ``region`` is ``[x, y, width, height]`` in LOGICAL screen points
+            (same space as element bounds) — mutually exclusive with
+            ``selector``. ``annotate=True`` draws numbered boxes over all
+            interactive elements and returns a legend mapping each number to its
+            selector plus its logical bounds/centre — use it to bridge pixel view
+            and the accessibility tree and then click via selector (precise for any
+            app). The result reports ``image_width``/``image_height`` (pixels the
+            vision model saw), ``image_scale_x/y`` (and legacy ``image_scale``) and
+            ``origin_x/y``: next ``input``/``sequence`` may pass raw pixels and
+            they are auto-converted to logical via ``origin + pixel/scale``.
+            Use "see" when the tree cannot answer (terminals, canvases, images,
+            video) or to verify any app visually.
           - "check_access": verify accessibility permissions; returns a
             per-OS setup hint when access is missing.
 
         SELECTORS are CSS-like (xa11y syntax), scoped to the target app:
           button[name='OK']          — button named exactly OK
-          textfield[name^='Search']  — text field whose name starts with Search
+          text_field[name^='Search'] — text field whose name starts with Search
           window >> tab              — descendant combinator
-          listitem:nth(2)            — 2nd match (1-based)
+          list_item:nth(2)           — 2nd match (1-based)
+        Roles are snake_case: text_field, check_box, radio_button, combo_box,
+        list_item, menu_item (NOT textfield/checkbox).
 
         STRATEGY (important):
           1. If you can guess the element (e.g. "click the OK button"), call
@@ -5792,11 +5868,15 @@ When you need to read several files, read multiple independent files in parallel
           2. Only read_screen when you don't know the app's structure, or
              after a failed/errored action.
           3. Prefer semantic "act" over coordinate "input" — it is precise and
-             doesn't move the user's mouse.
+             doesn't move the user's mouse. When you must use "input", still
+             pass a ``selector`` rather than coordinates.
           4. Multiple input steps (click → type → Enter) MUST go through ONE
              "sequence" call — separate calls lose focus between steps.
           5. Use "see" when the tree cannot answer: terminals, canvases,
              images, video, or when a visual check is needed.
+          6. Never click a pixel you estimated from a screenshot when the same
+             spot is an element in the tree — read_screen/read_element return
+             ``targets`` with each element's exact logical centre.
         """
         import computer_use as cu
 
@@ -5813,10 +5893,12 @@ When you need to read several files, read multiple independent files in parallel
                     "y": y,
                     "key": key,
                     "value": value[:100],
+                    "selector2": selector2,
                     "steps": (
                         [s.get("kind", "") for s in steps] if steps else []
                     ),
                     "annotate": annotate,
+                    "region": region,
                 },
             }
         )
@@ -5894,18 +5976,49 @@ When you need to read several files, read multiple independent files in parallel
                         cu.capture_screenshot,
                         app_name=app,
                         selector=selector,
+                        region=tuple(region) if region else None,
                         annotate=annotate,
                     )
                     if "error" in shot:
                         result = shot
                     else:
+                        # ذخیره برای تبدیل خودکار پیکسلِ see → منطقی در input/sequence بعدی (هر اپ، هر ناحیه)
+                        _computer_last_shot.clear()
+                        _computer_last_shot.update(
+                            {
+                                "image_width": shot.get("image_width"),
+                                "image_height": shot.get("image_height"),
+                                "image_scale": shot.get("image_scale"),
+                                "image_scale_x": shot.get("image_scale_x", shot.get("image_scale")),
+                                "image_scale_y": shot.get("image_scale_y", shot.get("image_scale")),
+                                "logical_width": shot.get("logical_width"),
+                                "logical_height": shot.get("logical_height"),
+                                "origin_x": shot.get("origin_x", 0),
+                                "origin_y": shot.get("origin_y", 0),
+                            }
+                        )
+                        _annotate_hint = ""
+                        if shot.get("legend"):
+                            _annotate_hint = (
+                                " Numbered boxes are drawn on interactive elements — "
+                                "mention the box tag (e.g. '[1]') together with the pixel so the main agent can click via selector."
+                            )
                         _sys = (
                             "You are a screen-analysis sub-agent. The main agent "
                             "captured a screenshot of the user's screen and needs "
-                            "your analysis. Reply with a precise, concise "
-                            "description (under ~300 words): exact visible text, "
-                            "UI elements, their approximate positions, colors, "
-                            "errors — the details the main agent needs to act."
+                            "your analysis. The image you were given is EXACTLY "
+                            f"{shot.get('image_width')}x{shot.get('image_height')} "
+                            "pixels, origin (0,0) at the top-left corner. Reply "
+                            "with a precise, concise description (under ~300 "
+                            "words): exact visible text, UI elements, colors, "
+                            "errors. For EVERY element the main agent might need "
+                            "to click, you MUST give its approximate center as a "
+                            "pixel coordinate within that exact image — e.g. "
+                            "'Save button ~(342,118)'. A vague direction with no "
+                            "number ('top-right', 'near the toolbar') is USELESS "
+                            "to the main agent — it cannot see the image itself "
+                            "and can only click the numbers you give it."
+                            + _annotate_hint
                         )
                         try:
                             _output, usage = await llm_generate(
@@ -5933,22 +6046,33 @@ When you need to read several files, read multiple independent files in parallel
                                 result = {
                                     "ok": True,
                                     "analysis": _output,
-                                    "image_width": shot.get("width"),
-                                    "image_height": shot.get("height"),
+                                    # ابعاد تصویرِ واقعاً دیده‌شده توسط مدل
+                                    # بینایی + ضریب تبدیل به نقطهٔ منطقی
+                                    "image_width": shot.get("image_width"),
+                                    "image_height": shot.get("image_height"),
+                                    "image_scale": shot.get("image_scale"),
+                                    "image_scale_x": shot.get("image_scale_x", shot.get("image_scale")),
+                                    "image_scale_y": shot.get("image_scale_y", shot.get("image_scale")),
+                                    "logical_width": shot.get("logical_width"),
+                                    "logical_height": shot.get("logical_height"),
+                                    # مبدأ برش نسبت به کل صفحه (۰ برای full screen)
+                                    "origin_x": shot.get("origin_x"),
+                                    "origin_y": shot.get("origin_y"),
                                 }
                                 if shot.get("legend"):
                                     result["legend"] = shot["legend"]
+                                if shot.get("omitted"):
+                                    result["omitted"] = shot["omitted"]
+                                result["hint"] = shot.get("hint", "")
             elif action == "act":
                 if not selector.strip():
                     result = {"error": "act needs a selector — see read_screen output."}
-                elif do == "type_text" and not app.strip():
-                    # type_text رویداد کیبورد است و به اپِ فوکوس‌شده می‌رود؛
-                    # بدون app مشخص، متن به اپ اشتباه (مثلاً خودِ ایجنت) می‌رود.
+                elif not app.strip():
+                    # همیشه باید app مشخص باشد تا روی اپ اشتباهی کلیک/اکشن نشود
                     result = {
-                        "error": "act with do='type_text' needs the target app "
-                        "in ``app`` — keyboard events go to the focused app. "
-                        "Set app (e.g. app='Microsoft Word') or use "
-                        "do='set_value' which writes directly into the element."
+                        "error": "act needs the target app in ``app`` — always set "
+                        "app (e.g. app='Google Chrome', app='Notes') so the action "
+                        "runs on the correct app via its selector. First select the app, then the element."
                     }
                 elif not (permit and permit.get("computer")):
                     granted = await _ask_permission(
@@ -5971,17 +6095,21 @@ When you need to read several files, read multiple independent files in parallel
                         app_name=app,
                     )
             elif action == "input":
-                if do in ("type_text", "press_key", "chord") and not app.strip():
-                    # ورودی کیبورد به اپِ فوکوس‌شدهٔ سیستم می‌رود؛ بدون app
-                    # مشخص، کلیدها به اپ اشتباه (مثلاً خودِ ایجنت) می‌روند.
+                if not app.strip():
+                    # هر input (حتی click) روی اپ فوکوس‌شده می‌رود — بدون app، روی اپ اشتباهی می‌نشیند
                     result = {
                         "error": f"input with do={do!r} needs the target app in "
-                        "``app`` — keyboard events go to the focused app. "
-                        "Set app (e.g. app='Notes') so the tool activates it first."
+                        "``app`` — always set app (e.g. app='Google Chrome') so the "
+                        "tool activates the correct app first. Selector (if any) is then scoped to that app."
                     }
                 elif not (permit and permit.get("computer")):
+                    # توصیف مقصد: selector دقیق‌تر از مختصات است و کاربر باید
+                    # بفهمد قرار است روی چه چیزی کنترل داده شود
+                    where = f"on {selector}" if selector.strip() else ""
+                    if not where and x is not None and y is not None:
+                        where = f"at ({x},{y})"
                     granted = await _ask_permission(
-                        f"computer: {do} at ({x},{y})"
+                        f"computer: {do} {where}".strip()
                         + (f" = {key or text[:60]}" if key or text else "")
                     )
                     if not granted:
@@ -5991,34 +6119,39 @@ When you need to read several files, read multiple independent files in parallel
                     elif permit is not None:
                         permit["computer"] = True
                 if "error" not in result:
+                    # تبدیل خودکار پیکسلِ see → منطقی (هر اپ/هر ناحیه)
+                    # فقط وقتی selector خالی است؛ وگرنه xa11y خودش مرکز bounds را می‌زند
+                    conv_x, conv_y = x, y
+                    conv_x2, conv_y2 = x2, y2
+                    if not selector.strip():
+                        conv_x, conv_y = _convert_pixel_to_logical(x, y)
+                    if not selector2.strip():
+                        conv_x2, conv_y2 = _convert_pixel_to_logical(x2, y2)
                     result = await asyncio.to_thread(
                         cu.input_action,
                         kind=do,
-                        x=x,
-                        y=y,
-                        x2=x2,
-                        y2=y2,
+                        x=conv_x,
+                        y=conv_y,
+                        x2=conv_x2,
+                        y2=conv_y2,
                         key=key,
                         held=held,
                         text=text,
                         dx=dx,
                         dy=dy,
                         app_name=app,
+                        selector=selector,
+                        selector2=selector2,
                     )
             elif action == "sequence":
                 if not steps:
                     result = {"error": "sequence needs a non-empty steps list."}
-                elif not app.strip() and any(
-                    s.get("kind") in ("type_text", "press_key", "chord")
-                    for s in steps
-                ):
-                    # هر step کیبوردی به اپِ فوکوس‌شدهٔ سیستم می‌رود؛ بدون app
-                    # مشخص، کلیدها به اپ اشتباه (مثلاً خودِ ایجنت) می‌روند.
+                elif not app.strip():
+                    # کل sequence روی اپ فوکوس‌شده اجرا می‌شود — همیشه app بده
                     result = {
-                        "error": "sequence with keyboard steps (type_text/"
-                        "press_key/chord) needs the target app in ``app`` — "
-                        "keyboard events go to the focused app. Set app so the "
-                        "tool activates it first."
+                        "error": "sequence needs the target app in ``app`` — always set "
+                        "app (e.g. app='Google Chrome') so the whole sequence runs on "
+                        "the correct app. Select app first, then elements/coordinates."
                     }
                 else:
                     kinds = [s.get("kind", "") for s in steps]
@@ -6032,8 +6165,24 @@ When you need to read several files, read multiple independent files in parallel
                         elif permit is not None:
                             permit["computer"] = True
                     if "error" not in result:
+                        # تبدیل پیکسلِ see برای هر step مختصاتی (هر اپ)
+                        _converted_steps: list[dict] = []
+                        for _s in steps:
+                            _ns = dict(_s)
+                            _kind = str(_ns.get("kind", ""))
+                            if _kind in ("click", "double_click", "right_click", "move_to", "drag", "scroll"):
+                                if not str(_ns.get("selector", "") or "").strip():
+                                    _cx, _cy = _convert_pixel_to_logical(_ns.get("x"), _ns.get("y"))
+                                    # فقط وقتی x/y اصلی داده شده بود، مقدار تبدیل‌شده را بنویس
+                                    if _ns.get("x") is not None or _ns.get("y") is not None:
+                                        _ns["x"], _ns["y"] = _cx, _cy
+                                if _kind == "drag" and not str(_ns.get("selector2", "") or "").strip():
+                                    _cx2, _cy2 = _convert_pixel_to_logical(_ns.get("x2"), _ns.get("y2"))
+                                    if _ns.get("x2") is not None or _ns.get("y2") is not None:
+                                        _ns["x2"], _ns["y2"] = _cx2, _cy2
+                            _converted_steps.append(_ns)
                         result = await asyncio.to_thread(
-                            cu.run_sequence, steps=steps, app_name=app
+                            cu.run_sequence, steps=_converted_steps, app_name=app
                         )
             else:
                 result = {

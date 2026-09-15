@@ -118,17 +118,18 @@ async def test_explore_grep_searches_run_concurrently(monkeypatch):
     ``await asyncio.to_thread(search_in_files, ...)``, so two greps emitted in
     one step overlap on worker threads and finish in ~one scan's time.
 
-    This test fakes a slow, blocking scan and asserts the two grep calls (a)
-    overlap in wall-clock time and (b) run OFF the event-loop thread.
+    With step-local I/O coalescing, two literal greps in one step share ONE
+    union scan (``alpha|beta``) instead of two separate scans — so this test
+    fakes a slow, blocking scan and asserts (a) exactly one raw scan runs and
+    (b) it runs OFF the event-loop thread.
     """
     calls: list[dict] = []
     loop_tid = threading.get_ident()
 
     def fake_search_in_files(root, pattern, path, snippet, include, permit=None):
-        rec = {"tid": threading.get_ident(), "start": time.time(), "end": 0.0}
-        calls.append(rec)  # capture the reference; update OUR OWN record below
+        rec = {"tid": threading.get_ident(), "query": pattern}
+        calls.append(rec)
         time.sleep(0.08)  # simulate a heavy, blocking filesystem scan
-        rec["end"] = time.time()
         return {"matches": []}
 
     monkeypatch.setattr(tools, "search_in_files", fake_search_in_files)
@@ -145,15 +146,12 @@ async def test_explore_grep_searches_run_concurrently(monkeypatch):
 
     result = await langchain_tool_loop(model, tools={"grep": grep}, user="search")
     assert result == "done"
-    assert len(calls) == 2, f"expected 2 search_in_files calls, got {len(calls)}"
-    # Both scans must run on worker threads (not the event-loop thread).
-    assert calls[0]["tid"] != loop_tid and calls[1]["tid"] != loop_tid, (
+    # Coalescing: the two literal greps share ONE union scan, not two scans.
+    assert len(calls) == 1, f"expected 1 shared scan, got {len(calls)}"
+    assert calls[0]["query"] == "alpha|beta", calls[0]
+    # The shared scan must run on a worker thread (not the event-loop thread).
+    assert calls[0]["tid"] != loop_tid, (
         "search ran on the event-loop thread -- to_thread offload is missing"
-    )
-    # And they must overlap in time (true concurrency, not serialized).
-    a, b = calls[0], calls[1]
-    assert a["start"] < b["end"] and b["start"] < a["end"], (
-        f"grep searches did not overlap (serialized): {calls}"
     )
 
 

@@ -87,6 +87,7 @@ from llm import (
     strip_orphaned_tool_calls,
 )
 from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
+from tool_batching import execute_readonly_calls
 from tool_message_projection import project_tool_results
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
@@ -3218,40 +3219,12 @@ async def _run_mode_turn(
             _step_hint = _batchable_nudge(_pending)
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
-            # Enforcement: فراخوانی‌های تکِ بعد از تذکرِ نادیده‌گرفته‌شده یک
-            # بار رد می‌شوند (اجرا نمی‌شوند) — خطای ابزار سیگنال قوی‌تری از
-            # متن تذکر است و مدل مجبور است واکنش نشان دهد. فقط فراخوانی‌های
-            # تکِ batchable رد می‌شوند؛ فراخوانی batch شده همیشه اجرا می‌شود.
-            _rejects: dict[str, str] = {}
-            for tc in _pending:
-                _rn = (tc.get("name") or "").lower()
-                _ra = tc.get("args") or {}
-                if (
-                    _rn in ("grep", "glob", "read")
-                    and not any(
-                        k in _ra
-                        for k in ("patterns", "filePaths", "ranges", "paths", "includes")
-                    )
-                    and (_ra.get("filePath") if _rn == "read" else _ra.get("pattern"))
-                ):
-                    _rej = _streak.should_reject(_rn)
-                    if _rej:
-                        _rejects[tc.get("id", "")] = _rej
-            async def _run_or_reject(tc, _rej: dict[str, str]) -> str:
-                """Run the tool — or return the enforcement rejection text."""
-                _rid = tc.get("id", "")
-                if _rid in _rej:
-                    return _rej[_rid]
+            async def _run_readonly(tc) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}
                 )
 
-            if len(_parallel) > 1:
-                _results = await asyncio.gather(
-                    *(_run_or_reject(tc, _rejects) for tc in _parallel)
-                )
-            else:
-                _results = [await _run_or_reject(tc, _rejects) for tc in _parallel]
+            _results = await execute_readonly_calls(_parallel, _run_readonly)
             for tc, result in zip(_parallel, _results):
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))

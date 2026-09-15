@@ -37,7 +37,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
         sys.path.insert(0, _p)
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from llm import _batchable_nudge, _BatchStreakTracker
 from llm import langchain_tool_loop as _tool_loop
@@ -244,46 +244,6 @@ def test_streak_ignores_varied_work():
     t.observe([{"name": "grep", "args": {"pattern": "x"}, "id": "b"}])
     out = t.observe([{"name": "glob", "args": {"pattern": "*.py"}, "id": "d"}])
     assert out == ""
-
-
-# ── enforcement: رد فراخوانی تکِ بعد از تذکر نادیده‌گرفته‌شده ─────────────
-
-def test_enforcement_rejects_next_single_call_once():
-    """بعد از شلیک تذکر (streak)، فراخوانی تکِ بعدی همان ابزار یک بار رد
-    می‌شود — اجرا نمی‌شود و متن رد حاوی نمونه‌ی ترکیبی است. فراخوانی تکِ
-    بعد از رد، دوباره عادی اجرا می‌شود (بدترین حالت: ۱ رفت‌وبرگشت هدر)."""
-    t = _BatchStreakTracker(threshold=2)
-    t.observe([_read_tc("a.py", 1)])
-    assert t.observe([_read_tc("b.py", 2)]) != ""  # تذکر شلیک کرد
-    # فراخوانی تکِ بعدی → رد
-    rej = t.should_reject("read")
-    assert rej.startswith("NOT RUN"), rej
-    assert "ranges=" in rej or "filePaths=" in rej  # نمونه‌ی ترکیبی
-    assert "do NOT re-issue" in rej.lower() or "Do NOT re-issue" in rej
-    # رد فقط یک بار است — فراخوانی تکِ بعدیِ بعدی عادی اجرا می‌شود
-    assert t.should_reject("read") == ""
-    # ابزار دیگر تحت تأثیر نیست
-    assert t.should_reject("grep") == ""
-
-
-def test_enforcement_not_triggered_without_reminder():
-    """بدون شلیک تذکر، هیچ فراخوانی‌ای رد نمی‌شود."""
-    t = _BatchStreakTracker(threshold=2)
-    t.observe([_read_tc("a.py", 1)])
-    assert t.should_reject("read") == ""
-
-
-def test_enforcement_batch_call_never_rejected():
-    """فراخوانی batch شده (filePaths=[...]) هرگز رد نمی‌شود — رد فقط
-    فراخوانی‌های تک را می‌گیرد (سیم‌کشی در حلقه‌ها این شرط را چک می‌کند)."""
-    t = _BatchStreakTracker(threshold=2)
-    t.observe([_read_tc("a.py", 1)])
-    t.observe([_read_tc("b.py", 2)])  # تذکر شلیک کرد
-    # فراخوانی batch بعدی streak را ریست می‌کند و ردی هم نمی‌گیرد
-    assert t.observe([
-        {"name": "read", "args": {"filePath": "a.py", "filePaths": ["c.py"]}, "id": "c3"}
-    ]) == ""
-    assert t.should_reject("read") == ""
 
 
 # ── end-to-end: sub-agent loop appends the nudge to the LAST result ────────
@@ -547,73 +507,52 @@ def test_loop_streak_counts_through_per_step_nudge_step():
     )
 
 
-class _IgnoringModel:
-    """The reported regression: the model IGNORES the batching reminder and
-    keeps firing one read per step. Enforcement must reject exactly ONE of
-    those calls (the tool is not run — the model sees a NOT RUN error)."""
+# ── step-local I/O coalescing (tool_batching) ──────────────────────────────
 
-    model_name = "fake-ignoring-reminder"
+@pytest.mark.asyncio
+async def test_execute_readonly_calls_coalesces_same_key_io():
+    """تجمیع واقعی I/O: فراخوانی‌های هم‌مرحله‌ای با کلید یکسان فقط یک‌بار در
+    مرز I/O اجرا می‌شوند ولی نتیجه‌ی هر tool_call_id مستقل حفظ می‌شود."""
+    from tool_batching import coalesce_io, execute_readonly_calls
 
-    def __init__(self, steps: int = 5):
-        self._step = 0
-        self._max = steps
-        self.saw_nudge = False
-        self.saw_rejection = False
+    io_calls: list[list[str]] = []
 
-    def bind_tools(self, tools):
-        class _Bound:
-            def __init__(self, model):
-                self._model = model
+    async def _single():
+        raise AssertionError("مسیر single نباید داخل step اجرا شود")
 
-            async def ainvoke(self, msgs):
-                m = self._model
-                m._step += 1
-                for msg in msgs:
-                    _c = str(getattr(msg, "content", ""))
-                    if isinstance(msg, HumanMessage) and "BATCHING REMINDER" in _c:
-                        m.saw_nudge = True
-                    if isinstance(msg, ToolMessage) and "NOT RUN" in _c:
-                        m.saw_rejection = True
-                if m._step <= m._max:
-                    return AIMessage(
-                        content="",
-                        tool_calls=[
-                            {
-                                "name": "read",
-                                "args": {
-                                    "filePath": f"f{m._step}.py",
-                                    "offset": 1,
-                                    "limit": 100,
-                                },
-                                "id": f"call_{m._step}",
-                            }
-                        ],
-                    )
-                return AIMessage(content="done")
+    async def _batch(requests):
+        io_calls.append(list(requests))
+        return [f"body:{r}" for r in requests]
 
-        return _Bound(self)
-
-
-def test_loop_enforcement_rejects_ignored_reminder():
-    """End-to-end: a model that keeps firing single reads after the reminder
-    gets ONE rejected call (NOT RUN) — the tool is not executed for it."""
-    model = _IgnoringModel(steps=5)
-    result = asyncio.run(
-        _tool_loop(
-            model,
-            system="",
-            user="read f1..f5",
-            tools=_make_tools(),
-            max_steps=10,
-            ctx=0,
-            emit=None,
+    async def _execute(call):
+        return await coalesce_io(
+            ("read", call["filePath"]), call["filePath"], _single, _batch
         )
-    )
-    assert result == "done"
-    assert model.saw_nudge, "the reminder must reach the model first"
-    assert model.saw_rejection, (
-        "the ignored reminder must trigger a NOT RUN rejection the model sees"
-    )
+
+    calls = [
+        {"filePath": "a.py", "id": "c1"},
+        {"filePath": "a.py", "id": "c2"},
+        {"filePath": "b.py", "id": "c3"},
+    ]
+    results = await execute_readonly_calls(calls, _execute)
+    assert results == ["body:a.py", "body:a.py", "body:b.py"]
+    # a.py یک‌بار در مرز I/O اجرا شد؛ b.py جدا (کلید ناسازگار ادغام نمی‌شود).
+    assert io_calls == [["a.py", "a.py"], ["b.py"]]
+
+
+@pytest.mark.asyncio
+async def test_coalesce_io_falls_back_to_single_outside_step():
+    """خارج از step (بدون زمینه‌ی batch) مسیر single اجرا می‌شود — رفتار
+    قدیمی ابزارها بدون تجمیع حفظ می‌شود."""
+    from tool_batching import coalesce_io
+
+    async def _single():
+        return "single"
+
+    async def _batch(requests):
+        raise AssertionError("batch نباید خارج از step اجرا شود")
+
+    assert await coalesce_io(("read", "a.py"), "a.py", _single, _batch) == "single"
 
 
 @pytest.mark.asyncio
@@ -682,12 +621,4 @@ if __name__ == "__main__":
     print("  ✅ loop nudges one-at-a-time greps (different scopes)")
     test_loop_streak_counts_through_per_step_nudge_step()
     print("  ✅ streak counts through per-step-nudge steps")
-    test_enforcement_rejects_next_single_call_once()
-    print("  ✅ enforcement rejects next single call once")
-    test_enforcement_not_triggered_without_reminder()
-    print("  ✅ enforcement not triggered without reminder")
-    test_enforcement_batch_call_never_rejected()
-    print("  ✅ enforcement never rejects batch calls")
-    test_loop_enforcement_rejects_ignored_reminder()
-    print("  ✅ loop enforcement rejects ignored reminder")
     print("\n🎉 همه تست‌های batching nudge رد شد")

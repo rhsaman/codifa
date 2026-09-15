@@ -25,7 +25,6 @@ graph or the tools.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import logging
@@ -53,6 +52,7 @@ from providers import (
     normalize_base_url,
     qualify_model_id,
 )
+from tool_batching import execute_readonly_calls
 
 # _strip_think_tags و _is_repeating از _common import می‌شوند (single source of truth).
 
@@ -1151,46 +1151,17 @@ class _BatchStreakTracker:
     commands). Genuine varied work is never nagged.
     """
 
-    __slots__ = ("_counts", "_recent", "_rejected", "_threshold")
+    __slots__ = ("_counts", "_recent", "_threshold")
 
     def __init__(self, threshold: int = 2):
-        # شمارش per-tool + فراخوانی‌های اخیر برای ساخت نمونه‌ی ترکیبی.
         self._counts: dict[str, int] = {}
         self._recent: dict[str, list[dict]] = {}
         self._threshold = max(2, threshold)
-        # ابزارهایی که تذکرشان نادیده گرفته شد — فراخوانی تکِ بعدی همان
-        # ابزار یک بار رد می‌شود (enforcement) تا مدل به‌جای نادیده‌گرفتنِ
-        # متن تذکر، خطای واقعی ابزار را ببیند و واکنش نشان دهد.
-        self._rejected: set[str] = set()
 
     def _batch_args(self, args: dict) -> bool:
         return any(
             k in (args or {})
             for k in ("patterns", "filePaths", "ranges", "paths", "includes")
-        )
-
-    def should_reject(self, name: str) -> str:
-        """Enforcement: a one-at-a-time call AFTER an ignored reminder.
-
-        Returns the rejection text for this call (the tool is NOT run — the
-        model gets an error result instead), or "" when the call may run.
-        Fires ONCE per tool per turn: the next one-at-a-time call after the
-        rejection runs normally, so a model that keeps ignoring the reminder
-        still makes progress (worst case: 1 wasted round-trip per tool).
-        """
-        if name not in self._rejected:
-            return ""
-        self._rejected.discard(name)
-        recent = self._recent.get(name) or []
-        example = _batch_example(name, recent) if recent else ""
-        return (
-            f"NOT RUN — batching enforcement: you already received a BATCHING "
-            f"REMINDER for {name} but fired another single {name} call. This "
-            f"call was NOT executed.\n"
-            + (f"Merge your next calls into ONE tool call shaped exactly like "
-               f"this:\n{example}\n" if example else "")
-            + "Do NOT re-issue the calls that already ran — their results are "
-            "already in this conversation. Batch only your NEXT calls."
         )
 
     def observe(self, tcs: list) -> str:
@@ -1222,11 +1193,8 @@ class _BatchStreakTracker:
             # meant the streak never reached the threshold.
             return ""
         for name in batched:
-            # The model IS batching this tool now — restart its count and
-            # cancel any pending enforcement (the reminder was obeyed).
             self._counts.pop(name, None)
             self._recent.pop(name, None)
-            self._rejected.discard(name)
         fired: list[tuple[str, list[dict], int]] = []
         for name, args in step_calls.items():
             n = self._counts.get(name, 0) + 1
@@ -1239,10 +1207,6 @@ class _BatchStreakTracker:
                 fired.append((name, recent, n))
         if not fired:
             return ""
-        # تذکر شلیک کرد — ابزارهای مربوطه را برای enforcement علامت بزن:
-        # اگر مدل در step بعدی باز فراخوانی تک بزند، رد می‌شود.
-        for name, _, _ in fired:
-            self._rejected.add(name)
         lines = [
             f"- {_batch_example(name, calls)}"
             for name, calls, _ in fired
@@ -1301,10 +1265,6 @@ async def langchain_tool_loop(
             return r
         except Exception as exc:  # noqa: BLE001
             return f"ERROR running {name}: {exc}"
-
-    async def _noop_reject(tc, rejects: dict[str, str]):
-        """Enforcement: return the rejection text WITHOUT running the tool."""
-        return rejects.get(tc.get("id", ""), "NOT RUN — batching enforcement")
 
     msgs: list[Any] = []
     # Safety net: some chat templates (e.g. Qwen3.5 / llama.cpp) crash with
@@ -1444,39 +1404,7 @@ async def langchain_tool_loop(
         _step_hint = _batchable_nudge(tcs)
         _streak_hint = _streak.observe(tcs)
         _batch_hint = _step_hint or _streak_hint
-        # Enforcement: فراخوانی‌های تکِ بعد از تذکرِ نادیده‌گرفته‌شده یک بار
-        # رد می‌شوند (اجرا نمی‌شوند) — خطای ابزار سیگنال قوی‌تری از متن
-        # تذکر است و مدل مجبور است واکنش نشان دهد. فقط فراخوانی‌های تکِ
-        # batchable رد می‌شوند؛ فراخوانی batch شده همیشه اجرا می‌شود.
-        _rejects: dict[str, str] = {}
-        for tc in tcs:
-            _rn = (tc.get("name") or "").lower()
-            _ra = tc.get("args") or {}
-            if (
-                _rn in _BATCHABLE_TOOLS
-                and not any(
-                    k in _ra
-                    for k in ("patterns", "filePaths", "ranges", "paths", "includes")
-                )
-                and (_ra.get("filePath") if _rn == "read" else _ra.get("pattern"))
-            ):
-                _rej = _streak.should_reject(_rn)
-                if _rej:
-                    _rejects[tc.get("id", "")] = _rej
-        if len(_parallel) > 1:
-            _results = await asyncio.gather(
-                *(
-                    _exec(tc)
-                    if tc.get("id", "") not in _rejects
-                    else _noop_reject(tc, _rejects)
-                    for tc in _parallel
-                )
-            )
-        else:
-            _results = [
-                await (_exec(tc) if tc.get("id", "") not in _rejects else _noop_reject(tc, _rejects))
-                for tc in _parallel
-            ]
+        _results = await execute_readonly_calls(_parallel, _exec)
         for tc, result in zip(_parallel, _results):
             msgs.append(
                 ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))

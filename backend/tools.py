@@ -31,6 +31,7 @@ import state_db as _state_db
 from agent_registry import AGENTS, agent_system, agent_tools
 from cache import Cache, cache_path_for
 from secret_utils import decrypt_secret
+from tool_batching import coalesce_io
 from vector_store import (
     KIND_WEB,
     StoreConfig,
@@ -993,64 +994,53 @@ def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
     beyond the returned window. The caller uses these to pick the right footer,
     exactly like opencode's ``flags.cut`` / ``flags.more``.
     """
-    start = max(1, int(offset or 1))
-    cap = max(1, int(limit or 0))
-    lines: list[dict] = []
+    return _read_lines_excerpts(path, [(offset, limit)])[0]
+
+
+def _read_lines_excerpts(path: str, windows: list[tuple[int, int]]) -> list[dict]:
+    """Scan a file once, preserving the byte/line budget of every window."""
+    results = [
+        {
+            "path": path, "lines": [], "start": max(1, int(offset or 1)),
+            "total": 0, "cut": False, "more": False,
+        }
+        for offset, _ in windows
+    ]
+    caps = [max(1, int(limit or 0)) for _, limit in windows]
+    sizes = [0] * len(windows)
     total = 0
-    cut = False        # hit the 50 KB byte cap
-    more = False       # hit the `limit` line cap
-    bytes_used = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, raw in enumerate(fh, 1):
                 total = lineno
-                if lineno < start:
+                active = [
+                    i for i, result in enumerate(results)
+                    if lineno >= result["start"] and not result["cut"] and not result["more"]
+                ]
+                if not active:
                     continue
                 text = raw.rstrip("\n")
                 if len(text) > MAX_LINE_LENGTH:
-                    # opencode-style MIDDLE truncation: keep the line's head and
-                    # tail (so leading indent/keyword and the closing bracket/paren
-                    # survive) and replace the middle with a single ellipsis.
-                    _keep = MAX_LINE_LENGTH - 1
-                    _head = _keep // 2
-                    _tail = _keep - _head
-                    text = text[:_head] + "…" + text[-_tail:]
-                # opencode-style byte cap: stop once the accumulated output
-                # reaches MAX_READ_EXCERPT_BYTES so a huge file can't flood the
-                # context even when `limit` is large.
+                    keep = MAX_LINE_LENGTH - 1
+                    head = keep // 2
+                    text = text[:head] + "…" + text[-(keep - head):]
                 size = len(text.encode("utf-8", errors="replace")) + 1
-                if bytes_used + size > MAX_READ_EXCERPT_BYTES:
-                    cut = True
-                    # keep scanning to count total lines (cheap) so the footer is right
-                    for _extra in fh:
-                        total += 1
-                    break
-                lines.append({"line": lineno, "text": text})
-                bytes_used += size
-                if len(lines) >= cap:
-                    more = True
-                    # keep scanning to count total lines (cheap) so the footer is right
-                    for _extra in fh:
-                        total += 1
-                    break
+                for i in active:
+                    result = results[i]
+                    if sizes[i] + size > MAX_READ_EXCERPT_BYTES:
+                        result["cut"] = True
+                        continue
+                    result["lines"].append({"line": lineno, "text": text})
+                    sizes[i] += size
+                    if len(result["lines"]) >= caps[i]:
+                        result["more"] = True
     except (OSError, UnicodeError) as exc:
-        return {
-            "path": path,
-            "error": str(exc),
-            "lines": [],
-            "start": start,
-            "total": 0,
-            "cut": False,
-            "more": False,
-        }
-    return {
-        "path": path,
-        "lines": lines,
-        "start": start,
-        "total": total,
-        "cut": cut,
-        "more": more,
-    }
+        for result in results:
+            result.update(error=str(exc), lines=[], total=0, cut=False, more=False)
+        return results
+    for result in results:
+        result["total"] = total
+    return results
 
 
 def write_file(root: str, path: str, content: str, permit: dict | None = None) -> dict:
@@ -2152,6 +2142,72 @@ def search_in_files(
     if result is not None:
         return result
     return _search_python(root, query, path, ctx, include, permit)
+
+
+def _search_literal_batch(
+    root: str, queries: list[str], path: str, context: int, include: str,
+    permit: dict | None,
+) -> list[dict]:
+    """Union simple lowercase literals, then project raw hits to each query.
+
+    Complex regexes retain their original engine semantics via the caller's
+    single-scan path. A truncated union cannot prove any query's full result,
+    so fall back rather than silently starving a less frequent query.
+    """
+    unique = list(dict.fromkeys(queries))
+    combined = "|".join(unique)
+    result = search_in_files(root, combined, path, context, include, permit)
+    matches = result.get("matches", [])
+    if len(unique) == 1:
+        return [result for _ in queries]
+    if result.get("error"):
+        return [dict(result, query=query) for query in queries]
+    overlapping = any(
+        left["file"] == right["file"] and abs(left["line"] - right["line"]) <= context * 2
+        for i, left in enumerate(matches)
+        for right in matches[i + 1:]
+    )
+    if (
+        result.get("truncated") or overlapping
+        or any(len(m.get("text", "")) >= 500 for m in matches)
+    ):
+        individual = {
+            query: search_in_files(root, query, path, context, include, permit)
+            for query in unique
+        }
+        return [individual[query] for query in queries]
+    return [
+        dict(
+            result, query=query,
+            matches=[m for m in matches if re.search(query, m.get("text", ""), re.IGNORECASE)],
+        )
+        for query in queries
+    ]
+
+
+async def _coalesced_search(
+    root: str, query: str, path: str, context: int, include: str,
+    permit: dict | None, generation: int,
+) -> dict:
+    async def single() -> dict:
+        return await _shared_search(
+            root, ("grep", query, path, include, str(context)), generation,
+            search_in_files, root, query, path, context, include, permit,
+        )
+
+    # Only literals whose case behavior agrees in both search engines are safe.
+    if not re.fullmatch(r"[a-z0-9_ ]{1,80}", query):
+        return await single()
+
+    async def batch(queries: list[str]) -> list[dict]:
+        return await asyncio.to_thread(
+            _search_literal_batch, root, queries, path, context, include, permit,
+        )
+
+    return await coalesce_io(
+        ("grep", root, path, context, include, id(permit), generation, id(search_in_files)),
+        query, single, batch,
+    )
 
 
 def _glob_python(root: str, pattern: str, target: str, path: str) -> dict:
@@ -3696,9 +3752,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         try:
             results = await asyncio.gather(
                 *(
-                    _shared_search(
-                        root, ("grep", combined, p, inc, str(SNIPPET_CONTEXT)),
-                        generation, search_in_files, root, combined, p, SNIPPET_CONTEXT, inc, permit,
+                    _coalesced_search(
+                        root, combined, p, SNIPPET_CONTEXT, inc, permit, generation,
                     )
                     for p in all_paths
                     for inc in all_includes
@@ -4013,7 +4068,18 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             msg = "binary file (read skipped)"
             emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
-        excerpt = await asyncio.to_thread(_read_lines_excerpt, target, offset, limit)
+        async def single_excerpt() -> dict:
+            return await asyncio.to_thread(_read_lines_excerpt, target, offset, limit)
+
+        async def batch_excerpts(windows: list[tuple[int, int]]) -> list[dict]:
+            if len(windows) == 1:
+                return [await asyncio.to_thread(_read_lines_excerpt, target, *windows[0])]
+            return await asyncio.to_thread(_read_lines_excerpts, target, windows)
+
+        excerpt = await coalesce_io(
+            ("read", root, target, id(permit), _search_generations.get(root, 0)),
+            (offset, limit), single_excerpt, batch_excerpts,
+        )
         if excerpt.get("error"):
             msg = excerpt["error"]
             emit(_error_result("read", msg))

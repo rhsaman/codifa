@@ -835,7 +835,12 @@ _UNIVERSAL_RULES = (
     "شده...'). Keep it under ~15 words, plain text, no markdown/headers/code "
     "fences. That line renders as the caption of the tool row (Claude.ai-style) "
     "so the user always sees what you are doing while tools run. Never call a "
-    "tool silently."
+    "tool silently.\n"
+    "8. SKILLS ARE ALWAYS ENGLISH (HARD): skills created via create_skill "
+    "(`name`, `description`, `content`) must ALWAYS be written entirely in "
+    "English, regardless of the user's chat language. Never create Persian "
+    "skills — this hard rule overrides the language-matching rules above for "
+    "skills only."
 )
 
 # Length rule for plan/coder ONLY — these modes need full, complete deliverables
@@ -3934,12 +3939,18 @@ def _language_directive(text: str) -> str:
             "\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply "
             "ENTIRELY in Persian — every message, todo/checklist item, plan content, "
             "summary, ask_user question and options, and any comment or text inside "
-            "generated code/files. Never reply in English when the user writes Persian."
+            "generated code/files. Never reply in English when the user writes Persian. "
+            "EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via "
+            "create_skill, its `name`, `description` and `content` (full markdown body) "
+            "MUST be entirely in English, even though the chat is Persian. Never create "
+            "Persian skills. This hard rule overrides the Persian reply rule for skills."
         )
     return (
         "\nLANGUAGE RULE (always follow): Reply entirely in the same language the user "
         "writes in — Persian → Persian, English → English, etc. Never switch languages "
-        "for todo lists, plans or summaries."
+        "for todo lists, plans or summaries. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): "
+        "skill `name`/`description`/`content` via create_skill must always be English, "
+        "regardless of chat language."
     )
 
 

@@ -1234,6 +1234,24 @@ def _skill_name_error(name: str) -> str:
     return ""
 
 
+_HAS_PERSIAN_RE = re.compile(r"[\u0600-\u06FF]")
+
+
+def _skill_content_error(description: str, content: str) -> str:
+    """HARD English-only for skills: reject Persian script in description/content.
+
+    Skills are always English, even when the chat is Persian — this is the
+    runtime enforcement behind the prompt hard rule.
+    """
+    for label, text in (("description", description), ("content", content)):
+        if text and _HAS_PERSIAN_RE.search(text):
+            return (
+                f"skill {label} must be English — Persian script detected. "
+                "Rewrite it entirely in English and retry (hard rule: skills are always English)"
+            )
+    return ""
+
+
 MEMORY_SEARCH_MAX_RESULTS = 15
 DEFAULT_VECTOR_DB_DIR = "vector-db"
 
@@ -1323,6 +1341,9 @@ def persist_skill(
     error = _skill_name_error(name)
     if error:
         return {"ok": False, "note": error}
+    c_err = _skill_content_error(description, body)
+    if c_err:
+        return {"ok": False, "note": c_err}
     slug = slugify(name)
     if not body:
         body = f"Write step-by-step instructions for {name}."
@@ -3375,7 +3396,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
     ) -> str:
-        """Create or update a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use; `content` full markdown body. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or update a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",
@@ -3387,6 +3408,12 @@ def make_tool_callbacks(
         if error:
             emit(_error_result("create_skill", error))
             return f"ERROR creating skill {name!r}: {error}"
+        # HARD English-only for skills (even when chat is Persian) — description
+        # is known upfront; content is checked again after source fetch.
+        c_err = _skill_content_error(description, content)
+        if c_err:
+            emit(_error_result("create_skill", c_err))
+            return f"ERROR creating skill {name!r}: {c_err}"
         body = (content or "").strip()
         source_note = ""
         src_url = (source_url or "").strip()
@@ -3521,6 +3548,11 @@ def make_tool_callbacks(
                 description = _desc[:300]
         if not body:
             body = f"Write step-by-step instructions for {name}."
+        # Final HARD English check — covers fetched source bodies too.
+        c_err = _skill_content_error(description, body)
+        if c_err:
+            emit(_error_result("create_skill", c_err))
+            return f"ERROR creating skill {name!r}: {c_err}"
         try:
             result = create_skill(root, name, description, body)
         except PathEscapeError as exc:

@@ -24,6 +24,10 @@ Design notes
   lock) are reaped before every fresh connect and again on shutdown.
 * A per-server lock serialises connects so two concurrent turns never
   double-spawn the same server.
+* وقتی فراخوانی یک ابزار به‌خاطر بسته‌شدن مرورگر/اتصال شکست می‌خورد (کاربر
+  تب را بسته یا مرورگر بین دو turn کرش کرده)، سشن شفاف دوباره وصل
+  (reconnect) می‌شود و فراخوانی یک‌بار دیگر تکرار می‌گردد — مدل هرگز
+  شکستِ ساختگی را نمی‌بیند.
 * تعریف ابزارها قبل از رسیدن به مدل فشرده می‌شود: توضیحات به جمله(های)
   اول بریده و description فیلدهای schema سقف می‌خورند تا سرورهای پرحرف
   (مثل Playwright) با هر turn پاراگراف‌ها را دوباره نفرستند.
@@ -91,6 +95,31 @@ def _config_hash(cfg: dict) -> str:
 
 # SIGKILL where it exists; Windows only offers SIGTERM semantics for os.kill.
 _KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+# Substrings that signal the underlying browser/transport connection has been
+# closed (the user closed the tab, or the browser crashed between turns). When
+# a tool call fails with one of these, we transparently reconnect the session
+# and retry once — the model never sees the synthetic failure.
+_CLOSED_CONNECTION_MARKERS = (
+    "browser has been closed",
+    "browser is not connected",
+    "target page closed",
+    "connection closed",
+    "connection is closed",
+    "session closed",
+    "not connected",
+    "playwright has been closed",
+    "the page has been closed",
+    "context destroyed",
+    "execution context was destroyed",
+)
+
+
+def _is_closed_connection_error(exc: BaseException) -> bool:
+    """True when ``exc`` indicates the browser/transport connection dropped."""
+    msg = str(getattr(exc, "message", "")) or str(exc)
+    low = msg.lower()
+    return any(marker in low for marker in _CLOSED_CONNECTION_MARKERS)
 
 
 def _distinctive_tokens(cfg: dict) -> list[str]:
@@ -284,16 +313,51 @@ async def _call_mcp_tool(
     Mirrors the internal tools' UI contract: emit a ``tool`` event before the
     call and a ``tool_result`` event after, so MCP calls render in the live
     activity feed exactly like native tools.
+
+    When the call fails because the browser/transport connection was closed
+    (the user closed the tab, or the browser crashed between turns), the
+    session is transparently reconnected and the call retried once — so the
+    model never sees a synthetic failure for a recoverable condition.
     """
     emit({"kind": "tool", "tool": qualified, "args": kwargs, "mcp_server": server_name})
     try:
         result = await session.call_tool(tool_name, arguments=kwargs or {})
     except Exception as exc:  # noqa: BLE001
+        if _is_closed_connection_error(exc):
+            # Reconnect the cached session and retry once. The cached session
+            # (and its config) live at module scope; if the reconnect succeeds
+            # the retry runs against the fresh session.
+            if await _reconnect_session(server_name, emit):
+                cached = _session_cache.get(server_name)
+                if cached is not None:
+                    try:
+                        result = await cached.session.call_tool(
+                            tool_name, arguments=kwargs or {}
+                        )
+                    except Exception as retry_exc:  # noqa: BLE001
+                        msg = f"ERROR calling MCP tool {tool_name!r}: {retry_exc}"
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": tool_name,
+                                "summary": msg,
+                                "status": "error",
+                            }
+                        )
+                        return msg
+                    return _flatten_tool_result(result, qualified, emit)
         msg = f"ERROR calling MCP tool {tool_name!r}: {exc}"
         emit({"kind": "tool_result", "tool": tool_name, "summary": msg, "status": "error"})
         return msg
 
     # MCP returns structured content; flatten it to text for the model.
+    return _flatten_tool_result(result, qualified, emit)
+
+
+def _flatten_tool_result(result: Any, qualified: str, emit: Callable[[dict], None]) -> str:
+    """MCP structured content را به متن تخت تبدیل و رویداد ``tool_result`` صادر
+    می‌کند. در هر دو مسیر (موفقِ اولیه و تلاشِ دوباره پس از reconnect) یکسان
+    استفاده می‌شود تا خروجی یکسانی به مدل برسد."""
     parts: list[str] = []
     content = getattr(result, "content", None)
     if isinstance(content, list):
@@ -314,6 +378,73 @@ async def _call_mcp_tool(
     summary = "\n".join(parts)
     emit({"kind": "tool_result", "tool": qualified, "summary": summary[:500], "status": "ok"})
     return summary
+
+
+async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> bool:
+    """سشن کش‌شدهٔ یک سرور MCP را پس از بسته‌شدن اتصال دوباره وصل می‌کند.
+
+    سشن قدیمی (و پروسه‌های یتیمِ باقی‌مانده‌اش) بسته می‌شود و با همان کانفیگ یک
+    اتصال تازه برقرار می‌گردد. موفقیت را با ``True`` برمی‌گرداند. اگر سرور در
+    کش نباشد یا اتصال شکست بخورد، ``False`` برمی‌گرداند و یک هشدار صادر
+    می‌کند — فراخوانی ابزار سپس با خطای اصلی شکست می‌خورد (رفتارِ پیش از این
+    تغییر، بدون تلاشِ دوباره).
+    """
+    cached = _session_cache.get(server_name)
+    if cached is None:
+        return False
+    cfg = dict(cached.cfg)
+    h = cached.config_hash
+
+    # بستن سشن قدیمی و کشتن یتیم‌هایش (مرورگری که از سرور جان به‌در برده). از
+    # قفل سرور استفاده می‌کنیم تا دو turn هم‌زمان سشن را دوباره اسپاون نکنند.
+    async with _lock_for(server_name):
+        # ممکن است در حین انتظار یک turn دیگر همین سشن را reconnect کرده باشد.
+        current = _session_cache.get(server_name)
+        if current is not None and current.config_hash == h and current.session is not cached.session:
+            # قبلاً reconnect شده — همان سشنِ تازه را نگه می‌داریم.
+            return True
+        if current is cached:
+            with suppress(Exception):
+                await cached.stack.aclose()
+            _reap_processes(cached.cfg, protect_own=False)
+            _session_cache.pop(server_name, None)
+
+        try:
+            if cfg.get("url"):
+                stack, session, raw_tools = await _connect_http(server_name, cfg, emit)
+            else:
+                stack, session, raw_tools = await _connect_stdio(server_name, cfg, emit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[coder] MCP server {server_name!r}: reconnect failed: {exc}", flush=True)
+            emit(
+                {
+                    "kind": "warn",
+                    "content": (
+                        f"MCP server {server_name!r} could not be reconnected: {exc}. "
+                        "Its tools are unavailable this turn."
+                    ),
+                }
+            )
+            return False
+
+        if not raw_tools:
+            with suppress(Exception):
+                await stack.aclose()
+            print(f"[coder] MCP server {server_name!r}: reconnect yielded no tools", flush=True)
+            return False
+
+        _session_cache[server_name] = _CachedSession(
+            stack=stack,
+            session=session,
+            raw_tools=raw_tools,
+            config_hash=h,
+            cfg=cfg,
+        )
+        print(
+            f"[coder] MCP server {server_name!r}: reconnected ({len(raw_tools)} tool(s))",
+            flush=True,
+        )
+        return True
 
 
 def is_browser_mcp_tool(name: str) -> bool:

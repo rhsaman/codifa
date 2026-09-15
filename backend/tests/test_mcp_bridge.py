@@ -831,3 +831,101 @@ async def test_make_tool_compacts_description_and_schema():
     dumped = json.dumps(args)
     assert '"title": "T"' not in dumped
     assert "d" * 100 not in dumped
+
+
+# ---------------------------------------------------------------------------
+# باز‌کردن خودکار مرورگر وقتی اتصال بسته شده (reconnect شفاف)
+# ---------------------------------------------------------------------------
+
+
+def test_is_closed_connection_error_detects_markers():
+    """تشخیص خطاهای بسته‌شدن اتصال مرورگر/ترنسپورت."""
+    from mcp_bridge import _is_closed_connection_error
+
+    assert _is_closed_connection_error(RuntimeError("browser has been closed"))
+    assert _is_closed_connection_error(RuntimeError("Target page closed"))
+    assert _is_closed_connection_error(RuntimeError("Connection closed unexpectedly"))
+    assert _is_closed_connection_error(RuntimeError("Execution context was destroyed"))
+    # خطاهای دیگر نباید تشخیص داده شوند
+    assert not _is_closed_connection_error(RuntimeError("invalid arguments"))
+    assert not _is_closed_connection_error(ValueError("some unrelated error"))
+
+
+@pytest.mark.asyncio
+async def test_closed_browser_auto_reconnects_and_retries(monkeypatch):
+    """وقتی مرورگر بسته شده، فراخوانی ابزار باید سشن را شفاف دوباره وصل کند و
+    نتیجه را یک‌بار دیگر برگرداند — بدون اینکه مدل شکست را ببیند."""
+    tool = _fake_tool("browser_navigate", "Navigate to a URL")
+
+    # سشن اول: اولین call_tool با خطای بسته‌شدن شکست می‌خورد، دومی (پس از
+    # reconnect) موفق است. سشن دوم (تازه) همیشه موفق است.
+    session1 = _fake_session([tool])
+    session1.call_tool = AsyncMock(
+        side_effect=[
+            RuntimeError("browser has been closed"),
+            MagicMock(content=[MagicMock(text="nav-ok")], isError=False),
+        ]
+    )
+    session2 = _fake_session([tool], call_result_text="nav-ok")
+
+    connect_count = {"n": 0}
+
+    def _select_client(params):
+        connect_count["n"] += 1
+        # بار اول سشنِ بسته‌شده، بار دوم سشنِ تازه
+        return _fake_stdio_client(session1 if connect_count["n"] == 1 else session2)
+
+    def _select_session(r, w):
+        return session1 if connect_count["n"] == 1 else session2
+
+    monkeypatch.setattr("mcp_bridge.stdio_client", _select_client)
+    monkeypatch.setattr("mcp_bridge.ClientSession", _select_session)
+
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}}
+    tools, cleanup = await build_mcp_tools(servers, lambda ev: None)
+    assert len(tools) == 1
+
+    # فراخوانی باید با reconnect شفاف موفق شود
+    out = await tools[0].ainvoke({"url": "https://example.com"})
+    assert out == "nav-ok"
+    # سشن دوباره وصل شده (دو بار connect: اولیه + reconnect)
+    assert connect_count["n"] == 2
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_closed_browser_reconnect_failure_propagates_error(monkeypatch):
+    """اگر reconnect خود شکست بخورد، خطای اصلی به مدل می‌رسد (رفتارِ پیشین)."""
+    tool = _fake_tool("browser_navigate", "Navigate to a URL")
+
+    # سشن اول با خطای بسته‌شدن شکست می‌خورد؛ reconnect هم شکست می‌خورد.
+    session1 = _fake_session([tool])
+    session1.call_tool = AsyncMock(side_effect=RuntimeError("browser has been closed"))
+
+    class _BoomCM:
+        async def __aenter__(self):
+            raise RuntimeError("connection refused on reconnect")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    connect_count = {"n": 0}
+
+    def _select_client(params):
+        connect_count["n"] += 1
+        return _BoomCM() if connect_count["n"] > 1 else _fake_stdio_client(session1)
+
+    def _select_session(r, w):
+        return session1
+
+    monkeypatch.setattr("mcp_bridge.stdio_client", _select_client)
+    monkeypatch.setattr("mcp_bridge.ClientSession", _select_session)
+
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}}
+    tools, cleanup = await build_mcp_tools(servers, lambda ev: None)
+    assert len(tools) == 1
+
+    out = await tools[0].ainvoke({"url": "https://example.com"})
+    # خطای اصلی (بسته‌شدن مرورگر) به مدل می‌رسد چون reconnect ممکن نبود
+    assert "browser has been closed" in out
+    await cleanup()

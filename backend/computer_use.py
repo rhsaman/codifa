@@ -171,9 +171,12 @@ _CLIPBOARD_HELPERS = {
 _ACCESS_NOTES = {
     "Darwin": (
         "macOS requires Accessibility permission: System Settings → Privacy & "
-        "Security → Accessibility → enable this app (the Electron app, not the "
-        "terminal). Screen Recording is NOT needed for the tree, only for "
-        "screenshots."
+        "Security → Accessibility → enable the Electron app AND the Python sidecar "
+        "that actually calls the tree (when running dev via `npm run dev` "
+        "enable Terminal/iTerm + backend/.venv/bin/python; when running the "
+        "bundled app re-enable after every update). After enabling, fully quit "
+        "with ⌘Q and restart — a window close is not enough. Screen Recording "
+        "is NOT needed for the tree, only for screenshots."
     ),
     "Windows": (
         "Windows needs no setup — UI Automation is available to all processes."
@@ -190,8 +193,14 @@ _ACCESS_NOTES = {
 def _friendly_error(exc: Exception) -> str:
     """تبدیل خطاهای xa11y به پیام قابل‌فهم برای مدل."""
     name = type(exc).__name__
+    txt_lower = str(exc).lower()
     mapping = {
         "PermissionDeniedError": _ACCESS_NOTES.get(platform.system(), ""),
+        "PlatformError": (
+            _ACCESS_NOTES.get(platform.system(), "")
+            if ("permission denied" in txt_lower or "accessibility" in txt_lower)
+            else ""
+        ),
         "SelectorNotMatchedError": (
             "No element matched the selector — read the tree first "
             "(action=read_screen) and check the selector syntax. "
@@ -211,6 +220,11 @@ def _friendly_error(exc: Exception) -> str:
         "InvalidSelectorError": "Invalid selector syntax.",
     }
     hint = mapping.get(name)
+    # Fallback: any error whose MESSAGE says permission denied / accessibility
+    # (e.g. PlatformError(-1) from the Rust side, or future renames) still
+    # gets the Darwin note even if the class name changes.
+    if not hint and ("permission denied" in txt_lower or "enable accessibility" in txt_lower):
+        hint = _ACCESS_NOTES.get(platform.system(), "")
     out = f"{name}: {exc}"
     if hint:
         out += f" — {hint}"

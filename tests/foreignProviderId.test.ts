@@ -35,17 +35,19 @@ console.log('1) prefix یک provider دیگر، زیر provider اشتباه، �
   const nvidia = { id: 'nvidia' }
   check('openrouter/sonnet زیر nvidia خارجی است', isForeignModelId(nvidia, bareModel(nvidia, 'openrouter/sonnet')))
   check('opencode/gpt-5 زیر nvidia خارجی است', isForeignModelId(nvidia, bareModel(nvidia, 'opencode/gpt-5')))
-  check('google/gemini-2.0-flash زیر nvidia خارجی است', isForeignModelId(nvidia, bareModel(nvidia, 'google/gemini-2.0-flash')))
   check('cloudflare/@cf/meta/llama-3.1 زیر nvidia خارجی است', isForeignModelId(nvidia, bareModel(nvidia, 'cloudflare/@cf/meta/llama-3.1')))
+  check('anthropic/claude-3.5 زیر nvidia خارجی است', isForeignModelId(nvidia, bareModel(nvidia, 'anthropic/claude-3.5')))
 }
 
 console.log('')
-console.log('2) idهای داخلی provider حفظ می‌شوند (nvidia خودش مدل‌های "meta-llama/..." دارد):')
+console.log('2) idهای داخلی provider حفظ می‌شوند (nvidia خودش مدل‌های "meta-llama/..." و "google/gemma-*" دارد):')
 {
   const nvidia = { id: 'nvidia' }
   check('meta-llama/llama-3.1-70b-instruct داخلی nvidia است', !isForeignModelId(nvidia, bareModel(nvidia, 'meta-llama/llama-3.1-70b-instruct')))
   check('mistralai/mistral-large داخلی nvidia است', !isForeignModelId(nvidia, bareModel(nvidia, 'mistralai/mistral-large')))
   check('id بدون اسلش (bare) داخلی است', !isForeignModelId(nvidia, bareModel(nvidia, 'llama-3.1')))
+  // NIM کاتالوگ واقعی‌اش Gemma را با پیشوند google/ برمی‌گرداند — نباید فیلتر شود.
+  check('google/gemma-3-4b-it داخلی nvidia است (NIM host می‌کند)', !isForeignModelId(nvidia, bareModel(nvidia, 'google/gemma-3-4b-it')))
 }
 
 console.log('')
@@ -69,17 +71,29 @@ console.log('4) ردیف custom با نام "opencode" (id دلخواه کارب
 }
 
 console.log('')
-console.log('5) openrouter: idهایی مثل openai/gpt-4 داخلی هستند (هیچ kind شناخته‌شده‌ای prefix نیست):')
+console.log('5) openrouter: vendor-prefixهای کاتالوگ خودش داخلی‌اند، gateway-id خارجی:')
 {
   const or = { id: 'openrouter' }
   check('openai/gpt-4o داخلی openrouter است', !isForeignModelId(or, bareModel(or, 'openai/gpt-4o')))
   check('anthropic/claude-3.5-sonnet داخلی openrouter است', !isForeignModelId(or, bareModel(or, 'anthropic/claude-3.5-sonnet')))
+  check('google/gemini-3.8-flash داخلی openrouter است', !isForeignModelId(or, bareModel(or, 'google/gemini-3.8-flash')))
+  check('nvidia/nemotron-3.5-lightning داخلی openrouter است', !isForeignModelId(or, bareModel(or, 'nvidia/nemotron-3.5-lightning')))
+  check('ollama/llama3 خارجی openrouter است (gateway-id)', isForeignModelId(or, bareModel(or, 'ollama/llama3')))
   // ولی اگر یک entry عجیب مثل "opencode/foo" در openrouter باشد، خارجی است
   check('opencode/foo خارجی است (مدل متعلق به opencode)', isForeignModelId(or, bareModel(or, 'opencode/foo')))
 }
 
 console.log('')
-console.log('6) سناریوی کلیدی: p.id=local با entry doubly-prefixed "local/opencode/big-pickle":')
+console.log('6) ردیف custom با baseUrl پوینت‌شده به openrouter — پیشوند openrouter/ خود گیت‌وی داخلی است:')
+{
+  const customOr = { id: 'custom-abc', kind: 'custom', baseUrl: 'https://openrouter.ai/api/v1' }
+  check('openrouter/auto داخلی custom→openrouter است', !isForeignModelId(customOr, bareModel(customOr, 'openrouter/auto')))
+  check('anthropic/claude داخلی custom→openrouter است', !isForeignModelId(customOr, bareModel(customOr, 'anthropic/claude-3.5-sonnet')))
+  check('opencode/foo خارجی custom→openrouter است', isForeignModelId(customOr, bareModel(customOr, 'opencode/foo')))
+}
+
+console.log('')
+console.log('7) سناریوی کلیدی: p.id=local با entry doubly-prefixed "local/opencode/big-pickle":')
 {
   // recentModels migration یا یک entry قدیمی می‌تواند id را به صورت
   // doubly-prefixed در p.models باقی بگذارد. raw check روی `m` (head=local)
@@ -93,9 +107,9 @@ console.log('6) سناریوی کلیدی: p.id=local با entry doubly-prefixed
 }
 
 console.log('')
-console.log('7) FOREIGN_PROVIDER_PREFIXES همه kindهای built-in را شامل می‌شود:')
+console.log('8) FOREIGN_PROVIDER_PREFIXES همه kindهای built-in را شامل می‌شود:')
 {
-  for (const k of ['openrouter', 'google', 'nvidia', 'cloudflare', 'tokenrouter', 'ollama', 'custom', 'anthropic']) {
+  for (const k of ['openrouter', 'google', 'nvidia', 'cloudflare', 'tokenrouter', 'ollama', 'custom', 'anthropic', 'opencode']) {
     check(`kind "${k}" در مجموعه است`, FOREIGN_PROVIDER_PREFIXES.has(k))
   }
 }

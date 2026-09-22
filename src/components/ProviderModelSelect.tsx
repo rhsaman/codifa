@@ -106,6 +106,21 @@ export function ProviderModelSelect() {
   const searching = q.length > 0;
   const terms = q.split(/\s+/).filter(Boolean);
 
+  // Starting a search auto-expands every provider so matches are visible.
+  // After that first keystroke, `expanded` alone drives open/collapse —
+  // the user can collapse any provider mid-search (was forced open by
+  // `searching || expanded.has(...)` before, which made toggle a no-op).
+  const onSearchChange = (value: string) => {
+    const wasSearching = query.trim().length > 0;
+    const nowSearching = value.trim().length > 0;
+    setQuery(value);
+    if (nowSearching && !wasSearching) {
+      setExpanded(new Set(providers.map((p) => p.id)));
+    } else if (!nowSearching && wasSearching) {
+      setExpanded(new Set());
+    }
+  };
+
   // Last 10 used models, resolved to a provider (legacy bare entries are
   // attributed to the unique provider that owns the model).
   const recentList = useMemo(() => {
@@ -202,7 +217,7 @@ export function ProviderModelSelect() {
             className="pm-search"
             value={query}
             placeholder="Search models…"
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => onSearchChange(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") setOpen(false);
             }}
@@ -236,7 +251,7 @@ export function ProviderModelSelect() {
               </div>
             )}
             {filtered.map(({ p, models }) => {
-              const isOpen = searching || expanded.has(p.id);
+              const isOpen = expanded.has(p.id);
               return (
                 <div key={p.id} className={`pm-provider${isOpen ? " open" : ""}`}>
                   <div className="pm-provider-row">

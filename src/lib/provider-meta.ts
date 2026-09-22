@@ -149,10 +149,68 @@ export function providerMeta(kind: ProviderKind | undefined | null): ProviderKin
  *  This is intentionally a fixed set of built-in kind ids, NOT derived
  *  from per-user `p.id` values, because the user is free to rename their
  *  provider row ("my-openrouter"); only the kind id is authoritative.
+ *
+ *  `opencode` is included even though the kind was removed (rows migrate
+ *  to `custom`): model ids prefixed `opencode/...` still circulate in
+ *  persisted lists and must stay classifiable as a gateway identity.
  */
-export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
-  Object.keys(PROVIDER_META),
-)
+export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set([
+  ...Object.keys(PROVIDER_META),
+  'opencode',
+])
+
+/** Kinds that aggregate multi-vendor catalogs. Their wire ids are routinely
+ *  vendor-namespaced ("google/gemini-2.5-flash", "anthropic/claude-…",
+ *  "nvidia/nemotron-…") — prefixes that collide with our own kind ids but
+ *  are legitimate entries in that row's catalog, not cross-row contamination. */
+const AGGREGATOR_KINDS: ReadonlySet<string> = new Set(['openrouter', 'tokenrouter'])
+
+/** Kind ids used as VENDOR namespaces on aggregator/host wire ids. These get
+ *  the multi-vendor exemption; gateway/client identities (opencode, ollama,
+ *  custom) stay foreign even on those rows. */
+const VENDOR_NAMESPACE_KINDS: ReadonlySet<string> = new Set([
+  'google',
+  'anthropic',
+  'nvidia',
+  'cloudflare',
+])
+
+/** True when the row is (or points at) a multi-vendor aggregator, so
+ *  kind-colliding vendor prefixes in its catalog must not be filtered. */
+function isAggregatorRow(p: { id: string; kind?: string; baseUrl?: string }): boolean {
+  if (p.kind && AGGREGATOR_KINDS.has(p.kind)) return true
+  // Test mocks / legacy rows often carry the kind only in `id`.
+  if (AGGREGATOR_KINDS.has(p.id)) return true
+  // Custom rows pointed at a known aggregator gateway have the same catalog shape.
+  const base = (p.baseUrl || '').toLowerCase()
+  return base.includes('openrouter.ai') || base.includes('tokenrouter.com')
+}
+
+/** Kind-colliding prefixes this row may legitimately contain in its OWN
+ *  catalog (empty/null = none — foreign prefixes are filtered as usual).
+ *
+ *  - Aggregators (OpenRouter / TokenRouter, kind or baseUrl): every vendor
+ *    namespace above, plus their own wire prefix (custom→openrouter.ai
+ *    returns "openrouter/auto" — head !== p.id after bareModel).
+ *  - NVIDIA NIM: hosts Google Gemma as "google/gemma-*" — the same head as
+ *    the Google provider row, so "google" must stay visible here. */
+function allowedVendorPrefixes(p: {
+  id: string
+  kind?: string
+  baseUrl?: string
+}): ReadonlySet<string> {
+  if (isAggregatorRow(p)) {
+    const own = new Set<string>(VENDOR_NAMESPACE_KINDS)
+    if (p.kind && AGGREGATOR_KINDS.has(p.kind)) own.add(p.kind)
+    if (AGGREGATOR_KINDS.has(p.id)) own.add(p.id)
+    const base = (p.baseUrl || '').toLowerCase()
+    if (base.includes('openrouter.ai')) own.add('openrouter')
+    if (base.includes('tokenrouter.com')) own.add('tokenrouter')
+    return own
+  }
+  if (p.kind === 'nvidia' || p.id === 'nvidia') return new Set(['google'])
+  return new Set()
+}
 
 /** True when a BARE model id (already passed through `bareModel` so any
  *  redundant `${p.id}/` prefix is stripped) belongs to a DIFFERENT known
@@ -165,6 +223,14 @@ export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
  *    "meta-llama/llama-3.1"  → head = "meta-llama", unknown kind     → INTERNAL
  *    "local/foo"             → head = "local",   head === p.id       → INTERNAL
  *
+ *  Multi-vendor host rows keep kind-colliding prefixes that appear in their
+ *  OWN live catalogs (not cross-row leakage):
+ *    openrouter + "anthropic/claude-…" → INTERNAL (OpenRouter sells Claude)
+ *    openrouter + "google/gemini-…"    → INTERNAL
+ *    nvidia     + "google/gemma-…"     → INTERNAL (NIM hosts Gemma)
+ *    openrouter + "opencode/foo"       → FOREIGN  (gateway id, never a vendor)
+ *    nvidia     + "openrouter/sonnet"  → FOREIGN  (not in NIM's catalog)
+ *
  *  Why run on `b` (after bareModel) and not on the raw `m`? Because a
  *  stored entry may carry a doubled prefix that the raw check would miss:
  *    m = "local/google/gemini-2.5", p.id = "local"
@@ -176,10 +242,15 @@ export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set(
  *  we only flag KNOWN kind prefixes, so nvidia's own catalog entries like
  *  "meta-llama/llama-3.1-70b-instruct" (which carry a slash but no known
  *  provider prefix) are kept. */
-export function isForeignModelId(p: { id: string }, b: string): boolean {
+export function isForeignModelId(
+  p: { id: string; kind?: string; baseUrl?: string },
+  b: string,
+): boolean {
   const slash = b.indexOf('/')
   if (slash <= 0) return false
   const head = b.slice(0, slash)
   if (head === p.id) return false
-  return FOREIGN_PROVIDER_PREFIXES.has(head)
+  if (!FOREIGN_PROVIDER_PREFIXES.has(head)) return false
+  if (allowedVendorPrefixes(p).has(head)) return false
+  return true
 }

@@ -77,6 +77,15 @@ ELEMENT_ACTIONS = {
     "close",
 }
 
+# مدل‌ها اغلب برای «کلیک روی دکمه» action='click' می‌فرستند، در حالی که
+# click مال ``input`` (fallback مختصاتی) است، نه ``act`` (معنایی). به‌جای
+# خطا دادن و هدر رفتن یک رفت‌وبرگشت کامل، معادل معنایی‌اش اجرا می‌شود — دقیقاً
+# همان چیزی که از «کلیک روی یک دکمه/آیتم» انتظار می‌رود.
+ACT_DO_ALIASES: dict[str, str] = {
+    "click": "press",
+    "tap": "press",
+}
+
 # اکشن‌های مختصاتی InputSim (fallback وقتی اکشن معنایی ممکن نیست)
 INPUT_ACTIONS = {
     "click",
@@ -615,6 +624,7 @@ def find_and_act(
     """
     if not _XA11Y_AVAILABLE:
         return {"error": "xa11y is not installed."}
+    action = ACT_DO_ALIASES.get(action, action)
     if action not in ELEMENT_ACTIONS:
         return {
             "error": f"Unknown action {action!r} — use one of: "

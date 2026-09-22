@@ -5821,6 +5821,9 @@ When you need to read several files, read multiple independent files in parallel
             ``do`` is one of: press, focus, toggle, expand, collapse, select,
             show_menu, scroll_into_view, increment, decrement, set_value,
             set_numeric_value, type_text, minimize, maximize, restore, close.
+            do='click' is also accepted here as an alias for 'press' (clicking
+            a button/item IS pressing it semantically) — you do not need to
+            switch to "input" just because the instruction says "click".
             ``set_value``/``type_text`` need ``value``. For do='type_text' you
             MUST set ``app`` (keyboard events go to the focused app); prefer
             do='set_value' when the element accepts direct value writes.
@@ -5909,6 +5912,12 @@ When you need to read several files, read multiple independent files in parallel
           6. Never click a pixel you estimated from a screenshot when the same
              spot is an element in the tree — read_screen/read_element return
              ``targets`` with each element's exact logical centre.
+          7. After an action that can reveal NEW elements (show_menu, opening
+             a dropdown/combo_box/dialog/popup), call read_screen or
+             read_element on that app BEFORE reaching for "see" — native
+             menus/dropdowns are almost always menu_item/list_item nodes in
+             the tree, so the newly-revealed options can usually be acted on
+             by selector too, not just the control that opened them.
         """
         import computer_use as cu
 

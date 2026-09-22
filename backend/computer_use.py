@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import platform
 import subprocess
+import tempfile
+import threading
 import time
 from typing import Any
 
@@ -115,6 +118,11 @@ ACTIVATE_TIMEOUT_S = 2.0
 
 # حداکثر عرض تصویر (پیکسل فیزیکی) قبل از downscale برای کنترل توکن
 MAX_IMAGE_WIDTH = 1600
+
+# xa11y.screenshot از ScreenCaptureKit استفاده می‌کند و بدون رضایتِ Screen
+# Recording (یا وقتی XPC سرویس گیر کرده) برای همیشه hang می‌شود — بدون این
+# سقف، `see` هرگز برنمی‌گردد. سقف داخلی + fallback به `screencapture` CLI.
+SCREENSHOT_TIMEOUT = 12.0
 
 # نام کلیدهای نام‌دار در xa11y به شکل Pascal است ("Enter", "ArrowUp", "F5")؛
 # مدل‌ها اغلب lowercase یا نام‌های متعارف دیگر می‌فرستند. این جدول alias ها را
@@ -1118,6 +1126,167 @@ def _downscale_png(png: bytes) -> tuple[bytes, float]:
     return out.getvalue(), ratio
 
 
+def _screenshot_bounded(
+    kwargs: dict[str, Any], timeout: float = SCREENSHOT_TIMEOUT
+) -> tuple[Any | None, Exception | None]:
+    """``xa11y.screenshot`` در یک thread جدا + سقف زمانی.
+
+    SCK بدون رضایت Screen Recording hang می‌کند (thread هرگز تمام نمی‌شود)؛
+    join با سقف به caller اجازهٔ می‌دهد به fallback برود. thread daemon است
+    تا مرگ process منتظرش نماند.
+
+    Returns ``(shot, None)`` on success, ``(None, TimeoutError)`` on hang,
+    or ``(None, exc)`` when the native call raised.
+    """
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["shot"] = xa11y.screenshot(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — در همین‌جا برمی‌گردد
+            box["error"] = exc
+
+    t = threading.Thread(target=_run, daemon=True, name="xa11y-screenshot")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None, TimeoutError(
+            f"xa11y.screenshot hung for {timeout:.0f}s "
+            "(ScreenCaptureKit likely lacks Screen Recording consent)"
+        )
+    if "error" in box:
+        return None, box["error"]  # type: ignore[return-value]
+    return box.get("shot"), None
+
+
+def _desktop_logical_bounds() -> tuple[int, int, int, int] | None:
+    """Full-screen fallback: desktop bounds در فضای logical (points).
+
+    ``screencapture`` بدون ``-R`` کل صفحه در پیکسل فیزیکی می‌گیرد؛ برای
+    گزارش origin/scale درست باید اندازهٔ منطقی را داشته باشیم.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "Finder" to get bounds of window of desktop',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        parts = [p.strip().strip("{}") for p in out.stdout.strip().split(",")]
+        if len(parts) == 4:
+            x1, y1, x2, y2 = (int(float(p)) for p in parts)
+            if x2 > x1 and y2 > y1:
+                return (x1, y1, x2 - x1, y2 - y1)
+    except Exception:  # noqa: BLE001, S110 — بهترین تلاش؛ None یعنی scale=1
+        pass
+    return None
+
+
+def _capture_cli(
+    rect: tuple[int, int, int, int] | None,
+) -> dict[str, Any] | None:
+    """Fallback: ``screencapture`` CLI وقتی xa11y/ScreenCaptureKit hang کرده.
+
+    ``rect`` در فضای **logical point** (همان ``region``/bounds عنصر)؛ ``None``
+    یعنی کل صفحه. خروجی همان ساختار result را می‌دهد تا شاخهٔ ``see`` تفاوتی
+    نبیند. فقط macOS. ``annotate`` پشتیبانی نمی‌شود (کادرهای شماره‌دار کار
+    xa11y است) — caller باید legend را نادیده بگیرد.
+    """
+    if platform.system() != "Darwin":
+        return None
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            path = f.name
+        cmd = ["screencapture", "-x", "-o"]
+        if rect:
+            # -R نقاط منطقی می‌گیرد؛ PNG در پیکسل فیزیکی (رتینا ۲×) می‌آید
+            cmd.append(f"-R{rect[0]},{rect[1]},{rect[2]},{rect[3]}")
+        cmd.append(path)
+        proc = subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+        if proc.returncode != 0:
+            return None
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if not raw:
+            return None
+        png, downscale = _downscale_png(raw)
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(raw)) as img:
+                physical_w, physical_h = img.size
+        except Exception:  # noqa: BLE001 — PNG نامعتبر
+            return None
+        if rect is None:
+            rect = _desktop_logical_bounds()
+        if rect is not None:
+            origin_x, origin_y, logical_w_f, logical_h_f = (
+                rect[0],
+                rect[1],
+                float(rect[2]),
+                float(rect[3]),
+            )
+        else:
+            # desktop bounds در دسترس نبود — scale=1 فرض کن (کلیک ممکن است
+            # جابه‌جا شود ولی دست‌کم see برمی‌گردد)
+            origin_x, origin_y = 0, 0
+            logical_w_f, logical_h_f = float(physical_w), float(physical_h)
+        display_scale = (
+            physical_w / logical_w_f if logical_w_f else 1.0
+        ) or 1.0
+        sent_w = round(physical_w * downscale)
+        sent_h = round(physical_h * downscale)
+        result: dict[str, Any] = {
+            "ok": True,
+            "fallback": "screencapture",
+            "image_width": sent_w,
+            "image_height": sent_h,
+            "physical_width": physical_w,
+            "physical_height": physical_h,
+            "display_scale": round(display_scale, 6),
+            "logical_width": round(logical_w_f),
+            "logical_height": round(logical_h_f),
+            "image_scale": round(sent_w / logical_w_f, 6)
+            if logical_w_f
+            else 1.0,
+            "image_scale_x": round(sent_w / logical_w_f, 6)
+            if logical_w_f
+            else 1.0,
+            "image_scale_y": round(sent_h / logical_h_f, 6)
+            if logical_h_f
+            else 1.0,
+            "origin_x": origin_x,
+            "origin_y": origin_y,
+            "data_uri": screenshot_to_data_uri(png),
+            "note": (
+                "captured via screencapture CLI fallback "
+                "(xa11y/ScreenCaptureKit unavailable) — annotate boxes are NOT drawn"
+            ),
+            "hint": (
+                "Prefer acting by selector from the tree — never by pixel "
+                "guess. If you must click coordinates, they are LOGICAL screen "
+                "points: (origin_x + pixel_x / image_scale_x, origin_y + pixel_y / "
+                "image_scale_y). The tool also auto-converts image pixels from the "
+                "last `see` — you may pass raw pixel numbers and they will be mapped."
+            ),
+        }
+        return result
+    except Exception:  # noqa: BLE001 — fallback شکست خورد → caller تصمیم می‌گیرد
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def _normalize_region(region: Any) -> tuple[int, int, int, int]:
     """اعتبارسنجی ناحیهٔ اسکرین‌شات به ``(x, y, width, height)`` منطقی.
 
@@ -1172,6 +1341,13 @@ def capture_screenshot(
     که ``image_scale = physical_width / scale / image_width``.
     """
     if not _XA11Y_AVAILABLE:
+        # CLI fallback still works without xa11y (region/full-screen only —
+        # selector/app need the AX tree to resolve bounds).
+        if platform.system() == "Darwin" and not selector:
+            rect = _normalize_region(region) if region else None
+            cli = _capture_cli(rect)
+            if cli is not None:
+                return cli
         return {"error": "xa11y is not installed."}
     try:
         kwargs: dict[str, Any] = {}
@@ -1212,10 +1388,42 @@ def capture_screenshot(
             # قبلاً فقط button/text_field annotate می‌شد؛ بقیهٔ نقش‌های
             # تعاملی (چک‌باکس، رادیو، کمبو، منو، تب، اسلایدر، لیست‌آیتم،
             # لینک) بدون کادر می‌ماندند و مدل مجبور بود پیکسل حدس بزند —
-            # همان چیزی که کلیک را نادقیق می‌کرد. حالا از همان لیست مشترک
+            # همان چیزی که کلیک را نادقیق می‌کند. حالا از همان لیست مشترک
             # INTERACTIVE_ROLES استفاده می‌شود.
             kwargs["annotate"] = [app.locator(role) for role in INTERACTIVE_ROLES]
-        shot = xa11y.screenshot(**kwargs)
+        # Bounds را قبل از screenshot بگیر تا fallback CLI همان ناحیه را ببرد
+        # (وگرنه هنگام hang معلوم نیست چه چیزی را باید با screencapture بگیریم)
+        cli_rect: tuple[int, int, int, int] | None = None
+        if "region" in kwargs:
+            cli_rect = kwargs["region"]
+        elif "element" in kwargs:
+            try:
+                b = kwargs["element"].bounds
+                if (
+                    b is not None
+                    and getattr(b, "width", 0) > 0
+                    and getattr(b, "height", 0) > 0
+                ):
+                    cli_rect = (int(b.x), int(b.y), int(b.width), int(b.height))
+            except Exception:  # noqa: BLE001, S110 — CLI بدون rect = کل صفحه
+                pass
+
+        shot, shot_err = _screenshot_bounded(kwargs)
+        if shot is None:
+            # ScreenCaptureKit hang/fail → screencapture CLI (بدون annotate)
+            cli = _capture_cli(cli_rect)
+            if cli is not None:
+                return cli
+            if isinstance(shot_err, TimeoutError):
+                return {
+                    "error": (
+                        f"{shot_err} — grant Screen & System Audio Recording "
+                        "to this app in System Settings → Privacy & Security, "
+                        "then fully quit with ⌘Q and restart. The screencapture "
+                        "fallback also failed."
+                    )
+                }
+            raise shot_err  # type: ignore[misc] — به except پایین می‌رود
         png, downscale = _downscale_png(shot.to_png())
         # مقیاس نمایشگر (فیزیکی/منطقی). اگر xa11y نسخهٔ بدون scale داد، ۱ فرض کن.
         display_scale = float(getattr(shot, "scale", 1.0) or 1.0)

@@ -52,6 +52,9 @@ WEB_SEARCH_TIMEOUT = 15
 WEB_SEARCH_AUTO_FETCH = 3  # top-N results to actually fetch full content for, not just snippet
 WEB_SEARCH_FETCH_CHARS = 4000  # per-page cap when auto-fetched inside web_search (keeps distill input lean)
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
+# `see` screenshot: xa11y/ScreenCaptureKit can hang forever without Screen
+# Recording consent (packaged app) — outer bound so the tool always returns.
+SEE_CAPTURE_TIMEOUT = 25
 SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
 SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
 
@@ -6023,13 +6026,39 @@ When you need to read several files, read multiple independent files in parallel
                         )
                     }
                 else:
-                    shot = await asyncio.to_thread(
-                        cu.capture_screenshot,
-                        app_name=app,
-                        selector=selector,
-                        region=tuple(region) if region else None,
-                        annotate=annotate,
-                    )
+                    try:
+                        shot = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                cu.capture_screenshot,
+                                app_name=app,
+                                selector=selector,
+                                region=tuple(region) if region else None,
+                                annotate=annotate,
+                            ),
+                            timeout=SEE_CAPTURE_TIMEOUT,
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        shot = {
+                            "error": (
+                                f"screenshot capture exceeded {SEE_CAPTURE_TIMEOUT}s "
+                                "and was aborted — ScreenCaptureKit likely lacks "
+                                "Screen Recording consent. Grant Screen & System "
+                                "Audio Recording to this app in System Settings → "
+                                "Privacy & Security, then fully quit with ⌘Q and restart."
+                            )
+                        }
+                        _log_vision_error(
+                            TimeoutError(
+                                f"see: capture_screenshot exceeded "
+                                f"{SEE_CAPTURE_TIMEOUT}s (app={app!r}, "
+                                f"region={region!r})"
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        shot = {
+                            "error": f"screenshot capture failed: "
+                            f"{_log_vision_error(exc)}"
+                        }
                     if "error" in shot:
                         result = shot
                     else:
@@ -6105,10 +6134,23 @@ When you need to read several files, read multiple independent files in parallel
                                 if usage:
                                     emit(usage)
                             except Exception as exc:  # noqa: BLE001
-                                result = {
-                                    "error": f"vision analysis failed: {exc} — "
-                                    "check Settings → Tools → Vision model."
-                                }
+                                _rejected = _is_vision_image_rejection(exc)
+                                _detail = _log_vision_error(exc)
+                                if _rejected:
+                                    result = {
+                                        "error": (
+                                            f"vision model '{_vname}' rejected the "
+                                            f"image: {_detail} — it is not "
+                                            "vision-capable. Pick another model in "
+                                            "Settings → Tools → Vision model."
+                                        )
+                                    }
+                                else:
+                                    result = {
+                                        "error": f"vision analysis failed: "
+                                        f"{_detail} — check Settings → Tools → "
+                                        "Vision model."
+                                    }
                                 _output = ""
                             if "error" not in result:
                                 _output = (_output or "").strip()

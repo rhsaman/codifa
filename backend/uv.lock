@@ -547,7 +547,7 @@ requires-dist = [
     { name = "tree-sitter", specifier = ">=0.26.0" },
     { name = "tree-sitter-language-pack", specifier = ">=1.15.8" },
     { name = "uvicorn", specifier = ">=0.30.0" },
-    { name = "xa11y" },
+    { name = "xa11y", specifier = ">=0.15.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -3735,15 +3735,15 @@ wheels = [
 
 [[package]]
 name = "xa11y"
-version = "0.14.0"
+version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a7/19/6f8b7240bab4e8692f739e5a3b23396292201e7a5f477f364a698a072a00/xa11y-0.14.0.tar.gz", hash = "sha256:35b611fd4a6f131a29cb8967dd24e0fdd0931a1eaeeb5ce86c4ff899ce0804ce", size = 532700, upload-time = "2026-09-09T16:10:44.112Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f9/1c/d3b36d26b6c3e50dffd77bf2c769957729512afa2f0fc3ccff552b59aa95/xa11y-0.15.0.tar.gz", hash = "sha256:d53e25c4df8f91ac5c3df7e3337d6dd7cad751c498d432f8afac02bfd648ff2b", size = 672653, upload-time = "2026-09-19T04:09:57.49Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/7e/71cc0508d4040698336744d8f2a27a869d666592e012857bdbe6b319bc31/xa11y-0.14.0-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:9ffd5a8c266221189898a9e337b4d7dcb0f3edd0ff1ea00e701c2bbfe12bcd69", size = 1050135, upload-time = "2026-09-09T16:10:34.603Z" },
-    { url = "https://files.pythonhosted.org/packages/32/13/68f2dcc5752d569d1006152a78e713a82c81f34c7542073277cded5787c2/xa11y-0.14.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:fbf4429bbde7019cef8a80679e3a1cb75e7f111ddbf229d17cd2d5634e6606d8", size = 1032529, upload-time = "2026-09-09T16:10:36.822Z" },
-    { url = "https://files.pythonhosted.org/packages/95/c2/4feace44d7445a1fb86e454f97db4572667cee49d44c3c7efee891fb2aae/xa11y-0.14.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:def4f06061e433eeef01886ae55f968cc9b1e2ed854919555d6284704c7f18cb", size = 2780327, upload-time = "2026-09-09T16:10:38.592Z" },
-    { url = "https://files.pythonhosted.org/packages/0a/22/98ce1d5713d35312102130c00ef14ce74f2d515aac2a664ac334d111949b/xa11y-0.14.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3ad8235b46770bfc98b71467f5862f80aacafde49ed105d7e1d3ccf8e6b4b205", size = 2839020, upload-time = "2026-09-09T16:10:40.609Z" },
-    { url = "https://files.pythonhosted.org/packages/ce/7d/19b336718a3304bd9a8636d776c58ab99bc2827d8f989999c11d93128fd5/xa11y-0.14.0-cp39-abi3-win_amd64.whl", hash = "sha256:c8431b1234d88e9132270ae15b13a81550bd4ee7045f86c45ed232a68008c990", size = 900309, upload-time = "2026-09-09T16:10:42.188Z" },
+    { url = "https://files.pythonhosted.org/packages/26/7f/ca364ab64ca264762ea4fcbaf72fb89dd50bfd78f0af0f6bf94aead954bc/xa11y-0.15.0-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:89085d9197ec6cfb66320977fe17d1f0da1473a015f9bb482cc6f1821fda1a6c", size = 1183484, upload-time = "2026-09-19T04:09:49.197Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/4e/8c0f04dd9b187eaec5d66b7f65471b275742aa2888fe7b9e9d9cd7225395/xa11y-0.15.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:c5dd0d7056ca677ce0bd80719146446e2601bdeff7f07cc28cc426d600e8c31d", size = 1161259, upload-time = "2026-09-19T04:09:51.061Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/10/79053d57bae0797d4ea7cbb0127620a8823a42a7a1afdc647a9b5af7731d/xa11y-0.15.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4777b4daad46d6da72d4634db91bdad100c1af54464c16b4d1684cf098d32623", size = 2918235, upload-time = "2026-09-19T04:09:52.584Z" },
+    { url = "https://files.pythonhosted.org/packages/46/d3/ec739fadf802e71ec18c5d516655fa60aeb061040d2f5678038da4cd2ad9/xa11y-0.15.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a092463bb9c8fd0161e5008ac34e04d58fed4549399990e5d5bcc1c8c383be50", size = 2976624, upload-time = "2026-09-19T04:09:54.344Z" },
+    { url = "https://files.pythonhosted.org/packages/16/dd/f7c68f7a3b828872ae092aa5fff2493fd8bac899875601ab1b8788bf1669/xa11y-0.15.0-cp39-abi3-win_amd64.whl", hash = "sha256:6717c6d230e9b19ad8ed5ec5f41452910ff8469e5da1a18b3014b91b1b7e220f", size = 1057996, upload-time = "2026-09-19T04:09:55.81Z" },
 ]
 
 [[package]]

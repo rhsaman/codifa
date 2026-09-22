@@ -49,9 +49,17 @@ openssl pkcs12 -export $LEGACY_FLAG \
 
 security import "$TMP_DIR/codesign.p12" -k "$KEYCHAIN" -P temp1234 -T /usr/bin/codesign -A
 
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN" 2>/dev/null || true
+# partition list needs the real login password — empty string fails with
+# SecKeychainItemSetAccessWithPassword and codesign then gets errSecInternalComponent
+read -rs -p "macOS login password (for key partition list): " USER_PW
+echo
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$USER_PW" "$KEYCHAIN"
+unset USER_PW
 
-echo "✅ certificate «$CERT_NAME» ساخته و در کیچین import شد."
+# self-signed is untrusted by default → find-identity -v shows 0 and electron-builder skips it
+security add-trusted-cert -d -r trustRoot -p codeSign -k "$KEYCHAIN" "$TMP_DIR/codesign.crt"
+
+echo "✅ certificate «$CERT_NAME» ساخته، import و trust شد."
 security find-identity -v -p codesigning | grep "$CERT_NAME" || true
 echo ""
 echo "حالا می‌توانی 'npm run dist:mac' را اجرا کنی — امضا از این پس ثابت می‌ماند."

@@ -1150,6 +1150,143 @@ def test_capture_screenshot_rejects_selector_and_region(
     assert "not both" in result["error"]
 
 
+def test_screenshot_bounded_timeout(monkeypatch: pytest.MonkeyPatch):
+    """xa11y.screenshot که hang می‌کند باید بعد از سقف TimeoutError بدهد."""
+    import time as _time
+
+    mod = _make_xa11y()
+
+    def _hang(**_kw):
+        _time.sleep(60)  # به اندازهٔ sleep کوتاه‌تر از join نیست
+
+    mod.screenshot = _hang  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    shot, err = cu._screenshot_bounded({}, timeout=0.2)
+    assert shot is None
+    assert isinstance(err, TimeoutError)
+    assert "hung" in str(err)
+
+
+def test_screenshot_bounded_passes_through_exception(monkeypatch: pytest.MonkeyPatch):
+    mod = _make_xa11y()
+
+    def _boom(**_kw):
+        raise RuntimeError("screen capture failed")
+
+    mod.screenshot = _boom  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    shot, err = cu._screenshot_bounded({}, timeout=1.0)
+    assert shot is None
+    assert isinstance(err, RuntimeError)
+
+
+def test_capture_screenshot_cli_fallback_on_hang(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """hang در xa11y باید به screencapture CLI fallback برود و result برگردد."""
+    import time as _time
+
+    mod = _make_xa11y()
+
+    def _hang(**_kw):
+        _time.sleep(60)
+
+    mod.screenshot = _hang  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+
+    def _fake_cli(rect):
+        # rect باید همان region خواسته‌شده باشد
+        assert rect == (10, 20, 300, 200)
+        return {
+            "ok": True,
+            "fallback": "screencapture",
+            "image_width": 600,
+            "image_height": 400,
+            "image_scale": 2.0,
+            "logical_width": 300,
+            "logical_height": 200,
+            "origin_x": 10,
+            "origin_y": 20,
+            "data_uri": "data:image/png;base64,AA==",
+            "hint": "h",
+        }
+
+    monkeypatch.setattr(cu, "_capture_cli", _fake_cli)
+    monkeypatch.setattr(cu, "SCREENSHOT_TIMEOUT", 0.2)
+    result = cu.capture_screenshot(region=[10, 20, 300, 200])
+    assert result["ok"] is True
+    assert result["fallback"] == "screencapture"
+    assert result["origin_x"] == 10
+
+
+def test_capture_cli_result_shape(monkeypatch: pytest.MonkeyPatch):
+    """_capture_cli باید همان کلیدهای see را برگرداند."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    # PNG واقعی (۲۰۰×۱۰۰ فیزیکی) — subprocess ساختگی در فایل خروجی می‌نویسد
+    img = _Image.new("RGB", (200, 100), "red")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    captured_cmd: list[str] = []
+
+    def _fake_run(cmd, **_kw):
+        captured_cmd.extend(cmd)
+        out_path = cmd[-1]
+        with open(out_path, "wb") as fh:
+            fh.write(png_bytes)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cu.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cu.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(cu, "_desktop_logical_bounds", lambda: (0, 0, 100, 50))
+    result = cu._capture_cli((10, 20, 100, 50))
+    assert result is not None
+    assert result["ok"] is True
+    assert result["fallback"] == "screencapture"
+    # physical = PNG اندازه
+    assert result["physical_width"] == 200
+    # logical = rect
+    assert result["logical_width"] == 100
+    # display_scale = 200/100 = 2.0
+    assert result["display_scale"] == 2.0
+    assert result["origin_x"] == 10
+    assert result["data_uri"].startswith("data:image/png;base64,")
+    # -R باید با rect خواسته‌شده رفته باشد
+    assert any(c.startswith("-R10,20,100,50") for c in captured_cmd)
+
+
+def test_see_outer_capture_timeout(tool_env, monkeypatch: pytest.MonkeyPatch):
+    """اگر capture_screenshot خودش hang کند، ابزار see باید خطا برگرداند."""
+    _cbs, events, gates, permit = tool_env
+    import tools as tools_mod
+
+    cbs = tools_mod.make_tool_callbacks(
+        root=".",
+        emit=events.append,
+        vision_model=object(),
+        permission_gates=gates,
+        permit=permit,
+    )
+
+    def _hang_capture(**_kw):
+        import time as _time
+
+        _time.sleep(60)
+
+    monkeypatch.setattr(cu, "capture_screenshot", _hang_capture)
+    monkeypatch.setattr(tools_mod, "SEE_CAPTURE_TIMEOUT", 0.2)
+    result = asyncio.run(cbs["computer"](action="see", value="what?"))
+    parsed = json.loads(result)
+    assert "error" in parsed
+    assert "exceeded" in parsed["error"]
+    assert "Screen" in parsed["error"] or "Recording" in parsed["error"]
+
+
 @pytest.mark.parametrize(
     "bad",
     [

@@ -2966,6 +2966,10 @@ def make_tool_callbacks(
     # هر اپ/هر ناحیه (window/selector/region) را پوشش می‌دهد؛ بدون آن، مدل
     # باید دستی origin+pixel/scale حساب می‌کرد و روی رتینا/ downscale خطا می‌داد.
     _computer_last_shot: dict[str, Any] = {}
+    # کش یک‌-entry تحلیل see: اگر PNG + سؤال + مدل بینایی عیناً تکرار شد
+    # (مثلاً مدل دوباره وضعیت صفحه را می‌پرسد بی‌آنکه اکشنی زده باشد)،
+    # فراخوانی vision (تا چند ثانیه) رد می‌شود. تغییر پیکسل → کلید جدید.
+    _see_cache: dict[str, Any] = {"key": None, "result": None}
 
     def _convert_pixel_to_logical(x: int | None, y: int | None) -> tuple[int | None, int | None]:
         """اگر x,y داخل آخرین تصویرِ see باشد، به فضای منطقی تبدیل کن.
@@ -5906,13 +5910,19 @@ When you need to read several files, read multiple independent files in parallel
              doesn't move the user's mouse. When you must use "input", still
              pass a ``selector`` rather than coordinates.
           4. Multiple input steps (click → type → Enter) MUST go through ONE
-             "sequence" call — separate calls lose focus between steps.
-          5. Use "see" when the tree cannot answer: terminals, canvases,
-             images, video, or when a visual check is needed.
-          6. Never click a pixel you estimated from a screenshot when the same
+             "sequence" call — separate calls lose focus between steps AND
+             each separate call is a full model round-trip (hours of waste on
+             long tasks). Plan the whole flow, then fire it as one sequence.
+          5. Do NOT call "open_app" between steps on the same app —
+             input/act/sequence activate ``app`` automatically and skip
+             activation when it is already frontmost.
+          6. Use "see" only when the tree cannot answer: terminals, canvases,
+             images, video, or a visual check the tree cannot do. Each see is
+             an extra vision-model round-trip; prefer read_screen/read_element.
+          7. Never click a pixel you estimated from a screenshot when the same
              spot is an element in the tree — read_screen/read_element return
              ``targets`` with each element's exact logical centre.
-          7. After an action that can reveal NEW elements (show_menu, opening
+          8. After an action that can reveal NEW elements (show_menu, opening
              a dropdown/combo_box/dialog/popup), call read_screen or
              read_element on that app BEFORE reaching for "see" — native
              menus/dropdowns are almost always menu_item/list_item nodes in
@@ -6062,49 +6072,75 @@ When you need to read several files, read multiple independent files in parallel
                             + _annotate_hint
                         )
                         try:
-                            _output, usage = await llm_generate(
-                                _vmodel,
-                                system=_sys,
-                                user=question,
-                                images=[shot["data_uri"]],
-                                sub=True,
+                            import hashlib as _hashlib
+
+                            _see_payload = (
+                                shot["data_uri"].encode("utf-8")
+                                + b"\0"
+                                + question.encode("utf-8")
+                                + b"\0"
+                                + _vname.encode("utf-8")
+                                + (b"\1" if annotate else b"\0")
                             )
-                            if usage:
-                                emit(usage)
-                        except Exception as exc:  # noqa: BLE001
-                            result = {
-                                "error": f"vision analysis failed: {exc} — "
-                                "check Settings → Tools → Vision model."
-                            }
-                            _output = ""
-                        if "error" not in result:
-                            _output = (_output or "").strip()
-                            if not _output:
+                            _see_key = _hashlib.sha256(_see_payload).hexdigest()
+                        except Exception:  # noqa: BLE001 — کش best-effort
+                            _see_key = None
+                        _cached = (
+                            _see_cache.get("result")
+                            if _see_key and _see_cache.get("key") == _see_key
+                            else None
+                        )
+                        if _cached is not None:
+                            result = dict(_cached)
+                            result["cached"] = True
+                        else:
+                            try:
+                                _output, usage = await llm_generate(
+                                    _vmodel,
+                                    system=_sys,
+                                    user=question,
+                                    images=[shot["data_uri"]],
+                                    sub=True,
+                                )
+                                if usage:
+                                    emit(usage)
+                            except Exception as exc:  # noqa: BLE001
                                 result = {
-                                    "error": "the vision model produced no analysis."
+                                    "error": f"vision analysis failed: {exc} — "
+                                    "check Settings → Tools → Vision model."
                                 }
-                            else:
-                                result = {
-                                    "ok": True,
-                                    "analysis": _output,
-                                    # ابعاد تصویرِ واقعاً دیده‌شده توسط مدل
-                                    # بینایی + ضریب تبدیل به نقطهٔ منطقی
-                                    "image_width": shot.get("image_width"),
-                                    "image_height": shot.get("image_height"),
-                                    "image_scale": shot.get("image_scale"),
-                                    "image_scale_x": shot.get("image_scale_x", shot.get("image_scale")),
-                                    "image_scale_y": shot.get("image_scale_y", shot.get("image_scale")),
-                                    "logical_width": shot.get("logical_width"),
-                                    "logical_height": shot.get("logical_height"),
-                                    # مبدأ برش نسبت به کل صفحه (۰ برای full screen)
-                                    "origin_x": shot.get("origin_x"),
-                                    "origin_y": shot.get("origin_y"),
-                                }
-                                if shot.get("legend"):
-                                    result["legend"] = shot["legend"]
-                                if shot.get("omitted"):
-                                    result["omitted"] = shot["omitted"]
-                                result["hint"] = shot.get("hint", "")
+                                _output = ""
+                            if "error" not in result:
+                                _output = (_output or "").strip()
+                                if not _output:
+                                    result = {
+                                        "error": "the vision model produced no analysis."
+                                    }
+                                else:
+                                    result = {
+                                        "ok": True,
+                                        "analysis": _output,
+                                        # ابعاد تصویرِ واقعاً دیده‌شده توسط مدل
+                                        # بینایی + ضریب تبدیل به نقطهٔ منطقی
+                                        "image_width": shot.get("image_width"),
+                                        "image_height": shot.get("image_height"),
+                                        "image_scale": shot.get("image_scale"),
+                                        "image_scale_x": shot.get("image_scale_x", shot.get("image_scale")),
+                                        "image_scale_y": shot.get("image_scale_y", shot.get("image_scale")),
+                                        "logical_width": shot.get("logical_width"),
+                                        "logical_height": shot.get("logical_height"),
+                                        # مبدأ برش نسبت به کل صفحه (۰ برای full screen)
+                                        "origin_x": shot.get("origin_x"),
+                                        "origin_y": shot.get("origin_y"),
+                                    }
+                                    if shot.get("legend"):
+                                        result["legend"] = shot["legend"]
+                                    if shot.get("omitted"):
+                                        result["omitted"] = shot["omitted"]
+                                    result["hint"] = shot.get("hint", "")
+                                    if _see_key and "error" not in result:
+                                        _see_cache["key"] = _see_key
+                                        _see_cache["result"] = dict(result)
             elif action == "act":
                 if not selector.strip():
                     result = {"error": "act needs a selector — see read_screen output."}

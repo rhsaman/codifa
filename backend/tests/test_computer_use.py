@@ -861,12 +861,138 @@ def test_open_app_macos(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cu.platform, "system", lambda: "Darwin")
     # poll foreground mock می‌شود — در تست‌ها اپ fake در فهرست واقعی نیست
     monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
+    # میان‌بر «از قبل foreground» باید برای این تست خاموش باشد تا osascript
+    # (مسیر activate) قطعاً اجرا شود — حتی اگر Chrome واقعاً جلو باشد.
+    monkeypatch.setattr(cu, "_is_foreground_app", lambda name: False)
     result = cu.open_app("Google Chrome")
     assert result["ok"] is True
     # osascript با نام اپ درست صدا زده شود
     assert any(
         "osascript" in r[0] and "Google Chrome" in r[2] for r in runs
     )
+
+
+def test_open_app_skips_when_already_foreground(monkeypatch: pytest.MonkeyPatch):
+    """اپ از قبل جلو است → نه osascript، نه poll — بزرگ‌ترین برد سرعت."""
+    app = _FakeApp("Google Chrome")
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("subprocess must not run when app is already front")
+
+    monkeypatch.setattr(cu.subprocess, "run", _boom)
+    result = cu.open_app("Google Chrome")
+    assert result["ok"] is True
+    assert result["foreground"] is True
+    assert result["already_active"] is True
+
+
+def test_open_app_activates_when_background(monkeypatch: pytest.MonkeyPatch):
+    """اپ جلو نیست → همچنان osascript فعال می‌شود (رفتار قبل حفظ شود)."""
+    fg = _FakeApp("Notes")
+    target = _FakeApp("Google Chrome")
+    monkeypatch.setattr(
+        cu, "xa11y", _make_xa11y(apps=[fg, target]), raising=False
+    )
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    runs: list[Any] = []
+
+    def _fake_run(cmd, **kw):
+        runs.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(cu.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cu.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
+    result = cu.open_app("Google Chrome")
+    assert result["ok"] is True
+    assert any("osascript" in r[0] for r in runs)
+
+
+def test_sequence_no_double_foreground_wait(monkeypatch: pytest.MonkeyPatch):
+    """open_app خودش صبر می‌کند — sequence نباید دوباره poll کند (+۲s تلفات)."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    monkeypatch.setattr(cu.time, "sleep", lambda _s: None)
+    open_calls: list[str] = []
+    wait_calls: list[str] = []
+    monkeypatch.setattr(
+        cu,
+        "open_app",
+        lambda name: open_calls.append(name) or {"ok": True, "foreground": True},
+    )
+    monkeypatch.setattr(
+        cu,
+        "_wait_foreground",
+        lambda name, timeout=None: wait_calls.append(name) or True,
+    )
+    result = cu.run_sequence(
+        [{"kind": "press_key", "key": "o", "held": "Meta"}], app_name="Safari"
+    )
+    assert result["ok"] is True
+    assert open_calls == ["Safari"]
+    assert wait_calls == []  # poll دوم حذف شد
+
+
+def test_sequence_skips_gap_before_wait(monkeypatch: pytest.MonkeyPatch):
+    """کنارِ step «wait» gap اضافه نشود — وگذره ۱۵۰ms روی هر wait انباشته می‌شد."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    sleeps: list[float] = []
+    monkeypatch.setattr(cu.time, "sleep", sleeps.append)
+    steps = [
+        {"kind": "press_key", "key": "a"},
+        {"kind": "wait", "ms": 100},
+        {"kind": "press_key", "key": "b"},
+    ]
+    result = cu.run_sequence(steps)
+    assert result["ok"] is True
+    # فقط خودِ wait (0.1s) — نه gap قبل/بعد آن، نه gap بعد از آخرین step
+    assert sleeps == [0.1]
+
+
+def test_sequence_default_gap_between_actions(monkeypatch: pytest.MonkeyPatch):
+    """بین دو اکشن عادی هنوز gap پیش‌فرض هست (UI فرصت واکنش داشته باشد)."""
+    sim = _FakeSim()
+    mod = _make_xa11y()
+    mod.input_sim = lambda: sim  # type: ignore[attr-defined]
+    monkeypatch.setattr(cu, "xa11y", mod, raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    sleeps: list[float] = []
+    monkeypatch.setattr(cu.time, "sleep", sleeps.append)
+    result = cu.run_sequence(
+        [
+            {"kind": "press_key", "key": "a"},
+            {"kind": "press_key", "key": "b"},
+            {"kind": "press_key", "key": "c"},
+        ]
+    )
+    assert result["ok"] is True
+    gap_s = cu.SEQUENCE_DEFAULT_GAP_MS / 1000
+    assert sleeps == [gap_s, gap_s]  # بینها، نه بعد از آخرین
+
+
+def test_is_foreground_app_matches_canonical(monkeypatch: pytest.MonkeyPatch):
+    app = _FakeApp("Google Chrome")
+    monkeypatch.setattr(cu, "xa11y", _make_xa11y(apps=[app]), raising=False)
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    assert cu._is_foreground_app("chrome") is True
+    assert cu._is_foreground_app("Google Chrome") is True
+
+
+def test_is_foreground_app_false_when_other_app_front(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        cu, "xa11y", _make_xa11y(apps=[_FakeApp("Notes")]), raising=False
+    )
+    monkeypatch.setattr(cu, "_XA11Y_AVAILABLE", True)
+    assert cu._is_foreground_app("Safari") is False
 
 
 def test_read_element_subtree(monkeypatch: pytest.MonkeyPatch):
@@ -1091,6 +1217,56 @@ def test_see_forwards_region_through_tool(tool_env, monkeypatch: pytest.MonkeyPa
     assert seen["region"] == (5, 6, 100, 80)
     assert parsed["origin_x"] == 5
     assert parsed["origin_y"] == 6
+
+
+def test_see_caches_identical_vision_calls(tool_env, monkeypatch: pytest.MonkeyPatch):
+    """see تکراری روی همان PNG+سؤال نباید دوباره مدل بینایی صدا بزند."""
+    _cbs, events, gates, permit = tool_env
+    import tools as tools_mod
+
+    cbs = tools_mod.make_tool_callbacks(
+        root=".",
+        emit=events.append,
+        vision_model=object(),
+        permission_gates=gates,
+        permit=permit,
+    )
+
+    def _fake_capture(**_kw):
+        return {
+            "ok": True,
+            "data_uri": "data:image/png;base64,AA==",
+            "image_width": 100,
+            "image_height": 80,
+            "image_scale": 1.0,
+            "logical_width": 100,
+            "logical_height": 80,
+            "origin_x": 0,
+            "origin_y": 0,
+            "hint": "",
+        }
+
+    monkeypatch.setattr(cu, "capture_screenshot", _fake_capture)
+    calls = {"n": 0}
+
+    async def _generate(*_a, **_k):
+        calls["n"] += 1
+        return "screen is fine", None
+
+    import llm
+
+    monkeypatch.setattr(llm, "llm_generate", _generate)
+    first = json.loads(asyncio.run(cbs["computer"](action="see", value="q?")))
+    second = json.loads(asyncio.run(cbs["computer"](action="see", value="q?")))
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second.get("cached") is True
+    assert second["analysis"] == first["analysis"]
+    assert calls["n"] == 1  # فقط اولین بار vision رفت
+    # سؤال متفاوت → کش نباید بخورد
+    third = json.loads(asyncio.run(cbs["computer"](action="see", value="other?")))
+    assert third.get("cached") is not True
+    assert calls["n"] == 2
 
 
 def test_downscale_png_returns_ratio():

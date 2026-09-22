@@ -366,6 +366,25 @@ def _wait_foreground(app_name: str, timeout: float = ACTIVATE_TIMEOUT_S) -> bool
     return False
 
 
+def _is_foreground_app(app_name: str) -> bool:
+    """یک‌بار چک: آیا اپ همین الان foreground است؟ (بدون poll)
+
+    برای میان‌بر زدن activate در فراخوانی‌های متوالی روی یک اپ — هر
+    input/act/sequence قبلاً osascript + poll کامل اجرا می‌کرد حتی وقتی
+    اپ از قبل جلو بود (تا چند ثانیه تلف‌وقت به‌ازای هر اکشن).
+    """
+    if not _XA11Y_AVAILABLE:
+        return False
+    canonical = _canonical_app_name(app_name)
+    raw = app_name.strip()
+    try:
+        fg = xa11y.App.foreground(timeout=0.3)
+        name = str(getattr(fg, "name", "") or "")
+        return bool(name) and (_names_match(name, canonical) or _names_match(name, raw))
+    except Exception:  # noqa: BLE001 — foreground ناخوانا: activate کن
+        return False
+
+
 def _normalize_key(key: str) -> str:
     """نام کلید به امضای xa11y (Pascal برای کلیدهای نام‌دار، حرفی‌ها عیناً)."""
     raw = (key or "").strip()
@@ -712,7 +731,10 @@ def _paste_via_clipboard(sim, text: str) -> None:
         # paste یک رویداد غیرهمگام است: اپ متن را زمانِ رسیدنِ کلید
         # از کلیپ‌بورد می‌خواند. اگر زودتر restore کنیم، اپ محتوای
         # قبلی کلیپ‌بورد را می‌خواند و متن اشتباه paste می‌شود.
-        time.sleep(0.4)
+        # فقط وقتی واقعاً restore داریم (saved موفق) صبر کن — روی
+        # ویندوز/لینوکس restoreی در کار نیست و ۰.۴s هدر می‌رفت.
+        if saved is not None:
+            time.sleep(0.4)
     finally:
         if saved is not None:
             try:  # بازگردانی کلیپ‌بورد کاربر
@@ -828,9 +850,9 @@ def run_sequence(steps: list[dict[str, Any]], app_name: str = "") -> dict[str, A
             activated = open_app(app_name)
             if "error" in activated:
                 return activated
-            # فعال‌سازی ناهمگام است: تا واقعاً foreground نشده صبر کن، وگرنه
-            # اولین کلیک روی پنجرهٔ اپ قبلی می‌نشیند.
-            if not _wait_foreground(app_name):
+            # open_app خودش تا foreground واقعی صبر کرده (یا میان‌بر زده
+            # چون از قبل جلو بود) — poll دوم تا ۲ ثانیهٔ دیگر تلف می‌کرد.
+            if not activated.get("foreground", True):
                 focus_warning = (
                     f"target app {app_name!r} did not become foreground within "
                     f"{ACTIVATE_TIMEOUT_S}s — input may have gone to another app"
@@ -866,8 +888,14 @@ def run_sequence(steps: list[dict[str, Any]], app_name: str = "") -> dict[str, A
                     "error": _friendly_error(exc),
                 }
             ran += 1
+            if i >= len(steps) - 1:
+                continue
+            # کنارِ wait اضافه نکن: خودِ wait تأخیر است (gap+wait دو برابر می‌شود)
+            nxt = steps[i + 1]
+            if nxt.get("kind") == "wait":
+                continue
             gap = step.get("gap_ms", SEQUENCE_DEFAULT_GAP_MS)
-            if gap > 0 and i < len(steps) - 1:
+            if gap > 0:
                 time.sleep(gap / 1000)
         out: dict[str, Any] = {"ok": True, "ran": ran}
         if focus_warning:
@@ -888,6 +916,15 @@ def open_app(app_name: str) -> dict[str, Any]:
     """
     if not app_name.strip():
         return {"error": "open_app needs an app name."}
+    # اپ از قبل جلو است → subprocess + poll را رد کن (بزرگ‌ترین برد سرعت
+    # برای اکشن‌های متوالی روی همان اپ: act/input/sequence همگی اینجا می‌گذرند)
+    if _is_foreground_app(app_name):
+        return {
+            "ok": True,
+            "app": app_name,
+            "foreground": True,
+            "already_active": True,
+        }
     system = platform.system()
     canonical = _canonical_app_name(app_name)
     try:

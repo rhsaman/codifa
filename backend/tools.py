@@ -5191,22 +5191,16 @@ When you need to read several files, read multiple independent files in parallel
         action: str, path: str = "", reason: str = ""
     ) -> str:
         """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors come inline — never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
-        # Paths under the always-readable user data folder never need a
-        # permission prompt — grant silently with no UI card at all.
+        # Paths INSIDE the workspace root need no outside-workspace permission
+        # prompt — the agent can read, search and act there freely. Auto-grant
+        # so the UI never pops a needless dialog for in-workspace work; only
+        # genuinely OUTSIDE paths (including the user data folder — writing
+        # skills/plans there needs a real grant, since write_file/edit_file
+        # check permit["folders"], not the read-only allow_coder bypass)
+        # require the user's approval below.
         if path:
             try:
-                target = resolve_safe(root, path, allow_coder=True, permit=permit)
-                coder = os.path.realpath(user_coder_dir())
-                if target == coder or target.startswith(coder + os.sep):
-                    return (
-                        f"PERMISSION GRANTED for {path!r}. This is inside the always-readable "
-                        f"user data folder (Data path in Settings) — no permission is needed, you may proceed."
-                    )
-                # A path INSIDE the workspace root does not need an
-                # outside-workspace permission prompt — the agent can read,
-                # search and act there freely. Auto-grant so the UI never pops
-                # a needless dialog for in-workspace work; only genuinely
-                # OUTSIDE paths should require the user's approval.
+                target = resolve_safe(root, path, permit=permit)
                 ws = os.path.realpath(root)
                 if target == ws or target.startswith(ws + os.sep):
                     return (

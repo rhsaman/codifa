@@ -719,16 +719,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const saveSkill = async (name: string) => {
     const content = skillDrafts[name] ?? ''
-    const meta = skillMeta(content)
-    const newName = (meta.name || (name !== NEW_SKILL_KEY ? name : '') || 'new-skill').trim()
     if (!content.trim()) {
       setSkillsMsg('Nothing to save.')
       return
     }
+    const newName = resolveSkillName(content, name)
+    const normalized = withSkillName(content, newName)
     const res = await syncSkill({
       name: newName,
       previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
-      content,
+      content: normalized,
     })
     setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
     if (res.ok) {
@@ -736,7 +736,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       setSkillDrafts((prev) => {
         const next = { ...prev }
         if (name !== NEW_SKILL_KEY && name !== savedName) delete next[name]
-        next[savedName] = content
+        next[savedName] = normalized
         return next
       })
       setExpandedSkills((prev) => {
@@ -2198,6 +2198,45 @@ function skillMeta(raw: string): { name: string; description: string } {
   const name = /^name:\s*(.+)$/m.exec(m[1])?.[1]?.trim() ?? ''
   const description = /^description:\s*(.+)$/m.exec(m[1])?.[1]?.trim() ?? ''
   return { name, description }
+}
+
+const PLACEHOLDER_SKILL_NAMES = new Set(['new-skill', 'new_skill', 'skill', 'new skill', 'untitled'])
+
+function isPlaceholderSkillName(name: string): boolean {
+  return PLACEHOLDER_SKILL_NAMES.has(name.trim().toLowerCase())
+}
+
+/** First `# Heading` after stripping frontmatter — e.g. `# Market-Analysis`. */
+function skillTitleFallback(raw: string): string {
+  const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '')
+  const m = /^#\s+(.+)$/m.exec(body)
+  return (m?.[1] ?? '').trim()
+}
+
+/** Prefer a real frontmatter name, else the `# Title`, else the existing key. */
+function resolveSkillName(content: string, key: string): string {
+  const meta = skillMeta(content)
+  const title = skillTitleFallback(content)
+  const existing = key !== NEW_SKILL_KEY ? key : ''
+  for (const candidate of [meta.name, title, existing]) {
+    const v = (candidate ?? '').trim()
+    if (v && !isPlaceholderSkillName(v)) return v
+  }
+  return 'new-skill'
+}
+
+/** Rewrite/insert frontmatter `name:` so stored file matches the resolved name. */
+function withSkillName(raw: string, newName: string): string {
+  const m = /^---\n([\s\S]*?)\n---\n?/.exec(raw)
+  if (!m) {
+    return `---\nname: ${newName}\n---\n\n${raw.replace(/^\s+/, '')}`
+  }
+  const block = m[1]
+  const rest = raw.slice(m[0].length)
+  const nextBlock = /^name:\s*.+$/m.test(block)
+    ? block.replace(/^name:\s*.+$/m, `name: ${newName}`)
+    : `name: ${newName}\n${block}`
+  return `---\n${nextBlock}\n---\n${rest}`
 }
 
 function kvToText(kv: Record<string, string>): string {

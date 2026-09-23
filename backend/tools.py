@@ -1326,6 +1326,38 @@ def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
     )
 
 
+_PLACEHOLDER_SKILL_NAMES = frozenset(
+    {"new-skill", "new_skill", "skill", "new skill", "untitled"}
+)
+
+
+def _is_placeholder_skill_name(name: str) -> bool:
+    """True when ``name`` is a template placeholder rather than a real name."""
+    return (name or "").strip().lower() in _PLACEHOLDER_SKILL_NAMES
+
+
+def _skill_title_fallback(body: str) -> str:
+    """First ``# Heading`` in the body (e.g. ``# Market-Analysis``)."""
+    m = re.search(r"^#\s+(.+)$", body or "", re.MULTILINE)
+    return (m.group(1).strip() if m else "") or ""
+
+
+def _resolve_skill_name(parsed_name: str, body: str, fallback_name: str) -> str:
+    """Prefer a real name over template placeholders.
+
+    Order: frontmatter ``name`` → first ``# Title`` → explicit fallback.
+    When everything is empty/placeholder, keep the original value so the
+    untouched template still saves as ``new-skill``.
+    """
+    title = _skill_title_fallback(body)
+    fallback = (fallback_name or "").strip()
+    for candidate in (parsed_name, title, fallback):
+        candidate = (candidate or "").strip()
+        if candidate and not _is_placeholder_skill_name(candidate):
+            return candidate
+    return (parsed_name or title or fallback).strip()
+
+
 def persist_skill(
     raw: str,
     fallback_name: str = "",
@@ -1339,8 +1371,7 @@ def persist_skill(
     ``{"ok", "name", "slug", "path", "note"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
-    if not name:
-        name = fallback_name.strip()
+    name = _resolve_skill_name(name, body, fallback_name)
     error = _skill_name_error(name)
     if error:
         return {"ok": False, "note": error}

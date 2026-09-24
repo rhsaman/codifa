@@ -509,6 +509,7 @@ dependencies = [
     { name = "tree-sitter" },
     { name = "tree-sitter-language-pack" },
     { name = "uvicorn" },
+    { name = "websockets" },
     { name = "xa11y" },
 ]
 
@@ -547,6 +548,7 @@ requires-dist = [
     { name = "tree-sitter", specifier = ">=0.26.0" },
     { name = "tree-sitter-language-pack", specifier = ">=1.15.8" },
     { name = "uvicorn", specifier = ">=0.30.0" },
+    { name = "websockets", specifier = ">=16.1.1" },
     { name = "xa11y", specifier = ">=0.15.0" },
 ]
 

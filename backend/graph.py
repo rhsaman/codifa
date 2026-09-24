@@ -150,7 +150,7 @@ def _resume_thread_id(state: AgentState) -> str:
 
 
 async def _save_turn_checkpoint(thread_id: str, messages: list) -> None:
-    with contextlib.suppress(Exception):
+    try:
         from langgraph.checkpoint.base import empty_checkpoint
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -167,6 +167,79 @@ async def _save_turn_checkpoint(thread_id: str, messages: list) -> None:
                 {"step": 1, "source": "input", "writes": {}},
                 {"messages": "v1"},
             )
+    except Exception as exc:  # noqa: BLE001 — best-effort, but visible in the log
+        logger.warning("failed to persist resume checkpoint: %s", exc)
+
+
+# نتیجهٔ placeholder برای tool_callهایی که قبل از قطع‌شدنِ turn اجرا نشدند.
+# بدون این پوشش، provider ترنسکریپت را با خطای «tool_calls must be followed
+# by tool messages» رد می‌کند و resume از کار می‌افتد.
+_INTERRUPTED_TOOL_PLACEHOLDER = (
+    "[interrupted before running — re-issue if still needed]"
+)
+
+
+def _unanswered_tool_calls(msgs: list, calls: list) -> list:
+    """فراخوانی‌های ``calls`` که هنوز ToolMessage متناظری در ``msgs`` ندارند."""
+    answered = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
+    return [tc for tc in calls if tc.get("id") and tc.get("id") not in answered]
+
+
+async def _save_turn_checkpoint_valid(
+    thread_id: str, msgs: list, pending_calls: list = ()
+) -> None:
+    """ذخیرهٔ چک‌پوینتی که ترنسکریپتش «همیشه» برای provider معتبر است.
+
+    هر tool_call از step جاری که هنوز نتیجه‌ای ندارد با یک ToolMessageی
+    placeholder پوشانده می‌شود، تا resume هرگز با خطای «tool_calls must be
+    followed by tool messages» رد نشود و turn از همان‌جا ادامه یابد.
+    """
+    patch = [
+        ToolMessage(content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"])
+        for tc in _unanswered_tool_calls(msgs, pending_calls)
+    ]
+    await _save_turn_checkpoint(thread_id, list(msgs) + patch)
+
+
+def _sanitize_trailing_tool_calls(msgs: list) -> list:
+    """پاک‌سازی دفاعی چک‌پوینت‌های (احتمالاً خرابِ) موجود روی دیسک.
+
+    اگر آخرین AIMessage دارای tool_calls هنوز جواب‌های کاملش را ندارد،
+    برای فراخوانی‌های بی‌جواب placeholder append می‌کنیم. اگر بعد از آن
+    HumanMessageی در کار باشد (مثلاً steer)، دست نمی‌زنیم — pre-flight
+    ``strip_orphaned_tool_calls`` آن مورد را پوشش می‌دهد.
+    """
+    for m in reversed(msgs):
+        if isinstance(m, HumanMessage):
+            return msgs
+        calls = getattr(m, "tool_calls", None)
+        if isinstance(m, AIMessage) and calls:
+            patch = [
+                ToolMessage(
+                    content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"]
+                )
+                for tc in _unanswered_tool_calls(msgs, calls)
+            ]
+            return list(msgs) + patch if patch else msgs
+    return msgs
+
+
+def _append_resume_request(messages: list, request: str) -> list:
+    """افزودن پیام تازهٔ کاربر به ترنسکریپتِ resume (بدون duplicate).
+
+    موقع resume، ``messages`` کلاً با چک‌پوینت جایگزین می‌شود؛ بدون این
+    helper متن جدید کاربر («ادامه بده» یا هر دستور تازه) هرگز به مدل
+    نمی‌رسید. Retryِ همان متن قبلی duplicate نمی‌شود چون هم‌نامِ موجود است.
+    """
+    req = (request or "").strip()
+    if not req:
+        return messages
+    if any(
+        isinstance(m, HumanMessage) and str(m.content).strip() == req
+        for m in messages
+    ):
+        return messages
+    return list(messages) + [HumanMessage(content=req)]
 
 
 async def _load_turn_checkpoint(thread_id: str) -> list | None:
@@ -180,7 +253,8 @@ async def _load_turn_checkpoint(thread_id: str) -> list | None:
         if tup is None:
             return None
         return tup.checkpoint.get("channel_values", {}).get("messages")
-    except Exception:  # noqa: BLE001 — best-effort: a missing/corrupt checkpoint just means "no resume"
+    except Exception as exc:  # noqa: BLE001 — best-effort: a missing/corrupt checkpoint just means "no resume"
+        logger.warning("failed to load resume checkpoint: %s", exc)
         return None
 
 
@@ -228,13 +302,13 @@ def _parse_checkpoint_ts(ts_raw) -> float | None:
 # checkpoint from a previous model, workspace, or mode is more dangerous than
 # useful: resuming it would re-execute already-done tool calls and could
 # produce a silently broken first reply. Drop and start fresh instead.
-_RESUME_MAX_AGE_S = 30 * 60  # 30 minutes
+_RESUME_MAX_AGE_S = 120 * 60  # 2 hours
 # سیاست حد ابزار: این حد فقط «تعداد فراخوانی» را می‌شمارد، نه حجم توکن را؛
 # پنجرهٔ کانتکست را auto-compact (آستانهٔ درصدی) محافظت می‌کند. یک turn واقعی
 # coder به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد، پس حدِ پایین (مثل ۸) عملاً
 # چک‌پوینت را همیشه می‌انداخت و رزومهٔ واقعی بی‌استفاده می‌شد — همان
 # «کانتکست کم می‌شود بعد از استپ» که کاربر می‌دید.
-_RESUME_MAX_TOOL_CALLS = 25
+_RESUME_MAX_TOOL_CALLS = 40
 
 
 async def _load_turn_checkpoint_valid(
@@ -307,6 +381,11 @@ async def _load_turn_checkpoint_valid(
             await _clear_turn_checkpoint(thread_id)
             return None
 
+    # پاک‌سازی دفاعی: چک‌پوینت‌های قدیمیِ (خرابِ) روی دیسک ممکن است
+    # tool_callهای بی‌جواب داشته باشند؛ قبل از برگرداندن، placeholder
+    # می‌گیرند تا provider ترنسکریپت را رد نکند.
+    if isinstance(messages, list):
+        messages = _sanitize_trailing_tool_calls(messages)
     return messages if isinstance(messages, list) else None
 
 
@@ -2574,7 +2653,12 @@ async def _run_mode_turn(
             _resume_thread, current_mode=state.get("mode", "")
         )
         if _ckpt_msgs:
-            messages = list(_ckpt_msgs)
+            # پیام تازهٔ کاربر («ادامه بده» یا دستور جدید) باید به مدل
+            # برسد؛ بدون این، resume متن جدید را دور می‌ریخت. Retryِ همان
+            # متن قبلی duplicate نمی‌شود (dedup داخل helper).
+            messages = _append_resume_request(
+                list(_ckpt_msgs), state.get("request") or ""
+            )
             # The checkpoint already holds the full in-flight transcript
             # (prompt + tool calls + tool results). Don't also re-pull the
             # frontend history, or we'd duplicate the prompt.
@@ -3235,9 +3319,15 @@ async def _run_mode_turn(
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
             # half-finished checkpoint that orphans tool_calls on resume.
+            # The `_valid` variant patches any not-yet-run sequential call
+            # of this step with a placeholder so the saved transcript is
+            # ALWAYS provider-valid (a resume never trips the "tool_calls
+            # must be followed by tool messages" rejection).
             if _parallel:
-                await _save_turn_checkpoint(_resume_thread, msgs)
-            for tc in _sequential:
+                await _save_turn_checkpoint_valid(
+                    _resume_thread, msgs, _sequential
+                )
+            for _seq_idx, tc in enumerate(_sequential):
                 name = tc.get("name") or ""
                 args = tc.get("args") or {}
                 # The tool callback emits its own `tool` / `tool_result` events
@@ -3247,8 +3337,11 @@ async def _run_mode_turn(
                 msgs.append(
                     ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
                 )
-                # Persist this completed (mutating) tool result too.
-                await _save_turn_checkpoint(_resume_thread, msgs)
+                # Persist this completed (mutating) tool result too — the
+                # remaining sequential calls of this step get placeholders.
+                await _save_turn_checkpoint_valid(
+                    _resume_thread, msgs, _sequential[_seq_idx + 1:]
+                )
             # Emit ToolMessages for duplicate tool calls that were deduped above
             # so the LLM sees a result for every tool_call_id it originally sent.
             if _dup_ids:

@@ -34,12 +34,14 @@ from mock_openai import (
 from agents import run_agent
 from graph import (
     _RESUME_MAX_TOOL_CALLS,
+    _append_resume_request,
     _clear_turn_checkpoint,
     _load_turn_checkpoint,
     _load_turn_checkpoint_valid,
     _resume_checkpoint_path,
     _resume_thread_id,
     _save_turn_checkpoint,
+    _save_turn_checkpoint_valid,
     clear_chat_resume_checkpoint,
     prune_stale_resume_checkpoints,
 )
@@ -102,6 +104,88 @@ async def test_resume_guard_still_drops_oversized_loops():
             "چک‌پوینت ردشده باید از دیسک هم پاک شود"
     finally:
         await _clear_turn_checkpoint(tid)
+
+
+async def test_checkpoint_snapshot_patches_unanswered_sequential_calls():
+    """چک‌پوینتِ ذخیره‌شده وسط step باید همیشه برای provider معتبر باشد.
+
+    ترنسکریپتی که AIMessage با دو tool_call دارد ولی فقط اولی جواب گرفته
+    (قطع‌شدن وسط اجرای sequential) باید با placeholder برای فراخوانی دوم
+    ذخیره شود — وگرنه resume با خطای «tool_calls must be followed by tool
+    messages» رد می‌شود و کاربر از صفر شروع می‌کند.
+    """
+    tid = _resume_thread_id({"chat_id": "patch-seq"})
+    try:
+        msgs = [
+            HumanMessage(content="do it"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "grep", "args": {"pattern": "a"}, "id": "p1"},
+                    {"name": "edit_file", "args": {"path": "x"}, "id": "s1"},
+                ],
+            ),
+            ToolMessage(content="MATCHES a", tool_call_id="p1"),
+        ]
+        await _save_turn_checkpoint_valid(
+            tid, msgs, [{"name": "edit_file", "args": {"path": "x"}, "id": "s1"}]
+        )
+        loaded = await _load_turn_checkpoint(tid)
+        assert loaded is not None, "چک‌پوینت valid باید ذخیره/بارگذاری شود"
+        answered = {m.tool_call_id for m in loaded if isinstance(m, ToolMessage)}
+        assert {"p1", "s1"} <= answered, (
+            "هر دو tool_call باید ToolMessage داشته باشند (placeholder برای s1)"
+        )
+    finally:
+        await _clear_turn_checkpoint(tid)
+
+
+async def test_load_sanitizes_trailing_unanswered_tool_calls():
+    """بارگذاری باید چک‌پوینت‌های خرابِ (بدون placeholder) روی دیسک را نجات دهد.
+
+    چک‌پوینت‌های نوشته‌شده با نسخهٔ قدیمی (بدون پوشش tool_callهای بی‌جواب)
+    باید موقع load با placeholder سالم شوند تا resume کار بیفتد.
+    """
+    tid = _resume_thread_id({"chat_id": "sanitize-old"})
+    try:
+        # ذخیرهٔ خام (شبیه چک‌پوینت قدیمیِ خراب): s1 بی‌جواب مانده.
+        await _save_turn_checkpoint(
+            tid,
+            [
+                HumanMessage(content="hi"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "grep", "args": {"pattern": "b"}, "id": "s1"},
+                    ],
+                ),
+            ],
+        )
+        loaded = await _load_turn_checkpoint_valid(tid)
+        assert loaded is not None, "چک‌پوینت خراب نباید دور ریخته شود"
+        assert any(
+            isinstance(m, ToolMessage) and m.tool_call_id == "s1" for m in loaded
+        ), "بارگذاری باید برای tool_call بی‌جواب placeholder بسازد"
+    finally:
+        await _clear_turn_checkpoint(tid)
+
+
+def test_resume_appends_new_user_message():
+    """پیام تازهٔ کاربر باید به ترنسکریپت resume برسد؛ Retry duplicate نشود."""
+    base = [
+        HumanMessage(content="find foo"),
+        AIMessage(content="", tool_calls=[]),
+        ToolMessage(content="MATCHES", tool_call_id="c1"),
+    ]
+    # پیام جدید («ادامه بده») append می‌شود.
+    out = _append_resume_request(list(base), "ادامه بده")
+    assert isinstance(out[-1], HumanMessage) and out[-1].content == "ادامه بده"
+    # Retry همان متن قبلی duplicate نمی‌شود.
+    out2 = _append_resume_request(list(base), "find foo")
+    assert len(out2) == len(base), "Retry همان پیام نباید duplicate بسازد"
+    # درخواست خالی هم append نمی‌شود.
+    out3 = _append_resume_request(list(base), "   ")
+    assert len(out3) == len(base)
 
 
 def make_workspace():

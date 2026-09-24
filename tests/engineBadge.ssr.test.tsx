@@ -14,7 +14,7 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { ToolSingleRow } = await import('../src/components/ToolCallView')
+const { ToolSingleRow, ToolGroupView } = await import('../src/components/ToolCallView')
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -55,6 +55,28 @@ try {
   check('رندر شد', false, e)
 }
 check('بدون engine کلاس trace-row-engine نمایش داده نشد', !html2.includes('trace-row-engine'))
+
+console.log('4) badge پروایدر در ردیف سرچ گروهی هم نمایش داده می‌شود:')
+let groupedHtml = ''
+try {
+  groupedHtml = renderToString(
+    <ToolGroupView
+      activities={[
+        { activity: { ...activity, status: 'done' }, index: 0 },
+        {
+          activity: { tool: 'web_search', engine: 'duckduckgo', status: 'done' } as never,
+          index: 1,
+        },
+      ]}
+    />,
+  )
+  check('ردیف trace رندر شد', groupedHtml.length > 0)
+} catch (e) {
+  check('ردیف trace رندر شد', false, e)
+}
+check('هدر گروه کلاس badge پروایدر دارد', groupedHtml.includes('trace-row-engine'))
+check('هدر گروه provider تِیولی را نشان می‌دهد', groupedHtml.includes('tavily'))
+check('هدر گروه provider داک‌داک‌گو را هم نشان می‌دهد', groupedHtml.includes('duckduckgo'))
 
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)

@@ -649,6 +649,13 @@ export const ToolGroupView = memo(function ToolGroupView({
     acc[label] = (acc[label] || 0) + 1;
     return acc;
   }, {});
+  const searchEngines = [
+    ...new Set(
+      activities
+        .filter(({ activity }) => activity.tool === "web_search" && activity.engine)
+        .map(({ activity }) => activity.engine as string),
+    ),
+  ];
   // The head shows the LAST narration (Claude.ai's collapsed summary title).
   const headCaption = (() => {
     if (!captions) return undefined;
@@ -675,6 +682,11 @@ export const ToolGroupView = memo(function ToolGroupView({
             </span>
           ))}
         </span>
+        {searchEngines.map((engine) => (
+          <span key={engine} className="trace-row-engine">
+            {engine}
+          </span>
+        ))}
         {headCaption && (
           <span className="trace-head-caption" dir="auto" title={prepareContent(headCaption)}>
             {prepareContent(headCaption)}
@@ -901,6 +913,9 @@ const TraceRow = memo(function TraceRow({
           {running ? <span className="spinner" /> : "•"}
         </span>
         <span className="trace-pill">{label}</span>
+        {activity.tool === "web_search" && activity.engine && (
+          <span className="trace-row-engine">{activity.engine}</span>
+        )}
         <span className="trace-row-detail" dir="auto" title={detail ?? ""}>
           {detail}
         </span>

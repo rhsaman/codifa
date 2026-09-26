@@ -678,7 +678,7 @@ def filter_tools_for_mode(
     )
     if has_cap:
         _READ = {"grep", "glob", "read", "task"}
-        _WRITE = {"write_file", "edit_file", "confirm_action"}
+        _WRITE = {"write_file", "edit_file", "confirm_action", "git_commit"}
         _TERM = {"run_terminal"}
         denied: set[str] = set()
         if not cap.get("readFiles", False):
@@ -702,7 +702,13 @@ def filter_tools_for_mode(
                 n: fn
                 for n, fn in tools.items()
                 if n
-                not in ("write_file", "edit_file", "run_terminal", "confirm_action")
+                not in (
+                    "write_file",
+                    "edit_file",
+                    "run_terminal",
+                    "confirm_action",
+                    "git_commit",
+                )
             }
         if "run_terminal" in tools:
             tools["run_terminal"] = _agents._wrap_no_search_bypass(

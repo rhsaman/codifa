@@ -491,6 +491,100 @@ async def health() -> dict:
     return {"status": "ok", "version": "1.0.0"}
 
 
+# --- checkpoints (Undo) -------------------------------------------------- #
+# Snapshotهای محتوای قبل از هر write/edit مدل (backend/checkpoints.py).
+# فرانت‌اند لیست را برای دکمه‌ی Undo می‌گیرد و restore فایل‌ها را برمی‌گرداند.
+
+
+class CheckpointRestoreRequest(BaseModel):
+    """Restore یک checkpoint در workspace مشخص‌شده."""
+
+    root: str
+
+
+@app.get("/checkpoints/{chat_id}")
+async def checkpoints_list(chat_id: str) -> dict:
+    import checkpoints
+
+    return {"checkpoints": checkpoints.list_checkpoints(chat_id)}
+
+
+@app.post("/checkpoints/{chat_id}/{seq}/restore")
+async def checkpoints_restore(chat_id: str, seq: int, req: CheckpointRestoreRequest) -> dict:
+    import checkpoints
+    import tools
+
+    root = (req.root or "").strip()
+    if not root:
+        raise HTTPException(status_code=400, detail="missing workspace root")
+    out = checkpoints.restore(chat_id, seq, root)
+    if "error" in out:
+        raise HTTPException(status_code=404, detail=out["error"])
+    # کش خواندنِ فایل‌های restore شده را بی‌اعتبار کن تا read بعدی محتوای
+    # تازه را ببیند، نه bytes کش‌شده‌ی قبل از restore.
+    for entry in out.get("restored", []):
+        tools._invalidate_read_cache_for(entry.get("path", ""), root)
+    checkpoints.prune(chat_id)
+    return out
+
+
+# --- git ------------------------------------------------------------------- #
+# ابزارهای git برای پنل فرانت‌اند (GitPanel) — همان توابع امنِ
+# backend/git_tools.py که ابزارهای مدل هم استفاده می‌کنند.
+
+class GitRootRequest(BaseModel):
+    root: str
+
+
+class GitCommitRequest(BaseModel):
+    root: str
+    message: str
+    add_all: bool = False
+
+
+@app.get("/git/status")
+async def git_status(root: Annotated[str, Query(min_length=1)] = "") -> dict:
+    import git_tools
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    return git_tools.git_status(root)
+
+
+@app.get("/git/diff")
+async def git_diff(
+    root: Annotated[str, Query(min_length=1)] = "",
+    path: str = "",
+    staged: bool = False,
+) -> dict:
+    import git_tools
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    return git_tools.git_diff(root, path, staged)
+
+
+@app.get("/git/log")
+async def git_log(root: Annotated[str, Query(min_length=1)] = "", limit: int = 20) -> dict:
+    import git_tools
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    return git_tools.git_log(root, limit)
+
+
+@app.post("/git/commit")
+async def git_commit(req: GitCommitRequest) -> dict:
+    import git_tools
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    out = git_tools.git_commit(req.root, req.message, req.add_all)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""

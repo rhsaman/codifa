@@ -26,6 +26,8 @@ from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
+import checkpoints as _checkpoints
+import git_tools as _git
 import providers as _providers
 import state_db as _state_db
 from agent_registry import AGENTS, agent_system, agent_tools
@@ -235,6 +237,78 @@ def _parse_json_list(text: str) -> list[str]:
         for l in _lines
         if l.strip() and not l.strip().startswith(("```", "json"))
     ]
+
+
+# --- ask_user option cleaning ----------------------------------------------
+# مدل‌های ضعیف گاهی آرایهٔ options ابزار ask_user را خراب تولید می‌کنند:
+# کوتیشن‌های خام دور گزینه‌ها («"git integration"»)، تکرار یک گزینه، یا
+# چسبیدن چند گزینه داخل یک رشته با کوتیشن‌های جداکننده. پاک‌سازِ زیر
+# خروجی تمیز برای کارت سؤال می‌سازد و پاسخی که کاربر می‌زند هم متنِ
+# پاک‌شده را به مدل برمی‌گرداند.
+
+_ASK_QUOTE_PAIRS = {'"': '"', "'": "'", "«": "»", "“": "”", "„": "“", "‹": "›"}
+# سقف ضدسیل — خود ابزار ۲ تا ۵ گزینه می‌خواهد؛ بیشتر از این نشانهٔ گلیچ است.
+_ASK_MAX_OPTIONS = 8
+# حداقل کوتیشنِ داخلی برای بازکردن گزینهٔ چسبیده؛ کمتر از این، احتمالاً یک
+# عبارت کوتیشن‌دارِ عادی داخل گزینه است (مثل Use "strict" mode) و نباید بشکند.
+_ASK_GLUE_MIN_QUOTES = 3
+
+
+def _strip_outer_quotes(text: str) -> str:
+    """حذف جفت‌کوتیشن‌های متقارن دور متن — مثل "گزینه" یا «گزینه» (تودرتو هم)."""
+    out = text.strip()
+    while len(out) >= 2 and out[-1] == _ASK_QUOTE_PAIRS.get(out[0]):
+        out = out[1:-1].strip()
+    return out
+
+
+def _split_glued_option(text: str) -> list[str]:
+    """بازکردن گزینه‌های به‌هم‌چسبیده به سگمنت‌های بین کوتیشن‌ها.
+
+    وقتی مدل JSON آرگومان را خراب می‌نویسد، چند گزینه داخل «یک» رشته با
+    کوتیشن‌های جداکننده می‌آیند (مثل a"b"c"d"e). هر سگمنتِ ناصفر یک گزینهٔ
+    مجزاست؛ ویرگول/سمی‌کولِ ابتدا و انتهای سگمنت هم پاک می‌شود.
+    """
+    if text.count('"') < _ASK_GLUE_MIN_QUOTES:
+        return [text]
+    segments: list[str] = []
+    for part in text.split('"'):
+        part = part.strip().strip(",;،").strip()
+        if part:
+            segments.append(part)
+    return segments or [text]
+
+
+def _clean_ask_options(raw: Any) -> list[str]:
+    """نرمال‌سازی options ابزار ask_user به فهرست تمیز از رشته‌ها.
+
+    آیتم غیررشته‌ای (object/number/…) به رشته تبدیل می‌شود، کوتیشن‌های دورِ
+    هر گزینه حذف می‌شود، گزینه‌های چسبیده باز می‌شوند، تکراری‌ها (بدون
+    حساسیت به بزرگی/کوچکی حرف) حذف می‌شوند و سقف تعداد اعمال می‌شود.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = _parse_json_list(raw) or [raw]
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            text = item
+        elif isinstance(item, (dict, list)):
+            text = json.dumps(item, ensure_ascii=False)
+        else:
+            text = str(item)
+        for opt in _split_glued_option(_strip_outer_quotes(text)):
+            key = opt.casefold()
+            if opt and key not in seen:
+                seen.add(key)
+                cleaned.append(opt)
+    return cleaned[:_ASK_MAX_OPTIONS]
 
 
 async def _run_subagent_call(
@@ -2945,6 +3019,11 @@ def make_tool_callbacks(
     # per-chat state to disk via state_db. Previously chat_id was accepted but
     # never captured, so update_plan could only emit to the UI — never save.
     _chat_id = chat_id
+    # snapshot بازِ این turn: اولین write در turn یک checkpoint seq جدید می‌سازد
+    # و بقیه‌ی writeهای همان turn به همان seq اضافه می‌شوند (تجمیع per-turn).
+    # make_tool_callbacks به‌ازای هر turn دوباره صدا زده می‌شود، پس این state
+    # خودکار per-turn است و نیازی به reset دستی ندارد.
+    _ckpt_open: dict = {}
     # تاریخچهٔ چت از حافظه (از graph.py پاس داده می‌شه) — برای استخراج
     # mentioned_fnames/idents جهت رتبه‌بندی CODE MAP در explore. از خوندن
     # دیسک (get_state) اجتناب می‌کنیم تا event loop بلاک نشه و کل چت‌ها اسکن
@@ -3306,6 +3385,13 @@ def make_tool_callbacks(
             old = before.get("content")
         except (PathEscapeError, OSError):
             old = None
+        # Checkpoint: محتوای قبل از تغییر را snapshot کن تا Undo مطمئن ممکن باشد
+        # (best-effort — شکست checkpoint هرگز write اصلی را نمی‌شکند).
+        _ckpt_seq: int | None = None
+        if old is not None and old != content and _chat_id:
+            _ckpt_seq = _checkpoints.save_pre_edit(
+                _chat_id, root, path, old, _ckpt_open
+            )
         try:
             result = write_file(root, path, content, permit)
         except PathEscapeError as exc:
@@ -3341,6 +3427,7 @@ def make_tool_callbacks(
                     "path": path,
                     "diff": diff,
                     "summary": f"{len(content)} chars · +{adds}/-{dels}",
+                    "checkpoint": _ckpt_seq,
                 }
             )
         emit(
@@ -3746,6 +3833,12 @@ def make_tool_callbacks(
             return f"ERROR editing {path}: {result['error']}"
         old = result["old_content"]
         content = result["new_content"]
+        # Checkpoint: محتوای قبل از edit را snapshot کن (best-effort).
+        _ckpt_seq: int | None = None
+        if old != content and _chat_id:
+            _ckpt_seq = _checkpoints.save_pre_edit(
+                _chat_id, root, path, old, _ckpt_open
+            )
         diff = "".join(
             difflib.unified_diff(
                 old.splitlines(keepends=True),
@@ -3771,6 +3864,7 @@ def make_tool_callbacks(
                 "path": path,
                 "diff": diff,
                 "summary": f"+{adds}/-{dels}",
+                "checkpoint": _ckpt_seq,
             }
         )
         occ = result.get("occurrences", 1)
@@ -5352,11 +5446,12 @@ When you need to read several files, read multiple independent files in parallel
 
     async def ask_user_tool(question: str, options: list[str] | None = None) -> str:
         """Ask the user a question mid-task and WAIT for the answer instead of guessing. Use when the request is ambiguous, has conflicting instructions, or misses a detail you can't infer — and it's your FIRST action when intent is genuinely unclear. Pass 2-5 short, mutually-exclusive `options` (few words) for multiple-choice; omit/empty for free text. Order the options by YOUR OWN preference: put the option you recommend and think is best FIRST (it becomes option #1 the user sees), then the rest in decreasing preference. One clear `question`. Not for things you can find out yourself; one question per call. Returns the user's exact answer."""
+        clean_options = _clean_ask_options(options)
         emit(
             {
                 "kind": "tool",
                 "tool": "ask_user",
-                "args": {"question": question, "options": options or []},
+                "args": {"question": question, "options": clean_options},
             }
         )
         if ask_gates is None:
@@ -5366,7 +5461,7 @@ When you need to read several files, read multiple independent files in parallel
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ask_gates[aid] = fut
-        emit({"kind": "ask", "id": aid, "question": question, "options": options or []})
+        emit({"kind": "ask", "id": aid, "question": question, "options": clean_options})
         try:
             answer = await fut
         finally:
@@ -5797,6 +5892,39 @@ When you need to read several files, read multiple independent files in parallel
             }
         )
         return result
+
+    # ——— Git tools ———
+    # Narrow, argument-validated git wrappers (no shell, list-argv subprocess
+    # only — see git_tools.py). They bypass the terminal's git-write blacklist
+    # on purpose: the model can commit without shelling out, and the mode
+    # filter (graph.filter_tools_for_mode) keeps git_commit coder-only.
+    async def git_status_tool() -> str:
+        """Show the git working-tree status: current branch and every modified/staged/untracked file. Use this before committing or when the user asks what changed."""
+        result = _git.git_status(root)
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        emit({"kind": "tool_result", "tool": "git_status", "summary": text[:400], "status": "error" if "error" in result else "done"})
+        return text
+
+    async def git_diff_tool(path: str = "", staged: bool = False) -> str:
+        """Show the unified diff of the workspace's uncommitted changes (or the staged changes when `staged` is true). Optionally restrict to one `path`."""
+        result = _git.git_diff(root, path, staged)
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        emit({"kind": "tool_result", "tool": "git_diff", "summary": f"{len(result.get('diff', ''))} chars of diff", "status": "error" if "error" in result else "done"})
+        return text
+
+    async def git_commit_tool(message: str, add_all: bool = False) -> str:
+        """Commit the staged changes with `message` (required, non-empty). When `add_all` is true, stage every change first (git add -A). Returns the new commit hash. Never push."""
+        result = _git.git_commit(root, message, add_all)
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        emit({"kind": "tool_result", "tool": "git_commit", "summary": result.get("commit") or result.get("error", ""), "status": "error" if "error" in result else "done"})
+        return text
+
+    async def git_log_tool(limit: int = 20) -> str:
+        """List the most recent git commits (hash, date, subject), newest first. Use this when the user asks about commit history."""
+        result = _git.git_log(root, limit)
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        emit({"kind": "tool_result", "tool": "git_log", "summary": f"{len(result.get('commits', []))} commits", "status": "error" if "error" in result else "done"})
+        return text
 
     async def current_time_tool() -> str:
         """Return the current UTC date and time. Call this when the user asks about 'today', 'now', 'current date', 'recent', 'latest', or any time-sensitive question where you need the actual current timestamp."""
@@ -6373,6 +6501,10 @@ When you need to read several files, read multiple independent files in parallel
         "run_terminal": terminal_tool,
         "current_time": current_time_tool,
         "computer": computer_tool,
+        "git_status": git_status_tool,
+        "git_diff": git_diff_tool,
+        "git_commit": git_commit_tool,
+        "git_log": git_log_tool,
     }
     # The `vision` tool is only meaningful when a dedicated vision model is
     # configured AND this turn actually carries images — otherwise the main

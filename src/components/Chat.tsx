@@ -94,6 +94,8 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
+import { CheckpointsPanel } from "./CheckpointsPanel";
+import { GitPanel } from "./GitPanel";
 import { BalanceChip } from "./BalanceChip";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
@@ -1882,7 +1884,12 @@ export function ChatPanel() {
         const current = findMsg()?.toolActivity ?? [];
         const next = current.map((a) => {
           if (a.tool === event.tool && a.status === "running") {
-            return { ...a, diff: event.diff ?? "", summary: event.summary };
+            return {
+              ...a,
+              diff: event.diff ?? "",
+              summary: event.summary,
+              checkpoint: event.checkpoint,
+            };
           }
           return a;
         });
@@ -3373,6 +3380,8 @@ export function ChatPanel() {
           )}
         </span>
       </span>
+      <CheckpointsPanel />
+      <GitPanel />
       <BalanceChip
         providerName={
           shownBal
@@ -3451,6 +3460,7 @@ export function ChatPanel() {
                       <ToolCallView
                         key={i}
                         activity={act}
+                        chatId={chat.id}
                         onReverted={() =>
                           useStore.getState().markToolReverted(m.id, i)
                         }

@@ -981,3 +981,155 @@ export async function clearMemory(
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
+
+// --- Checkpoints (Undo) ---------------------------------------------------
+
+export interface CheckpointEntry {
+  seq: number
+  created: number
+  paths: string[]
+}
+
+export interface CheckpointRestoreResult {
+  seq: number
+  restored: { path: string; changed: boolean }[]
+  errors?: string[]
+}
+
+/** لیست snapshotهای یک chat (جدیدترین اول). */
+export async function listCheckpoints(
+  chatId: string,
+): Promise<CheckpointEntry[]> {
+  const url = await ensureSidecar()
+  if (!url || !chatId) return []
+  try {
+    const res = await fetch(`${url}/checkpoints/${encodeURIComponent(chatId)}`)
+    if (!res.ok) return []
+    const body = (await res.json()) as { checkpoints?: CheckpointEntry[] }
+    return body.checkpoints ?? []
+  } catch {
+    return []
+  }
+}
+
+/** Restore یک snapshot در workspace. خطا را به‌صورت رشته برمی‌گرداند. */
+export async function restoreCheckpoint(
+  chatId: string,
+  seq: number,
+  root: string,
+): Promise<{ ok: true; result: CheckpointRestoreResult } | { ok: false; error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { ok: false, error: "Python agent not ready" }
+  try {
+    const res = await fetch(
+      `${url}/checkpoints/${encodeURIComponent(chatId)}/${seq}/restore`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root }),
+      },
+    )
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { ok: false, error: body.detail || `restore failed (${res.status})` }
+    }
+    return { ok: true, result: (await res.json()) as CheckpointRestoreResult }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+// --- Git ---------------------------------------------------------------------
+
+export interface GitStatusEntry {
+  xy: string
+  path: string
+  st: string
+  wt: string
+}
+
+export interface GitStatus {
+  branch: string
+  entries: GitStatusEntry[]
+  error?: string
+}
+
+export interface GitDiff {
+  diff: string
+  truncated: boolean
+  error?: string
+}
+
+export interface GitCommitInfo {
+  hash: string
+  date: string
+  subject: string
+}
+
+export interface GitLog {
+  commits: GitCommitInfo[]
+  error?: string
+}
+
+export interface GitCommitResult {
+  commit: string
+  summary: string
+}
+
+async function sidecarGet<T>(path: string): Promise<T | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}${path}`)
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `request failed (${res.status})` }
+    }
+    return (await res.json()) as T
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** وضعیت working tree گیت (branch + فایل‌های تغییر یافته). */
+export async function gitStatus(root: string): Promise<GitStatus | { error: string }> {
+  return sidecarGet<GitStatus>(`/git/status?root=${encodeURIComponent(root)}`)
+}
+
+/** Diff تغییرات uncommitted (یا staged). */
+export async function gitDiff(
+  root: string,
+  path = "",
+  staged = false,
+): Promise<GitDiff | { error: string }> {
+  const q = new URLSearchParams({ root, path, staged: String(staged) })
+  return sidecarGet<GitDiff>(`/git/diff?${q.toString()}`)
+}
+
+/** تاریخچه‌ی commitها (جدیدترین اول). */
+export async function gitLog(root: string, limit = 20): Promise<GitLog | { error: string }> {
+  const q = new URLSearchParams({ root, limit: String(limit) })
+  return sidecarGet<GitLog>(`/git/log?${q.toString()}`)
+}
+
+/** Commit تغییرات staged (یا همه با add_all). */
+export async function gitCommit(
+  root: string,
+  message: string,
+  addAll = false,
+): Promise<GitCommitResult | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/git/commit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, message, add_all: addAll }),
+    })
+    const body = (await res.json().catch(() => ({}))) as Record<string, string>
+    if (!res.ok) return { error: body.detail || `commit failed (${res.status})` }
+    return body as unknown as GitCommitResult
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}

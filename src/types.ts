@@ -197,6 +197,10 @@ export interface ToolActivity {
   elapsedMs?: number
   startedAt?: number
   reverted?: boolean
+  /** شماره‌ی snapshot (checkpoint seq) پشت این کارت — backend آن را روی
+   *  eventهای diff می‌فرستد تا Undo به‌جای reverse-diff شکننده، از
+   *  snapshot مطمئن restore کند. */
+  checkpoint?: number
   /** Per-call correlation id (backend-assigned) so a tool_result resolves the
    *  exact card it belongs to even when the same tool runs many times. May
    *  be a number (LangChain auto-incremented ``call_id``) or a string
@@ -436,6 +440,9 @@ export interface SidecarEvent {
   keep?: number
   diff?: string
   path?: string
+  /** شماره‌ی snapshot (checkpoint seq) پشت این تغییر — روی eventهای diff
+   *  ارسال می‌شود تا Undo از snapshot مطمئن restore کند. */
+  checkpoint?: number
   /** Skill names attached for this turn via @mention (the 'skill' event kind). */
   skills?: string[]
   /** True when the skills were attached manually by the user (@mention). */

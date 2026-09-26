@@ -11,6 +11,7 @@ import {
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import { api } from "../lib/fs";
+import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
 import { handleLinkClick } from "../lib/link";
 import { FullscreenModal } from "./FullscreenModal";
@@ -477,7 +478,7 @@ function parseSideBySide(diff: string): DiffRow[] {
   return rows;
 }
 
-function DiffView({ diff }: { diff: string }) {
+export function DiffView({ diff }: { diff: string }) {
   const rows = parseSideBySide(diff);
   if (rows.length === 0) return null;
   const drag = useDragScroll<HTMLDivElement>();
@@ -1316,9 +1317,12 @@ export const ToolSingleRow = memo(function ToolSingleRow({
 
 export const ToolCallView = memo(function ToolCallView({
   activity,
+  chatId,
   onReverted,
 }: {
   activity: ToolActivity;
+  /** id چت فعلی — برای restore از checkpoint (snapshot) در revert. */
+  chatId?: string;
   onReverted?: () => void;
 }) {
   const [reverting, setReverting] = useState(false);
@@ -1328,6 +1332,8 @@ export const ToolCallView = memo(function ToolCallView({
   const closeFs = useFullscreen((s) => s.close);
   const fsOpen = activeKey === myKey;
   const root = useStore((s) => s.root);
+  // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
+  const activeChatId = useStore((s) => s.activeChatId);
   // Task cards (explore/general sub-agents) are collapsible and start
   // collapsed: the nested read/grep/glob sub-list is noisy, so it stays
   // hidden until clicked.
@@ -1361,9 +1367,23 @@ export const ToolCallView = memo(function ToolCallView({
   const fetchSummary = activity.tool === "fetch_url" ? activity.summary : "";
 
   const revert = async () => {
-    if (!activity.diff || !root) return;
+    if (!root) return;
     setReverting(true);
     try {
+      // مسیر ترجیحی: restore از snapshot (checkpoint) — حتی وقتی مدل بعد از
+      // این تغییر، فایل را دوباره عوض کرده باشد درست کار می‌کند. مسیر قدیمی
+      // (reverse-diff) فقط fallback کارت‌های قدیمی بدون checkpoint است.
+      // chatId از prop می‌آید و در نبودش از چت فعال store (فراخوانی از
+      // ChatMessage که chatId را ندارد).
+      const cid = chatId ?? activeChatId;
+      if (activity.checkpoint != null && cid) {
+        const res = await restoreCheckpoint(cid, activity.checkpoint, root);
+        if (res.ok) {
+          onReverted?.();
+          return;
+        }
+      }
+      if (!activity.diff) return;
       const path = String(activity.args?.path ?? activity.args?.filePath ?? "");
       const { content: current } = await api.fsRead(root, path);
       const oldContent = applyReverseDiff(activity.diff, current ?? "");

@@ -1130,13 +1130,27 @@ def write_file(root: str, path: str, content: str, permit: dict | None = None) -
         }
     if os.path.isdir(target):
         return {"path": path, "error": "path is a directory"}
+    # محتوای قبلی را قبل از بازنویسی نگه می‌داریم تا خروجی با edit_file
+    # یک قرارداد واحد داشته باشد و فرانت‌اند یک DiffView واحد بسازد.
+    old_content = ""
+    if os.path.exists(target) and not os.path.isdir(target) and _is_text_path(target):
+        try:
+            old_content, _ = _read_text(target)
+        except OSError:
+            old_content = ""
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(content)
     except OSError as exc:
         return {"path": path, "error": str(exc)}
-    return {"path": path, "ok": True}
+    return {
+        "path": path,
+        "ok": True,
+        "old_content": old_content,
+        "new_content": content,
+        "occurrences": 1,
+    }
 
 
 def user_coder_dir() -> str:
@@ -3401,10 +3415,12 @@ def make_tool_callbacks(
         if "error" in result:
             emit(_error_result("write_file", result["error"]))
             return f"ERROR writing {path}: {result['error']}"
-        if old is not None and old != content:
+        if (old or "") != content:
+            # فایل جدید (old=None) هم دیف می‌خواهد تا در DiffView/Review
+            # به‌صورت full-add نشان داده شود، نه فقط بازنویسی فایل‌های موجود.
             diff = "".join(
                 difflib.unified_diff(
-                    old.splitlines(keepends=True),
+                    (old or "").splitlines(keepends=True),
                     content.splitlines(keepends=True),
                     fromfile=path,
                     tofile=path,

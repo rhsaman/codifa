@@ -702,6 +702,13 @@ async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# تست مدل (POST /models/test): کل پرامپت کوچک باید در MODEL_TEST_TIMEOUT ثانیه
+# جواب بدهد؛ سقف کلاینت HTTP عمداً کوچک‌تر از آن است تا خطای خودِ پرووایدر
+# زودتر (و با پیام خودش) به UI برسد و سقف بیرونی فقط ترمز دستی باشد.
+MODEL_TEST_TIMEOUT = 15  # ثانیه — بودجه کل تست
+MODEL_TEST_CLIENT_TIMEOUT = 12  # ثانیه — سقف کلاینت (کوچک‌تر از بودجه کل)
+
+
 @app.post("/models/test")
 async def models_test(req: ModelTestRequest) -> dict:
     """Send a tiny one-shot completion to check a model actually works.
@@ -719,14 +726,16 @@ async def models_test(req: ModelTestRequest) -> dict:
             req.base_url,
             req.api_key,
             req.env_var,
-            timeout=25,
+            timeout=MODEL_TEST_CLIENT_TIMEOUT,
         )
         text, _usage = await asyncio.wait_for(
-            llm_complete(mo, user="Reply with the single word: OK"), timeout=30
+            llm_complete(mo, user="Reply with the single word: OK"),
+            timeout=MODEL_TEST_TIMEOUT,
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(
-            status_code=400, detail="timeout — model did not answer in 30s"
+            status_code=400,
+            detail=f"timeout — model did not answer in {MODEL_TEST_TIMEOUT}s",
         ) from exc
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

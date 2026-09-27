@@ -1,4 +1,42 @@
-import type { SidecarEvent, ToolActivity } from "../types";
+import type { DiffStats, SidecarEvent, ToolActivity } from "../types";
+
+/** شمارش +N -M را از رشته‌ی unified diff استخراج می‌کند (خطوط +++/--- نادیده گرفته می‌شوند). */
+export function diffStatsFromUnified(diff: string): DiffStats {
+  let adds = 0;
+  let dels = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) adds++;
+    else if (line.startsWith("-")) dels++;
+  }
+  return { adds, dels };
+}
+
+/**
+ * جمع +N -M سطح یک ترن را از روی فعالیت‌های edit_file/write_file حساب می‌کند
+ * (برای هدر Review به سبک کدکس). فقط ابزارهایی که در buildReviewTurn لیست
+ * می‌شوند شمرده می‌شوند تا عدد هدر با جمع فایل‌های لیست یکی باشد؛
+ * فعالیت‌های بدون diff نادیده گرفته می‌شوند.
+ */
+export function aggregateTurnStats(activities: ToolActivity[]): DiffStats {
+  let adds = 0;
+  let dels = 0;
+  const walk = (list: ToolActivity[]) => {
+    for (const a of list) {
+      if (
+        (a.tool === "edit_file" || a.tool === "write_file") &&
+        a.diff
+      ) {
+        const s = a.diffStats ?? diffStatsFromUnified(a.diff);
+        adds += s.adds;
+        dels += s.dels;
+      }
+      if (a.children) walk(a.children);
+    }
+  };
+  walk(activities);
+  return { adds, dels };
+}
 
 /**
  * Pure helpers for folding tool / sub-agent events into the `toolActivity`

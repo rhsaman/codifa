@@ -12650,3 +12650,218 @@ textarea {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* ---- Review panel (سبک کدکس) ---- */
+.review-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: 460px;
+  background: var(--bg-dark, #0d1117);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin: 4px 0;
+  direction: ltr;
+}
+
+.review-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.review-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.review-turn-select {
+  font-size: 12px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.review-counts {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.review-count-add { color: #4ade80; }
+.review-count-del { color: #f87171; }
+
+.review-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.review-icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.review-icon-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.review-close {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  line-height: 1;
+}
+
+.review-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.review-files {
+  flex: 0 0 auto;
+  max-height: 180px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.review-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+  text-align: left;
+}
+
+.review-file-row:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.review-file-row.selected {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.review-file-icon { color: var(--text-dim); }
+
+.review-file-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.review-file-counts {
+  display: flex;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.review-diff {
+  flex: 0 1 auto;
+  overflow: auto;
+}
+
+.review-empty {
+  padding: 24px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ---- دیف تک‌ستونی کدکس ---- */
+.diff-unified {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  direction: ltr;
+  overflow-x: auto;
+}
+
+.diff-u-meta {
+  padding: 4px 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
+  user-select: none;
+}
+
+.diff-u-row {
+  display: flex;
+  align-items: stretch;
+  white-space: pre;
+}
+
+.diff-u-row.diff-u-add { background: rgba(46, 160, 67, 0.15); }
+.diff-u-row.diff-u-del { background: rgba(248, 81, 73, 0.12); }
+
+/* گاتر علامت +/− با نوار رنگی کناری */
+.diff-u-gutter {
+  flex: 0 0 auto;
+  width: 20px;
+  text-align: center;
+  user-select: none;
+  color: var(--text-dim);
+  border-left: 3px solid transparent;
+  padding-left: 4px;
+}
+
+.diff-u-row.diff-u-add .diff-u-gutter {
+  color: #3fb950;
+  border-left-color: #3fb950;
+}
+
+.diff-u-row.diff-u-del .diff-u-gutter {
+  color: #f85149;
+  border-left-color: #f85149;
+}
+
+.diff-u-num {
+  flex: 0 0 auto;
+  width: 44px;
+  text-align: right;
+  padding-right: 10px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  user-select: none;
+}
+
+.diff-u-text {
+  flex: 1 1 auto;
+  padding-right: 12px;
+  color: var(--text);
+}
+
+/* هایلایت TOML به سبک کدکس */
+.toml-key { color: #ffa657; }
+.toml-eq { color: var(--text-dim); }
+.toml-string { color: #a5d6a7; }
+.toml-value { color: #79c0ff; }
+.toml-comment { color: #8b949e; font-style: italic; }

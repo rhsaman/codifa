@@ -192,12 +192,22 @@ export interface SearchResultItem {
   snippet?: string
 }
 
+export interface DiffStats { adds: number; dels: number }
+
+/** یک فایل در نمای Review به سبک کدکس: مسیر + شمارش + دیف یکپارچه. */
+export interface ReviewFile { path: string; adds: number; dels: number; diff: string }
+
+/** یک ترن در نمای Review: لیست فایل‌ها + جمع +N -M. */
+export interface ReviewTurn { id: string; files: ReviewFile[]; adds: number; dels: number }
+
 export interface ToolActivity {
   tool: string
   args?: Record<string, unknown>
   summary?: string
   status: 'running' | 'done' | 'error' | 'denied'
   diff?: string
+  /** شمارش +N -M استخراج‌شده از diff (برای هدر Review). */
+  diffStats?: DiffStats
   elapsedMs?: number
   startedAt?: number
   reverted?: boolean

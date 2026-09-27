@@ -10,6 +10,7 @@ import {
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
+import { diffStatsFromUnified } from "../lib/toolActivity";
 import { api } from "../lib/fs";
 import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
@@ -192,35 +193,6 @@ function StatusIcon({ status }: { status: ToolActivity["status"] }) {
   if (status === "error") return <IconX className="status-err" />;
   if (status === "denied") return <span className="status-denied">⏹</span>;
   return <IconCheck className="status-ok" />;
-}
-
-/** Parse unified diff into before/after line arrays for side-by-side display */
-function parseUnifiedDiff(diff: string): { before: string[]; after: string[] } {
-  const before: string[] = [];
-  const after: string[] = [];
-  for (const line of diff.split("\n")) {
-    if (
-      line.startsWith("@@") ||
-      line.startsWith("---") ||
-      line.startsWith("+++")
-    ) {
-      // hunk headers go in both
-      before.push(line);
-      after.push(line);
-    } else if (line.startsWith("-")) {
-      before.push(line.slice(1));
-      after.push("");
-    } else if (line.startsWith("+")) {
-      before.push("");
-      after.push(line.slice(1));
-    } else {
-      // context line (starts with space or no prefix)
-      const clean = line.startsWith(" ") ? line.slice(1) : line;
-      before.push(clean);
-      after.push(clean);
-    }
-  }
-  return { before, after };
 }
 
 /** Extract a clean host label (e.g. "github.com") from a URL for the
@@ -478,68 +450,80 @@ function parseSideBySide(diff: string): DiffRow[] {
   return rows;
 }
 
-export function DiffView({ diff }: { diff: string }) {
+/** هایلایت ساده‌ی TOML: کلید نارنجی، رشته زرد-سبز، کامنت خاکستری.
+ *  فقط برای فایل‌های toml اعمال می‌شود (DiffView بر اساس مسیر تصمیم می‌گیرد). */
+function TomlLine({ text }: { text: string }) {
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("#")) return <span className="toml-comment">{text}</span>;
+  const eq = text.indexOf("=");
+  if (eq < 0) return <>{text}</>;
+  const key = text.slice(0, eq).trimEnd();
+  const rest = text.slice(eq);
+  const value = rest.slice(1).trimStart();
+  const isString = value.startsWith('"') || value.startsWith("'");
+  return (
+    <>
+      <span className="toml-key">{key}</span>
+      <span className="toml-eq"> = </span>
+      <span className={isString ? "toml-string" : "toml-value"}>
+        {rest.slice(1).trimStart()}
+      </span>
+    </>
+  );
+}
+
+/** متن یک خط دیف: برای toml هایلایت‌دار، بقیه ساده. */
+function DiffLineText({ text, path }: { text: string; path?: string }) {
+  if (path && path.split("?")[0].toLowerCase().endsWith(".toml")) {
+    return <TomlLine text={text} />;
+  }
+  return <>{text}</>;
+}
+
+/** دیف تک‌ستونی به سبک کدکس — گاتر سبز برای add، قرمز برای del، شماره خط.
+ *  هر جفت delete+add (ردیف mod) به دو خط جدا (قرمز سپس سبز) باز می‌شود تا
+ *  خط حذف‌شده هم مثل کدکس دیده شود. */
+export function DiffView({ diff, path }: { diff: string; path?: string }) {
   const rows = parseSideBySide(diff);
   if (rows.length === 0) return null;
   const drag = useDragScroll<HTMLDivElement>();
+  const renderRow = (
+    key: number,
+    cls: "diff-u-add" | "diff-u-del" | "diff-u-ctx",
+    gutter: string,
+    lineNo: number,
+    text: string,
+  ) => (
+    <div key={key} className={`diff-u-row ${cls}`}>
+      <span className="diff-u-gutter">{gutter}</span>
+      <span className="diff-u-num">{lineNo >= 0 ? lineNo : ""}</span>
+      <span className="diff-u-text">
+        <DiffLineText text={text} path={path} />
+      </span>
+    </div>
+  );
   return (
-    <div className="diff-side" dir="ltr" {...drag}>
-      {/* Two INDEPENDENT columns (before | after). Each column is its own grid
-          context, so selecting text in "after" can never drag "before" along
-          (and vice-versa). Row heights stay identical (fixed line-height, one
-          line per row) so the two columns remain line-aligned. */}
-      <div className="diff-col diff-col-before">
-        <div className="diff-side-head">Before</div>
-        {rows.map((row, i) => {
-          if ("text" in row) {
-            return (
-              <div key={i} className={`diff-side-meta ${row.type}`}>
-                {row.text}
-              </div>
-            );
-          }
-          const beforeCls =
-            row.type === "same"
-              ? "diff-context"
-              : row.type === "del" || row.type === "mod"
-                ? "diff-del"
-                : "";
+    <div className="diff-unified" dir="ltr" {...drag}>
+      {rows.flatMap((row, i) => {
+        if ("text" in row) {
           return (
-            <div key={i} className={`diff-side-row ${row.type}`}>
-              <span className="diff-side-num">
-                {row.bLine >= 0 ? row.bLine : ""}
-              </span>
-              <div className={`diff-side-cell ${beforeCls}`}>{row.before}</div>
+            <div key={i} className={`diff-u-meta ${row.type}`}>
+              {row.text}
             </div>
           );
-        })}
-      </div>
-      <div className="diff-col diff-col-after">
-        <div className="diff-side-head">After</div>
-        {rows.map((row, i) => {
-          if ("text" in row) {
-            return (
-              <div key={i} className={`diff-side-meta ${row.type}`}>
-                {row.text}
-              </div>
-            );
-          }
-          const afterCls =
-            row.type === "same"
-              ? "diff-context"
-              : row.type === "add" || row.type === "mod"
-                ? "diff-add"
-                : "";
-          return (
-            <div key={i} className={`diff-side-row ${row.type}`}>
-              <span className="diff-side-num">
-                {row.aLine >= 0 ? row.aLine : ""}
-              </span>
-              <div className={`diff-side-cell ${afterCls}`}>{row.after}</div>
-            </div>
-          );
-        })}
-      </div>
+        }
+        if (row.type === "same")
+          return renderRow(i, "diff-u-ctx", " ", row.aLine, row.after);
+        if (row.type === "del")
+          return renderRow(i, "diff-u-del", "-", row.bLine, row.before);
+        if (row.type === "add")
+          return renderRow(i, "diff-u-add", "+", row.aLine, row.after);
+        // mod: خط قدیمی قرمز + خط جدید سبز، هر دو با شماره‌ی خودشان.
+        return [
+          renderRow(i * 2, "diff-u-del", "-", row.bLine, row.before),
+          renderRow(i * 2 + 1, "diff-u-add", "+", row.aLine, row.after),
+        ];
+      })}
     </div>
   );
 }
@@ -908,7 +892,7 @@ const TraceRow = memo(function TraceRow({
     >
       <button
         className="trace-row-head"
-        onClick={() => !isEdit && setExpanded((e) => !e)}
+        onClick={() => setExpanded((e) => !e)}
       >
         <span className="trace-row-bullet" aria-hidden="true">
           {running ? <span className="spinner" /> : "•"}
@@ -1167,16 +1151,12 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
 
-  /** Compute +/- stats from diff */
+  /** Compute +/- stats from diff — از مقدار ذخیره‌شده روی event در Chat.tsx
+   *  استفاده می‌کند وگرنه خودش از روی متن حساب می‌کند. */
   const diffStats = (() => {
     if (!activity.diff) return null;
-    let adds = 0,
-      dels = 0;
-    for (const line of activity.diff.split("\n")) {
-      if (line.startsWith("+") && !line.startsWith("+++")) adds++;
-      else if (line.startsWith("-") && !line.startsWith("---")) dels++;
-    }
-    return adds || dels ? `+${adds}/-${dels}` : null;
+    const s = activity.diffStats ?? diffStatsFromUnified(activity.diff);
+    return s.adds || s.dels ? `+${s.adds} -${s.dels}` : null;
   })();
 
   return (
@@ -1185,7 +1165,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     >
       <button
         className="trace-row-head"
-        onClick={() => !isEdit && setExpanded((e) => !e)}
+        onClick={() => setExpanded((e) => !e)}
       >
         <StatusIcon status={activity.status} />
         <span className="trace-pill">{label}</span>
@@ -1211,52 +1191,13 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           {isEdit && diffStats && (
             <span className="trace-row-diff-stats">{diffStats}</span>
           )}
-          {isEdit && (
-            <span
-              className="trace-row-revert"
-              role="button"
-              tabIndex={0}
-              title="Revert this change"
-              onClick={(e) => {
-                e.stopPropagation();
-              }}
-            >
-              Revert
-            </span>
-          )}
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
       </button>
       {expanded && isEdit && activity.diff ? (
         <div className="trace-row-expand edit-file-expand">
-          {(() => {
-            const { before, after } = parseUnifiedDiff(activity.diff);
-            return (
-              <div className="diff-columns">
-                <div className="diff-col">
-                  <div className="diff-col-header diff-col-before">Before</div>
-                  <pre className="diff-col-code">
-                    {before.map((l, i) => (
-                      <span key={i} className="diff-line">
-                        {l || "\u00A0"}
-                      </span>
-                    ))}
-                  </pre>
-                </div>
-                <div className="diff-col">
-                  <div className="diff-col-header diff-col-after">After</div>
-                  <pre className="diff-col-code">
-                    {after.map((l, i) => (
-                      <span key={i} className="diff-line">
-                        {l || "\u00A0"}
-                      </span>
-                    ))}
-                  </pre>
-                </div>
-              </div>
-            );
-          })()}
+          <DiffView diff={activity.diff} path={String(activity.args?.path ?? "")} />
         </div>
       ) : expanded ? (
         <div className="trace-row-expand">
@@ -1515,7 +1456,8 @@ export const ToolCallView = memo(function ToolCallView({
             const dels = (activity.diff.match(/^-[^-]/gm) || []).length;
             return adds + dels > 0 ? (
               <span className="tool-diff-stats">
-                -{dels}/+{adds}
+                <span className="review-count-add">+{adds}</span>{" "}
+                <span className="review-count-del">-{dels}</span>
               </span>
             ) : null;
           })()}
@@ -1580,7 +1522,12 @@ export const ToolCallView = memo(function ToolCallView({
             activity.items.length > 0 && (
               <WebResultLinks items={activity.items} />
             )}
-          {activity.diff && <DiffView diff={activity.diff} />}
+          {activity.diff && (
+            <DiffView
+              diff={activity.diff}
+              path={String(activity.args?.path ?? activity.args?.filePath ?? "")}
+            />
+          )}
         </div>
       )}
       {fsOpen && (
@@ -1594,7 +1541,10 @@ export const ToolCallView = memo(function ToolCallView({
           scrollable
         >
           {activity.diff ? (
-            <DiffView diff={activity.diff} />
+            <DiffView
+              diff={activity.diff}
+              path={String(activity.args?.path ?? activity.args?.filePath ?? "")}
+            />
           ) : (
             <div className="fullscreen-empty">
               No diff available for this file yet.

@@ -1223,6 +1223,23 @@ async def list_models(
                     # "reason/think" token). No model names are hardcoded here.
                     if m.get("reasoning") is None and _provider_meta(provider).get("auto_think"):
                         m["reasoning"] = True
+                    # Custom multi-vendor gateways (e.g. 9router) aggregate
+                    # several upstream vendors under one base URL. Their
+                    # /models payload rarely carries a reasoning flag and
+                    # models.dev doesn't know their ids, so the flag stays
+                    # None and the UI hides the thinking picker. When the
+                    # catalog itself shows a multi-vendor shape (ids with
+                    # vendor prefixes like "nvidia/…", "groq/…"), treat the
+                    # row as reasoning-capable — the gateway negotiates the
+                    # effort with the upstream model, same as auto_think
+                    # gateways. Single-vendor local servers (llama.cpp,
+                    # LM Studio) keep the conservative None default.
+                    if (
+                        m.get("reasoning") is None
+                        and provider == "custom"
+                        and _is_multi_vendor_catalog(models)
+                    ):
+                        m["reasoning"] = True
                 if _provider_meta(provider).get("model_class") == "google":
                     # Google's own REST catalog is the authoritative source for
                     # context (inputTokenLimit) / output (outputTokenLimit) —
@@ -1258,6 +1275,26 @@ async def list_models(
 
     _model_cache[cache_key] = (time.monotonic(), models)
     return models
+
+
+def _is_multi_vendor_catalog(models: list[dict]) -> bool:
+    """True when the model list shows a multi-vendor aggregator shape.
+
+    A custom gateway that aggregates several upstream vendors (e.g. 9router)
+    exposes ids with vendor prefixes like "nvidia/…", "groq/…", "gemini/…".
+    A single-vendor local server (llama.cpp, LM Studio) exposes bare ids like
+    "llama3" or "qwen2.5". We detect the aggregator shape by counting how
+    many distinct vendor prefixes appear in the catalog — two or more means
+    multi-vendor. No hardcoded vendor names: any prefix before the first
+    slash counts.
+    """
+    prefixes = set()
+    for m in models:
+        mid = m.get("id", "")
+        slash = mid.find("/")
+        if slash > 0:
+            prefixes.add(mid[:slash])
+    return len(prefixes) >= 2
 
 
 def _looks_local(provider: str, base_url: str) -> bool:

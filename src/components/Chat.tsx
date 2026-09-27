@@ -13,6 +13,7 @@ import { api } from "../lib/fs";
 import { resetStreamForRetry, isKeepTextRetry } from "../lib/retry";
 import {
   applyToolEvent,
+  diffStatsFromUnified,
   makeToolActivity,
   resolveStuckActivities,
   resolveToolResult,
@@ -1884,11 +1885,26 @@ export function ChatPanel() {
       } else if (event.kind === "diff") {
         clearTransientRetry();
         const current = findMsg()?.toolActivity ?? [];
+        // تطبیق ایونت diff با کارت ابزار: وقتی دو edit_file/write_file همزمان
+        // running هستند، تطبیقِ فقط بر اساس نام ابزار، دیف را به هر دو کارت
+        // می‌چسباند. بک‌اند path را می‌فرستد؛ پس اول بر اساس path مچ می‌کنیم و
+        // اگر هیچ کارتی مچ نشد (مثلاً استریم mid-turn ریکانکت شده)، به تطبیق
+        // قدیمیِ tool+running برمی‌گردیم.
+        const pathOf = (a: ToolActivity) =>
+          String(a.args?.path ?? a.args?.filePath ?? "");
+        const hasPath = typeof event.path === "string" && event.path !== "";
+        const isTarget = (a: ToolActivity) =>
+          a.tool === event.tool &&
+          a.status === "running" &&
+          (!hasPath || pathOf(a) === event.path);
+        const anyPathMatch = current.some(isTarget);
         const next = current.map((a) => {
-          if (a.tool === event.tool && a.status === "running") {
+          if (isTarget(a) || (hasPath && !anyPathMatch && a.tool === event.tool && a.status === "running")) {
+            const diff = event.diff ?? "";
             return {
               ...a,
-              diff: event.diff ?? "",
+              diff,
+              diffStats: diffStatsFromUnified(diff),
               summary: event.summary,
               checkpoint: event.checkpoint,
             };

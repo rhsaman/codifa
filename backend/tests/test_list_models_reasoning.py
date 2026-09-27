@@ -70,9 +70,38 @@ async def test_auto_think_provider_explicit_true_is_respected():
     assert models[0]["reasoning"] is True
 
 
+async def test_custom_multi_vendor_gateway_unknown_model_is_reasoning():
+    """Custom gateway with multi-vendor catalog (e.g. 9router) → True."""
+    _model_cache.clear()
+    client = _make_client({"data": [
+        {"id": "nvidia/llama-3.1-70b"},
+        {"id": "groq/llama-3.3-70b"},
+        {"id": "gemini/gemini-2.5-flash"},
+    ]})
+    with mock.patch("providers.httpx.AsyncClient", return_value=client), \
+         mock.patch("providers._models_dev_catalog", return_value=_empty_catalog()):
+        models = await list_models("custom", "http://localhost:20128/v1", "key")
+    assert all(m["reasoning"] is True for m in models)
+
+
+async def test_custom_single_vendor_local_server_stays_none():
+    """Custom local server with bare ids (llama.cpp) → None (conservative)."""
+    _model_cache.clear()
+    client = _make_client({"data": [
+        {"id": "llama3"},
+        {"id": "qwen2.5"},
+    ]})
+    with mock.patch("providers.httpx.AsyncClient", return_value=client), \
+         mock.patch("providers._models_dev_catalog", return_value=_empty_catalog()):
+        models = await list_models("custom", "http://localhost:8080/v1", "key")
+    assert all(m["reasoning"] is None for m in models)
+
+
 if __name__ == "__main__":
     asyncio.run(test_auto_think_provider_unknown_model_is_reasoning())
     asyncio.run(test_auto_think_provider_explicit_false_is_respected())
     asyncio.run(test_non_auto_think_provider_unknown_model_is_none())
     asyncio.run(test_auto_think_provider_explicit_true_is_respected())
+    asyncio.run(test_custom_multi_vendor_gateway_unknown_model_is_reasoning())
+    asyncio.run(test_custom_single_vendor_local_server_stays_none())
     print("✅ همه تست‌های list_models reasoning پاس شدند")

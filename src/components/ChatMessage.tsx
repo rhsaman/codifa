@@ -11,6 +11,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js";
 import type { ChatMessage, ToolActivity } from "../types";
+import { ReviewPanel, buildReviewTurn } from "./ReviewPanel";
 import {
   detectDir,
   fixZwsp,
@@ -1326,9 +1327,20 @@ export const ChatMessageView = memo(function ChatMessageView({
   // Reading mode: only assistant replies with ≥2 headed sections get the
   // "مطالعه" button — short answers don't need a two-pane viewer.
   const [reading, setReading] = useState(false);
+  const [reviewDismissed, setReviewDismissed] = useState(false);
   const sections = useMemo(
     () => (!isUser && !isSummary ? splitSections(message.content) : []),
     [message.content, isUser, isSummary],
+  );
+
+  // پنل Review به سبک کدکس — فقط برای پیام‌های assistant که دست‌کم یک
+  // edit_file/write_file با diff دارند. با بستن، برای همان پیام پنهان می‌ماند.
+  const reviewTurn = useMemo(
+    () =>
+      !isUser && !reviewDismissed && message.toolActivity
+        ? buildReviewTurn(message.id, message.toolActivity)
+        : null,
+    [isUser, reviewDismissed, message.id, message.toolActivity],
   );
 
   // Mode-switch notices exist so the model knows which mode the next message
@@ -1612,6 +1624,10 @@ export const ChatMessageView = memo(function ChatMessageView({
 
       {reading && (
         <ReadingMode message={message} onClose={() => setReading(false)} />
+      )}
+
+      {!isUser && reviewTurn && (
+        <ReviewPanel turn={reviewTurn} onClose={() => setReviewDismissed(true)} />
       )}
     </div>
   );

@@ -125,5 +125,11 @@
       ],
       "category": "Development"
     }
+  },
+  "allowScripts": {
+    "electron@31.7.7": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.21.5": true,
+    "fsevents@2.3.3": true
   }
 }

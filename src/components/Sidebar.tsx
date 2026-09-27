@@ -695,6 +695,23 @@ export function Sidebar() {
                           Color
                         </button>
                         <button
+                          className="ws-menu-btn"
+                          role="menuitem"
+                          title={g.root || "No folder set"}
+                          onClick={() => {
+                            setWsMenuOpenKey(null);
+                            void api.selectFolder().then((dir) => {
+                              if (dir) useStore.getState().moveWorkspace(g.key, dir);
+                            });
+                          }}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                            <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
+                          </svg>
+                          Change folder…
+                        </button>
+                        <button
                           className="ws-menu-btn danger"
                           role="menuitem"
                           onClick={(e) => {

@@ -514,6 +514,9 @@ interface State {
   deleteWorkspace: (key: string) => void
   setWorkspaceColor: (key: string, color: string) => void
   renameWorkspace: (key: string, label: string) => void
+  /** تغییر مسیر (root) یک ورک‌اسپیس: کلید جدید از مسیر جدید ساخته می‌شود و
+   *  همه چت‌ها، پین و رنگ به کلید جدید منتقل می‌شوند. کلید جدید را برمی‌گرداند. */
+  moveWorkspace: (key: string, root: string) => string
   togglePinWorkspace: (key: string) => void
   togglePinChat: (id: string) => void
   setActiveChat: (id: string) => void
@@ -1586,6 +1589,75 @@ export const useStore = create<State>((set, get) => ({
       ),
     }))
     get().persist()
+  },
+
+  moveWorkspace: (key, root) => {
+    const trimmed = (root ?? '').trim()
+    // نرمال‌سازی اسلش انتهایی تا «/b/» همان «/b» حساب شود و کلید تکراری نسازد.
+    const nextRoot = trimmed.length > 1 ? trimmed.replace(/[\\/]+$/, '') : trimmed
+    const nextKey = workspaceKey(nextRoot)
+    const prev = get().workspaces.find((w) => w.key === key)
+    const prevRoot = prev?.root ?? get().chats.find((c) => workspaceKey(c.root ?? '') === key)?.root ?? ''
+    // مسیر یکسان (فقط تفاوت اسلش انتهایی) → فقط root را نرمال کن.
+    if (nextKey === key) {
+      set((s) => ({
+        workspaces: s.workspaces.map((w) =>
+          w.key === key ? { ...w, root: nextRoot || null } : w,
+        ),
+        chats: s.chats.map((c) =>
+          workspaceKey(c.root ?? '') === key
+            ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() }
+            : c,
+        ),
+        root: s.root === prevRoot ? nextRoot : s.root,
+      }))
+      get().persist()
+      return key
+    }
+    // ورک‌اسپیس مبدأ ناشناخته → مثل ساخت جدید رفتار کن تا گم نشود.
+    if (!prev && get().chats.every((c) => workspaceKey(c.root ?? '') !== key)) {
+      get().createWorkspace(nextRoot)
+      return nextKey
+    }
+    set((s) => {
+      const targetExists = s.workspaces.some((w) => w.key === nextKey)
+      // لیبل: اگه کاربر اسم سفارشی گذاشته بود حفظش کن، وگرنه از پوشه جدید بساز.
+      const prevLabel = prev?.label ?? workspaceLabel(prevRoot)
+      const label =
+        prev && prevLabel !== workspaceLabel(prevRoot)
+          ? prevLabel
+          : workspaceLabel(nextRoot)
+      let workspaces: Workspace[]
+      if (targetExists) {
+        // ادغام در ورک‌اسپیس مقصدِ موجود: مبدأ حذف، مقصد سر جایش می‌ماند.
+        workspaces = s.workspaces
+          .filter((w) => w.key !== key)
+          .map((w) => (w.key === nextKey ? { ...w, root: nextRoot || null } : w))
+      } else {
+        workspaces = s.workspaces.map((w) =>
+          w.key === key ? { ...w, key: nextKey, root: nextRoot || null, label } : w,
+        )
+      }
+      const workspaceColors = { ...s.workspaceColors }
+      if (workspaceColors[key] !== undefined && workspaceColors[nextKey] === undefined) {
+        workspaceColors[nextKey] = workspaceColors[key]
+      }
+      delete workspaceColors[key]
+      return {
+        workspaces,
+        chats: s.chats.map((c) =>
+          workspaceKey(c.root ?? '') === key
+            ? { ...c, root: nextRoot || undefined, updatedAt: Date.now() }
+            : c,
+        ),
+        workspaceColors,
+        pinnedWorkspaces: s.pinnedWorkspaces.map((k) => (k === key ? nextKey : k)),
+        root: s.root === prevRoot ? nextRoot : s.root,
+        deletedWorkspaceRoots: prevRoot ? [...s.deletedWorkspaceRoots, prevRoot] : s.deletedWorkspaceRoots,
+      }
+    })
+    get().persist()
+    return nextKey
   },
 
   togglePinChat: (id) => {

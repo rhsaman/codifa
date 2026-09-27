@@ -3,6 +3,8 @@ import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
+import { ReviewPanel } from './components/ReviewPanel'
+import { useReviewPanel } from './lib/reviewPanel'
 import { TodosPanel } from './components/TodosPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
@@ -25,6 +27,9 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
+  // پنل Review سمت راست (سبک کدکس): با کلیک روی کارت edit_file/write_file باز
+  // می‌شود و ترنِ همان پیام را نشان می‌دهد.
+  const reviewOpen = useReviewPanel((s) => s.open)
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -256,6 +261,7 @@ export default function App() {
           <main className="main">
             <ChatPanel key={activeChatId} />
           </main>
+          {reviewOpen && <ReviewPanel />}
           {codeMapPanelOpen && (
             <CodeMapPanel
               onJumpToFile={(path, line) => {

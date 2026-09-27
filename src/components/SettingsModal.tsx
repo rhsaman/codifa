@@ -484,6 +484,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const addProvider = useStore((s) => s.addProvider)
   const removeProvider = useStore((s) => s.removeProvider)
   const addManualModel = useStore((s) => s.addManualModel)
+  const setManualModelContext = useStore((s) => s.setManualModelContext)
+  const removeManualModel = useStore((s) => s.removeManualModel)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
   const removeMode = useStore((s) => s.removeMode)
@@ -539,6 +541,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // ورودی «افزودن مدل دستی»: وقتی گیت‌وی فهرست مدل‌هایش را از /models نشان
   // نمی‌دهد (یا فچ شکست می‌خورد)، کاربر می‌تواند id مدل را مستقیم تایپ کند.
   const [manualModel, setManualModel] = useState('')
+  // طول کانتکست (توکن) مدل دستی — فقط برای پروایدرهای custom نمایش داده می‌شود؛
+  // با Add همراه مدل ذخیره و در متر کانتکست به‌جای مقدار زنده اولویت می‌گیرد.
+  const [manualContext, setManualContext] = useState('')
   // Readiness checks for the provider being edited (drives the banner at the
   // top of the form so the problem is visible BEFORE a message is sent).
   const hasSavedKey = !!(cfg.apiKey ?? '').trim()
@@ -790,6 +795,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Keep the local editor in sync when the edited provider changes.
   useEffect(() => {
     setCfg({ ...active })
+    setManualModel('')
+    setManualContext('')
   }, [editId, active.id])
 
   // Derive the credential method when switching providers: a saved API key wins,
@@ -901,6 +908,21 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setCredMode(m)
   }
 
+  // ورودی عددی طول کانتکست فقط برای kind‌هایی معنا دارد که /models‌شان پنجره‌ی
+  // قابل‌اعتماد گزارش نمی‌کند (`manualContextInput` در PROVIDER_META)؛ برای بقیه‌ی
+  // kind‌ها فرم دقیقاً مثل قبل تک‌فیلدی می‌ماند.
+  const isCustomKind = !!PROVIDER_META[cfg.kind]?.manualContextInput
+
+  // افزودن مدل دستی به‌همراه مقدار دستی کانتکست (اگر خالی/نامعتبر بود، مدل
+  // بدون مقدار دستی اضافه می‌شود و مقدارش از /models زنده گرفته می‌شود).
+  const commitManualModel = () => {
+    if (!manualModel.trim()) return
+    const parsed = isCustomKind ? parseInt(manualContext, 10) : NaN
+    addManualModel(active.id, manualModel, Number.isFinite(parsed) && parsed > 0 ? parsed : undefined)
+    setManualModel('')
+    setManualContext('')
+  }
+
   const save = async () => {
     // Providers that REQUIRE a credential must not be saved in a broken state
     // (empty env var + no saved key) — that is exactly how a user
@@ -925,13 +947,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     const { model: _model, ...cfgPersistFull } = cfg
     // Get live models/removedModels from store to avoid normalizing them to empty arrays
     const liveProvider = useStore.getState().settings.providers.find((p) => p.id === active.id)
-    const { models: _models, removedModels: _removed, addedModels: _added, ...cfgPersist } = cfgPersistFull
+    const { models: _models, removedModels: _removed, addedModels: _added, contextMap: _ctxMap, manualContextMap: _manualCtxMap, ...cfgPersist } = cfgPersistFull
     updateProvider(active.id, {
       ...cfgPersist,
       model: liveProvider?.model ?? active.model,
       models: liveProvider?.models ?? [],
       removedModels: liveProvider?.removedModels ?? [],
       addedModels: liveProvider?.addedModels ?? [],
+      // map های مدل‌محور از استور (نه اسنپ‌شات کهنه‌ی cfg) خوانده می‌شوند تا فچ زنده
+      // و مقادیر دستیِ کاربر هنگام Save پاک نشوند.
+      contextMap: liveProvider?.contextMap,
+      manualContextMap: liveProvider?.manualContextMap,
     })
     setSaved(true)
     setTimeout(onClose, 300)
@@ -1327,10 +1353,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
                       e.preventDefault()
-                      if (manualModel.trim()) {
-                        addManualModel(active.id, manualModel)
-                        setManualModel('')
-                      }
+                      commitManualModel()
                     }
                   }}
                   placeholder="e.g. claude-opus-4-6 — press Enter"
@@ -1338,14 +1361,30 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   autoComplete="off"
                   spellCheck={false}
                 />
+                {isCustomKind && (
+                  <input
+                    className="manual-model-ctx"
+                    type="number"
+                    min={1024}
+                    step={1024}
+                    value={manualContext}
+                    onChange={(e) => setManualContext(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        commitManualModel()
+                      }
+                    }}
+                    placeholder="context (tokens)"
+                    title="Context window in tokens for this custom model"
+                    dir="ltr"
+                  />
+                )}
                 <button
                   type="button"
                   className="btn tiny"
                   disabled={!manualModel.trim()}
-                  onClick={() => {
-                    addManualModel(active.id, manualModel)
-                    setManualModel('')
-                  }}
+                  onClick={commitManualModel}
                 >
                   Add
                 </button>
@@ -1353,6 +1392,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="hint">
                 For gateways that don’t list their models (or the fetch fails). The model is kept even
                 when the live catalog is unreachable, and can be picked in the composer.
+                {isCustomKind && ' Enter the context window (tokens) next to the id — it overrides the value fetched from /models.'}
               </div>
               {(() => {
                 const live = useStore.getState().settings.providers.find((p) => p.id === active.id)
@@ -1360,11 +1400,39 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 if (manual.length === 0) return null
                 return (
                   <div className="manual-model-list">
-                    {manual.map((m) => (
-                      <span key={m} className="manual-model-chip">
-                        {m}
-                      </span>
-                    ))}
+                    {manual.map((m) => {
+                      const bare = m.startsWith(`${active.id}/`) ? m.slice(active.id.length + 1) : m
+                      const manualCtx = live?.manualContextMap?.[bare]
+                      return (
+                        <span key={m} className="manual-model-chip">
+                          <span className="manual-model-name">{m}</span>
+                          {isCustomKind && (
+                            <input
+                              className="manual-model-ctx-input"
+                              type="number"
+                              min={1024}
+                              step={1024}
+                              value={manualCtx ?? ''}
+                              placeholder="ctx"
+                              title="Context window in tokens (overrides /models)"
+                              dir="ltr"
+                              onChange={(e) => {
+                                const n = parseInt(e.target.value, 10)
+                                setManualModelContext(active.id, m, Number.isFinite(n) ? n : null)
+                              }}
+                            />
+                          )}
+                          <button
+                            type="button"
+                            className="manual-model-remove"
+                            title="Remove model"
+                            onClick={() => removeManualModel(active.id, m)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      )
+                    })}
                   </div>
                 )
               })()}

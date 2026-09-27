@@ -18,6 +18,7 @@ def project_tool_results(
     calls: dict[str, tuple[str, str]] = {}
     originals: dict[tuple[str, str, str], str] = {}
     projected: list[BaseMessage] = []
+    seen_tool_result_ids: set[str] = set()
     for message in messages:
         if isinstance(message, AIMessage):
             for call in message.tool_calls:
@@ -30,6 +31,11 @@ def project_tool_results(
                     continue
                 calls[call_id] = (name, args)
         elif isinstance(message, ToolMessage):
+            call_id = str(message.tool_call_id or "")
+            if call_id and call_id in seen_tool_result_ids:
+                continue
+            if call_id:
+                seen_tool_result_ids.add(call_id)
             signature = calls.get(message.tool_call_id)
             content = message.content
             if (

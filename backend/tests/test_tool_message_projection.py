@@ -102,3 +102,21 @@ def test_all_tool_call_ids_preserved():
     assert [m.tool_call_id for m in out if isinstance(m, ToolMessage)] == [
         "c1", "c2", "c3",
     ]
+
+
+def test_duplicate_tool_result_id_is_removed_from_provider_request():
+    """نسخهٔ ارسالی به provider فقط یک خروجی برای هر شناسه نگه می‌دارد."""
+    msgs = [
+        AIMessage(content="", tool_calls=[
+            {"name": "grep", "args": {"pattern": "p"}, "id": "c1"},
+        ]),
+        ToolMessage(content="نخستین نتیجه", tool_call_id="c1", name="grep"),
+        ToolMessage(content="نتیجهٔ تکراری", tool_call_id="c1", name="grep"),
+    ]
+
+    out = project_tool_results(msgs)
+    tools = [message for message in out if isinstance(message, ToolMessage)]
+
+    assert len(tools) == 1
+    assert tools[0].tool_call_id == "c1"
+    assert tools[0].content == "نخستین نتیجه"

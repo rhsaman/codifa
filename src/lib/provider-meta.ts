@@ -28,6 +28,11 @@ export interface ProviderKindMeta {
   local?: boolean
   /** True = the user can enter a custom Base URL (custom / ollama). */
   editableBaseUrl?: boolean
+  /** True = the Settings form lets the user type a model id by hand AND (this
+   *  flag) its context window in tokens. Only kinds whose /models endpoint
+   *  can't be trusted to report a window need it (custom gateways); built-in
+   *  providers get their window from models.dev automatically. */
+  manualContextInput?: boolean
   /** Read-only base-URL hint shown for built-in providers (just the URL). */
   baseUrlHint?: string
   /** Optional description shown below the base-URL hint. */
@@ -119,6 +124,7 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     requiresKey: false,
     builtin: false,
     editableBaseUrl: true,
+    manualContextInput: true,
   },
   anthropic: {
     kind: 'anthropic',

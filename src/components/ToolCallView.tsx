@@ -11,6 +11,9 @@ import {
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import { diffStatsFromUnified } from "../lib/toolActivity";
+import { parseDiffRows, parseSideBySide, type DiffRow } from "../lib/reviewDiff";
+import { copyToClipboard } from "../lib/clipboard";
+import { useReviewPanel } from "../lib/reviewPanel";
 import { api } from "../lib/fs";
 import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
@@ -377,79 +380,6 @@ function ToolArgs({ args }: { args: Record<string, unknown> }) {
   );
 }
 
-type DiffRow =
-  | { type: "hunk" | "info"; text: string }
-  | {
-    type: "same" | "del" | "add" | "mod";
-    before: string;
-    after: string;
-    bLine: number;
-    aLine: number;
-  };
-
-/** Turn a unified diff into aligned before/after rows for a side-by-side view. */
-function parseSideBySide(diff: string): DiffRow[] {
-  const raw = diff.split("\n");
-  const rows: DiffRow[] = [];
-  let bLine = 0;
-  let aLine = 0;
-  let pendingDel: string[] = [];
-  let pendingAdd: string[] = [];
-
-  const flush = () => {
-    if (!pendingDel.length && !pendingAdd.length) return;
-    const n = Math.max(pendingDel.length, pendingAdd.length);
-    for (let i = 0; i < n; i++) {
-      const hasB = i < pendingDel.length;
-      const hasA = i < pendingAdd.length;
-      const type: DiffRow["type"] = hasB && hasA ? "mod" : hasB ? "del" : "add";
-      rows.push({
-        type,
-        before: hasB ? pendingDel[i] : "",
-        after: hasA ? pendingAdd[i] : "",
-        bLine: hasB ? bLine : -1,
-        aLine: hasA ? aLine : -1,
-      });
-      if (hasB) bLine++;
-      if (hasA) aLine++;
-    }
-    pendingDel = [];
-    pendingAdd = [];
-  };
-
-  const hunkRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
-  for (const line of raw) {
-    if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
-    const hm = hunkRe.exec(line);
-    if (hm) {
-      flush();
-      bLine = parseInt(hm[1], 10);
-      aLine = parseInt(hm[2], 10);
-      rows.push({ type: "hunk", text: line });
-    } else if (line.startsWith("\\")) {
-      // "\ No newline at end of file"
-      rows.push({ type: "info", text: line });
-    } else if (line.startsWith("-")) {
-      pendingDel.push(line.slice(1));
-    } else if (line.startsWith("+")) {
-      pendingAdd.push(line.slice(1));
-    } else {
-      flush();
-      rows.push({
-        type: "same",
-        before: line.slice(1),
-        after: line.slice(1),
-        bLine,
-        aLine,
-      });
-      bLine++;
-      aLine++;
-    }
-  }
-  flush();
-  return rows;
-}
-
 /** هایلایت ساده‌ی TOML: کلید نارنجی، رشته زرد-سبز، کامنت خاکستری.
  *  فقط برای فایل‌های toml اعمال می‌شود (DiffView بر اساس مسیر تصمیم می‌گیرد). */
 function TomlLine({ text }: { text: string }) {
@@ -480,15 +410,25 @@ function DiffLineText({ text, path }: { text: string; path?: string }) {
   return <>{text}</>;
 }
 
-/** دیف تک‌ستونی به سبک کدکس — گاتر سبز برای add، قرمز برای del، شماره خط.
- *  هر جفت delete+add (ردیف mod) به دو خط جدا (قرمز سپس سبز) باز می‌شود تا
- *  خط حذف‌شده هم مثل کدکس دیده شود. */
-export function DiffView({ diff, path }: { diff: string; path?: string }) {
-  const rows = parseSideBySide(diff);
-  if (rows.length === 0) return null;
+/** دیف به سبک کدکس. `mode="unified"` تک‌ستونی با گاتر سبز/قرمز و شماره‌ی خط
+ *  (کارت ابزار)، `mode="split"` دوستونی before|after با گاترهای جدا و
+ *  جداکنندهٔ «N unmodified lines» (پنل Review سمت راست). در حالت unified هر
+ *  جفت delete+add به دو خط جدا (قرمز سپس سبز) باز می‌شود. */
+export function DiffView({
+  diff,
+  path,
+  mode = "unified",
+}: {
+  diff: string;
+  path?: string;
+  mode?: "unified" | "split";
+}) {
+  const rows = mode === "split" ? null : parseDiffRows(diff);
+  const items = mode === "split" ? parseSideBySide(diff) : null;
+  if ((rows && rows.length === 0) || (items && items.length === 0)) return null;
   const drag = useDragScroll<HTMLDivElement>();
   const renderRow = (
-    key: number,
+    key: number | string,
     cls: "diff-u-add" | "diff-u-del" | "diff-u-ctx",
     gutter: string,
     lineNo: number,
@@ -502,9 +442,69 @@ export function DiffView({ diff, path }: { diff: string; path?: string }) {
       </span>
     </div>
   );
+
+  /** یک ستون از نمای دوستونی: شماره‌ی خط + متن، هر ردیف یک کلاس نوع. */
+  const renderColumn = (side: "before" | "after", list: DiffRow[]) => (
+    <div className={`diff-col diff-col-${side}`}>
+      <div className="diff-side-head">{side === "before" ? "Before" : "After"}</div>
+      {list.map((row, i) => {
+        if ("text" in row)
+          return (
+            <div key={i} className={`diff-side-meta ${row.type}`}>
+              {row.text}
+            </div>
+          );
+        const isBefore = side === "before";
+        const text = isBefore ? row.before : row.after;
+        const lineNo = isBefore ? row.bLine : row.aLine;
+        const cls =
+          row.type === "same"
+            ? "diff-context"
+            : row.type === "mod"
+              ? isBefore
+                ? "diff-del"
+                : "diff-add"
+              : row.type === "del"
+                ? isBefore
+                  ? "diff-del"
+                  : "diff-context"
+                : isBefore
+                  ? "diff-context"
+                  : "diff-add";
+        return (
+          <div key={i} className={`diff-side-row ${row.type}`}>
+            <span className="diff-side-num">{lineNo >= 0 ? lineNo : ""}</span>
+            <div className={`diff-side-cell ${cls}`}>
+              <DiffLineText text={text} path={path} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  if (items) {
+    return (
+      <div className="diff-columns" dir="ltr" {...drag}>
+        {items.map((item) =>
+          item.kind === "gap" ? (
+            <div key={item.key} className="diff-gap">
+              {item.count} unmodified lines
+            </div>
+          ) : (
+            <div key={item.key} className="diff-hunk-pair">
+              {renderColumn("before", item.rows)}
+              {renderColumn("after", item.rows)}
+            </div>
+          ),
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="diff-unified" dir="ltr" {...drag}>
-      {rows.flatMap((row, i) => {
+      {rows!.flatMap((row, i) => {
         if ("text" in row) {
           return (
             <div key={i} className={`diff-u-meta ${row.type}`}>
@@ -520,8 +520,8 @@ export function DiffView({ diff, path }: { diff: string; path?: string }) {
           return renderRow(i, "diff-u-add", "+", row.aLine, row.after);
         // mod: خط قدیمی قرمز + خط جدید سبز، هر دو با شماره‌ی خودشان.
         return [
-          renderRow(i * 2, "diff-u-del", "-", row.bLine, row.before),
-          renderRow(i * 2 + 1, "diff-u-add", "+", row.aLine, row.after),
+          renderRow(`${i}-d`, "diff-u-del", "-", row.bLine, row.before),
+          renderRow(`${i}-a`, "diff-u-add", "+", row.aLine, row.after),
         ];
       })}
     </div>
@@ -1118,13 +1118,15 @@ export const TraceNarration = memo(function TraceNarration({
  */
 export const ToolSingleRow = memo(function ToolSingleRow({
   activity,
+  messageId,
 }: {
   activity: ToolActivity;
+  /** id پیام مالک این فراخوانی — کلیک روی کارت ویرایش، ترن همین پیام را در
+   *  پنل Review سمت راست باز می‌کند (سبک کدکس). */
+  messageId?: string;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  const [expanded, setExpanded] = useState(
-    () => activity.tool === "edit_file" || activity.tool === "write_file",
-  );
+  const [expanded, setExpanded] = useState(false);
   const running = activity.status === "running";
   useEffect(() => {
     if (!running) return;
@@ -1150,6 +1152,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
+  const openReview = useReviewPanel((s) => s.openReview);
 
   /** Compute +/- stats from diff — از مقدار ذخیره‌شده روی event در Chat.tsx
    *  استفاده می‌کند وگرنه خودش از روی متن حساب می‌کند. */
@@ -1165,7 +1168,14 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     >
       <button
         className="trace-row-head"
-        onClick={() => setExpanded((e) => !e)}
+        /* کارت ویرایش دیف را در چت باز نمی‌کند — کلیک، ترن را در پنل Review
+           سمت راست نشان می‌دهد (سبک کدکس). بقیهٔ ردیف‌ها مثل قبل باز/بسته. */
+        onClick={
+          isEdit
+            ? () => messageId && openReview(messageId, String(activity.args?.path ?? ""))
+            : () => setExpanded((e) => !e)
+        }
+        title={isEdit ? "Review changes in the side panel" : undefined}
       >
         <StatusIcon status={activity.status} />
         <span className="trace-pill">{label}</span>
@@ -1191,15 +1201,16 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           {isEdit && diffStats && (
             <span className="trace-row-diff-stats">{diffStats}</span>
           )}
+          {isEdit && messageId && activity.diff && (
+            <span className="trace-row-review" aria-hidden="true">
+              Review ↗
+            </span>
+          )}
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
       </button>
-      {expanded && isEdit && activity.diff ? (
-        <div className="trace-row-expand edit-file-expand">
-          <DiffView diff={activity.diff} path={String(activity.args?.path ?? "")} />
-        </div>
-      ) : expanded ? (
+      {expanded ? (
         <div className="trace-row-expand">
           {ms ? (
             <div className="trace-expand-section">
@@ -1259,14 +1270,20 @@ export const ToolSingleRow = memo(function ToolSingleRow({
 export const ToolCallView = memo(function ToolCallView({
   activity,
   chatId,
+  messageId,
   onReverted,
 }: {
   activity: ToolActivity;
   /** id چت فعلی — برای restore از checkpoint (snapshot) در revert. */
   chatId?: string;
+  /** id پیام مالک این فراخوانی — دکمهٔ Review برای باز کردن ترن همان پیام. */
+  messageId?: string;
   onReverted?: () => void;
 }) {
   const [reverting, setReverting] = useState(false);
+  // سبک کدکس: کارت ویرایش کوچک می‌ماند و دیف هرگز داخل چت باز نمی‌شود؛
+  // کلیک روی خودِ کارت (یا دکمهٔ Review) دیف را در پنل سمت راست نشان می‌دهد.
+  const openReview = useReviewPanel((s) => s.openReview);
   const myKey = useId();
   const activeKey = useFullscreen((s) => s.activeKey);
   const openFs = useFullscreen((s) => s.open);
@@ -1301,6 +1318,8 @@ export const ToolCallView = memo(function ToolCallView({
 
   const isWrite =
     activity.tool === "write_file" || activity.tool === "edit_file";
+  /** مسیر فایلِ کارت نوشتن (path یا filePath) — برای هدر و پنل Review. */
+  const writePath = String(activity.args?.path ?? activity.args?.filePath ?? "");
   const readPaths = Array.isArray(activity.args?.paths)
     ? (activity.args.paths as string[])
     : [];
@@ -1340,17 +1359,28 @@ export const ToolCallView = memo(function ToolCallView({
       className={`tool-card ${activity.status}${isExploreCard(activity) ? " explore" : ""}`}
     >
       <div
-        className={`tool-card-head${collapsible ? " collapsible" : ""}`}
-        onClick={collapsible ? () => setCollapsed((c) => !c) : undefined}
-        role={collapsible ? "button" : undefined}
-        tabIndex={collapsible ? 0 : undefined}
+        className={`tool-card-head${collapsible ? " collapsible" : ""}${isWrite ? " write-head" : ""}`}
+        onClick={
+          isWrite
+            ? () => messageId && openReview(messageId, writePath)
+            : collapsible
+              ? () => setCollapsed((c) => !c)
+              : undefined
+        }
+        role={isWrite || collapsible ? "button" : undefined}
+        tabIndex={isWrite || collapsible ? 0 : undefined}
         aria-expanded={collapsible ? !collapsed : undefined}
+        title={isWrite ? "Review changes in the side panel" : undefined}
         onKeyDown={
-          collapsible
+          isWrite || collapsible
             ? (e: KeyboardEvent<HTMLDivElement>) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                setCollapsed((c) => !c);
+                if (isWrite) {
+                  if (messageId) openReview(messageId, writePath);
+                } else {
+                  setCollapsed((c) => !c);
+                }
               }
             }
             : undefined
@@ -1358,9 +1388,11 @@ export const ToolCallView = memo(function ToolCallView({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-name">
-          {isExploreCard(activity)
-            ? "explore"
-            : (TOOL_LABEL[activity.tool] ?? activity.tool)}
+          {isWrite
+            ? `${activity.tool === "write_file" ? "Wrote" : "Edited"} ${writePath.split("/").pop() ?? writePath}`
+            : isExploreCard(activity)
+              ? "explore"
+              : (TOOL_LABEL[activity.tool] ?? activity.tool)}
         </span>
         {activity.tool === "task" && !!activity.args?.subagent_type && (
           <span className="tool-badge">
@@ -1375,7 +1407,7 @@ export const ToolCallView = memo(function ToolCallView({
         {activity.args && activity.args.command !== undefined && (
           <span className="tool-cmd">{String(activity.args.command)}</span>
         )}
-        {activity.args && activity.args.path !== undefined && (
+        {activity.args && activity.args.path !== undefined && !isWrite && (
           <span className="tool-path">{String(activity.args.path)}</span>
         )}
         {activity.args && activity.args.filePath !== undefined && (
@@ -1465,12 +1497,25 @@ export const ToolCallView = memo(function ToolCallView({
           <button
             className="tool-revert-inline"
             disabled={reverting}
+            title="Undo this change"
             onClick={(e) => {
               e.stopPropagation();
               revert();
             }}
           >
-            {reverting ? "Reverting…" : "↩ Revert"}
+            {reverting ? "Reverting…" : "↩ Undo"}
+          </button>
+        )}
+        {isWrite && activity.diff && messageId && (
+          <button
+            className="tool-review-btn"
+            title="Open in Review panel"
+            onClick={(e) => {
+              e.stopPropagation();
+              openReview(messageId, writePath);
+            }}
+          >
+            Review ↗
           </button>
         )}
         {isWrite && activity.reverted && (
@@ -1500,7 +1545,9 @@ export const ToolCallView = memo(function ToolCallView({
         activity.children.length > 0 && (
           <ToolCascade activities={activity.children} />
         )}
-      {!collapsed && (
+      {/* کارت‌های ویرایش (edit_file/write_file) کوچک می‌مانند — بدون بدنه؛
+          دیف فقط در پنل Review سمت راست باز می‌شود (سبک کدکس). */}
+      {!collapsed && !isWrite && (
         <div className="tool-card-body">
           {activity.summary && !isWrite && (
             <div className="tool-summary">{fixZwsp(activity.summary)}</div>
@@ -1522,6 +1569,7 @@ export const ToolCallView = memo(function ToolCallView({
             activity.items.length > 0 && (
               <WebResultLinks items={activity.items} />
             )}
+          {/* فقط ابزارهای غیر-ویرایش دیف را در چت نشان می‌دهند. */}
           {activity.diff && (
             <DiffView
               diff={activity.diff}

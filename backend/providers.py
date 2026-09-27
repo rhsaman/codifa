@@ -489,14 +489,35 @@ def _entry_context(entry: dict) -> int | None:
 
     Tries the field names used by the various OpenAI-compatible gateways
     (openrouter ``context_length``, vLLM/LM Studio ``max_model_len``, ...).
+    Some aggregators (e.g. 9router) nest the window under a ``capabilities``
+    object as ``contextWindow`` instead of a top-level field, so that shape
+    is checked as well.
     """
-    return _first_int(
+    n = _first_int(
         entry,
         (
             "context_length",
             "max_context_length",
             "context_window",
+            "contextWindow",
+            "contextLength",
             "max_model_len",
+            "context_len",
+        ),
+    )
+    if n is not None:
+        return n
+    caps = entry.get("capabilities")
+    return _first_int(
+        caps,
+        (
+            "contextWindow",
+            "context_window",
+            "contextLength",
+            "context_length",
+            "max_context_length",
+            "maxContext",
+            "max_context",
             "context_len",
         ),
     )
@@ -506,9 +527,27 @@ def _entry_max_output(entry: dict) -> int | None:
     """Best-effort max output tokens from a /models entry.
 
     OpenRouter advertises ``max_completion_tokens`` (top-level or under
-    ``top_provider``); some gateways use ``max_output_tokens``.
+    ``top_provider``); some gateways use ``max_output_tokens``. Aggregators
+    like 9router nest it under ``capabilities`` as ``maxOutput``.
     """
-    n = _first_int(entry, ("max_completion_tokens", "max_output_tokens", "output_tokens"))
+    n = _first_int(
+        entry,
+        ("max_completion_tokens", "max_output_tokens", "maxOutput", "output_tokens"),
+    )
+    if n is not None:
+        return n
+    caps = entry.get("capabilities")
+    n = _first_int(
+        caps,
+        (
+            "maxOutput",
+            "max_output",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "output_tokens",
+        ),
+    )
     if n is not None:
         return n
     return _first_int(entry.get("top_provider") or {}, ("max_completion_tokens",))
@@ -555,11 +594,15 @@ def _entry_reasoning(entry: dict) -> bool | None:
     """Best-effort reasoning-support flag from a models-listing entry.
 
     Some gateways advertise a boolean ``reasoning`` field (OpenRouter carries
-    it on newer entries; others use ``supports_reasoning``). Returns None when
+    it on newer entries; others use ``supports_reasoning``). Aggregators like
+    9router nest it under ``capabilities`` as ``reasoning``. Returns None when
     the payload doesn't say — callers then fall back to the models.dev catalog
     or a name-based heuristic.
     """
-    return _first_bool(entry, ("reasoning", "supports_reasoning", "reasoning_supported"))
+    flag = _first_bool(entry, ("reasoning", "supports_reasoning", "reasoning_supported"))
+    if flag is not None:
+        return flag
+    return _first_bool(entry.get("capabilities"), ("reasoning", "supports_reasoning"))
 
 
 def _server_root(base_url: str) -> str:

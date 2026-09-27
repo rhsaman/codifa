@@ -8,6 +8,9 @@ _models_dev_context, _models_dev_max_output).
 
 
 from providers import (
+    _entry_context,
+    _entry_max_output,
+    _entry_reasoning,
     _first_bool,
     _first_int,
     _models_dev_limit_int,
@@ -75,3 +78,26 @@ def test_models_dev_limit_int_missing_field_is_none():
 def test_models_dev_limit_int_string_value_coerced():
     catalog = {"openai": {"models": {"gpt-x": {"limit": {"context": "32768"}}}}}
     assert _models_dev_limit_int(catalog, ["openai"], "gpt-x", "context") == 32768
+
+
+def test_entry_context_reads_capabilities_context_window():
+    # 9router-style payload: no top-level context_length, window nested under
+    # capabilities.contextWindow (e.g. the "combo" model).
+    entry = {
+        "id": "combo",
+        "capabilities": {
+            "vision": True,
+            "tools": True,
+            "reasoning": True,
+            "contextWindow": 1048576,
+            "maxOutput": 131072,
+        },
+    }
+    assert _entry_context(entry) == 1048576
+    assert _entry_max_output(entry) == 131072
+    assert _entry_reasoning(entry) is True
+
+
+def test_entry_context_top_level_still_wins_over_capabilities():
+    entry = {"context_length": 131072, "capabilities": {"contextWindow": 1048576}}
+    assert _entry_context(entry) == 131072

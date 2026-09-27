@@ -5905,6 +5905,11 @@ textarea {
   flex: 1;
 }
 
+/* ورودی عددی طول کانتکست مدل کاستوم — باریک‌تر از فیلد نام مدل. */
+.manual-model-row .manual-model-ctx {
+  flex: 0 0 130px;
+}
+
 .manual-model-list {
   display: flex;
   flex-wrap: wrap;
@@ -5915,7 +5920,8 @@ textarea {
 .manual-model-chip {
   display: inline-flex;
   align-items: center;
-  padding: 3px 8px;
+  gap: 6px;
+  padding: 3px 4px 3px 8px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-input);
@@ -5923,6 +5929,41 @@ textarea {
   font-size: 11px;
   font-family: var(--mono, monospace);
   direction: ltr;
+}
+
+.manual-model-name {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* اینپوت کوچک مقدار کانتکست داخل چیپ مدل دستی. */
+.manual-model-ctx-input {
+  width: 68px;
+  padding: 1px 4px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+}
+
+.manual-model-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim, var(--text));
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 50%;
+}
+
+.manual-model-remove:hover {
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
 .cred-inline-fallback {
@@ -8786,6 +8827,25 @@ textarea {
   background: var(--hairline, rgba(128, 128, 128, 0.06));
   border-radius: 8px;
   overflow: hidden;
+}
+
+/* جداکنندهٔ «N unmodified lines» بین دو هانک (سبک کدکس). */
+.diff-gap {
+  grid-column: 1 / -1;
+  padding: 3px 12px;
+  font-size: 10.5px;
+  font-style: italic;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  text-align: center;
+  user-select: none;
+}
+
+/* یک هانک = دو ستون before|after کنار هم در گرید پنل Review. */
+.diff-hunk-pair {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
 }
 
 .diff-col {
@@ -12651,17 +12711,91 @@ textarea {
   cursor: not-allowed;
 }
 
-/* ---- Review panel (سبک کدکس) ---- */
+/* دکمهٔ «Review ↗» روی کارت ویرایش (سبک کدکس). */
+.tool-card-head .tool-review-btn {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.tool-card-head .tool-review-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: var(--accent);
+}
+
+/* کارت‌های ویرایش کلیک‌پذیرند (باز کردن پنل Review) — بج «Review ↗» در ردیف
+   تکی‌شان همین را نشان می‌دهد. */
+.trace-row.edit-file .trace-row-head {
+  cursor: pointer;
+}
+
+.trace-row-review {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--accent);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+/* ---- Review panel (سبک کدکس) — ستون داکت‌شده سمت راست ---- */
 .review-panel {
   display: flex;
   flex-direction: column;
-  max-height: 460px;
-  background: var(--bg-dark, #0d1117);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  flex: 0 0 auto;
+  width: 46%;
+  min-width: 340px;
+  max-width: 760px;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-alt, #0d1117);
+  border-inline-start: 1px solid var(--border);
   overflow: hidden;
-  margin: 4px 0;
   direction: ltr;
+}
+
+.review-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding: 0 8px;
+}
+
+.review-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 2px solid var(--accent);
+  margin-bottom: -1px;
+}
+
+.review-tab-x {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.review-tab-x:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
 }
 
 .review-header {
@@ -12768,6 +12902,40 @@ textarea {
 
 .review-file-icon { color: var(--text-dim); }
 
+/* بج پسوند فایل (css/tsx/…) و آیکن بازکردن در هدر لیست/دیف. */
+.review-file-ext {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.review-file-open {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.review-diff-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+
 .review-file-path {
   flex: 1 1 auto;
   overflow: hidden;
@@ -12785,7 +12953,8 @@ textarea {
 }
 
 .review-diff {
-  flex: 0 1 auto;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 

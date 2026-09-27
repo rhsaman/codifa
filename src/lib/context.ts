@@ -201,21 +201,27 @@ export function computeContextUsed(
   return estimateContextTokens(chat, systemPrompt, contextWindow)
 }
 
-/** Resolve a model's context window from the provider's contextMap, trying
+/** Resolve a model's context window from the provider's maps, trying
  *  both the bare id (what the picker stores) and the provider-prefixed id
  *  (NVIDIA's /models returns "nvidia/<model>" while the picker stores the
- *  bare form, so the map is keyed by the prefixed id). The window comes solely
- *  from the model (reported by the provider's /models endpoint) — there is no
- *  manual override. */
+ *  bare form, so the map is keyed by the prefixed id). Resolution order:
+ *  ۱) مقدار دستی کاربر (manualContextMap — فقط مدل‌های کاستوم) ۲) مقدار
+ *  زنده‌ی contextMap (گزارش‌شده از /models پروایدر). */
 export function modelContextWindow(
   provider: {
     id?: string
     contextMap?: Record<string, number>
+    manualContextMap?: Record<string, number>
     contextWindow?: number
   } | null | undefined,
   model: string,
 ): number | null {
   if (!provider) return null
+  const manual = provider.manualContextMap ?? {}
+  const directManual = manual[model]
+  if (directManual && directManual > 0) return directManual
+  const prefixedManual = manual[`${provider.id ?? ''}/${model}`]
+  if (prefixedManual && prefixedManual > 0) return prefixedManual
   const map = provider.contextMap ?? {}
   const direct = map[model]
   if (direct && direct > 0) return direct

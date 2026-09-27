@@ -338,6 +338,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
     model: p.model || '',
     contextMap: p.contextMap,
+    manualContextMap: p.manualContextMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
     thinkingLevel: p.thinkingLevel ?? '',
@@ -432,7 +433,9 @@ interface State {
   setActiveProvider: (id: string) => void
   setProviderModels: (id: string, models: string[]) => void
   /** افزودن دستی یک مدل به پروایدر (در addedModels ثبت می‌شود تا فچ‌ها حذفش نکنند). */
-  addManualModel: (id: string, model: string) => void
+  addManualModel: (id: string, model: string, contextTokens?: number) => void
+  setManualModelContext: (id: string, model: string, contextTokens: number | null) => void
+  removeManualModel: (id: string, model: string) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
@@ -1099,22 +1102,82 @@ export const useStore = create<State>((set, get) => ({
 
   // افزودن دستی یک مدل به پروایدر: هم به لیست ظاهری اضافه می‌شود و هم در
   // addedModels ثبت می‌شود تا فچ‌های بعدی (حتی ناموفق) آن را حذف نکنند.
-  addManualModel: (id, model) => {
+  // افزودن دستی مدل + ثبت اختیاری کانتکست دستی؛ ورودی دستی کانتکست فقط برای
+  // kind‌هایی معنا دارد که /models‌شان پنجره‌ی قابل‌اعتماد گزارش نمی‌کند
+  // (`manualContextInput` در PROVIDER_META — همین یک رجیستری، بدون چک done‌شده‌ی kind).
+  addManualModel: (id, model, contextTokens?) => {
+    const m = model.trim()
+    if (!m) return
+    const ctx =
+      typeof contextTokens === 'number' && Number.isFinite(contextTokens) && contextTokens > 0
+        ? Math.floor(contextTokens)
+        : undefined
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => {
+          if (p.id !== id) return p
+          const bare = m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
+          const acceptsManual = !!PROVIDER_META[p.kind]?.manualContextInput
+          const manual =
+            ctx !== undefined && acceptsManual
+              ? { ...(p.manualContextMap ?? {}), [bare]: ctx }
+              : p.manualContextMap
+          return {
+            ...p,
+            models: Array.from(new Set([...(p.models ?? []), m])),
+            addedModels: Array.from(new Set([...(p.addedModels ?? []), m])),
+            removedModels: (p.removedModels ?? []).filter((x) => x !== m),
+            ...(manual !== undefined ? { manualContextMap: manual } : {}),
+          }
+        }),
+      },
+    }))
+    get().persist()
+  },
+
+  // ویرایش/حذف مقدار دستی کانتکست یک مدل دستی (کلید نرمال‌شده‌ی bare). مثل
+  // افزودن، فقط برای kind‌های دارای manualContextInput اعمال می‌شود.
+  setManualModelContext: (id, model, contextTokens) => {
     const m = model.trim()
     if (!m) return
     set((s) => ({
       settings: {
         ...s.settings,
-        providers: s.settings.providers.map((p) =>
-          p.id === id
-            ? {
-                ...p,
-                models: Array.from(new Set([...(p.models ?? []), m])),
-                addedModels: Array.from(new Set([...(p.addedModels ?? []), m])),
-                removedModels: (p.removedModels ?? []).filter((x) => x !== m),
-              }
-            : p,
-        ),
+        providers: s.settings.providers.map((p) => {
+          if (p.id !== id) return p
+          if (!PROVIDER_META[p.kind]?.manualContextInput) return p
+          const bare = m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
+          const next = { ...(p.manualContextMap ?? {}) }
+          if (contextTokens === null || !(contextTokens > 0)) delete next[bare]
+          else next[bare] = Math.floor(contextTokens)
+          return { ...p, manualContextMap: next }
+        }),
+      },
+    }))
+    get().persist()
+  },
+
+  // حذف یک مدل دستی به‌همراه مقدار دستی کانتکست آن.
+  removeManualModel: (id, model) => {
+    const m = model.trim()
+    if (!m) return
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => {
+          if (p.id !== id) return p
+          const bare = m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
+          const next = { ...(p.manualContextMap ?? {}) }
+          delete next[bare]
+          delete next[m]
+          return {
+            ...p,
+            models: (p.models ?? []).filter((x) => x !== m),
+            addedModels: (p.addedModels ?? []).filter((x) => x !== m),
+            manualContextMap: next,
+          }
+        }),
       },
     }))
     get().persist()

@@ -87,6 +87,8 @@ export interface ProviderConfig {
   enabled?: boolean
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
   contextMap?: Record<string, number>
+  /** مقادیر دستی کانتکست که کاربر برای مدل‌های کاستوم وارد کرده؛ بر contextMap اولویت دارد. */
+  manualContextMap?: Record<string, number>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   reasoningMap?: Record<string, boolean>

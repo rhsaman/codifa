@@ -927,8 +927,13 @@ async def _get_whisper_model():
 
 @app.post("/transcribe")
 async def transcribe(request: Request) -> dict:
-    """Transcribe a recorded audio clip (multipart 'file') using the local Whisper
-    model. Returns {"text": "..."} or an HTTP error. Fully local and offline.
+    """Transcribe a recorded audio clip (multipart 'audio').
+
+    Local (no `provider` form field): on-device Whisper, fully offline.
+    Remote (`provider` + `base_url` fields): forwarded to
+    `POST {base_url}/audio/transcriptions` (OpenAI-compatible, e.g. a custom
+    9router gateway at `http://localhost:20128/v1`).
+    Returns {"text": "..."} or an HTTP error.
 
     Tuned for clean, hallucination-free dictation on short clips:
     * Silero VAD trims silence and skips pure-silence clips (no ghost text).
@@ -936,8 +941,6 @@ async def transcribe(request: Request) -> dict:
     * Temperature fallback + conservative thresholds fix repeated-text stutters.
     """
     import io
-
-    from faster_whisper.audio import decode_audio
 
     try:
         # Parsing the multipart form (and every downstream step) lives inside the
@@ -951,7 +954,19 @@ async def transcribe(request: Request) -> dict:
         data = await audio.read()
         if not data:
             raise HTTPException(status_code=400, detail="empty audio")
-        lang = (form.get("lang") or "").strip().lower() or None
+        lang = str(form.get("lang") or "").strip().lower() or None
+        provider_kind = str(form.get("provider") or "").strip()
+        base_url = str(form.get("base_url") or "").strip()
+        api_key = str(form.get("api_key") or "").strip()
+        env_var = str(form.get("env_var") or "").strip()
+        stt_model = str(form.get("model") or "").strip() or "whisper-1"
+
+        if provider_kind and provider_kind != "local":
+            return await _transcribe_remote(
+                data, provider_kind, base_url, api_key, env_var, stt_model, lang
+            )
+
+        from faster_whisper.audio import decode_audio
 
         model = await _get_whisper_model()
         # faster-whisper's decode_audio uses `av` to decode webm/ogg/opus/wav/mp3
@@ -989,6 +1004,42 @@ async def transcribe(request: Request) -> dict:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from exc
+
+
+async def _transcribe_remote(
+    data: bytes,
+    provider_kind: str,
+    base_url: str,
+    api_key: str,
+    env_var: str,
+    model: str,
+    lang: str | None,
+) -> dict:
+    """Forward an audio clip to an OpenAI-compatible /audio/transcriptions endpoint."""
+    import httpx
+
+    if not base_url:
+        raise HTTPException(status_code=400, detail="remote STT needs 'base_url'")
+    url = f"{base_url.rstrip('/')}/audio/transcriptions"
+    key = api_key or providers.env_key(provider_kind, env_var)
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    files = {"file": ("clip.wav", data, "application/octet-stream")}
+    payload: dict[str, str] = {"model": model or "whisper-1"}
+    if lang:
+        payload["language"] = lang
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, headers=headers, files=files, data=payload)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"remote transcription failed: {exc}") from exc
+    if resp.status_code >= 400:
+        detail = resp.text.strip()[:500] or f"remote transcription failed ({resp.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"remote transcription bad response: {exc}") from exc
+    return {"text": str(body.get("text", "")).strip()}
 
 
 def _sse(obj: dict) -> str:

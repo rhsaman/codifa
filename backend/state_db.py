@@ -309,6 +309,8 @@ _DEFAULT_SETTINGS_KEYS = frozenset(
         "dataPath",
         "whisperModel",
         "whisperBaseUrl",
+        "sttProviderId",
+        "sttModel",
         "embeddingModel",
         "embeddingBaseUrl",
         "ragWebTtlDays",

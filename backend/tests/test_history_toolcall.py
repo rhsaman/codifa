@@ -127,3 +127,65 @@ def test_system_and_user_turns_unchanged():
     assert len(msgs) == 2
     assert isinstance(msgs[0], HumanMessage)
     assert isinstance(msgs[1], HumanMessage)
+
+
+def test_duplicate_call_ids_across_turns_are_renamed():
+    """callIdهای عددی بین چند نوبت assistant تکرار می‌شوند؛ شناسهٔ بازسازی‌شده
+    باید در کل تاریخچه یکتا بماند وگرنه provider با خطای «Duplicate
+    function_call_output for call_id» ترنسکریپت را رد می‌کند."""
+    history = [
+        {
+            "role": "assistant",
+            "content": "first",
+            "toolActivity": [
+                {"tool": "grep", "args": {"pattern": "a"}, "callId": 1,
+                 "status": "done", "items": "one"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "second",
+            "toolActivity": [
+                {"tool": "grep", "args": {"pattern": "b"}, "callId": 1,
+                 "status": "done", "items": "two"},
+            ],
+        },
+    ]
+    msgs = history_to_langchain_messages(history)
+    ai_ids = [
+        tc["id"]
+        for m in msgs
+        if isinstance(m, AIMessage)
+        for tc in m.tool_calls
+    ]
+    tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
+    # نوبت اول id اصلی را نگه می‌دارد؛ نوبت دوم پسوند یکتا می‌گیرد
+    assert ai_ids == ["1", "1#2"]
+    # به‌ازای هر فراخوانی دقیقاً یک ToolMessage با همان id
+    assert tool_ids == ["1", "1#2"]
+    # هر نتیجه به فراخوانی خودش متصل می‌ماند
+    assert "one" in msgs[1].content
+    assert "two" in msgs[3].content
+
+
+def test_duplicate_call_ids_within_one_turn_are_renamed():
+    """دو کارت toolActivity با یک callId داخل یک نوبت هم باید یکتا شوند."""
+    history = [
+        {
+            "role": "assistant",
+            "content": "x",
+            "toolActivity": [
+                {"tool": "read", "args": {"filePath": "a.py"}, "callId": 5,
+                 "status": "done", "items": "A"},
+                {"tool": "read", "args": {"filePath": "b.py"}, "callId": 5,
+                 "status": "done", "items": "B"},
+            ],
+        },
+    ]
+    msgs = history_to_langchain_messages(history)
+    ai = next(m for m in msgs if isinstance(m, AIMessage))
+    tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
+    assert [tc["id"] for tc in ai.tool_calls] == ["5", "5#2"]
+    assert tool_ids == ["5", "5#2"]
+    assert "A" in msgs[1].content
+    assert "B" in msgs[2].content

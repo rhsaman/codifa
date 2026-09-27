@@ -372,6 +372,8 @@ export function ChatPanel() {
   }, []);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  const sttProviderId = useStore((s) => s.sttProviderId);
+  const sttModel = useStore((s) => s.sttModel);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
   // Mirror of `recording` so the global keydown handler (which lives in a
@@ -2927,7 +2929,24 @@ export function ChatPanel() {
             bytes: blob.size,
             lang,
           });
-          const text = await transcribeAudio(blob, setTranscribing, lang);
+          const sttCfg =
+            sttProviderId === "local"
+              ? undefined
+              : settings.providers.find((p) => p.id === sttProviderId);
+          const text = await transcribeAudio(
+            blob,
+            setTranscribing,
+            lang,
+            sttCfg
+              ? {
+                  kind: sttCfg.kind,
+                  baseUrl: sttCfg.baseUrl ?? "",
+                  apiKey: sttCfg.apiKey ?? "",
+                  envVar: sttCfg.envVar ?? "",
+                  model: sttModel,
+                }
+              : undefined,
+          );
           if (text) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
             requestAnimationFrame(() => textareaRef.current?.focus());

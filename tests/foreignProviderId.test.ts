@@ -115,6 +115,29 @@ console.log('8) FOREIGN_PROVIDER_PREFIXES همه kindهای built-in را شام
 }
 
 console.log('')
+console.log('9) ردیف custom (گیت‌وی چندفروشنده مثل 9router): پیشوند فروشنده‌ها فیلتر نمی‌شود:')
+{
+  // قاعده‌ی فیلتر ساختاری است — نه بر اساس آدرس/پورت: ردیف custom حتی
+  // بدون baseUrl (یا با دامنه‌ی ناشناخته) هم multi-vendor شناخته می‌شود.
+  // (تشخیص از روی شناسه‌های زنده مثل nvidia/… معادل همین قاعده است، چون
+  // فیلتر کردن لیست علیه headهای خودِ همان لیست عملاً no-op می‌شود.)
+  const noUrl = { id: 'custom-router', kind: 'custom' }
+  check('nvidia/… بدون baseUrl هم داخلی است (تشخیص ساختاری، نه آدرس)', !isForeignModelId(noUrl, bareModel(noUrl, 'nvidia/nemotron-3-ultra-550b-a55b')))
+
+  // 9router واقعی: کاتالوگ چندفروشنده زیر یک baseUrl واحد؛ headهای
+  // فروشنده مثل nvidia/ نباید حذف شوند، ولی هویت‌های گیت‌وی
+  // (openrouter/…، opencode/…) همچنان خارجی‌اند.
+  const router = { id: 'custom-muiw3uo6', kind: 'custom', baseUrl: 'http://localhost:20128/v1' }
+  check('nvidia/nemotron-3-ultra-550b-a55b داخلی ردیف router است', !isForeignModelId(router, bareModel(router, 'nvidia/nemotron-3-ultra-550b-a55b')))
+  check('anthropic/claude-3.5 داخلی ردیف router است', !isForeignModelId(router, bareModel(router, 'anthropic/claude-3.5')))
+  check('openrouter/sonnet خارجی ردیف router است (هویت گیت‌وی)', isForeignModelId(router, bareModel(router, 'openrouter/sonnet')))
+  check('opencode/foo خارجی ردیف router است (هویت گیت‌وی)', isForeignModelId(router, bareModel(router, 'opencode/foo')))
+  // ردیف custom قدیمی که kind فقط در id آن است (mock/legacy).
+  const legacy = { id: 'custom-abc' }
+  check('nvidia/foo داخلی ردیف custom-abc (legacy) است', !isForeignModelId(legacy, bareModel(legacy, 'nvidia/foo')))
+}
+
+console.log('')
 if (failed === 0) {
   console.log('✅ همهٔ تست‌های isForeignModelId پاس شدند')
 } else {

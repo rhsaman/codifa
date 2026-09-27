@@ -128,6 +128,10 @@ export interface Settings {
   /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */
   whisperModel?: string
   whisperBaseUrl?: string
+  /** STT source: 'local' = on-device Whisper, otherwise a settings.providers id. */
+  sttProviderId?: string
+  /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */
+  sttModel?: string
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string

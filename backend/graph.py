@@ -81,8 +81,11 @@ from llm import (
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
+    append_tool_result,
     build_chat_model,
     chat_model_settings,
+    dedupe_step_tool_call_ids,
+    dedupe_tool_outputs,
     llm_generate,
     strip_orphaned_tool_calls,
 )
@@ -560,6 +563,11 @@ def history_to_langchain_messages(
     system prompt, not by history tagging.
     """
     out: list[BaseMessage] = []
+    # شناسهٔ tool_callهای بازسازی‌شده باید در کل تاریخچه یکتا باشد: front-end
+    # کارت‌ها را با callId عددی علامت می‌زند که بین چند نوبت تکرار می‌شود
+    # (مثلاً «1»). دو ToolMessage با یک tool_call_id خطای provider
+    # «Duplicate function_call_output for call_id» را می‌سازد.
+    used_ids: set[str] = set()
     for turn in history or []:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
@@ -577,7 +585,13 @@ def history_to_langchain_messages(
             for ta in tool_activity:
                 if not isinstance(ta, dict):
                     continue
-                tc_id = str(ta.get("callId") or f"ta-{len(tool_calls)}")
+                base_id = str(ta.get("callId") or f"ta-{len(tool_calls)}")
+                tc_id = base_id
+                _dup_n = 2
+                while tc_id in used_ids:
+                    tc_id = f"{base_id}#{_dup_n}"
+                    _dup_n += 1
+                used_ids.add(tc_id)
                 tool_calls.append(
                     {
                         "name": ta.get("tool", "tool"),
@@ -2801,6 +2815,10 @@ async def _run_mode_turn(
                 # Strip tool_calls from any such assistant messages so the
                 # text content is still visible to the model.
                 strip_orphaned_tool_calls(msgs)
+                # نگهبان نهایی «یک خروجی به‌ازای هر tool_call_id» — چک‌پوینت
+                # خراب یا compaction ممکن است دو ToolMessage با یک id بسازد که
+                # provider با 400 «Duplicate function_call_output» رد می‌کند.
+                msgs[:] = dedupe_tool_outputs(msgs)
 
                 request_messages = project_tool_results(msgs)
                 async for chunk in bound.astream(request_messages):
@@ -3224,6 +3242,15 @@ async def _run_mode_turn(
                     }
                 )
                 _nudge_pending = True
+            # tool_callهایی با id تکراری داخل یک پیام، یک ToolMessage مشترک
+            # می‌خواهند و provider با «Duplicate function_call_output» ردشان
+            # می‌کند — idهای تکراریِ داخل همین پیام را قبل از ثبت یکتا کن.
+            _reserved_tc_ids = {
+                str(m.tool_call_id)
+                for m in msgs
+                if isinstance(m, ToolMessage) and m.tool_call_id
+            }
+            dedupe_step_tool_call_ids(ai, _reserved_tc_ids)
             msgs.append(ai)
             # Partition this step's tool calls: read-only ones (grep/glob/read/
             # web/vision/task/...) run CONCURRENTLY via gather -- they cannot
@@ -3258,11 +3285,7 @@ async def _run_mode_turn(
                     # tool_call_id has no matching ToolMessage yet.  Create one
                     # so the API doesn't reject the transcript with "missing
                     # results for tool_call_id(s)".
-                    msgs.append(
-                        ToolMessage(
-                            content=str(existing), tool_call_id=_tc_id
-                        )
-                    )
+                    append_tool_result(msgs, str(existing), _tc_id)
             # ── Deduplicate identical tool calls in the main agent loop ──
             # The model sometimes outputs the same (name, args) pair twice in
             # one step. Execute each unique call once and reuse the result for
@@ -3319,9 +3342,7 @@ async def _run_mode_turn(
 
             _results = await execute_readonly_calls(_parallel, _run_readonly)
             for tc, result in zip(_parallel, _results):
-                msgs.append(
-                    ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
-                )
+                append_tool_result(msgs, str(result), tc.get("id", ""))
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
             # half-finished checkpoint that orphans tool_calls on resume.
@@ -3340,9 +3361,7 @@ async def _run_mode_turn(
                 # (via the emit callback wired into make_tool_callbacks), so we
                 # only execute it and feed the result back to the model.
                 result = await _execute_tool(name, args)
-                msgs.append(
-                    ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
-                )
+                append_tool_result(msgs, str(result), tc.get("id", ""))
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
                 await _save_turn_checkpoint_valid(
@@ -3357,9 +3376,7 @@ async def _run_mode_turn(
                             isinstance(_m, ToolMessage)
                             and getattr(_m, "tool_call_id", "") == _orig_id
                         ):
-                            msgs.append(
-                                ToolMessage(content=_m.content, tool_call_id=_dup_id)
-                            )
+                            append_tool_result(msgs, _m.content, _dup_id)
                             break
             # Batching reminder: delivered as its OWN HumanMessage AFTER the
             # tool results (same placement as the repetition warning below) —
@@ -5462,4 +5479,3 @@ _ASK_REPO_CUES = re.compile(
     r"پیاده سازی|چطور کار|کامپوننت",
     re.IGNORECASE,
 )
-

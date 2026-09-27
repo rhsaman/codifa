@@ -176,12 +176,29 @@ const VENDOR_NAMESPACE_KINDS: ReadonlySet<string> = new Set([
 ])
 
 /** True when the row is (or points at) a multi-vendor aggregator, so
- *  kind-colliding vendor prefixes in its catalog must not be filtered. */
+ *  kind-colliding vendor prefixes in its catalog must not be filtered.
+ *
+ *  ردیف‌های custom هم شامل می‌شوند: یک endpoint دلخواه (مثل 9router که
+ *  nvidia/*، gemini/*، groq/* و … را زیر یک baseUrl واحد عرضه می‌کند)
+ *  هیچ سیگنال قابل اتکایی از kind برای تک‌فروشنده بودن ندارد، پس
+ *  prefixهای فروشنده‌ی شناخته‌شده در آن‌ها فیلتر نمی‌شوند. هویت‌های
+ *  گیت‌وی (openrouter، ollama، opencode، …) همچنان خارجی می‌مانند مگر
+ *  baseUrl خود ردیف به همان گیت‌وی اشاره کند.
+ *
+ *  تشخیص ساختاری است (kind / id ردیف) — نه تطبیق آدرس یا پورت (نه
+ *  localhost، نه شماره‌ی سرور). معادل تشخیص «بر اساس شناسه‌های زندهٔ
+ *  کاتالوگ» (cl/… ، nvidia/…) است: چون این فیلتر روی همان لیستِ ذخیره‌شده
+ *  از کاتالوگ زنده اجرا می‌شود، اجازه دادن به headهای موجود در خود لیست
+ *  عملاً no-op است و فقط بررسی‌های pre-add (قبل از persist) را می‌شکند؛
+ *  پس قاعده به صورت ساختاری و یک‌جا اینجا تعریف می‌شود. */
 function isAggregatorRow(p: { id: string; kind?: string; baseUrl?: string }): boolean {
   if (p.kind && AGGREGATOR_KINDS.has(p.kind)) return true
   // Test mocks / legacy rows often carry the kind only in `id`.
   if (AGGREGATOR_KINDS.has(p.id)) return true
-  // Custom rows pointed at a known aggregator gateway have the same catalog shape.
+  // Custom rows are arbitrary gateways (multi-vendor by nature).
+  if (p.kind === 'custom') return true
+  if (p.id === 'custom' || p.id.startsWith('custom-')) return true
+  // Other kinds pointed at a known aggregator gateway share the catalog shape.
   const base = (p.baseUrl || '').toLowerCase()
   return base.includes('openrouter.ai') || base.includes('tokenrouter.com')
 }
@@ -189,7 +206,8 @@ function isAggregatorRow(p: { id: string; kind?: string; baseUrl?: string }): bo
 /** Kind-colliding prefixes this row may legitimately contain in its OWN
  *  catalog (empty/null = none — foreign prefixes are filtered as usual).
  *
- *  - Aggregators (OpenRouter / TokenRouter, kind or baseUrl): every vendor
+ *  - Aggregators (OpenRouter / TokenRouter, kind or baseUrl) و ردیف‌های
+ *    custom (گیت‌وی چندفروشنده‌ی دلخواه مثل 9router): every vendor
  *    namespace above, plus their own wire prefix (custom→openrouter.ai
  *    returns "openrouter/auto" — head !== p.id after bareModel).
  *  - NVIDIA NIM: hosts Google Gemma as "google/gemma-*" — the same head as

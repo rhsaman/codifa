@@ -401,6 +401,16 @@ def test_400_validation_is_not_retryable():
     assert agents._is_retryable(exc2) is False
 
 
+def test_400_duplicate_function_call_output_is_not_retryable():
+    """خطای Duplicate function_call_output یک باگ دائمی ترنسکریپت است، نه
+    مشکل گذرا — retry همان payload را دوباره با همان 400 رد می‌کند."""
+    exc = RuntimeError(
+        "Error code: 400 - Duplicate function_call_output for call_id '1' "
+        "(muse-spark-1.3-contributor-free)"
+    )
+    assert agents._is_retryable(exc) is False
+
+
 def test_hard_quota_exhausted_still_detected():
     """A genuine usage-quota cap (no transient phrase) is still detected as
     exhausted and skips the retry loop."""

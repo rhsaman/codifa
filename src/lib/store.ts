@@ -253,7 +253,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -266,7 +266,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -474,10 +474,16 @@ interface State {
   /** On-device model preferences (Settings → Models). */
   whisperModel: string
   whisperBaseUrl: string
+  /** STT source: 'local' = on-device Whisper, otherwise a settings.providers id. */
+  sttProviderId: string
+  /** Remote STT model id sent to {base_url}/audio/transcriptions. */
+  sttModel: string
   embeddingModel: string
   embeddingBaseUrl: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
+  setSttProviderId: (id: string) => void
+  setSttModel: (m: string) => void
   setEmbeddingModel: (m: string) => void
   setEmbeddingBaseUrl: (u: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
@@ -692,6 +698,8 @@ export const useStore = create<State>((set, get) => ({
   ragWebTtlDays: 90,
   whisperModel: 'Systran/faster-whisper-medium',
   whisperBaseUrl: '',
+  sttProviderId: 'local',
+  sttModel: 'whisper-1',
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
   recentModels: [],
@@ -938,6 +946,8 @@ export const useStore = create<State>((set, get) => ({
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
       whisperModel: typeof raw.whisperModel === 'string' && raw.whisperModel.trim() ? raw.whisperModel : 'Systran/faster-whisper-medium',
       whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
+      sttProviderId: typeof raw.sttProviderId === 'string' && raw.sttProviderId.trim() ? raw.sttProviderId : 'local',
+      sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
@@ -1278,6 +1288,14 @@ export const useStore = create<State>((set, get) => ({
   },
   setWhisperBaseUrl: (u) => {
     set({ whisperBaseUrl: (u ?? '').trim() })
+    get().persist()
+  },
+  setSttProviderId: (id) => {
+    set({ sttProviderId: (id ?? '').trim() || 'local' })
+    get().persist()
+  },
+  setSttModel: (m) => {
+    set({ sttModel: (m ?? '').trim() || 'whisper-1' })
     get().persist()
   },
   setEmbeddingModel: (m) => {

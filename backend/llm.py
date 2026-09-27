@@ -996,6 +996,96 @@ def strip_orphaned_tool_calls(msgs: list, logger: Any = None) -> list:
     return msgs
 
 
+def dedupe_tool_outputs(msgs: list) -> list:
+    """فقط اولین ``ToolMessage`` به‌ازای هر ``tool_call_id`` را نگه می‌دارد.
+
+    نگهبان نهاییِ قبل از هر درخواست provider: تاریخچهٔ تکراریِ front-end،
+    چک‌پوینت خراب یا compaction ممکن است دو خروجی برای یک call_id بسازد که
+    provider آن را با خطای 400 «Duplicate function_call_output for call_id»
+    رد می‌کند.
+    """
+    seen: set[str] = set()
+    out: list = []
+    for m in msgs:
+        if isinstance(m, ToolMessage):
+            if m.tool_call_id in seen:
+                continue
+            seen.add(m.tool_call_id)
+        out.append(m)
+    return out
+
+
+def append_tool_result(msgs: list, content: Any, tool_call_id: str) -> bool:
+    """فقط وقتی ``ToolMessage`` اضافه می‌کند که این ``tool_call_id`` بی‌جواب باشد.
+
+    اگر جواب از قبل موجود باشد ``False`` برمی‌گرداند (تکراری حذف می‌شود):
+    دو خروجی برای یک call_id خطای 400 «Duplicate function_call_output for
+    call_id» را می‌سازد.
+    """
+    if any(
+        isinstance(m, ToolMessage) and m.tool_call_id == tool_call_id for m in msgs
+    ):
+        return False
+    msgs.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+    return True
+
+
+def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> None:
+    """یکتاسازیِ in-place همهٔ idهای ``tool_call`` داخل یک پیام assistant.
+
+    برخی providerها شناسهٔ ساده (عددی یا تکرارشونده بین فراخوانی‌ها) صادر
+    می‌کنند، طوری که یک پیام می‌تواند دو ``tool_calls`` با یک id داشته باشد؛
+    هر دو آن‌گاه یک ToolMessage مشترک می‌خواهند و provider پاسخ را با خطای
+    400 «Duplicate function_call_output for call_id» رد می‌کند. تکراری‌ها
+    قبل از ذخیرهٔ پیام پسوند ``#N`` می‌گیرند تا هر فراخوانی با id خودش جواب
+    بگیرد (نتیجه‌ها بعد از این اجرا append می‌شوند).
+
+    با ``reserved_ids`` می‌توان idهای موجود در تاریخچه را هم رزرو کرد؛
+    در غیر این صورت provider اگر شناسهٔ مرحلهٔ قبل (مثلاً ``1``) را دوباره
+    برگرداند، نتیجهٔ جدید به‌اشتباه به خروجی قدیمی وصل می‌شود.
+
+    تغییر نام در ``tool_call_chunks`` و blob خام
+    ``additional_kwargs["tool_calls"]`` هم اعمال می‌شود (اگر ترتیب‌شان با
+    ``tool_calls`` یکی باشد) چون ``model_copy`` بعدی ``tool_calls`` را از
+    همان‌ها بازاستخراج می‌کند (نگاه کن به ``strip_orphaned_tool_calls``) و
+    بدون این کار، idهای تکراری برمی‌گشتند.
+    """
+    tcs = getattr(ai, "tool_calls", None) or []
+    if not tcs:
+        return
+    renames: dict[int, str] = {}
+    seen: set[str] = set(reserved_ids or ())
+    for idx, tc in enumerate(tcs):
+        raw = str(tc.get("id") or "")
+        cid = raw or "call"
+        if cid in seen:
+            n = 2
+            while f"{cid}#{n}" in seen:
+                n += 1
+            cid = f"{cid}#{n}"
+        if cid != raw:
+            tc["id"] = cid
+            renames[idx] = cid
+        seen.add(cid)
+    if not renames:
+        return
+    chunks = getattr(ai, "tool_call_chunks", None) or []
+    if len(chunks) == len(tcs):
+        for idx, new_id in renames.items():
+            c = chunks[idx]
+            if isinstance(c, dict):
+                c["id"] = new_id
+            else:
+                with contextlib.suppress(Exception):
+                    c.id = new_id
+    raw_tcs = (getattr(ai, "additional_kwargs", None) or {}).get("tool_calls")
+    if isinstance(raw_tcs, list) and len(raw_tcs) == len(tcs):
+        for idx, new_id in renames.items():
+            entry = raw_tcs[idx]
+            if isinstance(entry, dict):
+                entry["id"] = new_id
+
+
 # ── Batchable-call detection (shared by both tool loops) ──────────────────
 # The model keeps firing one grep/glob/read per turn even though the tools
 # accept batch parameters (grep `patterns=[...]`, read `filePaths=[...]` /
@@ -1305,6 +1395,9 @@ async def langchain_tool_loop(
         # ToolMessages (which causes a 400 "missing results for
         # tool_call_id(s)" validation error).
         strip_orphaned_tool_calls(msgs, _logger)
+        # نگهبان نهاییِ «یک خروجی به‌ازای هر call_id» (compaction یا چک‌پوینت
+        # خراب ممکن است دو ToolMessage برای یک call_id بسازد).
+        msgs[:] = dedupe_tool_outputs(msgs)
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The
@@ -1351,6 +1444,15 @@ async def langchain_tool_loop(
                         _unit = max(20, _unit // 2)
                     content = content[: _unit * 3] + " … [repetition loop truncated]"
             return str(content) if isinstance(content, str) else str(content or "")
+        # idهای تکراری داخل همین پیام یک ToolMessage مشترک می‌خواهند و provider
+        # با «Duplicate function_call_output» پاسخ را رد می‌کند — قبل از ثبت
+        # پیام یکتاشان کن تا هر فراخوانی جواب خودش را بگیرد.
+        _reserved_tc_ids = {
+            str(m.tool_call_id)
+            for m in msgs
+            if isinstance(m, ToolMessage) and m.tool_call_id
+        }
+        dedupe_step_tool_call_ids(ai, _reserved_tc_ids)
         msgs.append(ai)
         # ── Deduplicate identical tool calls ──────────────────────────
         # The model sometimes outputs the same (name, args) pair twice in one
@@ -1406,12 +1508,10 @@ async def langchain_tool_loop(
         _batch_hint = _step_hint or _streak_hint
         _results = await execute_readonly_calls(_parallel, _exec)
         for tc, result in zip(_parallel, _results):
-            msgs.append(
-                ToolMessage(content=str(result), tool_call_id=tc.get("id", ""))
-            )
+            append_tool_result(msgs, str(result), tc.get("id", ""))
         for tc in _sequential:
             result = await _exec(tc)
-            msgs.append(ToolMessage(content=str(result), tool_call_id=tc.get("id", "")))
+            append_tool_result(msgs, str(result), tc.get("id", ""))
         # Emit ToolMessages for duplicate tool calls that were deduped above so
         # the LLM sees a result for every tool_call_id it originally sent.
         if _dup_ids:
@@ -1421,9 +1521,7 @@ async def langchain_tool_loop(
                         isinstance(_m, ToolMessage)
                         and getattr(_m, "tool_call_id", "") == _orig_id
                     ):
-                        msgs.append(
-                            ToolMessage(content=_m.content, tool_call_id=_dup_id)
-                        )
+                        append_tool_result(msgs, _m.content, _dup_id)
                         break
         # Batching reminder: delivered as its OWN HumanMessage AFTER the tool
         # results (same placement as the steering messages below) — a
@@ -1543,6 +1641,7 @@ async def _auto_compact_subagent(
     had_system = bool(msgs) and isinstance(msgs[0], SystemMessage)
     if had_system:
         rebuilt.append(msgs[0])
+    _cid_n = 0
     for d in new_history:
         role = d.get("role")
         content = str(d.get("content") or "")
@@ -1559,7 +1658,12 @@ async def _auto_compact_subagent(
         if role == "assistant":
             rebuilt.append(AIMessage(content=content))
         elif role == "tool":
-            rebuilt.append(ToolMessage(content=content, tool_call_id="__compacted__"))
+            # NOTE: چند ToolMessage خلاصه‌شده با یک tool_call_id ثابت
+            # خطای 400 «Duplicate function_call_output» می‌سازد؛ شناسه‌ها
+            # را شمارشی یکتا نگه می‌داریم تا گارد pre-flight پاکشان نکند.
+            _cid = f"__compacted__#{_cid_n}" if _cid_n else "__compacted__"
+            _cid_n += 1
+            rebuilt.append(ToolMessage(content=content, tool_call_id=_cid))
         else:
             rebuilt.append(HumanMessage(content=content))
     msgs[:] = rebuilt

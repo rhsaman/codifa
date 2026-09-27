@@ -495,6 +495,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
   const setWhisperModel = useStore((s) => s.setWhisperModel)
   const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
+  const sttProviderId = useStore((s) => s.sttProviderId)
+  const sttModel = useStore((s) => s.sttModel)
+  const setSttProviderId = useStore((s) => s.setSttProviderId)
+  const setSttModel = useStore((s) => s.setSttModel)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
@@ -1987,6 +1991,35 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 refreshes automatically while a download runs.
               </div>
               {modelsMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{modelsMsg}</div>}
+
+              <div className="mcp-card open">
+                <div className="mcp-card-head">
+                  <span className="mcp-chevron open">▶</span>
+                  <span className="mcp-card-title">Speech-to-Text source</span>
+                </div>
+                <div className="mcp-fields">
+                  <div className="hint">
+                    Choose which provider transcribes voice input. <code>Local Whisper</code> runs
+                    fully offline on your machine; any other entry sends the recording to that
+                    provider's OpenAI-compatible <code>/audio/transcriptions</code> endpoint.
+                  </div>
+                  <label className="field-label">STT provider</label>
+                  <select value={sttProviderId} onChange={(e) => setSttProviderId(e.target.value)} dir="ltr">
+                    <option value="local">Whisper لوکال — آفلاین</option>
+                    {providers.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                      </option>
+                    ))}
+                  </select>
+                  {sttProviderId !== 'local' && (
+                    <>
+                      <label className="field-label">STT model</label>
+                      <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
+                    </>
+                  )}
+                </div>
+              </div>
 
               <div className="mcp-card open">
                 <div className="mcp-card-head">

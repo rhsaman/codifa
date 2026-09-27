@@ -102,21 +102,39 @@ export interface ModelsResult {
   reasoning: Record<string, boolean>
 }
 
+/** Remote STT provider details forwarded to POST /transcribe. Omit for local Whisper. */
+export interface TranscribeProviderOpts {
+  kind: string
+  baseUrl: string
+  apiKey?: string
+  envVar?: string
+  model?: string
+}
+
 /**
- * Transcribe a recorded audio blob using the local Whisper model in the sidecar.
- * Returns the transcribed text. Fully local and offline (the Whisper "small"
- * model ships inside the packaged backend/whisper/ folder).
+ * Transcribe a recorded audio blob via the sidecar.
+ * Local (no opts): on-device Whisper, fully offline.
+ * Remote (opts): forwarded to POST {base_url}/audio/transcriptions.
+ * Returns the transcribed text.
  */
 export async function transcribeAudio(
   blob: Blob,
   onModelLoading?: (loading: boolean) => void,
   lang?: string,
+  opts?: TranscribeProviderOpts,
 ): Promise<string> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const form = new FormData()
   form.append('audio', blob, 'clip.wav')
   if (lang) form.append('lang', lang)
+  if (opts) {
+    form.append('provider', opts.kind)
+    form.append('base_url', opts.baseUrl)
+    if (opts.apiKey) form.append('api_key', opts.apiKey)
+    if (opts.envVar) form.append('env_var', opts.envVar)
+    if (opts.model) form.append('model', opts.model)
+  }
   if (onModelLoading) onModelLoading(true)
   try {
     const res = await fetch(`${url}/transcribe`, {

@@ -155,6 +155,7 @@ console.log('۴) رندر SSR دکمه‌ها:')
   const { renderToString } = await import('react-dom/server')
   const { ModelTestButton } = await import('../src/components/ModelTestButton')
   const { ProviderTestButton } = await import('../src/components/ProviderTestButton')
+  const { RecentTestButton } = await import('../src/components/RecentTestButton')
   const html = renderToString(<ModelTestButton cfg={cfg} model="test-model" />)
   check('کلاس pm-model-test در HTML است', html.includes('pm-model-test'), html)
   check('آیکون رعد SVG در حالت idle رندر می‌شود', html.includes('pm-test-bolt'), html)
@@ -163,6 +164,41 @@ console.log('۴) رندر SSR دکمه‌ها:')
   check('دکمهٔ پروایدر هم آیکون رعد دارد', phtml.includes('pm-test-bolt'), phtml)
   check('دکمهٔ پروایدر در حالت idle هیچ ✓ ندارد', !phtml.includes('✓'), phtml)
   check('دکمهٔ پروایدر در حالت idle هیچ ✕ ندارد', !phtml.includes('✕'), phtml)
+  const rhtml = renderToString(<RecentTestButton entries={[{ cfg, model: 'a' }]} />)
+  check('کلاس pm-recent-test در HTML است', rhtml.includes('pm-recent-test'), rhtml)
+  check('دکمهٔ Recent هم آیکون رعد دارد', rhtml.includes('pm-test-bolt'), rhtml)
+  check('دکمهٔ Recent در حالت idle هیچ ✓ ندارد', !rhtml.includes('✓'), rhtml)
+  check('دکمهٔ Recent در حالت idle هیچ ✕ ندارد', !rhtml.includes('✕'), rhtml)
+}
+
+console.log('۵) runMixedTests — تست مدل‌های اخیر از چند پروایدر:')
+{
+  const { runMixedTests, getTestEntry, clearModelTests } = await import('../src/lib/useModelTests.ts')
+  clearModelTests()
+  const cfg2 = { ...cfg, id: 'p2', name: 'Second Provider' }
+
+  ;(globalThis as any).fetch = async (url: string, init?: any) => {
+    if (url.endsWith('/models/test')) {
+      const body = JSON.parse((init?.body as string) ?? '{}')
+      if (body.model === 'bad') {
+        return { ok: false, status: 400, json: async () => ({ detail: 'boom-bad' }) } as any
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, reply: 'OK' }) } as any
+    }
+    return new Response('', { status: 200 })
+  }
+
+  await runMixedTests([
+    { cfg, model: 'good' },
+    { cfg: cfg2, model: 'bad' },
+  ])
+  check('مدل good پروایدر اول → ok', getTestEntry(cfg, 'good').status === 'ok', getTestEntry(cfg, 'good'))
+  check('مدل bad پروایدر دوم → fail', getTestEntry(cfg2, 'bad').status === 'fail', getTestEntry(cfg2, 'bad'))
+  check('کلیدها جدا هستند (good در p2 دست‌نخورده)', getTestEntry(cfg2, 'good').status === 'idle', getTestEntry(cfg2, 'good'))
+
+  // لیست خالی no-op است و خطا نمی‌دهد.
+  await runMixedTests([])
+  check('لیست خالی خطا نمی‌دهد', true)
 }
 
 if (failed > 0) {

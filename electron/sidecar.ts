@@ -180,9 +180,9 @@ async function doStart(): Promise<SidecarHandle> {
     if (text) console.error('[sidecar]', text)
   })
   child.on('exit', (code, signal) => {
-    if (stopping) {
+    const wasStopping = stopping
+    if (wasStopping) {
       console.log(`[sidecar] stopped (${signal || 'exit'})`)
-      stopping = false
     } else if (code === null) {
       // A crash (not a clean stop) leaves the renderer with a stale cached URL.
       // Make the log actionable: hint at the two most common silent causes so a
@@ -202,11 +202,12 @@ async function doStart(): Promise<SidecarHandle> {
     // CTranslate2/onnxruntime, OOM, etc.) leaves the renderer holding a stale
     // cached URL that keeps returning "Failed to fetch". Tell every window so
     // the client drops its cache and re-resolves (restarting) on the next call.
-    if (!stopping) {
+    if (!wasStopping) {
       for (const w of BrowserWindow.getAllWindows()) {
         if (!w.isDestroyed()) w.webContents.send('sidecar:dead')
       }
     }
+    stopping = false
   })
   child.on('error', (err) => {
     console.error('[sidecar] spawn error', err)
@@ -230,6 +231,7 @@ async function doStart(): Promise<SidecarHandle> {
     }
     await new Promise((r) => setTimeout(r, 400))
   }
+  stopping = true
   child.kill()
   throw new Error('Python sidecar did not become healthy; run `npm run setup`')
 }
@@ -257,9 +259,10 @@ export async function stopSidecar(timeoutMs = 5000): Promise<void> {
   handle = null
   stopping = true
   const proc = current.process
-  // Already gone — nothing to wait for.
+  // Already gone — nothing to wait for. Keep `stopping` set so the pending
+  // `exit` handler still treats this as an intentional stop and does not
+  // emit a false `sidecar:dead`; the handler itself resets the flag.
   if (proc.exitCode !== null) {
-    stopping = false
     return
   }
   await new Promise<void>((resolve) => {

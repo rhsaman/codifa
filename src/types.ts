@@ -126,6 +126,8 @@ export interface Settings {
   sidebarOpen?: boolean
   /** پنل code map سمت راست (Ctrl+O) باز باشد یا نه — مثل sidebarOpen persisted می‌شود. */
   codeMapPanelOpen?: boolean
+  /** پنل راست داک‌شده (تودوها + بخش‌های آینده) — مثل sidebarOpen persisted می‌شود. */
+  rightPanelOpen?: boolean
   /** Directory for the per-workspace RAG vector store (memory + web chunks).
    *  Empty string = default ({dataPath}/vector-db). */
   vectorDbPath?: string

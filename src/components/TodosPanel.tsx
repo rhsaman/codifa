@@ -1,24 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import type { ChatMessage } from "../types";
-
-/** عرض ثابت پنل شناور (px) — برای clamp افقی و مهاجرت موقعیت قدیمی. */
-const PANEL_W = 300;
-
-/** وضعیت ذخیره‌شدهٔ پنل Todos (localStorage با کلید `coder:todoPanel`):
- *  فاصله از لبهٔ راست پنجره، فاصله از بالا، حالت جمع‌شده و ارتفاع‌های
- *  per-chat. لنگرِ «راست» یعنی با بزرگ/کوچک‌شدن پنجره، فاصله از لبهٔ
- *  راست خودکار حفظ می‌شود و پنل از گوشه نمی‌پرد. */
-interface TodoPanelUi {
-  right?: number;
-  y?: number;
-  collapsed?: boolean;
-  /** ارتفاع‌های صریحِ ریسایزشده به‌ازای هر چت — کلید = chatId؛ چت بدون
-   *  رکورد پیش‌فرضِ بر اساس تعداد todo می‌گیرد. */
-  heights?: Record<string, number>;
-}
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
  *  خالص (pure) تا تست بتواند مستقیم صدا بزند (همان الگوی buildGroups). */
@@ -30,6 +13,21 @@ export function latestTodos(
     if (plan && plan.length > 0) return plan;
   }
   return [];
+}
+
+/** عرض ثابت پنل شناور قدیمی (px) — فقط برای clamp و مهاجرت موقعیت قدیمی. */
+const PANEL_W = 300;
+
+/** وضعیت ذخیره‌شدهٔ پنل Todos (localStorage با کلید `coder:todoPanel`):
+ *  حالت جمع‌شده و ارتفاع‌های per-chat. موقعیت (right/y) نسخهٔ شناور قدیمی
+ *  است و فقط برای مهاجرت خوانده می‌شود — پنل جدید داک‌شده است و موقعیت ندارد. */
+export interface TodoPanelUi {
+  right?: number;
+  y?: number;
+  collapsed?: boolean;
+  /** ارتفاع‌های صریحِ ریسایزشده به‌ازای هر چت — کلید = chatId؛ چت بدون
+   *  رکورد پیش‌فرضِ بر اساس تعداد todo می‌گیرد. */
+  heights?: Record<string, number>;
 }
 
 /** خواندن وضعیت ذخیره‌شدهٔ پنل؛ مهاجرت از نسخهٔ x (لنگر چپ) به right
@@ -64,8 +62,9 @@ export function loadTodoPanelUi(): TodoPanelUi {
   return {};
 }
 
-/** پنل شناور همیشه قابل‌گرفتن بماند: افقی حداقل ۴۰px از پنل داخل
- *  viewport بماند؛ عمودی هدر (بالای پنل) از بالا/پایین پنجره بیرون نزند. */
+/** سازگاری با تست‌ها و مهاجرت موقعیت قدیمی: افقی حداقل ۴۰px از پنل داخل
+ *  viewport بماند؛ عمودی هدر از بالا/پایین بیرون نزند. پنل داک‌شدهٔ جدید
+ *  از این استفاده نمی‌کند (موقعیت ندارد). */
 export function clampPos(right: number, y: number, vw: number, vh: number) {
   return {
     right: Math.max(-(PANEL_W - 40), Math.min(vw - 40, right)),
@@ -100,7 +99,10 @@ export function heightForChat(
   return heights?.[chatId] ?? defaultHeightFor(todoCount);
 }
 
-export function TodosPanel() {
+/** بخش تودوهای داخل پنل راست داک‌شده — بدون درگ و شناور بودن؛ ارتفاع
+ *  کاملاً داینامیک از روی محتواست (بدون height ثابت؛ لیست خودش به‌اندازهٔ
+ *  متن‌ها بلند می‌شود و فقط سقف max-height دارد تا اسکرول بیاید). */
+export function TodosSection() {
   const chats = useStore((s) => s.chats);
   const activeChatId = useStore((s) => s.activeChatId);
   const dir = useStore((s) => s.dir);
@@ -110,38 +112,14 @@ export function TodosPanel() {
   );
 
   const [ui] = useState(loadTodoPanelUi);
-  // جای پیش‌فرض: گوشهٔ بالا-راست، زیر نوار عنوان (titlebar ۳۸px + ۸px حاشیه).
-  const [pos, setPos] = useState(() => ({
-    right: ui.right ?? 16,
-    y: ui.y ?? 46,
-  }));
   const [collapsed, setCollapsed] = useState(ui.collapsed ?? false);
-  const chatId = activeChatId || "";
-  // ارتفاع‌های صریحِ ریسایزشدهٔ هر چت (کلید = chatId). ارتفاع مؤثر از همین
-  // نقشه derive می‌شود: چتِ ریسایزشده مقدار خودش را نگه می‌دارد (سوییچ
-  // چت همان مقدار برمی‌گردد) و چتِ بدون ریسایز زنده با تعداد todoهایش
-  // بزرگ/کوچک می‌شود.
-  const [heights, setHeights] = useState<Record<string, number>>(
-    ui.heights ?? {},
-  );
-  const height = heightForChat(heights, chatId, todos.length);
 
-  // ذخیره با debounce (درگ هر فریم state عوض می‌کند؛ نوشتن localStorage در
-  // هر فریم درگ را می‌لرزاند) + flush هم‌زمان روی بستن اپ — همان الگوی
-  // coder:sidebarUi در سایدبار.
+  // ذخیرهٔ حالت جمع‌شدن با debounce + flush روی بستن اپ.
   const persist = () => {
     try {
       localStorage.setItem(
         "coder:todoPanel",
-        JSON.stringify({
-          right: pos.right,
-          y: pos.y,
-          collapsed,
-          // v2 = ارتفاع‌ها per-chat و فقط از ریسایز صریح می‌آیند؛
-          // مهاجرتِ loadTodoPanelUi ذخیره‌های قدیمی‌تر را یک‌بار پاک می‌کند.
-          v: 2,
-          heights,
-        }),
+        JSON.stringify({ collapsed, v: 2 }),
       );
     } catch {
       /* خطای quota — ذخیره نمی‌شود */
@@ -150,7 +128,7 @@ export function TodosPanel() {
   useEffect(() => {
     const t = setTimeout(persist, 250);
     return () => clearTimeout(t);
-  }, [pos, collapsed, heights]);
+  }, [collapsed]);
   useEffect(() => {
     window.addEventListener("coder:flush-ui", persist);
     window.addEventListener("beforeunload", persist);
@@ -160,159 +138,50 @@ export function TodosPanel() {
       window.removeEventListener("beforeunload", persist);
       window.removeEventListener("pagehide", persist);
     };
-  }, [pos, collapsed, heights]);
-
-  // ریسپانسیو: چون لنگر «راست/بالا» است، فاصله از لبه‌ها با تغییر اندازهٔ
-  // پنجره خودکار حفظ می‌شود؛ فقط اگر پنل بیرون از viewport بیفتد (مثلاً
-  // مانیتور کوچک‌تر) به داخل کشیده می‌شود.
-  useEffect(() => {
-    const clamp = () =>
-      setPos((p) => {
-        const c = clampPos(p.right, p.y, window.innerWidth, window.innerHeight);
-        return c.right === p.right && c.y === p.y ? p : c;
-      });
-    clamp();
-    window.addEventListener("resize", clamp);
-    return () => window.removeEventListener("resize", clamp);
-  }, []);
-
-  // درگ هدر برای جابه‌جایی پنل. کلیکِ بدون حرکت همچنان collapse را toggle
-  // می‌کند — با پرچم suppressClick بعد از درگ واقعی، click دور می‌شود.
-  const moveDrag = useRef<{
-    startX: number;
-    startY: number;
-    right: number;
-    y: number;
-    moved: boolean;
-  } | null>(null);
-  const suppressClick = useRef(false);
-  const startMove = (e: React.MouseEvent) => {
-    e.preventDefault();
-    moveDrag.current = {
-      startX: e.clientX,
-      startY: e.clientY,
-      right: pos.right,
-      y: pos.y,
-      moved: false,
-    };
-    const onMove = (ev: MouseEvent) => {
-      if (!moveDrag.current) return;
-      const dx = ev.clientX - moveDrag.current.startX;
-      const dy = ev.clientY - moveDrag.current.startY;
-      if (Math.abs(dx) + Math.abs(dy) > 3) moveDrag.current.moved = true;
-      setPos(
-        clampPos(
-          moveDrag.current.right - dx,
-          moveDrag.current.y + dy,
-          window.innerWidth,
-          window.innerHeight,
-        ),
-      );
-    };
-    const onUp = () => {
-      if (moveDrag.current?.moved) suppressClick.current = true;
-      moveDrag.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  // هندل بالای بدنه: کشیدن به پایین = کوچک‌شدن از بالا. y پنل هم‌زمان
-  // با ارتفاع جابه‌جا می‌شود تا لبهٔ پایین پنل سر جای خودش بماند و فقط
-  // لبهٔ بالا حرکت کند — همان رفتار ریسایز پنجره‌های OS.
-  const heightDrag = useRef<{
-    startY: number;
-    startH: number;
-    panelY: number;
-  } | null>(null);
-  const startHeightResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    heightDrag.current = {
-      startY: e.clientY,
-      startH: height,
-      panelY: pos.y,
-    };
-    const onMove = (ev: MouseEvent) => {
-      // مقادیر درگ را قبل از setPos در متغیر محلی می‌گیریم — updaterِ
-      // setPos ممکن است بعد از mouseup اجرا شود، وقتی ref را null کرده‌ایم.
-      const drag = heightDrag.current;
-      if (!drag) return;
-      const dy = ev.clientY - drag.startY;
-      const h = Math.max(60, Math.min(760, drag.startH - dy));
-      setHeights((prev) => withChatHeight(prev, chatId, h));
-      setPos((p) => ({
-        ...p,
-        y: Math.max(8, drag.panelY + (drag.startH - h)),
-      }));
-    };
-    const onUp = () => {
-      heightDrag.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  // هندل پایین بدنه: کشیدن به پایین = بزرگ‌شدن از پایین (y ثابت می‌ماند).
-  const startBottomResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startY = e.clientY;
-    const startH = height;
-    const onMove = (ev: MouseEvent) => {
-      const dy = ev.clientY - startY;
-      const h = Math.max(60, Math.min(760, startH + dy));
-      setHeights((prev) => withChatHeight(prev, chatId, h));
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
+  }, [collapsed]);
 
   if (todos.length === 0) return null;
 
-  return createPortal(
+  const done = todos.filter((t) => t.status === "completed").length;
+  const pct = todos.length === 0 ? 0 : Math.round((done / todos.length) * 100);
+
+  return (
     <div
-      className={`sidebar-panel todos-float${collapsed ? " collapsed" : ""}`}
+      className={`sidebar-panel todos-docked${collapsed ? " collapsed" : ""}`}
       dir={dir}
-      style={{ right: pos.right, top: pos.y }}
     >
       <div
         className="sidebar-panel-head"
-        title="Drag to move · click to collapse"
-        onMouseDown={startMove}
-        onClick={() => {
-          if (suppressClick.current) {
-            suppressClick.current = false;
-            return;
+        role="button"
+        tabIndex={0}
+        title="Click to collapse"
+        onClick={() => setCollapsed((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setCollapsed((v) => !v);
           }
-          setCollapsed((v) => !v);
         }}
       >
         <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
         <span className="sidebar-panel-title">Todos</span>
         <span className="sidebar-panel-count">
-          {todos.filter((t) => t.status === "completed").length}/{todos.length}
+          {done}/{todos.length}
         </span>
       </div>
       {!collapsed && (
         <>
-          {/* دستگیرهٔ بالا: با position:absolute روی لبهٔ بالای کادر
-              (روی هدر) — کشیدن به بالا بزرگ می‌کند (y هم‌زمان جابه‌جا
-              می‌شود). */}
           <div
-            className="sidebar-panel-resize"
-            title="Drag down to shrink from the top, up to grow"
-            onMouseDown={startHeightResize}
-          />
-          {/* height ثابت (نه maxHeight) تا ریسایز همیشه اثر بصری داشته
-              باشد حتی وقتی محتوا کوتاه‌تر است — لیست خودش اسکرول می‌شود. */}
-          <ul className="sidebar-todos-list" style={{ height }}>
+            className="sidebar-todos-progress"
+            role="progressbar"
+            aria-valuenow={pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`${done} of ${todos.length} todos done`}
+          >
+            <div className="sidebar-todos-progress-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <ul className="sidebar-todos-list">
             {todos.map((t, i) => (
               <li
                 key={i}
@@ -331,16 +200,110 @@ export function TodosPanel() {
               </li>
             ))}
           </ul>
-          {/* دستگیرهٔ پایین: روی لبهٔ پایین باکس (بعد از لیست) — کشیدن
-              به پایین بزرگ می‌کند. */}
-          <div
-            className="sidebar-panel-resize bottom"
-            title="Drag down to grow, up to shrink from the bottom"
-            onMouseDown={startBottomResize}
-          />
         </>
       )}
-    </div>,
-    document.body,
+    </div>
+  );
+}
+
+/** نگه‌داشت سازگاری: رندر شناور قدیمی حذف شد — همیشه null برمی‌گرداند تا
+ *  مانت قدیمی در App بی‌اثر بماند. */
+export function TodosPanel() {
+  return null;
+}
+
+/** پنل راست داک‌شده به سبک کلود — میزبان تودوها و بخش‌های آینده.
+ *  عرض با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و ذخیرهٔ محلی
+ *  مثل سایدبار تا بین بازشدن‌ها حفظ شود. */
+export function RightPanel() {
+  const open = useStore((s) => s.rightPanelOpen);
+  const close = useStore((s) => s.setRightPanelOpen);
+
+  // عرض پنل — با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و
+  // ذخیرهٔ محلی تا بین بازشدن‌ها حفظ شود.
+  const [width, setWidth] = useState(() => {
+    if (typeof window === "undefined") return 300;
+    const vw =
+      typeof window.innerWidth === "number" &&
+      Number.isFinite(window.innerWidth)
+        ? window.innerWidth
+        : 1024;
+    const saved = (() => {
+      try {
+        return parseInt(localStorage.getItem("coder:rightPanelWidth") ?? "", 10);
+      } catch {
+        return NaN;
+      }
+    })();
+    const n = Number.isFinite(saved) ? saved : 300;
+    return Math.max(220, Math.min(Math.max(220, vw - 24), n));
+  });
+  const dragCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    return () => {
+      dragCleanup.current?.();
+      dragCleanup.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    const onResize = () => {
+      setWidth((w) => Math.max(220, Math.min(window.innerWidth - 24, w)));
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.max(
+        220,
+        Math.min(window.innerWidth - 24, startW - (ev.clientX - startX)),
+      );
+      setWidth(w);
+      try {
+        localStorage.setItem("coder:rightPanelWidth", String(w));
+      } catch {
+        /* حافظه در دسترس نیست — عرض فقط حفظ نمی‌شود */
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragCleanup.current = null;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    dragCleanup.current = onUp;
+  };
+
+  if (!open) return null;
+  return (
+    <aside
+      className="right-panel"
+      role="complementary"
+      aria-label="Right panel"
+      style={{ width }}
+    >
+      <div
+        className="right-panel-resize-handle"
+        title="Drag to resize"
+        onMouseDown={startResize}
+      />
+      <div className="right-panel-head">
+        <button
+          className="review-header-btn"
+          title="Close panel"
+          aria-label="Close panel"
+          onClick={() => close(false)}
+        >
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+        </button>
+      </div>
+      <div className="right-panel-body">
+        <TodosSection />
+      </div>
+    </aside>
   );
 }

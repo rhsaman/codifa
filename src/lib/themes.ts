@@ -16,38 +16,38 @@ export const THEMES: Theme[] = [
     name: 'Claude',
     blurb: 'claude.ai dark',
     vars: {
-      '--bg': '#262624',
-      '--bg-alt': '#1f1e1d',
-      '--bg-panel': '#2d2d2b',
-      '--bg-input': '#333331',
-      '--bg-hover': '#3a3a37',
-      '--border': '#3d3d3a',
-      '--text': '#f0eee6',
-      '--text-dim': '#b8b6ac',
-      '--accent': '#da7a5a',
-      '--accent-dim': '#3a3734',
-      '--on-accent': '#1f1e1d',
-      '--danger': '#ea6c70',
-      '--success': '#46a758',
-      '--link': '#e88d67',
-      '--thinking': '#e8c468',
-      '--provider-openrouter': '#e8c468',
-      '--provider-google': '#46a758',
-      '--provider-nvidia': '#6bb8a8',
-      '--provider-cloudflare': '#e88d67',
-      '--provider-tokenrouter': '#d97757',
-      '--provider-ollama': '#a78bfa',
-      '--provider-custom': '#b8b6ac',
+      '--bg': '#1a1816',
+      '--bg-alt': '#16140f',
+      '--bg-panel': '#1f1c18',
+      '--bg-input': '#2d2820',
+      '--bg-hover': '#2a2620',
+      '--border': '#2b2621',
+      '--text': '#e8e6e3',
+      '--text-dim': '#9a9287',
+      '--accent': '#c15f3c',
+      '--accent-dim': '#2d2820',
+      '--on-accent': '#ffffff',
+      '--danger': '#f85149',
+      '--success': '#3fb950',
+      '--link': '#d97b5a',
+      '--thinking': '#d4a574',
+      '--provider-openrouter': '#d4a574',
+      '--provider-google': '#9fb3a6',
+      '--provider-nvidia': '#7fb4a8',
+      '--provider-cloudflare': '#d97b5a',
+      '--provider-tokenrouter': '#c15f3c',
+      '--provider-ollama': '#b1ada1',
+      '--provider-custom': '#8f8878',
     },
     workspaceColors: [
-      '#e5484d', // red
-      '#e8c468', // yellow
-      '#46a758', // green
-      '#6bb8a8', // teal
-      '#e88d67', // orange
-      '#d97757', // terracotta
-      '#a78bfa', // purple
-      '#f0eee6', // cream
+      '#c15f3c', // crail
+      '#d97b5a', // lighter crail
+      '#d4a574', // tan
+      '#e2c08d', // sand
+      '#9fb3a6', // sage
+      '#b1ada1', // cloudy
+      '#c88a91', // muted rose
+      '#e8e6e3', // pampas
     ],
   },
   {

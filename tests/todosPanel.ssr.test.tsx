@@ -232,6 +232,29 @@ console.log("۱۵) heightForChat — زنجیرهٔ fallback ارتفاع مؤث
   check("heights خالی → حداقل پیش‌فرض", heightForChat({}, "chat-x", 0) === 60)
 }
 
+console.log("۱۶) پنل راست — تاگل استور و لایه‌بندی زدایندکس:")
+{
+  const { useStore } = await import("../src/lib/store")
+  const s0 = useStore.getState()
+  const initial = s0.rightPanelOpen
+  s0.setRightPanelOpen(!initial)
+  check("setRightPanelOpen مقدار را ست می‌کند", useStore.getState().rightPanelOpen === !initial)
+  useStore.getState().toggleRightPanel()
+  check("toggleRightPanel برمی‌گرداند", useStore.getState().rightPanelOpen === initial)
+  // لایه‌بندی: پنل راست همیشه پشت مطالعه و گیت‌دیف
+  const { readFileSync } = await import("node:fs")
+  const css = readFileSync("src/styles/global.css", "utf8")
+  const pick = (name: string) => {
+    const m = css.match(new RegExp(`${name}:\\s*(\\d+)`))
+    return m ? parseInt(m[1], 10) : NaN
+  }
+  const zRight = pick("--z-right-panel")
+  const zReading = pick("--z-reading-mode")
+  const zReview = pick("--z-review-overlay")
+  check("زدایندکس پنل راست پشت مطالعه است", zRight < zReading, { zRight, zReading })
+  check("زدایندکس پنل راست پشت اورلی دیف است", zRight < zReview, { zRight, zReview })
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

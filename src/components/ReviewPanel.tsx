@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { buildReviewTurn } from "../lib/reviewTurn";
 import { buildUncommittedFiles } from "../lib/uncommitted";
 import { countDiffHits, filterFilesByQuery, locateHit, stepHitIndex } from "../lib/diffSearch";
@@ -7,7 +8,6 @@ import { splitUnifiedDiffByFile } from "../lib/reviewDiff";
 import { diffStatsFromUnified } from "../lib/toolActivity";
 import { useStore } from "../lib/store";
 import { useReviewPanel, type ReviewSource } from "../lib/reviewPanel";
-import { copyToClipboard } from "../lib/clipboard";
 import { gitDiff, gitLog, gitShow, gitStatus, type GitCommitInfo } from "../lib/api";
 import { DiffView } from "./ToolCallView";
 
@@ -94,16 +94,19 @@ export function ReviewFileAccordion({
 
 /** پنل Review به سبک کدکس — تب `Review` با فیلتر منبع (ترن / uncommitted /
  *  committed)، لیست فایل‌های تغییرکرده، و دیف تک‌ستونی فایل انتخاب‌شده.
- *  داده‌ی ترن از `messageId` در استور خوانده می‌شود تا حین استریم زنده بماند. */
+ *  داده‌ی ترن از `messageId` در استور خوانده می‌شود تا حین استریم زنده بماند.
+ *  مثل حالت مطالعه به‌صورت اورلی روی چت باز می‌شود (چت کوچک نمی‌شود)؛ با
+ *  درگ لبه بزرگ/کوچک و با دکمهٔ گوشه فول‌اسکرین می‌شود. */
 export function ReviewPanel() {
   const { messageId, selectedPath, selectPath, close, source, setSource } =
     useReviewPanel();
-  const [copied, setCopied] = useState(false);
+  // حالت فول‌اسکرین — پنل کل ویوپورت را می‌گیرد (مثل فول‌اسکرین دیف).
+  const [fullscreen, setFullscreen] = useState(false);
 
-  // عرض پنل — با درگ لبه‌ی چپ (مثل سایدبار، معکوس چون به راست داک شده) و
-  // ذخیره‌ی محلی تا بین بازشدن‌ها حفظ شود.
+  // عرض پنل — با درگ لبه (مثل مطالعه، چون اورلی به راست داک شده) و
+  // ذخیره‌ی محلی تا بین بازشدن‌ها حفظ شود. در فول‌اسکرین نادیده گرفته می‌شود.
   const [width, setWidth] = useState(() => {
-    if (typeof window === "undefined") return 520;
+    if (typeof window === "undefined") return 720;
     const vw =
       typeof window.innerWidth === "number" &&
       Number.isFinite(window.innerWidth)
@@ -116,9 +119,9 @@ export function ReviewPanel() {
         return NaN;
       }
     })();
-    const fallback = Math.round(vw * 0.46);
+    const fallback = Math.round(vw / 2) - 12;
     const n = Number.isFinite(saved) ? saved : fallback;
-    return Math.max(340, Math.min(vw - 24, n));
+    return Math.max(320, Math.min(vw - 24, n));
   });
   const dragCleanup = useRef<(() => void) | null>(null);
   useEffect(() => {
@@ -129,18 +132,26 @@ export function ReviewPanel() {
   }, []);
   useEffect(() => {
     const onResize = () => {
-      setWidth((w) => Math.max(340, Math.min(window.innerWidth - 24, w)));
+      setWidth((w) => Math.max(320, Math.min(window.innerWidth - 24, w)));
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
+  // Esc پنل را می‌بندد (مثل حالت مطالعه).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [close]);
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = width;
     const onMove = (ev: MouseEvent) => {
       const w = Math.max(
-        340,
+        320,
         Math.min(window.innerWidth - 24, startW - (ev.clientX - startX)),
       );
       setWidth(w);
@@ -331,15 +342,6 @@ export function ReviewPanel() {
   // فایلی باز نمی‌ماند، پس fallback به فایل اول نداریم.
   const selected = files.find((f) => f.path === selectedPath) ?? null;
 
-  const copyDiff = async () => {
-    if (!selected) return;
-    const ok = await copyToClipboard(selected.diff);
-    if (ok) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    }
-  };
-
   const switchSource = (next: ReviewSource) => {
     setSource(next);
     setGitError(null);
@@ -369,21 +371,24 @@ export function ReviewPanel() {
     );
   };
 
-  return (
-    <aside className="review-panel" dir="ltr" style={{ width }}>
-      <div
-        className="review-resize-handle"
-        title="Drag to resize"
-        onMouseDown={startResize}
-      />
-      <div className="review-tabs">
-        <span className="review-tab">
-          Review
-          <button className="review-tab-x" title="Close" onClick={close}>
-            ✕
-          </button>
-        </span>
-      </div>
+  const panel = (
+    <div
+      className={`review-overlay${fullscreen ? " fullscreen" : ""}`}
+      dir="ltr"
+      style={{ "--review-w": `${width}px` } as React.CSSProperties}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {/* اسکریم نرم — کلیک بیرون پنل می‌بندد (مثل حالت مطالعه). */}
+      <div className="review-scrim" aria-hidden="true" onClick={close} />
+      {/* دستگیره‌ی درگ لبه — تغییرعرض مثل مطالعه (در فول‌اسکرین مخفی). */}
+      {!fullscreen && (
+        <div
+          className="review-overlay-resize-handle"
+          title="Drag to resize"
+          onMouseDown={startResize}
+        />
+      )}
+      <aside className="review-panel review-floating-panel" dir="ltr">
       <div className="review-header">
         <span className="review-source" role="tablist" aria-label="Diff source">
           {(
@@ -412,11 +417,24 @@ export function ReviewPanel() {
         )}
         <span className="review-header-actions">
           <button
-            className={`review-icon-btn${copied ? " copied" : ""}`}
-            title="Copy diff"
-            onClick={() => void copyDiff()}
+            className="review-header-btn"
+            title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            onClick={() => setFullscreen((v) => !v)}
           >
-            {copied ? "✓" : "⧉"}
+            {fullscreen ? (
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
+            ) : (
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
+            )}
+          </button>
+          <button
+            className="review-header-btn"
+            title="Close"
+            aria-label="Close"
+            onClick={close}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
           </button>
         </span>
       </div>
@@ -511,6 +529,13 @@ export function ReviewPanel() {
       ) : (
         renderFileList(visibleFiles)
       )}
-    </aside>
+      </aside>
+    </div>
   );
+
+  // مثل حالت مطالعه از پورتال به body رندر می‌شود تا `position: fixed`
+  // نسبت به ویوپورت باشد و چت پشت آن کوچک نشود. در SSR (بدون document)
+  // مستقیم رندر می‌شود تا تست سلامت خروجی را ببیند.
+  if (typeof document === "undefined") return panel;
+  return createPortal(panel, document.body);
 }

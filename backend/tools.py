@@ -22,6 +22,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
@@ -2045,8 +2046,10 @@ def _search_python(
         }
 
     try:
-        pattern = re.compile(query, re.IGNORECASE)
-    except re.error:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FutureWarning)
+            pattern = re.compile(query, re.IGNORECASE)
+    except (re.error, FutureWarning):
         pattern = re.compile(re.escape(query), re.IGNORECASE)
 
     include_re = _include_glob_to_re(include)
@@ -4372,7 +4375,9 @@ When you need to read several files, read multiple independent files in parallel
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # بازه‌های per-path ("path:offset:limit") → پنجره‌ی اختصاصی هر فایل.
         # offset/limit سراسری همچنان برای مسیرهای بدون بازه‌ی اختصاصی اعمال می‌شود.
-        windowed: dict[str, tuple[int, int]] = {}
+        # jobs فهرست است (نه dict روی path) تا ranges تکراری هم‌فایل
+        # (مثل ["tools.py:640:60","tools.py:2089:80"]) هر دو اجرا شوند.
+        jobs: list[tuple[str, int, int]] = []
         for spec in ranges or []:
             parts = str(spec).split(":")
             if len(parts) != 3:
@@ -4380,15 +4385,16 @@ When you need to read several files, read multiple independent files in parallel
             p, o, l = parts[0].strip(), parts[1].strip(), parts[2].strip()
             if not p or not o.isdigit() or not l.isdigit():
                 continue
-            windowed[p] = (int(o), int(l))
-        all_paths = [filePath] + [
+            jobs.append((p, int(o), int(l)))
+        base_paths = [filePath] + [
             p for p in (filePaths or []) if p and p != filePath
         ]
-        # مسیرهای فقط داخل ranges هم به batch اضافه می‌شوند (بدون تکرار).
-        for p in windowed:
-            if p not in all_paths:
-                all_paths.append(p)
-        if len(all_paths) == 1 and not windowed:
+        # مسیرهای فقط داخل ranges هم به batch اضافه می‌شوند (بدون تکرار
+        # برای لاگ) — اجرای واقعی از tasks می‌آید تا تکراری‌ها حفظ شوند.
+        for p, _, _ in jobs:
+            if p not in base_paths:
+                base_paths.append(p)
+        if len(base_paths) == 1 and not jobs:
             emit(
                 {
                     "kind": "tool",
@@ -4398,12 +4404,17 @@ When you need to read several files, read multiple independent files in parallel
                 }
             )
             return await _read_target(filePath, offset, limit, _main_name)
+        job_paths = {p for p, _, _ in jobs}
+        tasks: list[tuple[str, int, int]] = [
+            (p, offset, limit) for p in base_paths if p not in job_paths
+        ]
+        tasks.extend(jobs)
         emit(
             {
                 "kind": "tool",
                 "tool": "read",
                 "args": {
-                    "filePaths": all_paths,
+                    "filePaths": base_paths,
                     "offset": offset,
                     "limit": limit,
                     **({"ranges": list(ranges)} if ranges else {}),
@@ -4414,15 +4425,9 @@ When you need to read several files, read multiple independent files in parallel
         # Read every target concurrently — same asyncio.gather pattern used for
         # parallel read-only tool calls elsewhere in the graph, just applied
         # WITHIN one tool call instead of across several parallel tool calls.
+        # tasks تکراری‌های هم‌فایل را حفظ می‌کند (هر ranges یک job جدا).
         results = await asyncio.gather(
-            *(
-                _read_target(
-                    p,
-                    *(windowed.get(p) or (offset, limit)),
-                    _main_name,
-                )
-                for p in all_paths
-            )
+            *(_read_target(p, o, l, _main_name) for p, o, l in tasks)
         )
         # فوتر خلاصه: اگر بعضی فایل‌ها خطا داده‌اند ولی بقیه موفق بوده‌اند،
         # مدل نباید فکر کند کل batch شکست خورده (رفع «خواندن دسته‌ای خطا
@@ -4430,7 +4435,7 @@ When you need to read several files, read multiple independent files in parallel
         # برمی‌گردند + یک خط خلاصه در انتها.
         _errs = [
             (p, r)
-            for p, r in zip(all_paths, results)
+            for (p, _, _), r in zip(tasks, results)
             if str(r).startswith("ERROR")
         ]
         if _errs and len(_errs) < len(results):

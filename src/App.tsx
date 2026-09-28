@@ -5,7 +5,7 @@ import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
 import { ReviewPanel } from './components/ReviewPanel'
 import { useReviewPanel } from './lib/reviewPanel'
-import { TodosPanel } from './components/TodosPanel'
+import { RightPanel } from './components/TodosPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -27,6 +27,7 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
+  const rightPanelOpen = useStore((s) => s.rightPanelOpen)
   // پنل Review سمت راست (سبک کدکس): با کلیک روی کارت edit_file/write_file باز
   // می‌شود و ترنِ همان پیام را نشان می‌دهد.
   const reviewOpen = useReviewPanel((s) => s.open)
@@ -248,6 +249,15 @@ export default function App() {
         <div className="titlebar-workspace">
           <button
             className="dir-toggle"
+            title={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
+            aria-label={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
+            aria-pressed={rightPanelOpen}
+            onClick={() => useStore.getState().toggleRightPanel()}
+          >
+            ▤
+          </button>
+          <button
+            className="dir-toggle"
             title="Git diff — uncommitted changes"
             onClick={() => useReviewPanel.getState().openGitDiff()}
           >
@@ -282,7 +292,7 @@ export default function App() {
               }}
             />
           )}
-          <TodosPanel />
+          <RightPanel />
         </ErrorBoundary>
       </div>
 

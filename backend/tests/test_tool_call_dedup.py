@@ -320,7 +320,6 @@ def test_normalize_uniquifies_ids_across_messages():
 
 
 def test_normalize_keeps_unique_ids_untouched():
-    """ترنسکریپت سالم نباید دست‌کاری شود."""
     msgs = [
         AIMessage(
             content="",
@@ -369,6 +368,25 @@ def test_dedupe_step_tool_call_ids_renames_duplicates():
     assert len(ids) == len(set(ids))
 
 
+def test_normalize_reserves_orphan_tool_output_id():
+    """خروجی یتیم (بدون فراخوانی متناظر، مثلاً از چک‌پوینت) شناسه‌اش را رزرو
+    می‌کند تا فراخوانی بعدی همان شناسه را دوباره نگیرد و خروجی تکراری نسازد."""
+    msgs = [
+        ToolMessage(content="stale", tool_call_id="1"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": "b"}, "id": "1"}],
+        ),
+        ToolMessage(content="fresh", tool_call_id="1"),
+    ]
+    _llm.normalize_tool_transcript(msgs)
+    ai_ids = [tc["id"] for m in msgs if isinstance(m, AIMessage) for tc in m.tool_calls]
+    tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
+    assert ai_ids == ["1#2"]
+    assert tool_ids == ["1", "1#2"]
+    assert len(tool_ids) == len(set(tool_ids))
+
+
 if __name__ == "__main__":
     test_duplicate_calls_executed_only_once()
     print("  ✅ test_duplicate_calls_executed_only_once")
@@ -390,4 +408,6 @@ if __name__ == "__main__":
     print("  ✅ test_normalize_uniquifies_ids_across_messages")
     test_normalize_keeps_unique_ids_untouched()
     print("  ✅ test_normalize_keeps_unique_ids_untouched")
+    test_normalize_reserves_orphan_tool_output_id()
+    print("  ✅ test_normalize_reserves_orphan_tool_output_id")
     print("\n🎉 همه تست‌های dedup رد شد")

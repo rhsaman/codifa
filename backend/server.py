@@ -1776,6 +1776,8 @@ class SteerRequest(BaseModel):
     chat_id: str = ""
     id: str = ""
     prompt: str = ""
+    attachments: list[str] = []
+    images: list = []  # قرارداد یکسان با ChatRequest شامل path و dataUrl
 
 
 @app.post("/chat/steer")
@@ -1790,7 +1792,16 @@ async def chat_steer(req: SteerRequest) -> dict:
     """
     if not req.chat_id or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="chat_id and prompt are required")
-    await _enqueue_steer(req.chat_id, {"id": req.id, "prompt": req.prompt.strip()})
+    # ذخیره متن به‌همراه فایل‌ها و عکس‌ها تا تزریق گراف کامل باشد
+    await _enqueue_steer(
+        req.chat_id,
+        {
+            "id": req.id,
+            "prompt": req.prompt.strip(),
+            "attachments": req.attachments,
+            "images": req.images,
+        },
+    )
     return {"ok": True}
 
 

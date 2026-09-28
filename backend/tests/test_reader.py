@@ -498,6 +498,24 @@ async def test_read_ranges_per_path_windows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_read_ranges_same_file_two_windows(tmp_path):
+    """رگرسیون تصویر: ranges تکراری هم‌فایل (tools.py با 640:60 و 2089:80)
+    باید هر دو بازه را برگرداند — نه فقط آخری (رفع collapse روی dict)."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 101)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py", ranges=["a.py:10:5", "a.py:30:5"])
+    # هر دو بازه در همان خروجی واحد هستند.
+    assert "10 | line10" in out
+    assert "14 | line14" in out
+    assert "30 | line30" in out
+    assert "34 | line34" in out
+    # مرزهای هر بازه رعایت شده‌اند.
+    assert "15 | line15" not in out
+    assert "35 | line35" not in out
+
+
+@pytest.mark.asyncio
 async def test_read_batch_partial_failure_footer(tmp_path):
     """رگرسیون «خواندن دسته‌ای خطا داد»: یک فایل خطادار در batch نباید کل
     نتیجه را ERROR جلوه دهد — فایل‌های سالم عادی خوانده می‌شوند و خطاها

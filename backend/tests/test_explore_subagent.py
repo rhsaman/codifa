@@ -42,6 +42,24 @@ async def test_explore_system_prompt_is_compact_and_grep_first():
     )
 
 
+async def test_explore_system_batches_searches_and_bans_chunk_walking():
+    """پرامپت explore باید ادغام سرچ‌ها، منع تکه‌خوانی ترتیبی و منع خوانش
+    تکراری را صریح بگوید — رگرسیون لاگ explore review CSS layout با ۱۹ فراخوانی
+    (سرچ‌های جدا، تکه‌خوانی global.css، خوانش تکراری Chat.tsx و global.css)."""
+    text = EXPLORE_SYSTEM
+    assert "patterns=[...]" in text, "باید ادغام چند grep/glob در یک فراخوانی را بگوید"
+    assert "ranges=[" in text, "باید خوانش چندپنجره‌ای با ranges را بگوید"
+    assert "NEVER walk a large file chunk-by-chunk" in text, (
+        "باید تکه‌خوانی ترتیبی فایل بزرگ را منع کند"
+    )
+    assert "NEVER re-read the same path:window twice" in text, (
+        "باید خوانش تکراری همان پنجره را منع کند"
+    )
+    assert "Finish ALL Glob/Grep discovery FIRST" in text, (
+        "باید ترتیب اکتشاف-اول-بعد-خوانش را صریح بگوید"
+    )
+
+
 async def test_explore_fail_note_steers_to_narrower_scope():
     """The structured failure note must tell the Main Agent to re-delegate with
     a narrower scope rather than read the whole codebase manually."""
@@ -150,6 +168,7 @@ async def test_explore_total_failure_returns_structured_note():
 
 if __name__ == "__main__":
     asyncio.run(test_explore_system_prompt_is_compact_and_grep_first())
+    asyncio.run(test_explore_system_batches_searches_and_bans_chunk_walking())
     asyncio.run(test_explore_fail_note_steers_to_narrower_scope())
     asyncio.run(test_explore_retries_then_falls_back_to_main_model())
     asyncio.run(test_explore_total_failure_returns_structured_note())

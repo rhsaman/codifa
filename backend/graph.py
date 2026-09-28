@@ -2353,6 +2353,37 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
     msgs[:] = rebuilt
 
 
+def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
+    """ساخت پیام تزریقی steer با همان قرارداد ترن عادی تا عکس هم به مدل برسد.
+
+    متن + فایل‌های ضمیمه در بخش متنی می‌آیند و عکس‌ها (dataUrl یا مسیر) به
+    بخش‌های `image_url` تبدیل می‌شوند؛ بدون عکس پیام تک‌متنه برمی‌گردد.
+    """
+    _steer_lines = [f"- {s.get('prompt')}" for s in steers]
+    _steer_atts: list[str] = []
+    _steer_imgs: list = []
+    for _s in steers:
+        _steer_atts.extend(_s.get("attachments") or [])
+        _steer_imgs.extend(_s.get("images") or [])
+    _steer_text = (
+        "[NEW USER MESSAGE DURING THIS TASK -- INTERRUPTION]\n"
+        + "\n".join(_steer_lines)
+    )
+    if _steer_atts:
+        _steer_text += (
+            "\nAttached files (in scope — read with the read tool): "
+            + ", ".join(f"`{a}`" for a in _steer_atts)
+        )
+    _steer_text += "\nAddress it before the next step."
+    _steer_uris = _agents._load_images(_steer_imgs)
+    if _steer_uris:
+        _steer_blocks: list = [{"type": "text", "text": _steer_text}]
+        for _uri in _steer_uris:
+            _steer_blocks.append({"type": "image_url", "image_url": {"url": _uri}})
+        return HumanMessage(content=_steer_blocks)
+    return HumanMessage(content=_steer_text)
+
+
 # Cap on how many times mid-turn compaction may actually FIRE within a single
 # turn, so a pathological transcript can never spin in a compact loop. The
 # post-turn backstop still runs once at the end.
@@ -2769,15 +2800,8 @@ async def _run_mode_turn(
             # Live steer injection: user messages typed mid-run.
             steers = await _agents._drain_steer(chat_id)
             if steers:
-                msgs.append(
-                    HumanMessage(
-                        content=(
-                            "[NEW USER MESSAGE DURING THIS TASK -- INTERRUPTION]\n"
-                            + "\n".join(f"- {s.get('prompt')}" for s in steers)
-                            + "\nAddress it before the next step."
-                        )
-                    )
-                )
+                # ساخت پیام چندبخشی با همان قرارداد ترن عادی تا عکس هم به مدل برسد
+                msgs.append(_steer_to_human_message(steers))
                 queue.put_nowait(
                     {"kind": "steer_applied", "ids": [s.get("id", "") for s in steers]}
                 )

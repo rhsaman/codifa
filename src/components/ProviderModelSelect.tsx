@@ -4,6 +4,7 @@ import { useStore } from "../lib/store";
 import { isForeignModelId } from "../lib/provider-meta";
 import { ModelTestButton } from "./ModelTestButton";
 import { ProviderTestButton } from "./ProviderTestButton";
+import { RecentTestButton } from "./RecentTestButton";
 
 /** Strip a redundant "providerId/" prefix from a model id (a model can get
  *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
@@ -225,7 +226,12 @@ export function ProviderModelSelect() {
           <div className="pm-scroll">
             {recentsShown.length > 0 && (
               <div className="pm-recents">
-                <div className="pm-recent-label">Recent</div>
+                <div className="pm-recent-header">
+                  <div className="pm-recent-label">Recent</div>
+                  <RecentTestButton
+                    entries={recentsShown.map(({ p, model }) => ({ cfg: p, model }))}
+                  />
+                </div>
                 {recentsShown.map(({ p, model }) => {
                   const isCurrent = p.id === activeProviderId && model === activeModel;
                   return (

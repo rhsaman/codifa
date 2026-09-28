@@ -253,7 +253,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -266,7 +266,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -388,6 +388,8 @@ interface State {
   recentModels: RecentModel[]
   sidebarOpen: boolean
   codeMapPanelOpen: boolean
+  /** پنل راست داک‌شده (تودوها + بخش‌های آینده) — مثل sidebarOpen persisted می‌شود. */
+  rightPanelOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
@@ -459,6 +461,8 @@ interface State {
   toggleSidebar: () => void
   setCodeMapPanelOpen: (open: boolean) => void
   toggleCodeMapPanel: () => void
+  setRightPanelOpen: (open: boolean) => void
+  toggleRightPanel: () => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
@@ -734,6 +738,7 @@ export const useStore = create<State>((set, get) => ({
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
   codeMapPanelOpen: false,
+  rightPanelOpen: true,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -1006,6 +1011,7 @@ export const useStore = create<State>((set, get) => ({
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
       codeMapPanelOpen: raw.codeMapPanelOpen === true,
+      rightPanelOpen: raw.rightPanelOpen !== false,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
       pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
@@ -1513,6 +1519,16 @@ export const useStore = create<State>((set, get) => ({
   toggleCodeMapPanel: () => {
     const next = !get().codeMapPanelOpen
     get().setCodeMapPanelOpen(next)
+  },
+
+  setRightPanelOpen: (rightPanelOpen) => {
+    set({ rightPanelOpen })
+    get().persist()
+  },
+
+  toggleRightPanel: () => {
+    const next = !get().rightPanelOpen
+    get().setRightPanelOpen(next)
   },
 
   setRecentModels: (recentModels) => {

@@ -749,6 +749,8 @@ export async function steerChat(
   chatId: string,
   id: string,
   prompt: string,
+  attachments: string[] = [],
+  images: Array<{ path: string; name: string; dataUrl?: string }> = [],
 ): Promise<boolean> {
   const url = await ensureSidecar()
   if (!url) return false
@@ -756,7 +758,7 @@ export async function steerChat(
     const res = await fetch(`${url}/chat/steer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, id, prompt }),
+      body: JSON.stringify({ chat_id: chatId, id, prompt, attachments, images }),
     })
     if (!res.ok) return false
     const body = (await res.json().catch(() => ({}))) as { ok?: boolean }

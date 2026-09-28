@@ -60,6 +60,31 @@ function check(name: string, cond: boolean, extra?: unknown) {
   check('خلاصهٔ قبلی فولد شده (در scrollback)', msgs.some((m) => m.compacted && m.content === '[Compacted earlier context]\nخلاصه اول'), msgs.map((m) => ({ c: m.content, f: m.compacted })))
 }
 
+// سناریو ۳: پیام صف‌شده حین کامپکت باید attachments و images را حفظ کند تا بعد
+// از اتمام کامپکت کامل تحویل داده شود (رگرسیون باگ حذف عکس در queue).
+{
+  console.log('── queue حین compacting: حفظ عکس و فایل ──')
+  const s = useStore.getState()
+  const chatId = s.newChat('ask')
+  s.setChatCompacting(chatId, true)
+  s.queueMessage(chatId, {
+    id: 'q-img-1',
+    text: 'این عکس را ببین',
+    attachments: ['a.txt'],
+    images: [{ path: '/tmp/x.png', name: 'x.png', dataUrl: 'data:image/png;base64,AAA' }],
+    kind: 'queue',
+  })
+  const q = useStore.getState().chats.find((c) => c.id === chatId)!.queued![0]
+  check('متن صف حفظ شده', q.text === 'این عکس را ببین', q)
+  check('attachments حفظ شده', q.attachments?.length === 1 && q.attachments[0] === 'a.txt', q)
+  check('images با dataUrl حفظ شده', q.images?.length === 1 && q.images[0].dataUrl === 'data:image/png;base64,AAA', q)
+  check('پرچم compacting روشن است', useStore.getState().chats.find((c) => c.id === chatId)!.compacting === true)
+  // پایان کامپکت: پرچم می‌افتد ولی صف می‌ماند تا تخلیه شود
+  s.setChatCompacting(chatId, false)
+  const qAfter = useStore.getState().chats.find((c) => c.id === chatId)!.queued!.filter((x) => !x.sent)
+  check('صف بعد از کامپکت هنوز برای تحویل هست', qAfter.length === 1 && qAfter[0].images?.length === 1, qAfter)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

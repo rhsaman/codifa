@@ -34,6 +34,7 @@ import {
 } from "./ToolCallView";
 import { ReadingMode } from "./ReadingMode";
 import { Mermaid } from "./Mermaid";
+import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
@@ -862,6 +863,11 @@ const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file"]);
  *  Used both for standalone user messages and for interleaved steer segments so
  *  the icons always match the main user message. `className` is applied to the
  *  bubble wrapper (e.g. "seg-steer" for the interleaved steer look). */
+// Claude-style folding threshold for long user text (attachments/images
+// always stay visible, only the text clamps).
+const USER_COLLAPSE_CHARS = 600;
+const USER_COLLAPSE_LINES = 10;
+
 function UserMessageBubble({
   message,
   onRetry,
@@ -873,6 +879,12 @@ function UserMessageBubble({
 }) {
   const dir = useStore((s) => s.dir);
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const content = message.content || "";
+  const isLong =
+    content.length > USER_COLLAPSE_CHARS ||
+    content.split("\n").length > USER_COLLAPSE_LINES;
+  const clamped = isLong && !expanded;
 
   const copy = async () => {
     try {
@@ -887,9 +899,21 @@ function UserMessageBubble({
   return (
     <>
       <div className={`msg-bubble${className ? ` ${className}` : ""}`}>
-        <div className="chat-message user-text" dir={dir}>
+        <div
+          className={`chat-message user-text${clamped ? " clamped" : ""}`}
+          dir={dir}
+        >
           {cachedPrepare(message.id, message.content, dir) || "(empty)"}
         </div>
+        {isLong && (
+          <button
+            className="msg-expand"
+            onClick={() => setExpanded((e) => !e)}
+            aria-expanded={expanded}
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        )}
         {message.attachments && message.attachments.length > 0 && (
           <div className="msg-attachments" dir="ltr">
             {message.attachments.map((a) => (
@@ -898,6 +922,9 @@ function UserMessageBubble({
               </span>
             ))}
           </div>
+        )}
+        {message.images && message.images.length > 0 && (
+          <MessageImages images={message.images} />
         )}
       </div>
       {message.content && (
@@ -1457,26 +1484,12 @@ export const ChatMessageView = memo(function ChatMessageView({
         </div>
       )}
 
-      {message.attachments && message.attachments.length > 0 && (
+      {!isUser && message.attachments && message.attachments.length > 0 && (
         <div className="msg-attachments" dir="ltr">
           {message.attachments.map((a) => (
             <span className="attachment-chip" key={a}>
               @ {a}
             </span>
-          ))}
-        </div>
-      )}
-
-      {message.images && message.images.length > 0 && (
-        <div className="msg-images" dir="ltr">
-          {message.images.map((img) => (
-            <div className="msg-image" key={img.path} title={img.name}>
-              {img.dataUrl ? (
-                <img src={img.dataUrl} alt={img.name} />
-              ) : (
-                <span className="msg-image-ph">{img.name}</span>
-              )}
-            </div>
           ))}
         </div>
       )}
@@ -1541,6 +1554,18 @@ export const ChatMessageView = memo(function ChatMessageView({
             >
               {cachedPrepare(message.id, message.content, dir)}
             </div>
+            {message.attachments && message.attachments.length > 0 && (
+              <div className="msg-attachments" dir="ltr">
+                {message.attachments.map((a) => (
+                  <span className="attachment-chip" key={a}>
+                    @ {a}
+                  </span>
+                ))}
+              </div>
+            )}
+            {message.images && message.images.length > 0 && (
+              <MessageImages images={message.images} />
+            )}
           </div>
         ) : isUser ? (
           /* Same fixed dir as the composer (dir={dir}): dir="auto" resolved
@@ -1651,6 +1676,9 @@ export const ChatMessageView = memo(function ChatMessageView({
                   )}
                   {ttsStatus === "loading" ? "…" : ttsStatus === "speaking" ? "Stop" : "Speak"}
                 </button>
+              )}
+              {ttsError && !isUser && !message.streaming && (
+                <span className="msg-tts-error" role="alert">{ttsError}</span>
               )}
               {!isUser &&
                 !isSummary &&

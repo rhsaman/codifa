@@ -62,8 +62,10 @@
   --z-scroll-jump: 30;
   --z-popover: 40;
   --z-todos-float: 45;
+  --z-right-panel: 60;
   --z-modal-overlay: 100;
   --z-reading-mode: 90;
+  --z-review-overlay: 95;
   --z-ws-menu: 110;
 
   /* ── layout tokens ──────────────────────────────────────────────────── */
@@ -1433,34 +1435,76 @@ textarea {
   /* داخل کانتینر flex لیست: له نشوند تا واقعاً سرریز کنند و اسکرول‌بار
      ظاهر شود (flex-shrink پیش‌فرض آیتم‌ها را در ارتفاع ثابت جا می‌کرد). */
   flex: 0 0 auto;
-  gap: 7px;
+  gap: 8px;
   align-items: flex-start;
-  padding: 0 10px;
-  font-size: 12px;
+  margin: 0 8px;
+  padding: 6px 9px;
+  border-radius: 9px;
+  font-size: 11px;
   color: var(--text-dim);
-  line-height: 1.4;
+  line-height: 1.5;
+  border: 1px solid transparent;
   transition:
     color 0.14s,
-    background 0.14s;
+    background 0.14s,
+    border-color 0.14s;
+}
+
+.sidebar-todo-item:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
 .sidebar-todo-item.done {
   color: var(--text);
 }
 
+.sidebar-todo-item.done .sidebar-todo-content {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  opacity: 0.75;
+}
+
 .sidebar-todo-item.done .sidebar-todo-mark {
   color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* آیتم در انتظار — نشانگر با ته‌مایهٔ thinking تم (کهربایی) تا از
+   متن خنثی جدا شود؛ بدون بک‌گراند ردیف تا لیست شلوغ نشود. */
+.sidebar-todo-item:not(.done):not(.running) .sidebar-todo-mark {
+  color: var(--thinking);
+  border-color: color-mix(in srgb, var(--thinking) 45%, transparent);
+  background: color-mix(in srgb, var(--thinking) 10%, transparent);
+}
+
+.sidebar-todo-item.running {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 .sidebar-todo-item.running .sidebar-todo-mark {
   color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   animation: pulse 1.2s infinite;
 }
 
 .sidebar-todo-mark {
   flex: 0 0 auto;
-  font-size: 11px;
-  line-height: 1.5;
+  width: 17px;
+  height: 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 45%, transparent);
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
 .sidebar-todo-content {
@@ -2752,6 +2796,32 @@ textarea {
   margin-right: auto;
 }
 
+/* Claude-style folding for long user text: clamp the text only, keep
+   attachments/images and the toggle always visible. */
+.chat-message.user-text.clamped {
+  max-height: 180px;
+  overflow: hidden;
+  position: relative;
+}
+
+.msg.user .msg-bubble:has(.user-text.clamped) .msg-expand {
+  margin-top: 6px;
+}
+
+.msg-expand {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.msg-expand:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 .msg.error .msg-bubble {
   border-color: var(--danger);
 }
@@ -2823,6 +2893,18 @@ textarea {
 .msg-copy.copied {
   opacity: 1;
   color: var(--success);
+}
+
+/* خطای پخش صدا زیر دکمه Speak — به‌جای title */
+.msg-tts-error {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--danger, #e5484d);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* "Read" button — accent-tinted so it reads as a distinct action next to
@@ -3864,6 +3946,47 @@ textarea {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-dim);
+}
+
+/* سربرگ Recent: برچسب + دکمهٔ «تست همهٔ مدل‌های اخیر» کنار هم. */
+.pm-recent-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pm-recent-header .pm-recent-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/* دکمهٔ «تست همهٔ مدل‌های اخیر» — همان زبان بصری دکمهٔ تست پروایدر
+ *  (ghost، فقط رنگ) در سربرگ Recent. */
+.pm-recent-test {
+  flex: 0 0 auto;
+  margin-right: 8px;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color 0.12s;
+}
+
+.pm-recent-test:hover {
+  color: var(--accent);
+}
+
+.pm-recent-test.testing {
+  color: var(--accent);
+  animation: pm-test-pulse 1s ease-in-out infinite;
 }
 
 .pm-recents .pm-model {
@@ -7076,6 +7199,37 @@ textarea {
   color: var(--text-dim);
   font-family: var(--font-mono);
   overflow-wrap: anywhere;
+}
+
+.msg-image.zoomable {
+  cursor: zoom-in;
+}
+
+.msg-image.zoomable:hover {
+  border-color: var(--accent);
+}
+
+.msg-image.zoomable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- fullscreen image viewer (Codex-style, via FullscreenModal) ---- */
+.image-fullscreen {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 16px;
+}
+
+.image-fullscreen img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius);
 }
 
 /* ---- markdown inline images (rendered via mdComponents.img) ---- */
@@ -12986,12 +13140,35 @@ textarea {
   outline: none;
 }
 
-.review-tabs {
-  flex: 0 0 auto;
-  display: flex;
+.review-header-btn {
+  display: inline-flex;
   align-items: center;
-  border-bottom: 1px solid var(--border);
-  padding: 0 8px;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.review-header-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.review-header-btn svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+.right-panel-head .review-header-btn {
+  margin-left: auto;
 }
 
 .review-tab {
@@ -13428,4 +13605,208 @@ mark.diff-hit-active {
 .review-search-btn:hover {
   background: var(--bg-hover);
   color: var(--text);
+}
+
+/* ---- Right panel (داک‌شده مثل Claude) — میزبان todos و بخش‌های آینده ----
+   داخل .app-body داک می‌شود (چت کوچک نمی‌شود؟ نه — داک یعنی چت جا باز می‌کند؛
+   اورلی‌های مطالعه/دیف با زدایندکس بالاتر روی آن می‌نشینند). */
+.right-panel {
+  flex: 0 0 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-alt);
+  border-inline-start: 1px solid var(--hairline);
+  position: relative;
+  z-index: var(--z-right-panel);
+  overflow: hidden;
+}
+
+.right-panel-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+}
+
+.right-panel-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.right-panel-resize-handle:hover::after,
+.right-panel-resize-handle:active::after {
+  background: var(--accent);
+}
+
+.right-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.right-panel-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.right-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* تودو داخل پنل راست — کارت جمع‌شونده با نوار پیشرفت و ردیف‌های بج‌دار. */
+.sidebar-panel.todos-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 7%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.todos-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sidebar-panel.todos-docked .sidebar-panel-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* نوار پیشرفت تودوها — تک‌رنگ accent تم تا با همهٔ تم‌ها هماهنگ باشد. */
+.sidebar-todos-progress {
+  height: 4px;
+  margin: 10px 12px 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  overflow: hidden;
+}
+
+.sidebar-todos-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+/* ---- Review overlay (مثل حالت مطالعه) — روی چت شناور می‌شود و چت را
+   کوچک نمی‌کند؛ پنل راست همیشه پشت آن می‌ماند. ---- */
+.review-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-review-overlay);
+  pointer-events: none;
+  --review-w: min(calc(50vw - 12px), calc(100vw - 24px));
+}
+
+.review-overlay.fullscreen {
+  --review-w: calc(100vw - 24px);
+}
+
+.review-scrim {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  background: linear-gradient(90deg,
+      rgba(0, 0, 0, 0.32) 0%,
+      rgba(0, 0, 0, 0.16) 45%,
+      rgba(0, 0, 0, 0.04) 100%);
+  opacity: 0;
+  animation: reading-scrim-in 0.3s ease forwards;
+}
+
+.review-overlay-resize-handle {
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: calc(var(--review-w) + 9px);
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.review-overlay-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 2px;
+  height: 100%;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.review-overlay-resize-handle:hover::after,
+.review-overlay-resize-handle:active::after {
+  background: var(--accent);
+}
+
+.review-panel.review-floating-panel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: var(--review-w);
+  max-width: calc(100vw - 24px);
+  height: auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  overflow: hidden;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: var(--shadow-pop);
+  pointer-events: auto;
+  animation: reading-panel-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.review-overlay.fullscreen .review-panel.review-floating-panel {
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  width: auto;
+  max-width: none;
+}
+
+.review-tabs-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
 }

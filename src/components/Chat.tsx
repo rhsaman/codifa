@@ -91,6 +91,7 @@ import type {
   SearchResultItem,
 } from "../types";
 import { ChatMessageView, RetryBanner } from "./ChatMessage";
+import { MessageImages } from "./MessageImages";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -1961,6 +1962,10 @@ export function ChatPanel() {
               chat.id,
               "Context compacted — older messages are summarized below (after the conversation).",
             );
+          // پیام‌های صف‌شده حین کامپکت فقط بعد از اتمام کامپکت تحویل داده می‌شوند
+          setTimeout(() => {
+            if (!sendPendingSteerNext(chat.id)) sendQueuedNext(chat.id);
+          }, 0);
         }
       } else if (event.kind === "compact_failed") {
         // Auto-compact failed — the backend did NOT drop any messages. Surface
@@ -1976,6 +1981,10 @@ export function ChatPanel() {
             event.reason ||
             "Automatic compaction failed — nothing was deleted.",
           );
+        // حتی در شکست کامپکت هم صف تخلیه شود تا پیام کاربر گم نشود
+        setTimeout(() => {
+          if (!sendPendingSteerNext(chat.id)) sendQueuedNext(chat.id);
+        }, 0);
       } else if (event.kind === "plan") {
         const incoming = event.items ?? [];
         // Get current plan from store (not stale assistantMsg.plan)
@@ -2471,6 +2480,10 @@ export function ChatPanel() {
       useStore
         .getState()
         .setChatCompactError(ch.id, result?.error || errMsg || "empty summary");
+      // حتی در شکست کامپکت دستی هم صف تخلیه شود تا پیام کاربر گم نشود
+      setTimeout(() => {
+        if (!sendPendingSteerNext(ch.id)) sendQueuedNext(ch.id);
+      }, 0);
       return;
     }
     // The backend already returns opencode's "[Compacted earlier context]"
@@ -2500,6 +2513,10 @@ export function ChatPanel() {
         ch.id,
         "Context compacted — older messages are summarized below (after the conversation).",
       );
+    // پیام‌های صف‌شده حین کامپکت دستی فقط بعد از اتمام کامپکت تحویل داده می‌شوند
+    setTimeout(() => {
+      if (!sendPendingSteerNext(ch.id)) sendQueuedNext(ch.id);
+    }, 0);
     // Stay where the user is (normally the bottom, where the live conversation
     // continues). The messages-change effect below keeps the view pinned to
     // the bottom; do NOT yank the view up to the summary — that reads as the
@@ -2766,7 +2783,22 @@ export function ChatPanel() {
     setNoRootHint("");
     const atts = attachments;
     const imgs = images;
+    setAttachments([]);
     setImages([]);
+    // اگر کامپکت در جریان است پیام باید صف شود نه steer مستقیم
+    if (chatObj.compacting) {
+      ss.queueMessage(chatObj.id, {
+        id: uid2(),
+        text: v,
+        attachments: atts,
+        images: imgs,
+        kind: "queue",
+      });
+      setInput("");
+      setCmdOpen(null);
+      forceScrollToBottom();
+      return;
+    }
     // While THIS chat's agent is working, Enter delivers a non-interrupting
     // steer: the message becomes a REAL user message (visible immediately) and
     // is POSTed to /chat/steer (injected at the next tool call). If the turn
@@ -2784,7 +2816,7 @@ export function ChatPanel() {
       setInput("");
       setCmdOpen(null);
       forceScrollToBottom();
-      void steerChat(chatObj.id, userMsg.id, v);
+      void steerChat(chatObj.id, userMsg.id, v, atts, imgs);
       return;
     }
     setInput("");
@@ -2809,6 +2841,7 @@ export function ChatPanel() {
     });
     forceScrollToBottom();
     setInput("");
+    setAttachments([]);
     setImages([]);
   };
 
@@ -3274,7 +3307,7 @@ export function ChatPanel() {
     }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      if (busy) queueForLater();
+      if (busy || compacting) queueForLater();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
@@ -3582,21 +3615,7 @@ export function ChatPanel() {
                     </div>
                   )}
                   {q.images && q.images.length > 0 && (
-                    <div className="msg-images" dir="ltr">
-                      {q.images.map((img) => (
-                        <div
-                          className="msg-image"
-                          key={img.path}
-                          title={img.name}
-                        >
-                          {img.dataUrl ? (
-                            <img src={img.dataUrl} alt={img.name} />
-                          ) : (
-                            <span className="msg-image-ph">{img.name}</span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
+                    <MessageImages images={q.images} />
                   )}
                 </div>
               ))}

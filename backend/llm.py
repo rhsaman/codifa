@@ -1060,8 +1060,16 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
                 renames.append((i, changed))
         elif isinstance(m, ToolMessage):
             tcid = str(m.tool_call_id or "")
+            if tcid:
+                # شناسهٔ خروجی‌ها هم فضای شناسه را اشغال می‌کند: حتی وقتی
+                # فراخوانی متناظر پیدا نشود (خروجی یتیم از چک‌پوینت/ترمیم)،
+                # باید رزرو شود تا فراخوانی بعدی همان شناسه را دوباره نگیرد
+                # و خروجی تکراری نسازد (بای‌پس واقعی خطای 400 تکراری).
+                used.add(tcid)
             for entry in open_calls:
-                if entry[0] == tcid:
+                if entry[0] is not None and (
+                    entry[0] == tcid or entry[1] == tcid
+                ):
                     entry[0] = None  # مصرف شد
                     if entry[1] != tcid:
                         msgs[i] = m.model_copy(update={"tool_call_id": entry[1]})
@@ -1208,7 +1216,7 @@ def _batch_rest(name: str, args: dict) -> dict:
     several filters in one call. For read, ``offset``/``limit`` are per-file
     windows — a batch expresses differing windows via
     ``ranges=['path:offset:limit', ...]`` — so they are excluded and reads
-    of different files with different windows still merge.
+    with different windows still merge, even two windows on the SAME file.
     """
     primary = "filePath" if name == "read" else "pattern"
     rest = {k: v for k, v in args.items() if k != primary}
@@ -1229,24 +1237,32 @@ def _batch_example(name: str, calls: list[dict]) -> str:
     so the reminder shows the exact merged call they should have made.
     """
     if name == "read":
-        windows = {
-            str(c.get("filePath")): (int(c.get("offset") or 1), int(c.get("limit") or 2000))
+        # فهرست تاپل‌ها (نه dict روی filePath) تا خوانش‌های تکراری هم‌فایل
+        # با پنجره‌های متفاوت گم نشوند (مثل ranges هم‌فایل tools.py).
+        windows = [
+            (
+                str(c.get("filePath")),
+                int(c.get("offset") or 1),
+                int(c.get("limit") or 2000),
+            )
             for c in calls
-        }
-        if len({w for w in windows.values()}) == 1:
-            off, lim = next(iter(windows.values()))
-            primary = next(iter(windows))
+        ]
+        if len({(o, l) for _, o, l in windows}) == 1:
+            off, lim = windows[0][1], windows[0][2]
+            seen: list[str] = []
+            for p, _, _ in windows:
+                if p not in seen:
+                    seen.append(p)
+            primary = seen[0]
             return (
                 f"read(filePath={primary!r}, filePaths="
-                f"{[p for p in windows if p != primary]!r}, offset={off}, limit={lim})"
+                f"{seen[1:]!r}, offset={off}, limit={lim})"
             )
         return (
             "read(filePath="
-            + repr(next(iter(windows)))
+            + repr(windows[0][0])
             + ", ranges=["
-            + ", ".join(
-                repr(f"{p}:{o}:{l}") for p, (o, l) in sorted(windows.items())
-            )
+            + ", ".join(repr(f"{p}:{o}:{l}") for p, o, l in windows)
             + "])"
         )
     # grep / glob — scope (path) and file filter (include) may differ; merge
@@ -1278,9 +1294,12 @@ def _batchable_nudge(tcs: list) -> str:
     """Return a reminder suffix when a step's tool calls could be merged.
 
     Detects, per batchable tool name, whether ≥2 calls share the same
-    non-batch parameters (path/include for grep/glob; offset/limit for read)
-    — i.e. they differ only in the primary argument (pattern / filePath) and
-    would have been a single call with `patterns=[...]` / `filePaths=[...]`.
+    non-batch parameters (path/include for grep/glob; other args except
+    filePath/offset/limit for read) — i.e. they differ only in the primary
+    argument (pattern / filePath) or the read window (offset/limit) and
+    would have been a single call with `patterns=[...]` / `filePaths=[...]` /
+    `ranges=[...]`. Reads with different windows merge via
+    `ranges=['path:offset:limit', ...]` — even two windows on the SAME file.
     Calls that ALREADY pass a batch parameter are ignored (the model is
     already batching). Returns "" when nothing is mergeable.
     """

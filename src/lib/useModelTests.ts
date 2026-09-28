@@ -22,6 +22,13 @@ export interface ProviderTestSummary {
 
 const IDLE: ModelTestEntry = { status: "idle", msg: "" };
 
+/** ورودی تست مختلط (مدل + کانفیگ پروایدرش) — برای لیست‌هایی مثل Recent که
+ *  مدل‌ها از چند پروایدر مختلف می‌آیند. */
+export interface MixedTestEntry {
+  cfg: ProviderConfig;
+  model: string;
+}
+
 /** استور مشترک نتایج تست. چون «تست همهٔ مدل‌های پروایدر» باید بتواند همان
  *  دکمه‌های تکی را همزمان پیش ببرد، وضعیت‌ها مرکزی نگه داشته می‌شوند و
  *  دکمه‌ها با useSyncExternalStore از یک snapshot تغییرناپذیر می‌خوانند. */
@@ -102,6 +109,53 @@ export async function runProviderTests(
   }
 }
 
+/** تست لیست مختلط (مثل Recent: مدل‌هایی از چند پروایدر مختلف) با استخر
+ *  همزمانی محدود — هر نتیجه روی دکمهٔ تکی همان مدل می‌نشیند. اجرای همزمان
+ *  دوم با کلید یکسان نادیده گرفته می‌شود. */
+const mixedRuns = new Set<string>();
+
+export async function runMixedTests(
+  entries: MixedTestEntry[],
+  pool = 3,
+  runKey = "recent",
+): Promise<void> {
+  if (entries.length === 0 || mixedRuns.has(runKey)) return;
+  mixedRuns.add(runKey);
+  try {
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < entries.length) {
+        const e = entries[cursor++];
+        await runModelTest(e.cfg, e.model);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(pool, entries.length) }, worker));
+  } finally {
+    mixedRuns.delete(runKey);
+  }
+}
+
+function summarizeMixed(
+  snap: ReadonlyMap<string, ModelTestEntry>,
+  entries: MixedTestEntry[],
+): ProviderTestSummary {
+  let ok = 0;
+  let fail = 0;
+  let running = false;
+  let firstFail = "";
+  for (const e of entries) {
+    const s = snap.get(key(e.cfg, e.model));
+    if (!s) continue;
+    if (s.status === "testing") running = true;
+    else if (s.status === "ok") ok++;
+    else if (s.status === "fail") {
+      fail++;
+      if (!firstFail) firstFail = s.msg;
+    }
+  }
+  return { running, ok, fail, done: ok + fail, total: entries.length, firstFail };
+}
+
 function summarize(
   snap: ReadonlyMap<string, ModelTestEntry>,
   cfg: ProviderConfig,
@@ -124,8 +178,8 @@ function summarize(
   return { running, ok, fail, done: ok + fail, total: models.length, firstFail };
 }
 
-/** هوک دسترسی به استور تست مدل‌ها — دکمهٔ تکی هر مدل و دکمهٔ «تست همه»
- *  پروایدر هر دو از همین هوک می‌خوانند تا همیشه هم‌نما باشند. */
+/** هوک دسترسی به استور تست مدل‌ها — دکمهٔ تکی هر مدل و دکمه‌های «تست همه»
+ *  (پروایدر و Recent) هر سه از همین هوک می‌خوانند تا همیشه هم‌نما باشند. */
 export function useModelTests() {
   const snap = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const getStatus = useCallback(
@@ -136,11 +190,18 @@ export function useModelTests() {
     (cfg: ProviderConfig, models: string[]): ProviderTestSummary => summarize(snap, cfg, models),
     [snap],
   );
+  const getMixedSummary = useCallback(
+    (entries: MixedTestEntry[]): ProviderTestSummary => summarizeMixed(snap, entries),
+    [snap],
+  );
   const run = useCallback((cfg: ProviderConfig, model: string): void => {
     void runModelTest(cfg, model);
   }, []);
   const runAll = useCallback((cfg: ProviderConfig, models: string[]): void => {
     void runProviderTests(cfg, models);
   }, []);
-  return { getStatus, getSummary, run, runAll };
+  const runMixed = useCallback((entries: MixedTestEntry[], runKey = "recent"): void => {
+    void runMixedTests(entries, 3, runKey);
+  }, []);
+  return { getStatus, getSummary, getMixedSummary, run, runAll, runMixed };
 }

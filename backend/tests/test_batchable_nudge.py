@@ -111,6 +111,20 @@ def test_ranges_members_are_quoted():
     assert "'a.py:1:100'" in out and "'b.py:50:140'" in out, out
 
 
+def test_two_reads_same_file_different_windows_nudge_keeps_both():
+    """رگرسیون تصویر: دو read پشت‌سرهم روی یک فایل با پنجره‌های متفاوت
+    (مثل tools.py با 640:60 و 2089:80) نباید روی هم collapse شوند — مثال
+    ترکیبی باید هر دو عضو را در ranges نگه دارد."""
+    tcs = [
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 640, "limit": 60}, "id": "a"},
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 2089, "limit": 80}, "id": "b"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "BATCHING REMINDER" in out
+    assert "ranges=" in out, out
+    assert "'tools.py:640:60'" in out and "'tools.py:2089:80'" in out, out
+
+
 def test_mixed_tools_nudge_mentions_both():
     tcs = [
         {"name": "grep", "args": {"pattern": "alpha"}, "id": "a"},
@@ -170,6 +184,22 @@ def test_streak_fires_across_different_windows():
     # نمونه‌ی ترکیبی دقیق ساخته‌شده از خود فراخوانی‌های مدل:
     assert "ranges=" in out
     assert "'a.py:1:100'" in out and "'b.py:50:140'" in out
+
+
+def test_streak_fires_across_same_file_different_windows():
+    """رگرسیون تصویر: دو read تک‌تک روی یک فایل با پنجره‌های متفاوت
+    (tools.py با 640:60 و سپس 2089:80) باید استریک بسازد و هر دو پنجره
+    در مثال ranges باشند."""
+    t = _BatchStreakTracker(threshold=2)
+    assert t.observe([
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 640, "limit": 60}, "id": "c1"}
+    ]) == ""
+    out = t.observe([
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 2089, "limit": 80}, "id": "c2"}
+    ])
+    assert "BATCHING REMINDER" in out
+    assert "ranges=" in out, out
+    assert "'tools.py:640:60'" in out and "'tools.py:2089:80'" in out, out
 
 
 def test_streak_fires_across_different_scopes():

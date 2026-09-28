@@ -71,3 +71,21 @@ async def test_steer_concurrent_enqueue_drain_no_loss():
         f"lost={len(set(ids) - set(drained))} "
         f"dupes={len(drained) - len(set(drained))}"
     )
+
+
+async def test_steer_preserves_attachments_and_images():
+    """Regression: steer با عکس/فایل نباید آن‌ها را گم کند — enqueue باید
+    attachments و images (شامل dataUrl) را دست‌نخورده نگه دارد تا تزریق گراف
+    پیام چندبخشی بسازد."""
+    chat_id = "test-steer-images"
+    imgs = [{"path": "/tmp/x.png", "name": "x.png", "dataUrl": "data:image/png;base64,AAA"}]
+    await _enqueue_steer(
+        chat_id,
+        {"id": "m1", "prompt": "p1", "attachments": ["a.txt"], "images": imgs},
+    )
+
+    items = await _drain_steer(chat_id)
+    assert len(items) == 1
+    assert items[0]["attachments"] == ["a.txt"]
+    assert items[0]["images"] == imgs
+    assert items[0]["images"][0]["dataUrl"].startswith("data:image/png;base64,")

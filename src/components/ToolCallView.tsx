@@ -2,7 +2,6 @@ import {
   Fragment,
   memo,
   useEffect,
-  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -11,15 +10,15 @@ import {
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import { diffStatsFromUnified } from "../lib/toolActivity";
-import { parseDiffRows, parseSideBySide, type DiffRow } from "../lib/reviewDiff";
+import { reviewPathOf } from "../lib/reviewTurn";
+import { parseDiffRows } from "../lib/reviewDiff";
+import { countOccurrences } from "../lib/diffSearch";
 import { copyToClipboard } from "../lib/clipboard";
 import { useReviewPanel } from "../lib/reviewPanel";
 import { api } from "../lib/fs";
 import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
 import { handleLinkClick } from "../lib/link";
-import { FullscreenModal } from "./FullscreenModal";
-import { useFullscreen } from "../lib/fullscreen";
 import { useDragScroll } from "../lib/useDragScroll";
 
 const TOOL_LABEL: Record<string, string> = {
@@ -402,109 +401,137 @@ function TomlLine({ text }: { text: string }) {
   );
 }
 
-/** متن یک خط دیف: برای toml هایلایت‌دار، بقیه ساده. */
-function DiffLineText({ text, path }: { text: string; path?: string }) {
+/** متن یک خط دیف: برای toml هایلایت‌دار، بقیه ساده.
+ *  وقتی کوئری جست‌وجو فعال است، رخدادها با <mark> هایلایت می‌شوند؛
+ *  رخداد فعال (`activeHit`) کلاس متمایز می‌گیرد تا با دکمه‌های عقب/جلو دیده شود. */
+function DiffLineText({
+  text,
+  path,
+  query,
+  hitBase = 0,
+  activeHit = -1,
+  activeRef,
+}: {
+  text: string;
+  path?: string;
+  query?: string;
+  hitBase?: number;
+  activeHit?: number;
+  activeRef?: { current: HTMLElement | null };
+}) {
+  const q = (query ?? "").trim();
+  if (q)
+    return (
+      <>{highlightParts(text, q, hitBase, activeHit, activeRef)}</>
+    );
   if (path && path.split("?")[0].toLowerCase().endsWith(".toml")) {
     return <TomlLine text={text} />;
   }
   return <>{text}</>;
 }
 
-/** دیف به سبک کدکس. `mode="unified"` تک‌ستونی با گاتر سبز/قرمز و شماره‌ی خط
- *  (کارت ابزار)، `mode="split"` دوستونی before|after با گاترهای جدا و
- *  جداکنندهٔ «N unmodified lines» (پنل Review سمت راست). در حالت unified هر
- *  جفت delete+add به دو خط جدا (قرمز سپس سبز) باز می‌شود. */
+/** متن را به تکه‌های عادی/هایلایت می‌شکند (case-insensitive).
+ *  `base` ایندکس سراسری اولین رخداد این خط است؛ رخدادی که ایندکسش با
+ *  `active` برابر شود کلاس فعال می‌گیرد و `activeRef` رویش ست می‌شود. */
+function highlightParts(
+  text: string,
+  query: string,
+  base: number,
+  active: number,
+  activeRef?: { current: HTMLElement | null },
+) {
+  const lower = text.toLowerCase();
+  const q = query.toLowerCase();
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  let k = 0;
+  let ordinal = 0;
+  for (;;) {
+    const j = lower.indexOf(q, i);
+    if (j < 0) {
+      if (i < text.length) out.push(<span key={k++}>{text.slice(i)}</span>);
+      break;
+    }
+    if (j > i) out.push(<span key={k++}>{text.slice(i, j)}</span>);
+    const idx = base + ordinal;
+    ordinal++;
+    const isActive = idx === active;
+    out.push(
+      <mark
+        key={k++}
+        className={isActive ? "diff-hit diff-hit-active" : "diff-hit"}
+        {...(isActive ? { "aria-current": "true" as const } : {})}
+        ref={
+          isActive && activeRef
+            ? (el: HTMLElement | null) => {
+                activeRef.current = el;
+              }
+            : undefined
+        }
+      >
+        {text.slice(j, j + q.length)}
+      </mark>,
+    );
+    i = j + q.length;
+  }
+  return out;
+}
+
+/** دیف به سبک کدکس — تک‌ستونی با گاتر سبز/قرمز و شماره‌ی خط.
+ *  هر جفت delete+add به دو خط جدا (قرمز سپس سبز) باز می‌شود.
+ *  `query` رخدادهای جست‌وجو را هایلایت می‌کند؛ `activeHit` ایندکس محلی
+ *  رخداد فعال داخل همین دیف است (‎-1‎ یعنی هیچ‌کدام) که خودکار اسکرول می‌شود. */
 export function DiffView({
   diff,
   path,
-  mode = "unified",
+  query,
+  activeHit = -1,
 }: {
   diff: string;
   path?: string;
-  mode?: "unified" | "split";
+  query?: string;
+  activeHit?: number;
 }) {
-  const rows = mode === "split" ? null : parseDiffRows(diff);
-  const items = mode === "split" ? parseSideBySide(diff) : null;
-  if ((rows && rows.length === 0) || (items && items.length === 0)) return null;
+  const rows = parseDiffRows(diff);
+  if (rows.length === 0) return null;
   const drag = useDragScroll<HTMLDivElement>();
+  const activeRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: "nearest" });
+  }, [activeHit, query, diff]);
+  // شمارنده‌ی ترتیبی رخدادها در ترتیب رندر خط‌ها.
+  let hitCursor = 0;
   const renderRow = (
     key: number | string,
     cls: "diff-u-add" | "diff-u-del" | "diff-u-ctx",
     gutter: string,
     lineNo: number,
     text: string,
-  ) => (
-    <div key={key} className={`diff-u-row ${cls}`}>
-      <span className="diff-u-gutter">{gutter}</span>
-      <span className="diff-u-num">{lineNo >= 0 ? lineNo : ""}</span>
-      <span className="diff-u-text">
-        <DiffLineText text={text} path={path} />
-      </span>
-    </div>
-  );
-
-  /** یک ستون از نمای دوستونی: شماره‌ی خط + متن، هر ردیف یک کلاس نوع. */
-  const renderColumn = (side: "before" | "after", list: DiffRow[]) => (
-    <div className={`diff-col diff-col-${side}`}>
-      <div className="diff-side-head">{side === "before" ? "Before" : "After"}</div>
-      {list.map((row, i) => {
-        if ("text" in row)
-          return (
-            <div key={i} className={`diff-side-meta ${row.type}`}>
-              {row.text}
-            </div>
-          );
-        const isBefore = side === "before";
-        const text = isBefore ? row.before : row.after;
-        const lineNo = isBefore ? row.bLine : row.aLine;
-        const cls =
-          row.type === "same"
-            ? "diff-context"
-            : row.type === "mod"
-              ? isBefore
-                ? "diff-del"
-                : "diff-add"
-              : row.type === "del"
-                ? isBefore
-                  ? "diff-del"
-                  : "diff-context"
-                : isBefore
-                  ? "diff-context"
-                  : "diff-add";
-        return (
-          <div key={i} className={`diff-side-row ${row.type}`}>
-            <span className="diff-side-num">{lineNo >= 0 ? lineNo : ""}</span>
-            <div className={`diff-side-cell ${cls}`}>
-              <DiffLineText text={text} path={path} />
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-
-  if (items) {
+  ) => {
+    const q = (query ?? "").trim();
+    const base = hitCursor;
+    if (q) hitCursor += countOccurrences(text, q);
     return (
-      <div className="diff-columns" dir="ltr" {...drag}>
-        {items.map((item) =>
-          item.kind === "gap" ? (
-            <div key={item.key} className="diff-gap">
-              {item.count} unmodified lines
-            </div>
-          ) : (
-            <div key={item.key} className="diff-hunk-pair">
-              {renderColumn("before", item.rows)}
-              {renderColumn("after", item.rows)}
-            </div>
-          ),
-        )}
+      <div key={key} className={`diff-u-row ${cls}`}>
+        <span className="diff-u-gutter">{gutter}</span>
+        <span className="diff-u-num">{lineNo >= 0 ? lineNo : ""}</span>
+        <span className="diff-u-text">
+          <DiffLineText
+            text={text}
+            path={path}
+            query={query}
+            hitBase={base}
+            activeHit={activeHit}
+            activeRef={activeRef}
+          />
+        </span>
       </div>
     );
-  }
+  };
 
   return (
     <div className="diff-unified" dir="ltr" {...drag}>
-      {rows!.flatMap((row, i) => {
+      {rows.flatMap((row, i) => {
         if ("text" in row) {
           return (
             <div key={i} className={`diff-u-meta ${row.type}`}>
@@ -1172,7 +1199,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
            سمت راست نشان می‌دهد (سبک کدکس). بقیهٔ ردیف‌ها مثل قبل باز/بسته. */
         onClick={
           isEdit
-            ? () => messageId && openReview(messageId, String(activity.args?.path ?? ""))
+            ? () => messageId && openReview(messageId, reviewPathOf(activity))
             : () => setExpanded((e) => !e)
         }
         title={isEdit ? "Review changes in the side panel" : undefined}
@@ -1183,9 +1210,9 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           <span
             className="trace-row-detail"
             dir="auto"
-            title={String(activity.args?.path ?? "")}
+            title={reviewPathOf(activity)}
           >
-            {String(activity.args?.path ?? "")
+            {reviewPathOf(activity)
               .split("/")
               .pop()}
           </span>
@@ -1284,11 +1311,6 @@ export const ToolCallView = memo(function ToolCallView({
   // سبک کدکس: کارت ویرایش کوچک می‌ماند و دیف هرگز داخل چت باز نمی‌شود؛
   // کلیک روی خودِ کارت (یا دکمهٔ Review) دیف را در پنل سمت راست نشان می‌دهد.
   const openReview = useReviewPanel((s) => s.openReview);
-  const myKey = useId();
-  const activeKey = useFullscreen((s) => s.activeKey);
-  const openFs = useFullscreen((s) => s.open);
-  const closeFs = useFullscreen((s) => s.close);
-  const fsOpen = activeKey === myKey;
   const root = useStore((s) => s.root);
   // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
   const activeChatId = useStore((s) => s.activeChatId);
@@ -1319,7 +1341,7 @@ export const ToolCallView = memo(function ToolCallView({
   const isWrite =
     activity.tool === "write_file" || activity.tool === "edit_file";
   /** مسیر فایلِ کارت نوشتن (path یا filePath) — برای هدر و پنل Review. */
-  const writePath = String(activity.args?.path ?? activity.args?.filePath ?? "");
+  const writePath = reviewPathOf(activity);
   const readPaths = Array.isArray(activity.args?.paths)
     ? (activity.args.paths as string[])
     : [];
@@ -1521,19 +1543,6 @@ export const ToolCallView = memo(function ToolCallView({
         {isWrite && activity.reverted && (
           <span className="reverted-tag">reverted</span>
         )}
-        {isWrite && (
-          <button
-            className="tool-fullscreen-btn"
-            title="Open full screen"
-            aria-label="Open full screen"
-            onClick={(e) => {
-              e.stopPropagation();
-              openFs(myKey);
-            }}
-          >
-            ⤢
-          </button>
-        )}
         {collapsible && (
           <span className={`chev${collapsed ? "" : " open"}`}>▾</span>
         )}
@@ -1573,32 +1582,10 @@ export const ToolCallView = memo(function ToolCallView({
           {activity.diff && (
             <DiffView
               diff={activity.diff}
-              path={String(activity.args?.path ?? activity.args?.filePath ?? "")}
+              path={reviewPathOf(activity)}
             />
           )}
         </div>
-      )}
-      {fsOpen && (
-        <FullscreenModal
-          open={fsOpen}
-          onClose={closeFs}
-          title={String(
-            activity.args?.path ?? activity.args?.filePath ?? "File",
-          )}
-          bodyClass="diff-fullscreen-body"
-          scrollable
-        >
-          {activity.diff ? (
-            <DiffView
-              diff={activity.diff}
-              path={String(activity.args?.path ?? activity.args?.filePath ?? "")}
-            />
-          ) : (
-            <div className="fullscreen-empty">
-              No diff available for this file yet.
-            </div>
-          )}
-        </FullscreenModal>
       )}
     </div>
   );

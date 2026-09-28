@@ -253,7 +253,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -266,7 +266,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -339,6 +339,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     model: p.model || '',
     contextMap: p.contextMap,
     manualContextMap: p.manualContextMap,
+    manualReasoningMap: p.manualReasoningMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
     thinkingLevel: p.thinkingLevel ?? '',
@@ -435,6 +436,7 @@ interface State {
   /** افزودن دستی یک مدل به پروایدر (در addedModels ثبت می‌شود تا فچ‌ها حذفش نکنند). */
   addManualModel: (id: string, model: string, contextTokens?: number) => void
   setManualModelContext: (id: string, model: string, contextTokens: number | null) => void
+  setManualModelReasoning: (id: string, model: string, reasoning: boolean | null) => void
   removeManualModel: (id: string, model: string) => void
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
@@ -481,12 +483,21 @@ interface State {
   sttProviderId: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions. */
   sttModel: string
+  /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
+  ttsProviderId: string
+  /** Remote TTS model id sent to {base_url}/audio/speech. */
+  ttsModel: string
+  /** Remote TTS voice id sent to {base_url}/audio/speech. */
+  ttsVoice: string
   embeddingModel: string
   embeddingBaseUrl: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
   setSttModel: (m: string) => void
+  setTtsProviderId: (id: string) => void
+  setTtsModel: (m: string) => void
+  setTtsVoice: (v: string) => void
   setEmbeddingModel: (m: string) => void
   setEmbeddingBaseUrl: (u: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
@@ -498,6 +509,9 @@ interface State {
   /** History turn limit sent to the model. 0 = full history (default). */
   historyLimit: number
   setHistoryLimit: (n: number) => void
+  /** Max tool-loop steps per turn. 0 = auto from context window (default). */
+  maxSteps: number
+  setMaxSteps: (n: number) => void
 
   /** Web-search engines for web_search (Settings → Plugins). */
   searchPlugins: SearchPluginConfig[]
@@ -706,12 +720,16 @@ export const useStore = create<State>((set, get) => ({
   whisperBaseUrl: '',
   sttProviderId: 'local',
   sttModel: 'whisper-1',
+  ttsProviderId: '',
+  ttsModel: 'tts-1',
+  ttsVoice: 'alloy',
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
   recentModels: [],
   subagentModels: {},
   cacheTtlMinutes: 60,
   historyLimit: 0,
+  maxSteps: 0,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
@@ -954,6 +972,11 @@ export const useStore = create<State>((set, get) => ({
       whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
       sttProviderId: typeof raw.sttProviderId === 'string' && raw.sttProviderId.trim() ? raw.sttProviderId : 'local',
       sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
+      ttsProviderId: typeof raw.ttsProviderId === 'string' ? raw.ttsProviderId.trim() : '',
+      // خالی مجاز است (پروایدرهای 9router بدون مدل/ویس): فقط وقتی فیلد اصلاً
+      // رشته نیست (settings قدیمی) پیش‌فرض می‌گذاریم، نه وقتی کاربر پاکش کرده.
+      ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
+      ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
@@ -966,6 +989,7 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
+      maxSteps: coerceBoundedInt((raw as { maxSteps?: unknown }).maxSteps, 0, 0, 200),
       // Migration: اگه settings قدیمی webSearchTtlDays داشت ولی ragWebTtlDays نداشت،
       // مقدار webSearchTtlDays → ragWebTtlDays منتقل بشه.
       ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 0)
@@ -1161,7 +1185,34 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  // حذف یک مدل دستی به‌همراه مقدار دستی کانتکست آن.
+  // ثبت/حذف پرچم دستی reasoning برای یک مدل دستی (کلید نرمال‌شده‌ی bare).
+  // برخلاف کانتکست، به kind گیت‌وی وابسته نیست: هر مدلی که کاربر دستی اضافه
+  // کرده می‌تواند reasoning-capable اعلام شود تا pill تغییر effort در کامپوزر
+  // نمایش داده شود و reasoning_effort به بک‌اند ارسال گردد.
+  setManualModelReasoning: (id, model, reasoning) => {
+    const m = model.trim()
+    if (!m) return
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => {
+          if (p.id !== id) return p
+          const bare = m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
+          const next = { ...(p.manualReasoningMap ?? {}) }
+          if (reasoning === null) {
+            delete next[bare]
+            delete next[m]
+          } else {
+            next[bare] = reasoning
+          }
+          return { ...p, manualReasoningMap: next }
+        }),
+      },
+    }))
+    get().persist()
+  },
+
+  // حذف یک مدل دستی به‌همراه مقادیر دستی کانتکست و reasoning آن.
   removeManualModel: (id, model) => {
     const m = model.trim()
     if (!m) return
@@ -1174,11 +1225,15 @@ export const useStore = create<State>((set, get) => ({
           const next = { ...(p.manualContextMap ?? {}) }
           delete next[bare]
           delete next[m]
+          const nextReasoning = { ...(p.manualReasoningMap ?? {}) }
+          delete nextReasoning[bare]
+          delete nextReasoning[m]
           return {
             ...p,
             models: (p.models ?? []).filter((x) => x !== m),
             addedModels: (p.addedModels ?? []).filter((x) => x !== m),
             manualContextMap: next,
+            manualReasoningMap: nextReasoning,
           }
         }),
       },
@@ -1364,6 +1419,23 @@ export const useStore = create<State>((set, get) => ({
     set({ sttModel: (m ?? '').trim() || 'whisper-1' })
     get().persist()
   },
+  setTtsProviderId: (id) => {
+    set({ ttsProviderId: (id ?? '').trim() })
+    get().persist()
+  },
+  setTtsModel: (m) => {
+    // خالی مجاز است: بعضی پروایدرهای 9router مدل ندارند — مقدار خالی یعنی
+    // «ارسال نکن» و در payload حذف می‌شود. fallback قبلی (`|| 'tts-1'`)
+    // پاک‌کردن فیلد را غیرممکن می‌کرد (با هر حذف کامل، مقدار به پیش‌فرض
+    // برمی‌گشت و حس «غیرقابل ویرایش بودن» می‌داد).
+    set({ ttsModel: (m ?? '').trim() })
+    get().persist()
+  },
+  setTtsVoice: (v) => {
+    // خالی مجاز است — مثل setTtsModel.
+    set({ ttsVoice: (v ?? '').trim() })
+    get().persist()
+  },
   setEmbeddingModel: (m) => {
     set({ embeddingModel: (m ?? '').trim() || 'intfloat/multilingual-e5-base' })
     get().persist()
@@ -1404,6 +1476,12 @@ export const useStore = create<State>((set, get) => ({
 
   setHistoryLimit: (n) => {
     set({ historyLimit: Math.max(0, Math.round(n) || 0) })
+    get().persist()
+  },
+
+  setMaxSteps: (n) => {
+    const r = Math.round(n)
+    set({ maxSteps: Number.isFinite(r) ? Math.max(0, Math.min(200, r)) : 0 })
     get().persist()
   },
 

@@ -287,6 +287,60 @@ def test_append_tool_result_skips_existing_id():
     assert len(msgs) == 2
 
 
+def test_normalize_uniquifies_ids_across_messages():
+    """سناریوی «ترن جدید / استاپ و ادامه»: یک call_id در دو پیام assistant
+    تکرار شده (شناسه‌های عددی که هر نوبت از نو شروع می‌شوند). گلوگاه
+    ``normalize_tool_transcript`` باید شناسهٔ دوم را یکتا کند و ToolMessage
+    متناظر را هم به شناسهٔ جدید وصل کند — وگرنه provider با 400
+    «Duplicate function_call_output for call_id» درخواست را رد می‌کند."""
+    msgs = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": "a"}, "id": "1"}],
+        ),
+        ToolMessage(content="result-a", tool_call_id="1"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": "b"}, "id": "1"}],
+        ),
+        ToolMessage(content="result-b", tool_call_id="1"),
+    ]
+    _llm.normalize_tool_transcript(msgs)
+    ai_ids = [tc["id"] for m in msgs if isinstance(m, AIMessage) for tc in m.tool_calls]
+    tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
+    # هر شناسه در کل ترنسکریپت یکتاست
+    assert ai_ids == ["1", "1#2"]
+    assert len(ai_ids) == len(set(ai_ids))
+    # هر نتیجه به فراخوانی خودش وصل مانده (نه به فراخوانی قبلیِ هم‌شناسه)
+    assert tool_ids == ["1", "1#2"]
+    assert [m.content for m in msgs if isinstance(m, ToolMessage)] == [
+        "result-a",
+        "result-b",
+    ]
+
+
+def test_normalize_keeps_unique_ids_untouched():
+    """ترنسکریپت سالم نباید دست‌کاری شود."""
+    msgs = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": "a"}, "id": "c1"}],
+        ),
+        ToolMessage(content="r1", tool_call_id="c1"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": "b"}, "id": "c2"}],
+        ),
+        ToolMessage(content="r2", tool_call_id="c2"),
+    ]
+    _llm.normalize_tool_transcript(msgs)
+    assert [tc["id"] for m in msgs if isinstance(m, AIMessage) for tc in m.tool_calls] == [
+        "c1",
+        "c2",
+    ]
+    assert [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)] == ["c1", "c2"]
+
+
 def test_dedupe_step_tool_call_ids_avoids_history_ids():
     """id برگشتی provider نباید با خروجی tool قدیمی تداخل کند."""
     ai = AIMessage(
@@ -332,4 +386,8 @@ if __name__ == "__main__":
     print("  ✅ test_dedupe_step_tool_call_ids_renames_duplicates")
     test_dedupe_step_tool_call_ids_avoids_history_ids()
     print("  ✅ test_dedupe_step_tool_call_ids_avoids_history_ids")
+    test_normalize_uniquifies_ids_across_messages()
+    print("  ✅ test_normalize_uniquifies_ids_across_messages")
+    test_normalize_keeps_unique_ids_untouched()
+    print("  ✅ test_normalize_keeps_unique_ids_untouched")
     print("\n🎉 همه تست‌های dedup رد شد")

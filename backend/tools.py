@@ -1649,12 +1649,13 @@ def search_web_docs(
 
 
 def create_skill(root: str, name: str, description: str, content: str) -> dict:
-    """Create or overwrite a user skill (global, shared across workspaces).
+    """Create or edit (overwrite) a user skill (global, shared across workspaces).
 
     ``name`` is the display name — it must be English (ASCII) because the
     storage folder slug is derived from it. ``description`` is indexed for
     the system prompt, and ``content`` is the full markdown body. The skill
-    is stored as ``skills/<slug>/skill.md`` in the user data folder. The
+    is stored as ``skills/<slug>/skill.md`` in the user data folder. Calling
+    with an existing skill's SAME ``name`` overwrites it (edit flow). The
     ``root`` argument is kept for API compatibility and is not used.
     """
     body = content.strip()
@@ -3537,7 +3538,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
     ) -> str:
-        """Create or update a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",

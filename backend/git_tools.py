@@ -129,3 +129,25 @@ def git_log(root: str, limit: int = 20) -> dict:
                 {"hash": parts[0], "date": parts[1], "subject": parts[2]}
             )
     return {"commits": commits}
+
+
+def git_show(root: str, rev: str = "HEAD", path: str = "") -> dict:
+    """Unified diff of a single commit (default HEAD), optionally scoped to a path."""
+    if not _is_repo(root):
+        return {"error": "not a git repository"}
+    rev = (rev or "HEAD").strip() or "HEAD"
+    if rev.startswith("-"):
+        return {"error": f"invalid revision: {rev!r}"}
+    args = ["show", rev, "--no-color", "--pretty=format:", "--no-ext-diff"]
+    if path:
+        # "--" ends option parsing; the path can never be read as a flag.
+        args += ["--", path]
+    res = _run_git(root, args)
+    if not res.get("ok"):
+        return {"error": res.get("error") or res.get("err") or "git show failed"}
+    diff = res["out"]
+    truncated = False
+    if len(diff) > _MAX_DIFF:
+        diff = diff[:_MAX_DIFF]
+        truncated = True
+    return {"diff": diff, "truncated": truncated}

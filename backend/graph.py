@@ -85,9 +85,8 @@ from llm import (
     build_chat_model,
     chat_model_settings,
     dedupe_step_tool_call_ids,
-    dedupe_tool_outputs,
     llm_generate,
-    strip_orphaned_tool_calls,
+    normalize_tool_transcript,
 )
 from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
 from tool_batching import execute_readonly_calls
@@ -501,6 +500,7 @@ class AgentState(TypedDict, total=False):
     providers: dict
     reserved: int | None
     compact_at_percent: int | None
+    max_steps: int
     # MCP connectors the user toggled on in the composer chip. Passed through
     # verbatim from the UI request; consumed by build_turn_context to attach
     # live MCP tools. MUST be declared on the state or LangGraph drops it
@@ -1853,9 +1853,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     )
                 ),
             )
+    # Recency: the tool-reuse note must sit right BEFORE the current user
+    # turn (not at index 0). An instruction buried at the head of a long
+    # context is the weakest position — the model re-searched/re-read
+    # everything instead of reusing results. Appending puts it adjacent to
+    # the decision point. (Plan/test notes stay at the head: they are
+    # orientation, not per-step action guidance.)
     reuse_tool = _agents._tool_reuse_note(history)
     if reuse_tool:
-        lc_history.insert(0, HumanMessage(content=reuse_tool))
+        lc_history.append(HumanMessage(content=reuse_tool))
 
     # User content (prompt; images as content parts). Attached FILE
     # contents are no longer force-injected here — they enter via scope + the
@@ -2586,7 +2592,17 @@ async def _run_mode_turn(
     # is undesirable. Transient throttles are retried below without any such
     # injection.
 
-    MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 40))
+    # User override from Settings → General ("Max agent steps", 0 = auto).
+    # Threaded through ChatRequest.max_steps → run_agent → state["max_steps"],
+    # same plumbing as compact_at_percent. Clamped 5–200; 0 falls back to the
+    # ctx-derived auto budget below.
+    _max_steps_override = 0
+    with contextlib.suppress(Exception):
+        _max_steps_override = int(state.get("max_steps") or 0)
+    if _max_steps_override > 0:
+        MAX_STEPS = max(5, min(_max_steps_override, 200))
+    else:
+        MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 40))
 
     async def _execute_tool(name: str, args: dict) -> str:
         import inspect
@@ -2814,11 +2830,12 @@ async def _run_mode_turn(
                 # checkpoint is missing tool results for later calls.
                 # Strip tool_calls from any such assistant messages so the
                 # text content is still visible to the model.
-                strip_orphaned_tool_calls(msgs)
-                # نگهبان نهایی «یک خروجی به‌ازای هر tool_call_id» — چک‌پوینت
-                # خراب یا compaction ممکن است دو ToolMessage با یک id بسازد که
-                # provider با 400 «Duplicate function_call_output» رد می‌کند.
-                msgs[:] = dedupe_tool_outputs(msgs)
+                # نگهبان نهایی ترنسکریپت: یکتاسازی شناسهٔ فراخوانی‌ها در کل
+                # ترنسکریپت (چک‌پوینت/ادامهٔ turn ممکن است یک call_id را در دو
+                # نوبت تکرار کند) → حذف tool_callهای بی‌جواب → یک خروجی به‌ازای
+                # هر شناسه. بدون این، provider با 400 «Duplicate
+                # function_call_output for call_id» درخواست را رد می‌کند.
+                normalize_tool_transcript(msgs)
 
                 request_messages = project_tool_results(msgs)
                 async for chunk in bound.astream(request_messages):

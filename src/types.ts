@@ -35,6 +35,8 @@ export type ThinkingLevel =
   | 'low'
   | 'medium'
   | 'high'
+  | 'xhigh'
+  | 'max'
 
 /** Transport type for an MCP tool connector. */
 export type McpTransport = 'stdio' | 'http' | 'sse'
@@ -89,6 +91,9 @@ export interface ProviderConfig {
   contextMap?: Record<string, number>
   /** مقادیر دستی کانتکست که کاربر برای مدل‌های کاستوم وارد کرده؛ بر contextMap اولویت دارد. */
   manualContextMap?: Record<string, number>
+  /** مقادیر دستی reasoning که کاربر برای مدل‌ها وارد کرده؛ بر reasoningMap و
+   *  heuristic نام مدل اولویت دارد. */
+  manualReasoningMap?: Record<string, boolean>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   reasoningMap?: Record<string, boolean>
@@ -134,6 +139,12 @@ export interface Settings {
   sttProviderId?: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */
   sttModel?: string
+  /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). 'local' پشتیبانی نمی‌شود. */
+  ttsProviderId?: string
+  /** Remote TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
+  ttsModel?: string
+  /** Remote TTS voice id sent to {base_url}/audio/speech (e.g. alloy). */
+  ttsVoice?: string
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
@@ -173,6 +184,11 @@ export interface Settings {
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */
   historyLimit?: number
+  /** Max tool-loop steps per turn. 0 = auto from context window (default:
+   *  12–40 by ctx). N > 0 = fixed budget (clamped 5–200). Applies on the
+   *  next message. Higher = longer tasks finish in one turn but burn more
+   *  tokens when the model loops. */
+  maxSteps?: number
   /** Tool result cache TTL in minutes (default 60). */
   cacheTtlMinutes?: number
 }

@@ -1,12 +1,22 @@
 # ============================================================
-# Node.js / npm
+# Node.js / npm / yarn / pnpm / bun
 # ============================================================
 node_modules/
+bower_components/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+.pnpm-store/
+.pnp.*
+.yarn/cache/
+.yarn/install-state.gz
+.yarn/unplugged/
+.npm/
+.yarnrc.yml.local
 *.tgz
+bun.lockb.meta
+.bun-cache/
 
 # Downloaded on-device ML models (Settings → Models; fetched at runtime, not committed):
 backend/whisper/
@@ -118,5 +128,208 @@ logs/
 # TypeScript / JS caches
 # ============================================================
 *.tsbuildinfo
+tsconfig.tsbuildinfo
 .eslintcache
+.stylelintcache
+.prettiercache
 .cache/
+.parcel-cache/
+.rollup.cache/
+.webpack-cache/
+.turbo/
+.node_repl_history
+.yarn-integrity
+.vitest-cache/
+.jest-cache/
+jest_*/
+vitest.config.*.timestamp-*
+vite.config.*.timestamp-*
+
+# ============================================================
+# Test results / coverage (real test files ARE tracked — see test/ and backend/tests/)
+# ============================================================
+coverage/
+.coverage.*
+coverage.xml
+*.cover
+*.lcov
+lcov.info
+.nyc_output/
+nosetests.xml
+pytest.xml
+test-results.xml
+junit*.xml
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.playwright/
+cypress/screenshots/
+cypress/videos/
+.cypress-cache/
+e2e/.auth/
+.auth/
+
+# ============================================================
+# Framework / deploy outputs
+# ============================================================
+.next/
+.nuxt/
+.output/
+.astro/
+.svelte-kit/
+storybook-static/
+storybook-static-*/
+web-build/
+.expo/
+.expo-shared/
+.vercel/
+.netlify/
+.firebase/
+.serverless/
+.sst/
+.docusaurus/
+.vuepress/dist/
+_site/
+.jekyll-cache/
+.jekyll-metadata
+docs/_build/
+site/
+
+# ============================================================
+# Electron builder / updater (besides release/ above)
+# ============================================================
+*.node
+app-update.yml
+latest*.yml
+shipit*.json
+*.blockmap
+!electron-builder.yml
+!electron-builder.*.js
+
+# ============================================================
+# Python extras
+# ============================================================
+.tox/
+.nox/
+.hypothesis/
+pytestdebug.log
+.coverage.*
+coverage.xml
+*.cover
+*.pyo
+*.pyd
+*.so
+*.whl
+*.egg-link
+.eggs/
+.installed.cfg
+pip-log.txt
+pip-delete-this-directory.txt
+__pypackages__/
+.uv/
+.uv-cache/
+.ipynb_checkpoints/
+.python_history
+dmypy.json
+.dmypy.json
+pyrightconfig.json.bak
+
+# ============================================================
+# Secrets extras
+# ============================================================
+.env.local
+.env.*.local
+.env.vault
+.env.me
+*.crt
+*.cer
+*.der
+*.pfx
+*.p8
+*.jks
+*.keystore
+secrets/
+.secrets/
+.aws/
+*.token
+*.vault
+
+# ============================================================
+# AI agent / assistant local files (never commit)
+# ============================================================
+.claude/
+.codex/
+.opencode/
+.continue/
+.copilot/
+.tabnine/
+.aider*
+.cursor/
+.windsurf/
+.zed/
+.claude/settings.local.json
+.codex/auth.json
+.vs/
+*.user
+*.suo
+*.sln.docstates
+.history/
+.vscode-test/
+.ionide/
+.vim/
+.nvim/
+*.elc
+
+# ============================================================
+# Temp / backup
+# ============================================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+*~
+.~lock.*#
+.tmp/
+.temp/
+tmp/
+temp/
+.tox-tmp/
+
+# ============================================================
+# Local runtime data / databases
+# ============================================================
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+dump.rdb
+.data/
+.local-data/
+app-data/
+
+# ============================================================
+# OS extras
+# ============================================================
+Icon?
+.AppleDouble
+.LSOverride
+.DocumentRevisions-V100
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
+.swx
+.nfs*

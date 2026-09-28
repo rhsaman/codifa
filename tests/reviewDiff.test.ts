@@ -4,7 +4,7 @@
 // اجرا: npx esbuild tests/reviewDiff.test.ts --bundle --platform=node \
 //        --format=esm --outfile=tests/.tmp-rd.mjs && node tests/.tmp-rd.mjs
 
-import { parseDiffRows, parseSideBySide } from "../src/lib/reviewDiff"
+import { mergeFileDiffs, parseDiffRows, parseSideBySide, splitUnifiedDiffByFile } from "../src/lib/reviewDiff"
 
 export {}
 
@@ -77,6 +77,111 @@ console.log("۳) unified خالص (بدون دهانش) گپی تولید نمی
   check("فقط یک بلوک rows", items.length === 1 && items[0].kind === "rows")
   const rows = parseDiffRows(single)
   check("یک ردیف add دارد", rows.filter((r) => r.type === "add").length === 1)
+}
+
+console.log("۴) buildReviewTurn: ویرایش تکراری یک فایل ادغام می‌شود:")
+{
+  const { buildReviewTurn } = await import("../src/lib/reviewTurn")
+  const d1 = [
+    "--- a/x.ts",
+    "+++ b/x.ts",
+    "@@ -1,1 +1,2 @@",
+    " const a = 1",
+    "+const b = 2",
+  ].join("\n")
+  const d2 = [
+    "--- a/x.ts",
+    "+++ b/x.ts",
+    "@@ -5,1 +6,2 @@",
+    " const c = 3",
+    "+const d = 4",
+  ].join("\n")
+  const mk = (path: string, diff: string): any =>
+    ({ tool: "edit_file", args: { path }, diff, status: "done" })
+  const turn = buildReviewTurn("m1", [mk("x.ts", d1), mk("x.ts", d2)])
+  check("فقط یک ردیف فایل", turn?.files.length === 1, turn?.files.length)
+  check("جمع adds = ۲", turn?.files[0]?.adds === 2, turn?.files[0])
+  check("دیف‌ها الحاق شده‌اند", !!turn?.files[0]?.diff.includes("const b = 2") && !!turn?.files[0]?.diff.includes("const d = 4"))
+}
+
+console.log("۵) buildReviewTurn: filePath هم مثل path پشتیبانی می‌شود:")
+{
+  const { buildReviewTurn } = await import("../src/lib/reviewTurn")
+  const d = [
+    "--- a/y.ts",
+    "+++ b/y.ts",
+    "@@ -1,1 +1,2 @@",
+    " const x = 1",
+    "+const y = 2",
+  ].join("\n")
+  const turn = buildReviewTurn("m2", [
+    ({ tool: "write_file", args: { filePath: "y.ts" }, diff: d, status: "done" }) as any,
+  ])
+  check("فایل با filePath پیدا شد", turn?.files.length === 1 && turn?.files[0]?.path === "y.ts", turn?.files)
+}
+
+console.log("۶) splitUnifiedDiffByFile: دیف چندفایلی گیت به تکه‌های تک‌فایلی:")
+{
+  const multi = [
+    "diff --git a/a.ts b/a.ts",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1,1 +1,2 @@",
+    " const a = 1",
+    "+const b = 2",
+    "diff --git a/b.css b/b.css",
+    "--- a/b.css",
+    "+++ b/b.css",
+    "@@ -1,1 +1,1 @@",
+    "-.x { color: red; }",
+    "+.x { color: blue; }",
+  ].join("\n")
+  const parts = splitUnifiedDiffByFile(multi)
+  check("دو تکه دارد", parts.length === 2, parts.length)
+  check("مسیر اول a.ts", parts[0]?.path === "a.ts", parts[0]?.path)
+  check("مسیر دوم b.css", parts[1]?.path === "b.css", parts[1]?.path)
+  check("تکه اول سرفصل خودش را دارد", !!parts[0]?.diff.includes("diff --git a/a.ts"))
+  check("تکه دوم خط آبی را دارد", !!parts[1]?.diff.includes("color: blue"))
+}
+
+console.log("۷) splitUnifiedDiffByFile: دیف خالی/بدون سرفصل:")
+{
+  check("دیف خالی → آرایه خالی", splitUnifiedDiffByFile("").length === 0)
+  check("دیف تک‌فایل بدون سرفصل → آرایه خالی", splitUnifiedDiffByFile("@@ -1 +1 @@\n-x\n+y").length === 0)
+}
+
+console.log("۸) mergeFileDiffs: ترکیب staged و unstaged یک مسیر:")
+{
+  const unstaged = [
+    "diff --git a/a.ts b/a.ts",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1,1 +1,2 @@",
+    " const a = 1",
+    "+const b = 2",
+  ].join("\n")
+  const staged = [
+    "diff --git a/a.ts b/a.ts",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -10,1 +10,2 @@",
+    " const c = 3",
+    "+const d = 4",
+    "diff --git a/b.ts b/b.ts",
+    "--- a/b.ts",
+    "+++ b/b.ts",
+    "@@ -1,1 +1,1 @@",
+    "-const x = 1",
+    "+const x = 2",
+  ].join("\n")
+  const merged = mergeFileDiffs([
+    splitUnifiedDiffByFile(unstaged),
+    splitUnifiedDiffByFile(staged),
+  ])
+  check("دو مسیر یکتا", merged.length === 2, merged.length)
+  const a = merged.find((f) => f.path === "a.ts")
+  check("دیف a.ts هر دو هانک را دارد", !!a?.diff.includes("const b = 2") && !!a?.diff.includes("const d = 4"), a?.diff)
+  check("ترتیب حفظ می‌شود (unstaged اول)", merged[0]?.path === "a.ts", merged.map((f) => f.path))
 }
 
 if (failed > 0) {

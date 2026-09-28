@@ -95,9 +95,8 @@ import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
-import { CheckpointsPanel } from "./CheckpointsPanel";
-import { GitPanel } from "./GitPanel";
 import { BalanceChip } from "./BalanceChip";
+import { ComposerDiffBar } from "./ComposerDiffBar";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -108,6 +107,7 @@ const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
   ["low", "Low"],
   ["medium", "Medium"],
   ["high", "High"],
+  ["xhigh", "XHigh"],
 ];
 const THINKING_LABELS = Object.fromEntries(THINKING_OPTIONS) as Record<
   ThinkingLevel,
@@ -119,6 +119,8 @@ const THINKING_DESCS: Record<ThinkingLevel, string> = {
   low: "Light reasoning — faster replies",
   medium: "Balanced reasoning — default",
   high: "Deep reasoning — better answers",
+  xhigh: "Extra-deep reasoning — strongest answers",
+  max: "Maximum reasoning — strongest answers",
 };
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
@@ -130,7 +132,7 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "redo", hint: "Redo the last undone exchange" },
   {
     name: "create-skill",
-    hint: "Create a skill (describe what you want after the command)",
+    hint: "Create or edit a skill (describe what you want after the command)",
   },
   {
     name: "create-mcp",
@@ -138,14 +140,16 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   },
 ];
 
-/** True when a message asks to create/install/import skills or MCP connectors,
+/** True when a message asks to create/edit/install/import skills or MCP connectors,
  *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
- *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه →
- *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too. */
+ *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
+ *  action; اسکیل/مهارت → skill target) so Persian-only prompts work too.
+ *  `create_skill` overwrites an existing skill with the same name, so the same
+ *  grant covers both creating AND editing a skill. */
 function wantsSkillOrMcp(text: string): boolean {
   const low = text.toLowerCase();
   const action =
-    /(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b/.test(
+    /\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)/.test(
       low,
     );
   const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)/.test(low);
@@ -2237,6 +2241,7 @@ export function ChatPanel() {
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
           compactAtPercent: s.settings.compactAtPercent ?? 80,
+        maxSteps: s.maxSteps ?? 0,
           signal: abort.signal,
         },
         handleEvent,
@@ -2576,7 +2581,7 @@ export function ChatPanel() {
         });
         void send(
           target === "skill"
-            ? `Create a new skill from this description: "${rest}". Use the create_skill tool to set it up with a good its name/slug and the instructions. Ask me only for anything essential that is genuinely missing; otherwise just create it. Do not modify files outside creating this skill.`
+            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
             : `Create a new MCP connector from this description: "${rest}". Use the create_mcp tool to add it, choosing a good name and command/URL/config that fits the description. Ask me only for anything essential that is genuinely missing; otherwise just create it. Do not modify files for this.`,
           [],
           [],
@@ -3415,8 +3420,6 @@ export function ChatPanel() {
           )}
         </span>
       </span>
-      <CheckpointsPanel />
-      <GitPanel />
       <BalanceChip
         providerName={
           shownBal
@@ -4035,6 +4038,7 @@ export function ChatPanel() {
               </div>
             );
           })()}
+        <ComposerDiffBar root={wroot} />
         <div className="composer-inner">
           {showJump && (
             <button
@@ -4561,12 +4565,12 @@ export function ChatPanel() {
                       type="button"
                       className="thinking-pill-btn"
                       onClick={() => setThinkingOpen((o) => !o)}
-                      title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? "Medium"}`}
+                      title={`Reasoning effort for this message — now: ${THINKING_LABELS[thinkingLevel] ?? (thinkingLevel ? thinkingLevel.toUpperCase() : "Medium")}`}
                       aria-label="Reasoning effort for this message"
                       aria-expanded={thinkingOpen}
                     >
                       <span className="thinking-label">
-                        {THINKING_LABELS[thinkingLevel] ?? "Medium"}
+                        {THINKING_LABELS[thinkingLevel] ?? (thinkingLevel ? thinkingLevel.toUpperCase() : "Medium")}
                       </span>
                       <span className="mode-select-caret" aria-hidden="true">
                         {thinkingOpen ? "▲" : "▼"}

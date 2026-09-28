@@ -230,15 +230,26 @@ export function modelContextWindow(
   return null
 }
 
-/** Resolve a model's reasoning-support flag from the provider's reasoningMap,
- *  trying both the bare and provider-prefixed id forms (see modelContextWindow).
- *  Returns null when the map doesn't know the model — callers then fall back
+/** Resolve a model's reasoning-support flag, trying both the bare and
+ *  provider-prefixed id forms (see modelContextWindow). Resolution order:
+ *  ۱) مقدار دستی کاربر (manualReasoningMap — تاگل دستی در Settings)
+ *  ۲) مقدار زنده‌ی reasoningMap (گزارش‌شده از /models یا models.dev).
+ *  Returns null when neither knows the model — callers then fall back
  *  to the name-based heuristic. */
 export function modelReasoning(
-  provider: { id?: string; reasoningMap?: Record<string, boolean> } | null | undefined,
+  provider: {
+    id?: string
+    reasoningMap?: Record<string, boolean>
+    manualReasoningMap?: Record<string, boolean>
+  } | null | undefined,
   model: string,
 ): boolean | null {
   if (!provider) return null
+  const manual = provider.manualReasoningMap ?? {}
+  const directManual = manual[model]
+  if (typeof directManual === 'boolean') return directManual
+  const prefixedManual = manual[`${provider.id ?? ''}/${model}`]
+  if (typeof prefixedManual === 'boolean') return prefixedManual
   const map = provider.reasoningMap ?? {}
   const direct = map[model]
   if (typeof direct === 'boolean') return direct

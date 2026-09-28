@@ -132,3 +132,51 @@ export function parseSideBySide(diff: string): SideBySideItem[] {
   });
   return items;
 }
+
+/** یک تکه دیف متعلق به یک فایل. */
+export interface FileDiff {
+  path: string;
+  diff: string;
+}
+
+/** چند تکه‌دیف (مثلاً staged و unstaged) را به‌ازای هر مسیر ادغام می‌کند —
+ *  دیف‌های یک مسیر به‌ترتیب ورودی الحاق می‌شوند تا آمار +N -M کامل شود. */
+export function mergeFileDiffs(groups: FileDiff[][]): FileDiff[] {
+  const order: string[] = [];
+  const byPath = new Map<string, string[]>();
+  for (const group of groups) {
+    for (const f of group) {
+      if (!f.path) continue;
+      const cur = byPath.get(f.path);
+      if (cur) cur.push(f.diff);
+      else {
+        byPath.set(f.path, [f.diff]);
+        order.push(f.path);
+      }
+    }
+  }
+  return order.map((path) => ({
+    path,
+    diff: (byPath.get(path) ?? []).join("\n"),
+  }));
+}
+
+/** دیف چندفایلی گیت (با سرفصل‌های `diff --git`) را به تکه‌های تک‌فایلی
+ *  می‌شکند تا پنل Review بتواند همان لیست فایل ترن را نشان بدهد. */
+export function splitUnifiedDiffByFile(diff: string): FileDiff[] {
+  const out: FileDiff[] = [];
+  let cur: string[] | null = null;
+  let curPath = "";
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      if (cur) out.push({ path: curPath, diff: cur.join("\n") });
+      const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line);
+      curPath = m ? m[2] : line.slice("diff --git ".length);
+      cur = [line];
+    } else if (cur) {
+      cur.push(line);
+    }
+  }
+  if (cur) out.push({ path: curPath, diff: cur.join("\n") });
+  return out.filter((f) => f.path.length > 0);
+}

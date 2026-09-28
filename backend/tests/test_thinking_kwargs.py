@@ -19,10 +19,17 @@ def test_off_levels_return_empty():
     assert _thinking_kwargs("openrouter", "gpt-4o", "  none  ") == {}
 
 
-def test_xhigh_is_no_longer_a_valid_level():
-    # 'xhigh' was removed because OpenAI/LangChain reject it (400). It must now
-    # fall through to the empty mapping (unknown key -> None -> {}).
-    assert _thinking_kwargs("openrouter", "gpt-4o", "xhigh") == {}
+def test_extra_top_rungs_pass_through():
+    # 'xhigh' (gpt-5.1 style routes) and 'max' (agentrouter / some OpenRouter
+    # routes) pass through verbatim; routes that reject one are remapped by the
+    # reasoning-effort 400 retry path instead of being dropped here.
+    assert _thinking_kwargs("openrouter", "gpt-4o", "xhigh") == {"reasoning_effort": "xhigh"}
+    assert _thinking_kwargs("openrouter", "gpt-4o", "max") == {"reasoning_effort": "max"}
+
+
+def test_unknown_level_stays_off():
+    # A genuinely unknown level still falls through to the empty mapping.
+    assert _thinking_kwargs("openrouter", "gpt-4o", "ultra") == {}
 
 
 def test_auto_think_cloud_provider_gets_reasoning_effort():

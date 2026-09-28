@@ -245,14 +245,23 @@ export default function App() {
         <div id="titlebar-toolbar" />
         <UsageChip />
         <UpdateButton />
-        <button
-          className="workspace-btn"
+        <div className="titlebar-workspace">
+          <button
+            className="dir-toggle"
+            title="Git diff — uncommitted changes"
+            onClick={() => useReviewPanel.getState().openGitDiff()}
+          >
+            ⎇
+          </button>
+          <button
+            className="workspace-btn"
           aria-label="Open workspace folder"
           title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
           onClick={() => void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))}
         >
           📁 {activeChatRoot ? activeChatRoot.split('/').filter(Boolean).pop() : 'Open workspace'}
-        </button>
+          </button>
+        </div>
       </header>
 
       <div className="app-body">

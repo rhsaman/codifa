@@ -289,6 +289,30 @@ npx esbuild src/lib/reviewStats.test.ts --bundle --platform=node --format=esm \
   --packages=external --outfile=tests/.tmp-rvs.mjs --external:electron >/dev/null 2>&1
 node tests/.tmp-rvs.mjs
 
-rm -f tests/.tmp-rd.mjs tests/.tmp-rvs.mjs tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-mc.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs tests/.tmp-tp.mjs tests/.tmp-pms.mjs tests/.tmp-snf.mjs tests/.tmp-mt.mjs src/lib/.tmp-shortcuts.mjs
+echo ""
+echo "── تست ۴۵ب: reviewAccordion (دیف زیر هر فایل باز می‌شود، نه لیست بالا + دیف پایین) ──"
+npx esbuild tests/reviewAccordion.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
+  --outfile=tests/.tmp-ra.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-ra.mjs
+
+echo ""
+echo "── تست ۴۶ب: diffSearch (هایلایت + فیلتر جست‌وجو داخل دیف) ──"
+node tests/diffSearch.test.ts
+
+echo ""
+echo "── تست ۴۶ج: uncommitted (ترکیب staged/unstaged + untracked) ──"
+npx esbuild tests/uncommitted.test.ts --bundle --platform=node --format=esm \
+  --packages=external --outfile=tests/.tmp-uc2.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-uc2.mjs
+
+echo ""
+echo "── تست ۴۶: tts single-play (پخش ویس جدید ویس قبلی را قطع می‌کند — بدون پخش همزمان) ──"
+npx esbuild src/lib/tts.test.ts --bundle --platform=node --format=esm \
+  --packages=external --outfile=tests/.tmp-tts.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-tts.mjs
+
+rm -f tests/.tmp-tts.mjs tests/.tmp-uc2.mjs tests/.tmp-ra.mjs tests/.tmp-rd.mjs tests/.tmp-rvs.mjs tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-mc.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs tests/.tmp-tp.mjs tests/.tmp-pms.mjs tests/.tmp-snf.mjs tests/.tmp-mt.mjs src/lib/.tmp-shortcuts.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

@@ -109,3 +109,31 @@ def test_log_limit(repo):
     # cap سخت: limit بزرگ از _MAX_LOG بیشتر نشود
     log = git_tools.git_log(repo, limit=999)
     assert len(log["commits"]) == 4
+
+
+def test_show_head_diff(repo):
+    with open(os.path.join(repo, "a.txt"), "a") as f:
+        f.write("second\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "second"], cwd=repo, check=True, capture_output=True
+    )
+    out = git_tools.git_show(repo)
+    assert "error" not in out, out
+    assert "+second" in out["diff"]
+    assert "diff --git" in out["diff"]
+    # scoped به یک path
+    out = git_tools.git_show(repo, rev="HEAD", path="a.txt")
+    assert "error" not in out, out
+    assert "+second" in out["diff"]
+
+
+def test_show_invalid_rev(repo):
+    out = git_tools.git_show(repo, rev="--bad")
+    assert "error" in out
+
+
+def test_show_not_a_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
+    out = git_tools.git_show(str(tmp_path))
+    assert "error" in out

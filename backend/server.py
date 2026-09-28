@@ -180,7 +180,7 @@ OAUTH_RESULTS: dict[str, dict] = {}
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, model_validator
 
 import providers
@@ -202,13 +202,15 @@ from llm import build_chat_model, llm_complete
 
 
 def wants_skill_or_mcp(text: str) -> bool:
-    """True when a prompt asks to create/install/import skills or MCP connectors,
+    """True when a prompt asks to create/edit/install/import skills or MCP connectors,
     so the agent gets the `create_skill` / `create_mcp` tools for the turn.
-    Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه →
+    `create_skill` overwrites an existing skill with the same name, so the same
+    grant covers both creating AND editing a skill.
+    Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
     action; اسکیل/مهارت → skill target)."""
     low = text.lower()
     action = re.search(
-        r"\b(install|add|create|import|save|set up|setup|copy|نصب|ساخت|بساز|ایجاد|ذخیره|اضافه)\b",
+        r"\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)",
         low,
     )
     target = re.search(r"\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)", low)
@@ -354,6 +356,9 @@ class ChatRequest(BaseModel):
     # The reserved headroom is implicit: `(100 - compact_at_percent)%` of the
     # window is left free. Range 1-99. Default 80.
     compact_at_percent: int = 80
+    # Max tool-loop steps per turn (Settings → General). 0 = backend auto from
+    # the context window (12–40). N > 0 = fixed budget (clamped 5–200).
+    max_steps: int = 0
 
 
 class CompactRequest(BaseModel):
@@ -414,6 +419,18 @@ class ModelRemoveRequest(BaseModel):
 
     kind: str = ""
     model: str = ""
+
+
+class TtsRequest(BaseModel):
+    """POST /tts — synthesize text via an OpenAI-compatible /audio/speech endpoint."""
+
+    text: str = ""
+    provider: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    env_var: str = ""
+    model: str = ""
+    voice: str = ""
 
 
 class PermissionResponse(BaseModel):
@@ -571,6 +588,19 @@ async def git_log(root: Annotated[str, Query(min_length=1)] = "", limit: int = 2
     if not root or not os.path.isdir(root):
         raise HTTPException(status_code=400, detail="invalid project root")
     return git_tools.git_log(root, limit)
+
+
+@app.get("/git/show")
+async def git_show(
+    root: Annotated[str, Query(min_length=1)] = "",
+    rev: str = "HEAD",
+    path: str = "",
+) -> dict:
+    import git_tools
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    return git_tools.git_show(root, rev, path)
 
 
 @app.post("/git/commit")
@@ -1049,6 +1079,56 @@ async def _transcribe_remote(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"remote transcription bad response: {exc}") from exc
     return {"text": str(body.get("text", "")).strip()}
+
+
+@app.post("/tts")
+async def text_to_speech(req: TtsRequest) -> Response:
+    """Synthesize text to speech via an OpenAI-compatible /audio/speech endpoint.
+
+    Local TTS is not supported yet — `provider: local` (or empty) is rejected
+    with a clear 400. Remote providers are forwarded to
+    `POST {base_url}/audio/speech` with {"model", "input", "voice"} and the
+    raw audio bytes are returned with the upstream content type.
+    """
+    import httpx
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="missing 'text' field")
+    provider_kind = (req.provider or "").strip()
+    if not provider_kind or provider_kind == "local":
+        raise HTTPException(status_code=400, detail="TTS لوکال پشتیبانی نمی‌شود — یک پروایدر ریموت انتخاب کنید")
+    base_url = (req.base_url or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="remote TTS needs 'base_url'")
+    url = f"{base_url.rstrip('/')}/audio/speech"
+    key = (req.api_key or "").strip() or providers.env_key(provider_kind, (req.env_var or "").strip())
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    # Some OpenAI-compatible gateways (e.g. multi-vendor routers like 9router)
+    # block unknown HTTP clients by User-Agent (HTTP 401 "unauthorized client")
+    # while allowing well-known agent CLIs — same UA the chat path sends for
+    # custom gateways (see llm._request_headers). Harmless for servers that
+    # don't filter (llama.cpp/Ollama/LM Studio just ignore the header).
+    headers["User-Agent"] = providers.UA_LADDER[0]
+    payload: dict = {"input": text}
+    # مدل/ویس خالی ارسال نمی‌شود: بعضی پروایدرهای 9router مدل یا ویس ندارند
+    # و با دریافت فیلد اضافه خطا می‌دهند. وقتی مقدار هست، مثل قبل فرستاده می‌شود.
+    tts_model = (req.model or "").strip()
+    if tts_model:
+        payload["model"] = tts_model
+    tts_voice = (req.voice or "").strip()
+    if tts_voice:
+        payload["voice"] = tts_voice
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"remote speech synthesis failed: {exc}") from exc
+    if resp.status_code >= 400:
+        detail = resp.text.strip()[:500] or f"remote speech synthesis failed ({resp.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+    media_type = (resp.headers.get("content-type") or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
+    return Response(content=resp.content, media_type=media_type)
 
 
 def _sse(obj: dict) -> str:
@@ -1665,6 +1745,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             chat_id=req.chat_id,
             providers=req.providers,
             compact_at_percent=req.compact_at_percent,
+            max_steps=req.max_steps,
         )
         try:
             logger.warning(

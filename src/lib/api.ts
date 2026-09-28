@@ -111,6 +111,70 @@ export interface TranscribeProviderOpts {
   model?: string
 }
 
+/** Remote TTS provider details forwarded to POST /tts. */
+export interface SpeakProviderOpts {
+  kind: string
+  baseUrl: string
+  apiKey?: string
+  envVar?: string
+  model?: string
+  voice?: string
+}
+
+/**
+ * Synthesize text to speech via the sidecar.
+ * Remote (opts): forwarded to POST {base_url}/audio/speech.
+ * Returns the audio bytes as a Blob.
+ */
+export async function speakText(
+  text: string,
+  opts: SpeakProviderOpts,
+): Promise<Blob> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const body: Record<string, string> = {
+    text,
+    provider: opts.kind,
+    base_url: opts.baseUrl,
+  }
+  // مدل/ویس خالی ارسال نمی‌شود تا پروایدرهایی که مدل/ویس ندارند (بعضی
+  // پروایدرهای 9router) هم کار کنند — بک‌اند هم آن‌ها را از payload حذف می‌کند.
+  if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
+  if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
+  if (opts.apiKey) body.api_key = opts.apiKey
+  if (opts.envVar) body.env_var = opts.envVar
+  const post = async (base: string): Promise<Blob> => {
+    const res = await fetch(`${base}/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(
+        (data as { detail?: string }).detail || `speech synthesis failed (${res.status})`,
+      )
+    }
+    return await res.blob()
+  }
+  try {
+    return await post(url)
+  } catch (err) {
+    // A network-level failure (TypeError) means the sidecar is unreachable —
+    // its cached URL is stale. Drop the cache and retry once against a freshly
+    // resolved URL (which restarts the sidecar if needed).
+    if (err instanceof TypeError) {
+      sidecarUrl = null
+      const retryUrl = await ensureSidecar()
+      if (retryUrl && retryUrl !== url) {
+        return await post(retryUrl)
+      }
+    }
+    throw err
+  }
+}
+
 /**
  * Transcribe a recorded audio blob via the sidecar.
  * Local (no opts): on-device Whisper, fully offline.
@@ -387,8 +451,11 @@ export interface StreamParams {
   /** Auto-compaction threshold as a percentage of the raw context window.
    *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`. */
   compactAtPercent?: number
+  /** Max tool-loop steps per turn. 0/undefined = backend auto from ctx. */
+  maxSteps?: number
   signal?: AbortSignal
 }
+
 
 export async function streamChat(
   params: StreamParams,
@@ -507,6 +574,8 @@ export async function streamChat(
           providers: params.providers ?? {},
           // Single auto-compaction threshold as a percentage of the raw window.
           compact_at_percent: params.compactAtPercent ?? 80,
+          // Max tool-loop steps per turn (Settings → General, 0 = backend auto).
+          max_steps: params.maxSteps ?? 0,
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })
@@ -1128,6 +1197,16 @@ export async function gitDiff(
 export async function gitLog(root: string, limit = 20): Promise<GitLog | { error: string }> {
   const q = new URLSearchParams({ root, limit: String(limit) })
   return sidecarGet<GitLog>(`/git/log?${q.toString()}`)
+}
+
+/** Diff یک کامیت مشخص (پیش‌فرض HEAD)، اختیاری محدود به یک فایل. */
+export async function gitShow(
+  root: string,
+  rev = "HEAD",
+  path = "",
+): Promise<GitDiff | { error: string }> {
+  const q = new URLSearchParams({ root, rev, path })
+  return sidecarGet<GitDiff>(`/git/show?${q.toString()}`)
 }
 
 /** Commit تغییرات staged (یا همه با add_all). */

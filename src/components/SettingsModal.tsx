@@ -485,6 +485,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const removeProvider = useStore((s) => s.removeProvider)
   const addManualModel = useStore((s) => s.addManualModel)
   const setManualModelContext = useStore((s) => s.setManualModelContext)
+  const setManualModelReasoning = useStore((s) => s.setManualModelReasoning)
   const removeManualModel = useStore((s) => s.removeManualModel)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
@@ -501,6 +502,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
   const setSttModel = useStore((s) => s.setSttModel)
+  const ttsProviderId = useStore((s) => s.ttsProviderId)
+  const ttsModel = useStore((s) => s.ttsModel)
+  const ttsVoice = useStore((s) => s.ttsVoice)
+  const setTtsProviderId = useStore((s) => s.setTtsProviderId)
+  const setTtsModel = useStore((s) => s.setTtsModel)
+  const setTtsVoice = useStore((s) => s.setTtsVoice)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
@@ -509,6 +516,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
+  const maxSteps = useStore((s) => s.maxSteps ?? 0)
+  const setMaxSteps = useStore((s) => s.setMaxSteps)
   const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
   const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
   const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
@@ -947,7 +956,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     const { model: _model, ...cfgPersistFull } = cfg
     // Get live models/removedModels from store to avoid normalizing them to empty arrays
     const liveProvider = useStore.getState().settings.providers.find((p) => p.id === active.id)
-    const { models: _models, removedModels: _removed, addedModels: _added, contextMap: _ctxMap, manualContextMap: _manualCtxMap, ...cfgPersist } = cfgPersistFull
+    const { models: _models, removedModels: _removed, addedModels: _added, contextMap: _ctxMap, manualContextMap: _manualCtxMap, manualReasoningMap: _manualReasoningMap, ...cfgPersist } = cfgPersistFull
     updateProvider(active.id, {
       ...cfgPersist,
       model: liveProvider?.model ?? active.model,
@@ -958,6 +967,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       // و مقادیر دستیِ کاربر هنگام Save پاک نشوند.
       contextMap: liveProvider?.contextMap,
       manualContextMap: liveProvider?.manualContextMap,
+      manualReasoningMap: liveProvider?.manualReasoningMap,
     })
     setSaved(true)
     setTimeout(onClose, 300)
@@ -1403,9 +1413,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     {manual.map((m) => {
                       const bare = m.startsWith(`${active.id}/`) ? m.slice(active.id.length + 1) : m
                       const manualCtx = live?.manualContextMap?.[bare]
+                      const manualReasoning = live?.manualReasoningMap?.[bare]
                       return (
-                        <span key={m} className="manual-model-chip">
+                        <span key={m} className="manual-model-chip" title={m}>
                           <span className="manual-model-name">{m}</span>
+                          <button
+                            type="button"
+                            className="manual-model-remove"
+                            title="Remove model"
+                            onClick={() => removeManualModel(active.id, m)}
+                          >
+                            ×
+                          </button>
                           {isCustomKind && (
                             <input
                               className="manual-model-ctx-input"
@@ -1424,11 +1443,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                           )}
                           <button
                             type="button"
-                            className="manual-model-remove"
-                            title="Remove model"
-                            onClick={() => removeManualModel(active.id, m)}
+                            className={`manual-model-reasoning${manualReasoning ? ' on' : ''}`}
+                            title={manualReasoning ? 'Reasoning: on — click to turn off' : 'Reasoning: off — click to enable the thinking-level picker for this model'}
+                            aria-pressed={manualReasoning === true}
+                            onClick={() => setManualModelReasoning(active.id, m, manualReasoning ? null : true)}
                           >
-                            ×
+                            <span aria-hidden="true" className="manual-model-reasoning-icon">✦</span>
+                            <span className="manual-model-reasoning-label">{manualReasoning ? 'Thinking' : 'No think'}</span>
                           </button>
                         </span>
                       )
@@ -1728,7 +1749,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
               <div className="hint">
                 Skills are stored in the app's user data folder and matched to your messages semantically:
-                when a request matches a skill, the agent follows its instructions. Create new skills
+                when a request matches a skill, the agent follows its instructions. Create or edit skills
                 by typing <code>/create-skill &lt;description&gt;</code> in the chat, or add them here.
               </div>
               <div className="settings-search">
@@ -2092,6 +2113,38 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="mcp-card open">
                 <div className="mcp-card-head">
                   <span className="mcp-chevron open">▶</span>
+                  <span className="mcp-card-title">Text-to-Speech source</span>
+                </div>
+                <div className="mcp-fields">
+                  <div className="hint">
+                    Choose which provider reads agent replies aloud. The recording is sent to that
+                    provider's OpenAI-compatible <code>/audio/speech</code> endpoint.
+                    Leave model/voice empty for providers that don't need them (some 9router
+                    providers have no model or voice) — empty fields are not sent.
+                  </div>
+                  <label className="field-label">TTS provider</label>
+                  <select value={ttsProviderId} onChange={(e) => setTtsProviderId(e.target.value)} dir="ltr">
+                    <option value="">انتخاب نشده</option>
+                    {providers.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                      </option>
+                    ))}
+                  </select>
+                  {ttsProviderId && (
+                    <>
+                      <label className="field-label">TTS model</label>
+                      <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
+                      <label className="field-label">TTS voice</label>
+                      <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="mcp-card open">
+                <div className="mcp-card-head">
+                  <span className="mcp-chevron open">▶</span>
                   <span className="mcp-card-title">Whisper — Voice input</span>
                   <span className={`status-dot ${(mStatus?.whisper?.dirs ?? []).length > 0 ? 'ok' : ''}`} />
                 </div>
@@ -2192,6 +2245,33 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <span className="font-size-label">200</span>
               </div>
               <div className="hint">Default: 0 (full history).</div>
+            </div>
+
+            <div className="field">
+              <div className="field-head">
+                <label>Max agent steps</label>
+                <span className="field-value-badge">{maxSteps === 0 ? 'Auto' : maxSteps}</span>
+              </div>
+              <div className="hint">
+                How many tool-calling steps the agent may take per turn before it is
+                forced to stop and summarize. 0 = automatic from the model's context
+                window (12–40 steps; default). Higher = longer tasks finish in one turn
+                but burn more tokens when the model loops. Range 0–200. Applies on the
+                next message.
+              </div>
+              <div className="font-size-row">
+                <span className="font-size-label">Auto</span>
+                <RangeSlider
+                  min={0}
+                  max={200}
+                  step={1}
+                  value={maxSteps}
+                  onChange={setMaxSteps}
+                  ariaLabel="Max agent steps"
+                />
+                <span className="font-size-label">200</span>
+              </div>
+              <div className="hint">Default: 0 (auto).</div>
             </div>
         </>
         )}

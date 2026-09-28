@@ -314,6 +314,10 @@ def build_chat_model(
             "low": 4096,
             "medium": 12288,
             "high": 32768,
+            # Gemini 2.5's max thinking budget is 32768 — xhigh/max clamp to
+            # the deepest available instead of disabling thinking (None).
+            "xhigh": 32768,
+            "max": 32768,
         }
         thinking_budget = google_thinking.get((thinking_level or "").strip())
         return _stamp_provider(
@@ -1015,6 +1019,99 @@ def dedupe_tool_outputs(msgs: list) -> list:
     return out
 
 
+def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
+    """یکتاسازیِ in-place شناسهٔ همهٔ ``tool_call``ها در کل ترنسکریپت.
+
+    providerهایی که هر فراخوانی را با خروجی‌اش بر اساس ``call_id`` جفت می‌کنند
+    (گیت‌وی‌های سبک OpenAI Responses) ترنسکریپتی را که یک ``call_id`` را در دو
+    فراخوانیِ متفاوت تکرار کرده با 400 «Duplicate function_call_output for
+    call_id» رد می‌کنند. یکتاسازی فعلی فقط *داخل یک پیام*
+    (``dedupe_step_tool_call_ids``) و *داخل بازسازی تاریخچه*
+    (``history_to_langchain_messages``) است؛ پس در «ترن جدید» یا «استاپ و
+    ادامه» ترنسکریپتِ انباشته می‌تواند شناسهٔ تکراری داشته باشد.
+
+    تکراری‌ها پسوند ``#N`` می‌گیرند و ``ToolMessage`` متناظر هم به شناسهٔ جدید
+    اشاره می‌کند تا هر نتیجه به فراخوانی خودش متصل بماند (نه به فراخوانی
+    قبلیِ هم‌شناسه).
+    """
+    used: set[str] = set()
+    # صف FIFO از [شناسهٔ اصلی، شناسهٔ یکتا] برای فراخوانی‌های بی‌جواب.
+    open_calls: list[list[Any]] = []
+    renames: list[tuple[int, dict[int, str]]] = []
+    for i, m in enumerate(msgs):
+        if isinstance(m, AIMessage):
+            tcs = list(getattr(m, "tool_calls", None) or [])
+            if not tcs:
+                continue
+            changed: dict[int, str] = {}
+            for j, tc in enumerate(tcs):
+                raw = str(tc.get("id") or "")
+                cid = raw or "call"
+                if cid in used:
+                    n = 2
+                    while f"{cid}#{n}" in used:
+                        n += 1
+                    cid = f"{cid}#{n}"
+                if cid != raw:
+                    changed[j] = cid
+                used.add(cid)
+                open_calls.append([raw, cid])
+            if changed:
+                renames.append((i, changed))
+        elif isinstance(m, ToolMessage):
+            tcid = str(m.tool_call_id or "")
+            for entry in open_calls:
+                if entry[0] == tcid:
+                    entry[0] = None  # مصرف شد
+                    if entry[1] != tcid:
+                        msgs[i] = m.model_copy(update={"tool_call_id": entry[1]})
+                    break
+    if not renames:
+        return
+    for i, changed in renames:
+        m = msgs[i]
+        tcs = list(m.tool_calls or [])
+        for j, new_id in changed.items():
+            tcs[j]["id"] = new_id
+        # ``model_copy`` بعدی ``tool_calls`` را از ``tool_call_chunks`` و blob
+        # خام بازاستخراج می‌کند، پس هر دو را هم به‌روز می‌کنیم.
+        chunks = getattr(m, "tool_call_chunks", None) or []
+        if len(chunks) == len(tcs):
+            for j, new_id in changed.items():
+                c = chunks[j]
+                if isinstance(c, dict):
+                    c["id"] = new_id
+                else:
+                    with contextlib.suppress(Exception):
+                        c.id = new_id
+        raw_tcs = (getattr(m, "additional_kwargs", None) or {}).get("tool_calls")
+        if isinstance(raw_tcs, list) and len(raw_tcs) == len(tcs):
+            for j, new_id in changed.items():
+                entry = raw_tcs[j]
+                if isinstance(entry, dict):
+                    entry["id"] = new_id
+        msgs[i] = m.model_copy(update={"tool_calls": tcs})
+    if logger is not None:
+        logger.warning(
+            "normalized %d assistant message(s) with duplicate tool_call ids",
+            len(renames),
+        )
+
+
+def normalize_tool_transcript(msgs: list, logger: Any = None) -> list:
+    """ترنسکریپت را در یک پاس برای provider معتبر می‌کند (in-place).
+
+    ترتیب: یکتاسازی شناسه‌ها در کل ترنسکریپت → حذف ``tool_call``های بی‌جواب →
+    نگه‌داشتن فقط یک خروجی به‌ازای هر شناسه. این تنها نقطهٔ گلوگاه پیش از هر
+    درخواست provider است، پس هیچ مسیری (چک‌پوینت خراب، compaction، ادامهٔ turn)
+    نمی‌تواند ترنسکریپت نامعتبر بفرستد.
+    """
+    _uniquify_tool_call_ids(msgs, logger)
+    strip_orphaned_tool_calls(msgs, logger)
+    msgs[:] = dedupe_tool_outputs(msgs)
+    return msgs
+
+
 def append_tool_result(msgs: list, content: Any, tool_call_id: str) -> bool:
     """فقط وقتی ``ToolMessage`` اضافه می‌کند که این ``tool_call_id`` بی‌جواب باشد.
 
@@ -1394,10 +1491,9 @@ async def langchain_tool_loop(
         # the provider never sees a tool_calls block without matching
         # ToolMessages (which causes a 400 "missing results for
         # tool_call_id(s)" validation error).
-        strip_orphaned_tool_calls(msgs, _logger)
-        # نگهبان نهاییِ «یک خروجی به‌ازای هر call_id» (compaction یا چک‌پوینت
-        # خراب ممکن است دو ToolMessage برای یک call_id بسازد).
-        msgs[:] = dedupe_tool_outputs(msgs)
+        # نگهبان نهایی ترنسکریپت (یکتاسازی شناسه‌ها + حذف بی‌جواب‌ها + یک
+        # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
+        normalize_tool_transcript(msgs, _logger)
         ai = await model.bind_tools(lc_tools).ainvoke(msgs)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The

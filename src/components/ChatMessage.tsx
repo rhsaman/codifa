@@ -19,6 +19,7 @@ import {
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
 import { cancelSteer } from "../lib/api";
+import { useTtsPlayback } from "../lib/tts";
 import { useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
@@ -1303,7 +1304,12 @@ export const ChatMessageView = memo(function ChatMessageView({
   const isUser = message.role === "user";
   const dir = useStore((s) => s.dir);
   const settings = useStore((s) => s.settings);
+  const ttsProviderId = useStore((s) => s.ttsProviderId);
+  const ttsModel = useStore((s) => s.ttsModel);
+  const ttsVoice = useStore((s) => s.ttsVoice);
   const [copied, setCopied] = useState(false);
+  const { status: ttsStatus, play: ttsPlay, stop: ttsStop } = useTtsPlayback();
+  const [ttsError, setTtsError] = useState<string | null>(null);
 
   const modeLabel = (id: string) => getMode(settings, id).label;
 
@@ -1316,6 +1322,38 @@ export const ChatMessageView = memo(function ChatMessageView({
       console.warn("copy failed", err);
     }
   };
+
+  const toggleSpeak = async () => {
+    if (ttsStatus === "loading" || ttsStatus === "speaking") {
+      ttsStop();
+      return;
+    }
+    setTtsError(null);
+    const provider = settings.providers.find((p) => p.id === ttsProviderId);
+    if (!provider) {
+      setTtsError("برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید");
+      return;
+    }
+    try {
+      await ttsPlay(stripBidiMarks(fixZwsp(message.content)), {
+        kind: provider.kind,
+        baseUrl: provider.baseUrl ?? "",
+        apiKey: provider.apiKey ?? "",
+        envVar: provider.envVar ?? "",
+        model: ttsModel,
+        voice: ttsVoice,
+      });
+    } catch (err) {
+      console.warn("speak failed", err);
+      setTtsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  // قطع صدا هنگام شروع پیام جدید یا unmount تا پخش قدیمی روی پیام تازه نماند.
+  useEffect(() => {
+    if (message.streaming) ttsStop();
+  }, [message.streaming, ttsStop]);
+  useEffect(() => () => ttsStop(), [ttsStop]);
 
   // No live token estimate while streaming: the char-based estimate overshot
   // and then "fell back down" to the real provider numbers once the usage event
@@ -1577,6 +1615,43 @@ export const ChatMessageView = memo(function ChatMessageView({
                 )}
                 {copied ? "Copied" : "Copy"}
               </button>
+              {!isUser && !message.streaming && (
+                <button
+                  className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""}`}
+                  onClick={toggleSpeak}
+                  title={ttsError ?? "خواندن با صدا"}
+                >
+                  {ttsStatus === "speaking" ? (
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  ) : (
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M11 5 6 9H2v6h4l5 4V5z" />
+                      <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+                    </svg>
+                  )}
+                  {ttsStatus === "loading" ? "…" : ttsStatus === "speaking" ? "Stop" : "Speak"}
+                </button>
+              )}
               {!isUser &&
                 !isSummary &&
                 !message.streaming &&

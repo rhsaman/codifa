@@ -89,6 +89,32 @@ def test_computer_kept_with_desktop_intent():
     assert "computer" in out
 
 
+def test_computer_kept_with_chrome_tab_intent():
+    tools = {"computer": lambda: None, "read": lambda: None}
+    out = graph.filter_tools_for_mode(
+        "coder", dict(tools), {}, set(), True, False,
+        prompt="look at my open chrome tabs and check the tradingview chart",
+    )
+    assert "computer" in out
+
+
+def test_computer_tab_hint_needs_word_boundary():
+    tools = {"computer": lambda: None, "read": lambda: None}
+    out = graph.filter_tools_for_mode(
+        "coder", dict(tools), {}, set(), True, False, prompt="fix the database table",
+    )
+    assert "computer" not in out
+
+
+def test_computer_kept_via_history_intent():
+    tools = {"computer": lambda: None, "read": lambda: None}
+    history = [{"role": "user", "content": "look at my open chrome tabs"}]
+    out = graph.filter_tools_for_mode(
+        "coder", dict(tools), {}, set(), True, False, prompt="continue", history=history,
+    )
+    assert "computer" in out
+
+
 def test_checkpoint_throttled_and_forced():
     graph._checkpoint_state.pop("thr", None)
     msgs = [HumanMessage(content="hi")]

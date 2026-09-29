@@ -741,9 +741,28 @@ def history_to_langchain_messages(
 
 _COMPUTER_INTENT_HINTS = (
     "computer", "desktop", "application", "windows", "macos", "linux",
+    "chrome", "tab", "window", "chart",
     "screenshot", "screen", "click", "keyboard", "mouse",
     "اپ دسکتاپ", "دسکتاپ", "ویندوز", "لینوکس", "صفحه", "کلیک",
+    "کروم", "کامپیوتر", "پنجره", "تب", "چارت",
 )
+
+
+def _computer_hint_hit(text: str, hint: str) -> bool:
+    """Word-boundary match for a computer-intent hint (mirrors laya's rule).
+
+    Short hints like ``tab``/``تب`` must not fire inside other words
+    (``table``/``database``/``تبلیغ``) — so alnum hints match on word
+    boundaries; non-alnum hints fall back to substring."""
+    hint = (hint or "").strip().lower()
+    if not hint:
+        return False
+    if any(ch.isalnum() or ch == "_" for ch in hint):
+        try:
+            return re.search(r"(?<!\w)" + re.escape(hint) + r"(?!\w)", text) is not None
+        except re.error:
+            return hint in text
+    return hint in text
 
 
 def _wants_computer(prompt: str) -> bool:
@@ -756,7 +775,25 @@ def _wants_computer(prompt: str) -> bool:
     text = (prompt or "").strip().lower()
     if not text:
         return False
-    return any(h in text for h in _COMPUTER_INTENT_HINTS)
+    return any(_computer_hint_hit(text, h) for h in _COMPUTER_INTENT_HINTS)
+
+
+def _history_wants_computer(history: list | None) -> bool:
+    """True when any of the last few user turns shows desktop-control intent.
+
+    Mirrors the ``allow_create`` safety net in ``server.chat_stream``: a
+    follow-up like "continue" keeps the grant when an earlier turn asked
+    for desktop work (e.g. "look at my open Chrome")."""
+    if not history:
+        return False
+    for turn in list(history)[-6:]:
+        if (
+            isinstance(turn, dict)
+            and turn.get("role") == "user"
+            and _wants_computer(str(turn.get("content", "")))
+        ):
+            return True
+    return False
 
 
 def filter_tools_for_mode(
@@ -769,6 +806,7 @@ def filter_tools_for_mode(
     prompt: str = "",
     root: str = "",
     allow_computer: bool = False,
+    history: list | None = None,
 ) -> dict[str, Callable]:
     """Return the mode-appropriate subset of ``tools``.
 
@@ -855,7 +893,9 @@ def filter_tools_for_mode(
     # server.chat_stream). Otherwise it is stripped here so it never reaches
     # the model — and the laya fast-route decision below is skipped too.
     # Runtime permission prompting still applies when the tool IS bound.
-    if "computer" in tools and not (allow_computer or _wants_computer(prompt)):
+    if "computer" in tools and not (
+        allow_computer or _wants_computer(prompt) or _history_wants_computer(history)
+    ):
         tools = {n: fn for n, fn in tools.items() if n != "computer"}
 
     scoped = bool(scoped_paths)
@@ -1589,6 +1629,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         prompt=prompt,
         root=root,
         allow_computer=bool(state.get("allow_computer")),
+        history=state.get("history"),
     )
 
     # --- MCP bridge -------------------------------------------------------

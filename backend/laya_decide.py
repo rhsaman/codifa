@@ -39,10 +39,28 @@ FAST_ROUTE_NORMAL = "normal"
 FAST_ROUTE_OPTIONS = (FAST_ROUTE_COMPUTER, FAST_ROUTE_BROWSER, FAST_ROUTE_NORMAL)
 
 _ROUTER_LOCK = threading.Lock()
+# Only one torch forward at a time: native backends (notably MPS) abort
+# the process on concurrent inference instead of raising.
+_PREDICT_LOCK = threading.Lock()
 _ROUTER: Any = None
 _ROUTER_REPO: str = ""
 # آخرین دلیل آماده‌نبودن روتر محلی (تفکیک «نصب نیست» از «وزن نیست»).
 _ROUTER_ERROR: str = ""
+
+# Device for the local laya router. Default "cpu": auto selection picks
+# MPS on Apple Silicon, whose native backend aborts (SIGABRT) under
+# threaded/parallel inference. Override with LAYA_DEVICE=mps|cuda|cpu.
+LAYA_DEVICE_DEFAULT = "cpu"
+
+
+def _laya_device() -> str:
+    """Local router device from env (default CPU for stability)."""
+    try:
+        raw = str(os.environ.get("LAYA_DEVICE") or "").strip().lower()
+    except Exception:  # noqa: BLE001 — env read must never fail
+        raw = ""
+    return raw or LAYA_DEVICE_DEFAULT
+
 
 # سقف‌های زمانی کوتاه تا حلقه رویداد بلوکه نشود.
 LOCAL_PREDICT_TIMEOUT = 4.0
@@ -300,10 +318,11 @@ def _get_router() -> Any | None:
         os.environ.setdefault("HF_HOME", cache)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache)
         try:
+            device = _laya_device()
             if models:
-                _ROUTER = Router(models=models)
+                _ROUTER = Router(models=models, device=device)
             else:
-                _ROUTER = Router()
+                _ROUTER = Router(device=device)
             _ROUTER_REPO = repo
             _note_router_error("")
             return _ROUTER
@@ -467,11 +486,20 @@ def _predict_local(router: Any, state: dict, questions: dict) -> Any:
     """اجرای Router.predict با سقف زمانی کوتاه (بدون بلوکه ماندن نخ)."""
     import concurrent.futures
 
+    snapshot_state = dict(state or {})
+    snapshot_questions = dict(questions or {})
+
+    def _call() -> Any:
+        # Only one torch forward at a time; concurrent native inference
+        # aborts the sidecar (SIGABRT) instead of raising.
+        with _PREDICT_LOCK:
+            return router.predict(snapshot_state, snapshot_questions)
+
     # بدون with: خروج از with هنگام timeout منتظر پایان نخ می‌ماند
     # (shutdown با wait=True) و مهلت عملاً اعمال نمی‌شد.
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        fut = pool.submit(router.predict, state or {}, questions)
+        fut = pool.submit(_call)
         try:
             return fut.result(timeout=LOCAL_PREDICT_TIMEOUT)
         except BaseException:
@@ -751,7 +779,10 @@ def fast_route(prompt: str) -> str:
     # decide با laya تأیید می‌کند.
     computer_hints = (
         "computer", "desktop", "application", "windows", "macos", "linux",
+        "chrome", "tab", "window", "chart",
+        "screenshot", "screen", "click", "keyboard", "mouse",
         "اپ دسکتاپ", "دسکتاپ", "ویندوز", "لینوکس",
+        "کروم", "کامپیوتر", "پنجره", "تب", "چارت",
     )
     browser_hints = (
         "browser", "playwright", "website", "http", "https",

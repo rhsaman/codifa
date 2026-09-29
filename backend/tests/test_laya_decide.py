@@ -120,6 +120,7 @@ def test_decide_local_returns_zero_token_usage(monkeypatch):
 def test_fast_route_hints():
     """سرنخ متنی computer/browser به مسیر درست می‌رسد."""
     assert laya_decide.fast_route("open the desktop application") == laya_decide.FAST_ROUTE_COMPUTER
+    assert laya_decide.fast_route("look at my open chrome tabs") == laya_decide.FAST_ROUTE_COMPUTER
     assert laya_decide.fast_route("open the website with playwright") == laya_decide.FAST_ROUTE_BROWSER
     assert laya_decide.fast_route("refactor this function") == laya_decide.FAST_ROUTE_NORMAL
 
@@ -265,6 +266,59 @@ def test_get_router_uses_local_models_not_repo_string(tmp_path, monkeypatch):
     assert seen["args"] == ()
     assert isinstance(seen["kwargs"].get("models"), dict)
     assert seen["kwargs"]["models"]["english"][0] == str(weight)
+    # پایداری روی مک: دستگاه پیش‌فرض CPU است تا بک‌اند MPS سایدکار را نکشد.
+    assert seen["kwargs"]["device"] == "cpu"
+
+
+def test_laya_device_defaults_to_cpu_and_env_overrides(monkeypatch):
+    """دستگاه پیش‌فرض CPU است؛ LAYA_DEVICE آن را بازنویسی می‌کند."""
+    monkeypatch.delenv("LAYA_DEVICE", raising=False)
+    assert laya_decide._laya_device() == "cpu"
+    monkeypatch.setenv("LAYA_DEVICE", "mps")
+    assert laya_decide._laya_device() == "mps"
+
+
+def test_predict_local_serializes_concurrent_calls(monkeypatch):
+    """پیش‌بینی‌های هم‌زمان سریال می‌شوند تا بک‌اند نیتیو abort نکند."""
+    import threading
+    import time
+
+    entered: list[float] = []
+    exited: list[float] = []
+    gate = threading.Event()
+
+    class _SlowRouter:
+        def predict(self, state, questions):
+            entered.append(time.monotonic())
+            assert gate.wait(timeout=10.0)
+            exited.append(time.monotonic())
+            return {"label": "x", "confidence": 0.9}
+
+    router = _SlowRouter()
+    results: list = []
+
+    def _run():
+        results.append(laya_decide._predict_local(router, {}, {}))
+
+    first = threading.Thread(target=_run)
+    first.start()
+    # صبر کن تا نخ اول واقعاً داخل predict باشد (بدون خواب ثابت طولانی).
+    deadline = time.monotonic() + 10.0
+    while not entered and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(entered) == 1
+    second = threading.Thread(target=_run)
+    second.start()
+    time.sleep(0.5)
+    # نخ دوم نباید وارد predict شده باشد (سریال‌سازی با قفل).
+    assert len(entered) == 1
+    gate.set()
+    first.join(timeout=15.0)
+    second.join(timeout=15.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert len(results) == 2
+    assert len(entered) == 2
+    assert exited[0] <= entered[1]
 
 
 def test_display_ready_for_panel():

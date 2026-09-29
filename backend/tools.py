@@ -1216,6 +1216,38 @@ def _web_search_auto_fetch() -> int:
     return max(0, min(10, n))
 
 
+def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0) -> str | None:
+    """گیت laya روی خلاصه‌سازی وب: «distill» / «raw» / None.
+
+    فقط تصمیم اطراف distill (لزوم خلاصه) گرفته می‌شود، نه تولید متن.
+    خروجی ``"raw"`` یعنی laya با اطمینان بالا می‌گوید نتایج خام کافی است و
+    فراخواننده باید distill را رد کند؛ هر چیز دیگر یعنی رفتار قبلی ادامه یابد.
+    ``total_chars`` طول کل نتایج خام است تا laya با دید کامل تصمیم بگیرد.
+    هرگز استثنا بیرون نمی‌دهد.
+    """
+    try:
+        import laya_decide
+    except Exception:  # noqa: BLE001 — laya اختیاری است
+        return None
+    try:
+        decision = laya_decide.choice(
+            {
+                "query": (query or "")[:300],
+                "num_results": int(num_results or 0),
+                "total_chars": int(total_chars or 0),
+            },
+            ["distill", "raw"],
+        )
+    except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
+        return None
+    try:
+        if decision.handled and str(decision.value or "") in ("distill", "raw"):
+            return str(decision.value)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _rag_web_enabled() -> bool:
     """آیا RAG برای وب/fetch فعاله؟ (مدل embedding دانلود شده باشه)."""
     try:
@@ -3188,6 +3220,9 @@ def make_tool_callbacks(
     # (مثلاً مدل دوباره وضعیت صفحه را می‌پرسد بی‌آنکه اکشنی زده باشد)،
     # فراخوانی vision (تا چند ثانیه) رد می‌شود. تغییر پیکسل → کلید جدید.
     _see_cache: dict[str, Any] = {"key": None, "result": None}
+    # راه فرار دروازه laya روی see: بعد از یک رد، همان سؤال+اپ در همین نوبت
+    # از دروازه معاف است تا بینایی برای آن سؤال قفل نشود.
+    _see_gate_rejected: set[str] = set()
 
     def _convert_pixel_to_logical(x: int | None, y: int | None) -> tuple[int | None, int | None]:
         """اگر x,y داخل آخرین تصویرِ see باشد، به فضای منطقی تبدیل کن.
@@ -3387,7 +3422,7 @@ def make_tool_callbacks(
     # that prevent overflow / mid-task truncation.
     if context_window and context_window > 0:
         ctx = int(context_window)
-        tool_out_chars = max(400, min((ctx // 14) - 150, 2_400))
+        tool_out_chars = max(400, min(ctx // 6, 16_000))
         max(15, ctx // 600)
         max(10, ctx // 500)
         terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_000, tool_out_chars * 1))
@@ -4127,17 +4162,25 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
             return f"No matches for {combined!r} under {scope or '/'}"
         # Output contract (spec §3, revised): each hit shows the match line plus
-        # ±SNIPPET_CONTEXT lines of surrounding code (already computed by
-        # search_in_files above — previously discarded here, forcing an almost-
-        # mandatory follow-up `read` just to see context around every match).
-        # Capped by max_results and the context budget; when truncated, tell the
-        # agent to narrow the search or read files.
+        # surrounding code (already computed by search_in_files above).
+        # Adaptive context: full ±3 lines for up to 5 results, ±1 line when
+        # more are shown, so a broad search stays within the char budget
+        # without forcing a repeat grep. Capped by max_results and the
+        # context budget; when truncated by EITHER cap, always note how many
+        # matches were hidden so the model never mistakes a cut list for all.
         lines: list[str] = []
         total = 0
+        _adaptive = 3 if min(len(matches), max_results) <= 5 else 1
         for shown, m in enumerate(matches):
             if shown >= max_results:
                 break
             ctx_lines = m.get("context_lines") or []
+            if _adaptive < SNIPPET_CONTEXT and ctx_lines:
+                _match = m.get("line")
+                ctx_lines = [
+                    cl for cl in ctx_lines
+                    if cl.get("line") is not None and abs(int(cl["line"]) - int(_match or 0)) <= _adaptive
+                ]
             if ctx_lines:
                 body = "\n".join(
                     f"{'>' if cl['line'] == m['line'] else ' '} {cl['line']} | {(cl.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
@@ -4150,10 +4193,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 break
             lines.append(entry)
             total += len(entry) + 2
-        if len(matches) > max_results:
+        _shown = len(lines)
+        _hidden = len(matches) - _shown
+        if _hidden > 0:
             note = (
                 f"\nFound {len(matches)} matches.\n"
-                f"Showing the first {max_results} relevant matches.\n"
+                f"Showing the first {_shown} relevant matches ({_hidden} more not shown).\n"
                 "Use a narrower pattern/path or read specific files."
             )
         else:
@@ -5183,7 +5228,16 @@ When you need to read several files, read multiple independent files in parallel
         # (Claude-Code-style). Otherwise return the raw results as before. On a
         # hard sub-agent failure the call falls back to the MAIN model (see
         # _run_distill) — raw results are only returned when BOTH models fail.
-        if _web_runner is not None:
+        # گیت laya همگام است؛ در نخ جدا تا حلقه بلوکه نشود. ورودی‌اش طول کل
+        # نتایج خام هم هست تا تصمیم با دید کامل گرفته شود.
+        try:
+            _raw_total = sum(len(ln) for ln in lines)
+            _laya_skip_distill = await asyncio.to_thread(
+                _laya_distill_choice, query, len(results), _raw_total
+            ) == "raw"
+        except Exception:  # noqa: BLE001 — گیت اختیاری است
+            _laya_skip_distill = False
+        if _web_runner is not None and not _laya_skip_distill:
             try:
                 res, ran_model = await _run_distill(
                     "web",
@@ -6295,7 +6349,32 @@ When you need to read several files, read multiple independent files in parallel
                     or "Describe this screen precisely: visible text, UI "
                     "elements, their approximate positions."
                 )
-                if _vmodel is None:
+                # گیت آزمایشی laya: وقتی درخت به‌احتمال زیاد کافی است، see (کندترین
+                # مسیر: اسکرین‌شات + مدل بینایی) را زود رد کن تا هزینه دورریخته نشود.
+                # None یعنی laya تصمیم نگرفت → رفتار قبلی ادامه می‌یابد.
+                # راه فرار: کپچر هدفمند (selector/region) و سؤالِ یک‌بار-ردشده در
+                # همین نوبت از دروازه معاف‌اند تا بینایی قفل نشود.
+                _gate_key = f"{app}|{value or ''}"
+                try:
+                    if selector or region or _gate_key in _see_gate_rejected:
+                        _tree_first = None
+                    else:
+                        _tree_first = await asyncio.to_thread(
+                            cu.prefer_tree_over_see, value or "", app
+                        )
+                except Exception:  # noqa: BLE001 — گیت اختیاری است
+                    _tree_first = None
+                if _tree_first is True:
+                    _see_gate_rejected.add(_gate_key)
+                    result = {
+                        "error": (
+                            "laya suggests the accessibility tree is enough for this "
+                            "question — call read_screen (or read_element) first; use "
+                            "see only if the tree cannot answer (terminals, canvases, "
+                            "images, video)."
+                        )
+                    }
+                elif _vmodel is None:
                     result = {
                         "error": (
                             "No vision model configured — set a vision-capable "

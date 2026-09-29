@@ -9,6 +9,7 @@ import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
+import { layaReasonLabel } from './TodosPanel'
 import { ModelTestButton } from './ModelTestButton'
 import { ProviderTestButton } from './ProviderTestButton'
 import { THEMES } from '../lib/themes'
@@ -2308,6 +2309,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         Status: {layaStatus.available ? 'Installed' : 'Not installed'}
                         {layaStatus.ready ? ' · Ready offline' : ' · Not downloaded'}
                         {layaStatus.repo ? <> · <code>{layaStatus.repo}</code></> : null}
+                        {layaStatus.reason ? <> · <span title={layaStatus.reason}>{layaReasonLabel(layaStatus.reason)}</span></> : null}
                       </>
                     )}
                   </div>

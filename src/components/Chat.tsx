@@ -2111,6 +2111,22 @@ export function ChatPanel() {
             steerInterleaved: true,
           });
         }
+      } else if (event.kind === "laya") {
+        // فعالیت زنده تصمیم سریع laya — جدا از رویداد usage (مصرف دست‌نخورده
+        // می‌ماند)؛ در تاریخچه همان چت ثبت می‌شود تا پنل راست زیر todos نشان دهد.
+        store.appendLayaRun(chat.id, {
+          route: typeof event.route === "string" ? event.route : "normal",
+          confidence: typeof event.confidence === "number" ? event.confidence : 0,
+          abstained: event.abstained === true,
+          reason: typeof event.reason === "string" ? event.reason : "",
+          handled: event.handled === true,
+          providerId:
+            (event.provider_id as string | undefined) ||
+            (event.provider as string | undefined) ||
+            "local",
+          model: typeof event.model === "string" ? event.model : "",
+          elapsedMs: typeof event.elapsed_ms === "number" ? event.elapsed_ms : 0,
+        });
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -2134,11 +2150,14 @@ export function ChatPanel() {
         );
         // Store the provider + model EXPLICITLY (no key string, no guessing) so
         // the sidebar shows the exact provider/model that ran this chat.
+        // رویداد laya (لوکال صفرتوکنی یا پروایدر خارجی) با پرچم laya ثبت می‌شود
+        // تا ردیف صفرتوکنی لوکال هم در model usage بماند — مثل مدل‌های tools.
         store.accrueChatUsage(chat.id, providerId, model, {
           input: inputTokens,
           output: outputTokens,
           cacheRead: event.cache_read_tokens ?? 0,
           cacheWrite: event.cache_write_tokens ?? 0,
+          ...(event.laya ? { laya: true } : {}),
         });
         // The message badge mirrors the LAST request of this turn (each new
         // request REPLACES the previous while streaming) — it is NOT the
@@ -3420,7 +3439,7 @@ export function ChatPanel() {
   const toolbar = (
     <div className="chat-toolbar titlebar-toolbar">
       <button
-        className="dir-toggle"
+        className="titlebar-icon-btn dir-text-btn"
         onClick={toggleDir}
         title={
           dir === "rtl"
@@ -3445,14 +3464,31 @@ export function ChatPanel() {
         }
         dir="ltr"
       >
-        {ctxPct !== null && contextUsed > 0 && (
-          <span className="context-meter-track">
-            <span
-              className="context-meter-fill"
-              style={{ width: `${Math.min(100, ctxPct)}%` }}
-            />
-          </span>
-        )}
+        {ctxPct !== null && contextUsed > 0 && (() => {
+          const clamped = Math.min(100, Math.max(0, ctxPct)) / 100;
+          const radius = 6;
+          const circumference = 2 * Math.PI * radius;
+          return (
+            <span className="context-meter-ring" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="16" height="16">
+                <circle
+                  cx="8"
+                  cy="8"
+                  r={radius}
+                  className="context-meter-ring-track"
+                />
+                <circle
+                  cx="8"
+                  cy="8"
+                  r={radius}
+                  className="context-meter-ring-fill"
+                  strokeDasharray={circumference}
+                  strokeDashoffset={circumference * (1 - clamped)}
+                />
+              </svg>
+            </span>
+          );
+        })()}
         <span className="context-meter-text">
           {contextUsed > 0 ? (
             <>

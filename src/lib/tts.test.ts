@@ -2,6 +2,7 @@
 // - پخش ویس جدید، ویس قبلی (پیام/چت دیگر) را قطع می‌کند — چند ویس همزمان نه.
 // - استاپ غیرمالک، ویس فعال را نمی‌کشد (unmount پیام دیگر بی‌اثر است).
 // - نتیجه fetch کهنه (ویسی که حین لودینگ قطع شده) پخش نمی‌شود.
+// - کلیک تند پلی/استاپ/پلی روی همان پیام، دو ویس همزمان نمی‌سازد.
 // اجرا: npx esbuild src/lib/tts.test.ts --bundle --platform=node --format=esm \
 //        --packages=external --outfile=tests/.tmp-tts.mjs --external:electron \
 //        && node tests/.tmp-tts.mjs
@@ -120,6 +121,35 @@ console.log('۳) نتیجه fetch کهنه پخش نمی‌شود:')
   check('فقط یک Audio (ویس تازه) ساخته شد', MockAudio.instances.length === 1, MockAudio.instances.length)
   check('مالک فعال، ویس تازه است', getTtsSnapshot().owner === 21, getTtsSnapshot())
   stopTts()
+}
+
+console.log('۴) کلیک تند روی همان پیام، دو ویس همزمان نمی‌سازد:')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  firstTtsSlow = true
+  const p1 = playTts('کلیک اول', opts, 30)
+  await sleep(10)
+  const p2 = playTts('کلیک دوم', opts, 30)
+  await Promise.all([p1, p2])
+  firstTtsSlow = false
+  check('فقط یک Audio (کلیک آخر) ساخته شد', MockAudio.instances.length === 1, MockAudio.instances.length)
+  check('وضعیت speaking است', getTtsSnapshot().status === 'speaking', getTtsSnapshot())
+  stopTts()
+}
+
+console.log('۵) استاپ حین لودینگ، نتیجه fetch را دور می‌ریزد:')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  firstTtsSlow = true
+  const p = playTts('متن در حال لود', opts, 40)
+  await sleep(10)
+  stopTts(40)
+  await p
+  firstTtsSlow = false
+  check('هیچ Audio ساخته نشد', MockAudio.instances.length === 0, MockAudio.instances.length)
+  check('وضعیت idle است', getTtsSnapshot().status === 'idle', getTtsSnapshot())
 }
 
 if (failed > 0) {

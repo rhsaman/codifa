@@ -2,11 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { useStore } from "../lib/store";
 import {
   deleteSchedule,
+  listAllScheduleRuns,
   listScheduleRuns,
   listSchedules,
   runScheduleNow,
   saveSchedule,
 } from "../lib/api";
+import { formatTokens } from "../lib/context";
+import { taskTokenTotals } from "../lib/schedule-notify";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
 /** Format next_run for display (Today/Tomorrow/date). */
@@ -33,11 +36,30 @@ export function runStatusFa(status: ScheduleRun["status"]): string {
 
 const CRON_PRESETS = [
   { value: "", label: "Once" },
-  { value: "every 15 minutes", label: "Every 15 minutes" },
-  { value: "hourly", label: "Hourly" },
-  { value: "daily", label: "Daily (9 AM)" },
-  { value: "weekly", label: "Weekly (Mon 9 AM)" },
+  { value: "*/15 * * * *", label: "Every 15 minutes" },
+  { value: "0 * * * *", label: "Hourly" },
+  { value: "0 9 * * *", label: "Daily (9 AM)" },
+  { value: "0 9 * * 1", label: "Weekly (Mon 9 AM)" },
 ];
+
+const CRON_PRESET_VALUES = new Set(CRON_PRESETS.map((p) => p.value));
+
+/** نگاشت کرون ذخیره‌شده (نرمال‌شده بک‌اند) به مقدار select فرم.
+ * بک‌اند presetها را نرمال می‌کند (مثلاً daily → ‎"0 9 * * *"‎)، پس cron
+ * ذخیره‌شده با valueهای نمایشی یکی نیست؛ این تابع هر دو شکل (قدیمی/نرمال)
+ * را به value درست select برمی‌گرداند تا ویرایش بعدی Repeat را درست نشان دهد. */
+export function cronToPresetValue(cron: string | null | undefined): string {
+  const c = (cron ?? "").trim().toLowerCase();
+  if (!c || c === "once") return "";
+  if (CRON_PRESET_VALUES.has(c)) return c;
+  const legacy: Record<string, string> = {
+    "every 15 minutes": "*/15 * * * *",
+    hourly: "0 * * * *",
+    daily: "0 9 * * *",
+    weekly: "0 9 * * 1",
+  };
+  return legacy[c] ?? c;
+}
 
 /** Create/edit form for a scheduled task. */
 function ScheduleForm(props: {
@@ -49,13 +71,11 @@ function ScheduleForm(props: {
   const { initial, defaultRoot, onDone, onCancel } = props;
   const [name, setName] = useState(initial?.name ?? "");
   const [prompt, setPrompt] = useState(initial?.prompt ?? "");
-  const [cron, setCron] = useState(initial?.cron ?? "");
-  const [customCron, setCustomCron] = useState("");
-  const [useCustom, setUseCustom] = useState(
-    !!initial?.cron &&
-      !["", "0 * * * *", "0 9 * * *", "0 9 * * 1"].includes(initial.cron) &&
-      !initial.cron.startsWith("*/"),
-  );
+  const presetValue = cronToPresetValue(initial?.cron);
+  const isPreset = CRON_PRESET_VALUES.has(presetValue);
+  const [cron, setCron] = useState(isPreset ? presetValue : "");
+  const [customCron, setCustomCron] = useState(isPreset ? "" : (initial?.cron ?? "").trim());
+  const [useCustom, setUseCustom] = useState(!isPreset && presetValue !== "");
   const [root, setRoot] = useState(initial?.root ?? defaultRoot);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -171,8 +191,8 @@ function ScheduleForm(props: {
 }
 
 /** A task row with run/pause/edit/delete buttons (بدون نمایش پاسخ؛ خروجی فقط در Inbox). */
-function ScheduleRow(props: { task: ScheduledTask; onChanged: () => void }) {
-  const { task, onChanged } = props;
+function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: () => void }) {
+  const { task, tokens, onChanged } = props;
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -209,19 +229,33 @@ function ScheduleRow(props: { task: ScheduledTask; onChanged: () => void }) {
     if (running) return;
     setRunning(true);
     setRunError(null);
+    const startedAt = Date.now();
     const out = await runScheduleNow(task.id);
     if ("error" in out) {
       setRunning(false);
       setRunError(out.error);
       return;
     }
-    // بک‌اند اجرا را در پس‌زمینه شروع می‌کند؛ تا پایان واقعی (done/error)
-    // اسپینر نگه می‌داریم و با پولینگ وضعیت، آیکون پلی را برمی‌گردانیم.
+    // بک‌اند run_id همان اجرا را برمی‌گرداند؛ پولینگ دقیق همان ران (نه «آخرین
+    // ران») + سقف ۱۰ دقیقه تا اسپینر برای همیشه گیر نکند. رکورد running یتیم
+    // (قدیمی‌تر از ۱۵ دقیقه) هم پایان‌یافته حساب می‌شود.
+    const targetRunId = "run_id" in out ? out.run_id : undefined;
+    const STALE_RUNNING_MS = 15 * 60 * 1000;
     try {
-      for (let i = 0; i < 120; i++) {
+      for (let i = 0; i < 300; i++) {
         await new Promise((r) => setTimeout(r, 2000));
-        const runs = await listScheduleRuns(task.id, 1);
-        if (Array.isArray(runs) && runs.length > 0 && runs[0].status !== "running") break;
+        const runs = await listScheduleRuns(task.id, 5);
+        if (!Array.isArray(runs) || runs.length === 0) continue;
+        const target = targetRunId
+          ? runs.find((r) => r.id === targetRunId)
+          : runs[0];
+        if (!target) continue;
+        if (target.status !== "running") break;
+        const ageMs = Date.now() - target.started_at * 1000;
+        if (ageMs > STALE_RUNNING_MS) break;
+        // اگر بک‌اند run_id نداد و جدیدترین ران از شروع ما قدیمی‌تر است،
+        // یعنی اجرای ما هنوز ثبت نشده — ادامه بده.
+        if (!targetRunId && target.started_at * 1000 < startedAt - 5000) continue;
       }
     } catch {
       // خطای پولینگ مهم نیست؛ فقط اسپینر را رها می‌کنیم
@@ -267,6 +301,7 @@ function ScheduleRow(props: { task: ScheduledTask; onChanged: () => void }) {
       <div className="schedule-item-sub">
         {formatNextRunFa(task.next_run)}
         {typeof task.run_count === "number" && task.run_count > 0 ? ` · ${task.run_count} runs` : ""}
+        {tokens > 0 ? ` · ${formatTokens(tokens)} tokens` : ""}
       </div>
       {expanded && (
         <div className="schedule-item-body">
@@ -312,12 +347,17 @@ export function ScheduleSection() {
   const activeRoot = useStore((s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root);
   const [collapsed, setCollapsed] = useState(false);
   const [loading, setLoading] = useState(false);
+  // مجموع توکن مصرفی هر تسک (از usage ران‌ها) — روی خود تسک نمایش داده می‌شود،
+  // نه در model usage که فقط مصرف چت فعال است.
+  const [taskTokens, setTaskTokens] = useState<Record<string, number>>({});
 
   const refresh = useCallback(async () => {
     setLoading(true);
     const out = await listSchedules();
     setLoading(false);
     if (!("error" in out)) setSchedules(out);
+    const all = await listAllScheduleRuns(200);
+    if (!("error" in all)) setTaskTokens(taskTokenTotals(all));
   }, [setSchedules]);
 
   useEffect(() => {
@@ -374,7 +414,7 @@ export function ScheduleSection() {
           ) : schedules.length === 0 && !formOpen ? (
             <div className="schedule-runs-empty">No scheduled tasks — press ＋ to create one</div>
           ) : (
-            schedules.map((t) => <ScheduleRow key={t.id} task={t} onChanged={() => void refresh()} />)
+            schedules.map((t) => <ScheduleRow key={t.id} task={t} tokens={taskTokens[t.id] ?? 0} onChanged={() => void refresh()} />)
           )}
         </div>
       )}

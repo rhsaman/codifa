@@ -59,6 +59,11 @@ INTERACTIVE_ROLES = (
 # سقف آیتم‌های targets — کنترل مصرف توکن در اپ‌های شلوغ
 MAX_TARGETS = 60
 
+# پرچم آزمایشی گیت read_screen در برابر see (بعد از تست روی نمونه واقعی بازبینی شود).
+# True یعنی prefer_tree_over_see واقعاً از laya می‌پرسد؛ False یعنی همیشه None
+# (رفتار قبلی: انتخاب کاملاً با مدل، فقط راهنمای متنی). خاموش‌کردن هیچ مسیر دیگری را عوض نمی‌کند.
+LAYA_SEE_GATE_ENABLED = True
+
 # اکشن‌های معنایی مجاز روی عنصر (نام متد Locator در xa11y)
 ELEMENT_ACTIONS = {
     "press",
@@ -624,6 +629,45 @@ def read_screen(app_name: str = "", max_depth: int = DEFAULT_MAX_DEPTH) -> dict[
         return result
     except Exception as exc:  # noqa: BLE001
         return {"error": _friendly_error(exc)}
+
+
+def prefer_tree_over_see(question: str = "", app_name: str = "") -> bool | None:
+    """گیت آزمایشی: آیا درخت Accessibility به‌احتمال زیاد برای این سؤال کافی است؟
+
+    سؤال دودویی ``choice`` از laya (``prefer_tree`` در برابر ``prefer_see``) با
+    آستانه اطمینان و واگذاری امن. خروجی True یعنی اول read_screen/read_element
+    بزن (مسیر کند see: اسکرین‌شات + مدل بینایی)؛ False یعنی see لازم است؛ None
+    یعنی laya نتوانست تصمیم بگیرد (نصب نیست / وزن نیست / اطمینان پایین / پرچم
+    خاموش) و فراخواننده باید رفتار قبلی (see) را ادامه دهد. هرگز استثنا بیرون
+    نمی‌دهد تا مسیر اصلی ابزار نشکند.
+    """
+    if not LAYA_SEE_GATE_ENABLED:
+        return None
+    try:
+        import laya_decide
+    except Exception:  # noqa: BLE001 — laya اختیاری است
+        return None
+    try:
+        decision = laya_decide.choice(
+            {
+                "question": (question or "")[:500],
+                "app": (app_name or "")[:120],
+            },
+            ["prefer_tree", "prefer_see"],
+        )
+    except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
+        return None
+    try:
+        if not decision.handled:
+            return None
+        value = str(decision.value or "").strip().lower()
+        if value == "prefer_tree":
+            return True
+        if value == "prefer_see":
+            return False
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def list_apps() -> dict[str, Any]:

@@ -100,6 +100,9 @@ class TaskResult:
     total_tokens: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    steps: int = 0
     tool_calls: int = 0
     error: str | None = None
     output_preview: str = ""
@@ -221,9 +224,12 @@ async def run_task(
             ):
                 events.append(ev)
                 if ev.get("kind") == "usage":
-                    result.total_tokens = ev.get("total_tokens", 0) or result.total_tokens
-                    result.input_tokens = ev.get("input_tokens", 0) or result.input_tokens
-                    result.output_tokens = ev.get("output_tokens", 0) or result.output_tokens
+                    result.steps += 1
+                    result.total_tokens = max(result.total_tokens, int(ev.get("total_tokens", 0) or 0))
+                    result.input_tokens = max(result.input_tokens, int(ev.get("input_tokens", 0) or 0))
+                    result.output_tokens += int(ev.get("output_tokens", 0) or 0)
+                    result.cache_read_tokens = max(result.cache_read_tokens, int(ev.get("cache_read_tokens", 0) or 0))
+                    result.cache_write_tokens = max(result.cache_write_tokens, int(ev.get("cache_write_tokens", 0) or 0))
                 elif ev.get("kind") == "tool":
                     result.tool_calls += 1
                 elif ev.get("kind") == "text":
@@ -268,7 +274,8 @@ def format_report(results: list[TaskResult]) -> str:
             continue
         status = "PASS" if r.passed else "FAIL"
         lines.append(f"[{status}] {r.name}  ({r.time_seconds:.1f}s, "
-                     f"{r.total_tokens} tokens, {r.tool_calls} tool calls)")
+                     f"{r.total_tokens} tokens in / {r.cache_read_tokens} cached, "
+                     f"{r.steps} steps, {r.tool_calls} tool calls)")
         for c in r.checks:
             mark = "✓" if c.passed else "✗"
             line = f"    {mark} {c.label}"
@@ -306,6 +313,9 @@ def results_to_json(results: list[TaskResult]) -> dict:
                 "total_tokens": r.total_tokens,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "cache_write_tokens": r.cache_write_tokens,
+                "steps": r.steps,
                 "tool_calls": r.tool_calls,
                 "error": r.error,
                 "output_preview": r.output_preview[:500],

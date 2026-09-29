@@ -2205,6 +2205,11 @@ async def _select_relevant_summary(
     if not full_content or not user_prompt:
         return ""
 
+    # دروازه laya حذف شد: امتیازدهی پر-بولت همگام (N × ده‌ها تا صدها میلی‌ثانیه)
+    # حلقه رویداد را بلوکه می‌کرد، wait_for روی کد همگام اثر نداشت، و بولت‌های
+    # نامطمئن (handled=False) گم می‌شدند در حالی که مدل بزرگ هم آن‌ها را نمی‌دید.
+    # فیلتر مرتبط‌بودن فقط با همان یک تماس مدل بزرگ انجام می‌شود (رفتار قبلی).
+
     system_prompt = (
         "You will be given a cumulative summary of earlier work in this "
         "workspace (a bullet list) and the user's first message in a "
@@ -2594,97 +2599,155 @@ def _needs_workspace(prompt: str) -> bool:
 # Broad is checked FIRST so "how does the whole architecture work end to end"
 # stays broad even though it contains "how does". Unclear prompts return ""
 # (full budget) — safer than cutting off a long answer.
+def _scope_contains(text: str, hint: str) -> bool:
+    """تطبیق سرنخ با مرز کلمه تا زیررشته حدس غلط نزند («کلیک»/«نشانه»/«کلیه»)."""
+    hint = (hint or "").strip().lower()
+    if not hint:
+        return False
+    if any(ch.isalnum() or ch == "_" for ch in hint):
+        try:
+            return re.search(r"(?<!\w)" + re.escape(hint) + r"(?!\w)", text) is not None
+        except re.error:
+            return hint in text
+    return hint in text
+
+
 def _detect_scope(prompt: str) -> str:
+    """تشخیص دامنه سؤال (broad/narrow) با کیورد + مرز کلمه؛ laya فقط در ابهام.
+
+    اول قانون کیورد (تقریباً صفر میلی‌ثانیه)؛ laya فقط وقتی پرسیده می‌شود که
+    کیوردها چیزی نگفتند (نتیجه ``""``)، تا حلقه رویداد برای همه نوبت‌ها بلوکه
+    نشود. هرگز استثنا بیرون نمی‌دهد.
+    """
     if not prompt:
         return ""
     low = prompt.lower()
-    if any(
-        k in low
-        for k in (
-            "architecture",
-            "overview",
-            "end to end",
-            "whole",
-            "entire codebase",
-            "entire project",
-            "how does everything",
-            "how does the whole",
-            "how everything",
-            "understand the codebase",
-            "full picture",
-            "deep dive",
-            "comprehensive",
-            "explain the system",
-            "design",
-            "all the files",
-            "every file",
-            "all files",
-            "how do all",
-            "what are all",
-            "list all",
-            "compare",
-            "differences between",
-            "refactor",
-            "migrate",
-            "restructure",
-            "rewrite",
-            "plan",
-        )
-    ):
+    _broad_hits = (
+        "architecture",
+        "overview",
+        "end to end",
+        "whole",
+        "entire codebase",
+        "entire project",
+        "how does everything",
+        "how does the whole",
+        "how everything",
+        "understand the codebase",
+        "full picture",
+        "deep dive",
+        "comprehensive",
+        "explain the system",
+        "design",
+        "all the files",
+        "every file",
+        "all files",
+        "how do all",
+        "what are all",
+        "list all",
+        "compare",
+        "differences between",
+        "refactor",
+        "migrate",
+        "restructure",
+        "rewrite",
+        "plan",
+        # معادل‌های فارسی دامنه گسترده — فقط عبارت‌های چندکلمه‌ای/دقیق تا
+        # زیررشته حدس غلط نزند («کلی» در «کلیک»، «برنامه» در «تو برنامه یه باگ هست»)
+        "معماری",
+        "کل پروژه",
+        "کل کد",
+        "همه فایل",
+        "مقایسه",
+        "تفاوت",
+        "بازطراحی",
+        "مهاجرت",
+        "بازنویسی",
+        "طراحی",
+        "نقشه",
+        "برنامه‌ریزی",
+        "برنامه ریزی",
+    )
+    if any(_scope_contains(low, k) for k in _broad_hits):
         return "broad"
-    if any(
-        k in low
-        for k in (
-            "find",
-            "where is",
-            "where's",
-            "what is",
-            "what's",
-            "which file",
-            "which function",
-            "which class",
-            "locate",
-            "search",
-            "show me",
-            "how is",
-            "how does",
-            "why does",
-            "why is",
-            "is there",
-            "does it",
-            "fix",
-            "bug",
-            "error",
-            "typo",
-            "rename",
-            "delete",
-            "remove",
-            "add",
-            "change",
-            "update",
-            "parameter",
-            "argument",
-            "signature",
-            "definition",
-            "defined",
-            "implement",
-            "usage",
-            "call",
-            "function",
-            "class",
-            "variable",
-            "import",
-            "export",
-            "test",
-            "run",
-            "explain briefly",
-            "short",
-            "quick",
-            "what does",
-            "what happens",
-        )
-    ):
+    _narrow_hits = (
+        "find",
+        "where is",
+        "where's",
+        "what is",
+        "what's",
+        "which file",
+        "which function",
+        "which class",
+        "locate",
+        "search",
+        "show me",
+        "how is",
+        "how does",
+        "why does",
+        "why is",
+        "is there",
+        "does it",
+        "fix",
+        "bug",
+        "error",
+        "typo",
+        "rename",
+        "delete",
+        "remove",
+        "add",
+        "change",
+        "update",
+        "parameter",
+        "argument",
+        "signature",
+        "definition",
+        "defined",
+        "implement",
+        "usage",
+        "call",
+        "function",
+        "class",
+        "variable",
+        "import",
+        "export",
+        "test",
+        "run",
+        "explain briefly",
+        "short",
+        "quick",
+        "what does",
+        "what happens",
+        # معادل‌های فارسی دامنه محدود — فقط دقیق‌ها («نشان» در «نشانه» نه)
+        "پیدا",
+        "کجاست",
+        "کدام فایل",
+        "کدام تابع",
+        "جستجو",
+        "نشان بده",
+        "نشانم بده",
+        "نمایش بده",
+        "چرا",
+        "چطور",
+        "چگونه",
+        "رفع",
+        "خطا",
+        "باگ",
+        "اشکال",
+        "تغییر",
+        "اضافه",
+        "حذف",
+        "اصلاح",
+        "توضیح کوتاه",
+        "خلاصه",
+        "کوتاه",
+        "سریع",
+    )
+    if any(_scope_contains(low, k) for k in _narrow_hits):
         return "narrow"
+    # ابهام واقعی → بودجه کامل ("") بدون صدازدن laya: این تابع همگام داخل
+    # مسیر async صدا زده می‌شود و حتی یک predict نادر (۷۰ تا ۵۰۰ms) حلقه را
+    # برای همه نوبت‌ها بلوکه می‌کرد؛ سقف توکن فقط راهنماست پس امن‌ترین
+    # پیش‌فرض بودجه کامل است.
     return ""
 
 
@@ -4092,6 +4155,10 @@ def laya_precheck(prompt: str, mode: str = "", history_len: int = 0) -> dict | N
     laya با اطمینان بالا «ادامه محلی» را انتخاب کرد، نتیجه را به‌صورت دیکشنری
     برمی‌گرداند؛ در غیر این صورت ``None`` تا فراخواننده فقط همان مورد سخت را
     به مدل بزرگ بفرستد. هرگز استثنا بیرون نمی‌دهد تا مسیر اصلی چت نشکند.
+
+    توجه: در حال حاضر هیچ فراخواننده‌ای ندارد (فقط graph.py از decide مستقیم
+    استفاده می‌کند)؛ نگه داشته شده تا مسیر آینده «ادامه محلی» بدون بازنویسی
+    وصل شود. حذفش نکنید.
     """
     try:
         import laya_decide

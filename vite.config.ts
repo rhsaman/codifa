@@ -7,30 +7,35 @@ export default defineConfig({
     react(),
     electron({
       main: {
-        entry: 'electron/main.ts'
+        // Shortcut of `build.lib.entry`
+        entry: 'electron/main.ts',
       },
       preload: {
+        // Shortcut of `build.rolldownOptions.input` (vite 8+)
         input: 'electron/preload.ts',
         vite: {
           build: {
-            rollupOptions: {
+            // vite 8+ uses rolldown; vite < 8 uses rollup. The plugin adapts
+            // automatically — only `rolldownOptions` is needed for vite 8.
+            rolldownOptions: {
               output: {
                 format: 'cjs',
-                entryFileNames: 'preload.cjs'
-              }
-            }
-          }
-        }
+                entryFileNames: 'preload.cjs',
+              },
+            },
+          },
+        },
       },
-      renderer: {}
-    })
+      // Optional: Use Node.js API in the Renderer process
+      renderer: {},
+    }),
   ],
   build: {
     outDir: 'dist',
-    sourcemap: true
+    sourcemap: true,
   },
   server: {
     port: 5173,
-    strictPort: false
-  }
+    strictPort: false,
+  },
 })

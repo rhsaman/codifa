@@ -4,7 +4,7 @@
 // اجرا: npx esbuild src/lib/shortcuts.test.ts --bundle --platform=node \
 //        --format=esm --outfile=src/lib/.tmp-shortcuts.mjs && node src/lib/.tmp-shortcuts.mjs
 
-import { navChord, shouldFocusSearch } from "./shortcuts"
+import { navChord, panelToggleTarget, shouldFocusSearch } from "./shortcuts"
 
 export {}
 
@@ -64,6 +64,24 @@ console.log('۳) shouldFocusSearch — گارد Ctrl+K سایدبار:')
   check('Ctrl+K بلعیده‌شده (defaultPrevented) → false', shouldFocusSearch(key("k", { code: "KeyK", ctrl: true, prevented: true })) === false)
   check('حرف k بدون Ctrl → false', shouldFocusSearch(key("k", { code: "KeyK" })) === false)
   check('Ctrl+J → false (کورد ناوبری است، نه سرچ)', shouldFocusSearch(key("j", { code: "KeyJ", ctrl: true })) === false)
+}
+
+console.log('۴) panelToggleTarget — تفکیک سایدبار و پنل راست:')
+{
+  const chord = (shift: boolean, code = 'KeyB', key = 'b') => ({
+    code,
+    key,
+    ctrlKey: true,
+    metaKey: false,
+    shiftKey: shift,
+  })
+  check('Ctrl+B → sidebar', panelToggleTarget(chord(false)) === 'sidebar')
+  check('Ctrl+Shift+B → right', panelToggleTarget(chord(true)) === 'right')
+  check('⌘+Shift+B (مک) → right', panelToggleTarget({ code: 'KeyB', key: 'b', ctrlKey: false, metaKey: true, shiftKey: true }) === 'right')
+  // چیدمان فارسی: کلید فیزیکی B حرف «ذ» می‌دهد ولی code همان KeyB است.
+  check('Ctrl+Shift+«ذ» (code=KeyB) → right', panelToggleTarget(chord(true, 'KeyB', 'ذ')) === 'right')
+  check('بدون Ctrl → null', panelToggleTarget({ code: 'KeyB', key: 'b', ctrlKey: false, metaKey: false, shiftKey: true }) === null)
+  check('کلید دیگر → null', panelToggleTarget({ code: 'KeyC', key: 'c', ctrlKey: true, metaKey: false, shiftKey: true }) === null)
 }
 
 if (failed > 0) {

@@ -27,9 +27,11 @@ import { handleLinkClick } from "../lib/link";
 import { sanitizeHtml } from "../lib/sanitizeHtml";
 import {
   ToolCallView,
+  ToolEditGroupView,
   ToolGroupView,
   ToolSingleRow,
   TraceNarration,
+  isEditActivity,
   isExploreCard,
 } from "./ToolCallView";
 import { ReadingMode } from "./ReadingMode";
@@ -846,11 +848,14 @@ export function ThinkingIndicator({
   );
 }
 
-// Only tools that write to the workspace filesystem always render as their
-// own full, visible card (diff + revert) — every other tool (including
+// Only tools that write to the workspace filesystem render as their own
+// visible edit UI (diff + revert) — every other tool (including
 // memory/skill/connector saves) sweeps into the collapsed Claude-app-style
 // trace group. Explore sub-agents are also always-visible (isExploreCard
 // below) so the explorer never hides inside the collapsed group.
+// ویرایش‌های پشت‌سرهم (edit_file/write_file) در یک گروه ویرایش جدا
+// (ToolEditGroupView) جمع می‌شوند — نه کارت تکی جدا، نه قاطی با گروه
+// ابزارهای فقط‌خواندنی.
 const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file"]);
 
 /** Interleave text slices with tool cards (Claude-style), but collapse runs of
@@ -1126,6 +1131,41 @@ export function renderSegments(
   // grp-… فقط یک‌بار ثبت می‌شود) کلید را در همهٔ رندرها ثابت نگه می‌دارد؛
   // گروهِ باز فقط با کلیک خود کاربر بسته می‌شود.
   let traceAnchor: number | null = null;
+  // ران ویرایشی جدا: edit_file/write_fileهای پشت‌سرهم این‌جا انباشته می‌شوند
+  // تا در یک گروه ویرایش واحد (ToolEditGroupView) فلاش شوند — هرگز با ران
+  // فقط‌خواندنی (pending) قاطی نمی‌شوند.
+  let pendingEdit: { activity: ToolActivity; index: number }[] = [];
+  const flushEdits = () => {
+    if (pendingEdit.length === 0) return;
+    if (pendingEdit.length === 1) {
+      const entry = pendingEdit[0];
+      const { activity } = entry;
+      const entryIndex = entry.index;
+      nodes.push(
+        <ToolCallView
+          key={`edit-${entryIndex}`}
+          activity={activity}
+          messageId={message.id}
+          onReverted={() =>
+            useStore.getState().markToolReverted(message.id, entryIndex)
+          }
+        />,
+      );
+    } else {
+      const key = `edit-grp-${pendingEdit[0].index}`;
+      nodes.push(
+        <ToolEditGroupView
+          key={key}
+          activities={pendingEdit}
+          messageId={message.id}
+          onReverted={(idx) =>
+            useStore.getState().markToolReverted(message.id, idx)
+          }
+        />,
+      );
+    }
+    pendingEdit = [];
+  };
   const wrapTrace = () => {
     if (trace.length === 0) return;
     nodes.push(
@@ -1222,6 +1262,7 @@ export function renderSegments(
     if (seg.kind === "user") {
       flush();
       wrapTrace();
+      flushEdits();
       const steerMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1240,6 +1281,7 @@ export function renderSegments(
       // this segment just anchors where it renders.
       flush();
       wrapTrace();
+      flushEdits();
       const summaryMsg = useStore
         .getState()
         .chats.flatMap((c) => c.messages)
@@ -1286,14 +1328,26 @@ export function renderSegments(
       // Genuine prose — flush whatever tool run was accumulating.
       flush();
       wrapTrace();
+      flushEdits();
       renderProse(String(i), seg.text);
       return;
     }
     const activity = message.toolActivity?.[seg.index];
     if (!activity) return;
+    // ران ویرایشی جدا: edit_file/write_file پشت‌سرهم در pendingEdit انباشته
+    // می‌شوند و هرگز با ران فقط‌خواندنی (pending) یا گروه ابزارهای دیگر قاطی
+    // نمی‌شوند. تک‌ویرایش مثل قبل کارت تکی (ToolCallView) می‌ماند تا Undo و
+    // Review تکی هر فایل حفظ شود؛ ۲+ ویرایش در یک ToolEditGroupView جمع می‌شوند.
+    if (isEditActivity(activity) && !isExploreCard(activity)) {
+      flush();
+      wrapTrace();
+      pendingEdit.push({ activity, index: seg.index });
+      return;
+    }
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
       flush();
       wrapTrace();
+      flushEdits();
       nodes.push(
         <ToolCallView
           key={i}
@@ -1305,6 +1359,9 @@ export function renderSegments(
         />,
       );
     } else {
+      // شروع ران فقط‌خواندنی: گروه ویرایش قبلی (اگر بود) اول بسته می‌شود تا
+      // دو ران هرگز در یک کارت قاطی نشوند.
+      flushEdits();
       // Attach the held-back narration to THIS call (per-call captions), then
       // keep accumulating — the run stays one group even with interleaved
       // narrations.
@@ -1318,6 +1375,7 @@ export function renderSegments(
   });
   flush();
   wrapTrace();
+  flushEdits();
   return nodes;
 }
 

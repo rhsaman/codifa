@@ -143,6 +143,18 @@ def _laya_dir(repo: str = "") -> str:
     return os.path.join(_models_dir(), f"laya--{slug}") if slug else os.path.join(_models_dir(), "laya")
 
 
+def laya_weight_status(repo: str = "") -> dict:
+    """وضعیت آماده‌بودن وزن laya: پوشه، حجم، آماده‌بودن (تفکیک «وزن نیست»)."""
+    target = (repo or "").strip() or _user_laya_model()
+    weight_dir = _laya_dir(target)
+    return {
+        "repo": target,
+        "weight_dir": weight_dir,
+        "ready": laya_ready(target),
+        "size": _dir_size(weight_dir),
+    }
+
+
 def _embedding_dir(repo: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
     return os.path.join(_models_dir(), f"models--{slug}") if slug else ""

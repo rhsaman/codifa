@@ -15,6 +15,11 @@ let activeUrl: string | null = null
 let activeOwner = -1
 let activeStatus: TtsStatus = 'idle'
 let nextOwnerId = 0
+// توالی درخواست پخش: هر playTts یک شناسه یکتا می‌گیرد. fetch قبلیِ همان مالک
+// (کلیک تند پلی/استاپ روی یک پیام) با همین شناسه کهنه تشخیص داده و دور ریخته
+// می‌شود — وگرنه دو fetch همزمان هر دو به Audio می‌رسیدند و همزمان پخش می‌شدند.
+let activeSeq = 0
+let seqCounter = 0
 
 export type TtsListener = (status: TtsStatus, owner: number) => void
 const listeners = new Set<TtsListener>()
@@ -44,6 +49,8 @@ export function subscribeTts(listener: TtsListener): () => void {
 
 /** قطع ویس فعال و برگرداندن همه نمونه‌ها به idle. */
 function stopTtsGlobal() {
+  // باطل‌کردن fetchهای در راه: نتیجه کهنه بعد از resolve پخش نمی‌شود.
+  activeSeq = -1
   if (activeAudio) {
     activeAudio.onended = null
     activeAudio.onerror = null
@@ -73,7 +80,8 @@ export function stopTts(owner?: number) {
 
 /**
  * پخش متن با مالک مشخص. ویس قبلی (هر پیام/چت) اول قطع می‌شود؛ اگر حین fetch
- * ویس دیگری شروع شود، نتیجه کهنه دور ریخته می‌شود و پخش نمی‌شود.
+ * ویس دیگری شروع شود (حتی از همان پیام با کلیک تند پلی/استاپ)، نتیجه کهنه
+ * با شناسه توالی دور ریخته می‌شود و پخش نمی‌شود.
  */
 export async function playTts(
   text: string,
@@ -81,28 +89,57 @@ export async function playTts(
   owner: number,
 ): Promise<void> {
   stopTtsGlobal()
+  const seq = ++seqCounter
+  activeSeq = seq
   activeOwner = owner
   activeStatus = 'loading'
   notifyTts()
+  let blob: Blob
   try {
-    const blob = await speakText(text, opts)
-    if (activeOwner !== owner) return
-    const url = URL.createObjectURL(blob)
-    activeUrl = url
-    const audio = new Audio(url)
-    activeAudio = audio
-    audio.onended = () => {
-      if (activeOwner === owner) stopTtsGlobal()
-    }
-    audio.onerror = () => {
-      if (activeOwner === owner) stopTtsGlobal()
-    }
-    activeStatus = 'speaking'
-    notifyTts()
+    blob = await speakText(text, opts)
+  } catch (err) {
+    if (activeSeq === seq) stopTtsGlobal()
+    throw err
+  }
+  if (activeSeq !== seq) return
+  const url = URL.createObjectURL(blob)
+  // بین resolve شدن fetch و ساخت Audio ممکن است پخش دیگری شروع شده باشد؛
+  // دوباره بررسی کن تا دو Audio همزمان ساخته نشود.
+  if (activeSeq !== seq) {
+    URL.revokeObjectURL(url)
+    return
+  }
+  // اگر ویس قبلی هنوز در حال پخش است (مسابقه دو fetch همزمان)، قطعش کن.
+  if (activeAudio) {
+    activeAudio.onended = null
+    activeAudio.onerror = null
+    activeAudio.pause()
+    activeAudio = null
+  }
+  if (activeUrl) {
+    URL.revokeObjectURL(activeUrl)
+    activeUrl = null
+  }
+  activeUrl = url
+  const audio = new Audio(url)
+  activeAudio = audio
+  audio.onended = () => {
+    if (activeSeq === seq) stopTtsGlobal()
+  }
+  audio.onerror = () => {
+    if (activeSeq === seq) stopTtsGlobal()
+  }
+  activeStatus = 'speaking'
+  notifyTts()
+  try {
     await audio.play()
   } catch (err) {
-    if (activeOwner === owner) stopTtsGlobal()
+    if (activeSeq === seq) stopTtsGlobal()
     throw err
+  }
+  // حین audio.play استاپ زده شده؟ ویسی که تازه شروع شده را بخوابان.
+  if (activeSeq !== seq) {
+    audio.pause()
   }
 }
 

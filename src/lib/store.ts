@@ -5,6 +5,7 @@ import type {
   Chat,
   ChatDraft,
   ChatMessage,
+  LayaRun,
   McpServerConfig,
   MessageSegment,
   ProviderConfig,
@@ -20,6 +21,31 @@ import type {
   ToolActivity,
   Workspace,
 } from '../types'
+
+/** سقف تاریخچه تصمیم‌های laya هر چت — فقط تازه‌ترین‌ها نگه داشته می‌شوند. */
+export const MAX_LAYA_RUNS_PER_CHAT = 20
+
+/** نرمال‌سازی یک رویداد laya به رکورد نمایشی + سقف آخرین ~۲۰ تا. خالص برای تست. */
+export function appendLayaRun(
+  runs: LayaRun[] | undefined,
+  run: Omit<LayaRun, 'at'> & { at?: number },
+): LayaRun[] {
+  const conf = Number.isFinite(run.confidence)
+    ? Math.max(0, Math.min(1, run.confidence))
+    : 0
+  const next: LayaRun = {
+    route: (run.route || 'normal').trim() || 'normal',
+    confidence: conf,
+    abstained: run.abstained === true,
+    reason: typeof run.reason === 'string' ? run.reason : '',
+    handled: run.handled === true,
+    providerId: typeof run.providerId === 'string' ? run.providerId : '',
+    model: typeof run.model === 'string' ? run.model : '',
+    elapsedMs: Number.isFinite(run.elapsedMs) && (run.elapsedMs ?? 0) >= 0 ? Math.round(run.elapsedMs ?? 0) : 0,
+    at: Number.isFinite(run.at) && (run.at ?? 0) > 0 ? Math.round(run.at as number) : Date.now(),
+  }
+  return [...(runs ?? []), next].slice(-MAX_LAYA_RUNS_PER_CHAT)
+}
 import { api } from './fs'
 import { deleteMcp, listMcp, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
@@ -177,10 +203,42 @@ function persistSoon(): void {
   persistTimer = setTimeout(() => useStore.getState().persist(), PERSIST_DEBOUNCE_MS)
 }
 
+// Lightweight debounced write for panel visibility toggles (sidebar / right
+// panel / code-map). A toggle must feel instant: it only flips a boolean in
+// memory and schedules a settings-only write in the background — never the
+// heavy full snapshot (sanitizeChats over every message + AES encryption +
+// chats IPC) on the keydown path. Chats are untouched by a toggle, so there
+// is nothing to lose by skipping them here; the next full persist (or the
+// quit flush below) still includes the latest panel flags.
+let panelPersistTimer: ReturnType<typeof setTimeout> | undefined
+function persistPanelsSoon(): void {
+  clearTimeout(panelPersistTimer)
+  panelPersistTimer = setTimeout(() => {
+    panelPersistTimer = undefined
+    void writeSettingsNow(useStore.getState())
+  }, PERSIST_DEBOUNCE_MS)
+}
+
 // Chats-only snapshot for the mid-stream heartbeat: skips settings entirely so
 // the (async, AES) settings encryption is never re-run every 2s during a run.
 function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
   void api.storeSet('chats', sanitizeChats(s.chats))
+}
+
+// Settings-only snapshot for panel toggles: skips the chats sanitize + write
+// entirely so toggling the sidebar / right panel never walks every message.
+// Shares the persistSeq guard with writeStateNow so a stale snapshot can
+// never overtake a newer full write.
+function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
+  if (!s.settingsHydrated) return Promise.resolve()
+  const seq = ++persistSeq
+  return (async () => {
+    const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+    void chats
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+    if (seq !== persistSeq) return
+    await api.storeSet('settings', payload)
+  })()
 }
 
 // Called from updateMessage on every SSE token. While streaming, only a cheap
@@ -208,6 +266,10 @@ function flushPendingPersist(): Promise<unknown> {
   if (persistTimer) {
     clearTimeout(persistTimer)
     persistTimer = undefined
+  }
+  if (panelPersistTimer) {
+    clearTimeout(panelPersistTimer)
+    panelPersistTimer = undefined
   }
   // Mounted chat panels keep their scroll position in a ref (not the store) so
   // scrolling never re-renders the transcript. Before ANY flush — including the
@@ -621,10 +683,14 @@ interface State {
     chatId: string,
     providerId: string,
     model: string,
-    delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+    delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number; laya?: boolean },
   ) => void
   /** Zero the cumulative per-model usage of a chat (sidebar "reset" button). */
   resetChatUsage: (chatId: string) => void
+  /** ثبت یک تصمیم سریع laya در تاریخچه همان چت (آخرین ~۲۰ تا) برای پنل راست. */
+  appendLayaRun: (chatId: string, run: Omit<LayaRun, 'at'> & { at?: number }) => void
+  /** پاک‌کردن تاریخچه laya یک چت. */
+  clearLayaRuns: (chatId: string) => void
   /** Set/clear a chat's pending `ask_user` request. Stored on the chat (not
    *  local component state) so it survives the ChatPanel remount that happens
    *  on every chat switch (`key={activeChatId}`) — otherwise a background
@@ -1587,7 +1653,7 @@ export const useStore = create<State>((set, get) => ({
 
   setSidebarOpen: (sidebarOpen) => {
     set({ sidebarOpen })
-    get().persist()
+    persistPanelsSoon()
   },
 
   toggleSidebar: () => {
@@ -1597,7 +1663,7 @@ export const useStore = create<State>((set, get) => ({
 
   setCodeMapPanelOpen: (codeMapPanelOpen) => {
     set({ codeMapPanelOpen })
-    get().persist()
+    persistPanelsSoon()
   },
 
   toggleCodeMapPanel: () => {
@@ -1607,7 +1673,7 @@ export const useStore = create<State>((set, get) => ({
 
   setRightPanelOpen: (rightPanelOpen) => {
     set({ rightPanelOpen })
-    get().persist()
+    persistPanelsSoon()
   },
 
   toggleRightPanel: () => {
@@ -2115,12 +2181,15 @@ export const useStore = create<State>((set, get) => ({
     // Keep cache-only events (input=0, output=0, but cacheRead/cacheWrite>0):
     // those are real billed tokens and must not be dropped, otherwise the
     // cached portion silently disappears from the totals.
+    // ورودی صفرتوکنی laya (تصمیم لوکال بدون توکن) هم قبول می‌شود تا ردیف
+    // قابل‌مشاهده در model usage بماند — مثل مدل‌های tools.
+    const isLaya = Boolean(delta.laya)
     const hasTokens =
       (delta.input || 0) > 0 ||
       (delta.output || 0) > 0 ||
       (delta.cacheRead || 0) > 0 ||
       (delta.cacheWrite || 0) > 0;
-    if (!hasTokens) return
+    if (!hasTokens && !isLaya) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== chatId) return c
@@ -2137,6 +2206,7 @@ export const useStore = create<State>((set, get) => ({
             cacheRead: (prev.cacheRead ?? 0) + (delta.cacheRead ?? 0),
             cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
             lastUsed: Date.now(),
+            ...(isLaya ? { laya: true } : {}),
           }
         } else {
           entries.push({
@@ -2147,6 +2217,7 @@ export const useStore = create<State>((set, get) => ({
             cacheRead: delta.cacheRead ?? 0,
             cacheWrite: delta.cacheWrite ?? 0,
             lastUsed: Date.now(),
+            ...(isLaya ? { laya: true } : {}),
           })
         }
         // Usage fires once per model call INSIDE a run — don't reorder the
@@ -2180,6 +2251,20 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({
       chats: s.chats.map((c) => (c.id === chatId ? { ...c, pendingPermission: req } : c)),
     }))
+  },
+
+  appendLayaRun: (chatId, run) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === chatId ? { ...c, layaRuns: appendLayaRun(c.layaRuns, run) } : c)),
+    }))
+    persistSoon()
+  },
+
+  clearLayaRuns: (chatId) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === chatId ? { ...c, layaRuns: [] } : c)),
+    }))
+    get().persist()
   },
 
   setChatCompacting: (id, compacting) => {
@@ -2263,7 +2348,7 @@ export const useStore = create<State>((set, get) => ({
   clearChat: (id) => {
     set((s) => ({
       chats: s.chats.map((c) =>
-        c.id === id ? { ...c, messages: [], usage: undefined, updatedAt: Date.now() } : c,
+        c.id === id ? { ...c, messages: [], usage: undefined, layaRuns: [], updatedAt: Date.now() } : c,
       ),
     }))
     get().persist()

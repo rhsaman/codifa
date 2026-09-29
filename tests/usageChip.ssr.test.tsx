@@ -137,6 +137,23 @@ console.log("۳) UsagePopover رندر SSR با view seed شده:")
   check("dir=ltr روی پاپ‌اور", html.includes('dir="ltr"'))
 }
 
+console.log("۴) ردیف laya لوکال/خارجی:")
+{
+  // ردیف صفرتوکنی laya (لوکال) نگه داشته می‌شود تا در model usage دیده شود.
+  const localView = buildUsageView(
+    { entries: [{ providerId: "local", model: "convaiinnovations/laya", input: 0, output: 0, laya: true, lastUsed: 3 }] },
+    providers,
+  )
+  check("ردیف صفرتوکنی laya حذف نمی‌شود", localView.groups.length === 1, localView.groups.length)
+  check("مدل لوکال laya نمایش داده می‌شود", localView.groups[0]?.entries[0]?.model === "convaiinnovations/laya")
+  // مصرف واقعی پروایدر خارجی laya مثل tools ثبت می‌شود.
+  const extView = buildUsageView(
+    { entries: [{ providerId: "p1", model: "model-a", input: 10, output: 5, laya: true, lastUsed: 4 }] },
+    providers,
+  )
+  check("ردیف پروایدر خارجی laya ثبت می‌شود", extView.groups.length === 1 && extView.totalTokens === 15, extView.totalTokens)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

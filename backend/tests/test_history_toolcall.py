@@ -160,9 +160,9 @@ def test_duplicate_call_ids_across_turns_are_renamed():
     ]
     tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
     # نوبت اول id اصلی را نگه می‌دارد؛ نوبت دوم پسوند یکتا می‌گیرد
-    assert ai_ids == ["1", "1#2"]
+    assert ai_ids == ["1", "1_dup2"]
     # به‌ازای هر فراخوانی دقیقاً یک ToolMessage با همان id
-    assert tool_ids == ["1", "1#2"]
+    assert tool_ids == ["1", "1_dup2"]
     # هر نتیجه به فراخوانی خودش متصل می‌ماند
     assert "one" in msgs[1].content
     assert "two" in msgs[3].content
@@ -185,7 +185,7 @@ def test_duplicate_call_ids_within_one_turn_are_renamed():
     msgs = history_to_langchain_messages(history)
     ai = next(m for m in msgs if isinstance(m, AIMessage))
     tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
-    assert [tc["id"] for tc in ai.tool_calls] == ["5", "5#2"]
-    assert tool_ids == ["5", "5#2"]
+    assert [tc["id"] for tc in ai.tool_calls] == ["5", "5_dup2"]
+    assert tool_ids == ["5", "5_dup2"]
     assert "A" in msgs[1].content
     assert "B" in msgs[2].content

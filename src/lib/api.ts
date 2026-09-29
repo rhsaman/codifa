@@ -884,12 +884,19 @@ export async function getModelsStatus(): Promise<ModelsStatus> {
   }
 }
 
-/** وضعیت تصمیم‌گیر محلی laya (نصب/آماده/ریپو/پروایدر) برای Settings → Models. */
+/** وضعیت تصمیم‌گیر محلی laya (نصب/آماده/ریپو/پروایدر + دلیل دقیق + وزن + پروگرس) برای Settings → Models. */
 export interface LayaStatus {
   available: boolean
   ready: boolean
   repo: string
   provider?: string
+  /** دلیل دقیق آماده‌نبودن: laya-not-installed | laya-weights-missing | laya-error… */
+  reason?: string
+  /** پوشه وزن محلی + حجم بایت. */
+  weight_dir?: string
+  size?: number
+  /** پروگرس دانلود در حال اجرا (همان شکل ModelRunState). */
+  running?: ModelRunState
 }
 
 /** خواندن وضعیت laya از سایدکار؛ در صورت قطعی، پیش‌فرض خاموش برمی‌گردد. */
@@ -1379,8 +1386,8 @@ export async function deleteSchedule(id: string): Promise<{ ok: true } | { error
   }
 }
 
-/** اجرای دستی یک تسک (بدون انتظار برای سررسید). */
-export async function runScheduleNow(id: string): Promise<{ ok: true } | { error: string }> {
+/** اجرای دستی یک تسک (بدون انتظار برای سررسید). شناسه‌ی ران را برمی‌گرداند تا پولینگ دقیق همان اجرا ممکن شود. */
+export async function runScheduleNow(id: string): Promise<{ ok: true; run_id?: string } | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: "Python agent not ready" }
   try {
@@ -1389,7 +1396,8 @@ export async function runScheduleNow(id: string): Promise<{ ok: true } | { error
       const body = (await res.json().catch(() => ({}))) as { detail?: string }
       return { error: body.detail || `run failed (${res.status})` }
     }
-    return { ok: true }
+    const body = (await res.json().catch(() => ({}))) as { run_id?: string }
+    return typeof body.run_id === "string" && body.run_id ? { ok: true, run_id: body.run_id } : { ok: true }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }

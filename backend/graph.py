@@ -187,15 +187,49 @@ def _unanswered_tool_calls(msgs: list, calls: list) -> list:
     return [tc for tc in calls if tc.get("id") and tc.get("id") not in answered]
 
 
+# Throttle per-step checkpoint writes: persisting the full transcript to
+# sqlite on EVERY step adds latency that grows with the transcript. Save at
+# most every N steps (plus the final step of the turn, handled by the
+# caller), unless the transcript grew significantly since the last save.
+_CHECKPOINT_EVERY_N_STEPS = 3
+_CHECKPOINT_MIN_GROWTH_CHARS = 20_000
+_checkpoint_state: dict[str, dict] = {}
+
+
+def _checkpoint_due(thread_id: str, msgs: list, *, force: bool = False) -> bool:
+    """True when a checkpoint write is worth its latency cost."""
+    try:
+        st = _checkpoint_state.get(thread_id)
+        if st is None:
+            st = {"steps": 0, "chars": 0}
+            _checkpoint_state[thread_id] = st
+        st["steps"] = int(st.get("steps") or 0) + 1
+        _chars = sum(len(str(getattr(m, "content", "") or "")) for m in msgs)
+        _grown = _chars - int(st.get("chars") or 0)
+        if force or st["steps"] >= _CHECKPOINT_EVERY_N_STEPS or _grown >= _CHECKPOINT_MIN_GROWTH_CHARS:
+            st["steps"] = 0
+            st["chars"] = _chars
+            return True
+        return False
+    except Exception:  # noqa: BLE001 — throttling must never block a save
+        return True
+
+
 async def _save_turn_checkpoint_valid(
-    thread_id: str, msgs: list, pending_calls: list = ()
+    thread_id: str, msgs: list, pending_calls: list = (), *, force: bool = False
 ) -> None:
     """ذخیرهٔ چک‌پوینتی که ترنسکریپتش «همیشه» برای provider معتبر است.
 
     هر tool_call از step جاری که هنوز نتیجه‌ای ندارد با یک ToolMessageی
     placeholder پوشانده می‌شود، تا resume هرگز با خطای «tool_calls must be
     followed by tool messages» رد نشود و turn از همان‌جا ادامه یابد.
+
+    Writes are throttled (every N steps or on significant growth) so the
+    per-step sqlite latency does not grow with the transcript; pass
+    ``force=True`` for the final save of a turn.
     """
+    if not _checkpoint_due(thread_id, msgs, force=force):
+        return
     patch = [
         ToolMessage(content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"])
         for tc in _unanswered_tool_calls(msgs, pending_calls)
@@ -589,7 +623,7 @@ def history_to_langchain_messages(
                 tc_id = base_id
                 _dup_n = 2
                 while tc_id in used_ids:
-                    tc_id = f"{base_id}#{_dup_n}"
+                    tc_id = f"{base_id}_dup{_dup_n}"
                     _dup_n += 1
                 used_ids.add(tc_id)
                 tool_calls.append(
@@ -667,6 +701,26 @@ def history_to_langchain_messages(
 # ---------------------------------------------------------------------------
 
 
+_COMPUTER_INTENT_HINTS = (
+    "computer", "desktop", "application", "windows", "macos", "linux",
+    "screenshot", "screen", "click", "keyboard", "mouse",
+    "اپ دسکتاپ", "دسکتاپ", "ویندوز", "لینوکس", "صفحه", "کلیک",
+)
+
+
+def _wants_computer(prompt: str) -> bool:
+    """True when the prompt shows desktop-control intent.
+
+    Cheap keyword gate (same safety-net pattern as ``wants_skill_or_mcp`` in
+    server.py): keeps the ~2k-token `computer` schema out of every turn unless
+    the user actually asks for desktop work. The laya fast-route decision
+    still runs when the tool IS bound and can steer the model precisely."""
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+    return any(h in text for h in _COMPUTER_INTENT_HINTS)
+
+
 def filter_tools_for_mode(
     mode: str,
     tools: dict[str, Callable],
@@ -676,6 +730,7 @@ def filter_tools_for_mode(
     allow_outside: bool,
     prompt: str = "",
     root: str = "",
+    allow_computer: bool = False,
 ) -> dict[str, Callable]:
     """Return the mode-appropriate subset of ``tools``.
 
@@ -756,6 +811,14 @@ def filter_tools_for_mode(
         tools = {
             n: fn for n, fn in tools.items() if n not in ("create_skill", "create_mcp")
         }
+    # The `computer` tool (~2k tokens of schema) is only bound when the user
+    # pre-approved desktop control (allow_computer) or the prompt/history
+    # shows desktop intent (same safety-net pattern as allow_create in
+    # server.chat_stream). Otherwise it is stripped here so it never reaches
+    # the model — and the laya fast-route decision below is skipped too.
+    # Runtime permission prompting still applies when the tool IS bound.
+    if "computer" in tools and not (allow_computer or _wants_computer(prompt)):
+        tools = {n: fn for n, fn in tools.items() if n != "computer"}
 
     scoped = bool(scoped_paths)
     if scoped:
@@ -1455,6 +1518,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         allow_outside,
         prompt=prompt,
         root=root,
+        allow_computer=bool(state.get("allow_computer")),
     )
 
     # --- MCP bridge -------------------------------------------------------
@@ -1897,30 +1961,74 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
     if mcp_tools:
         user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
-    # مسیر سریع laya: قبل از مدل بزرگ، computer/browser/normal را حدس بزن تا
-    # مدل با ابزار درست و توکن کمتر شروع کند (best-effort، هرگز خطا نمی‌دهد).
-    try:
-        import laya_decide
+    # مسیر سریع laya: فقط وقتی computer/مرورگر زنده است اجرا می‌شود تا
+    # اجرای بی‌مصرف نشود؛ decide همگام در نخ جدا (to_thread) تا حلقه بلوکه نشود.
+    # مصرف laya (لوکال صفرتوکنی یا توکن واقعی پروایدر) مثل tools با sub=True
+    # در صف رویداد منتشر می‌شود تا در جمع چت ثبت شود و بج پیام به‌هم نریزد.
+    _computer_live = filtered.get("computer") is not None
+    _laya_needed = bool(_computer_live or browser_mcp_live)
+    if _laya_needed:
+        try:
+            import time as _laya_time
 
-        _fast_route = laya_decide.fast_route(prompt)
-        _fast_decision = laya_decide.decide(
-            {"prompt": prompt or "", "mode": mode or ""},
-            {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
-        )
-        if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
-            _fast_route = str(_fast_decision.value)
-        if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and filtered.get("computer") is not None:
-            user_parts.append(
-                "FAST ROUTE: computer — start with the `computer` tool "
-                "(read_screen first, then ONE sequence call)."
+            import laya_decide
+
+            _laya_start = _laya_time.monotonic()
+            _fast_route = laya_decide.fast_route(prompt)
+            _fast_decision = await asyncio.to_thread(
+                laya_decide.decide,
+                {"prompt": prompt or "", "mode": mode or ""},
+                {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
             )
-        elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
-            user_parts.append(
-                "FAST ROUTE: browser — start with the browser MCP tools "
-                "(navigate/snapshot first, avoid web_search)."
-            )
-    except Exception:  # noqa: BLE001 — مسیر سریع اختیاری است
-        pass
+            if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
+                _fast_route = str(_fast_decision.value)
+            _laya_usage = getattr(_fast_decision, "usage", None)
+            if isinstance(_laya_usage, dict) and _laya_usage.get("kind") == "usage":
+                _laya_ev = dict(_laya_usage)
+                _laya_ev["sub"] = True
+                _laya_ev["laya"] = True
+                if not _laya_ev.get("provider_id"):
+                    _laya_ev["provider_id"] = getattr(_fast_decision, "provider_id", "") or "local"
+                if not _laya_ev.get("model"):
+                    _laya_ev["model"] = getattr(_fast_decision, "model", "") or ""
+                with contextlib.suppress(Exception):
+                    queue.put_nowait(_laya_ev)
+            # رویداد فعالیت زنده laya برای پنل راست (زیر todos، فقط چت فعال):
+            # مسیر، اطمینان، انصراف، دلیل و زمان تصمیم — جدا از رویداد usage.
+            try:
+                _laya_elapsed = int((_laya_time.monotonic() - _laya_start) * 1000)
+            except Exception:  # noqa: BLE001 — تایمر اختیاری است
+                _laya_elapsed = 0
+            try:
+                _laya_display = _fast_decision.display(_fast_route) if hasattr(_fast_decision, "display") else {}
+            except Exception:  # noqa: BLE001 — نمایش اختیاری است
+                _laya_display = {}
+            if isinstance(_laya_display, dict):
+                _laya_act = {
+                    "kind": "laya",
+                    "route": str(_laya_display.get("route") or _fast_route or "normal"),
+                    "confidence": float(_laya_display.get("confidence") or 0.0),
+                    "abstained": bool(_laya_display.get("abstained", False)),
+                    "reason": str(_laya_display.get("reason") or ""),
+                    "handled": bool(_laya_display.get("handled", False)),
+                    "provider_id": str(_laya_display.get("provider_id") or getattr(_fast_decision, "provider_id", "") or "local"),
+                    "model": str(_laya_display.get("model") or getattr(_fast_decision, "model", "") or ""),
+                    "elapsed_ms": _laya_elapsed,
+                }
+                with contextlib.suppress(Exception):
+                    queue.put_nowait(_laya_act)
+            if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and _computer_live:
+                user_parts.append(
+                    "FAST ROUTE: computer — start with the `computer` tool "
+                    "(read_screen first, then ONE sequence call)."
+                )
+            elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
+                user_parts.append(
+                    "FAST ROUTE: browser — start with the browser MCP tools "
+                    "(navigate/snapshot first, avoid web_search)."
+                )
+        except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
+            pass
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
     # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
     if filtered.get("computer") is not None:
@@ -2491,22 +2599,65 @@ async def _maybe_auto_compact(
     # with a short placeholder so the transcript sheds weight early.  This
     # fires at half the user's compact_at_percent, is a no-LLM operation,
     # and prevents slow context creep across many tool-call steps.
+    # Batched: truncate all-but-recent in ONE pass and skip re-runs until
+    # the transcript regrows significantly, so the message prefix stays
+    # stable for prompt caching (truncating one more message every step
+    # would rewrite the prefix each step and force full-price reprocessing).
     _cheap_pct = _pct // 2  # e.g. 80 → 40
     cheap_threshold = int(ctx * _cheap_pct / 100)
     if total >= cheap_threshold:
-        _tool_idxs = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
-        _KEEP = 6
-        if len(_tool_idxs) > _KEEP:
-            _old = set(_tool_idxs[:-_KEEP])
-            _ph = "[result truncated — see earlier compact summary]"
-            for i in _old:
-                _c = getattr(msgs[i], "content", "")
-                if len(str(_c)) > len(_ph) + 20:
-                    msgs[i] = msgs[i].copy(update={"content": _ph})
+        _last_cheap = state.get("_cheap_truncated_at")
+        _regrow = max(10_000, int(ctx * 5 / 100))
+        _skip_cheap = isinstance(_last_cheap, (int, float)) and total < _last_cheap + _regrow
+        if not _skip_cheap:
+            # Keep whole tool steps, not a fixed count of ToolMessages:
+            # collect tool_call ids of the last assistant steps and keep
+            # all their results verbatim.
+            _KEEP_STEPS = 6
+            _step_ids: list[set[str]] = []
+            for _m in msgs:
+                _tcs = getattr(_m, "tool_calls", None)
+                if isinstance(_m, AIMessage) and _tcs:
+                    _ids = {tc.get("id") for tc in _tcs if tc.get("id")}
+                    if _ids:
+                        _step_ids.append(_ids)
+            _keep_ids: set[str] = set()
+            for _ids in _step_ids[-_KEEP_STEPS:]:
+                _keep_ids |= _ids
+            # Map every tool_call id to (name, args) for a meaningful placeholder.
+            _call_meta: dict[str, tuple[str, dict]] = {}
+            for _m in msgs:
+                _tcs2 = getattr(_m, "tool_calls", None)
+                if isinstance(_m, AIMessage) and _tcs2:
+                    for _tc in _tcs2:
+                        _tid = _tc.get("id")
+                        if _tid and _tid not in _call_meta:
+                            _call_meta[_tid] = (str(_tc.get("name") or "tool"), _tc.get("args") or {})
+            _truncated_any = False
+            for _i, _m in enumerate(msgs):
+                if not isinstance(_m, ToolMessage):
+                    continue
+                _tid = getattr(_m, "tool_call_id", "")
+                if _tid in _keep_ids:
+                    continue
+                _c = getattr(_m, "content", "")
+                _cs = str(_c)
+                if len(_cs) <= 120:
+                    continue
+                if _cs.startswith("[truncated ") and _cs.endswith("re-issue if still needed]"):
+                    continue
+                _name, _args = _call_meta.get(_tid, (getattr(_m, "name", "") or "tool", {}))
+                try:
+                    _arg_str = json.dumps(_args, ensure_ascii=False, sort_keys=True)[:160]
+                except Exception:  # noqa: BLE001 — placeholder must never fail
+                    _arg_str = str(_args)[:160]
+                _ph = f"[truncated {_name}({_arg_str}) — re-issue if still needed]"
+                if len(_cs) > len(_ph) + 20:
+                    with contextlib.suppress(Exception):
+                        msgs[_i] = _m.model_copy(update={"content": _ph})
+                        _truncated_any = True
             # Recalculate total after truncation so the threshold check
-            # below sees the reduced size. No per-turn marker is needed: once
-            # the old results are replaced with the short placeholder, the
-            # len() check above skips them on subsequent visits.
+            # below sees the reduced size.
             total = max(
                 last_context_tokens or 0,
                 _estimate_prompt_tokens(msgs) or 0,
@@ -2516,6 +2667,9 @@ async def _maybe_auto_compact(
                     _agents._estimate_tokens(d["content"])
                     for d in _agents._messages_to_dicts(msgs)
                 )
+            if _truncated_any:
+                with contextlib.suppress(Exception):
+                    state["_cheap_truncated_at"] = total
     # --- end cheap truncation -------------------------------------------
     if total < threshold:
         return 0
@@ -3429,8 +3583,11 @@ async def _run_mode_turn(
                 append_tool_result(msgs, str(result), tc.get("id", ""))
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
+                # Force the save on the LAST sequential call so the turn-end
+                # state is always durable despite throttling.
                 await _save_turn_checkpoint_valid(
-                    _resume_thread, msgs, _sequential[_seq_idx + 1:]
+                    _resume_thread, msgs, _sequential[_seq_idx + 1:],
+                    force=_seq_idx == len(_sequential) - 1,
                 )
             # Emit ToolMessages for duplicate tool calls that were deduped above
             # so the LLM sees a result for every tool_call_id it originally sent.

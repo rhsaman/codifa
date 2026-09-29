@@ -94,6 +94,153 @@ function groupSummary(activities: ToolActivity[]): string {
 export const isExploreCard = (a: ToolActivity) =>
   a.tool === "task" && a.args?.subagent_type === "explore";
 
+/** ابزارهای ویرایش فایل — ران‌های پشت‌سرهم آن‌ها در یک گروه ویرایش جدا
+ *  (ToolEditGroupView) جمع می‌شوند و هرگز با گروه ابزارهای فقط‌خواندنی
+ *  (ToolGroupView) قاطی نمی‌شوند. */
+export const EDIT_TOOLS = new Set(["edit_file", "write_file"]);
+
+export const isEditActivity = (a: ToolActivity) => EDIT_TOOLS.has(a.tool);
+
+/** جمع +N -M چند فعالیت ویرایش (ترجیحاً diffStats ذخیره‌شده، وگرنه محاسبه
+ *  از روی متن دیف) — برای هدر گروه ویرایش. */
+export function editGroupStats(
+  activities: { activity: ToolActivity }[],
+): { adds: number; dels: number } {
+  let adds = 0;
+  let dels = 0;
+  for (const { activity } of activities) {
+    if (!activity.diff) continue;
+    const s = activity.diffStats ?? diffStatsFromUnified(activity.diff);
+    adds += s.adds;
+    dels += s.dels;
+  }
+  return { adds, dels };
+}
+
+/** گروه ویرایش جدا (Claude/Codex-style): ران پشت‌سرهم edit_file/write_file
+ *  در یک کارت جمع با هدر «N files · +A -D» و یک ردیف تکی به‌ازای هر فایل.
+ *  هر ردیف Undo و Review تکی خودش را حفظ می‌کند (کلیک روی ردیف هم ترن را در
+ *  پنل Review سمت راست باز می‌کند). */
+export const ToolEditGroupView = memo(function ToolEditGroupView({
+  activities,
+  messageId,
+  chatId,
+  onReverted,
+}: {
+  activities: { activity: ToolActivity; index: number }[];
+  messageId?: string;
+  chatId?: string;
+  onReverted?: (index: number) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const openReview = useReviewPanel((s) => s.openReview);
+  const root = useStore((s) => s.root);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const [reverting, setReverting] = useState<number | null>(null);
+  const running = activities.some((a) => a.activity.status === "running");
+  const { adds, dels } = editGroupStats(activities);
+  const totalMs = activities.reduce(
+    (sum, a) => sum + (a.activity.elapsedMs || 0),
+    0,
+  );
+
+  const revertOne = async (entry: { activity: ToolActivity; index: number }) => {
+    if (!root) return;
+    setReverting(entry.index);
+    try {
+      const cid = chatId ?? activeChatId;
+      if (entry.activity.checkpoint != null && cid) {
+        const res = await restoreCheckpoint(cid, entry.activity.checkpoint, root);
+        if (res.ok) {
+          onReverted?.(entry.index);
+          return;
+        }
+      }
+      if (!entry.activity.diff) return;
+      const path = reviewPathOf(entry.activity);
+      if (!path) return;
+      const { content: current } = await api.fsRead(root, path);
+      const oldContent = applyReverseDiff(entry.activity.diff, current ?? "");
+      const ok = await api.fsWrite(root, path, oldContent);
+      if (ok) onReverted?.(entry.index);
+    } finally {
+      setReverting(null);
+    }
+  };
+
+  return (
+    <div className={`tool-edit-group ${open ? "open" : ""} ${running ? "running" : "done"}`}>
+      <button className="trace-head edit-group-head" onClick={() => setOpen((o) => !o)}>
+        <span className="edit-group-icon" aria-hidden="true">✎</span>
+        <span className="trace-head-pills">
+          <span className="trace-pill edit-group-pill">
+            {activities.length} file{activities.length === 1 ? "" : "s"} edited
+          </span>
+        </span>
+        <span className="trace-head-right">
+          {(adds > 0 || dels > 0) && (
+            <span className="edit-group-stats" dir="ltr">
+              <span className="review-count-add">{`+${adds}`}</span>{" "}
+              <span className="review-count-del">{`-${dels}`}</span>
+            </span>
+          )}
+          {totalMs > 0 && <span className="trace-time">{fmtTime(totalMs)}</span>}
+          <IconChevron open={open} className="trace-chev" />
+        </span>
+      </button>
+      {open && (
+        <div className="edit-group-list">
+          {activities.map((entry) => {
+            const path = reviewPathOf(entry.activity);
+            const base = path.split("/").pop() || path;
+            const st = entry.activity.diff
+              ? (entry.activity.diffStats ?? diffStatsFromUnified(entry.activity.diff))
+              : null;
+            const stats = st && (st.adds || st.dels) ? `+${st.adds} -${st.dels}` : null;
+            return (
+              <div
+                key={entry.index}
+                className={`edit-group-row ${entry.activity.status}${entry.activity.reverted ? " reverted" : ""}`}
+              >
+                <button
+                  className="edit-group-row-main"
+                  title={path || undefined}
+                  onClick={() => messageId && openReview(messageId, path)}
+                >
+                  <StatusIcon status={entry.activity.status} />
+                  <span className="edit-group-file" dir="auto">{base}</span>
+                  {stats && (
+                    <span className="trace-row-diff-stats" dir="ltr">{stats}</span>
+                  )}
+                  {entry.activity.reverted && (
+                    <span className="reverted-tag">reverted</span>
+                  )}
+                  {messageId && entry.activity.diff && (
+                    <span className="trace-row-review" aria-hidden="true">Review ↗</span>
+                  )}
+                </button>
+                {entry.activity.diff && !entry.activity.reverted && (
+                  <button
+                    className="tool-revert-inline"
+                    disabled={reverting === entry.index}
+                    title="Undo this change"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void revertOne(entry);
+                    }}
+                  >
+                    {reverting === entry.index ? "Reverting…" : "↩ Undo"}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+});
+
 function fmtTime(ms?: number): string {
   if (!ms) return "";
   if (ms < 1000) return `${ms}ms`;

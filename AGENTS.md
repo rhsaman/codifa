@@ -1,6 +1,8 @@
 pyproject is contain backend with python and front end with electron and react in src/.
 dont grep and read release folder and README.md
 
+when writing or editing code, dont use persian words in code base just use english words
+
 # backend
 
 backend path is backend/ and backend tests is in backend/tests.

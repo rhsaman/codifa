@@ -2,7 +2,40 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { ScheduleSection } from "./SchedulePanel";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, LayaRun } from "../types";
+
+/** دلیل آماده‌نبودن laya به فارسی برای تنظیمات (دقیق: نصب‌نیست در برابر وزن‌نیست). */
+export function layaReasonLabel(reason?: string): string {
+  const r = (reason || '').trim().toLowerCase()
+  if (!r) return ''
+  if (r === 'laya-not-installed') return 'نصب نیست — `pip install laya`'
+  if (r === 'laya-weights-missing') return 'وزن دانلود نشده — دکمه دانلود'
+  if (r.startsWith('laya-timeout')) return 'کند بود — به مدل بزرگ واگذار شد'
+  if (r.startsWith('laya-provider')) return 'پروایدر خارجی جواب نداد — واگذاری'
+  if (r.startsWith('low-confidence')) return 'اطمینان پایین — واگذاری'
+  if (r === 'abstained') return 'نمی‌دانم — واگذاری'
+  return r
+}
+
+/** برچسب فارسی مسیر تصمیم laya برای بج کارت. */
+export function layaRouteLabel(route: string): string {
+  const r = (route || "").trim().toLowerCase();
+  if (r === "computer") return "کامپیوتر";
+  if (r === "browser") return "مرورگر";
+  return "معمولی";
+}
+
+/** کلاس حالت کارت laya: لوکال / خارجی / واگذاری به مدل بزرگ. */
+export function layaCardTone(run: LayaRun): "local" | "external" | "fallback" {
+  if (run.abstained || !run.handled) return "fallback";
+  return (run.providerId || "local") === "local" ? "local" : "external";
+}
+
+/** درصد نمایشی اطمینان (۰ تا ۱۰۰، clamp شده). */
+export function layaConfidencePct(confidence: number): number {
+  if (!Number.isFinite(confidence)) return 0;
+  return Math.max(0, Math.min(100, Math.round(confidence * 100)));
+}
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
  *  خالص (pure) تا تست بتواند مستقیم صدا بزند (همان الگوی buildGroups). */
@@ -219,6 +252,87 @@ export function TodosSection() {
   );
 }
 
+/** سکشن زنده تصمیم‌های laya زیر todos — فقط تاریخچه چت فعال (آخرین ~۲۰ تا)
+ *  با بج مسیر و نوار اطمینان. خالی بودن یعنی هیچ تصمیمی هنوز ثبت نشده. */
+export function LayaSection() {
+  const activeChatId = useStore((s) => s.activeChatId);
+  const runs = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.layaRuns ?? [],
+  );
+  const dir = useStore((s) => s.dir);
+  const [collapsed, setCollapsed] = useState(false);
+
+  if (!activeChatId || runs.length === 0) return null;
+  const shown = runs.slice(-20).slice().reverse();
+
+  return (
+    <div
+      className={`sidebar-panel laya-docked${collapsed ? " collapsed" : ""}`}
+      dir={dir}
+      aria-label="Laya decisions"
+    >
+      <div
+        className="sidebar-panel-head"
+        role="button"
+        tabIndex={0}
+        title="Click to collapse"
+        onClick={() => setCollapsed((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setCollapsed((v) => !v);
+          }
+        }}
+      >
+        <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
+        <span className="sidebar-panel-title">Laya</span>
+        <span className="sidebar-panel-count">{runs.length}</span>
+      </div>
+      {!collapsed && (
+        <ul className="laya-run-list">
+          {shown.map((run, i) => {
+            const pct = layaConfidencePct(run.confidence);
+            const tone = layaCardTone(run);
+            const toneLabel =
+              tone === "local" ? "لوکال" : tone === "external" ? "خارجی" : "واگذاری";
+            return (
+              <li key={`${run.at}-${i}`} className={`laya-run-card laya-${tone}`}>
+                <div className="laya-run-top">
+                  <span className={`laya-route-badge route-${(run.route || "normal").toLowerCase()}`}>
+                    {layaRouteLabel(run.route)}
+                  </span>
+                  <span className={`laya-tone-badge tone-${tone}`}>{toneLabel}</span>
+                  <span className="laya-run-time">
+                    {run.elapsedMs > 0 ? `${run.elapsedMs}ms` : "—"}
+                  </span>
+                </div>
+                <div
+                  className="laya-confidence-track"
+                  role="progressbar"
+                  aria-valuenow={pct}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Laya confidence ${pct} percent`}
+                >
+                  <div className="laya-confidence-fill" style={{ width: `${pct}%` }} />
+                </div>
+                <div className="laya-run-meta">
+                  <span className="laya-confidence-num">{pct}٪</span>
+                  {run.reason ? (
+                    <span className="laya-run-reason" title={run.reason}>
+                      {layaReasonLabel(run.reason) || prepareContent(run.reason, dir)}
+                    </span>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** نگه‌داشت سازگاری: رندر شناور قدیمی حذف شد — همیشه null برمی‌گرداند تا
  *  مانت قدیمی در App بی‌اثر بماند. */
 export function TodosPanel() {
@@ -229,7 +343,15 @@ export function TodosPanel() {
  *  عرض با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و ذخیرهٔ محلی
  *  مثل سایدبار تا بین بازشدن‌ها حفظ شود. */
 export function RightPanel() {
+  // Lightweight shell: subscribes ONLY to the open flag so Cmd/Ctrl+Shift+B
+  // flips instantly. The heavy content (schedules fetch, todos, laya runs,
+  // width state, resize listeners) mounts only when open.
   const open = useStore((s) => s.rightPanelOpen);
+  if (!open) return null;
+  return <RightPanelContent />;
+}
+
+function RightPanelContent() {
   const close = useStore((s) => s.setRightPanelOpen);
 
   // عرض پنل — با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و
@@ -291,7 +413,6 @@ export function RightPanel() {
     dragCleanup.current = onUp;
   };
 
-  if (!open) return null;
   return (
     <aside
       className="right-panel"
@@ -317,6 +438,7 @@ export function RightPanel() {
       <div className="right-panel-body">
         <ScheduleSection />
         <TodosSection />
+        <LayaSection />
       </div>
     </aside>
   );

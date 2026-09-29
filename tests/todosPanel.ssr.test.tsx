@@ -264,6 +264,36 @@ console.log("۱۷) باز شدن خودکار پنل — فقط ساخت تاز�
   check("بدون تودو (۰→۰) → باز نشود", shouldAutoOpenTodosPanel(0, 0, false) === false)
 }
 
+console.log("۱۹) سکشن Laya — برچسب مسیر، لحن کارت و درصد اطمینان:")
+{
+  const { layaRouteLabel, layaCardTone, layaConfidencePct } = await import("../src/components/TodosPanel")
+  check("مسیر computer فارسی می‌شود", layaRouteLabel("computer") === "کامپیوتر")
+  check("مسیر browser فارسی می‌شود", layaRouteLabel("browser") === "مرورگر")
+  check("مسیر normal فارسی می‌شود", layaRouteLabel("normal") === "معمولی")
+  check("لوکال موفق لحن local می‌گیرد", layaCardTone({ route: "browser", confidence: 0.9, abstained: false, reason: "", handled: true, providerId: "local", model: "m", elapsedMs: 120, at: 1 } as any) === "local")
+  check("خارجی موفق لحن external می‌گیرد", layaCardTone({ route: "browser", confidence: 0.9, abstained: false, reason: "", handled: true, providerId: "openrouter", model: "m", elapsedMs: 120, at: 1 } as any) === "external")
+  check("واگذاری لحن fallback می‌گیرد", layaCardTone({ route: "normal", confidence: 0.1, abstained: true, reason: "", handled: false, providerId: "local", model: "m", elapsedMs: 5, at: 1 } as any) === "fallback")
+  check("اطمینان ۰٫۹ می‌شود ۹۰", layaConfidencePct(0.9) === 90)
+  check("اطمینان نامعتبر می‌شود ۰", layaConfidencePct(NaN) === 0)
+  check("اطمینان بالای یک clamp می‌شود", layaConfidencePct(9) === 100)
+}
+
+console.log("۲۰) تاریخچه laya — per-chat با سقف ~۲۰ تا:")
+{
+  const { useStore, appendLayaRun } = await import("../src/lib/store")
+  const chatId = useStore.getState().newChat("ask")
+  const mk = (i: number) => ({ route: "browser", confidence: 0.8, abstained: false, reason: "r", handled: true, providerId: "local", model: "m", elapsedMs: 10 + i })
+  for (let i = 0; i < 25; i++) useStore.getState().appendLayaRun(chatId, mk(i))
+  const runs = useStore.getState().chats.find((c) => c.id === chatId)?.layaRuns ?? []
+  check("سقف تاریخچه ۲۰ تاست", runs.length === 20, runs.length)
+  check("تازه‌ترین آخر می‌ماند", runs[runs.length - 1].elapsedMs === 34, runs[runs.length - 1])
+  const otherId = useStore.getState().newChat("ask")
+  const otherRuns = useStore.getState().chats.find((c) => c.id === otherId)?.layaRuns ?? []
+  check("تاریخچه چت دیگر قاطی نمی‌شود", otherRuns.length === 0)
+  const capped = appendLayaRun(undefined, mk(0))
+  check("append خالص روی undefined کار می‌کند", capped.length === 1 && capped[0].route === "browser")
+}
+
 console.log("۱۸) چت جدید — پنل راست دیفالت بسته است:")
 {
   const { useStore } = await import("../src/lib/store")

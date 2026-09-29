@@ -263,7 +263,7 @@ def test_same_id_calls_get_unique_outputs():
     tool_ids = [
         m.tool_call_id for m in second_request if isinstance(m, ToolMessage)
     ]
-    assert tool_ids == ["1", "1#2"]
+    assert tool_ids == ["1", "1_dup2"]
     assert len(tool_ids) == len(set(tool_ids))
 
 
@@ -309,10 +309,10 @@ def test_normalize_uniquifies_ids_across_messages():
     ai_ids = [tc["id"] for m in msgs if isinstance(m, AIMessage) for tc in m.tool_calls]
     tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
     # هر شناسه در کل ترنسکریپت یکتاست
-    assert ai_ids == ["1", "1#2"]
+    assert ai_ids == ["1", "1_dup2"]
     assert len(ai_ids) == len(set(ai_ids))
     # هر نتیجه به فراخوانی خودش وصل مانده (نه به فراخوانی قبلیِ هم‌شناسه)
-    assert tool_ids == ["1", "1#2"]
+    assert tool_ids == ["1", "1_dup2"]
     assert [m.content for m in msgs if isinstance(m, ToolMessage)] == [
         "result-a",
         "result-b",
@@ -349,7 +349,7 @@ def test_dedupe_step_tool_call_ids_avoids_history_ids():
         ],
     )
     _llm.dedupe_step_tool_call_ids(ai, {"1"})
-    assert [tc["id"] for tc in ai.tool_calls] == ["1#2"]
+    assert [tc["id"] for tc in ai.tool_calls] == ["1_dup2"]
 
 
 def test_dedupe_step_tool_call_ids_renames_duplicates():
@@ -364,7 +364,7 @@ def test_dedupe_step_tool_call_ids_renames_duplicates():
     )
     _llm.dedupe_step_tool_call_ids(ai)
     ids = [tc["id"] for tc in ai.tool_calls]
-    assert ids == ["1", "1#2", "call"]
+    assert ids == ["1", "1_dup2", "call"]
     assert len(ids) == len(set(ids))
 
 
@@ -382,8 +382,8 @@ def test_normalize_reserves_orphan_tool_output_id():
     _llm.normalize_tool_transcript(msgs)
     ai_ids = [tc["id"] for m in msgs if isinstance(m, AIMessage) for tc in m.tool_calls]
     tool_ids = [m.tool_call_id for m in msgs if isinstance(m, ToolMessage)]
-    assert ai_ids == ["1#2"]
-    assert tool_ids == ["1", "1#2"]
+    assert ai_ids == ["1_dup2"]
+    assert tool_ids == ["1", "1_dup2"]
     assert len(tool_ids) == len(set(tool_ids))
 
 
@@ -418,13 +418,19 @@ def test_normalize_survives_chunk_rederivation():
         ToolMessage(content="rb", tool_call_id="12"),
     ]
     _llm.normalize_tool_transcript(msgs)
-    assert [tc["id"] for tc in msgs[2].tool_calls] == ["12#2"]
+    assert [tc["id"] for tc in msgs[2].tool_calls] == ["12_dup2"]
     # بازاستخراج اعتبارسنج پس از unpickle نباید شناسهٔ کهنه را برگرداند
     revived = pickle.loads(pickle.dumps(msgs[2]))
-    assert [tc["id"] for tc in revived.tool_calls] == ["12#2"]
+    assert [tc["id"] for tc in revived.tool_calls] == ["12_dup2"]
     # وایر هم شناسهٔ یکتا را می‌بیند
     wire = _convert_message_to_dict(msgs[2]).get("tool_calls") or []
-    assert [t.get("id") for t in wire] == ["12#2"]
+    assert [t.get("id") for t in wire] == ["12_dup2"]
+
+
+def test_safe_tool_call_id_strips_unsafe_chars():
+    """کاراکترهای غیرمجاز شناسه (مثل #) باید به _ تبدیل شوند تا gateway حذفشان نکند."""
+    assert _llm._safe_tool_call_id("1#2") == "1_2"
+    assert _llm._safe_tool_call_id("") == "call"
 
 
 if __name__ == "__main__":

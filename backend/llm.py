@@ -246,6 +246,7 @@ def build_chat_model(
     cache: bool = False,
     session_id: str = "",
     provider_id: str = "",
+    parallel_tool_calls: bool = False,
 ) -> Any:
     """Build a LangChain chat model for the given provider configuration.
 
@@ -282,15 +283,23 @@ def build_chat_model(
     lc_timeout = timeout or 900
     tkwargs = _thinking_kwargs(provider, model, thinking_level, model_reasoning)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
-    # parallel_tool_calls is intentionally NOT sent. opencode also doesn't
-    # send it, and several OpenRouter free-tier models (e.g.
-    # minimax/minimax-m3:free) reject it with 400 — which would kill every
-    # turn. If a future provider really needs it, set it explicitly in
-    # tkwargs here; the strip-on-400 retry path in graph._run_mode_turn will
-    # also handle any model that flips between supporting and not supporting
-    # the field.
-    # if meta.get("parallel_calls"):
-    #     tkwargs["parallel_tool_calls"] = True
+    # parallel_tool_calls is NOT sent by default: several OpenRouter free-tier
+    # models (e.g. minimax/minimax-m3:free) reject it with 400, which would
+    # kill every turn. It is only enabled when the caller explicitly opts in
+    # (parallel_tool_calls=True) AND the provider is known to honor the flag
+    # (meta["parallel_calls"]). The strip-on-400 retry path in
+    # graph._run_mode_turn stays as the fallback for models that flip between
+    # supporting and not supporting the field.
+    # Ask OpenAI-compatible providers to return token usage on the final streamed
+    # chunk. Without this, streaming responses omit usage and `usage_metadata`
+    # stays None, so no `usage` event is emitted and the sidebar shows no cost /
+    # the title bar shows no consumed context. This now applies to LOCAL servers
+    # too (llama.cpp / LM Studio / Ollama all accept `include_usage` and return
+    # token counts) so the context meter reflects local-model usage. If a server
+    # genuinely rejects the param, the runner retries once without it (see the
+    # stream_options fallback in graph.py / llm_generate).
+    if parallel_tool_calls and meta.get("parallel_calls"):
+        tkwargs["parallel_tool_calls"] = True
     # Ask OpenAI-compatible providers to return token usage on the final streamed
     # chunk. Without this, streaming responses omit usage and `usage_metadata`
     # stays None, so no `usage` event is emitted and the sidebar shows no cost /
@@ -343,6 +352,13 @@ def build_chat_model(
         # HTTP clients by User-Agent get a well-known agent-CLI UA.
         anthropic_headers = dict(headers)
         anthropic_headers.setdefault("User-Agent", UA_LADDER[0])
+        # Direct Anthropic connections get the same prompt-cache behavior as
+        # OpenRouter+Claude: mark the system/tools/history prefix cacheable so
+        # every step after the first bills at cache-read rates instead of full
+        # price. The SDK maps this onto cache_control breakpoints.
+        _anthropic_cache_kwargs: dict[str, Any] = {}
+        if cache:
+            _anthropic_cache_kwargs["cache_control"] = {"type": "ephemeral"}
         return _stamp_provider(
             ChatAnthropic(
                 model=model,
@@ -353,6 +369,7 @@ def build_chat_model(
                 streaming=True,
                 timeout=lc_timeout,
                 default_headers=anthropic_headers or None,
+                **_anthropic_cache_kwargs,
             ),
             provider,
             provider_id,
@@ -1105,6 +1122,20 @@ def _sync_derived_tool_ids(
                             e["id"] = new
 
 
+_UNSAFE_TOOL_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_tool_call_id(raw: str) -> str:
+    """شناسهٔ tool_call را به کاراکترهای امن ``[A-Za-z0-9_-]`` تبدیل می‌کند.
+
+    بعضی gatewayها (مثل muse) موقع تبدیل به فرمت Responses کاراکترهای غیرمجاز
+    شناسه را حذف می‌کنند؛ آن‌وقت «1#2» می‌شود «12» و با شناسهٔ واقعیِ «12»
+    برخورد می‌کند («Duplicate function_call_output»). پس هم پسوند یکتاساز و
+    هم شناسه‌های قدیمیِ ذخیره‌شده (چک‌پوینت/تاریخچه) با ``_`` امن می‌شوند.
+    """
+    return _UNSAFE_TOOL_ID_CHARS.sub("_", raw) or "call"
+
+
 def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
     """یکتاسازیِ in-place شناسهٔ همهٔ ``tool_call``ها در کل ترنسکریپت.
 
@@ -1116,7 +1147,7 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
     (``history_to_langchain_messages``) است؛ پس در «ترن جدید» یا «استاپ و
     ادامه» ترنسکریپتِ انباشته می‌تواند شناسهٔ تکراری داشته باشد.
 
-    تکراری‌ها پسوند ``#N`` می‌گیرند و ``ToolMessage`` متناظر هم به شناسهٔ جدید
+    تکراری‌ها پسوند ``_dupN`` می‌گیرند و ``ToolMessage`` متناظر هم به شناسهٔ جدید
     اشاره می‌کند تا هر نتیجه به فراخوانی خودش متصل بماند (نه به فراخوانی
     قبلیِ هم‌شناسه).
     """
@@ -1132,12 +1163,12 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
             changed: dict[int, tuple[str, str]] = {}
             for j, tc in enumerate(tcs):
                 raw = str(tc.get("id") or "")
-                cid = raw or "call"
+                cid = _safe_tool_call_id(raw)
                 if cid in used:
                     n = 2
-                    while f"{cid}#{n}" in used:
+                    while f"{cid}_dup{n}" in used:
                         n += 1
-                    cid = f"{cid}#{n}"
+                    cid = f"{cid}_dup{n}"
                 if cid != raw:
                     changed[j] = (raw, cid)
                 used.add(cid)
@@ -1218,7 +1249,7 @@ def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> 
     می‌کنند، طوری که یک پیام می‌تواند دو ``tool_calls`` با یک id داشته باشد؛
     هر دو آن‌گاه یک ToolMessage مشترک می‌خواهند و provider پاسخ را با خطای
     400 «Duplicate function_call_output for call_id» رد می‌کند. تکراری‌ها
-    قبل از ذخیرهٔ پیام پسوند ``#N`` می‌گیرند تا هر فراخوانی با id خودش جواب
+    قبل از ذخیرهٔ پیام پسوند ``_dupN`` می‌گیرند تا هر فراخوانی با id خودش جواب
     بگیرد (نتیجه‌ها بعد از این اجرا append می‌شوند).
 
     با ``reserved_ids`` می‌توان idهای موجود در تاریخچه را هم رزرو کرد؛
@@ -1238,12 +1269,12 @@ def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> 
     seen: set[str] = set(reserved_ids or ())
     for idx, tc in enumerate(tcs):
         raw = str(tc.get("id") or "")
-        cid = raw or "call"
+        cid = _safe_tool_call_id(raw)
         if cid in seen:
             n = 2
-            while f"{cid}#{n}" in seen:
+            while f"{cid}_dup{n}" in seen:
                 n += 1
-            cid = f"{cid}#{n}"
+            cid = f"{cid}_dup{n}"
         if cid != raw:
             tc["id"] = cid
             renames[idx] = (raw, cid)
@@ -1840,7 +1871,7 @@ async def _auto_compact_subagent(
             # NOTE: چند ToolMessage خلاصه‌شده با یک tool_call_id ثابت
             # خطای 400 «Duplicate function_call_output» می‌سازد؛ شناسه‌ها
             # را شمارشی یکتا نگه می‌داریم تا گارد pre-flight پاکشان نکند.
-            _cid = f"__compacted__#{_cid_n}" if _cid_n else "__compacted__"
+            _cid = f"__compacted__{_cid_n}" if _cid_n else "__compacted__"
             _cid_n += 1
             rebuilt.append(ToolMessage(content=content, tool_call_id=_cid))
         else:

@@ -248,6 +248,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     asyncio.create_task(_bg())
     _stop = await _start_schedule_loop()
+    # پیش‌گرم‌کردن روتر laya خارج از حلقه چت تا ساخت اول‌باره بلوکه نکند.
+    try:
+        import laya_decide
+
+        await asyncio.to_thread(laya_decide.warmup_router)
+    except Exception:  # noqa: BLE001, S110 — warmup اختیاری است
+        pass
     yield
     try:
         _stop.set()
@@ -414,13 +421,16 @@ async def _run_due_schedules(now: float | None = None) -> int:
     return started
 
 
-async def _execute_schedule(schedule_id: str) -> None:
+async def _execute_schedule(schedule_id: str, run_id: str | None = None) -> None:
     """اجرای headless یک تسک: run_agent بدون گیت تعاملی + ثبت run."""
     import scheduler
     import state_db
 
     started_at = time.time()
-    run_id = ""
+    preset_run_id = str(run_id or "").strip()
+    run_id = preset_run_id
+    # تجمیع مصرف توکن (ایونت‌های kind == usage) برای نمایش در model usage.
+    usage_totals: dict[tuple[str, str], dict] = {}
     try:
         task = state_db.get_schedule(schedule_id)
         if task is None:
@@ -493,15 +503,54 @@ async def _execute_schedule(schedule_id: str) -> None:
                         model = sched_model
             except Exception:
                 pass
-        run = state_db.save_schedule_run({
-            "schedule_id": schedule_id,
-            "status": "running",
-            "started_at": started_at,
-        })
-        run_id = str(run.get("id"))
+        if run_id:
+            # ران running از قبل توسط POST /run ساخته شده؛ started_at آن را نگه دار.
+            try:
+                existing = None
+                for r in state_db.list_schedule_runs(schedule_id, limit=5):
+                    if isinstance(r, dict) and str(r.get("id") or "") == run_id:
+                        existing = r
+                        break
+                if isinstance(existing, dict) and existing.get("started_at"):
+                    started_at = float(existing.get("started_at"))
+            except Exception:  # noqa: BLE001, S110 — خواندن رکورد running اختیاری است
+                pass
+        else:
+            run = state_db.save_schedule_run({
+                "schedule_id": schedule_id,
+                "status": "running",
+                "started_at": started_at,
+            })
+            run_id = str(run.get("id"))
         # اجرای headless: گیت‌های تعاملی None → ابزارهای ask/permission
         # بلافاصله خطای «سیستم در دسترس نیست» می‌دهند و مدل ادامه می‌دهد.
         final_text = ""
+
+        def _accrue_schedule_usage(ev: dict) -> None:
+            try:
+                if ev.get("unbilled"):
+                    return
+                inp = int(ev.get("input_tokens") or 0)
+                outp = int(ev.get("output_tokens") or 0)
+                cr = int(ev.get("cache_read_tokens") or 0)
+                cw = int(ev.get("cache_write_tokens") or 0)
+                if inp + outp + cr + cw <= 0:
+                    return
+                pid = str(ev.get("provider_id") or ev.get("provider") or provider_cfg.get("id") or "")
+                mdl = str(ev.get("model") or model or provider_cfg.get("model") or "main")
+                key = (pid, mdl)
+                cur = usage_totals.get(key)
+                if cur is None:
+                    cur = {"providerId": pid, "model": mdl, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "lastUsed": 0}
+                    usage_totals[key] = cur
+                cur["input"] += inp
+                cur["output"] += outp
+                cur["cacheRead"] += cr
+                cur["cacheWrite"] += cw
+                cur["lastUsed"] = int(time.time() * 1000)
+            except Exception:  # noqa: BLE001, S110 — تجمیع usage نباید اجرا را بکشد
+                pass
+
         async for event in run_agent(
             provider=str(provider_cfg.get("kind") or "custom"),
             provider_id=str(provider_cfg.get("id") or ""),
@@ -519,42 +568,51 @@ async def _execute_schedule(schedule_id: str) -> None:
             providers=providers_cfg,
             chat_id=f"schedule-{schedule_id}",
         ):
-            if isinstance(event, dict) and event.get("kind") == "text":
-                final_text += str(event.get("content") or "")
+            if isinstance(event, dict):
+                if event.get("kind") == "text":
+                    final_text += str(event.get("content") or "")
+                elif event.get("kind") == "usage":
+                    _accrue_schedule_usage(event)
         finished = time.time()
-        state_db.save_schedule_run({
+        done_run: dict = {
             "id": run_id,
             "schedule_id": schedule_id,
             "status": "done",
             "output": final_text[:8000],
             "started_at": started_at,
             "finished_at": finished,
-        })
+        }
+        if usage_totals:
+            done_run["usage"] = {"entries": list(usage_totals.values())}
+        state_db.save_schedule_run(done_run)
         # به‌روزرسانی last_run/next_run/run_count تسک
         fresh = state_db.get_schedule(schedule_id) or task
         fresh["last_run"] = finished
         fresh["run_count"] = int(fresh.get("run_count") or 0) + 1
         try:
             fresh["next_run"] = scheduler.compute_next_run(fresh, finished)
-        except Exception:
+        except Exception:  # noqa: BLE001 — بدون نوبت بعدی ادامه می‌دهد
             fresh["next_run"] = None
         state_db.save_schedule(fresh)
         try:
             state_db.prune_schedule_runs(schedule_id)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — prune اختیاری است
             pass
-    except Exception as exc:  # noqa: BLE001 — خطای اجرا نباید حلقه را بکشد
+    except Exception as exc:  # خطای اجرا نباید حلقه را بکشد
         logger.warning("schedule %s failed: %s", schedule_id, exc, exc_info=True)
         try:
-            state_db.save_schedule_run({
+            err_run: dict = {
                 **({"id": run_id} if run_id else {}),
                 "schedule_id": schedule_id,
                 "status": "error",
                 "error": str(exc)[:500],
                 "started_at": started_at,
                 "finished_at": time.time(),
-            })
-        except Exception:
+            }
+            if usage_totals:
+                err_run["usage"] = {"entries": list(usage_totals.values())}
+            state_db.save_schedule_run(err_run)
+        except Exception:  # noqa: BLE001, S110 — ثبت خطا best-effort است
             pass
     finally:
         _SCHEDULE_RUNNING.discard(schedule_id)
@@ -662,10 +720,24 @@ async def schedules_run_now(schedule_id: str) -> dict:
     if state_db.get_schedule(schedule_id) is None:
         raise HTTPException(status_code=404, detail="تسک یافت نشد")
     if schedule_id in _SCHEDULE_RUNNING:
+        try:
+            for r in state_db.list_schedule_runs(schedule_id, limit=5):
+                if isinstance(r, dict) and r.get("status") == "running" and r.get("id"):
+                    return {"ok": True, "running": True, "run_id": str(r.get("id"))}
+        except Exception:  # noqa: BLE001, S110 — بدون run_id هم پاسخ معتبر است
+            pass
         return {"ok": True, "running": True}
+    # رکورد running را همین‌جا (همگام) بساز تا شناسه‌اش را به فرانت برگردانیم؛
+    # پولینگ دقیق همان اجرا جای حدس «آخرین ران» را می‌گیرد و لودینگ کاذب می‌رود.
+    run = state_db.save_schedule_run({
+        "schedule_id": schedule_id,
+        "status": "running",
+        "started_at": time.time(),
+    })
+    new_run_id = str(run.get("id"))
     _SCHEDULE_RUNNING.add(schedule_id)
-    asyncio.create_task(_execute_schedule(schedule_id))
-    return {"ok": True, "running": True}
+    asyncio.create_task(_execute_schedule(schedule_id, new_run_id))
+    return {"ok": True, "running": True, "run_id": new_run_id}
 
 
 @app.get("/schedules/{schedule_id}/runs")
@@ -1313,10 +1385,22 @@ async def models_cancel(req: ModelControlRequest) -> dict:
 
 @app.get("/models/laya-status")
 async def models_laya_status() -> dict:
-    """تصمیم‌گیر سریع laya: نصب/آماده/ریپو/پروایدر (برای Settings → Models)."""
+    """تصمیم‌گیر سریع laya: نصب/آماده/ریپو/پروایدر + دلیل دقیق + پروگرس دانلود."""
     import laya_decide
+    import model_download
 
-    return laya_decide.status()
+    out = laya_decide.status()
+    try:
+        out.update(model_download.laya_weight_status(out.get("repo") or ""))
+    except Exception:  # noqa: BLE001, S110 — وزن اختیاری است
+        pass
+    try:
+        running = model_download.download_state(model_download.KIND_LAYA)
+        if running:
+            out["running"] = running
+    except Exception:  # noqa: BLE001, S110 — پروگرس اختیاری است
+        pass
+    return out
 
 
 @app.get("/system-prompts")

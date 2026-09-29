@@ -126,6 +126,16 @@ export function buildGroups(
 }
 
 export function Sidebar() {
+  // Lightweight shell: subscribes ONLY to the open flag so Cmd/Ctrl+B flips
+  // instantly without touching chats/workspaces. The heavy content (all chat
+  // subscriptions, grouping, search) mounts only when open and unmounts on
+  // close, so a toggle never walks a single message.
+  const open = useStore((s) => s.sidebarOpen);
+  if (!open) return null;
+  return <SidebarContent />;
+}
+
+function SidebarContent() {
   const chats = useStore((s) => s.chats);
   const workspaces = useStore((s) => s.workspaces);
   const activeChatId = useStore((s) => s.activeChatId);
@@ -236,7 +246,6 @@ export function Sidebar() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const open = useStore((s) => s.sidebarOpen);
   const dir = useStore((s) => s.dir);
 
   // Persist the panel/group UI state whenever it changes, so collapse toggles
@@ -419,8 +428,6 @@ export function Sidebar() {
         .renameChat(renamingId, renameValue.trim() || "New chat");
     setRenamingId(null);
   };
-
-  if (!open) return null;
 
   return (
     <aside

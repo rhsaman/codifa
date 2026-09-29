@@ -3,15 +3,62 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "../lib/store";
 import { clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
+import {
+  ensureScheduleNotificationPermission,
+  findNewScheduleRuns,
+  notifyScheduleRun,
+  notifyScheduleRunBatch,
+} from "../lib/schedule-notify";
 import { prepareContent } from "../lib/bidi";
+import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
+
+/** مجموع توکن یک ران از روی usage ثبت‌شده (input+output)؛ ۰ یعنی بدون مصرف ثبت‌شده. */
+export function scheduleRunTokens(run: ScheduleRun): number {
+  let total = 0;
+  for (const u of run.usage?.entries ?? []) {
+    total += (u.input || 0) + (u.output || 0);
+  }
+  return total;
+}
 
 /** تعداد اجراهای دیده‌نشده (برای بج نوتیفیکیشن Inbox). */
 export function unseenRunCount(runs: ScheduleRun[], seen: string[]): number {
   const seenSet = new Set(seen);
   return runs.filter((r) => !seenSet.has(r.id)).length;
+}
+
+/** تعداد اجراهای دیده‌نشده‌ی یک تسک خاص (برای بج کنار هر تسک در لیست Inbox). */
+export function unseenRunCountForTask(
+  runs: ScheduleRun[],
+  seen: string[],
+  scheduleId: string,
+): number {
+  const seenSet = new Set(seen);
+  return runs.filter((r) => r.schedule_id === scheduleId && !seenSet.has(r.id)).length;
+}
+
+/** انتخاب تسک نمایشی Inbox: انتخاب ذخیره‌شده اگر هنوز وجود دارد، وگرنه تسکی که
+ *  تازه‌ترین ران را دارد (نه لزوماً اولین تسک لیست)، وگرنه اولین تسک. */
+export function pickInboxTask(
+  schedules: ScheduledTask[],
+  runs: ScheduleRun[],
+  selected: string | null,
+): ScheduledTask | null {
+  if (schedules.length === 0) return null;
+  if (selected) {
+    const kept = schedules.find((t) => t.id === selected);
+    if (kept) return kept;
+  }
+  // تازه‌ترین ران اول است (بک‌اند جدیدترین اول می‌دهد) — تسک آن را انتخاب کن
+  // تا بج غیرصفر با پنل «No runs yet» همراه نشود.
+  for (const r of runs) {
+    const owner = schedules.find((t) => t.id === r.schedule_id);
+    if (owner) return owner;
+  }
+  return schedules[0] ?? null;
 }
 
 /** رندر مارکداون خروجی کرون دقیقاً با همان رندر چت (فونت، جهت، کد، جدول). */
@@ -29,6 +76,7 @@ function InboxMarkdown({ text }: { text: string }) {
 
 /** کارت یک اجرا در Inbox — چت‌مانند: هدر خنثی + بدنه مارکداون با فونت چت. */
 function InboxRunCard({ run }: { run: ScheduleRun }) {
+  const tokens = scheduleRunTokens(run);
   return (
     <div className={`schedule-inbox-run ${run.status}`}>
       <div className="schedule-inbox-run-head">
@@ -36,6 +84,11 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
         <span className="schedule-inbox-time">
           {new Date(run.started_at * 1000).toLocaleString("en-US")}
         </span>
+        {tokens > 0 && (
+          <span className="schedule-inbox-tokens" title={`${tokens} tokens`}>
+            {formatTokens(tokens)}
+          </span>
+        )}
       </div>
       {run.error && <div className="schedule-run-error">{run.error}</div>}
       {run.output ? (
@@ -129,9 +182,31 @@ export function ScheduleInbox() {
   };
 
   const selectedTask: ScheduledTask | null = useMemo(
-    () => schedules.find((t) => t.id === selected) ?? schedules[0] ?? null,
-    [schedules, selected],
+    () => pickInboxTask(schedules, runs, selected),
+    [schedules, runs, selected],
   );
+
+  // ران‌های یتیم (تسک حذف‌شده ولی تاریخچه نگه‌داشته‌شده): در لیست چپ تسکی
+  // ندارند ولی در بج شمرده می‌شوند — آن‌ها را جداگانه نگه می‌داریم تا پنل راست
+  // به‌جای خالی، همین‌ها را نشان دهد.
+  const orphanRuns = useMemo(
+    () => runs.filter((r) => !schedules.some((t) => t.id === r.schedule_id)),
+    [runs, schedules],
+  );
+
+  // ترتیب لیست چپ: تسک‌های با ران تازه‌تر بالا (بج‌دارها گم نمی‌شوند).
+  const orderedSchedules = useMemo(() => {
+    const latest = new Map<string, number>();
+    for (const r of runs) {
+      const t = typeof r.started_at === "number" ? r.started_at : 0;
+      if (!latest.has(r.schedule_id) || (latest.get(r.schedule_id) ?? 0) < t) {
+        latest.set(r.schedule_id, t);
+      }
+    }
+    return [...schedules].sort(
+      (a, b) => (latest.get(b.id) ?? -1) - (latest.get(a.id) ?? -1),
+    );
+  }, [schedules, runs]);
 
   const refresh = useCallback(async () => {
     const out = await listSchedules();
@@ -189,6 +264,31 @@ export function ScheduleInbox() {
     if (open && runs.length > 0) markSeen(runs.map((r) => r.id));
   }, [open, runs, markSeen]);
 
+  // ران‌های نمایشی تسک انتخاب‌شده: اجتماع پاسخ مستقیم تسک و کش سراسری runs
+  // (حذف تکراری با id، جدیدترین اول) تا با بج ناسازگار نشود — هر کدام تازه‌تر
+  // باشد همان دیده می‌شود و نژاد پولینگ «بج دارد ولی پنل خالی است» می‌رود.
+  const displayedRuns: ScheduleRun[] | null = useMemo(() => {
+    if (!selectedTask) return taskRuns;
+    const fromAll = runs.filter((r) => r.schedule_id === selectedTask.id);
+    if (!taskRuns) return fromAll.length > 0 ? fromAll : null;
+    const merged = new Map<string, ScheduleRun>();
+    for (const r of [...taskRuns, ...fromAll]) merged.set(r.id, r);
+    return [...merged.values()].sort(
+      (a, b) => (b.started_at || 0) - (a.started_at || 0),
+    );
+  }, [taskRuns, runs, selectedTask]);
+
+  // تسکی که تازه‌ترین ران دیده‌نشده را دارد — برای دکمه پرش وقتی پنل راست خالی است.
+  const newestUnseenTaskId = useMemo(() => {
+    const seenSet = new Set(seen);
+    for (const r of runs) {
+      if (!seenSet.has(r.id) && schedules.some((t) => t.id === r.schedule_id)) {
+        return r.schedule_id;
+      }
+    }
+    return null;
+  }, [runs, seen, schedules]);
+
   if (!open) return null;
   const unseen = unseenRunCount(runs, seen);
 
@@ -233,24 +333,44 @@ export function ScheduleInbox() {
         </div>
         <div className="schedule-inbox-body">
           <div className="schedule-inbox-list">
-            {schedules.length === 0 ? (
+            {orderedSchedules.length === 0 ? (
               <div className="schedule-runs-empty">No scheduled tasks yet</div>
             ) : (
-              schedules.map((t) => (
-                <button
-                  key={t.id}
-                  className={`schedule-inbox-item${selectedTask?.id === t.id ? " active" : ""}`}
-                  onClick={() => setSelected(t.id)}
-                >
-                  <span className="schedule-item-name">{t.name}</span>
-                  <span className="schedule-item-sub">{formatNextRunFa(t.next_run)}</span>
-                </button>
-              ))
+              orderedSchedules.map((t) => {
+                const taskUnseen = unseenRunCountForTask(runs, seen, t.id);
+                return (
+                  <button
+                    key={t.id}
+                    className={`schedule-inbox-item${selectedTask?.id === t.id ? " active" : ""}`}
+                    onClick={() => setSelected(t.id)}
+                  >
+                    <span className="schedule-item-name">{t.name}</span>
+                    {taskUnseen > 0 && (
+                      <span className="schedule-inbox-badge">{taskUnseen}</span>
+                    )}
+                    <span className="schedule-item-sub">{formatNextRunFa(t.next_run)}</span>
+                  </button>
+                );
+              })
+            )}
+            {orphanRuns.length > 0 && orderedSchedules.length > 0 && (
+              <div className="schedule-runs-empty">
+                {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""} below
+              </div>
             )}
           </div>
           <div className="schedule-inbox-chat">
             {!selectedTask ? (
-              <div className="schedule-runs-empty">Select a task to see its runs</div>
+              orphanRuns.length > 0 ? (
+                <div className="schedule-inbox-runs">
+                  <div className="schedule-inbox-prompt-label">Runs from deleted tasks</div>
+                  {orphanRuns.slice(0, 20).map((r) => (
+                    <InboxRunCard key={r.id} run={r} />
+                  ))}
+                </div>
+              ) : (
+                <div className="schedule-runs-empty">Select a task to see its runs</div>
+              )
             ) : (
               <>
                 <div className="schedule-inbox-chat-head">
@@ -291,6 +411,11 @@ export function ScheduleInbox() {
                                 return;
                               }
                               setTaskRuns([]);
+                              // کش سراسری را هم همان‌جا خالی کن تا اجتماع displayedRuns
+                              // ران‌های پاک‌شده را تا پولینگ بعدی زنده نکند.
+                              setRuns((prev) =>
+                                prev.filter((r) => r.schedule_id !== selectedTask.id),
+                              );
                               setConfirmClear(false);
                               void refresh();
                             })
@@ -323,13 +448,31 @@ export function ScheduleInbox() {
                   <InboxMarkdown text={selectedTask.prompt} />
                 </div>
                 {loading && <div className="schedule-runs-empty">Loading…</div>}
-                {!taskRuns ? (
+                {!displayedRuns ? (
                   <div className="schedule-runs-empty">Loading…</div>
-                ) : taskRuns.length === 0 ? (
-                  <div className="schedule-runs-empty">No runs yet</div>
+                ) : displayedRuns.length === 0 ? (
+                  <>
+                    <div className="schedule-runs-empty">No runs yet</div>
+                    {newestUnseenTaskId && newestUnseenTaskId !== selectedTask.id && (
+                      <button
+                        className="schedule-btn"
+                        onClick={() => setSelected(newestUnseenTaskId)}
+                      >
+                        Show latest run
+                      </button>
+                    )}
+                    {orphanRuns.length > 0 && (
+                      <div className="schedule-inbox-runs">
+                        <div className="schedule-inbox-prompt-label">Runs from deleted tasks</div>
+                        {orphanRuns.slice(0, 20).map((r) => (
+                          <InboxRunCard key={r.id} run={r} />
+                        ))}
+                      </div>
+                    )}
+                  </>
                 ) : (
                   <div className="schedule-inbox-runs">
-                    {taskRuns.map((r) => (
+                    {displayedRuns.map((r) => (
                       <InboxRunCard key={r.id} run={r} />
                     ))}
                   </div>
@@ -343,17 +486,42 @@ export function ScheduleInbox() {
   );
 }
 
-/** دکمه Inbox در تایتل‌بار با بج اجرای دیده‌نشده (نوتیفیکیشن کرون). */
+/** دکمه Inbox در تایتل‌بار با بج اجرای دیده‌نشده (نوتیفیکیشن کرون).
+ * ران‌های واقعاً جدید (نسبت به پولینگ قبلی و دیده‌نشده‌ها) اعلان سیستم‌عامل هم
+ * می‌دهند تا حتی وقتی Inbox باز نیست، کاربر خبردار شود. */
 export function ScheduleInboxButton() {
   const setOpen = useStore((s) => s.setScheduleInboxOpen);
   const seen = useStore((s) => s.scheduleRunsSeen);
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
+  const prevIdsRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
       const out = await listAllScheduleRuns(50);
-      if (!cancelled && !("error" in out)) setRuns(out);
+      if (cancelled || "error" in out) return;
+      setRuns(out);
+      // اعلان OS فقط برای ران‌هایی که از پولینگ قبلی جدیدند و هنوز دیده نشده‌اند
+      // (بدون تکرار): اولین پولینگ فقط baseline می‌سازد.
+      const prev = prevIdsRef.current;
+      const seenNow = useStore.getState().scheduleRunsSeen;
+      const schedulesNow = useStore.getState().schedules;
+      if (prev !== null) {
+        const fresh = findNewScheduleRuns(prev, out, seenNow);
+        if (fresh.length > 0) {
+          const openInbox = () => useStore.getState().setScheduleInboxOpen(true);
+          if (await ensureScheduleNotificationPermission()) {
+            if (fresh.length === 1) {
+              const r = fresh[0];
+              const name = schedulesNow.find((t) => t.id === r.schedule_id)?.name;
+              notifyScheduleRun(r, name, openInbox);
+            } else {
+              notifyScheduleRunBatch(fresh.length, openInbox);
+            }
+          }
+        }
+      }
+      prevIdsRef.current = new Set(out.map((r) => r.id));
     };
     void tick();
     const t = setInterval(() => void tick(), 30000);
@@ -364,20 +532,22 @@ export function ScheduleInboxButton() {
   }, []);
 
   const unseen = unseenRunCount(runs, seen);
+  const open = useStore((s) => s.scheduleInboxOpen);
   return (
     <button
-      className="dir-toggle schedule-inbox-btn"
+      className="titlebar-icon-btn schedule-inbox-btn"
       title={unseen > 0 ? `${unseen} new schedule runs` : "Schedule inbox"}
       aria-label="Schedule inbox"
+      aria-pressed={open}
       onClick={() => setOpen(true)}
     >
       <svg
-        width="15"
-        height="15"
+        width="17"
+        height="17"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="2"
+        strokeWidth="1.8"
         strokeLinecap="round"
         strokeLinejoin="round"
         aria-hidden="true"

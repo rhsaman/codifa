@@ -11,7 +11,7 @@ import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
@@ -32,6 +32,7 @@ export default function App() {
   // پنل Review سمت راست (سبک کدکس): با کلیک روی کارت edit_file/write_file باز
   // می‌شود و ترنِ همان پیام را نشان می‌دهد.
   const reviewOpen = useReviewPanel((s) => s.open)
+  const reviewSource = useReviewPanel((s) => s.source)
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -140,6 +141,25 @@ export default function App() {
       window.dispatchEvent(new CustomEvent('coder:prefix', { detail: false }))
     }
 
+    // Panel toggles (Cmd/Ctrl+B, Cmd/Ctrl+Shift+B) must feel instant: flip
+    // the boolean synchronously on keydown with zero extra work — no
+    // prefix/palette checks, no async persist. The store debounces the
+    // settings write to the background (see persistPanelsSoon in store.ts).
+    function togglePanelFromKey(e: KeyboardEvent): boolean {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return false
+      const target = panelToggleTarget(e)
+      if (!target) return false
+      e.preventDefault()
+      // Stop the event here so no other window-level handler (search
+      // overlay, pickers) re-processes the same chord after the default
+      // is already prevented.
+      e.stopPropagation()
+      const st = useStore.getState()
+      if (target === 'right') st.setRightPanelOpen(!st.rightPanelOpen)
+      else st.setSidebarOpen(!st.sidebarOpen)
+      return true
+    }
+
     function onKey(e: KeyboardEvent) {
       // While the prefix is armed, the very next key runs (or cancels) it.
       if (prefixActiveRef.current) {
@@ -172,14 +192,11 @@ export default function App() {
         prefixTimerRef.current = window.setTimeout(cancelPrefix, 2000)
         return
       }
+      // Fast path first: panel toggle never falls through to the switch.
+      if (togglePanelFromKey(e)) return
       if (!(e.metaKey || e.ctrlKey)) return
       const k = physicalKey(e)
       switch (k) {
-        case 'b': {
-          e.preventDefault()
-          useStore.getState().toggleSidebar()
-          break
-        }
         case ',': {
           e.preventDefault()
           useStore.getState().setSettingsOpen(true)
@@ -234,44 +251,61 @@ export default function App() {
     <div className="app">
       <header className="titlebar" role="banner">
         <button
-          className="icon-btn"
+          className="icon-btn titlebar-icon-btn"
           aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
           title={sidebarOpen ? 'Hide sidebar (⌘B)' : 'Show sidebar (⌘B)'}
+          aria-pressed={sidebarOpen}
           onClick={() => useStore.getState().toggleSidebar()}
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
             <path d="M4 6h16M4 12h16M4 18h10" />
           </svg>
         </button>
         <span className="app-title">Codifa</span>
+        <button
+          className="workspace-btn"
+          aria-label="Open workspace folder"
+          title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
+          onClick={() => void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+          </svg>
+          <span className="workspace-btn-label">{activeChatRoot ? activeChatRoot.split('/').filter(Boolean).pop() : 'Open workspace'}</span>
+        </button>
         <div id="titlebar-toolbar" />
         <UsageChip />
         <UpdateButton />
         <div className="titlebar-workspace">
           <ScheduleInboxButton />
           <button
-            className="dir-toggle"
-            title={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
+            className="titlebar-icon-btn"
+            title="Git diff — uncommitted changes"
+            aria-label="Git diff — uncommitted changes"
+            aria-pressed={reviewOpen && reviewSource === 'uncommitted'}
+            onClick={() => useReviewPanel.getState().openGitDiff()}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="6" cy="6" r="2.4" />
+              <circle cx="6" cy="18" r="2.4" />
+              <circle cx="18" cy="8" r="2.4" />
+              <path d="M6 8.4v7.2M18 10.4c0 4.2-4.5 3.6-8.6 3.6" />
+            </svg>
+          </button>
+          <span className="titlebar-divider" aria-hidden="true" />
+          <button
+            className="titlebar-icon-btn panel-toggle"
+            title={rightPanelOpen ? 'Hide right panel (⌘⇧B)' : 'Show right panel (⌘⇧B)'}
             aria-label={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
+            aria-keyshortcuts="Control+Shift+B Meta+Shift+B"
             aria-pressed={rightPanelOpen}
             onClick={() => useStore.getState().toggleRightPanel()}
           >
-            ▤
-          </button>
-          <button
-            className="dir-toggle"
-            title="Git diff — uncommitted changes"
-            onClick={() => useReviewPanel.getState().openGitDiff()}
-          >
-            ⎇
-          </button>
-          <button
-            className="workspace-btn"
-          aria-label="Open workspace folder"
-          title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
-          onClick={() => void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))}
-        >
-          📁 {activeChatRoot ? activeChatRoot.split('/').filter(Boolean).pop() : 'Open workspace'}
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="2.5" />
+              <path d="M15 4v16" />
+              <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
+            </svg>
           </button>
         </div>
       </header>

@@ -103,9 +103,26 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+T", label: "Start a new chat" },
   { keys: "Cmd/Ctrl+P", label: "Quick-open / search overlay (⌘⇧F = content search)" },
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
+  { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
   { keys: "Cmd/Ctrl+,", label: "Open settings" },
   { keys: "Cmd/Ctrl+O", label: "Open a workspace folder" },
 ];
+
+/** Which panel a Cmd/Ctrl+B chord should toggle: plain chord toggles the
+ *  sidebar, Shift-modified chord toggles the right panel. Returns null when
+ *  the event is not a panel-toggle chord. Layout-independent via physicalKey
+ *  so it works on Persian/Arabic layouts too. */
+export function panelToggleTarget(e: {
+  code: string;
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}): 'sidebar' | 'right' | null {
+  if (!(e.ctrlKey || e.metaKey)) return null;
+  if (physicalKey(e) !== 'b') return null;
+  return e.shiftKey ? 'right' : 'sidebar';
+}
 
 export function formatGlobalShortcut(sc: GlobalShortcut): string {
   return `\`${sc.keys}\` — ${sc.label}`;

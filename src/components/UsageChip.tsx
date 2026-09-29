@@ -55,6 +55,8 @@ export interface UsageView {
  * - Entries with all-zero token fields are dropped (but cache-only entries
  *   with input=0/output=0 and cacheRead/cacheWrite>0 are KEPT, so the cached
  *   portion is never silently dropped from the totals).
+ * - ردیف صفرتوکنی laya (تصمیم لوکال بدون توکن با پرچم laya) نگه داشته می‌شود
+ *   تا لوکال هم در model usage قابل‌مشاهده بماند — مثل مدل‌های tools.
  * - providerId + model are stored explicitly on each entry — no key parsing.
  *   Legacy chats are migrated to this shape on load (normalizeUsageEntry).
  * - Cost bills cache-read/cache-write at their own (cheaper) rate when the
@@ -67,7 +69,9 @@ export function buildUsageView(
   const byProvider = new Map<string, UsageModelRow[]>();
   if (usage) {
     for (const u of usage.entries) {
+      const isLayaRow = Boolean((u as { laya?: boolean }).laya)
       if (
+        !isLayaRow &&
         (u.input || 0) +
         (u.output || 0) +
         (u.cacheRead || 0) +
@@ -343,6 +347,8 @@ export function UsageChip() {
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.usage,
   );
   const allProviders = useStore((s) => s.settings.providers);
+  // چیپ فقط مصرف چت فعال را نشان می‌دهد؛ مصرف تسک‌های اسکجول چیز جداست و روی
+  // خود تسک در پنل زمان‌بندی نمایش داده می‌شود.
   const view = useMemo(
     () => buildUsageView(activeUsage, allProviders),
     [activeUsage, allProviders],

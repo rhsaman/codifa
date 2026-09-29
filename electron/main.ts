@@ -1121,10 +1121,10 @@ app.whenReady().then(async () => {
   // unsigned builds, where Electron would otherwise auto-deny media requests
   // and getUserMedia would fail silently or error out.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'media' || permission === 'clipboard-sanitized-write')
+    callback(permission === 'media' || permission === 'clipboard-sanitized-write' || permission === 'notifications')
   })
   session.defaultSession.setPermissionCheckHandler(
-    (_wc, permission) => permission === 'media' || permission === 'clipboard-sanitized-write',
+    (_wc, permission) => permission === 'media' || permission === 'clipboard-sanitized-write' || permission === 'notifications',
   )
   // Import any legacy JSON state into the SQLite DB BEFORE the renderer
   // mounts, so the very first store:get already reads from the DB (and the

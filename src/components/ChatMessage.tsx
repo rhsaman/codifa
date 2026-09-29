@@ -19,7 +19,7 @@ import {
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
 import { cancelSteer } from "../lib/api";
-import { useTtsPlayback } from "../lib/tts";
+import { friendlyTtsError, useTtsPlayback } from "../lib/tts";
 import { useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
@@ -1393,8 +1393,9 @@ export const ChatMessageView = memo(function ChatMessageView({
   const ttsModel = useStore((s) => s.ttsModel);
   const ttsVoice = useStore((s) => s.ttsVoice);
   const [copied, setCopied] = useState(false);
-  const { status: ttsStatus, play: ttsPlay, stop: ttsStop } = useTtsPlayback();
+  const { status: ttsStatus, toggle: ttsToggle, stop: ttsStop } = useTtsPlayback();
   const [ttsError, setTtsError] = useState<string | null>(null);
+  const [ttsRetrying, setTtsRetrying] = useState(false);
 
   const modeLabel = (id: string) => getMode(settings, id).label;
 
@@ -1408,11 +1409,9 @@ export const ChatMessageView = memo(function ChatMessageView({
     }
   };
 
+  // تصمیم پلی/استاپ داخل toggle همگام و اتمیک است (نه با ttsStatus ناهمگام) —
+  // کلیک تند هرگز دو پخش همزمان نمی‌سازد. لغو دستی (AbortError) خطا نیست.
   const toggleSpeak = async () => {
-    if (ttsStatus === "loading" || ttsStatus === "speaking") {
-      ttsStop();
-      return;
-    }
     setTtsError(null);
     const provider = settings.providers.find((p) => p.id === ttsProviderId);
     if (!provider) {
@@ -1420,7 +1419,7 @@ export const ChatMessageView = memo(function ChatMessageView({
       return;
     }
     try {
-      await ttsPlay(stripBidiMarks(fixZwsp(message.content)), {
+      await ttsToggle(stripBidiMarks(fixZwsp(message.content)), {
         kind: provider.kind,
         baseUrl: provider.baseUrl ?? "",
         apiKey: provider.apiKey ?? "",
@@ -1429,9 +1428,16 @@ export const ChatMessageView = memo(function ChatMessageView({
         voice: ttsVoice,
       });
     } catch (err) {
+      const friendly = friendlyTtsError(err);
+      if (!friendly) return;
       console.warn("speak failed", err);
-      setTtsError(err instanceof Error ? err.message : String(err));
+      setTtsError(friendly);
     }
+  };
+
+  const retrySpeak = () => {
+    setTtsRetrying(true);
+    void toggleSpeak().finally(() => setTtsRetrying(false));
   };
 
   // قطع صدا هنگام شروع پیام جدید یا unmount تا پخش قدیمی روی پیام تازه نماند.
@@ -1736,7 +1742,17 @@ export const ChatMessageView = memo(function ChatMessageView({
                 </button>
               )}
               {ttsError && !isUser && !message.streaming && (
-                <span className="msg-tts-error" role="alert">{ttsError}</span>
+                <span className="msg-tts-error" role="alert">
+                  <span className="msg-tts-error-text">{ttsError}</span>
+                  <button
+                    className="msg-tts-retry"
+                    onClick={retrySpeak}
+                    disabled={ttsRetrying}
+                    title="تلاش مجدد"
+                  >
+                    {ttsRetrying ? "…" : "تلاش مجدد"}
+                  </button>
+                </span>
               )}
               {!isUser &&
                 !isSummary &&

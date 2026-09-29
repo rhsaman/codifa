@@ -1177,6 +1177,47 @@ def delete_schedule_runs(schedule_id: str) -> int:
     return removed
 
 
+def delete_schedule_run(run_id: str) -> bool:
+    """حذف تکی یک ران با id؛ True وقتی فایلی حذف شد."""
+    if not str(run_id or "").strip():
+        return False
+    with _LOCK:
+        try:
+            os.remove(_schedule_run_file(str(run_id)))
+            return True
+        except OSError:
+            return False
+
+
+def delete_orphan_schedule_runs() -> int:
+    """ران‌های یتیم (schedule_id بدون تسک زنده) را پاک کن؛ تعداد حذف‌شده.
+
+    وقتی تسکی حذف می‌شود تاریخچه‌اش می‌ماند؛ این تابع آن باقیمانده‌ها را
+    جمع می‌کند تا اینباکس تسک تازه تمیز بماند. Best-effort و بدون raise."""
+    try:
+        live_ids = {str(t.get("id")) for t in list_schedules() if isinstance(t, dict) and t.get("id")}
+    except OSError:
+        return 0
+    try:
+        runs = list_schedule_runs("", limit=10_000)
+    except OSError:
+        return 0
+    removed = 0
+    with _LOCK:
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            sid = str(r.get("schedule_id") or "")
+            if sid and sid in live_ids:
+                continue
+            try:
+                os.remove(_schedule_run_file(str(r.get("id"))))
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 # -- whole-state snapshot --------------------------------------------------- #
 
 

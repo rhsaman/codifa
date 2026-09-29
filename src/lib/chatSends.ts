@@ -11,7 +11,7 @@
  * Chat.tsx for why).
  */
 
-import type { QueuedMessage } from "../types"
+import type { McpServerConfig, QueuedMessage } from "../types"
 import { useStore } from "./store"
 
 type SendFn = (
@@ -20,6 +20,9 @@ type SendFn = (
   images?: Array<{ path: string; name: string; dataUrl?: string }>,
   allowCreate?: boolean,
   reuseMsgId?: string,
+  continueAssistantId?: string,
+  forceScroll?: boolean,
+  overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] },
 ) => void
 
 const registry = new Map<string, SendFn>()
@@ -44,7 +47,10 @@ export function sendQueuedNext(chatId: string): boolean {
   const next: QueuedMessage = queued[0]
   // Mark sent BEFORE calling send so re-entrant drains don't re-pick it.
   store.markQueuedSent(chatId, next.id)
-  fn(next.text, next.attachments ?? [], next.images ?? [])
+  fn(next.text, next.attachments ?? [], next.images ?? [], undefined, undefined, undefined, undefined, {
+    mcpServers: next.mcpServers,
+    skills: next.skills,
+  })
   return true
 }
 
@@ -64,6 +70,12 @@ export function sendPendingSteerNext(chatId: string): boolean {
     pending.images ?? [],
     undefined,
     pending.id,
+    undefined,
+    undefined,
+    {
+      mcpServers: pending.mcpServers,
+      skills: pending.skills,
+    },
   )
   return true
 }

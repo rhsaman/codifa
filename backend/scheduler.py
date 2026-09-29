@@ -191,35 +191,56 @@ def compute_next_run(task: dict, now: float | None = None) -> float | None:
     return next_run_after(cron, anchor)
 
 
-def is_due(task: dict, now: float | None = None) -> bool:
+# پنجره تحمل سررسید (ثانیه): next_run ذخیره‌شده‌ای که حداکثر این‌قدر از
+# اکنون گذشته باشد، سررسید واقعی حساب می‌شود. بزرگ‌تر از فاصله پولینگ حلقه
+# (۳۰ ثانیه) است تا تاخیر یک تیک، اجرا را از دست ندهد؛ ولی ران‌های missed
+# قدیمی (دوران مکث/خاموشی) را stale حساب می‌کند تا burst تکراری نزنند.
+DUE_GRACE_SECONDS = 90.0
+
+
+def is_due(task: dict, now: float | None = None, grace: float | None = None) -> bool:
     """True اگر تسک فعال باشد و نوبتش رسیده (next_run <= now).
 
-    نکته resume: اگر next_run ذخیره‌شده قدیمی (stale) باشد — مثلاً از قبل
-    از مکث مانده و در گذشته است — مستقیم due حساب نمی‌شود؛ اول next_run
-    تازه از روی max(last_run, now) حساب می‌شود تا ران‌های missed دوران
-    مکث اجرا نشوند و resume همیشه از لحظه ادامه جلو برود.
+    - تسک once (کرون خالی): اگر هرگز اجرا نشده باشد due است (اجرای فوری در
+      تیک بعدی حلقه)، وگرنه هرگز due نیست.
+    - تسک تکراری بدون next_run ذخیره‌شده: هنوز due نیست — کالر باید next_run
+      تازه را persist کند و تا نوبت بعدی صبر کند (بدون burst فوری پس از ساخت).
+    - next_run ذخیره‌شده در آینده: هنوز نرسیده → False.
+    - next_run ذخیره‌شده در گذشته نزدیک (داخل grace): سررسید واقعی → True.
+    - next_run خیلی قدیمی (stale — مثلاً از دوران مکث/خاموشی): ران missed
+      اجرا نمی‌شود → False؛ کالر باید next_run را تازه کند (heal).
     """
     now = now if now is not None else time.time()
     if not task.get("enabled", True):
         return False
+    try:
+        cron = normalize_cron(str(task.get("cron") or ""))
+    except ValueError:
+        return False
+    try:
+        last_f = float(task.get("last_run") or 0)
+    except (TypeError, ValueError):
+        last_f = 0.0
     nxt = task.get("next_run")
     try:
         nxt_f = float(nxt) if nxt else None
     except (TypeError, ValueError):
         nxt_f = None
-    if nxt_f is None:
-        nxt_f = compute_next_run(task, now)
-    elif nxt_f <= now:
-        # next_run ذخیره‌شده در گذشته است — ممکن است stale پس از مکث باشد؛
-        # دوباره از روی لنگر تازه حساب کن (بدون catch-up burst).
-        try:
-            fresh = compute_next_run(task, now)
-        except Exception:
-            fresh = None
-        nxt_f = fresh
+    if not cron:
+        # once: اگر قبلاً اجرا شده هرگز due نیست؛ وگرنه فوری due است مگر
+        # next_run ذخیره‌شده‌ای در آینده داشته باشد. ران missed یک‌باره
+        # (stale) همچنان اجرا می‌شود — برخلاف تکراری‌ها catch-up دارد.
+        if last_f:
+            return False
+        if nxt_f is not None and nxt_f > now:
+            return False
+        return True
     if nxt_f is None:
         return False
-    return nxt_f <= now
+    if nxt_f > now:
+        return False
+    grace_s = DUE_GRACE_SECONDS if grace is None else float(grace)
+    return (now - nxt_f) <= grace_s
 
 
 def days_in_month(year: int, month: int) -> int:

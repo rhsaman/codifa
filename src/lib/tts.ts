@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { speakText, type SpeakProviderOpts } from './api'
+import { speakTextStream, splitTtsSentences, type SpeakProviderOpts } from './api'
 
 export type TtsStatus = 'idle' | 'loading' | 'speaking'
 
@@ -20,6 +20,9 @@ let nextOwnerId = 0
 // می‌شود — وگرنه دو fetch همزمان هر دو به Audio می‌رسیدند و همزمان پخش می‌شدند.
 let activeSeq = 0
 let seqCounter = 0
+// کنترلر لغو fetch در راه: استاپ/پخش جدید، دانلود قبلی را واقعاً قطع می‌کند
+// (بدون این، fetch کهنه تا آخر دانلود می‌شد و فقط نتیجه‌اش دور ریخته می‌شد).
+let activeAbort: AbortController | null = null
 
 export type TtsListener = (status: TtsStatus, owner: number) => void
 const listeners = new Set<TtsListener>()
@@ -32,6 +35,27 @@ function notifyTts() {
       // شنونده نباید پخش را خراب کند — نادیده بگیر
     }
   }
+}
+
+/** پیام خطای TTS را به فارسی قابل‌فهم برای کاربر تبدیل می‌کند. */
+export function friendlyTtsError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '')
+  const msg = raw.trim()
+  if (!msg) return 'پخش صدا ناموفق بود — دوباره تلاش کنید'
+  const lower = msg.toLowerCase()
+  if (lower.includes('aborted') || lower.includes('aborterror')) return ''
+  if (msg.includes('Python agent not ready')) return 'سرویس صوتی آماده نیست — برنامه را دوباره راه‌اندازی کنید'
+  if (lower.includes('failed to fetch') || lower.includes('networkerror') || lower.includes('load failed'))
+    return 'ارتباط با سرویس صوتی قطع شد — اتصال اینترنت/سرور محلی را بررسی کنید'
+  if (lower.includes('timeout') || lower.includes('timed out'))
+    return 'ساخت صدا طول کشید — دوباره تلاش کنید یا متن کوتاه‌تری بدهید'
+  if (msg.includes('401') || lower.includes('unauthorized') || lower.includes('invalid api key') || lower.includes('bad key'))
+    return 'کلید پروایدر TTS معتبر نیست — تنظیمات ← مدل‌ها را بررسی کنید'
+  if (msg.includes('402') || msg.includes('429') || lower.includes('quota') || lower.includes('insufficient') || lower.includes('rate limit'))
+    return 'سهمیه TTS تمام شده یا محدود شد — اعتبار/پلن پروایدر را بررسی کنید'
+  if (msg.includes('remote speech synthesis failed') || msg.includes('speech synthesis failed'))
+    return `ساخت صدا ناموفق بود — ${msg}`
+  return msg.length > 300 ? `${msg.slice(0, 300)}…` : msg
 }
 
 /** وضعیت فعلی پخش سراسری (برای تست و دیباگ). */
@@ -51,6 +75,11 @@ export function subscribeTts(listener: TtsListener): () => void {
 function stopTtsGlobal() {
   // باطل‌کردن fetchهای در راه: نتیجه کهنه بعد از resolve پخش نمی‌شود.
   activeSeq = -1
+  // لغو واقعی دانلود در راه — پاسخ لغوشده هرگز به Audio نمی‌رسد.
+  if (activeAbort) {
+    activeAbort.abort()
+    activeAbort = null
+  }
   if (activeAudio) {
     activeAudio.onended = null
     activeAudio.onerror = null
@@ -82,6 +111,10 @@ export function stopTts(owner?: number) {
  * پخش متن با مالک مشخص. ویس قبلی (هر پیام/چت) اول قطع می‌شود؛ اگر حین fetch
  * ویس دیگری شروع شود (حتی از همان پیام با کلیک تند پلی/استاپ)، نتیجه کهنه
  * با شناسه توالی دور ریخته می‌شود و پخش نمی‌شود.
+ *
+ * متن‌های بلند جمله‌به‌جمله در صف پخش می‌شوند: جمله اول همین که رسید پخش
+ * می‌شود و بقیه در پس‌زمینه دانلود و پشت سر هم پخش می‌شوند — حتی وقتی
+ * پروایدر استریم بایت‌به‌بایت واقعی ندهد، شروع پخش سریع می‌ماند.
  */
 export async function playTts(
   text: string,
@@ -89,58 +122,146 @@ export async function playTts(
   owner: number,
 ): Promise<void> {
   stopTtsGlobal()
+  const controller = new AbortController()
+  activeAbort = controller
   const seq = ++seqCounter
   activeSeq = seq
   activeOwner = owner
   activeStatus = 'loading'
   notifyTts()
-  let blob: Blob
+  const sentences = splitTtsSentences(text)
+  // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
+  const queue = sentences.length > 1 ? sentences : [text]
+  // پیش‌واکشی جمله بعدی حین پخش جمله فعلی تا مکث بین جمله‌ها حذف شود:
+  // دانلود N+1 موازی با پخش N انجام می‌شود، پس پایان N بلافاصله N+1 شروع می‌شود.
+  const fetchSentence = (sentence: string): Promise<Blob> =>
+    speakTextStream(sentence, opts, undefined, controller.signal)
+  let prefetched: Promise<Blob> | null = null
   try {
-    blob = await speakText(text, opts)
+    for (let i = 0; i < queue.length; i++) {
+      if (activeSeq !== seq || controller.signal.aborted) return
+      let blob: Blob
+      try {
+        const pending = prefetched
+        prefetched = null
+        // دانلود جمله بعدی را همین حالا در پس‌زمینه شروع کن تا حین پخش فعلی آماده شود.
+        if (i + 1 < queue.length && !controller.signal.aborted) {
+          prefetched = fetchSentence(queue[i + 1])
+          // رد غیرمنتظره پس‌زمینه نباید unhandled بماند تا await بعدی برسد.
+          prefetched.catch(() => {})
+        }
+        blob = pending ? await pending : await fetchSentence(queue[i])
+      } catch (err) {
+        if (activeSeq !== seq || controller.signal.aborted) return
+        throw err
+      }
+      if (activeSeq !== seq || controller.signal.aborted) return
+      // جمله خالی (پروایدر هیچ بایتی نداد): رد شو تا صف گیر نکند.
+      if (blob.size === 0) continue
+      await playBlobChunk(blob, seq, controller)
+    }
   } catch (err) {
-    if (activeSeq === seq) stopTtsGlobal()
+    if (activeAbort === controller) activeAbort = null
+    // درخواست کهنه یا لغوشده (استاپ/پخش جدید حین لودینگ): بی‌صدا برگرد —
+    // نه استاپ اضافه، نه خطا برای کاربر. فقط خطای واقعیِ درخواست جاری بالا می‌رود.
+    if (activeSeq !== seq || controller.signal.aborted) return
+    stopTtsGlobal()
     throw err
   }
-  if (activeSeq !== seq) return
-  const url = URL.createObjectURL(blob)
-  // بین resolve شدن fetch و ساخت Audio ممکن است پخش دیگری شروع شده باشد؛
-  // دوباره بررسی کن تا دو Audio همزمان ساخته نشود.
-  if (activeSeq !== seq) {
-    URL.revokeObjectURL(url)
+  if (activeAbort === controller) activeAbort = null
+  // پایان طبیعی صف: اگر هنوز همین درخواست فعال است، idle شو.
+  if (activeSeq === seq) stopTtsGlobal()
+}
+
+/** پخش یک تکه صوتی (یک جمله) و انتظار تا پایان آن. */
+function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (activeSeq !== seq || controller.signal.aborted) {
+      resolve()
+      return
+    }
+    const url = URL.createObjectURL(blob)
+    // بین resolve شدن fetch و ساخت Audio ممکن است پخش دیگری شروع شده باشد؛
+    // دوباره بررسی کن تا دو Audio همزمان ساخته نشود.
+    if (activeSeq !== seq || controller.signal.aborted) {
+      URL.revokeObjectURL(url)
+      resolve()
+      return
+    }
+    // اگر ویس قبلی هنوز در حال پخش است (مسابقه دو fetch همزمان)، قطعش کن.
+    if (activeAudio) {
+      activeAudio.onended = null
+      activeAudio.onerror = null
+      activeAudio.pause()
+      activeAudio = null
+    }
+    if (activeUrl) {
+      URL.revokeObjectURL(activeUrl)
+      activeUrl = null
+    }
+    activeUrl = url
+    const audio = new Audio(url)
+    activeAudio = audio
+    const onAbort = () => {
+      audio.onended = null
+      audio.onerror = null
+      try {
+        audio.pause()
+      } catch {
+        // توقف روی Audioی نیمه‌ساخته نباید صف را خراب کند
+      }
+      resolve()
+    }
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+    audio.onended = () => {
+      controller.signal.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    audio.onerror = () => {
+      controller.signal.removeEventListener('abort', onAbort)
+      // خطای پخش جمله میانی نباید کل صف را بکشد — فقط رد شو.
+      resolve()
+    }
+    activeStatus = 'speaking'
+    notifyTts()
+    audio.play().then(() => {
+      // حین audio.play استاپ زده شده؟ ویسی که تازه شروع شده را بخوابان.
+      if (activeSeq !== seq || controller.signal.aborted) {
+        try {
+          audio.pause()
+        } catch {
+          // نادیده بگیر — قطع همان هدف است
+        }
+      }
+    }).catch((err: unknown) => {
+      controller.signal.removeEventListener('abort', onAbort)
+      // درخواست کهنه (حین پخش، ویس دیگری شروع/استاپ شده): خطا را قورت بده —
+      // کاربر دیگر منتظر این ویس نیست.
+      if (activeSeq !== seq || controller.signal.aborted) {
+        resolve()
+        return
+      }
+      reject(err)
+    })
+  })
+}
+
+/**
+ * تغییر وضعیت پخش با تصمیم همگام و اتمیک: اگر همین مالک در حال پخش/لودینگ
+ * است قطع می‌کند، وگرنه پخش می‌کند. تصمیم با وضعیت ماژول (همگام) گرفته
+ * می‌شود، نه با state ناهمگام ری‌اکت — پس کلیک تند پلی/استاپ هرگز دو پخش
+ * همزمان نمی‌سازد (مشکل خواندن ttsStatus کهنه در toggleSpeak).
+ */
+export async function toggleTts(
+  text: string,
+  opts: SpeakProviderOpts,
+  owner: number,
+): Promise<void> {
+  if (activeOwner === owner && activeStatus !== 'idle') {
+    stopTtsGlobal()
     return
   }
-  // اگر ویس قبلی هنوز در حال پخش است (مسابقه دو fetch همزمان)، قطعش کن.
-  if (activeAudio) {
-    activeAudio.onended = null
-    activeAudio.onerror = null
-    activeAudio.pause()
-    activeAudio = null
-  }
-  if (activeUrl) {
-    URL.revokeObjectURL(activeUrl)
-    activeUrl = null
-  }
-  activeUrl = url
-  const audio = new Audio(url)
-  activeAudio = audio
-  audio.onended = () => {
-    if (activeSeq === seq) stopTtsGlobal()
-  }
-  audio.onerror = () => {
-    if (activeSeq === seq) stopTtsGlobal()
-  }
-  activeStatus = 'speaking'
-  notifyTts()
-  try {
-    await audio.play()
-  } catch (err) {
-    if (activeSeq === seq) stopTtsGlobal()
-    throw err
-  }
-  // حین audio.play استاپ زده شده؟ ویسی که تازه شروع شده را بخوابان.
-  if (activeSeq !== seq) {
-    audio.pause()
-  }
+  await playTts(text, opts, owner)
 }
 
 /** پخش‌کننده TTS هر پیام — همه نمونه‌ها روی یک پخش سراسری سوارند. */
@@ -173,8 +294,15 @@ export function useTtsPlayback() {
     [myId],
   )
 
+  const toggle = useCallback(
+    async (text: string, opts: SpeakProviderOpts) => {
+      await toggleTts(text, opts, myId)
+    },
+    [myId],
+  )
+
   // unmount مالک، ویس خودش را قطع می‌کند؛ unmount غیرمالک اثری ندارد.
   useEffect(() => () => stopTts(idRef.current), [])
 
-  return { status, play, stop }
+  return { status, play, stop, toggle }
 }

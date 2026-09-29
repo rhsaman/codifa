@@ -36,7 +36,7 @@ import type { ChatUsage, ProviderConfig } from "../src/types"
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).openExternal = async () => {}
 
-const { buildUsageView, UsagePopover } = await import("../src/components/UsageChip")
+const { buildUsageView, UsagePopover, computeUsagePopoverPos } = await import("../src/components/UsageChip")
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -152,6 +152,18 @@ console.log("۴) ردیف laya لوکال/خارجی:")
     providers,
   )
   check("ردیف پروایدر خارجی laya ثبت می‌شود", extView.groups.length === 1 && extView.totalTokens === 15, extView.totalTokens)
+}
+
+console.log("۵) computeUsagePopoverPos (لنگر پاپ‌اور زیر چیپ، بدون سرریز افقی):")
+{
+  check("زیر چیپ با فاصله ۶ پیکسل", computeUsagePopoverPos({ left: 100, bottom: 40 }, 1280).top === 46)
+  check("چپ بدون clamp", computeUsagePopoverPos({ left: 100, bottom: 40 }, 1280).left === 100)
+  const nearRight = computeUsagePopoverPos({ left: 1200, bottom: 40 }, 1280)
+  check("لبه راست clamp می‌شود", nearRight.left === 1280 - 400 - 8, nearRight.left)
+  const nearLeft = computeUsagePopoverPos({ left: 2, bottom: 40 }, 1280)
+  check("لبه چپ clamp می‌شود", nearLeft.left === 8, nearLeft.left)
+  const html = renderToString(<UsagePopover view={buildUsageView({ entries: [{ providerId: "p1", model: "model-a", input: 10, output: 5, lastUsed: 1 }] }, providers)} style={{ position: "fixed", top: 46, left: 100 }} />)
+  check("استایل fixed روی پاپ‌اور می‌نشیند", html.includes("position:fixed") && html.includes("top:46px"))
 }
 
 if (failed > 0) {

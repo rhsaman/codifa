@@ -694,7 +694,7 @@ def test_cheap_truncation_does_not_crash_on_plain_list():
     # compact threshold above the live transcript (~120k tokens of tool
     # results, well below 99% of 200k) but the cheap pass (40% threshold =
     # 80k) still fires.
-    placeholder = "[result truncated — see earlier compact summary]"
+    # Cheap pass uses per-tool placeholders like "[truncated read({}) — re-issue if still needed]".
 
     async def fake_compact(*a, **k):
         # Should NOT be called — the heavy threshold is above the transcript.
@@ -731,7 +731,7 @@ def test_cheap_truncation_does_not_crash_on_plain_list():
     # results and _KEEP=6, the first 2 are eligible for shortening.
     shortened = [
         m for m in msgs
-        if isinstance(m, ToolMessage) and m.content == placeholder
+        if isinstance(m, ToolMessage) and str(m.content).startswith("[truncated ")
     ]
     assert len(shortened) >= 1, (
         f"cheap pass did not rewrite any tool message in place; got: "

@@ -2606,12 +2606,13 @@ textarea {
 }
 
 /* Floating "jump to bottom" pill, Claude-style: floats centered fully ABOVE
-   the composer card with a small gap (no overlap). Anchored to .composer-inner
-   (position: relative) so it tracks the card, not the scroll content. */
+   the whole composer stack (input card + git diff bar) with a small gap
+   (no overlap). Anchored to .composer (position: absolute) — NOT to
+   .composer-inner — so showing the .composer-diff-bar above the input card
+   never slides the git bar under the button. */
 /* Dedicated entrance animation for .scroll-jump: fade-only so the button's
-   own translate(-50%, -100%) transform is never overridden — any keyframe
-   transform would render the button un-centered INSIDE the card while the
-   animation runs (it "pops" above the composer only after it finishes). */
+   own translateX(-50%) transform is never overridden — any keyframe
+   transform would render the button un-centered while the animation runs. */
 @keyframes scroll-jump-in {
   from {
     opacity: 0;
@@ -2624,9 +2625,10 @@ textarea {
 
 .scroll-jump {
   position: absolute;
-  top: -10px;
+  bottom: calc(100% + 12px);
+  top: auto;
   left: 50%;
-  transform: translate(-50%, -100%);
+  transform: translateX(-50%);
   z-index: 30;
   width: 32px;
   height: 32px;
@@ -2665,7 +2667,7 @@ textarea {
 .scroll-jump:hover {
   background: var(--accent-dim);
   color: var(--text);
-  transform: translate(-50%, calc(-100% - 1px));
+  transform: translateX(-50%) translateY(-1px);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.09),
     0 10px 26px rgba(0, 0, 0, 0.35);
@@ -2676,7 +2678,7 @@ textarea {
 }
 
 .scroll-jump:active {
-  transform: translate(-50%, -100%) scale(0.94);
+  transform: translateX(-50%) scale(0.94);
 }
 
 .chat-messages {
@@ -3052,12 +3054,38 @@ textarea {
 .msg-tts-error {
   display: inline-flex;
   align-items: center;
+  gap: 8px;
   font-size: 11px;
   color: var(--danger, #e5484d);
-  max-width: 320px;
+  max-width: 100%;
+}
+
+.msg-tts-error-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 320px;
+}
+
+.msg-tts-retry {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger, #e5484d);
+  border: 1px solid color-mix(in srgb, var(--danger, #e5484d) 40%, transparent);
+  background: transparent;
+  cursor: pointer;
+}
+
+.msg-tts-retry:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
+}
+
+.msg-tts-retry:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 /* "Read" button — accent-tinted so it reads as a distinct action next to
@@ -13513,10 +13541,6 @@ textarea {
   flex: 0 0 auto;
 }
 
-.right-panel-head .review-header-btn {
-  margin-left: auto;
-}
-
 .review-tab {
   display: inline-flex;
   align-items: center;
@@ -13992,24 +14016,6 @@ mark.diff-hit-active {
 .right-panel-resize-handle:hover::after,
 .right-panel-resize-handle:active::after {
   background: var(--accent);
-}
-
-.right-panel-head {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.right-panel-title {
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-dim);
 }
 
 .right-panel-body {
@@ -14740,6 +14746,12 @@ mark.diff-hit-active {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.laya-run-empty {
+  padding: 4px 12px 12px;
+  font-size: 11.5px;
+  color: var(--text-dim);
 }
 
 /* ---- Review overlay (مثل حالت مطالعه) — روی چت شناور می‌شود و چت را

@@ -378,6 +378,8 @@ export interface ChatMessage {
   steerInterleaved?: boolean
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
+  mcpServers?: Record<string, McpServerConfig>
+  skills?: string[]
   usage?: TokenUsage
   error?: boolean
   retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
@@ -414,6 +416,8 @@ export interface QueuedMessage {
   text: string
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
+  mcpServers?: Record<string, McpServerConfig>
+  skills?: string[]
   kind: 'steer' | 'queue'
   createdAt: number
   sent?: boolean

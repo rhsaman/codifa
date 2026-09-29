@@ -168,6 +168,52 @@ def test_duplicate_call_ids_across_turns_are_renamed():
     assert "two" in msgs[3].content
 
 
+def test_results_alias_and_diff_are_reconstructed():
+    """The `results` alias (backend tool_result shape) and the unified diff
+    on write/edit activities must reach the ToolMessage so the next turn sees
+    real output without re-running the tool."""
+    history = [
+        {
+            "role": "assistant",
+            "content": "done",
+            "toolActivity": [
+                {
+                    "tool": "fetch_url",
+                    "args": {"url": "https://x.test"},
+                    "callId": 9,
+                    "status": "done",
+                    "results": [{"title": "T", "url": "https://x.test", "snippet": "body text"}],
+                    "summary": "1 chars",
+                },
+                {
+                    "tool": "read",
+                    "args": {"filePath": "a.py"},
+                    "callId": 10,
+                    "status": "done",
+                    "results": [{"path": "a.py", "content": "print(1)"}],
+                    "summary": "1 lines",
+                },
+                {
+                    "tool": "edit_file",
+                    "args": {"path": "a.py"},
+                    "callId": 11,
+                    "status": "done",
+                    "diff": "+print(2)",
+                    "summary": "+1/-0",
+                },
+            ],
+        },
+    ]
+    msgs = history_to_langchain_messages(history)
+    tools = [m for m in msgs if isinstance(m, ToolMessage)]
+    assert len(tools) == 3
+    assert "body text" in tools[0].content
+    assert "https://x.test" in tools[0].content
+    assert "print(1)" in tools[1].content
+    assert "a.py" in tools[1].content
+    assert "+print(2)" in tools[2].content
+
+
 def test_duplicate_call_ids_within_one_turn_are_renamed():
     """دو کارت toolActivity با یک callId داخل یک نوبت هم باید یکتا شوند."""
     history = [

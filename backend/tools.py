@@ -4281,9 +4281,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         summary = f"exit {result['exit_code']} · {len(output)} chars"
         nudge = _format_plan_nudge_suffix(_plan_nudge_due())
         if not output:
-            emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
+            emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary, "results": [{"content": f"$ {command}\n(exit {result['exit_code']})"}]})
             return f"$ {command}\n(no output, exit code {result['exit_code']})" + nudge
-        emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary})
+        emit({"kind": "tool_result", "tool": "run_terminal", "summary": summary, "results": [{"content": f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output[:8000]}"}]})
         # Exit code used to live ONLY in the emit() summary (UI-only) — the
         # model never saw it in the text it actually reads, so it had to guess
         # pass/fail purely from output text. Prepending it explicitly gives the
@@ -4497,6 +4497,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "tool": "read",
                 "summary": f"{len(lines)} lines",
                 "model": _main_name,
+                "results": [{"path": filePath, "content": body[:8000]}],
             }
         )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
@@ -4632,6 +4633,7 @@ When you need to read several files, read multiple independent files in parallel
                 "tool": "read",
                 "summary": f"directory · {len(entries)} entries",
                 "model": _model,
+                "results": [{"path": filePath or "/", "content": "\n".join(window[:100])}],
             }
         )
         return f"<path>{filePath or '/'}</path>\n<type>directory</type>\n<entries>\n{body}\n{footer}\n</entries>"
@@ -4966,6 +4968,7 @@ When you need to read several files, read multiple independent files in parallel
                 "summary": f"{len(_output)} chars",
                 "model": _model_name,
                 "branch": branch,
+                "results": [{"content": _output[:8000]}],
             }
         )
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
@@ -5090,6 +5093,7 @@ When you need to read several files, read multiple independent files in parallel
                 "summary": f"{len(_output)} chars",
                 "model": _used_model,
                 "branch": _ecall,
+                "results": [{"content": _output[:8000]}],
             }
         )
         if not _output:
@@ -5486,6 +5490,7 @@ When you need to read several files, read multiple independent files in parallel
                 "kind": "tool_result",
                 "tool": "fetch_url",
                 "summary": f"{len(body)} chars",
+                "results": [{"title": title or url, "url": url, "snippet": body[:4000]}],
             }
         )
         return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
@@ -6119,6 +6124,109 @@ When you need to read several files, read multiple independent files in parallel
             }
         )
 
+    async def laya_tool(
+        operation: str = "choice",
+        state: str | dict | None = None,
+        options: list[str] | None = None,
+        candidate: str = "",
+        candidates: list | None = None,
+        top_k: int = 5,
+        instructions: str = "",
+        threshold: float = 0.65,
+    ) -> str:
+        """Fast local decision/classification/ranking via laya (System 1 router, not a chatbot). Use for any quick decision with caller-supplied labels — triage, routing, ranking — without hard-coding any domain. `operation` is 'choice' (pick one of `options` given `state` context), 'score' (rate `candidate` 0-1 given `state` context), 'rank' (order `candidates` — names or {name, description} dicts — by relevance to `state` text, at most `top_k`; e.g. to pick which skill or MCP tool fits the task, pass their names+descriptions as candidates and take the top entries; an empty ranked list means no signal — fall back to the full list yourself), or 'status' (laya readiness). `state` is free-form context (text or dict); `threshold` is the confidence cutoff for choice/score (below it the result is not handled — do the task with the main model instead). Returns JSON with handled/value/confidence/abstained/reason (rank returns handled/ranked/count/reason)."""
+        op = (operation or "choice").strip().lower()
+        emit(
+            {
+                "kind": "tool",
+                "tool": "laya",
+                "args": {"operation": op},
+            }
+        )
+        try:
+            import laya_decide as _laya
+        except Exception as exc:  # noqa: BLE001 — laya is optional
+            msg = f"laya unavailable: {exc}"
+            emit(_error_result("laya", msg))
+            return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "laya-not-installed"}, ensure_ascii=False)
+        try:
+            try:
+                thr = float(threshold)
+            except (TypeError, ValueError):
+                thr = 0.65
+            if not 0.0 <= thr <= 1.0:
+                thr = 0.65
+            if op == "status":
+                result = await asyncio.to_thread(_laya.status)
+                text = json.dumps({"operation": op, **result}, ensure_ascii=False, default=str)
+                emit({"kind": "tool_result", "tool": "laya", "summary": str(result.get("reason") or ("ready" if result.get("ready") else "not-ready"))[:400]})
+                return text
+            if isinstance(state, dict):
+                state_dict = dict(state)
+            elif state is None or (isinstance(state, str) and not state.strip()):
+                state_dict = {}
+            elif isinstance(state, str):
+                state_dict = {"text": state[:4000]}
+            else:
+                state_dict = {"text": str(state)[:4000]}
+            if op == "rank":
+                cands = list(candidates or [])
+                try:
+                    topk = int(top_k)
+                except (TypeError, ValueError):
+                    topk = 5
+                rtext = state_dict.get("text", "") if isinstance(state_dict, dict) else ""
+                if not rtext and isinstance(state_dict, dict):
+                    try:
+                        rtext = json.dumps(state_dict, ensure_ascii=False, default=str)[:4000]
+                    except Exception:  # noqa: BLE001 — empty text means no signal
+                        rtext = ""
+                ranked = await asyncio.to_thread(
+                    _laya.rank, rtext, cands, topk, instructions or ""
+                )
+                payload = {
+                    "operation": op,
+                    "handled": bool(ranked),
+                    "ranked": ranked,
+                    "count": len(ranked),
+                    "reason": "rank-ok" if ranked else "rank-no-signal",
+                }
+                text = json.dumps(payload, ensure_ascii=False, default=str)
+                emit({"kind": "tool_result", "tool": "laya", "summary": (text[:400] + "…") if len(text) > 400 else text, "status": "done"})
+                return text
+            if op == "score":
+                decision = await asyncio.to_thread(_laya.score, state_dict, candidate, thr)
+            elif op == "choice":
+                opts = [str(o) for o in (options or []) if str(o or "").strip()]
+                decision = await asyncio.to_thread(_laya.choice, state_dict, opts, thr)
+            else:
+                msg = f"Unknown operation {operation!r} — use 'choice', 'score', 'rank' or 'status'."
+                emit(_error_result("laya", msg))
+                return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "unknown-operation"}, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 — never break the main turn
+            msg = f"laya tool failed: {exc}"
+            emit(_error_result("laya", msg))
+            return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "laya-error"}, ensure_ascii=False)
+        usage = getattr(decision, "usage", None)
+        if isinstance(usage, dict) and usage.get("kind") == "usage":
+            try:
+                emit(dict(usage))
+            except Exception:  # noqa: BLE001, S110 — usage is best-effort
+                pass
+        payload = {
+            "operation": op,
+            "handled": bool(getattr(decision, "handled", False)),
+            "value": getattr(decision, "value", None),
+            "confidence": float(getattr(decision, "confidence", 0.0) or 0.0),
+            "abstained": bool(getattr(decision, "abstained", False)),
+            "reason": str(getattr(decision, "reason", "") or ""),
+            "provider_id": str(getattr(decision, "provider_id", "") or ""),
+            "model": str(getattr(decision, "model", "") or ""),
+        }
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+        emit({"kind": "tool_result", "tool": "laya", "summary": (text[:400] + "…") if len(text) > 400 else text, "status": "done"})
+        return text
+
     async def computer_tool(
         action: str,
         app: str = "",
@@ -6703,6 +6811,7 @@ When you need to read several files, read multiple independent files in parallel
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
         "current_time": current_time_tool,
+        "laya": laya_tool,
         "computer": computer_tool,
         "git_status": git_status_tool,
         "git_diff": git_diff_tool,

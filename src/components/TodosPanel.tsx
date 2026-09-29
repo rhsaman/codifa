@@ -252,17 +252,31 @@ export function TodosSection() {
   );
 }
 
+/** آرایه خالی پایدار برای سلکتور laya — از ساخت آرایه تازه در هر رندر جلوگیری می‌کند. */
+const EMPTY_LAYA_RUNS: LayaRun[] = [];
+
 /** سکشن زنده تصمیم‌های laya زیر todos — فقط تاریخچه چت فعال (آخرین ~۲۰ تا)
- *  با بج مسیر و نوار اطمینان. خالی بودن یعنی هیچ تصمیمی هنوز ثبت نشده. */
+ *  با بج مسیر و نوار اطمینان. خالی بودن یعنی هیچ تصمیمی هنوز برای این چت ثبت نشده. */
 export function LayaSection() {
   const activeChatId = useStore((s) => s.activeChatId);
   const runs = useStore(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.layaRuns ?? [],
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.layaRuns ?? EMPTY_LAYA_RUNS,
   );
   const dir = useStore((s) => s.dir);
   const [collapsed, setCollapsed] = useState(false);
 
-  if (!activeChatId || runs.length === 0) return null;
+  if (!activeChatId) return null;
+  if (runs.length === 0) {
+    return (
+      <div className="sidebar-panel laya-docked" dir={dir} aria-label="Laya decisions">
+        <div className="sidebar-panel-head">
+          <span className="sidebar-panel-title">Laya</span>
+          <span className="sidebar-panel-count">0</span>
+        </div>
+        <div className="laya-run-empty">هنوز تصمیمی برای این چت ثبت نشده</div>
+      </div>
+    );
+  }
   const shown = runs.slice(-20).slice().reverse();
 
   return (
@@ -352,8 +366,6 @@ export function RightPanel() {
 }
 
 function RightPanelContent() {
-  const close = useStore((s) => s.setRightPanelOpen);
-
   // عرض پنل — با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و
   // ذخیرهٔ محلی تا بین بازشدن‌ها حفظ شود.
   const [width, setWidth] = useState(() => {
@@ -425,16 +437,6 @@ function RightPanelContent() {
         title="Drag to resize"
         onMouseDown={startResize}
       />
-      <div className="right-panel-head">
-        <button
-          className="review-header-btn"
-          title="Close panel"
-          aria-label="Close panel"
-          onClick={() => close(false)}
-        >
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-        </button>
-      </div>
       <div className="right-panel-body">
         <ScheduleSection />
         <TodosSection />

@@ -83,6 +83,7 @@ import {
 import type {
   AgentMode,
   ChatMessage,
+  McpServerConfig,
   MessageSegment,
   NvimDiagnostic,
   SidecarEvent,
@@ -99,6 +100,7 @@ import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import { shouldAutoOpenTodosPanel } from "./TodosPanel";
+import { visibleChatMessages } from "../lib/compactDedupe";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -948,12 +950,15 @@ export function ChatPanel() {
     if (!el || !composer) return;
     const update = () => {
       const card = composer.querySelector<HTMLElement>(".ask-card, .perm-card");
+      const diffBar = composer.querySelector<HTMLElement>(".composer-diff-bar");
       const composerH = composer.getBoundingClientRect().height;
       const cardH = card ? card.getBoundingClientRect().height : null;
-      const padding = composerScrollPadding(composerH, cardH);
+      const diffBarH = diffBar ? diffBar.getBoundingClientRect().height : null;
+      const padding = composerScrollPadding(composerH, cardH, diffBarH);
       el.style.paddingBottom = `${padding}px`;
       // فلش فقط وقتی معنا دارد که متن‌های چت واقعاً پشت کامپوزر پنهان شده
-      // باشند؛ آستانه = فضای رزروشدهٔ انتهای محتوا منهای ارتفاع UI شناور.
+      // باشند؛ آستانه = فضای رزروشدهٔ انتهای محتوا منهای ارتفاع UI شناور
+      // (کامپوزر + کارت + نوار گیت که داخل composerH اندازه‌گیری می‌شود).
       jumpThresholdRef.current = jumpVisibleThreshold(padding, composerH + (cardH ?? 0));
     };
     update();
@@ -1228,6 +1233,7 @@ export function ChatPanel() {
     reuseMsgId?: string,
     continueAssistantId?: string,
     forceScroll = false,
+    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] },
   ) => {
     stoppedRef.current = false;
     // Per-turn flag: set when a create_mcp tool event arrives, consumed by the
@@ -1320,6 +1326,16 @@ export function ChatPanel() {
     }
     const { skills: mentionSkills, cleaned: cleanedText } =
       extractMentionSkills(text, getSkillsList());
+    const effectiveSkills = overrides?.skills ?? Array.from(mentionSkills);
+    const effectiveMcpServers: Record<string, McpServerConfig> =
+      overrides?.mcpServers ??
+      (() => {
+        const all = s.settings.mcpServers ?? {};
+        const enabled = s.settings.mcpEnabled ?? [];
+        const sel: Record<string, McpServerConfig> = {};
+        for (const n of enabled) if (all[n]) sel[n] = all[n];
+        return sel;
+      })();
     const finalPrompt =
       skillNotes.length > 0
         ? `${cleanedText}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
@@ -1367,6 +1383,8 @@ export function ChatPanel() {
         content: text,
         attachments: atts,
         images: imgs,
+        mcpServers: effectiveMcpServers,
+        skills: effectiveSkills,
         // Capture the CURRENT chat mode on the user bubble so the transcript
         // stays consistent: every user message records which mode it ran in.
         // This also guarantees a retry (which re-sends via send()) inherits the
@@ -2113,8 +2131,12 @@ export function ChatPanel() {
         }
       } else if (event.kind === "laya") {
         // فعالیت زنده تصمیم سریع laya — جدا از رویداد usage (مصرف دست‌نخورده
-        // می‌ماند)؛ در تاریخچه همان چت ثبت می‌شود تا پنل راست زیر todos نشان دهد.
-        store.appendLayaRun(chat.id, {
+        // می‌ماند)؛ در تاریخچه همان چت مبدأ استریم ثبت می‌شود (نه چت فعال لحظه‌ای)
+        // تا با سوییچ چت، تاریخچه قاطی نشود و پنل فقط مال چت فعال را نشان دهد.
+        const originChatId = chat.id;
+        const prevRuns =
+          store.chats.find((c) => c.id === originChatId)?.layaRuns?.length ?? 0;
+        store.appendLayaRun(originChatId, {
           route: typeof event.route === "string" ? event.route : "normal",
           confidence: typeof event.confidence === "number" ? event.confidence : 0,
           abstained: event.abstained === true,
@@ -2127,6 +2149,11 @@ export function ChatPanel() {
           model: typeof event.model === "string" ? event.model : "",
           elapsedMs: typeof event.elapsed_ms === "number" ? event.elapsed_ms : 0,
         });
+        // اولین رویداد laya و پنل بسته است → پنل راست خودکار باز شود تا
+        // کاربر تصمیم را ببیند (مثل تودوها؛ فقط گذار ۰→۱ باز می‌کند).
+        if (prevRuns === 0 && !store.rightPanelOpen) {
+          store.setRightPanelOpen(true);
+        }
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -2252,17 +2279,8 @@ export function ChatPanel() {
               activeProvider.kind,
               modelReasoning(activeProvider, activeProvider.model),
             ),
-          mcpServers: (() => {
-            const all = s.settings.mcpServers ?? {};
-            const enabled = s.settings.mcpEnabled ?? [];
-            // Only send connectors the user explicitly toggled ON in the
-            // composer chip. If none are enabled, send nothing — the chip is
-            // the per-chat toggle (on = use it, off = use none).
-            const sel: Record<string, (typeof all)[string]> = {};
-            for (const n of enabled) if (all[n]) sel[n] = all[n];
-            return sel;
-          })(),
-          skills: Array.from(mentionSkills),
+          mcpServers: effectiveMcpServers,
+          skills: effectiveSkills,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
@@ -2447,9 +2465,22 @@ export function ChatPanel() {
     // Serialize the live conversation — including any prior compact summary —
     // so the backend can MERGE it into the new one (opencode keeps a running
     // summary across repeated compactions instead of starting from scratch).
+    // Full fidelity: toolActivity/plan/mode/preservedToolSummary travel too,
+    // so the summarizer sees WHAT tools ran (not just prose) and the next
+    // turn does not re-issue them.
     const history = ch.messages
       .filter((m) => !m.compacted)
-      .map((m) => ({ role: m.role, content: m.content ?? "" }));
+      .map((m) => ({
+        role: m.role,
+        content: m.content ?? "",
+        thinking: m.thinking,
+        plan: m.plan,
+        mode: m.mode,
+        toolActivity: (m.toolActivity ?? []).filter(
+          (a) => a.status !== "running",
+        ),
+        preservedToolSummary: m.preservedToolSummary,
+      }));
 
     // Route the primary summarizer through the user's configured "compact"
     // subagent (Settings → Tools) when set, else the active provider. The
@@ -2816,6 +2847,16 @@ export function ChatPanel() {
     const imgs = images;
     setAttachments([]);
     setImages([]);
+    const selectedMcpServers: Record<string, McpServerConfig> = (() => {
+      const all = ss.settings.mcpServers ?? {};
+      const enabled = ss.settings.mcpEnabled ?? [];
+      const sel: Record<string, McpServerConfig> = {};
+      for (const n of enabled) if (all[n]) sel[n] = all[n];
+      return sel;
+    })();
+    const selectedSkills: string[] = Array.from(
+      extractMentionSkills(v, getSkillsList()).skills,
+    );
     // اگر کامپکت در جریان است پیام باید صف شود نه steer مستقیم
     if (chatObj.compacting) {
       ss.queueMessage(chatObj.id, {
@@ -2823,6 +2864,8 @@ export function ChatPanel() {
         text: v,
         attachments: atts,
         images: imgs,
+        mcpServers: selectedMcpServers,
+        skills: selectedSkills,
         kind: "queue",
       });
       setInput("");
@@ -2842,12 +2885,17 @@ export function ChatPanel() {
         content: v,
         attachments: atts,
         images: imgs,
+        mcpServers: selectedMcpServers,
+        skills: selectedSkills,
         steerPending: true,
       });
       setInput("");
       setCmdOpen(null);
       forceScrollToBottom();
-      void steerChat(chatObj.id, userMsg.id, v, atts, imgs);
+      void steerChat(chatObj.id, userMsg.id, v, atts, imgs, {
+        mcpServers: selectedMcpServers,
+        skills: selectedSkills,
+      });
       return;
     }
     setInput("");
@@ -2863,11 +2911,17 @@ export function ChatPanel() {
     if (!chatObj) return;
     const atts = attachments;
     const imgs = images;
+    const all = ss.settings.mcpServers ?? {};
+    const enabled = ss.settings.mcpEnabled ?? [];
+    const sel: Record<string, McpServerConfig> = {};
+    for (const n of enabled) if (all[n]) sel[n] = all[n];
     ss.queueMessage(chatObj.id, {
       id: uid2(),
       text: v,
       attachments: atts,
       images: imgs,
+      mcpServers: sel,
+      skills: Array.from(extractMentionSkills(v, getSkillsList()).skills),
       kind: "queue",
     });
     forceScrollToBottom();
@@ -2973,8 +3027,28 @@ export function ChatPanel() {
     setImages((imgs) => imgs.filter((i) => i.path !== path));
   };
 
+  // Resolve STT provider config + language for the current input.
+  const resolveStt = () => {
+    const lang =
+      dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
+    const sttCfg =
+      sttProviderId === "local"
+        ? undefined
+        : settings.providers.find((p) => p.id === sttProviderId);
+    const opts = sttCfg
+      ? {
+          kind: sttCfg.kind,
+          baseUrl: sttCfg.baseUrl ?? "",
+          apiKey: sttCfg.apiKey ?? "",
+          envVar: sttCfg.envVar ?? "",
+          model: sttModel,
+        }
+      : undefined;
+    return { lang, opts };
+  };
+
   const startRecording = async () => {
-    if (recording || transcribing || busy) return;
+    if (recording || transcribing) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // Prefer a format the sidecar's `av` can decode; fall back to whatever the
@@ -2992,7 +3066,9 @@ export function ChatPanel() {
       });
       mediaChunksRef.current = [];
       rec.ondataavailable = (e) => {
-        if (e.data.size > 0) mediaChunksRef.current.push(e.data);
+        if (e.data.size > 0) {
+          mediaChunksRef.current.push(e.data);
+        }
       };
       rec.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
@@ -3007,33 +3083,16 @@ export function ChatPanel() {
         }
         setTranscribing(true);
         try {
-          const lang =
-            dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
+          const { lang, opts } = resolveStt();
           console.debug("[voice] transcribing", {
             mime: blob.type,
             bytes: blob.size,
             lang,
           });
-          const sttCfg =
-            sttProviderId === "local"
-              ? undefined
-              : settings.providers.find((p) => p.id === sttProviderId);
-          const text = await transcribeAudio(
-            blob,
-            setTranscribing,
-            lang,
-            sttCfg
-              ? {
-                  kind: sttCfg.kind,
-                  baseUrl: sttCfg.baseUrl ?? "",
-                  apiKey: sttCfg.apiKey ?? "",
-                  envVar: sttCfg.envVar ?? "",
-                  model: sttModel,
-                }
-              : undefined,
-          );
-          if (text) {
-            setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
+          const text = await transcribeAudio(blob, setTranscribing, lang, opts);
+          const finalText = (text ?? "").trim();
+          if (finalText) {
+            setInput((prev) => (prev ? prev.trimEnd() + " " + finalText : finalText));
             requestAnimationFrame(() => textareaRef.current?.focus());
           } else {
             console.debug("[voice] empty transcription (silence/unrecognized)");
@@ -3547,48 +3606,57 @@ export function ChatPanel() {
               </div>
             </div>
           )}
-          {msgLimit < chat.messages.length && (
-            <div className="load-older-row">
-              <button
-                className="load-older-btn"
-                onClick={() => {
-                  prependAnchorRef.current =
-                    scrollRef.current?.scrollHeight ?? null;
-                  setMsgLimit((n) =>
-                    Math.min(chat.messages.length, n + MSG_PAGE),
-                  );
-                }}
-              >
-                Load {Math.min(MSG_PAGE, chat.messages.length - msgLimit)}{" "}
-                earlier message
-                {chat.messages.length - msgLimit === 1 ? "" : "s"}…
-              </button>
-            </div>
-          )}
-          {chat.messages
-            .slice(Math.max(0, chat.messages.length - msgLimit))
-            .map((m: ChatMessage) => (
-              <Fragment key={m.id}>
-                <ChatMessageView message={m} onRetry={onRetry} />
-                {/* Newer messages render tool cards inline via `segments`; only
-                  older persisted messages without segments keep the stacked
-                  timeline below the bubble. */}
-                {!m.segments && m.toolActivity && m.toolActivity.length > 0 && (
-                  <div className="tool-timeline">
-                    {m.toolActivity.map((act, i) => (
-                      <ToolCallView
-                        key={i}
-                        activity={act}
-                        chatId={chat.id}
-                        onReverted={() =>
-                          useStore.getState().markToolReverted(m.id, i)
-                        }
-                      />
-                    ))}
+          {(() => {
+            const visible = visibleChatMessages(chat.messages);
+            return (
+              <>
+                {msgLimit < visible.length && (
+                  <div className="load-older-row">
+                    <button
+                      className="load-older-btn"
+                      onClick={() => {
+                        prependAnchorRef.current =
+                          scrollRef.current?.scrollHeight ?? null;
+                        setMsgLimit((n) =>
+                          Math.min(visible.length, n + MSG_PAGE),
+                        );
+                      }}
+                    >
+                      Load {Math.min(MSG_PAGE, visible.length - msgLimit)}{" "}
+                      earlier message
+                      {visible.length - msgLimit === 1 ? "" : "s"}…
+                    </button>
                   </div>
                 )}
-              </Fragment>
-            ))}
+                {visible
+                  .slice(Math.max(0, visible.length - msgLimit))
+                  .map((m: ChatMessage) => (
+                    <Fragment key={m.id}>
+                      <ChatMessageView message={m} onRetry={onRetry} />
+                      {/* Newer messages render tool cards inline via `segments`; only
+                        older persisted messages without segments keep the stacked
+                        timeline below the bubble. */}
+                      {!m.segments &&
+                        m.toolActivity &&
+                        m.toolActivity.length > 0 && (
+                          <div className="tool-timeline">
+                            {m.toolActivity.map((act, i) => (
+                              <ToolCallView
+                                key={i}
+                                activity={act}
+                                chatId={chat.id}
+                                onReverted={() =>
+                                  useStore.getState().markToolReverted(m.id, i)
+                                }
+                              />
+                            ))}
+                          </div>
+                        )}
+                    </Fragment>
+                  ))}
+              </>
+            );
+          })()}
           {queuedMsgs.length > 0 && (
             <div className="queued-bubbles">
               {queuedMsgs.map((q) => (
@@ -3664,6 +3732,21 @@ export function ChatPanel() {
                   )}
                   {q.images && q.images.length > 0 && (
                     <MessageImages images={q.images} />
+                  )}
+                  {((q.skills && q.skills.length > 0) ||
+                    (q.mcpServers && Object.keys(q.mcpServers).length > 0)) && (
+                    <div className="msg-attachments" dir="ltr">
+                      {(q.skills ?? []).map((sk) => (
+                        <span className="attachment-chip" key={`skill-${sk}`}>
+                          @{sk}
+                        </span>
+                      ))}
+                      {Object.keys(q.mcpServers ?? {}).map((n) => (
+                        <span className="attachment-chip" key={`mcp-${n}`}>
+                          MCP {n}
+                        </span>
+                      ))}
+                    </div>
                   )}
                 </div>
               ))}
@@ -3855,6 +3938,32 @@ export function ChatPanel() {
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
+        {showJump && (
+          <button
+            className="scroll-jump"
+            title="Scroll to bottom"
+            onClick={() => {
+              stickToBottom.current = true;
+              setShowJump(false);
+              scrollRef.current?.scrollTo({
+                top: scrollRef.current.scrollHeight,
+                behavior: "smooth",
+              });
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M6 5.5l6 6 6-6" />
+              <path d="M6 12.5l6 6 6-6" />
+            </svg>
+          </button>
+        )}
         {askReq &&
           (() => {
             const fa = detectDir(askReq.question) === "rtl";
@@ -4107,32 +4216,6 @@ export function ChatPanel() {
           })()}
         <ComposerDiffBar root={wroot} />
         <div className="composer-inner">
-          {showJump && (
-            <button
-              className="scroll-jump"
-              title="Scroll to bottom"
-              onClick={() => {
-                stickToBottom.current = true;
-                setShowJump(false);
-                scrollRef.current?.scrollTo({
-                  top: scrollRef.current.scrollHeight,
-                  behavior: "smooth",
-                });
-              }}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M6 5.5l6 6 6-6" />
-                <path d="M6 12.5l6 6 6-6" />
-              </svg>
-            </button>
-          )}
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
           )}
@@ -4353,7 +4436,6 @@ export function ChatPanel() {
                   <button
                     className="icon-btn plus-btn"
                     onClick={attachFile}
-                    disabled={busy}
                     title="Attach files or images"
                     aria-label="Attach"
                   >
@@ -4373,7 +4455,6 @@ export function ChatPanel() {
                   <button
                     className="icon-btn attach-btn"
                     onClick={captureRegion}
-                    disabled={busy}
                     title="Capture a region of the screen"
                   >
                     <svg
@@ -4391,7 +4472,6 @@ export function ChatPanel() {
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onClick={toggleRecording}
-                    disabled={busy}
                     title={
                       transcribing
                         ? "Transcribing voice…"
@@ -4441,7 +4521,6 @@ export function ChatPanel() {
                   <button
                     className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
                     onClick={() => void openSkillPicker()}
-                    disabled={busy}
                     title="Add MCP tools to this message"
                   >
                     <svg

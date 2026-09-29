@@ -1,17 +1,25 @@
-// Bottom clearance for the floating composer + ask/perm cards.
+// Bottom clearance for the floating composer + ask/perm cards + git diff bar.
 //
 // The composer is absolutely positioned over the bottom of the conversation
 // (position: absolute; bottom: 0) and the ask/perm cards anchor above it
-// (bottom: calc(100% + 10px)). The scroll container needs enough padding-bottom
-// so the last message never hides behind that floating UI.
+// (bottom: calc(100% + 10px)). The git diff bar (.composer-diff-bar) sits in
+// normal flow above the input card with an 8px bottom margin. The scroll
+// container needs enough padding-bottom so the last message never hides
+// behind that floating UI.
 //
 // - 210px is the baseline that clears the idle composer (matches the CSS
 //   default on .chat-scroll).
 // - When a card is open we add its height plus the 10px gap above the composer.
+// - When the git diff bar is visible we add its height plus its 8px margin.
 // - A 24px safety margin keeps the last message comfortably visible.
-export function composerScrollPadding(composerH: number, cardH: number | null): number {
+export function composerScrollPadding(
+  composerH: number,
+  cardH: number | null,
+  diffBarH: number | null = null,
+): number {
   const card = cardH ? cardH + 10 : 0;
-  return Math.max(210, composerH + card + 24);
+  const diff = diffBarH ? diffBarH + 8 : 0;
+  return Math.max(210, composerH + card + diff + 24);
 }
 
 /** آستانهٔ نمایش فلش «پرش به پایین»: فاصلهٔ اسکرول از پایین که در آن محتوای

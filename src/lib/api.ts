@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SidecarEvent } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -125,10 +125,30 @@ export interface SpeakProviderOpts {
  * Synthesize text to speech via the sidecar.
  * Remote (opts): forwarded to POST {base_url}/audio/speech.
  * Returns the audio bytes as a Blob.
+ *
+ * The sidecar streams the audio (StreamingResponse), so callers that want
+ * first-byte latency should use `speakTextStream` below instead of waiting
+ * for the full Blob here.
  */
 export async function speakText(
   text: string,
   opts: SpeakProviderOpts,
+  callerSignal?: AbortSignal,
+): Promise<Blob> {
+  return await speakTextStream(text, opts, undefined, callerSignal)
+}
+
+/**
+ * Read the /tts response as progressive audio chunks.
+ * Resolves once the FIRST chunk arrives (so playback can start early) and
+ * keeps invoking `onChunk` for the rest in the background. The returned
+ * promise settles when the whole body is consumed.
+ */
+export async function speakTextStream(
+  text: string,
+  opts: SpeakProviderOpts,
+  onChunk?: (chunk: BlobPart, first: boolean) => void,
+  callerSignal?: AbortSignal,
 ): Promise<Blob> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
@@ -137,33 +157,34 @@ export async function speakText(
     provider: opts.kind,
     base_url: opts.baseUrl,
   }
-  // مدل/ویس خالی ارسال نمی‌شود تا پروایدرهایی که مدل/ویس ندارند (بعضی
-  // پروایدرهای 9router) هم کار کنند — بک‌اند هم آن‌ها را از payload حذف می‌کند.
   if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
   if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
   if (opts.apiKey) body.api_key = opts.apiKey
   if (opts.envVar) body.env_var = opts.envVar
+  const timeoutSignal = AbortSignal.timeout(120_000)
+  const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  const signal =
+    callerSignal && typeof anyFn === 'function'
+      ? anyFn([callerSignal, timeoutSignal])
+      : (callerSignal ?? timeoutSignal)
   const post = async (base: string): Promise<Blob> => {
-    const res = await fetch(`${base}/tts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+    const chunks: BlobPart[] = []
+    let first = true
+    await postTtsChunks(base, body, signal, (chunk) => {
+      chunks.push(chunk)
+      try {
+        onChunk?.(chunk, first)
+      } finally {
+        first = false
+      }
     })
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}))
-      throw new Error(
-        (data as { detail?: string }).detail || `speech synthesis failed (${res.status})`,
-      )
-    }
-    return await res.blob()
+    const firstType = chunks.length > 0 && chunks[0] instanceof Blob ? (chunks[0] as Blob).type : ''
+    return new Blob(chunks, { type: firstType || 'audio/mpeg' })
   }
   try {
     return await post(url)
   } catch (err) {
-    // A network-level failure (TypeError) means the sidecar is unreachable —
-    // its cached URL is stale. Drop the cache and retry once against a freshly
-    // resolved URL (which restarts the sidecar if needed).
+    if (callerSignal?.aborted) throw err
     if (err instanceof TypeError) {
       sidecarUrl = null
       const retryUrl = await ensureSidecar()
@@ -173,6 +194,83 @@ export async function speakText(
     }
     throw err
   }
+}
+
+/** POST /tts and forward each body chunk to `onChunk` as it arrives. */
+async function postTtsChunks(
+  base: string,
+  body: Record<string, string>,
+  signal: AbortSignal,
+  onChunk: (chunk: BlobPart) => void,
+): Promise<void> {
+  const res = await fetch(`${base}/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(
+      (data as { detail?: string }).detail || `speech synthesis failed (${res.status})`,
+    )
+  }
+  const contentType = res.headers?.get?.('content-type')?.split(';')[0]?.trim() || 'audio/mpeg'
+  // Fast path: no streaming body (mocked fetch in tests) — single chunk.
+  if (!res.body || typeof (res.body as ReadableStream).getReader !== 'function') {
+    const blob = await res.blob()
+    onChunk(blob.size > 0 ? blob : new Blob([], { type: contentType }))
+    return
+  }
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value && value.byteLength > 0) {
+        const copy = value.slice().buffer as ArrayBuffer
+        onChunk(new Blob([copy], { type: contentType }))
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // best-effort — reader may already be closed after cancel
+    }
+  }
+}
+
+/** Split long text into sentence chunks for queued TTS playback. */
+export function splitTtsSentences(text: string, maxLen = 280): string[] {
+  const clean = (text ?? '').replace(/\s+/g, ' ').trim()
+  if (!clean) return []
+  // Only true sentence boundaries (. ! ? … ؟) — splitting on colon/semicolon
+  // chopped mid-sentence phrases into tiny chunks, multiplying requests and
+  // making playback choppy. Colons/semicolons stay inside the chunk.
+  const parts = clean.split(/(?<=[.!?…؟!])/u).map((s) => s.trim()).filter(Boolean)
+  const sentences = parts.length > 0 ? parts : [clean]
+  const out: string[] = []
+  for (const s of sentences) {
+    if (s.length <= maxLen) {
+      out.push(s)
+      continue
+    }
+    // Long sentence without punctuation: hard-split on word boundaries.
+    const words = s.split(' ')
+    let cur = ''
+    for (const w of words) {
+      const next = cur ? `${cur} ${w}` : w
+      if (next.length > maxLen && cur) {
+        out.push(cur)
+        cur = w
+      } else {
+        cur = next
+      }
+    }
+    if (cur) out.push(cur)
+  }
+  return out
 }
 
 /**
@@ -395,7 +493,7 @@ export interface StreamParams {
     role: string
     content: string
     thinking?: string
-    plan?: Array<{ content: string; status: string }>
+    plan?: Array<{ id?: string; content: string; status: string }>
     mode?: string
     toolActivity?: Array<{
       tool: string
@@ -403,7 +501,9 @@ export interface StreamParams {
       callId?: number | string
       summary?: string
       status: string
-      items?: Array<Record<string, unknown>>
+      items?: Array<SearchResultItem | Record<string, unknown>>
+      results?: Array<SearchResultItem | Record<string, unknown>>
+      diff?: string
     }>
     /** Tool-output recap from a previously interrupted turn. NOT rendered in
      *  the UI; folded into the assistant message's content server-side so the
@@ -709,7 +809,24 @@ export interface CompactResult {
 export async function triggerCompact(params: {
   provider: CompactProvider
   fallback: CompactProvider
-  history: Array<{ role: string; content: string }>
+  history: Array<{
+    role: string
+    content: string
+    thinking?: string
+    plan?: Array<{ id?: string; content: string; status: string }>
+    mode?: string
+    toolActivity?: Array<{
+      tool: string
+      args?: Record<string, unknown>
+      callId?: number | string
+      summary?: string
+      status: string
+      items?: Array<SearchResultItem | Record<string, unknown>>
+      results?: Array<SearchResultItem | Record<string, unknown>>
+      diff?: string
+    }>
+    preservedToolSummary?: string
+  }>
   contextWindow?: number
   compactAtPercent?: number
   signal?: AbortSignal
@@ -754,6 +871,7 @@ export async function steerChat(
   prompt: string,
   attachments: string[] = [],
   images: Array<{ path: string; name: string; dataUrl?: string }> = [],
+  opts: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] } = {},
 ): Promise<boolean> {
   const url = await ensureSidecar()
   if (!url) return false
@@ -761,7 +879,15 @@ export async function steerChat(
     const res = await fetch(`${url}/chat/steer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, id, prompt, attachments, images }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        id,
+        prompt,
+        attachments,
+        images,
+        mcp_servers: opts.mcpServers ?? {},
+        skills: opts.skills ?? [],
+      }),
     })
     if (!res.ok) return false
     const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
@@ -1429,6 +1555,41 @@ export async function clearScheduleRuns(
     }
     const body = (await res.json().catch(() => ({}))) as { removed?: number }
     return { ok: true, removed: typeof body.removed === 'number' ? body.removed : 0 }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** حذف همه ران‌های یتیم (ران تسک‌های حذف‌شده). */
+export async function clearOrphanScheduleRuns(): Promise<{ ok: true; removed: number } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedule-runs/orphans`, { method: "DELETE" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `clear failed (${res.status})` }
+    }
+    const body = (await res.json().catch(() => ({}))) as { removed?: number }
+    return { ok: true, removed: typeof body.removed === 'number' ? body.removed : 0 }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** حذف تکی یک ران با id. */
+export async function deleteScheduleRun(
+  runId: string,
+): Promise<{ ok: true } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedule-runs/${encodeURIComponent(runId)}`, { method: "DELETE" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `delete failed (${res.status})` }
+    }
+    return { ok: true }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }

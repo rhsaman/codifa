@@ -37,6 +37,23 @@ console.log('4) کارت با ارتفاع صفر مثل نبودن کارت ر�
   check('cardH=0 → بدون فاصله 10px', composerScrollPadding(142, 0) === 210)
 }
 
+console.log('4ب) نوار گیت بالای اینپوت (حالت کامپوزر + نوار گیت):')
+{
+  // نوار گیت ~30px + فاصله 8px زیرش؛ پدینگ باید بزرگتر شود تا آخرین پیام زیر آن نرود
+  // (کامپوزر 180 تا از حداقل 210px بالاتر برود و اثر نوار دیده شود)
+  const withDiff = composerScrollPadding(180, null, 30)
+  check('نوار گیت padding را بزرگ میکند', withDiff === 180 + 30 + 8 + 24, withDiff)
+  // بدون نوار گیت همان حداقل قبلی میماند (پارامتر اختیاری، سازگار با قبل)
+  check('diffBarH غایب → رفتار قبلی', composerScrollPadding(142, null) === 210)
+  check('diffBarH=0 → بدون فاصله 8px', composerScrollPadding(142, null, 0) === 210)
+  // نوار گیت + کارت ask/perm با هم جمع میشوند
+  check('نوار گیت + کارت با هم جمع میشوند', composerScrollPadding(142, 200, 30) === 142 + 200 + 10 + 30 + 8 + 24)
+  // آستانه فلش با نوار گیت: محتوا دیرتر پشت UI شناور پنهان میشود
+  const padding = composerScrollPadding(180, null, 30)
+  const floating = 180 + 30 + 8
+  check('آستانه فلش با نوار گیت معتبر است', jumpVisibleThreshold(padding, floating) === padding - floating, jumpVisibleThreshold(padding, floating))
+}
+
 console.log('5) آستانهٔ نمایش فلش پرش به پایین (jumpVisibleThreshold):')
 {
   // حالت عادی: padding=210، کامپوزر=142 → محتوا از 68px فاصله از پایین پنهان میشود

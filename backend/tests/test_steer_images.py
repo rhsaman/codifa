@@ -42,6 +42,22 @@ def test_steer_images_build_multipart_blocks():
     assert img_block["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_steer_skills_and_mcp_servers_injected_in_text():
+    msg = _steer_to_human_message(
+        [
+            {
+                "id": "m1",
+                "prompt": "p1",
+                "skills": ["alpha"],
+                "mcp_servers": {"docker": {"command": "docker"}},
+            }
+        ]
+    )
+    text = msg.content if isinstance(msg.content, str) else msg.content[0]["text"]
+    assert "`alpha`" in text
+    assert "`docker`" in text
+
+
 def test_steer_multiple_merges_text_and_images():
     msg = _steer_to_human_message(
         [

@@ -116,6 +116,7 @@ AGENTS: dict[str, dict] = {
             "fetch_url",
             "search_console",
             "current_time",
+            "laya",
             "vision",
             # search_memory removed: exploration uses the CODE MAP (injected into
             # the system prompt) for structure, and web/fetch recall is the main

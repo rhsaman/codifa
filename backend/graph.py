@@ -200,13 +200,14 @@ def _checkpoint_due(thread_id: str, msgs: list, *, force: bool = False) -> bool:
     """True when a checkpoint write is worth its latency cost."""
     try:
         st = _checkpoint_state.get(thread_id)
-        if st is None:
+        is_new = st is None
+        if is_new:
             st = {"steps": 0, "chars": 0}
             _checkpoint_state[thread_id] = st
         st["steps"] = int(st.get("steps") or 0) + 1
         _chars = sum(len(str(getattr(m, "content", "") or "")) for m in msgs)
         _grown = _chars - int(st.get("chars") or 0)
-        if force or st["steps"] >= _CHECKPOINT_EVERY_N_STEPS or _grown >= _CHECKPOINT_MIN_GROWTH_CHARS:
+        if force or is_new or st["steps"] >= _CHECKPOINT_EVERY_N_STEPS or _grown >= _CHECKPOINT_MIN_GROWTH_CHARS:
             st["steps"] = 0
             st["chars"] = _chars
             return True
@@ -633,32 +634,69 @@ def history_to_langchain_messages(
                         "id": tc_id,
                     }
                 )
-                # Prefer the full tool result (items); fall back to the summary.
-                # `items` may be a plain string (e.g. "MATCHES for 'foo'") OR a
-                # list of dicts (e.g. [{"snippet": "..."}]) — flatten either into
-                # readable text so the model sees the real result and does NOT
-                # re-execute the tool on reconnect (which would waste context).
-                items = ta.get("items")
-                if isinstance(items, str):
-                    result = items
-                elif isinstance(items, list) and items:
+                # Prefer the full tool result (items, or the `results` alias the
+                # backend emits on tool_result events); fall back to the summary.
+                # Either may be a plain string (e.g. "MATCHES for 'foo'") OR a
+                # list of dicts — flatten either into readable text so the model
+                # sees the real result and does NOT re-execute the tool on
+                # reconnect (which would waste context).
+                raw_items = ta.get("items")
+                if raw_items is None:
+                    raw_items = ta.get("results")
+                if isinstance(raw_items, str):
+                    result = raw_items
+                elif isinstance(raw_items, list) and raw_items:
                     parts = []
-                    for _it in items:
+                    for _it in raw_items:
                         if isinstance(_it, dict):
-                            parts.append(
-                                str(
-                                    _it.get("snippet")
-                                    or _it.get("content")
-                                    or _it.get("text")
-                                    or _it.get("result")
-                                    or _it
-                                )
+                            # Keep the identifying fields, not just the snippet
+                            # text, so the model can act without re-running:
+                            # grep -> file:line:text, glob -> path,
+                            # web_search -> title (url): snippet,
+                            # read/terminal/task -> path: content.
+                            _path = _it.get("path") or _it.get("file") or ""
+                            _line_no = _it.get("line")
+                            _title = _it.get("title") or ""
+                            _url = _it.get("url") or ""
+                            _body = (
+                                _it.get("snippet")
+                                or _it.get("content")
+                                or _it.get("text")
+                                or _it.get("result")
+                                or _it.get("output")
+                                or ""
                             )
+                            if _path and _line_no is not None and _body:
+                                parts.append(f"{_path}:{_line_no}:{_body}")
+                            elif _path and _body:
+                                parts.append(f"{_path}: {_body}")
+                            elif _path and not _body:
+                                parts.append(str(_path))
+                            elif _title and _url and _body:
+                                parts.append(f"{_title} ({_url}): {_body}")
+                            elif _title and _body:
+                                parts.append(f"{_title}: {_body}")
+                            elif _body:
+                                parts.append(str(_body))
+                            else:
+                                parts.append(str(_it))
                         else:
                             parts.append(str(_it))
                     result = "\n".join(parts)
                 else:
                     result = ta.get("summary") or ""
+                # write_file/edit_file store the unified diff on the activity
+                # (not in items) — carry it so the next turn sees what changed
+                # without re-reading the file.
+                _diff = ta.get("diff")
+                if isinstance(_diff, str) and _diff.strip():
+                    _diff_text = _diff.strip()
+                    if len(_diff_text) > 8000:
+                        _diff_text = _diff_text[:8000] + "\n...(diff truncated)"
+                    if result:
+                        result = f"{result}\nDiff:\n{_diff_text}"
+                    else:
+                        result = f"Diff:\n{_diff_text}"
                 tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             if tool_calls:
                 _ai_content = content + preserved_summary if preserved_summary else content
@@ -1172,11 +1210,26 @@ async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | Non
     return result
 
 
+def _rank_candidates(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    """Best-effort relevance ranking via laya_decide.rank (never raises).
+
+    Returns ranked [{name, confidence, ...}] or [] on no-signal — callers must
+    keep their previous behaviour (full list, original order) when empty.
+    """
+    try:
+        import laya_decide
+
+        return laya_decide.rank(query or "", candidates or [], top_k=top_k)
+    except Exception:  # noqa: BLE001 — ranking is best-effort
+        return []
+
+
 def _build_skills_section(
     picked_names: list[str],
     root: str,
     emit: Callable[[dict], None] | None = None,
     catalog: bool = True,
+    rank_order: list[str] | None = None,
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
@@ -1195,7 +1248,11 @@ def _build_skills_section(
 
     This is intentionally independent of ``_skill_names_to_strip``: stripping a
     skill's *name* out of the search-keyword derivation must never prevent its
-    *body* from being inlined here — the skill is still fully used."""
+    *body* from being inlined here — the skill is still fully used.
+
+    ``rank_order`` (laya pre-rank, most relevant first) only REORDERS the
+    catalog — it never hides a skill; unknown names keep their relative order
+    at the end, and an empty/None order keeps the original order."""
     manual_names = list(dict.fromkeys(
         n.strip().casefold() for n in picked_names if n and n.strip()
     ))
@@ -1206,10 +1263,23 @@ def _build_skills_section(
     all_skills = _agents._load_skills(root)
     out = ""
     if catalog and all_skills:
+        ordered = list(all_skills)
+        if rank_order:
+            _pos = {str(n or "").casefold(): i for i, n in enumerate(rank_order)}
+            _base = len(_pos)
+            ordered = [
+                s for _, s in sorted(
+                    enumerate(ordered),
+                    key=lambda pair: (
+                        _pos.get(str(pair[1].get("name", "") or "").casefold(), _base),
+                        pair[0],
+                    ),
+                )
+            ]
         lines = [
             f"- {s['name']}"
             + (f": {s['description']}" if s.get("description") else "")
-            for s in all_skills
+            for s in ordered
         ]
         out += (
             "\n\n=== AVAILABLE SKILLS ===\n"
@@ -1540,6 +1610,33 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             lambda ev: queue.put_nowait(ev),
             reserved_names=set(filtered),
         )
+    if mcp_tools and prompt:
+        # Laya MCP pre-rank: most relevant server tools first (reorder-only;
+        # on no-signal the original order is kept — full fallback). Only the
+        # composer-enabled servers in state["mcp_servers"] are ranked, never
+        # the whole connector store.
+        try:
+            from mcp_bridge import describe_tools as _describe_mcp_tools
+
+            _mcp_ranked = await asyncio.to_thread(
+                _rank_candidates,
+                prompt,
+                _describe_mcp_tools(mcp_tools),
+                len(mcp_tools),
+            )
+            if _mcp_ranked:
+                _mcp_order = {
+                    str(r.get("name") or ""): i for i, r in enumerate(_mcp_ranked)
+                }
+                _mcp_base = len(_mcp_order)
+                mcp_tools = sorted(
+                    mcp_tools,
+                    key=lambda t: _mcp_order.get(
+                        str(getattr(t, "name", "") or ""), _mcp_base
+                    ),
+                )
+        except Exception:  # noqa: BLE001, S110 — ranking is best-effort
+            pass
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
@@ -1682,12 +1779,37 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
     # (name + description) is always in the prompt (except small-context
     # models, where every token counts) so the model can auto-trigger a skill
-    # via load_skill; @mentioned bodies are inlined in full.
+    # via load_skill; @mentioned bodies are inlined in full. Laya pre-ranks
+    # the catalog by relevance (reorder-only, full fallback) so the model
+    # sees the most relevant skills first without hiding any.
+    _skill_rank_order: list[str] | None = None
+    if not small_ctx and prompt:
+        try:
+            _rank_skills = _agents._load_skills(root) or []
+            if len(_rank_skills) > 1:
+                _ranked = await asyncio.to_thread(
+                    _rank_candidates,
+                    prompt,
+                    [
+                        {"name": s.get("name", ""), "description": s.get("description") or ""}
+                        for s in _rank_skills
+                    ],
+                    len(_rank_skills),
+                )
+                if _ranked:
+                    _skill_rank_order = [
+                        str(r.get("name") or "")
+                        for r in _ranked
+                        if str(r.get("name") or "").strip()
+                    ] or None
+        except Exception:  # noqa: BLE001 — ranking is best-effort
+            _skill_rank_order = None
     system_final += _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
         catalog=not small_ctx,
+        rank_order=_skill_rank_order,
     )
 
     if mode in ("plan", "coder"):
@@ -1961,74 +2083,73 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
     if mcp_tools:
         user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
-    # مسیر سریع laya: فقط وقتی computer/مرورگر زنده است اجرا می‌شود تا
-    # اجرای بی‌مصرف نشود؛ decide همگام در نخ جدا (to_thread) تا حلقه بلوکه نشود.
+    # مسیر سریع laya: برای همه چت‌ها اجرا می‌شود تا چت معمولی هم رویداد
+    # laya بگیرد و پنل خالی نماند؛ decide همگام در نخ جدا (to_thread) تا حلقه بلوکه نشود.
     # مصرف laya (لوکال صفرتوکنی یا توکن واقعی پروایدر) مثل tools با sub=True
     # در صف رویداد منتشر می‌شود تا در جمع چت ثبت شود و بج پیام به‌هم نریزد.
+    # نکته FAST ROUTE فقط وقتی به پرامپت اضافه می‌شود که ابزار مقصد واقعاً زنده باشد.
     _computer_live = filtered.get("computer") is not None
-    _laya_needed = bool(_computer_live or browser_mcp_live)
-    if _laya_needed:
+    try:
+        import time as _laya_time
+
+        import laya_decide
+
+        _laya_start = _laya_time.monotonic()
+        _fast_route = laya_decide.fast_route(prompt)
+        _fast_decision = await asyncio.to_thread(
+            laya_decide.decide,
+            {"prompt": prompt or "", "mode": mode or ""},
+            {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
+        )
+        if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
+            _fast_route = str(_fast_decision.value)
+        _laya_usage = getattr(_fast_decision, "usage", None)
+        if isinstance(_laya_usage, dict) and _laya_usage.get("kind") == "usage":
+            _laya_ev = dict(_laya_usage)
+            _laya_ev["sub"] = True
+            _laya_ev["laya"] = True
+            if not _laya_ev.get("provider_id"):
+                _laya_ev["provider_id"] = getattr(_fast_decision, "provider_id", "") or "local"
+            if not _laya_ev.get("model"):
+                _laya_ev["model"] = getattr(_fast_decision, "model", "") or ""
+            with contextlib.suppress(Exception):
+                queue.put_nowait(_laya_ev)
+        # رویداد فعالیت زنده laya برای پنل راست (زیر todos، فقط چت فعال):
+        # مسیر، اطمینان، انصراف، دلیل و زمان تصمیم — جدا از رویداد usage.
         try:
-            import time as _laya_time
-
-            import laya_decide
-
-            _laya_start = _laya_time.monotonic()
-            _fast_route = laya_decide.fast_route(prompt)
-            _fast_decision = await asyncio.to_thread(
-                laya_decide.decide,
-                {"prompt": prompt or "", "mode": mode or ""},
-                {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
+            _laya_elapsed = int((_laya_time.monotonic() - _laya_start) * 1000)
+        except Exception:  # noqa: BLE001 — تایمر اختیاری است
+            _laya_elapsed = 0
+        try:
+            _laya_display = _fast_decision.display(_fast_route) if hasattr(_fast_decision, "display") else {}
+        except Exception:  # noqa: BLE001 — نمایش اختیاری است
+            _laya_display = {}
+        if isinstance(_laya_display, dict):
+            _laya_act = {
+                "kind": "laya",
+                "route": str(_laya_display.get("route") or _fast_route or "normal"),
+                "confidence": float(_laya_display.get("confidence") or 0.0),
+                "abstained": bool(_laya_display.get("abstained", False)),
+                "reason": str(_laya_display.get("reason") or ""),
+                "handled": bool(_laya_display.get("handled", False)),
+                "provider_id": str(_laya_display.get("provider_id") or getattr(_fast_decision, "provider_id", "") or "local"),
+                "model": str(_laya_display.get("model") or getattr(_fast_decision, "model", "") or ""),
+                "elapsed_ms": _laya_elapsed,
+            }
+            with contextlib.suppress(Exception):
+                queue.put_nowait(_laya_act)
+        if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and _computer_live:
+            user_parts.append(
+                "FAST ROUTE: computer — start with the `computer` tool "
+                "(read_screen first, then ONE sequence call)."
             )
-            if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
-                _fast_route = str(_fast_decision.value)
-            _laya_usage = getattr(_fast_decision, "usage", None)
-            if isinstance(_laya_usage, dict) and _laya_usage.get("kind") == "usage":
-                _laya_ev = dict(_laya_usage)
-                _laya_ev["sub"] = True
-                _laya_ev["laya"] = True
-                if not _laya_ev.get("provider_id"):
-                    _laya_ev["provider_id"] = getattr(_fast_decision, "provider_id", "") or "local"
-                if not _laya_ev.get("model"):
-                    _laya_ev["model"] = getattr(_fast_decision, "model", "") or ""
-                with contextlib.suppress(Exception):
-                    queue.put_nowait(_laya_ev)
-            # رویداد فعالیت زنده laya برای پنل راست (زیر todos، فقط چت فعال):
-            # مسیر، اطمینان، انصراف، دلیل و زمان تصمیم — جدا از رویداد usage.
-            try:
-                _laya_elapsed = int((_laya_time.monotonic() - _laya_start) * 1000)
-            except Exception:  # noqa: BLE001 — تایمر اختیاری است
-                _laya_elapsed = 0
-            try:
-                _laya_display = _fast_decision.display(_fast_route) if hasattr(_fast_decision, "display") else {}
-            except Exception:  # noqa: BLE001 — نمایش اختیاری است
-                _laya_display = {}
-            if isinstance(_laya_display, dict):
-                _laya_act = {
-                    "kind": "laya",
-                    "route": str(_laya_display.get("route") or _fast_route or "normal"),
-                    "confidence": float(_laya_display.get("confidence") or 0.0),
-                    "abstained": bool(_laya_display.get("abstained", False)),
-                    "reason": str(_laya_display.get("reason") or ""),
-                    "handled": bool(_laya_display.get("handled", False)),
-                    "provider_id": str(_laya_display.get("provider_id") or getattr(_fast_decision, "provider_id", "") or "local"),
-                    "model": str(_laya_display.get("model") or getattr(_fast_decision, "model", "") or ""),
-                    "elapsed_ms": _laya_elapsed,
-                }
-                with contextlib.suppress(Exception):
-                    queue.put_nowait(_laya_act)
-            if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and _computer_live:
-                user_parts.append(
-                    "FAST ROUTE: computer — start with the `computer` tool "
-                    "(read_screen first, then ONE sequence call)."
-                )
-            elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
-                user_parts.append(
-                    "FAST ROUTE: browser — start with the browser MCP tools "
-                    "(navigate/snapshot first, avoid web_search)."
-                )
-        except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
-            pass
+        elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
+            user_parts.append(
+                "FAST ROUTE: browser — start with the browser MCP tools "
+                "(navigate/snapshot first, avoid web_search)."
+            )
+    except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
+        pass
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
     # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
     if filtered.get("computer") is not None:
@@ -2490,13 +2611,23 @@ def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
 
     متن + فایل‌های ضمیمه در بخش متنی می‌آیند و عکس‌ها (dataUrl یا مسیر) به
     بخش‌های `image_url` تبدیل می‌شوند؛ بدون عکس پیام تک‌متنه برمی‌گردد.
+    اسکیل‌ها و سرورهای MCP انتخاب‌شده هم در متن تزریق می‌شوند تا مدل بداند
+    کدام ابزار/دستورالعمل این نوبت فعال است.
     """
     _steer_lines = [f"- {s.get('prompt')}" for s in steers]
     _steer_atts: list[str] = []
     _steer_imgs: list = []
+    _steer_skills: list[str] = []
+    _steer_mcp: dict = {}
     for _s in steers:
         _steer_atts.extend(_s.get("attachments") or [])
         _steer_imgs.extend(_s.get("images") or [])
+        for _name in _s.get("skills") or []:
+            if _name and _name not in _steer_skills:
+                _steer_skills.append(_name)
+        _servers = _s.get("mcp_servers") or {}
+        if isinstance(_servers, dict):
+            _steer_mcp.update(_servers)
     _steer_text = (
         "[NEW USER MESSAGE DURING THIS TASK -- INTERRUPTION]\n"
         + "\n".join(_steer_lines)
@@ -2505,6 +2636,18 @@ def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
         _steer_text += (
             "\nAttached files (in scope — read with the read tool): "
             + ", ".join(f"`{a}`" for a in _steer_atts)
+        )
+    if _steer_skills:
+        _steer_text += (
+            "\nUser-selected skills for this turn: "
+            + ", ".join(f"`{n}`" for n in _steer_skills)
+            + " — load each with the load_skill tool and follow its instructions."
+        )
+    if _steer_mcp:
+        _steer_text += (
+            "\nUser-selected MCP servers for this turn: "
+            + ", ".join(f"`{n}`" for n in sorted(_steer_mcp))
+            + " — their tools are bound under their short names and callable now."
         )
     _steer_text += "\nAddress it before the next step."
     _steer_uris = _agents._load_images(_steer_imgs)
@@ -2731,6 +2874,8 @@ async def _run_mode_turn(
     """
     chat_id = state.get("chat_id", "")
     ctx = state.get("context_window") or 0
+    cap = state.get("cap") or {}
+    root = state.get("root", "")
     # The `mode` parameter is authoritative for THIS turn. `reader_answer` and
     # other nodes mutate `state["mode"]` on the shared LangGraph state, so we
     # copy it and override with the parameter before building the context —
@@ -2918,7 +3063,7 @@ async def _run_mode_turn(
     _step_progress = 0
 
     async def _inner() -> str:
-        nonlocal model, _step_progress
+        nonlocal model, _step_progress, mcp_cleanup
         # NOTE: `msgs` aliases the OUTER `messages` list so completed tool work
         # (tool calls + their results) survives a retry. On a transient throttle
         # we re-run the loop from the SAME accumulated transcript -- the model
@@ -2980,6 +3125,61 @@ async def _run_mode_turn(
             if steers:
                 # ساخت پیام چندبخشی با همان قرارداد ترن عادی تا عکس هم به مدل برسد
                 msgs.append(_steer_to_human_message(steers))
+                # ابزارهای همراه steer: اسکیل‌ها به متن تزریق شدند؛ سرورهای MCP
+                # باید واقعاً وصل شوند تا ابزارشان قابل فراخوانی باشد.
+                _steer_mcp: dict = {}
+                _steer_skills: list[str] = []
+                for _s in steers:
+                    _srv = _s.get("mcp_servers") or {}
+                    if isinstance(_srv, dict):
+                        _steer_mcp.update(_srv)
+                    for _name in _s.get("skills") or []:
+                        if _name and _name not in _steer_skills:
+                            _steer_skills.append(_name)
+                if _steer_mcp:
+                    try:
+                        _new_tools, _new_cleanup = await build_mcp_tools(
+                            _steer_mcp,
+                            lambda ev: queue.put_nowait(ev),
+                            reserved_names=set(filtered),
+                        )
+                        if _new_tools:
+                            _browser_live = merge_mcp_tools(filtered, _new_tools, cap)
+                            for _t in _new_tools:
+                                lc_tools.append(_t)
+                            msgs.append(
+                                HumanMessage(
+                                    content=_mcp_tools_note(_new_tools, _browser_live)
+                                )
+                            )
+                            if _new_cleanup is not None:
+                                _prev_cleanup = mcp_cleanup
+                                if _prev_cleanup is None:
+                                    mcp_cleanup = _new_cleanup
+                                else:
+                                    async def _combined_cleanup(
+                                        _a=_prev_cleanup, _b=_new_cleanup
+                                    ) -> None:
+                                        with contextlib.suppress(Exception):
+                                            await _a()
+                                        with contextlib.suppress(Exception):
+                                            await _b()
+
+                                    mcp_cleanup = _combined_cleanup
+                    except Exception:  # noqa: BLE001, S110 — steer must never break the turn
+                        pass
+                if _steer_skills:
+                    try:
+                        _skill_section = _build_skills_section(
+                            _steer_skills,
+                            root,
+                            emit=lambda ev: queue.put_nowait(ev),
+                            catalog=False,
+                        )
+                        if _skill_section:
+                            msgs.append(HumanMessage(content=_skill_section))
+                    except Exception:  # noqa: BLE001, S110 — steer must never break the turn
+                        pass
                 queue.put_nowait(
                     {"kind": "steer_applied", "ids": [s.get("id", "") for s in steers]}
                 )

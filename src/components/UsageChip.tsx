@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import {
   formatTokens,
@@ -203,8 +204,27 @@ function splitTooltip(
     .join(" · ");
 }
 
+/** Viewport-aware anchor for the usage popover (pure so it is testable).
+ *  Clamps the chip's left edge so the fixed popover never overflows the
+ *  viewport horizontally; vertical anchor is always just below the chip. */
+export function computeUsagePopoverPos(
+  rect: { left: number; bottom: number },
+  viewportWidth: number,
+  popoverWidth = 400,
+  gap = 6,
+): { top: number; left: number } {
+  const left = Math.max(
+    8,
+    Math.min(rect.left, Math.max(8, viewportWidth - popoverWidth - 8)),
+  );
+  return { top: rect.bottom + gap, left };
+}
+
 export interface UsagePopoverProps {
   view: UsageView;
+  style?: React.CSSProperties;
+  onMouseEnter?: () => void;
+  onMouseLeave?: () => void;
 }
 
 /**
@@ -213,13 +233,16 @@ export interface UsagePopoverProps {
  * with a seeded view — no store access. The reset button lives inside the
  * titlebar chip pill (see UsageChip), not here.
  */
-function UsagePopoverImpl({ view }: UsagePopoverProps) {
+function UsagePopoverImpl({ view, style, onMouseEnter, onMouseLeave }: UsagePopoverProps) {
   return (
     <div
       className="usage-popover"
       dir="ltr"
       role="dialog"
       aria-label="Token usage details"
+      style={style}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
     >
       <div className="usage-groups">
         {view.groups.map((g) => (
@@ -355,6 +378,8 @@ export function UsageChip() {
   );
 
   const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const chipRef = useRef<HTMLDivElement | null>(null);
   const closeTimer = useRef<number | null>(null);
   const cancelClose = () => {
     if (closeTimer.current !== null) {
@@ -370,14 +395,49 @@ export function UsageChip() {
   };
   const openNow = () => {
     cancelClose();
+    // Anchor from the chip rect so the portaled popover sits just below it.
+    // Guarded for SSR (no window/document) — falls back to CSS anchoring.
+    if (chipRef.current && typeof window !== "undefined") {
+      const r = chipRef.current.getBoundingClientRect();
+      setPos(computeUsagePopoverPos(r, window.innerWidth));
+    }
     setOpen(true);
   };
   useEffect(() => cancelClose, []);
+  // Keep the fixed popover glued under the chip on resize/scroll while open.
+  useEffect(() => {
+    if (!open || typeof window === "undefined") return;
+    const reanchor = () => {
+      const el = chipRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setPos(computeUsagePopoverPos(r, window.innerWidth));
+    };
+    window.addEventListener("resize", reanchor);
+    window.addEventListener("scroll", reanchor, true);
+    return () => {
+      window.removeEventListener("resize", reanchor);
+      window.removeEventListener("scroll", reanchor, true);
+    };
+  }, [open]);
 
   if (view.groups.length === 0) return null;
 
+  // Portaled so .titlebar{overflow:hidden} cannot clip the popover; falls back
+  // to inline (CSS-anchored) rendering under SSR where document is missing.
+  const canPortal = typeof document !== "undefined";
+  const popoverNode = open ? (
+    <UsagePopover
+      view={view}
+      style={pos ? { position: "fixed", top: pos.top, left: pos.left } : undefined}
+      onMouseEnter={cancelClose}
+      onMouseLeave={scheduleClose}
+    />
+  ) : null;
+
   return (
     <div
+      ref={chipRef}
       className="usage-chip"
       dir="ltr"
       role="button"
@@ -433,7 +493,9 @@ export function UsageChip() {
       >
         ↺
       </button>
-      {open && <UsagePopover view={view} />}
+      {canPortal && popoverNode
+        ? createPortal(popoverNode, document.body)
+        : popoverNode}
     </div>
   );
 }

@@ -406,6 +406,21 @@ async def _run_due_schedules(now: float | None = None) -> int:
         except Exception:
             continue
         if not due:
+            # heal: next_run گم‌شده یا stale (قدیمی‌تر از grace) را تازه کن تا
+            # تسک گیر نکند — ولی ران missed اجرا نمی‌شود (بدون catch-up).
+            try:
+                nxt_raw = task.get("next_run")
+                nxt_f = float(nxt_raw) if nxt_raw else None
+            except (TypeError, ValueError):
+                nxt_f = None
+            stale = nxt_f is None or (nxt_f <= now and (now - nxt_f) > scheduler.DUE_GRACE_SECONDS)
+            if stale:
+                try:
+                    fresh = state_db.get_schedule(sid) or task
+                    fresh["next_run"] = scheduler.compute_next_run(fresh, now)
+                    state_db.save_schedule(fresh)
+                except Exception:
+                    pass
             continue
         _SCHEDULE_RUNNING.add(sid)
         # next_run را همین‌جا جلو ببر تا تیک بعدی حلقه (۳۰ ثانیه بعد) همان
@@ -694,6 +709,17 @@ async def schedules_upsert(req: ScheduleUpsertRequest) -> dict:
         saved["next_run"] = scheduler.compute_next_run(saved)
     except Exception:
         saved["next_run"] = None
+    # next_run محاسبه‌شده را روی دیسک هم persist کن — حلقه پس‌زمینه فقط روی
+    # next_run ذخیره‌شده تصمیم می‌گیرد (is_due) و بدون این، تسک تازه هیچ‌وقت
+    # due نمی‌شود و در زمان تعیین‌شده اجرا نمی‌کند.
+    if saved.get("next_run"):
+        try:
+            persisted = dict(saved)
+            # save_schedule خودش next_run گذشته را پاک می‌کند؛ اینجا مقدار
+            # آینده است پس نگه داشته می‌شود.
+            state_db.save_schedule(persisted)
+        except Exception:
+            pass
     return {"schedule": saved}
 
 
@@ -753,10 +779,32 @@ async def schedules_runs_clear(schedule_id: str) -> dict:
     """پاک‌کردن چت اینباکس یک کرون: حذف همه اجراهای همان تسک."""
     import state_db
 
+    # تسک حذف‌شده هم ممکن است ران یتیم داشته باشد؛ به‌جای 404 آن‌ها را پاک کن
+    # تا دکمه Clear فرانت همیشه کار کند.
     if state_db.get_schedule(schedule_id) is None:
-        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+        removed = state_db.delete_schedule_runs(schedule_id)
+        return {"ok": True, "removed": removed}
     removed = state_db.delete_schedule_runs(schedule_id)
     return {"ok": True, "removed": removed}
+
+
+@app.delete("/schedule-runs/orphans")
+async def schedule_runs_orphans_clear() -> dict:
+    """حذف همه ران‌های یتیم (ران تسک‌های حذف‌شده)."""
+    import state_db
+
+    removed = state_db.delete_orphan_schedule_runs()
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/schedule-runs/{run_id}")
+async def schedule_run_delete(run_id: str) -> dict:
+    """حذف تکی یک ران با id."""
+    import state_db
+
+    if not state_db.delete_schedule_run(run_id):
+        raise HTTPException(status_code=404, detail="ران یافت نشد")
+    return {"ok": True}
 
 
 @app.get("/schedule-runs")
@@ -886,7 +934,9 @@ class CompactRequest(BaseModel):
     fallback_api_key: str = ""
     fallback_env_var: str = ""
     fallback_provider_id: str = ""
-    # Conversation history to compact, as plain {role, content} turns.
+    # Conversation history to compact — full-fidelity turns (role, content,
+    # toolActivity, plan, mode, preservedToolSummary) so the summarizer sees
+    # WHAT tools ran, not just prose.
     history: list[dict] = []
     context_window: int = 0
     # Default matches the auto-compact `compact_at_percent` (80) and the UI's
@@ -1580,7 +1630,7 @@ async def transcribe(request: Request) -> dict:
 
         if provider_kind and provider_kind != "local":
             return await _transcribe_remote(
-                data, provider_kind, base_url, api_key, env_var, stt_model, lang
+                data, provider_kind, base_url, api_key, env_var, stt_model, lang,
             )
 
         from faster_whisper.audio import decode_audio
@@ -1666,7 +1716,9 @@ async def text_to_speech(req: TtsRequest) -> Response:
     Local TTS is not supported yet — `provider: local` (or empty) is rejected
     with a clear 400. Remote providers are forwarded to
     `POST {base_url}/audio/speech` with {"model", "input", "voice"} and the
-    raw audio bytes are returned with the upstream content type.
+    audio bytes are streamed back (StreamingResponse) as they arrive from the
+    upstream, so the first bytes reach the player without waiting for the full
+    clip. Falls back to a buffered Response only when streaming is unavailable.
     """
     import httpx
 
@@ -1697,16 +1749,48 @@ async def text_to_speech(req: TtsRequest) -> Response:
     tts_voice = (req.voice or "").strip()
     if tts_voice:
         payload["voice"] = tts_voice
+    # Open the upstream in streaming mode so bytes are forwarded immediately.
+    # The client/response pair is closed in the generator's finally block after
+    # the stream ends (or the downloader disconnects and FastAPI cancels us).
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
+        client = httpx.AsyncClient(timeout=120.0)
+        upstream_req = client.build_request("POST", url, headers=headers, json=payload)
+        upstream = await client.send(upstream_req, stream=True)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"remote speech synthesis failed: {exc}") from exc
-    if resp.status_code >= 400:
-        detail = resp.text.strip()[:500] or f"remote speech synthesis failed ({resp.status_code})"
+    if upstream.status_code >= 400:
+        try:
+            err_body = (await upstream.aread()).decode("utf-8", errors="replace").strip()[:500]
+        except Exception:  # noqa: BLE001, S110 — error body is best-effort
+            err_body = ""
+        try:
+            await upstream.aclose()
+        except Exception:  # noqa: BLE001, S110 — cleanup must not raise
+            pass
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001, S110 — cleanup must not raise
+            pass
+        detail = err_body or f"remote speech synthesis failed ({upstream.status_code})"
         raise HTTPException(status_code=502, detail=detail)
-    media_type = (resp.headers.get("content-type") or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
-    return Response(content=resp.content, media_type=media_type)
+    media_type = (upstream.headers.get("content-type") or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
+
+    async def _audio_stream():
+        try:
+            async for chunk in upstream.aiter_bytes(chunk_size=32 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                await upstream.aclose()
+            except Exception:  # noqa: BLE001, S110 — cleanup must not raise
+                pass
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001, S110 — cleanup must not raise
+                pass
+
+    return StreamingResponse(_audio_stream(), media_type=media_type)
 
 
 def _sse(obj: dict) -> str:
@@ -2356,6 +2440,13 @@ class SteerRequest(BaseModel):
     prompt: str = ""
     attachments: list[str] = []
     images: list = []  # قرارداد یکسان با ChatRequest شامل path و dataUrl
+    mcp_servers: dict = {}
+    skills: list[str] = []
+    # Full-fidelity history snapshot (same shape as ChatRequest.history).
+    # Accepted for forward-compat but intentionally NOT enqueued: a running
+    # turn already holds the live transcript, so re-attaching history here
+    # would duplicate context and waste tokens.
+    history: list[dict] = []
 
 
 @app.post("/chat/steer")
@@ -2378,6 +2469,8 @@ async def chat_steer(req: SteerRequest) -> dict:
             "prompt": req.prompt.strip(),
             "attachments": req.attachments,
             "images": req.images,
+            "mcp_servers": req.mcp_servers,
+            "skills": req.skills,
         },
     )
     return {"ok": True}

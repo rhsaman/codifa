@@ -53,11 +53,11 @@ from tools import (
 )
 
 # Steer messages injected into a RUNNING agent without interrupting it. Keyed
-# by chat_id; each entry is {"id", "prompt", "attachments", "images"}. The
-# frontend POSTs here while the agent is mid-run; the tool wrapper drains them
-# into the next tool call's result, so the model reads the user's message on
-# its very next request after the current tool — no abort, no waiting for the
-# answer to finish.
+# by chat_id; each entry is {"id", "prompt", "attachments", "images",
+# "mcp_servers", "skills"}. The frontend POSTs here while the agent is
+# mid-run; the tool wrapper drains them into the next tool call's result, so
+# the model reads the user's message on its very next request after the
+# current tool — no abort, no waiting for the answer to finish.
 STEER_INBOX: dict[str, list[dict]] = {}
 _STEER_LOCK = asyncio.Lock()
 
@@ -1564,16 +1564,16 @@ def _tool_reuse_note(history: list[dict]) -> str:
                 continue
             args = a.get("args")
             arg_str = _fmt_log_args(args) if args else ""
-            summary = _trim_log_text(a.get("summary"), limit=240)
+            summary = _trim_log_text(a.get("summary"), limit=400)
             line = f"- {tool}({arg_str})"
             if summary:
                 line += f" → {summary}"
             if status == "error":
                 line += " [FAILED]"
             entries.append(line)
-            if len(entries) >= 20:  # keep the note bounded
+            if len(entries) >= 30:  # keep the note bounded
                 break
-        if len(entries) >= 20:
+        if len(entries) >= 30:
             break
     if not entries:
         return ""
@@ -3540,7 +3540,7 @@ async def _compact_history(
                 if status == "error":
                     line += " [FAILED]"
                 lines.append(line)
-                if len(lines) >= 30:
+                if len(lines) >= 40:
                     break
             if lines:
                 extras.append(

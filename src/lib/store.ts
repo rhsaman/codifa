@@ -64,8 +64,11 @@ function sanitizeChats(chats: Chat[]): Chat[] {
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
+    // تاریخچه laya هر چت حفظ می‌شود (per-chat) با سقف تازه‌ترین‌ها تا با ریلود نپرد.
+    const layaRuns = Array.isArray(c.layaRuns) ? c.layaRuns.slice(-MAX_LAYA_RUNS_PER_CHAT) : undefined
     return {
       ...clean,
+      ...(layaRuns !== undefined ? { layaRuns } : {}),
       messages: c.messages.map((m) => {
         const msg = { ...m } as Record<string, unknown>
         delete msg.retry

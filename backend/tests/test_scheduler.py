@@ -100,6 +100,25 @@ def test_is_due_with_next_run():
     assert not scheduler.is_due({"enabled": False, "cron": "", "next_run": 500}, now=1000.0)
 
 
+def test_is_due_recurring_stored_next_run():
+    # باگ اصلی: next_run ذخیره‌شده‌ای که تازه گذشته باید due شود.
+    now = 1000.0
+    due = {"enabled": True, "cron": "*/15 * * * *", "last_run": 100.0, "next_run": now - 10}
+    assert scheduler.is_due(due, now=now)
+    # آینده → هنوز نرسیده
+    future = {"enabled": True, "cron": "*/15 * * * *", "last_run": 100.0, "next_run": now + 600}
+    assert not scheduler.is_due(future, now=now)
+    # بدون next_run → False (حلقه heal می‌کند، بدون burst فوری)
+    missing = {"enabled": True, "cron": "*/15 * * * *", "last_run": 100.0}
+    assert not scheduler.is_due(missing, now=now)
+    # stale خیلی قدیمی (missed دوران مکث) → False، بدون catch-up
+    stale = {"enabled": True, "cron": "*/15 * * * *", "last_run": 100.0, "next_run": now - 80000}
+    assert not scheduler.is_due(stale, now=now)
+    # once هرگز اجرا نشده → True؛ اجرا شده → False
+    assert scheduler.is_due({"enabled": True, "cron": ""}, now=now)
+    assert not scheduler.is_due({"enabled": True, "cron": "", "last_run": 900.0}, now=now)
+
+
 def test_schedule_crud_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(state_db, "data_root", lambda: str(tmp_path))
     saved = state_db.save_schedule({"name": "گزارش", "prompt": "گزارش بده", "cron": "0 9 * * *"})
@@ -124,3 +143,48 @@ def test_schedule_run_history(tmp_path, monkeypatch):
     assert state_db.prune_schedule_runs(task["id"], keep=1) == 1
     assert len(state_db.list_schedule_runs(task["id"])) == 1
     assert r1["id"]
+
+
+def test_run_due_schedules_heals_missing_next_run(tmp_path, monkeypatch):
+    # تسک تکراری بدون next_run ذخیره‌شده: اجرا نمی‌شود ولی next_run تازه
+    # persist می‌شود تا در نوبت بعدی سر وقتش اجرا شود (گیر نمی‌کند).
+    import asyncio
+    import time
+
+    import server
+
+    monkeypatch.setattr(state_db, "data_root", lambda: str(tmp_path))
+    now = time.time()
+    task = state_db.save_schedule({"name": "t", "prompt": "p", "cron": "*/15 * * * *"})
+    assert "next_run" not in task
+    started = asyncio.run(server._run_due_schedules(now=now))
+    assert started == 0
+    healed = state_db.get_schedule(task["id"])
+    assert healed is not None
+    assert float(healed.get("next_run") or 0) > now
+
+
+def test_run_due_schedules_starts_due_task(tmp_path, monkeypatch):
+    # تسک با next_run ذخیره‌شده تازه‌گذشته: حلقه اجرایش را شروع می‌کند.
+    import asyncio
+    import time
+
+    import server
+
+    monkeypatch.setattr(state_db, "data_root", lambda: str(tmp_path))
+    monkeypatch.setattr(server, "_has_recent_running", lambda _sid, _now: False)
+    calls: list[str] = []
+
+    async def _fake_execute(schedule_id: str, run_id: str | None = None) -> None:
+        calls.append(schedule_id)
+
+    monkeypatch.setattr(server, "_execute_schedule", _fake_execute)
+    now = time.time()
+    task = state_db.save_schedule({"name": "t", "prompt": "p", "cron": "*/15 * * * *"})
+    # next_run را مستقیم روی دیسک بگذار (save_schedule مقدار گذشته را پاک می‌کند)
+    raw = dict(state_db.get_schedule(task["id"]) or {})
+    raw["next_run"] = now - 10
+    state_db._atomic_write_json(state_db._schedule_file(task["id"]), raw)
+    started = asyncio.run(server._run_due_schedules(now=now))
+    assert started == 1
+    assert calls == [task["id"]]

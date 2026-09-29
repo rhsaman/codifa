@@ -323,29 +323,30 @@ async def _call_mcp_tool(
     try:
         result = await session.call_tool(tool_name, arguments=kwargs or {})
     except Exception as exc:  # noqa: BLE001
-        if _is_closed_connection_error(exc):
-            # Reconnect the cached session and retry once. The cached session
-            # (and its config) live at module scope; if the reconnect succeeds
-            # the retry runs against the fresh session.
-            if await _reconnect_session(server_name, emit):
-                cached = _session_cache.get(server_name)
-                if cached is not None:
-                    try:
-                        result = await cached.session.call_tool(
-                            tool_name, arguments=kwargs or {}
-                        )
-                    except Exception as retry_exc:  # noqa: BLE001
-                        msg = f"ERROR calling MCP tool {tool_name!r}: {retry_exc}"
-                        emit(
-                            {
-                                "kind": "tool_result",
-                                "tool": tool_name,
-                                "summary": msg,
-                                "status": "error",
-                            }
-                        )
-                        return msg
-                    return _flatten_tool_result(result, qualified, emit)
+        # Reconnect the cached session and retry once. The cached session
+        # (and its config) live at module scope; if the reconnect succeeds
+        # the retry runs against the fresh session.
+        if (
+            _is_closed_connection_error(exc)
+            and await _reconnect_session(server_name, emit)
+            and (cached := _session_cache.get(server_name)) is not None
+        ):
+            try:
+                result = await cached.session.call_tool(
+                    tool_name, arguments=kwargs or {}
+                )
+            except Exception as retry_exc:  # noqa: BLE001
+                msg = f"ERROR calling MCP tool {tool_name!r}: {retry_exc}"
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": tool_name,
+                        "summary": msg,
+                        "status": "error",
+                    }
+                )
+                return msg
+            return _flatten_tool_result(result, qualified, emit)
         msg = f"ERROR calling MCP tool {tool_name!r}: {exc}"
         emit({"kind": "tool_result", "tool": tool_name, "summary": msg, "status": "error"})
         return msg
@@ -457,6 +458,26 @@ def is_browser_mcp_tool(name: str) -> bool:
         return True
     parts = name.split("__", 2)
     return len(parts) == 3 and parts[0] == "mcp" and parts[2].startswith("browser_")
+
+
+def describe_tools(mcp_tools: list | None) -> list[dict]:
+    """نام و توضیح کوتاه ابزارهای زنده MCP برای ورودی laya.
+
+    رتبه‌بندی/انتخاب ابزار (پیش‌فیلتر graph، عملیات rank تول laya) به همین
+    فهرست نیاز دارد؛ توضیح از همان description فشرده‌شده StructuredTool
+    می‌آید. هرگز استثنا نمی‌دهد (خالی = بدون سیگنال، فراخواننده رفتار قبلی).
+    """
+    out: list[dict] = []
+    try:
+        for t in mcp_tools or []:
+            name = str(getattr(t, "name", "") or "").strip()
+            if not name:
+                continue
+            desc = str(getattr(t, "description", "") or "").strip()[:300]
+            out.append({"name": name, "description": desc})
+    except Exception:  # noqa: BLE001 — best-effort
+        return out
+    return out
 
 
 def _short_tool_name(server_name: str, tool_name: str) -> str:

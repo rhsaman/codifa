@@ -322,20 +322,39 @@ def warmup_router() -> bool:
         return False
 
 
+def _first_answer(result: Any) -> Any | None:
+    """اولین جواب typed را از خروجی واقعی Router.predict بیرون می‌کشد."""
+    try:
+        if isinstance(result, dict):
+            answers = result.get("answers")
+            if isinstance(answers, dict) and answers:
+                first_key = next(iter(answers))
+                return answers[first_key]
+    except Exception as exc:  # noqa: BLE001 — خروجی ناهمگون؛ fallback به خود result
+        logger.debug("laya first answer unreadable: %s", exc)
+    return None
+
+
 def _confidence_of(result: Any) -> float:
     """اطمینان ۰ تا ۱ را از خروجی ناهمگون Router.predict استخراج می‌کند."""
-    for attr in ("confidence", "prob", "probability", "score"):
-        try:
-            val = result.get(attr) if isinstance(result, dict) else getattr(result, attr, None)
-        except Exception:  # noqa: BLE001 — خروجی ناهمگون؛ ادامه به ویژگی بعدی
-            logger.debug("laya confidence attr %s unreadable", attr)
-            continue
-        try:
-            num = float(val)
-        except (TypeError, ValueError):
-            continue
-        if 0.0 <= num <= 1.0:
-            return num
+    answer = _first_answer(result)
+    candidates: list[Any] = []
+    if answer is not None:
+        candidates.append(answer)
+    candidates.append(result)
+    for item in candidates:
+        for attr in ("answer_confidence", "confidence", "prob", "probability", "score"):
+            try:
+                val = item.get(attr) if isinstance(item, dict) else getattr(item, attr, None)
+            except Exception:  # noqa: BLE001 — خروجی ناهمگون؛ ادامه به ویژگی بعدی
+                logger.debug("laya confidence attr %s unreadable", attr)
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= num <= 1.0:
+                return num
     return 0.0
 
 
@@ -353,6 +372,21 @@ def _abstained_of(result: Any, value: Any) -> bool:
 
 def _value_of(result: Any) -> Any:
     """مقدار تصمیم را از خروجی ناهمگون Router.predict استخراج می‌کند."""
+    answer = _first_answer(result)
+    if isinstance(answer, dict):
+        for key in ("choice", "label", "value", "decision", "prediction"):
+            if answer.get(key) is not None:
+                return answer[key]
+        if answer.get("type") == "score" and answer.get("score") is not None:
+            try:
+                levels = len(answer.get("legend") or answer.get("probabilities") or [])
+                if levels > 1:
+                    return float(answer["score"]) / float(levels - 1)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            return answer.get("score")
+        if answer.get("type") == "noul" and answer.get("noul") is not None:
+            return answer.get("noul")
     if isinstance(result, dict):
         for key in ("label", "choice", "value", "decision", "prediction"):
             if result.get(key) is not None:
@@ -367,6 +401,84 @@ def _value_of(result: Any) -> Any:
         if val is not None:
             return val
     return result
+
+
+def _normalize_candidates(candidates: Any) -> list[tuple[str, str | None]]:
+    """فهرست نامزدها (رشته یا دیکت name/description) را به (نام، توضیح) تبدیل می‌کند."""
+    out: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    items = candidates if isinstance(candidates, list) else []
+    for item in items:
+        name = ""
+        desc: str | None = None
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("label") or item.get("id") or "").strip()
+            raw_desc = item.get("description", item.get("desc"))
+            if raw_desc is not None:
+                desc = str(raw_desc).strip()[:300] or None
+        else:
+            name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append((name, desc))
+    return out
+
+
+def _to_laya_questions(question: dict) -> dict:
+    """سؤال داخلی (options/candidates) را به فرمت واقعی Router.predict تبدیل می‌کند."""
+    q = question or {}
+    kind = str(q.get("type") or "choice").strip().lower() or "choice"
+    instructions = str(q.get("instructions") or "").strip()[:500]
+    if kind == "choice":
+        raw = q.get("options", q.get("candidates", []))
+        pairs = _normalize_candidates(raw if isinstance(raw, list) else [])
+        if not pairs:
+            return {}
+        if not instructions:
+            instructions = "Pick the best matching option."
+        if all(d is None for _, d in pairs):
+            criteria: Any = [n for n, _ in pairs]
+        else:
+            criteria = {n: (d or "") for n, d in pairs}
+        return {"q": {"type": "choice", "instructions": instructions, "criteria": criteria}}
+    if kind == "score":
+        levels = q.get("levels")
+        if isinstance(levels, list):
+            clean = [str(l).strip() for l in levels if str(l or "").strip()][:8]
+        else:
+            clean = []
+        if not clean:
+            clean = ["not relevant", "somewhat relevant", "relevant", "very relevant"]
+        if not instructions:
+            instructions = "Rate how relevant the candidate is."
+        return {"q": {"type": "score", "instructions": instructions, "criteria": clean}}
+    if kind == "noul":
+        if not instructions:
+            instructions = "Is it true?"
+        crit = q.get("criteria")
+        if isinstance(crit, dict):
+            return {"q": {"type": "noul", "instructions": instructions, "criteria": crit}}
+        return {"q": {"type": "noul", "instructions": instructions}}
+    return {}
+
+
+def _predict_local(router: Any, state: dict, questions: dict) -> Any:
+    """اجرای Router.predict با سقف زمانی کوتاه (بدون بلوکه ماندن نخ)."""
+    import concurrent.futures
+
+    # بدون with: خروج از with هنگام timeout منتظر پایان نخ می‌ماند
+    # (shutdown با wait=True) و مهلت عملاً اعمال نمی‌شد.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = pool.submit(router.predict, state or {}, questions)
+        try:
+            return fut.result(timeout=LOCAL_PREDICT_TIMEOUT)
+        except BaseException:
+            fut.cancel()
+            raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def decide(
@@ -397,21 +509,37 @@ def decide(
             abstained=True, reason=reason,
             usage=_local_usage(repo), provider_id=LAYA_PROVIDER_DEFAULT, model=repo,
         )
-    try:
-        import concurrent.futures
-
-        # بدون with: خروج از with هنگام timeout منتظر پایان نخ می‌ماند
-        # (shutdown با wait=True) و مهلت عملاً اعمال نمی‌شد.
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    questions = _to_laya_questions(question or {})
+    if not questions:
+        # Backward compat: legacy callers/tests pass a bare
+        # {"type": "choice"} with no options and a stub router that
+        # ignores the question shape. Try the raw question once so those
+        # still resolve; real Router rejects it and we fall back below.
         try:
-            fut = pool.submit(router.predict, state or {}, question or {})
-            try:
-                result = fut.result(timeout=LOCAL_PREDICT_TIMEOUT)
-            except BaseException:
-                fut.cancel()
-                raise
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            legacy = _predict_local(router, dict(state or {}), dict(question or {}))
+            value = _value_of(legacy)
+            confidence = _confidence_of(legacy)
+            abstained = _abstained_of(legacy, value)
+            if not abstained and confidence >= threshold and value is not None:
+                return LayaDecision(
+                    handled=True, kind=kind, value=value, confidence=confidence,
+                    abstained=False, reason="local-decision",
+                    usage=_local_usage(repo), provider_id=LAYA_PROVIDER_DEFAULT, model=repo,
+                )
+        except Exception as exc:  # noqa: BLE001 — fall through to bad-question
+            logger.debug("laya legacy question failed: %s", exc)
+        return LayaDecision(
+            handled=False, kind=kind, value=None, confidence=0.0,
+            abstained=True, reason="laya-bad-question",
+            usage=_local_usage(repo), provider_id=LAYA_PROVIDER_DEFAULT, model=repo,
+        )
+    eff_state = dict(state or {})
+    if kind == "score":
+        cand = (question or {}).get("candidate")
+        if cand is not None and "candidate" not in eff_state:
+            eff_state["candidate"] = cand
+    try:
+        result = _predict_local(router, eff_state, questions)
     except Exception as exc:  # noqa: BLE001 — خطای محلی = واگذاری به مدل بزرگ
         reason = "laya-timeout" if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower() else f"laya-error: {exc}"
         return LayaDecision(
@@ -662,6 +790,88 @@ def score(state: dict, candidate: Any, threshold: float = DEFAULT_CONFIDENCE_THR
             usage=out.usage, provider_id=out.provider_id, model=out.model,
         )
     return out
+
+
+def rank(
+    text: str,
+    candidates: Any,
+    top_k: int = 5,
+    instructions: str = "",
+) -> list[dict]:
+    """Generic ranking of candidates against free-form text (no domain hard-coding).
+
+    Fast embedding prefilter in the spirit of ``laya.predict_shortlist``:
+    ranks many options locally before any expensive Router call. Returns at
+    most ``top_k`` dicts sorted by relevance (desc), each with ``name``,
+    ``confidence`` (0-1), ``score`` (raw cosine or overlap count) and
+    ``reason`` (``embedding-rank`` or ``keyword-rank``).
+
+    Empty list means "no signal" — the caller must keep its previous
+    behaviour (full list). Never raises.
+    """
+    pairs = _normalize_candidates(candidates)
+    if not pairs:
+        return []
+    try:
+        limit = int(top_k)
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, len(pairs)))
+    head = str(instructions or "").strip()
+    body = str(text or "").strip()
+    query_text = f"{head}\n{body}".strip()[:4000] if head else body[:4000]
+    if not query_text:
+        return []
+    # Fast path: local embedding cosine (offline e5 model, no Router load).
+    try:
+        from embeddings import embed_passages, embed_queries, model_dir
+
+        if model_dir():
+            option_texts = [n if not d else f"{n}: {d}" for n, d in pairs]
+            qvec = embed_queries([query_text])[0]
+            pvecs = embed_passages(option_texts)
+            scored: list[tuple[str, float, float]] = []
+            for idx, (name, _desc) in enumerate(pairs):
+                pv = pvecs[idx] if idx < len(pvecs) else []
+                try:
+                    dot = sum(a * b for a, b in zip(qvec, pv))
+                    qn = sum(a * a for a in qvec) ** 0.5
+                    pn = sum(b * b for b in pv) ** 0.5
+                    cos = dot / (qn * pn) if qn > 0.0 and pn > 0.0 else 0.0
+                    if not (-1.0 <= cos <= 1.0):
+                        cos = 0.0
+                except Exception:  # noqa: BLE001 — one bad vector skips, not the batch
+                    cos = 0.0
+                conf = max(0.0, min(1.0, cos))
+                scored.append((name, conf, float(cos)))
+            scored.sort(key=lambda item: item[2], reverse=True)
+            return [
+                {"name": n, "confidence": c, "score": s, "reason": "embedding-rank"}
+                for n, c, s in scored[:limit]
+            ]
+    except Exception as exc:  # noqa: BLE001 — fall through to keyword path
+        logger.debug("laya rank embedding path failed: %s", exc)
+    # Fallback: token-overlap ranking (no model needed, modest confidence).
+    try:
+        qtokens = {t for t in re.findall(r"\w+", query_text.lower()) if len(t) >= 2}
+        if not qtokens:
+            return []
+        keyed: list[tuple[str, float, float]] = []
+        for name, desc in pairs:
+            ctokens = set(re.findall(r"\w+", f"{name} {desc or ''}".lower()))
+            overlap = len(qtokens & ctokens)
+            conf = min(0.55, 0.15 + 0.1 * overlap) if overlap else 0.0
+            keyed.append((name, conf, float(overlap)))
+        keyed.sort(key=lambda item: (-item[2], item[0]))
+        if not any(k[2] > 0.0 for k in keyed):
+            return []
+        return [
+            {"name": n, "confidence": c, "score": s, "reason": "keyword-rank"}
+            for n, c, s in keyed[:limit]
+        ]
+    except Exception as exc:  # noqa: BLE001 — no signal, caller falls back
+        logger.debug("laya rank keyword path failed: %s", exc)
+        return []
 
 
 def status() -> dict:

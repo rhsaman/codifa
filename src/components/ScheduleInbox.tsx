@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "../lib/store";
-import { clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
+import { clearOrphanScheduleRuns, clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
 import {
   ensureScheduleNotificationPermission,
   findNewScheduleRuns,
@@ -117,6 +117,10 @@ export function ScheduleInbox() {
   const [clearing, setClearing] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
+  const [orphanOpen, setOrphanOpen] = useState(false);
+  const [clearingOrphans, setClearingOrphans] = useState(false);
+  const [confirmClearOrphans, setConfirmClearOrphans] = useState(false);
+  const [orphanError, setOrphanError] = useState<string | null>(null);
 
   // عرض پنل — با درگ لبهٔ چپ (مثل پنل گیت‌دیف) + ذخیرهٔ محلی.
   const [width, setWidth] = useState(() => {
@@ -353,9 +357,17 @@ export function ScheduleInbox() {
                 );
               })
             )}
-            {orphanRuns.length > 0 && orderedSchedules.length > 0 && (
-              <div className="schedule-runs-empty">
-                {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""} below
+            {orphanRuns.length > 0 && (
+              <div className="schedule-inbox-orphan-toggle">
+                <button
+                  className="schedule-btn"
+                  title="Show runs from deleted tasks"
+                  aria-label="Show runs from deleted tasks"
+                  aria-expanded={orphanOpen}
+                  onClick={() => setOrphanOpen((v) => !v)}
+                >
+                  {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
+                </button>
               </div>
             )}
           </div>
@@ -363,7 +375,70 @@ export function ScheduleInbox() {
             {!selectedTask ? (
               orphanRuns.length > 0 ? (
                 <div className="schedule-inbox-runs">
-                  <div className="schedule-inbox-prompt-label">Runs from deleted tasks</div>
+                  <div className="schedule-inbox-chat-head">
+                    <span className="schedule-inbox-prompt-label">Runs from deleted tasks</span>
+                    <span className="schedule-inbox-head-spacer" />
+                    {!confirmClearOrphans ? (
+                      <button
+                        className="schedule-btn danger"
+                        title="Delete runs from deleted tasks"
+                        aria-label="Delete runs from deleted tasks"
+                        disabled={clearingOrphans}
+                        onClick={() => {
+                          setOrphanError(null);
+                          setConfirmClearOrphans(true);
+                        }}
+                      >
+                        Clear
+                      </button>
+                    ) : (
+                      <span className="schedule-clear-confirm">
+                        <span className="schedule-clear-text">Delete all?</span>
+                        <button
+                          className="schedule-btn danger"
+                          title="Confirm delete"
+                          aria-label="Confirm delete"
+                          disabled={clearingOrphans}
+                          onClick={() => {
+                            setClearingOrphans(true);
+                            setOrphanError(null);
+                            void clearOrphanScheduleRuns()
+                              .then((out) => {
+                                if ("error" in out) {
+                                  setOrphanError(out.error);
+                                  return;
+                                }
+                                setRuns((prev) =>
+                                  prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
+                                );
+                                setConfirmClearOrphans(false);
+                                setOrphanOpen(false);
+                                void refresh();
+                              })
+                              .catch((err: unknown) => {
+                                setOrphanError(err instanceof Error ? err.message : String(err));
+                              })
+                              .finally(() => setClearingOrphans(false));
+                          }}
+                        >
+                          {clearingOrphans ? "Clearing…" : "Yes"}
+                        </button>
+                        <button
+                          className="schedule-btn"
+                          title="Cancel"
+                          aria-label="Cancel"
+                          disabled={clearingOrphans}
+                          onClick={() => {
+                            setConfirmClearOrphans(false);
+                            setOrphanError(null);
+                          }}
+                        >
+                          No
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                  {orphanError && <div className="schedule-error">{orphanError}</div>}
                   {orphanRuns.slice(0, 20).map((r) => (
                     <InboxRunCard key={r.id} run={r} />
                   ))}
@@ -462,20 +537,191 @@ export function ScheduleInbox() {
                       </button>
                     )}
                     {orphanRuns.length > 0 && (
-                      <div className="schedule-inbox-runs">
-                        <div className="schedule-inbox-prompt-label">Runs from deleted tasks</div>
-                        {orphanRuns.slice(0, 20).map((r) => (
-                          <InboxRunCard key={r.id} run={r} />
-                        ))}
+                      <div className="schedule-inbox-orphan-section">
+                        <div className="schedule-inbox-orphan-head">
+                          <button
+                            className="schedule-btn"
+                            title="Show runs from deleted tasks"
+                            aria-label="Show runs from deleted tasks"
+                            aria-expanded={orphanOpen}
+                            onClick={() => setOrphanOpen((v) => !v)}
+                          >
+                            {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
+                          </button>
+                          <span className="schedule-inbox-head-spacer" />
+                          <button
+                            className="review-header-btn"
+                            title="Refresh deleted runs"
+                            aria-label="Refresh deleted runs"
+                            onClick={() => {
+                              setLoading(true);
+                              void refresh().finally(() => setLoading(false));
+                            }}
+                          >
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></svg>
+                          </button>
+                          {!confirmClearOrphans ? (
+                            <button
+                              className="schedule-btn danger"
+                              title="Delete runs from deleted tasks"
+                              aria-label="Delete runs from deleted tasks"
+                              disabled={clearingOrphans}
+                              onClick={() => {
+                                setOrphanError(null);
+                                setConfirmClearOrphans(true);
+                              }}
+                            >
+                              Clear
+                            </button>
+                          ) : (
+                            <span className="schedule-clear-confirm">
+                              <span className="schedule-clear-text">Delete all?</span>
+                              <button
+                                className="schedule-btn danger"
+                                title="Confirm delete"
+                                aria-label="Confirm delete"
+                                disabled={clearingOrphans}
+                                onClick={() => {
+                                  setClearingOrphans(true);
+                                  setOrphanError(null);
+                                  void clearOrphanScheduleRuns()
+                                    .then((out) => {
+                                      if ("error" in out) {
+                                        setOrphanError(out.error);
+                                        return;
+                                      }
+                                      setRuns((prev) =>
+                                        prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
+                                      );
+                                      setConfirmClearOrphans(false);
+                                      setOrphanOpen(false);
+                                      void refresh();
+                                    })
+                                    .catch((err: unknown) => {
+                                      setOrphanError(err instanceof Error ? err.message : String(err));
+                                    })
+                                    .finally(() => setClearingOrphans(false));
+                                }}
+                              >
+                                {clearingOrphans ? "Clearing…" : "Yes"}
+                              </button>
+                              <button
+                                className="schedule-btn"
+                                title="Cancel"
+                                aria-label="Cancel"
+                                disabled={clearingOrphans}
+                                onClick={() => {
+                                  setConfirmClearOrphans(false);
+                                  setOrphanError(null);
+                                }}
+                              >
+                                No
+                              </button>
+                            </span>
+                          )}
+                        </div>
+                        {orphanError && <div className="schedule-error">{orphanError}</div>}
+                        {orphanOpen && (
+                          <div className="schedule-inbox-runs">
+                            {orphanRuns.slice(0, 20).map((r) => (
+                              <InboxRunCard key={r.id} run={r} />
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </>
                 ) : (
-                  <div className="schedule-inbox-runs">
-                    {displayedRuns.map((r) => (
-                      <InboxRunCard key={r.id} run={r} />
-                    ))}
-                  </div>
+                  <>
+                    <div className="schedule-inbox-runs">
+                      {displayedRuns.map((r) => (
+                        <InboxRunCard key={r.id} run={r} />
+                      ))}
+                    </div>
+                    {orphanRuns.length > 0 && (
+                      <div className="schedule-inbox-orphan-section">
+                        <div className="schedule-inbox-orphan-head">
+                          <button
+                            className="schedule-btn"
+                            title="Show runs from deleted tasks"
+                            aria-label="Show runs from deleted tasks"
+                            aria-expanded={orphanOpen}
+                            onClick={() => setOrphanOpen((v) => !v)}
+                          >
+                            {orphanOpen ? "Hide" : "Show"} {orphanRuns.length} run{orphanRuns.length > 1 ? "s" : ""} from deleted task{orphanRuns.length > 1 ? "s" : ""}
+                          </button>
+                          <span className="schedule-inbox-head-spacer" />
+                          {!confirmClearOrphans ? (
+                            <button
+                              className="schedule-btn danger"
+                              title="Delete runs from deleted tasks"
+                              aria-label="Delete runs from deleted tasks"
+                              disabled={clearingOrphans}
+                              onClick={() => {
+                                setOrphanError(null);
+                                setConfirmClearOrphans(true);
+                              }}
+                            >
+                              Clear
+                            </button>
+                          ) : (
+                            <span className="schedule-clear-confirm">
+                              <span className="schedule-clear-text">Delete all?</span>
+                              <button
+                                className="schedule-btn danger"
+                                title="Confirm delete"
+                                aria-label="Confirm delete"
+                                disabled={clearingOrphans}
+                                onClick={() => {
+                                  setClearingOrphans(true);
+                                  setOrphanError(null);
+                                  void clearOrphanScheduleRuns()
+                                    .then((out) => {
+                                      if ("error" in out) {
+                                        setOrphanError(out.error);
+                                        return;
+                                      }
+                                      setRuns((prev) =>
+                                        prev.filter((r) => schedules.some((t) => t.id === r.schedule_id)),
+                                      );
+                                      setConfirmClearOrphans(false);
+                                      setOrphanOpen(false);
+                                      void refresh();
+                                    })
+                                    .catch((err: unknown) => {
+                                      setOrphanError(err instanceof Error ? err.message : String(err));
+                                    })
+                                    .finally(() => setClearingOrphans(false));
+                                }}
+                              >
+                                {clearingOrphans ? "Clearing…" : "Yes"}
+                              </button>
+                              <button
+                                className="schedule-btn"
+                                title="Cancel"
+                                aria-label="Cancel"
+                                disabled={clearingOrphans}
+                                onClick={() => {
+                                  setConfirmClearOrphans(false);
+                                  setOrphanError(null);
+                                }}
+                              >
+                                No
+                              </button>
+                            </span>
+                          )}
+                        </div>
+                        {orphanError && <div className="schedule-error">{orphanError}</div>}
+                        {orphanOpen && (
+                          <div className="schedule-inbox-runs">
+                            {orphanRuns.slice(0, 20).map((r) => (
+                              <InboxRunCard key={r.id} run={r} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             )}

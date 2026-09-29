@@ -26,8 +26,8 @@ import re
 from retrieval import Hit, RetrievalSettings, retrieve
 from vector_store import KIND_FILE, KIND_MEMORY, KIND_WEB, VectorStore
 
-_DEFAULT_MAX_CHARS = 3_600
-_DEFAULT_PER_SECTION = 1_400
+_DEFAULT_MAX_CHARS = 8_000
+_DEFAULT_PER_SECTION = 2_500
 
 # Titles for each injected section.
 _SECTION_TITLES = {
@@ -95,9 +95,6 @@ def build_context(
     parts: list[str] = []
     used = 0
     for kind in order:
-        # RAG فقط برای وب/fetch — کد پروژه از طریق CODE MAP تزریق می‌شه.
-        if kind == KIND_FILE:
-            continue
         if kind not in settings.active_kinds():
             continue
         try:
@@ -137,6 +134,8 @@ def build_context_with_memory(
     (which also touches their TTL) aren't fetched twice through different
     paths.
     """
-    # RAG context injection حذف شد — فقط tool-level recall فعاله
-    # (web_search_tool و fetch_url_tool خودشون از RAG recall می‌کنن)
-    return (memory_block or "").strip()
+    rag_block = build_context(store, prompt, settings, max_chars=max_chars)
+    mem = (memory_block or "").strip()
+    if rag_block and mem:
+        return f"{mem}\n{rag_block}".strip()
+    return (rag_block or mem).strip()

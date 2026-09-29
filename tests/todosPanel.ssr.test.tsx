@@ -255,6 +255,26 @@ console.log("۱۶) پنل راست — تاگل استور و لایه‌بند�
   check("زدایندکس پنل راست پشت اورلی دیف است", zRight < zReview, { zRight, zReview })
 }
 
+console.log("۱۷) باز شدن خودکار پنل — فقط ساخت تازه وقتی پنل بسته است:")
+{
+  const { shouldAutoOpenTodosPanel } = await import("../src/components/TodosPanel")
+  check("بسته + تازه (۰→۳) → باز شود", shouldAutoOpenTodosPanel(0, 3, false) === true)
+  check("پنل باز است → باز نشود", shouldAutoOpenTodosPanel(0, 3, true) === false)
+  check("آپدیت وضعیت (۲→۳) → باز نشود", shouldAutoOpenTodosPanel(2, 3, false) === false)
+  check("بدون تودو (۰→۰) → باز نشود", shouldAutoOpenTodosPanel(0, 0, false) === false)
+}
+
+console.log("۱۸) چت جدید — پنل راست دیفالت بسته است:")
+{
+  const { useStore } = await import("../src/lib/store")
+  useStore.getState().setRightPanelOpen(true)
+  useStore.getState().newChat("ask")
+  check("newChat پنل باز را می‌بندد", useStore.getState().rightPanelOpen === false)
+  useStore.getState().setRightPanelOpen(true)
+  useStore.getState().newChatInRoot("", "ask")
+  check("newChatInRoot پنل باز را می‌بندد", useStore.getState().rightPanelOpen === false)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

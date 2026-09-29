@@ -516,6 +516,43 @@ async def test_read_ranges_same_file_two_windows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_edit_file_batch_applies_all_edits_atomically(tmp_path):
+    """چند ویرایش هم‌فایل در یک فراخوانی edit_file با edits=[...] — یک
+    checkpoint/diff/verify به‌جای N راندتریپ ترتیبی؛ خطا در هر عضو یعنی
+    هیچ‌چیز نوشته نمی‌شود (atomic)."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    root = str(tmp_path)
+    captured: list[dict] = []
+
+    def emit(event: dict) -> None:
+        captured.append(event)
+
+    cbs = tools.make_tool_callbacks(root, emit)
+    out = await cbs["edit_file"](
+        path="a.py",
+        edits=[
+            {"old_string": "alpha", "new_string": "ALPHA"},
+            {"old_string": "gamma", "new_string": "GAMMA"},
+        ],
+    )
+    assert "2 edits" in out
+    assert (tmp_path / "a.py").read_text() == "ALPHA\nbeta\nGAMMA\n"
+    # فقط یک diff برای کل بچ (نه یکی به‌ازای هر ویرایش).
+    assert sum(1 for e in captured if e.get("kind") == "diff") == 1
+    # عضو نامعتبر → هیچ‌چیز نوشته نمی‌شود.
+    (tmp_path / "b.py").write_text("one\ntwo\n")
+    out2 = await cbs["edit_file"](
+        path="b.py",
+        edits=[
+            {"old_string": "one", "new_string": "ONE"},
+            {"old_string": "missing", "new_string": "X"},
+        ],
+    )
+    assert out2.startswith("ERROR")
+    assert (tmp_path / "b.py").read_text() == "one\ntwo\n"
+
+
+@pytest.mark.asyncio
 async def test_read_batch_partial_failure_footer(tmp_path):
     """رگرسیون «خواندن دسته‌ای خطا داد»: یک فایل خطادار در batch نباید کل
     نتیجه را ERROR جلوه دهد — فایل‌های سالم عادی خوانده می‌شوند و خطاها

@@ -62,7 +62,7 @@ def bootstrap() -> None:
     missing a directory.
     """
     data_root()
-    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir(), workspace_summaries_dir()):
+    for d in (skills_dir(), mcp_dir(), plans_dir(), models_dir(), workspace_summaries_dir(), schedules_dir(), schedule_runs_dir()):
         os.makedirs(d, exist_ok=True)
     os.makedirs(vector_db_dir(), exist_ok=True)
     sp = settings_path()
@@ -115,6 +115,14 @@ def skills_dir() -> str:
 
 def mcp_dir() -> str:
     return os.path.join(data_root(), "mcp")
+
+
+def schedules_dir() -> str:
+    return os.path.join(data_root(), "schedules")
+
+
+def schedule_runs_dir() -> str:
+    return os.path.join(schedules_dir(), "runs")
 
 
 def models_dir() -> str:
@@ -313,6 +321,10 @@ _DEFAULT_SETTINGS_KEYS = frozenset(
         "sttModel",
         "embeddingModel",
         "embeddingBaseUrl",
+        "layaModel",
+        "layaBaseUrl",
+        "layaProviderId",
+        "layaProviderModel",
         "ragWebTtlDays",
         "subagentModels",
         "memory",
@@ -1005,6 +1017,164 @@ def prune_orphan_plans() -> int:
         return removed
     except OSError:
         return 0
+
+
+# -- schedules (زمان‌بندی خودکار تسک‌ها، مثل Codex) ------------------------ #
+# هر تسک یک فایل ``schedules/<id>.json`` است؛ تاریخچه اجراها در
+# ``schedules/runs/<run-id>.json`` با فیلد ``schedule_id`` ذخیره می‌شود.
+# همه نوشتن‌ها اتمیک (tmp + os.replace) و زیر قفل ماژول هستند.
+
+
+def _schedule_file(schedule_id: str) -> str:
+    return os.path.join(schedules_dir(), f"{_safe_file(schedule_id, 'schedule')}.json")
+
+
+def list_schedules() -> list[dict]:
+    """همه تسک‌های زمان‌بندی‌شده را برگردان (مرتب بر اساس created_at)."""
+    base = schedules_dir()
+    if not os.path.isdir(base):
+        return []
+    out: list[dict] = []
+    with _LOCK:
+        for fn in sorted(os.listdir(base)):
+            if not fn.endswith(".json"):
+                continue
+            obj = _read_json(os.path.join(base, fn))
+            if isinstance(obj, dict) and obj.get("id"):
+                out.append(obj)
+    out.sort(key=lambda t: float(t.get("created_at") or 0))
+    return out
+
+
+def get_schedule(schedule_id: str) -> dict | None:
+    """یک تسک را با id بخوان؛ None وقتی وجود ندارد."""
+    if not schedule_id:
+        return None
+    obj = _read_json(_schedule_file(str(schedule_id)))
+    return obj if isinstance(obj, dict) and obj.get("id") else None
+
+
+def save_schedule(task: dict) -> dict:
+    """ایجاد/به‌روزرسانی یک تسک زمان‌بندی (اتمیک). id می‌سازد اگر خالی باشد."""
+    import uuid
+
+    with _LOCK:
+        _migrate_legacy_db()
+        task = dict(task or {})
+        sid = str(task.get("id") or "").strip() or f"sch-{uuid.uuid4().hex[:8]}"
+        now = _now()
+        task["id"] = sid
+        if not isinstance(task.get("created_at"), (int, float)):
+            task["created_at"] = now
+        task["updated_at"] = now
+        task["name"] = str(task.get("name") or task.get("title") or "تسک زمان‌بندی").strip() or "تسک زمان‌بندی"
+        task["prompt"] = str(task.get("prompt") or "")
+        task["cron"] = str(task.get("cron") or "").strip()
+        task["enabled"] = bool(task.get("enabled", True))
+        task["root"] = str(task.get("root") or "")
+        task["mode"] = str(task.get("mode") or "coder")
+        task["provider_id"] = str(task.get("provider_id") or "")
+        task["model"] = str(task.get("model") or "")
+        if not isinstance(task.get("run_count"), int):
+            task["run_count"] = int(task.get("run_count") or 0)
+        # next_run ذخیره‌شده قدیمی (stale) را نگه ندار: اگر در گذشته است،
+        # پنل ساعت گذشته نشان می‌دهد و حلقه ممکن است burst بزند. مقدار تازه
+        # همیشه با compute_next_run از روی max(last_run, now) حساب می‌شود.
+        try:
+            nxt = float(task.get("next_run") or 0)
+        except (TypeError, ValueError):
+            nxt = 0.0
+        if nxt and nxt <= now:
+            task.pop("next_run", None)
+        _atomic_write_json(_schedule_file(sid), task)
+        return task
+
+
+def delete_schedule(schedule_id: str) -> bool:
+    """حذف یک تسک زمان‌بندی. تاریخچه اجراها نگه داشته می‌شود. True وقتی حذف شد."""
+    if not schedule_id:
+        return False
+    with _LOCK:
+        try:
+            os.remove(_schedule_file(str(schedule_id)))
+            return True
+        except OSError:
+            return False
+
+
+def _schedule_run_file(run_id: str) -> str:
+    return os.path.join(schedule_runs_dir(), f"{_safe_file(run_id, 'run')}.json")
+
+
+def list_schedule_runs(schedule_id: str = "", limit: int = 50) -> list[dict]:
+    """تاریخچه اجراها (جدیدترین اول). با schedule_id خالی همه اجراها."""
+    base = schedule_runs_dir()
+    if not os.path.isdir(base):
+        return []
+    out: list[dict] = []
+    try:
+        files = sorted(os.listdir(base), reverse=True)
+    except OSError:
+        return []
+    with _LOCK:
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            obj = _read_json(os.path.join(base, fn))
+            if not isinstance(obj, dict) or not obj.get("id"):
+                continue
+            if schedule_id and str(obj.get("schedule_id") or "") != str(schedule_id):
+                continue
+            out.append(obj)
+            if len(out) >= max(1, int(limit or 50)):
+                break
+    out.sort(key=lambda r: float(r.get("started_at") or 0), reverse=True)
+    return out
+
+
+def save_schedule_run(run: dict) -> dict:
+    """ثبت یک اجرای زمان‌بندی (اتمیک). id می‌سازد اگر خالی باشد."""
+    import uuid
+
+    with _LOCK:
+        run = dict(run or {})
+        rid = str(run.get("id") or "").strip() or f"run-{uuid.uuid4().hex[:8]}"
+        run["id"] = rid
+        if not isinstance(run.get("started_at"), (int, float)):
+            run["started_at"] = _now()
+        _atomic_write_json(_schedule_run_file(rid), run)
+        return run
+
+
+def prune_schedule_runs(schedule_id: str, keep: int = 50) -> int:
+    """اجراهای قدیمی یک تسک را حذف کن؛ فقط ``keep`` تای جدید می‌ماند."""
+    runs = list_schedule_runs(schedule_id, limit=10_000)
+    doomed = runs[max(1, int(keep or 50)):]
+    removed = 0
+    with _LOCK:
+        for r in doomed:
+            try:
+                os.remove(_schedule_run_file(str(r.get("id"))))
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def delete_schedule_runs(schedule_id: str) -> int:
+    """همه اجراهای یک تسک (چت اینباکس آن کرون) را پاک کن؛ تعداد حذف‌شده."""
+    if not schedule_id:
+        return 0
+    runs = list_schedule_runs(str(schedule_id), limit=10_000)
+    removed = 0
+    with _LOCK:
+        for r in runs:
+            try:
+                os.remove(_schedule_run_file(str(r.get("id"))))
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 # -- whole-state snapshot --------------------------------------------------- #

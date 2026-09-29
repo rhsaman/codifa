@@ -6,6 +6,7 @@ import { CodeMapPanel } from './components/CodeMapPanel'
 import { ReviewPanel } from './components/ReviewPanel'
 import { useReviewPanel } from './lib/reviewPanel'
 import { RightPanel } from './components/TodosPanel'
+import { ScheduleInbox, ScheduleInboxButton } from './components/ScheduleInbox'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -247,6 +248,7 @@ export default function App() {
         <UsageChip />
         <UpdateButton />
         <div className="titlebar-workspace">
+          <ScheduleInboxButton />
           <button
             className="dir-toggle"
             title={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
@@ -298,6 +300,7 @@ export default function App() {
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}
       {searchOpen && <SearchOverlay onClose={() => setSearchOpen(false)} />}
+      <ScheduleInbox />
     </div>
   )
 }

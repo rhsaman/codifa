@@ -97,6 +97,59 @@ console.log('۴) دوباره انتخاب کردن یک مدل قدیمی → �
   check('newChat حالا model-A را برمیدارد', chat.model === 'model-A', chat.model)
 }
 
+console.log('۵) پین کردن → پین‌شده بالای لیست می‌ماند و سقف ۳ رعایت می‌شود:')
+{
+  useStore.setState({ recentModels: [] })
+  useStore.getState().addRecentModel('model-A', activeId)
+  useStore.getState().addRecentModel('model-B', activeId)
+  useStore.getState().addRecentModel('model-C', activeId)
+  useStore.getState().addRecentModel('model-D', activeId)
+  // قدیمی‌ترین (A) را پین کن → باید بالای لیست بیاید حتی با اینکه تازه‌ترین نیست
+  check('پین A موفق است', useStore.getState().togglePinRecentModel('model-A', activeId) === true)
+  let rm = useStore.getState().recentModels
+  check('مدل پین‌شده بالای لیست است', rm[0]?.model === 'model-A' && rm[0]?.pinned === true, rm.map((r) => `${r.model}${r.pinned ? '*' : ''}`))
+  // دو تای دیگر را پین کن → سقف ۳ پر می‌شود
+  check('پین B موفق است', useStore.getState().togglePinRecentModel('model-B', activeId) === true)
+  check('پین C موفق است', useStore.getState().togglePinRecentModel('model-C', activeId) === true)
+  // چهارمی نباید پین شود (سقف ۳)
+  check('پین چهارم (D) رد می‌شود', useStore.getState().togglePinRecentModel('model-D', activeId) === false)
+  rm = useStore.getState().recentModels
+  check('فقط ۳ مدل پین‌شده‌اند', rm.filter((r) => r.pinned).length === 3, rm.map((r) => `${r.model}${r.pinned ? '*' : ''}`))
+  check('D پین نشده است', rm.find((r) => r.model === 'model-D')?.pinned !== true)
+  // آنپین A → دوباره D قابل پین شدن است
+  check('آنپین A موفق است (false برمی‌گردد)', useStore.getState().togglePinRecentModel('model-A', activeId) === false)
+  rm = useStore.getState().recentModels
+  check('A دیگر پین نیست', rm.find((r) => r.model === 'model-A')?.pinned !== true)
+  check('حالا پین D موفق است', useStore.getState().togglePinRecentModel('model-D', activeId) === true)
+}
+
+console.log('۶) حذف از لیست اخیر + مصونیت پین‌شده از حذف خودکار:')
+{
+  useStore.setState({ recentModels: [] })
+  useStore.getState().addRecentModel('keep-me', activeId)
+  useStore.getState().togglePinRecentModel('keep-me', activeId)
+  useStore.getState().addRecentModel('other', activeId)
+  // حذف دستی مدل غیرپین
+  useStore.getState().removeRecentModel('other', activeId)
+  let rm = useStore.getState().recentModels
+  check('مدل حذف‌شده از لیست رفته است', !rm.some((r) => r.model === 'other'), rm.map((r) => r.model))
+  check('مدل پین‌شده سر جایش است', rm.some((r) => r.model === 'keep-me' && r.pinned === true))
+  // لیست را با ۲۰+ مدل غیرپین پر کن → پین‌شده نباید با سقف حذف شود
+  for (let i = 0; i < 25; i++) useStore.getState().addRecentModel(`filler-${i}`, activeId)
+  rm = useStore.getState().recentModels
+  check('پین‌شده از حذف خودکار مصون است', rm.some((r) => r.model === 'keep-me' && r.pinned === true), rm.map((r) => r.model))
+  check('پین‌شده هنوز بالای لیست است', rm[0]?.model === 'keep-me', rm.slice(0, 3).map((r) => r.model))
+  // حذف دستی پین‌شده ممکن نیست — اول باید آنپین شود
+  useStore.getState().removeRecentModel('keep-me', activeId)
+  rm = useStore.getState().recentModels
+  check('حذف دستی پین‌شده کار نمی‌کند (مصون است)', rm.some((r) => r.model === 'keep-me' && r.pinned === true))
+  // بعد از آنپین، حذف دستی کار می‌کند
+  useStore.getState().togglePinRecentModel('keep-me', activeId)
+  useStore.getState().removeRecentModel('keep-me', activeId)
+  rm = useStore.getState().recentModels
+  check('بعد از آنپین، حذف دستی کار می‌کند', !rm.some((r) => r.model === 'keep-me'))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

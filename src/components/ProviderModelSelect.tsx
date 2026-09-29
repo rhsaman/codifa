@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderConfig } from "../types";
-import { useStore } from "../lib/store";
+import { MAX_PINNED_RECENT_MODELS, sortRecentModels, useStore } from "../lib/store";
 import { isForeignModelId } from "../lib/provider-meta";
-import { ModelTestButton } from "./ModelTestButton";
+import { ModelTestButton, PinIcon, RemoveIcon } from "./ModelTestButton";
 import { ProviderTestButton } from "./ProviderTestButton";
 import { RecentTestButton } from "./RecentTestButton";
 
@@ -34,6 +34,9 @@ export function ProviderModelSelect() {
   const setProviderConfig = useStore((s) => s.setProviderConfig);
   const setProviderModels = useStore((s) => s.setProviderModels);
   const addRecentModel = useStore((s) => s.addRecentModel);
+  const removeRecentModel = useStore((s) => s.removeRecentModel);
+  const togglePinRecentModel = useStore((s) => s.togglePinRecentModel);
+  const pinnedCount = useStore((s) => s.recentModels.filter((r) => r.pinned).length);
   const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
   const setChatProvider = useStore((s) => s.setChatProvider);
   const [open, setOpen] = useState(false);
@@ -123,12 +126,13 @@ export function ProviderModelSelect() {
   };
 
   // Last 10 used models, resolved to a provider (legacy bare entries are
-  // attributed to the unique provider that owns the model).
+  // attributed to the unique provider that owns the model). Pinned models
+  // always stay on top (most-recent-pinned first), then the rest by recency.
   const recentList = useMemo(() => {
-    const items: Array<{ p: ProviderConfig; model: string }> = [];
+    const items: Array<{ p: ProviderConfig; model: string; pinned: boolean }> = [];
     const seen = new Set<string>();
-    // Sort by lastUsed descending so the most recently used model is first.
-    const ordered = [...recents].sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0));
+    // پین‌شده‌ها اول، بعد بقیه — هر دو گروه تازه‌ترین اول.
+    const ordered = sortRecentModels(recents);
     for (const r of ordered) {
       if (!r.model) continue;
       let p = providers.find((x) => x.id === r.providerId);
@@ -143,7 +147,7 @@ export function ProviderModelSelect() {
       const key = `${p.id}/${model}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      items.push({ p, model });
+      items.push({ p, model, pinned: r.pinned === true });
       if (items.length >= 10) break;
     }
     return items;
@@ -232,10 +236,11 @@ export function ProviderModelSelect() {
                     entries={recentsShown.map(({ p, model }) => ({ cfg: p, model }))}
                   />
                 </div>
-                {recentsShown.map(({ p, model }) => {
+                {recentsShown.map(({ p, model, pinned }) => {
                   const isCurrent = p.id === activeProviderId && model === activeModel;
+                  const pinFull = !pinned && pinnedCount >= MAX_PINNED_RECENT_MODELS;
                   return (
-                    <div key={`${p.id}/${model}`} className="pm-model-row">
+                    <div key={`${p.id}/${model}`} className={`pm-model-row${pinned ? " pinned" : ""}`}>
                       <button
                         type="button"
                         className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
@@ -244,6 +249,42 @@ export function ProviderModelSelect() {
                         <span className="pm-model-provider">{p.name}/</span>
                         <span className="pm-model-name">{model}</span>
                       </button>
+                      <button
+                        type="button"
+                        className={`pm-recent-pin${pinned ? " on" : ""}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          togglePinRecentModel(model, p.id);
+                        }}
+                        title={
+                          pinned
+                            ? `Unpin ${model} (از بالای لیست بردار)`
+                            : pinFull
+                              ? `سقف پین ${MAX_PINNED_RECENT_MODELS} مدل است — اول یکی را آنپین کن`
+                              : `Pin ${model} (همیشه بالای لیست اخیر)`
+                        }
+                        aria-label={pinned ? `Unpin ${model}` : `Pin ${model}`}
+                        aria-pressed={pinned}
+                        disabled={pinFull}
+                      >
+                        <PinIcon filled={pinned} />
+                      </button>
+                      {!pinned && (
+                        <button
+                          type="button"
+                          className="pm-recent-remove"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            removeRecentModel(model, p.id);
+                          }}
+                          title={`Remove ${model} from recent`}
+                          aria-label={`Remove ${model} from recent`}
+                        >
+                          <RemoveIcon />
+                        </button>
+                      )}
                       <ModelTestButton cfg={p} model={model} />
                     </div>
                   );

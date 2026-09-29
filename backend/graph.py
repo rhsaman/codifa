@@ -1897,6 +1897,30 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
     if mcp_tools:
         user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
+    # مسیر سریع laya: قبل از مدل بزرگ، computer/browser/normal را حدس بزن تا
+    # مدل با ابزار درست و توکن کمتر شروع کند (best-effort، هرگز خطا نمی‌دهد).
+    try:
+        import laya_decide
+
+        _fast_route = laya_decide.fast_route(prompt)
+        _fast_decision = laya_decide.decide(
+            {"prompt": prompt or "", "mode": mode or ""},
+            {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
+        )
+        if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
+            _fast_route = str(_fast_decision.value)
+        if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and filtered.get("computer") is not None:
+            user_parts.append(
+                "FAST ROUTE: computer — start with the `computer` tool "
+                "(read_screen first, then ONE sequence call)."
+            )
+        elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
+            user_parts.append(
+                "FAST ROUTE: browser — start with the browser MCP tools "
+                "(navigate/snapshot first, avoid web_search)."
+            )
+    except Exception:  # noqa: BLE001 — مسیر سریع اختیاری است
+        pass
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
     # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
     if filtered.get("computer") is not None:

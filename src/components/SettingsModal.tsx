@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow } from '../lib/store'
-import { downloadModel, getModelsStatus, listSkills, removeModel, syncSkill, type ModelsStatus } from '../lib/api'
+import { cancelModelDownload, downloadModel, getLayaStatus, getModelsStatus, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type LayaStatus, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
@@ -191,8 +191,12 @@ function ToolModelSelect({
         closeMenu()
       }
     }
-    document.addEventListener('mousedown', onDoc)
-    return () => document.removeEventListener('mousedown', onDoc)
+    // Capture phase: the settings modal root stops mousedown propagation
+    // (onMouseDown={e => e.stopPropagation()}), so a bubble-phase document
+    // listener never fires for clicks inside the modal but outside this
+    // picker — the dropdown would stay open. Capture runs before that stop.
+    document.addEventListener('mousedown', onDoc, true)
+    return () => document.removeEventListener('mousedown', onDoc, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
@@ -266,7 +270,18 @@ function ToolModelSelect({
               if (e.key === 'Escape') { closeMenu(); inputRef.current?.blur() }
             }}
           />
-          <span className="model-select-combo-chevron">{open ? '▴' : '▾'}</span>
+          <span
+            className="model-select-combo-chevron"
+            onMouseDown={(e) => {
+              // The chevron sits inside wrapRef, so the document outside-click
+              // handler ignores it — toggle explicitly so clicking it closes.
+              e.preventDefault()
+              if (open) closeMenu()
+              else openMenu()
+            }}
+          >
+            {open ? '▴' : '▾'}
+          </span>
         </div>
         {open && (
           <div className="model-select-dropdown combo">
@@ -478,6 +493,49 @@ function PluginEditor() {
   )
 }
 
+/**
+ * فچ دستی لیست مدل‌های پروایدر (دکمه‌ی «Fetch models» در تب Providers) — همان
+ * مسیر استارت‌آپ: کاتالوگ زنده‌ی /models معیار قطعی است (مدل حذف/تغییرنام‌شده
+ * از لیست می‌رود)، مدل انتخابی stale ترمیم می‌شود و چت‌ها heal می‌شوند؛ بعد از
+ * موفقیت، callback تازه‌کردنِ مدل انتخابیِ فرم (cfg.model) اجرا می‌شود. جدا از
+ * کامپوننت تا بدون DOM قابل تست باشد — کامپوننت فقط callback های state خود را
+ * می‌دهد و پیام نتیجه (تعداد مدل / دلیل skip / خطا) را زیر دکمه نشان می‌دهد.
+ */
+export async function fetchProviderModels(
+  cfg: ProviderConfig,
+  ctl: {
+    setFetching: (busy: boolean) => void
+    setMsg: (msg: string) => void
+    /** تازه‌کردن مدل انتخابی فرم بعد از موفقیت فچ. */
+    refreshFormModel: () => void
+    /** نتیجه‌ی در پرواز بعد از تعویض پروایدر باید دور ریخته شود. */
+    stale?: () => boolean
+  },
+): Promise<void> {
+  ctl.setFetching(true)
+  ctl.setMsg('')
+  try {
+    const r = await fetchAndPersist(cfg)
+    if (ctl.stale?.()) return
+    if (!r.ok) {
+      ctl.setMsg(
+        'skipped' in r
+          ? r.reason === 'disabled'
+            ? 'Fetch skipped — the provider is disabled.'
+            : 'Fetch skipped — set a base URL first.'
+          : `Fetch failed: ${r.error}`,
+      )
+      return
+    }
+    ctl.refreshFormModel()
+    ctl.setMsg(
+      r.count === 0 ? 'No models returned by the provider.' : `Fetched ${r.count} model${r.count === 1 ? '' : 's'} ✓`,
+    )
+  } finally {
+    if (!ctl.stale?.()) ctl.setFetching(false)
+  }
+}
+
 export function SettingsModal({ onClose, initialTab }: { onClose: () => void; initialTab?: string }) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
@@ -498,6 +556,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
   const setWhisperModel = useStore((s) => s.setWhisperModel)
   const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
+  const layaModel = useStore((s) => s.layaModel)
+  const layaBaseUrl = useStore((s) => s.layaBaseUrl)
+  const setLayaModel = useStore((s) => s.setLayaModel)
+  const setLayaBaseUrl = useStore((s) => s.setLayaBaseUrl)
+  const layaProviderId = useStore((s) => s.layaProviderId)
+  const setLayaProviderId = useStore((s) => s.setLayaProviderId)
+  const layaProviderModel = useStore((s) => s.layaProviderModel)
+  const setLayaProviderModel = useStore((s) => s.setLayaProviderModel)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -553,6 +619,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // طول کانتکست (توکن) مدل دستی — فقط برای پروایدرهای custom نمایش داده می‌شود؛
   // با Add همراه مدل ذخیره و در متر کانتکست به‌جای مقدار زنده اولویت می‌گیرد.
   const [manualContext, setManualContext] = useState('')
+  // وضعیت دکمه‌ی «Fetch models» (تب Providers): حین فچ دکمه غیرفعال می‌شود و
+  // پیام نتیجه (تعداد مدل / دلیل skip / خطا) زیر دکمه نمایش داده می‌شود.
+  const [fetching, setFetching] = useState(false)
+  const [fetchMsg, setFetchMsg] = useState('')
+  // توکن لغو فچ دستی: با تعویض پروایدر افزایش می‌یابد تا نتیجه‌ی در پرواز،
+  // فرمِ پروایدر جدید را با مدلِ پروایدر قدیمی بازنویسی نکند.
+  const fetchSeqRef = useRef(0)
   // Readiness checks for the provider being edited (drives the banner at the
   // top of the form so the problem is visible BEFORE a message is sent).
   const hasSavedKey = !!(cfg.apiKey ?? '').trim()
@@ -602,6 +675,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // ---- Managed on-device models (Settings → Models) ----
   const [mStatus, setMStatus] = useState<ModelsStatus | null>(null)
   const [modelsMsg, setModelsMsg] = useState('')
+  const [layaStatus, setLayaStatus] = useState<LayaStatus | null>(null)
   // ---- Data path (Settings → Memory) ----
   const [dataMsg, setDataMsg] = useState('')
   const [migrating, setMigrating] = useState(false)
@@ -645,22 +719,31 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const refreshModels = useCallback(async () => {
     setMStatus(await getModelsStatus())
+    setLayaStatus(await getLayaStatus())
   }, [])
 
   // Poll while the modal is open so download progress / completion shows live.
+  // 1s cadence while a download is in flight (speed + percent feel live);
+  // 2.5s otherwise to avoid needless traffic.
   useEffect(() => {
     void refreshModels()
-    const id = setInterval(() => void refreshModels(), 2500)
+    const id = setInterval(
+      () => void refreshModels(),
+      mStatus?.whisper?.running || mStatus?.embedding?.running || mStatus?.laya?.running ? 1000 : 2500,
+    )
     return () => clearInterval(id)
-  }, [refreshModels])
+  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running, mStatus?.laya?.running])
 
-  const isRunning = (kind: 'whisper' | 'embedding') =>
-    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
+  const isRunning = (kind: 'whisper' | 'embedding' | 'laya') =>
+    (kind === 'whisper' ? mStatus?.whisper : kind === 'laya' ? mStatus?.laya : mStatus?.embedding)?.running?.state ===
     'downloading'
 
-  const actDownload = async (kind: 'whisper' | 'embedding') => {
-    const repo = kind === 'whisper' ? whisperModel : 'intfloat/multilingual-e5-base'
-    const base = kind === 'whisper' ? whisperBaseUrl : ''
+  const runState = (kind: ManagedModelKind): ModelRunState | undefined =>
+    (kind === 'whisper' ? mStatus?.whisper : kind === 'laya' ? mStatus?.laya : mStatus?.embedding)?.running
+
+  const actDownload = async (kind: 'whisper' | 'embedding' | 'laya') => {
+    const repo = kind === 'whisper' ? whisperModel : kind === 'laya' ? layaModel : 'intfloat/multilingual-e5-base'
+    const base = kind === 'whisper' ? whisperBaseUrl : kind === 'laya' ? layaBaseUrl : ''
     setModelsMsg('')
     try {
       await downloadModel(kind, repo, base)
@@ -671,7 +754,41 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
   }
 
-  const actRemove = async (kind: 'whisper' | 'embedding', repo: string) => {
+  const actPause = async (kind: ManagedModelKind) => {
+    setModelsMsg('')
+    try {
+      await pauseModelDownload(kind)
+      void refreshModels()
+    } catch (err) {
+      setModelsMsg(`Pause failed: ${(err as Error).message}`)
+    }
+  }
+
+  const actResume = async (kind: ManagedModelKind) => {
+    setModelsMsg('')
+    try {
+      await resumeModelDownload(kind)
+      void refreshModels()
+    } catch (err) {
+      setModelsMsg(`Resume failed: ${(err as Error).message}`)
+    }
+  }
+
+  const actCancel = async (kind: ManagedModelKind) => {
+    setModelsMsg('')
+    try {
+      await cancelModelDownload(kind)
+      setModelsMsg('Download stopped. Partial files are kept for later resume.')
+      void refreshModels()
+      // Refresh once more after a beat so the cleared state is visible
+      // even if the first poll raced the background thread.
+      setTimeout(() => void refreshModels(), 800)
+    } catch (err) {
+      setModelsMsg(`Stop failed: ${(err as Error).message}`)
+    }
+  }
+
+  const actRemove = async (kind: 'whisper' | 'embedding' | 'laya', repo: string) => {
     setModelsMsg('')
     try {
       await removeModel(kind, repo)
@@ -806,6 +923,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setCfg({ ...active })
     setManualModel('')
     setManualContext('')
+    // پیام/وضعیت فچ مدل‌ها مال پروایدر قبلی است — با تعویض پروایدر پاک می‌شود
+    // و هر فچ در پرواز باطل می‌شود تا نتیجه‌اش به فرم جدید نرسد.
+    setFetchMsg('')
+    setFetching(false)
+    fetchSeqRef.current++
   }, [editId, active.id])
 
   // Derive the credential method when switching providers: a saved API key wins,
@@ -853,26 +975,23 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return () => { cancelled = true }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // فچ و ذخیره‌ی لیست مدل‌های پروایدر فعال از طریق fetchAndPersist — همان
-  // مسیر یکسان startup: کاتالوگ زنده‌ی /models معیار قطعی است (مدل حذف/
-  // تغییرنام‌شده از لیست می‌رود)، مدل انتخابی stale ترمیم می‌شود و چت‌ها/
-  // recents هم heal می‌شوند. اینجا فقط placeholder فرم (cfg.model) تازه
-  // می‌شود تا کاربر مدل معتبر را در فرم ببیند.
-  useEffect(() => {
-    let cancelled = false
-    void (async () => {
-      const r = await fetchAndPersist(cfg, { cancelled: () => cancelled })
-      if (cancelled || !r.ok) return
-      setCfg((c) => {
-        const fresh = useStore.getState().settings.providers.find((p) => p.id === active.id)
-        return { ...c, model: fresh?.model || c.model }
-      })
-    })()
-    return () => {
-      cancelled = true
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active.id, cfg.baseUrl, cfg.apiKey, cfg.kind])
+  // فچ دستی با دکمه‌ی «Fetch models» — فچ خودکار هنگام افزودن/ویرایش/تعویض
+  // پروایدر حذف شد و فقط با کلیک صریح اجرا می‌شود. نتیجه‌ی در پرواز هنگام
+  // تعویض پروایدر با توکن fetchSeqRef باطل می‌شود.
+  const fetchModelsNow = async () => {
+    if (fetching) return
+    const seq = ++fetchSeqRef.current
+    await fetchProviderModels(cfg, {
+      setFetching,
+      setMsg: setFetchMsg,
+      refreshFormModel: () =>
+        setCfg((c) => {
+          const fresh = useStore.getState().settings.providers.find((p) => p.id === active.id)
+          return { ...c, model: fresh?.model || c.model }
+        }),
+      stale: () => seq !== fetchSeqRef.current,
+    })
+  }
 
   const setPrompt = (mode: string, value: string) =>
     setPromptDrafts((d) => ({ ...d, [mode]: value }))
@@ -1353,6 +1472,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 )}
               </div>
             )}
+
+            <div className="field">
+              <label>Models catalog</label>
+              <button type="button" className="btn" disabled={fetching} onClick={() => void fetchModelsNow()}>
+                {fetching ? 'Fetching…' : 'Fetch models'}
+              </button>
+              {fetchMsg && <div className="hint">{fetchMsg}</div>}
+              <div className="hint">
+                Pulls the live /models list for this provider (ids, context windows, pricing), repairs a
+                stale selected model and heals chats. Nothing is fetched automatically while you edit —
+                run it after changing the base URL or credential.
+              </div>
+            </div>
 
             <div className="field">
               <label>Add model manually</label>
@@ -2030,7 +2162,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
             <div className="hint">
               Pick separate models for the built-in tools (web, vision,
-              compact, explore). Leave a field empty to use the main model (the one chosen in the
+              compact, explore, schedule). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
@@ -2064,37 +2196,187 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               current={subagentModels.explore || ''}
               onSelect={setSubagentModel}
             />
+            <ToolModelSelect
+              agent="schedule"
+              label="Schedule model"
+              desc="Model that runs scheduled tasks (cron inbox) in the background. Empty = the provider/model saved on each task, or the main model."
+              current={subagentModels.schedule || ''}
+              onSelect={setSubagentModel}
+            />
           </div>
         </>
         )}
 
         {tab === 'models' && (
         <>
-            <div className="field">
+            <div className="field models-tab">
               <div className="field-head">
                 <label>On-device Models</label>
               </div>
-              <div className="hint">
-                These run fully offline on your machine. Downloads use an optional
-                HuggingFace mirror (leave empty for <code>huggingface.co</code>). Status
-                refreshes automatically while a download runs.
+              <div className="hint models-intro">
+                These models run fully offline on your device. Download uses an
+                optional HuggingFace mirror (empty ={' '}
+                <code>huggingface.co</code>). Status and progress refresh
+                automatically.
               </div>
-              {modelsMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{modelsMsg}</div>}
+              {modelsMsg && <div className="hint models-msg">{modelsMsg}</div>}
 
-              <div className="mcp-card open">
-                <div className="mcp-card-head">
-                  <span className="mcp-chevron open">▶</span>
-                  <span className="mcp-card-title">Speech-to-Text source</span>
+              <div className="model-card">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Speech to Text</span>
+                    <span className="model-card-desc">Offline voice input, speech to text</span>
+                  </div>
+                  <ModelBadge status={mStatus?.whisper} />
                 </div>
-                <div className="mcp-fields">
+                <div className="model-card-body">
+                  <label className="field-label">Model (HF repo id)</label>
+                  <input value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} dir="ltr" placeholder="Systran/faster-whisper-medium" />
+                  <label className="field-label">Mirror base URL (optional)</label>
+                  <input value={whisperBaseUrl} onChange={(e) => setWhisperBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
+                  <ModelProgress running={runState('whisper')} />
+                  <ModelStatusLine status={mStatus?.whisper} running={isRunning('whisper')} onRemove={() => actRemove('whisper', whisperModel)} />
+                  <ModelControls
+                    running={runState('whisper')}
+                    canDownload={(mStatus?.whisper?.dirs ?? []).length === 0}
+                    onDownload={() => actDownload('whisper')}
+                    onPause={() => actPause('whisper')}
+                    onResume={() => actResume('whisper')}
+                    onCancel={() => actCancel('whisper')}
+                  />
+                </div>
+              </div>
+
+              <div className="model-card">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Memory</span>
+                    <span className="model-card-desc">Local embeddings for recall. Search still works without it.</span>
+                  </div>
+                  <ModelBadge status={mStatus?.embedding} />
+                </div>
+                <div className="model-card-body">
+                  <ModelProgress running={runState('embedding')} />
+                  <ModelStatusCard status={mStatus?.embedding} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
+                  <ModelControls
+                    running={runState('embedding')}
+                    canDownload={!(mStatus?.embedding?.dirs ?? []).some((d) => d.ready)}
+                    onDownload={() => actDownload('embedding')}
+                    onPause={() => actPause('embedding')}
+                    onResume={() => actResume('embedding')}
+                    onCancel={() => actCancel('embedding')}
+                  />
+                </div>
+              </div>
+
+              <div className="model-card model-card-laya">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Fast Local Decision</span>
+                    <span className="model-card-desc">Small on-device model for quick decisions</span>
+                  </div>
+                  {layaProviderId === 'local' && <ModelBadge status={mStatus?.laya} />}
+                </div>
+                <div className="model-card-body">
+                  <label className="field-label">Decision provider</label>
+                  <div className="laya-switch" role="group" aria-label="Decision provider">
+                    <button
+                      type="button"
+                      className={`laya-switch-btn${layaProviderId === 'local' ? ' active' : ''}`}
+                      onClick={() => setLayaProviderId('local')}
+                    >
+                      Local Laya — Offline
+                    </button>
+                    <button
+                      type="button"
+                      className={`laya-switch-btn${layaProviderId !== 'local' ? ' active' : ''}`}
+                      onClick={() => {
+                        if (layaProviderId === 'local') {
+                          const fallback = settings.activeProviderId || providers[0]?.id || 'local'
+                          setLayaProviderId(fallback)
+                        }
+                      }}
+                    >
+                      External provider
+                    </button>
+                  </div>
+                  {layaProviderId === 'local' ? (
+                    <>
                   <div className="hint">
-                    Choose which provider transcribes voice input. <code>Local Whisper</code> runs
-                    fully offline on your machine; any other entry sends the recording to that
-                    provider's OpenAI-compatible <code>/audio/transcriptions</code> endpoint.
+                    {layaStatus && (
+                      <>
+                        Status: {layaStatus.available ? 'Installed' : 'Not installed'}
+                        {layaStatus.ready ? ' · Ready offline' : ' · Not downloaded'}
+                        {layaStatus.repo ? <> · <code>{layaStatus.repo}</code></> : null}
+                      </>
+                    )}
+                  </div>
+                  <label className="field-label">Model (HF repo id)</label>
+                  <input value={layaModel} onChange={(e) => setLayaModel(e.target.value)} dir="ltr" placeholder="convaiinnovations/laya" />
+                  <label className="field-label">Mirror base URL (optional)</label>
+                  <input value={layaBaseUrl} onChange={(e) => setLayaBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
+                  <div className="hint">
+                    Local runs the on-device checkpoint (fast, offline). A provider sends the same
+                    choice/score question to that provider's chat model and falls back to the big
+                    model on low confidence — same pattern as STT.
+                  </div>
+                  <ModelProgress running={runState('laya')} />
+                  <ModelStatusCard status={mStatus?.laya} running={isRunning('laya')} onRemove={(repo) => actRemove('laya', repo)} />
+                  <ModelControls
+                    running={runState('laya')}
+                    canDownload={!(mStatus?.laya?.dirs ?? []).some((d) => d.ready)}
+                    onDownload={() => actDownload('laya')}
+                    onPause={() => actPause('laya')}
+                    onResume={() => actResume('laya')}
+                    onCancel={() => actCancel('laya')}
+                  />
+                    </>
+                  ) : (
+                    <>
+                  <ToolModelSelect
+                    agent="laya"
+                    label="Provider model"
+                    desc="Which chat model answers the fast choice/score question. Empty = this provider's default model."
+                    current={layaProviderModel ? `${layaProviderId}/${layaProviderModel}` : ''}
+                    onSelect={(_agent, val) => {
+                      if (!val) {
+                        setLayaProviderModel('')
+                        return
+                      }
+                      const slash = val.indexOf('/')
+                      if (slash > 0) {
+                        setLayaProviderId(val.slice(0, slash))
+                        setLayaProviderModel(val.slice(slash + 1))
+                      } else {
+                        setLayaProviderModel(val)
+                      }
+                    }}
+                  />
+                  <div className="hint">
+                    A provider sends the same choice/score question to that provider's chat model
+                    and falls back to the big model on low confidence — same pattern as STT.
+                  </div>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Voice</span>
+                    <span className="model-card-desc">Speech to text and text to speech provider</span>
+                  </div>
+                </div>
+                <div className="model-card-body">
+                  <div className="hint">
+                    Which provider transcribes voice input and reads answers aloud.{' '}
+                    <code>Local Whisper</code> is fully offline; the rest go to that
+                    provider's OpenAI-compatible endpoint.
                   </div>
                   <label className="field-label">STT provider</label>
                   <select value={sttProviderId} onChange={(e) => setSttProviderId(e.target.value)} dir="ltr">
-                    <option value="local">Whisper لوکال — آفلاین</option>
+                    <option value="local">Local Whisper — Offline</option>
                     {providers.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
@@ -2107,24 +2389,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
                     </>
                   )}
-                </div>
-              </div>
-
-              <div className="mcp-card open">
-                <div className="mcp-card-head">
-                  <span className="mcp-chevron open">▶</span>
-                  <span className="mcp-card-title">Text-to-Speech source</span>
-                </div>
-                <div className="mcp-fields">
-                  <div className="hint">
-                    Choose which provider reads agent replies aloud. The recording is sent to that
-                    provider's OpenAI-compatible <code>/audio/speech</code> endpoint.
-                    Leave model/voice empty for providers that don't need them (some 9router
-                    providers have no model or voice) — empty fields are not sent.
-                  </div>
                   <label className="field-label">TTS provider</label>
                   <select value={ttsProviderId} onChange={(e) => setTtsProviderId(e.target.value)} dir="ltr">
-                    <option value="">انتخاب نشده</option>
+                    <option value="">Not selected</option>
                     {providers.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
@@ -2139,51 +2406,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
                     </>
                   )}
-                </div>
-              </div>
-
-              <div className="mcp-card open">
-                <div className="mcp-card-head">
-                  <span className="mcp-chevron open">▶</span>
-                  <span className="mcp-card-title">Whisper — Voice input</span>
-                  <span className={`status-dot ${(mStatus?.whisper?.dirs ?? []).length > 0 ? 'ok' : ''}`} />
-                </div>
-                <div className="mcp-fields">
-                  <label className="field-label">Model (HF repo id)</label>
-                  <input value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} dir="ltr" placeholder="Systran/faster-whisper-medium" />
-                  <label className="field-label">Mirror base URL (optional)</label>
-                  <input value={whisperBaseUrl} onChange={(e) => setWhisperBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
-                  <ModelStatusLine status={mStatus?.whisper} running={isRunning('whisper')} onRemove={() => actRemove('whisper', whisperModel)} />
-                  <div className="skill-actions">
-                    {(mStatus?.whisper?.dirs ?? []).length === 0 && (
-                      <button className="btn tiny" disabled={isRunning('whisper')} onClick={() => actDownload('whisper')}>
-                        {isRunning('whisper') ? 'Downloading…' : 'Download'}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div className="mcp-card open">
-                <div className="mcp-card-head">
-                  <span className="mcp-chevron open">▶</span>
-                  <span className="mcp-card-title">Embedding — RAG memory</span>
-                  <span className={`status-dot ${(mStatus?.embedding?.dirs ?? []).some((d) => d.ready) ? 'ok' : ''}`} />
-                </div>
-                <div className="mcp-fields">
-                  <div className="hint">
-                    The embedding model downloads automatically in the background (default:
-                    <code> intfloat/multilingual-e5-base</code>). RAG for web/fetch is optional —
-                    if the model isn't downloaded yet, web search and fetch still work without it.
-                  </div>
-                  <ModelStatusCard status={mStatus?.embedding} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
-                  <div className="skill-actions">
-                    {(!(mStatus?.embedding?.dirs ?? []).some((d) => d.ready) || isRunning('embedding')) && (
-                      <button className="btn tiny" disabled={isRunning('embedding')} onClick={() => actDownload('embedding')}>
-                        {isRunning('embedding') ? 'Downloading…' : 'Download'}
-                      </button>
-                    )}
-                  </div>
                 </div>
               </div>
             </div>
@@ -2300,7 +2522,115 @@ function fmtBytes(n: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`
 }
 
-/** Whisper card status line: running → error → downloaded (single dir) → empty. */
+/** Readable speed: B/s → KB/s → MB/s. */
+function fmtSpeed(bps?: number): string {
+  const v = bps ?? 0
+  if (!v || v <= 0) return '—'
+  if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB/s`
+  if (v >= 1024) return `${Math.round(v / 1024)} KB/s`
+  return `${Math.round(v)} B/s`
+}
+
+/** Card status badge: Not downloaded · Downloading · Paused · Error · Ready. */
+function ModelBadge({ status }: { status?: ModelKindStatus }) {
+  const run = status?.running
+  const ready = (status?.dirs ?? []).some((d) => d.ready)
+  if (run?.state === 'downloading')
+    return <span className="model-badge downloading">Downloading</span>
+  if (run?.state === 'paused')
+    return <span className="model-badge paused">Paused</span>
+  if (run?.state === 'error')
+    return <span className="model-badge error">Error</span>
+  if (ready) return <span className="model-badge ready">Ready</span>
+  return <span className="model-badge idle">Not downloaded</span>
+}
+
+/** Live progress bar: percent, downloaded/total and speed. */
+function ModelProgress({ running }: { running?: ModelRunState }) {
+  if (!running || (running.state !== 'downloading' && running.state !== 'paused')) return null
+  const pct = Math.max(0, Math.min(100, running.percent ?? 0))
+  const total = running.total_bytes ?? 0
+  const done = running.downloaded_bytes ?? 0
+  const speed = running.speed_bps ?? 0
+  // Stalled = actively downloading but no bytes for a while (e.g. retry
+  // backoff on a filtered network). Nudge toward a mirror instead of
+  // looking frozen.
+  const stalled = running.state === 'downloading' && total > 0 && speed <= 0 && done < total
+  return (
+    <div className={`model-progress${running.state === 'paused' ? ' paused' : ''}`}>
+      <div className="model-progress-top">
+        <span className="model-progress-pct">{total > 0 ? `${pct.toFixed(1)}%` : '…'}</span>
+        <span className="model-progress-meta">
+          {total > 0 ? `${fmtBytes(done)} of ${fmtBytes(total)}` : fmtBytes(done)} · {fmtSpeed(speed)}
+        </span>
+      </div>
+      <div
+        className="model-progress-track"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(pct)}
+      >
+        <div className="model-progress-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="hint model-progress-repo" dir="ltr">{running.repo}</div>
+      {stalled && (
+        <div className="hint">Connection is slow or stalled — try a mirror base URL (e.g. https://hf-mirror.com), then Resume.</div>
+      )}
+    </div>
+  )
+}
+
+/** Download controls: Download / Pause / Resume / Stop. */
+function ModelControls({
+  running,
+  canDownload,
+  onDownload,
+  onPause,
+  onResume,
+  onCancel,
+}: {
+  running?: ModelRunState
+  canDownload: boolean
+  onDownload: () => void
+  onPause: () => void
+  onResume: () => void
+  onCancel: () => void
+}) {
+  const state = running?.state
+  if (state === 'downloading') {
+    return (
+      <div className="skill-actions model-controls">
+        <button className="btn tiny secondary" onClick={onPause}>Pause</button>
+        <button className="btn tiny danger" onClick={onCancel}>Stop</button>
+      </div>
+    )
+  }
+  if (state === 'paused') {
+    return (
+      <div className="skill-actions model-controls">
+        <button className="btn tiny" onClick={onResume}>Resume</button>
+        <button className="btn tiny danger" onClick={onCancel}>Stop</button>
+      </div>
+    )
+  }
+  if (state === 'error') {
+    return (
+      <div className="skill-actions model-controls">
+        {canDownload && <button className="btn tiny" onClick={onDownload}>Retry</button>}
+        <button className="btn tiny danger" onClick={onCancel}>Clear error</button>
+      </div>
+    )
+  }
+  if (!canDownload) return null
+  return (
+    <div className="skill-actions model-controls">
+      <button className="btn tiny" onClick={onDownload}>Download</button>
+    </div>
+  )
+}
+
+/** Whisper card status line: paused → error → downloaded (single dir) → empty. */
 function ModelStatusLine({
   status,
   running,
@@ -2310,7 +2640,9 @@ function ModelStatusLine({
   running: boolean
   onRemove: () => void
 }) {
-  if (running) return <div className="hint">Downloading…</div>
+  if (status?.running?.state === 'paused')
+    return <div className="hint">Paused — Resume continues from where it stopped.</div>
+  if (running) return null
   if (status?.running?.state === 'error')
     return (
       <div className="hint" style={{ color: 'var(--danger)' }}>
@@ -2339,7 +2671,9 @@ function ModelStatusCard({
   running: boolean
   onRemove: (repo: string) => void
 }) {
-  if (running) return <div className="hint">Downloading…</div>
+  if (status?.running?.state === 'paused')
+    return <div className="hint">Paused — Resume continues from where it stopped.</div>
+  if (running) return null
   if (status?.running?.state === 'error')
     return (
       <div className="hint" style={{ color: 'var(--danger)' }}>

@@ -230,10 +230,10 @@ def _oauth_redirect_uri() -> str:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """پیش‌بارگذاری کاتالوگ models.dev در هنگام راه‌اندازی سرور.
+    """پیش‌بارگذاری کاتالوگ models.dev + حلقه زمان‌بند تسک‌ها در هنگام راه‌اندازی.
 
-    این کاتالوگ فقط یک‌بار از اینترنت دریافت می‌شود و در حافظه cache می‌شود.
-    اگر در startup انجام نشود، اولین پیام کاربر باید منتظر HTTP request بماند.
+    کاتالوگ فقط یک‌بار از اینترنت دریافت و در حافظه cache می‌شود. حلقه زمان‌بند
+    هر ۳۰ ثانیه تسک‌های سررسیده را اجرا می‌کند (پس‌زمینه، headless).
     """
 
     async def _bg() -> None:
@@ -247,7 +247,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
 
     asyncio.create_task(_bg())
+    _stop = await _start_schedule_loop()
     yield
+    try:
+        _stop.set()
+    except Exception:
+        pass
 
     # بستن تمام sessionهای MCP cached در هنگام خروج
     try:
@@ -266,6 +271,432 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- زمان‌بندی تسک‌های خودکار (مثل Codex) ---------------------------------- #
+# حلقه پس‌زمینه هر SCHEDULE_POLL_SECONDS سررسیدها را چک می‌کند؛ اجرای هر تسک
+# headless است (بدون ask_user/permission — گیت‌ها None) و نتیجه در
+# schedules/runs ثبت می‌شود.
+
+SCHEDULE_POLL_SECONDS = 30
+_SCHEDULE_RUNNING: set[str] = set()
+# پنجره‌ای که یک ران «running» تازه محسوب می‌شود (ثانیه). اگر برای یک تسک
+# رانی با وضعیت running و شروع‌شده داخل این پنجره وجود داشته باشد، اجرای
+# جدید شروع نمی‌شود — این گارد روی دیسک است و بین چند پردازه/ری‌استارت هم
+# کار می‌کند (برخلاف _SCHEDULE_RUNNING که فقط حافظه است).
+_SCHEDULE_RUNNING_WINDOW = 15 * 60
+# ران‌های running قدیمی‌تر از این (ثانیه) در استارت‌آپ یتیم محسوب و error
+# می‌شوند (سایدکار قبلی وسط اجرا مرده است).
+_SCHEDULE_ORPHAN_AFTER = 60 * 60
+
+
+def _has_recent_running(schedule_id: str, now: float) -> bool:
+    """True اگر برای این تسک یک ران running تازه (داخل پنجره) روی دیسک باشد."""
+    import state_db
+
+    try:
+        runs = state_db.list_schedule_runs(str(schedule_id), limit=5)
+    except Exception:
+        return False
+    for r in runs:
+        if not isinstance(r, dict) or r.get("status") != "running":
+            continue
+        try:
+            started = float(r.get("started_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if started and (now - started) < _SCHEDULE_RUNNING_WINDOW:
+            return True
+    return False
+
+
+async def _mark_orphaned_running() -> int:
+    """ران‌های running به‌جامانده از پردازه قبلی را error کن؛ تعداد."""
+    import state_db
+
+    try:
+        runs = state_db.list_schedule_runs("", limit=10_000)
+    except Exception:
+        return 0
+    now = time.time()
+    fixed = 0
+    for r in runs:
+        if not isinstance(r, dict) or r.get("status") != "running":
+            continue
+        try:
+            started = float(r.get("started_at") or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        if started and (now - started) < _SCHEDULE_ORPHAN_AFTER:
+            continue
+        try:
+            state_db.save_schedule_run({
+                **r,
+                "status": "error",
+                "error": "interrupted (sidecar restarted)",
+                "finished_at": now,
+            })
+            fixed += 1
+        except Exception:
+            pass
+    return fixed
+
+
+async def _start_schedule_loop() -> asyncio.Event:
+    """حلقه بررسی سررسید تسک‌ها را روشن کن؛ Event توقف را برگردان."""
+    stop = asyncio.Event()
+
+    async def _loop() -> None:
+        # کمی صبر اول تا startup کامل شود
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=10)
+            return
+        except asyncio.TimeoutError:
+            pass
+        # ران‌های running یتیمِ پردازه قبلی را ببند تا برای همیشه Running نمانند.
+        try:
+            await _mark_orphaned_running()
+        except Exception:
+            logger.warning("schedule orphan sweep failed", exc_info=True)
+        while not stop.is_set():
+            try:
+                await _run_due_schedules()
+            except Exception:
+                logger.warning("schedule loop tick failed", exc_info=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=SCHEDULE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+
+    asyncio.create_task(_loop())
+    return stop
+
+
+async def _run_due_schedules(now: float | None = None) -> int:
+    """تسک‌های سررسیده را اجرا کن؛ تعداد اجراهای شروع‌شده را برگردان.
+
+    گارد چندگانه: هر تسک هم‌زمان فقط یک اجرا دارد (``_SCHEDULE_RUNNING``) و
+    ``is_due`` خودش ران‌های missed دوران مکث را نادیده می‌گیرد، پس پس از
+    resume فقط یک اجرای تازه شروع می‌شود — بدون burst تکراری.
+    """
+    import scheduler
+    import state_db
+
+    now = now if now is not None else time.time()
+    started = 0
+    for task in state_db.list_schedules():
+        sid = str(task.get("id") or "")
+        if not sid or sid in _SCHEDULE_RUNNING:
+            continue
+        if not task.get("enabled", True):
+            continue
+        # گارد روی دیسک: اگر همین تسک یک ران running تازه دارد (حتی از
+        # پردازه/تیک دیگر)، اجرای جدید شروع نکن — جلوی ران چندتایی هم‌زمان.
+        if _has_recent_running(sid, now):
+            continue
+        try:
+            due = scheduler.is_due(task, now)
+        except Exception:
+            continue
+        if not due:
+            continue
+        _SCHEDULE_RUNNING.add(sid)
+        # next_run را همین‌جا جلو ببر تا تیک بعدی حلقه (۳۰ ثانیه بعد) همان
+        # تسک را دوباره due نبیند — حتی اگر اجرای فعلی هنوز تمام نشده باشد.
+        try:
+            fresh = state_db.get_schedule(sid) or task
+            fresh["next_run"] = scheduler.compute_next_run(fresh, now)
+            state_db.save_schedule(fresh)
+        except Exception:
+            pass
+        asyncio.create_task(_execute_schedule(sid))
+        started += 1
+    return started
+
+
+async def _execute_schedule(schedule_id: str) -> None:
+    """اجرای headless یک تسک: run_agent بدون گیت تعاملی + ثبت run."""
+    import scheduler
+    import state_db
+
+    started_at = time.time()
+    run_id = ""
+    try:
+        task = state_db.get_schedule(schedule_id)
+        if task is None:
+            return
+        prompt = str(task.get("prompt") or "").strip()
+        root = str(task.get("root") or "").strip()
+        if not prompt or not root or not os.path.isdir(root):
+            state_db.save_schedule_run({
+                "schedule_id": schedule_id,
+                "status": "error",
+                "error": "پرامپت یا مسیر workspace نامعتبر است",
+                "started_at": started_at,
+                "finished_at": time.time(),
+            })
+            return
+        # تنظیمات ذخیره‌شده برای مدل/پروایدر + مدل‌های subagent (اختیاری —
+        # خالی یعنی پیش‌فرض چت). مدل اسکجول از setting->tools می‌آید.
+        settings = state_db.get_settings() or {}
+        provider_id = str(task.get("provider_id") or "")
+        model = str(task.get("model") or "")
+        subagent_models = settings.get("subagentModels") or {}
+        if not isinstance(subagent_models, dict):
+            subagent_models = {}
+        providers_cfg: dict = {}
+        for p in settings.get("providers") or []:
+            if isinstance(p, dict) and p.get("id"):
+                providers_cfg[str(p.get("id"))] = p
+        provider_cfg: dict = {}
+        active_id = str(settings.get("activeProviderId") or "")
+        for p in settings.get("providers") or []:
+            if not isinstance(p, dict):
+                continue
+            if (provider_id and str(p.get("id")) == provider_id) or (
+                not provider_id and str(p.get("id")) == active_id
+            ):
+                provider_cfg = p
+                break
+        if not provider_cfg and isinstance(settings.get("providers"), list) and settings["providers"]:
+            provider_cfg = settings["providers"][0] if isinstance(settings["providers"][0], dict) else {}
+        # مدل اسکجول از setting->tools: اگر روی خود تسک مدل/پروایدر ست نشده
+        # باشد و در تنظیمات مدل schedule انتخاب شده باشد، از همان استفاده کن.
+        schedule_entry = str(subagent_models.get("schedule") or "").strip()
+        if schedule_entry and not provider_id and not model:
+            try:
+                from agents import _subagent_target as _schedule_target
+
+                def _lookup(pid: str) -> dict | None:
+                    return providers_cfg.get(pid)
+
+                target = _schedule_target(
+                    schedule_entry,
+                    str(provider_cfg.get("kind") or "custom"),
+                    str(provider_cfg.get("baseUrl") or ""),
+                    str(provider_cfg.get("apiKey") or ""),
+                    str(provider_cfg.get("envVar") or ""),
+                    _lookup,
+                    active_id,
+                )
+                if target:
+                    kind, sched_model, burl, akey, env, spid = target
+                    if sched_model:
+                        provider_cfg = {
+                            **provider_cfg,
+                            "kind": kind,
+                            "baseUrl": burl,
+                            "apiKey": akey,
+                            "envVar": env,
+                            "id": spid or provider_cfg.get("id") or "",
+                        }
+                        model = sched_model
+            except Exception:
+                pass
+        run = state_db.save_schedule_run({
+            "schedule_id": schedule_id,
+            "status": "running",
+            "started_at": started_at,
+        })
+        run_id = str(run.get("id"))
+        # اجرای headless: گیت‌های تعاملی None → ابزارهای ask/permission
+        # بلافاصله خطای «سیستم در دسترس نیست» می‌دهند و مدل ادامه می‌دهد.
+        final_text = ""
+        async for event in run_agent(
+            provider=str(provider_cfg.get("kind") or "custom"),
+            provider_id=str(provider_cfg.get("id") or ""),
+            model_name=model or str(provider_cfg.get("model") or ""),
+            base_url=str(provider_cfg.get("baseUrl") or ""),
+            api_key=str(provider_cfg.get("apiKey") or ""),
+            env_var=str(provider_cfg.get("envVar") or ""),
+            root=root,
+            mode=str(task.get("mode") or "coder"),
+            prompt=prompt,
+            history=[],
+            permission_gates=None,
+            ask_gates=None,
+            subagent_models=dict(subagent_models),
+            providers=providers_cfg,
+            chat_id=f"schedule-{schedule_id}",
+        ):
+            if isinstance(event, dict) and event.get("kind") == "text":
+                final_text += str(event.get("content") or "")
+        finished = time.time()
+        state_db.save_schedule_run({
+            "id": run_id,
+            "schedule_id": schedule_id,
+            "status": "done",
+            "output": final_text[:8000],
+            "started_at": started_at,
+            "finished_at": finished,
+        })
+        # به‌روزرسانی last_run/next_run/run_count تسک
+        fresh = state_db.get_schedule(schedule_id) or task
+        fresh["last_run"] = finished
+        fresh["run_count"] = int(fresh.get("run_count") or 0) + 1
+        try:
+            fresh["next_run"] = scheduler.compute_next_run(fresh, finished)
+        except Exception:
+            fresh["next_run"] = None
+        state_db.save_schedule(fresh)
+        try:
+            state_db.prune_schedule_runs(schedule_id)
+        except Exception:
+            pass
+    except Exception as exc:  # noqa: BLE001 — خطای اجرا نباید حلقه را بکشد
+        logger.warning("schedule %s failed: %s", schedule_id, exc, exc_info=True)
+        try:
+            state_db.save_schedule_run({
+                **({"id": run_id} if run_id else {}),
+                "schedule_id": schedule_id,
+                "status": "error",
+                "error": str(exc)[:500],
+                "started_at": started_at,
+                "finished_at": time.time(),
+            })
+        except Exception:
+            pass
+    finally:
+        _SCHEDULE_RUNNING.discard(schedule_id)
+
+
+class ScheduleUpsertRequest(BaseModel):
+    """ساخت/ویرایش تسک زمان‌بندی."""
+
+    id: str = ""
+    name: str = ""
+    prompt: str = ""
+    cron: str = ""
+    enabled: bool = True
+    root: str = ""
+    mode: str = "coder"
+    provider_id: str = ""
+    model: str = ""
+
+
+@app.get("/schedules")
+async def schedules_list() -> dict:
+    """لیست تسک‌های زمان‌بندی + next_run محاسبه‌شده برای هر کدام."""
+    import scheduler
+    import state_db
+
+    now = time.time()
+    out = []
+    for task in state_db.list_schedules():
+        t = dict(task)
+        try:
+            t["next_run"] = scheduler.compute_next_run(task, now)
+        except Exception:
+            t["next_run"] = None
+        try:
+            t["cron_label"] = scheduler.describe_cron_fa(str(task.get("cron") or ""))
+        except Exception:
+            t["cron_label"] = str(task.get("cron") or "")
+        out.append(t)
+    return {"schedules": out}
+
+
+@app.post("/schedules")
+async def schedules_upsert(req: ScheduleUpsertRequest) -> dict:
+    """ایجاد یا ویرایش تسک زمان‌بندی (id خالی = ساخت جدید)."""
+    import scheduler
+    import state_db
+
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="پرامپت تسک خالی است")
+    try:
+        cron = scheduler.normalize_cron(req.cron or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    existing = state_db.get_schedule(req.id) if req.id else None
+    base = existing or {}
+    was_disabled = bool(existing and not existing.get("enabled", True))
+    task = {
+        **base,
+        **({"id": req.id} if req.id else {}),
+        "name": (req.name or "").strip() or str(base.get("name") or "تسک زمان‌بندی"),
+        "prompt": prompt,
+        "cron": cron,
+        "enabled": bool(req.enabled),
+        "root": (req.root or "").strip() or str(base.get("root") or ""),
+        "mode": (req.mode or "").strip() or str(base.get("mode") or "coder"),
+        "provider_id": (req.provider_id or "").strip(),
+        "model": (req.model or "").strip(),
+    }
+    # resume از لحظه ادامه: اگر تسک از حالت مکث برمی‌گردد، last_run قدیمی
+    # (قبل از مکث) را به اکنون منتقل کن تا next_run تازه از همین لحظه حساب
+    # شود و ران‌های missed دوران مکث اجرا نشوند. next_run ذخیره‌شده قدیمی
+    # هم پاک می‌شود تا پنل ساعت گذشته (stale) نشان ندهد.
+    if was_disabled and bool(task.get("enabled", True)):
+        task["last_run"] = time.time()
+        task.pop("next_run", None)
+    saved = state_db.save_schedule(task)
+    try:
+        saved["next_run"] = scheduler.compute_next_run(saved)
+    except Exception:
+        saved["next_run"] = None
+    return {"schedule": saved}
+
+
+@app.delete("/schedules/{schedule_id}")
+async def schedules_delete(schedule_id: str) -> dict:
+    """حذف تسک زمان‌بندی (تاریخچه اجراها نگه داشته می‌شود)."""
+    import state_db
+
+    if not state_db.delete_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    return {"ok": True}
+
+
+@app.post("/schedules/{schedule_id}/run")
+async def schedules_run_now(schedule_id: str) -> dict:
+    """اجرای دستی یک تسک (بدون انتظار برای سررسید).
+
+    فقط گارد حافظه چک می‌شود (اجرای واقعاً در حال انجام در همین پردازه)؛
+    گارد روی دیسک عمداً اعمال نمی‌شود تا رکورد running به‌جامانده (یتیم)
+    دکمه Run را قفل نکند — اجرای دستی همیشه مجاز است.
+    """
+    import state_db
+
+    if state_db.get_schedule(schedule_id) is None:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    if schedule_id in _SCHEDULE_RUNNING:
+        return {"ok": True, "running": True}
+    _SCHEDULE_RUNNING.add(schedule_id)
+    asyncio.create_task(_execute_schedule(schedule_id))
+    return {"ok": True, "running": True}
+
+
+@app.get("/schedules/{schedule_id}/runs")
+async def schedules_runs(schedule_id: str, limit: int = 20) -> dict:
+    """تاریخچه اجراهای یک تسک (جدیدترین اول)."""
+    import state_db
+
+    return {"runs": state_db.list_schedule_runs(schedule_id, limit=limit)}
+
+
+@app.delete("/schedules/{schedule_id}/runs")
+async def schedules_runs_clear(schedule_id: str) -> dict:
+    """پاک‌کردن چت اینباکس یک کرون: حذف همه اجراهای همان تسک."""
+    import state_db
+
+    if state_db.get_schedule(schedule_id) is None:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    removed = state_db.delete_schedule_runs(schedule_id)
+    return {"ok": True, "removed": removed}
+
+
+@app.get("/schedule-runs")
+async def schedule_runs_all(limit: int = 50) -> dict:
+    """تازه‌ترین اجراهای همه تسک‌ها (برای Inbox؛ جدیدترین اول)."""
+    import state_db
+
+    try:
+        lim = max(1, min(200, int(limit or 50)))
+    except (TypeError, ValueError):
+        lim = 50
+    return {"runs": state_db.list_schedule_runs("", limit=lim)}
 
 
 class ChatRequest(BaseModel):
@@ -407,7 +838,7 @@ class ModelTestRequest(ModelsRequest):
 
 
 class ModelDownloadRequest(BaseModel):
-    """Download a managed on-device model (whisper / embedding)."""
+    """Download a managed on-device model (whisper / embedding / laya)."""
 
     kind: str = ""
     model: str = ""
@@ -419,6 +850,12 @@ class ModelRemoveRequest(BaseModel):
 
     kind: str = ""
     model: str = ""
+
+
+class ModelControlRequest(BaseModel):
+    """Pause / resume / cancel a running model download."""
+
+    kind: str = ""
 
 
 class TtsRequest(BaseModel):
@@ -776,7 +1213,7 @@ async def models_test(req: ModelTestRequest) -> dict:
     return {"ok": True, "reply": (text or "").strip()[:200]}
 
 
-# --- managed on-device models (whisper / embedding) --------------------- #
+# --- managed on-device models (whisper / embedding / laya) ------------- #
 # Download & removal are user-initiated from Settings → Models (never
 # automatic). Downloads run on a background thread; /models/status is polled
 # while one is in flight.
@@ -787,13 +1224,15 @@ async def models_download(req: ModelDownloadRequest) -> dict:
     import model_download
 
     kind = (req.kind or "").strip() or model_download.KIND_EMBEDDING
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING, model_download.KIND_LAYA):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
-    model = (req.model or "").strip() or (
-        model_download.WHISPER_DEFAULT_REPO
-        if kind == model_download.KIND_WHISPER
-        else model_download.EMBEDDING_DEFAULT_REPO
-    )
+    if kind == model_download.KIND_LAYA:
+        default_repo = model_download.LAYA_DEFAULT_REPO
+    elif kind == model_download.KIND_WHISPER:
+        default_repo = model_download.WHISPER_DEFAULT_REPO
+    else:
+        default_repo = model_download.EMBEDDING_DEFAULT_REPO
+    model = (req.model or "").strip() or default_repo
     if not model_download.start_download(kind, model, req.base_url):
         raise HTTPException(status_code=400, detail="empty model repo id")
     return {"ok": True, "kind": kind, "model": model}
@@ -819,10 +1258,65 @@ async def models_remove(req: ModelRemoveRequest) -> dict:
     import model_download
 
     kind = (req.kind or "").strip().lower()
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING, model_download.KIND_LAYA):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     removed = model_download.remove(kind, req.model)
     return {"ok": True, "kind": kind, "removed": removed}
+
+
+def _require_model_kind(kind: str) -> str:
+    import model_download
+
+    kind = (kind or "").strip().lower()
+    if kind not in (
+        model_download.KIND_WHISPER,
+        model_download.KIND_EMBEDDING,
+        model_download.KIND_LAYA,
+    ):
+        raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
+    return kind
+
+
+@app.post("/models/pause")
+async def models_pause(req: ModelControlRequest) -> dict:
+    """مکث دانلود در حال اجرا (بایت‌های گرفته‌شده حفظ می‌شوند)."""
+    import model_download
+
+    kind = _require_model_kind(req.kind)
+    if not model_download.pause_download(kind):
+        raise HTTPException(status_code=404, detail="no running download to pause")
+    return {"ok": True, "kind": kind}
+
+
+@app.post("/models/resume")
+async def models_resume(req: ModelControlRequest) -> dict:
+    """ادامه دانلود مکث‌شده از همان نیمه."""
+    import model_download
+
+    kind = _require_model_kind(req.kind)
+    if not model_download.resume_download(kind):
+        raise HTTPException(status_code=404, detail="no paused download to resume")
+    return {"ok": True, "kind": kind}
+
+
+@app.post("/models/cancel")
+async def models_cancel(req: ModelControlRequest) -> dict:
+    """Stop an in-flight download; partial files stay for later resume."""
+    import model_download
+
+    kind = _require_model_kind(req.kind)
+    # Idempotent: stopping when nothing runs is still success so the
+    # Stop button never looks dead (no 404 when state already cleared).
+    model_download.cancel_download(kind)
+    return {"ok": True, "kind": kind}
+
+
+@app.get("/models/laya-status")
+async def models_laya_status() -> dict:
+    """تصمیم‌گیر سریع laya: نصب/آماده/ریپو/پروایدر (برای Settings → Models)."""
+    import laya_decide
+
+    return laya_decide.status()
 
 
 @app.get("/system-prompts")

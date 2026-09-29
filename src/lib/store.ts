@@ -253,7 +253,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     api.storeSet('chats', sanitizeChats(chats)),
@@ -266,7 +266,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -353,6 +353,19 @@ function defaultEnvVar(kind: ProviderKind): string {
   return PROVIDER_META[kind]?.defaultEnvVar ?? ''
 }
 
+/** سقف مدل‌های پین‌شده در لیست اخیر — پین‌شده‌ها همیشه بالای لیست‌اند و از حذف خودکار مصون‌اند. */
+export const MAX_PINNED_RECENT_MODELS = 3
+
+/** مرتب‌سازی لیست اخیر: پین‌شده‌ها اول (تازه‌ترین اول)، بعد بقیه (تازه‌ترین اول). */
+export function sortRecentModels(list: RecentModel[]): RecentModel[] {
+  return [...list].sort((a, b) => {
+    const pa = a.pinned ? 1 : 0
+    const pb = b.pinned ? 1 : 0
+    if (pa !== pb) return pb - pa
+    return (b.lastUsed ?? 0) - (a.lastUsed ?? 0)
+  })
+}
+
 /** Accept both the current {providerId, model} shape and legacy bare strings. */
 function normalizeRecentModels(raw: unknown): RecentModel[] {
   if (!Array.isArray(raw)) return []
@@ -361,15 +374,23 @@ function normalizeRecentModels(raw: unknown): RecentModel[] {
     if (typeof entry === 'string' && entry.trim()) {
       out.push({ providerId: '', model: entry.trim(), lastUsed: Date.now() })
     } else if (entry && typeof entry === 'object') {
-      const e = entry as { providerId?: unknown; model?: unknown; lastUsed?: unknown }
+      const e = entry as { providerId?: unknown; model?: unknown; lastUsed?: unknown; pinned?: unknown }
       const model = typeof e.model === 'string' ? e.model.trim() : ''
       const pid = typeof e.providerId === 'string' ? e.providerId : ''
       const lastUsed = typeof e.lastUsed === 'number' ? e.lastUsed : Date.now()
-      if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model, lastUsed })
+      const pinned = e.pinned === true
+      if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model, lastUsed, ...(pinned ? { pinned: true as const } : {}) })
     }
   }
+  // پین‌شده‌ها اول؛ سقف پین روی داده قدیمی هم اعمال می‌شود (۳ تای تازه‌تر می‌مانند).
+  const ordered = sortRecentModels(out)
+  const pinned = ordered.filter((r) => r.pinned).slice(0, MAX_PINNED_RECENT_MODELS)
+  const pinnedKeys = new Set(pinned.map((r) => `${r.providerId}/${r.model}`))
+  for (const r of ordered) {
+    if (r.pinned && !pinnedKeys.has(`${r.providerId}/${r.model}`)) delete r.pinned
+  }
   // Sort by lastUsed descending (most recent first) and limit to 20
-  return out.sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0)).slice(0, 20)
+  return [...pinned, ...ordered.filter((r) => !r.pinned)].slice(0, 20)
 }
 
 interface State {
@@ -456,6 +477,10 @@ interface State {
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
   addRecentModel: (model: string, providerId?: string) => void
+  /** حذف دستی یک مدل از لیست اخیر (حتی پین‌شده) — پین‌شده‌ها فقط از حذف خودکار مصون‌اند. */
+  removeRecentModel: (model: string, providerId?: string) => void
+  /** پین/آنپین یک مدل اخیر؛ سقف ۳ پین. وقتی سقف پر است پین جدید انجام نمی‌شود و false برمی‌گردد. */
+  togglePinRecentModel: (model: string, providerId?: string) => boolean
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
   toggleSidebar: () => void
@@ -495,6 +520,13 @@ interface State {
   ttsVoice: string
   embeddingModel: string
   embeddingBaseUrl: string
+  /** مدل تصمیم محلی laya (Settings → Models). */
+  layaModel: string
+  layaBaseUrl: string
+  /** منبع تصمیم سریع laya: 'local' یعنی روتر محلی، غیر آن شناسه پروایدر (مثل STT). */
+  layaProviderId: string
+  /** مدل تصمیم سریع روی پروایدر انتخاب‌شده (مثل انتخاب مدل در Tools)؛ خالی = مدل پیش‌فرض همان پروایدر. */
+  layaProviderModel: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
@@ -504,6 +536,10 @@ interface State {
   setTtsVoice: (v: string) => void
   setEmbeddingModel: (m: string) => void
   setEmbeddingBaseUrl: (u: string) => void
+  setLayaModel: (m: string) => void
+  setLayaBaseUrl: (u: string) => void
+  setLayaProviderId: (id: string) => void
+  setLayaProviderModel: (m: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
@@ -613,6 +649,21 @@ interface State {
 
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
+  /** باز/بسته بودن فرم ساخت تسک زمان‌بندی در پنل راست (session-scoped). */
+  scheduleFormOpen: boolean
+  setScheduleFormOpen: (open: boolean) => void
+  /** کش تسک‌های زمان‌بندی (از GET /schedules؛ session-scoped). */
+  schedules: import('../types').ScheduledTask[]
+  setSchedules: (schedules: import('../types').ScheduledTask[]) => void
+  /** باز/بسته بودن Inbox کرون‌ها (session-scoped). */
+  scheduleInboxOpen: boolean
+  setScheduleInboxOpen: (open: boolean) => void
+  /** تسک انتخاب‌شده داخل Inbox (چت همان کرون)؛ null یعنی هیچ انتخابی. */
+  scheduleInboxSelected: string | null
+  setScheduleInboxSelected: (id: string | null) => void
+  /** شناسه اجراهای دیده‌شده (برای بج نوتیفیکیشن Inbox؛ session-scoped). */
+  scheduleRunsSeen: string[]
+  markScheduleRunsSeen: (ids: string[]) => void
   setOutsideAllowed: (allowed: boolean) => void
   /** Add a per-folder outside-workspace grant ("Always allow" on the per-folder
    *  permission dialog). Idempotent; session-scoped like outsideAllowed. */
@@ -662,11 +713,9 @@ function makeChat(mode: AgentMode = 'ask'): Chat {
     s.settings.providers[0]
   // Default a new chat to the most recently used model so it continues where the
   // user left off, instead of always falling back to the provider's default model.
-  // Sort by lastUsed desc to mirror the recent-models list in the model selector
+  // sortRecentModels mirrors the recent-models list in the model selector
   // (its top entry is exactly the provider+model we want to inherit here).
-  const recent = [...s.recentModels].sort(
-    (a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0),
-  )[0]
+  const recent = sortRecentModels(s.recentModels)[0]
   const recentProvider = recent
     ? s.settings.providers.find((p) => p.id === recent.providerId)
     : undefined
@@ -729,6 +778,10 @@ export const useStore = create<State>((set, get) => ({
   ttsVoice: 'alloy',
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
+  layaModel: 'convaiinnovations/laya',
+  layaBaseUrl: '',
+  layaProviderId: 'local',
+  layaProviderModel: '',
   recentModels: [],
   subagentModels: {},
   cacheTtlMinutes: 60,
@@ -738,7 +791,7 @@ export const useStore = create<State>((set, get) => ({
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
   codeMapPanelOpen: false,
-  rightPanelOpen: true,
+  rightPanelOpen: false,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -752,6 +805,17 @@ export const useStore = create<State>((set, get) => ({
   unreadChats: [],
   prefixNotice: null,
   settingsOpen: false,
+  scheduleFormOpen: false,
+  schedules: [],
+  setScheduleFormOpen: (open) => set({ scheduleFormOpen: open }),
+  setSchedules: (schedules) => set({ schedules }),
+  scheduleInboxOpen: false,
+  setScheduleInboxOpen: (open) => set({ scheduleInboxOpen: open }),
+  scheduleInboxSelected: null,
+  setScheduleInboxSelected: (id) => set({ scheduleInboxSelected: id }),
+  scheduleRunsSeen: [],
+  markScheduleRunsSeen: (ids) =>
+    set((s) => ({ scheduleRunsSeen: [...new Set([...s.scheduleRunsSeen, ...ids])] })),
   isStreaming: false,
   isThinking: false,
   outsideAllowed: false,
@@ -984,6 +1048,10 @@ export const useStore = create<State>((set, get) => ({
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
+      layaModel: typeof raw.layaModel === 'string' && raw.layaModel.trim() ? raw.layaModel : 'convaiinnovations/laya',
+      layaBaseUrl: typeof raw.layaBaseUrl === 'string' ? raw.layaBaseUrl : '',
+      layaProviderId: typeof raw.layaProviderId === 'string' && raw.layaProviderId.trim() ? raw.layaProviderId : 'local',
+      layaProviderModel: typeof raw.layaProviderModel === 'string' ? raw.layaProviderModel.trim() : '',
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
         ? { ...(raw.subagentModels as Record<string, string>) }
         : {},
@@ -1011,7 +1079,7 @@ export const useStore = create<State>((set, get) => ({
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
       codeMapPanelOpen: raw.codeMapPanelOpen === true,
-      rightPanelOpen: raw.rightPanelOpen !== false,
+      rightPanelOpen: raw.rightPanelOpen === true,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
       pinnedChats: Array.isArray(raw.pinnedChats) ? raw.pinnedChats : [],
@@ -1450,6 +1518,22 @@ export const useStore = create<State>((set, get) => ({
     set({ embeddingBaseUrl: (u ?? '').trim() })
     get().persist()
   },
+  setLayaModel: (m) => {
+    set({ layaModel: (m ?? '').trim() || 'convaiinnovations/laya' })
+    get().persist()
+  },
+  setLayaBaseUrl: (u) => {
+    set({ layaBaseUrl: (u ?? '').trim() })
+    get().persist()
+  },
+  setLayaProviderId: (id) => {
+    set({ layaProviderId: (id ?? '').trim() || 'local' })
+    get().persist()
+  },
+  setLayaProviderModel: (m) => {
+    set({ layaProviderModel: (m ?? '').trim() })
+    get().persist()
+  },
   setWebSearchAutoFetch: (n) => {
     // 0 is a valid, deliberate value (disable auto-fetch) — unlike the TTL
     // setters above, we can't fall back with `|| default` since that would
@@ -1542,13 +1626,54 @@ export const useStore = create<State>((set, get) => ({
     const pid = providerId || ''
     const now = Date.now()
     set((s) => {
-      const recentModels = [
-        { providerId: pid, model: m, lastUsed: now },
-        ...s.recentModels.filter((x) => x.model !== m || x.providerId !== pid),
-      ].slice(0, 20)
+      const prev = s.recentModels.find((x) => x.model === m && x.providerId === pid)
+      const pinned = prev?.pinned === true
+      // پین‌شده‌ها همیشه بالای لیست‌اند و از حذف خودکار (سقف ۲۰) مصون‌اند:
+      // اول پین‌شده‌ها (تازه‌ترین اول)، بعد بقیه؛ سقف فقط روی غیرپین‌شده‌ها اعمال می‌شود.
+      const rest = s.recentModels.filter((x) => x.model !== m || x.providerId !== pid)
+      const entry: RecentModel = { providerId: pid, model: m, lastUsed: now, ...(pinned ? { pinned: true as const } : {}) }
+      const pinnedRest = sortRecentModels(rest.filter((x) => x.pinned)).slice(0, MAX_PINNED_RECENT_MODELS)
+      const unpinnedRest = sortRecentModels(rest.filter((x) => !x.pinned))
+      const recentModels = pinned
+        ? [entry, ...pinnedRest, ...unpinnedRest].slice(0, 20)
+        : [...pinnedRest, entry, ...unpinnedRest].slice(0, 20)
       return { recentModels }
     })
     get().persist()
+  },
+
+  removeRecentModel: (model, providerId) => {
+    const m = (model || '').trim()
+    if (!m) return
+    const pid = providerId || ''
+    // مدل پین‌شده اصلاً از لیست اخیر حذف نمی‌شود — نه دستی، نه خودکار.
+    // برای حذفش اول باید آنپین شود.
+    set((s) => ({
+      recentModels: s.recentModels.filter((x) => x.model !== m || x.providerId !== pid || x.pinned),
+    }))
+    get().persist()
+  },
+
+  togglePinRecentModel: (model, providerId) => {
+    const m = (model || '').trim()
+    if (!m) return false
+    const pid = providerId || ''
+    let pinnedNow = false
+    let changed = false
+    set((s) => {
+      const target = s.recentModels.find((x) => x.model === m && x.providerId === pid)
+      if (!target) return {}
+      if (target.pinned) {
+        changed = true
+        return { recentModels: sortRecentModels(s.recentModels.map((x) => (x.model === m && x.providerId === pid ? { ...x, pinned: undefined } : x))) }
+      }
+      if (s.recentModels.filter((x) => x.pinned).length >= MAX_PINNED_RECENT_MODELS) return {}
+      pinnedNow = true
+      changed = true
+      return { recentModels: sortRecentModels(s.recentModels.map((x) => (x.model === m && x.providerId === pid ? { ...x, pinned: true as const } : x))) }
+    })
+    if (changed) get().persist()
+    return pinnedNow
   },
 
   newChat: (mode) => {
@@ -1558,7 +1683,7 @@ export const useStore = create<State>((set, get) => ({
     const lastRoot = [...s.chats].reverse().find((c) => c.root)?.root
     chat.root = prevRoot ?? lastRoot ?? s.root
     const activeChatId = chat.id
-    set((st) => ({ chats: [...st.chats, chat], activeChatId }))
+    set((st) => ({ chats: [...st.chats, chat], activeChatId, rightPanelOpen: false }))
     get().persist()
     return activeChatId
   },
@@ -1574,7 +1699,7 @@ export const useStore = create<State>((set, get) => ({
       if (!workspaces.some((w) => w.key === key)) {
         workspaces = [...workspaces, makeWorkspace(root ?? '')]
       }
-      return { workspaces, chats: [...st.chats, chat], activeChatId }
+      return { workspaces, chats: [...st.chats, chat], activeChatId, rightPanelOpen: false }
     })
     get().persist()
     return activeChatId

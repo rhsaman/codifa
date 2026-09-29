@@ -1866,6 +1866,93 @@ def edit_file(
     }
 
 
+def edit_file_batch(
+    root: str,
+    path: str,
+    edits: list[dict],
+    permit: dict | None = None,
+) -> dict:
+    """Apply several old_string->new_string replacements to ``path`` atomically.
+
+    All edits run on the in-memory content in list order and the file is
+    written ONCE, so N changes to the same file cost one tool call, one
+    checkpoint, one diff and one verify instead of N sequential read/write
+    cycles. Either every edit applies or nothing is written (atomic).
+    Each item is ``{"old_string": ..., "new_string": ..., "replace_all": bool}``.
+    """
+    target = resolve_safe(root, path, permit=permit)
+    if _is_workspace_coder_dir(root, target):
+        return {
+            "path": path,
+            "error": "the workspace .coder/ folder is reserved — the agent's config (plans, skills, MCP) lives in the user data folder (Settings → Data path), not in the project — do not write here",
+        }
+    if not os.path.exists(target):
+        return {"path": path, "error": "file not found"}
+    if os.path.isdir(target):
+        return {"path": path, "error": "path is a directory"}
+    if not _is_text_path(target):
+        return {"path": path, "error": "binary file (edit skipped)"}
+    if not isinstance(edits, list) or not edits:
+        return {"path": path, "error": "edits must be a non-empty list"}
+    try:
+        content, truncated = _read_text(target)
+    except OSError as exc:
+        return {"path": path, "error": str(exc)}
+    if truncated:
+        return {
+            "path": path,
+            "error": "file too large to edit safely (use read with offset/limit to inspect it in parts instead)",
+        }
+    new_content = content
+    total_occ = 0
+    for idx, item in enumerate(edits):
+        if not isinstance(item, dict):
+            return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: must be an object"}
+        old_string = item.get("old_string", "")
+        new_string = item.get("new_string", "")
+        replace_all = bool(item.get("replace_all", False))
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string/new_string must be strings"}
+        if not old_string:
+            return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string is empty"}
+        if old_string == new_string:
+            return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string and new_string are identical"}
+        count = new_content.count(old_string)
+        if count == 0:
+            return {
+                "path": path,
+                "error": f"edit {idx + 1}/{len(edits)}: old_string not found — it must match the file's current content exactly "
+                "(whitespace included). Re-read the file (or the relevant lines) and copy the exact text.",
+            }
+        if count > 1 and not replace_all:
+            return {
+                "path": path,
+                "error": f"edit {idx + 1}/{len(edits)}: old_string is not unique ({count} occurrences) — include more surrounding "
+                "context to make it unique, or pass replace_all=true to replace every occurrence.",
+            }
+        if replace_all:
+            new_content = new_content.replace(old_string, new_string)
+            total_occ += count
+        else:
+            new_content = new_content.replace(old_string, new_string, 1)
+            total_occ += 1
+    if new_content == content:
+        return {"path": path, "error": "edits leave the file unchanged"}
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(new_content)
+    except OSError as exc:
+        return {"path": path, "error": str(exc)}
+    return {
+        "path": path,
+        "ok": True,
+        "old_content": content,
+        "new_content": new_content,
+        "occurrences": total_occ,
+        "edits_applied": len(edits),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Automatic post-edit verification (Coder mode)
 # --------------------------------------------------------------------------- #
@@ -3832,9 +3919,15 @@ def make_tool_callbacks(
         )
 
     async def edit_file_tool(
-        path: str, old_string: str, new_string: str, replace_all: bool = False
+        path: str,
+        old_string: str = "",
+        new_string: str = "",
+        replace_all: bool = False,
+        edits: list[dict] | None = None,
     ) -> str:
-        """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite."""
+        """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite.
+
+        BATCH: to apply several changes to the SAME file, pass `edits` (a list of {"old_string","new_string","replace_all"} objects) instead of firing one edit_file call per change — all edits apply atomically in list order with ONE checkpoint/diff/verify. Either every edit applies or nothing is written."""
         emit(
             {
                 "kind": "tool",
@@ -3843,7 +3936,10 @@ def make_tool_callbacks(
             }
         )
         try:
-            result = edit_file(root, path, old_string, new_string, replace_all, permit)
+            if edits:
+                result = edit_file_batch(root, path, list(edits), permit)
+            else:
+                result = edit_file(root, path, old_string, new_string, replace_all, permit)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("edit_file", msg))
@@ -3895,8 +3991,14 @@ def make_tool_callbacks(
         # reflects the new content instead of returning stale cached bytes.
         _invalidate_read_cache_for(path, root)
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
+        _n_edits = int(result.get("edits_applied", 0) or 0)
+        _head = (
+            f"Successfully edited {path} ({_n_edits} edits, {occ} replacement{'s' if occ != 1 else ''} total)."
+            if _n_edits > 1
+            else f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
+        )
         return (
-            f"Successfully edited {path} ({occ} occurrence{'s' if occ != 1 else ''} replaced)."
+            _head
             + _format_verify_suffix(verify_note)
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )

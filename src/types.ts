@@ -9,6 +9,8 @@ export interface RecentModel {
   model: string
   /** Epoch ms when this model was last used — used to sort recents by usage time. */
   lastUsed?: number
+  /** مدل پین‌شده همیشه بالای لیست اخیر می‌ماند و از حذف خودکار مصون است (سقف ۳). */
+  pinned?: boolean
 }
 
 /** Per-mode tool access. Sent to the backend so tool gating is data-driven
@@ -150,6 +152,13 @@ export interface Settings {
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
+  /** مدل تصمیم محلی laya: شناسه ریپوی هاگینگ‌فیس + آینه اختیاری. */
+  layaModel?: string
+  layaBaseUrl?: string
+  /** منبع تصمیم سریع laya: 'local' یعنی روتر محلی، غیر آن شناسه پروایدر (مثل STT). */
+  layaProviderId?: string
+  /** مدل تصمیم سریع روی پروایدر انتخاب‌شده (مثل انتخاب مدل در Tools)؛ خالی = مدل پیش‌فرض همان پروایدر. */
+  layaProviderModel?: string
   /** TTL for web/fetch text cache + RAG storage (days). Default: 90. */
   ragWebTtlDays?: number
   /** How many top web_search results get their page content auto-fetched
@@ -568,3 +577,36 @@ export interface CodeSymbol {
 
 /** نقشه‌ی کامل یک پروژه: مسیر نسبی فایل → لیست نمادهایش. */
 export type CodeMap = Record<string, CodeSymbol[]>
+
+/** یک تسک زمان‌بندی‌شده (مثل Codex): پرامپت + تکرار کرون + اجرای پس‌زمینه. */
+export interface ScheduledTask {
+  id: string
+  name: string
+  prompt: string
+  /** کرون ۵ فیلدی نرمال‌شده (UTC)؛ رشته خالی یعنی اجرای یک‌باره. */
+  cron: string
+  /** توصیف فارسی کوتاه برای نمایش (از بک‌اند می‌آید). */
+  cron_label?: string
+  enabled: boolean
+  root: string
+  mode: string
+  provider_id?: string
+  model?: string
+  /** نوبت بعدی اجرا (epoch ثانیه)؛ null یعنی بدون نوبت بعدی. */
+  next_run?: number | null
+  last_run?: number | null
+  run_count?: number
+  created_at?: number
+  updated_at?: number
+}
+
+/** یک اجرای ثبت‌شده‌ی تسک زمان‌بندی (تاریخچه). */
+export interface ScheduleRun {
+  id: string
+  schedule_id: string
+  status: 'running' | 'done' | 'error'
+  output?: string
+  error?: string
+  started_at: number
+  finished_at?: number
+}

@@ -1019,6 +1019,92 @@ def dedupe_tool_outputs(msgs: list) -> list:
     return out
 
 
+def _chunk_index(c: Any) -> Any:
+    """شمارهٔ موقعیت تکهٔ استریم (``index``) یا ``None``."""
+    if isinstance(c, dict):
+        return c.get("index")
+    return getattr(c, "index", None)
+
+
+def _chunk_id(c: Any) -> Any:
+    """شناسهٔ تکهٔ استریم یا ورودی blob خام."""
+    if isinstance(c, dict):
+        return c.get("id")
+    return getattr(c, "id", None)
+
+
+def _set_chunk_id(c: Any, new_id: str) -> None:
+    if isinstance(c, dict):
+        c["id"] = new_id
+    else:
+        with contextlib.suppress(Exception):
+            c.id = new_id
+
+
+def _sync_derived_tool_ids(
+    chunks: list,
+    raw_tcs: Any,
+    total: int,
+    renames: dict[int, tuple[str, str]],
+) -> None:
+    """همگام‌سازی درجا شناسه‌ها در منابعِ مشتق‌ساز ``tool_calls``.
+
+    اعتبارسنج langchain در ``model_copy``/unpickle بعدی ``tool_calls`` را از
+    ``tool_call_chunks`` بازاستخراج می‌کند و مبدل وایر وقتی ``tool_calls``
+    خالی است به blob خام ``additional_kwargs["tool_calls"]`` برمی‌گردد؛ پس هر
+    تغییرنام باید در هر سه منبع بنشیند وگرنه شناسهٔ کهنه برمی‌گردد و provider
+    با 400 تکراری رد می‌کند (بای‌پس واقعی). ``renames`` نگاشت موقعیت→(کهنه،
+    جدید) است؛ ``total`` طول ``tool_calls``. حالت معمول (طول برابر) موقعیتی
+    همگام می‌شود؛ وگرنه (تکه‌تکه‌شدن آرگومان در استریم) بر اساس ``index``
+    تکه‌ها، و در نهایت فقط وقتی شناسهٔ کهنه در آن منبع یکتاست (تا فراخوانیِ
+    هم‌شناسهٔ دیگر خراب نشود).
+    """
+    if not renames:
+        return
+    if chunks:
+        if len(chunks) == total:
+            for j, (_old, new) in renames.items():
+                if 0 <= j < len(chunks):
+                    _set_chunk_id(chunks[j], new)
+        else:
+            by_index: dict[Any, list] = {}
+            no_index: list = []
+            for c in chunks:
+                idx = _chunk_index(c)
+                if idx is None:
+                    no_index.append(c)
+                else:
+                    by_index.setdefault(idx, []).append(c)
+            counts: dict[Any, int] = {}
+            for c in chunks:
+                cid = _chunk_id(c)
+                counts[cid] = counts.get(cid, 0) + 1
+            for j, (old, new) in renames.items():
+                if j in by_index:
+                    for c in by_index[j]:
+                        _set_chunk_id(c, new)
+                elif old and counts.get(old) == 1:
+                    for c in no_index:
+                        if _chunk_id(c) == old:
+                            _set_chunk_id(c, new)
+    if isinstance(raw_tcs, list) and raw_tcs:
+        if len(raw_tcs) == total:
+            for j, (_old, new) in renames.items():
+                if 0 <= j < len(raw_tcs) and isinstance(raw_tcs[j], dict):
+                    raw_tcs[j]["id"] = new
+        else:
+            counts = {}
+            for e in raw_tcs:
+                if isinstance(e, dict):
+                    eid = e.get("id")
+                    counts[eid] = counts.get(eid, 0) + 1
+            for _j, (old, new) in renames.values():
+                if old and counts.get(old) == 1:
+                    for e in raw_tcs:
+                        if isinstance(e, dict) and e.get("id") == old:
+                            e["id"] = new
+
+
 def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
     """یکتاسازیِ in-place شناسهٔ همهٔ ``tool_call``ها در کل ترنسکریپت.
 
@@ -1037,13 +1123,13 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
     used: set[str] = set()
     # صف FIFO از [شناسهٔ اصلی، شناسهٔ یکتا] برای فراخوانی‌های بی‌جواب.
     open_calls: list[list[Any]] = []
-    renames: list[tuple[int, dict[int, str]]] = []
+    renames: list[tuple[int, dict[int, tuple[str, str]]]] = []
     for i, m in enumerate(msgs):
         if isinstance(m, AIMessage):
             tcs = list(getattr(m, "tool_calls", None) or [])
             if not tcs:
                 continue
-            changed: dict[int, str] = {}
+            changed: dict[int, tuple[str, str]] = {}
             for j, tc in enumerate(tcs):
                 raw = str(tc.get("id") or "")
                 cid = raw or "call"
@@ -1053,7 +1139,7 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
                         n += 1
                     cid = f"{cid}#{n}"
                 if cid != raw:
-                    changed[j] = cid
+                    changed[j] = (raw, cid)
                 used.add(cid)
                 open_calls.append([raw, cid])
             if changed:
@@ -1079,25 +1165,15 @@ def _uniquify_tool_call_ids(msgs: list, logger: Any = None) -> None:
     for i, changed in renames:
         m = msgs[i]
         tcs = list(m.tool_calls or [])
-        for j, new_id in changed.items():
+        for j, (_old, new_id) in changed.items():
             tcs[j]["id"] = new_id
-        # ``model_copy`` بعدی ``tool_calls`` را از ``tool_call_chunks`` و blob
-        # خام بازاستخراج می‌کند، پس هر دو را هم به‌روز می‌کنیم.
+        # اعتبارسنج langchain در ``model_copy``/unpickle بعدی ``tool_calls`` را
+        # از ``tool_call_chunks`` بازاستخراج می‌کند و مبدل وایر وقتی
+        # ``tool_calls`` خالی است به blob خام برمی‌گردد؛ پس هر دو را هم به‌روز
+        # می‌کنیم (بای‌پس واقعی خطای 400 تکراری).
         chunks = getattr(m, "tool_call_chunks", None) or []
-        if len(chunks) == len(tcs):
-            for j, new_id in changed.items():
-                c = chunks[j]
-                if isinstance(c, dict):
-                    c["id"] = new_id
-                else:
-                    with contextlib.suppress(Exception):
-                        c.id = new_id
         raw_tcs = (getattr(m, "additional_kwargs", None) or {}).get("tool_calls")
-        if isinstance(raw_tcs, list) and len(raw_tcs) == len(tcs):
-            for j, new_id in changed.items():
-                entry = raw_tcs[j]
-                if isinstance(entry, dict):
-                    entry["id"] = new_id
+        _sync_derived_tool_ids(chunks, raw_tcs, len(tcs), changed)
         msgs[i] = m.model_copy(update={"tool_calls": tcs})
     if logger is not None:
         logger.warning(
@@ -1158,7 +1234,7 @@ def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> 
     tcs = getattr(ai, "tool_calls", None) or []
     if not tcs:
         return
-    renames: dict[int, str] = {}
+    renames: dict[int, tuple[str, str]] = {}
     seen: set[str] = set(reserved_ids or ())
     for idx, tc in enumerate(tcs):
         raw = str(tc.get("id") or "")
@@ -1170,25 +1246,13 @@ def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> 
             cid = f"{cid}#{n}"
         if cid != raw:
             tc["id"] = cid
-            renames[idx] = cid
+            renames[idx] = (raw, cid)
         seen.add(cid)
     if not renames:
         return
     chunks = getattr(ai, "tool_call_chunks", None) or []
-    if len(chunks) == len(tcs):
-        for idx, new_id in renames.items():
-            c = chunks[idx]
-            if isinstance(c, dict):
-                c["id"] = new_id
-            else:
-                with contextlib.suppress(Exception):
-                    c.id = new_id
     raw_tcs = (getattr(ai, "additional_kwargs", None) or {}).get("tool_calls")
-    if isinstance(raw_tcs, list) and len(raw_tcs) == len(tcs):
-        for idx, new_id in renames.items():
-            entry = raw_tcs[idx]
-            if isinstance(entry, dict):
-                entry["id"] = new_id
+    _sync_derived_tool_ids(chunks, raw_tcs, len(tcs), renames)
 
 
 # ── Batchable-call detection (shared by both tool loops) ──────────────────

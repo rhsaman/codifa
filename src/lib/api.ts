@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, SidecarEvent } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SidecarEvent } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -286,11 +286,14 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
   modelsInFlight.set(sig, p)
   // Clear the cache entry once the request settles, but keep a short "fresh"
   // window so a re-mount within ~1s still dedupes.
+  // `p.finally(...)` returns a NEW promise mirroring p's rejection — swallow
+  // it here: callers await `p` itself and surface its error, while this
+  // derived promise has no other handler (an unhandled rejection otherwise).
   p.finally(() => {
     setTimeout(() => {
       if (modelsInFlight.get(sig) === p) modelsInFlight.delete(sig)
     }, 1000)
-  })
+  }).catch(() => {})
   return p
 }
 
@@ -816,9 +819,9 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
   }
 }
 
-// ---- Managed on-device models (whisper / embedding) ---------------------- //
+// ---- Managed on-device models (whisper / embedding / laya) ------------ //
 
-export type ManagedModelKind = "whisper" | "embedding"
+export type ManagedModelKind = "whisper" | "embedding" | "laya"
 
 export interface ModelDirInfo {
   repo: string
@@ -828,9 +831,17 @@ export interface ModelDirInfo {
 }
 
 export interface ModelRunState {
-  state: "downloading" | "error"
+  state: "downloading" | "paused" | "error"
   repo: string
   error?: string
+  /** Downloaded bytes so far (cumulative across all files). */
+  downloaded_bytes?: number
+  /** Estimated total size (bytes); zero means still unknown. */
+  total_bytes?: number
+  /** Percent 0–100 (one decimal). */
+  percent?: number
+  /** Live speed (bytes/sec, 5s rolling average). */
+  speed_bps?: number
 }
 
 export interface ModelKindStatus {
@@ -841,6 +852,7 @@ export interface ModelKindStatus {
 export interface ModelsStatus {
   whisper: ModelKindStatus
   embedding: ModelKindStatus
+  laya?: ModelKindStatus
 }
 
 /** Kick off a background model download (Settings → Models). */
@@ -861,13 +873,36 @@ export async function downloadModel(
 /** Poll the current download state + on-disk model dirs. */
 export async function getModelsStatus(): Promise<ModelsStatus> {
   const url = await ensureSidecar()
-  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] }, laya: { dirs: [] } }
   const res = await fetch(`${url}/models/status`)
-  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] }, laya: { dirs: [] } }
   const data = (await res.json()) as ModelsStatus
   return {
     whisper: data.whisper ?? { dirs: [] },
     embedding: data.embedding ?? { dirs: [] },
+    laya: data.laya ?? { dirs: [] },
+  }
+}
+
+/** وضعیت تصمیم‌گیر محلی laya (نصب/آماده/ریپو/پروایدر) برای Settings → Models. */
+export interface LayaStatus {
+  available: boolean
+  ready: boolean
+  repo: string
+  provider?: string
+}
+
+/** خواندن وضعیت laya از سایدکار؛ در صورت قطعی، پیش‌فرض خاموش برمی‌گردد. */
+export async function getLayaStatus(): Promise<LayaStatus> {
+  const url = await ensureSidecar()
+  const empty: LayaStatus = { available: false, ready: false, repo: '' }
+  if (!url) return empty
+  try {
+    const res = await fetch(`${url}/models/laya-status`)
+    if (!res.ok) return empty
+    return { ...empty, ...((await res.json()) as Partial<LayaStatus>) }
+  } catch {
+    return empty
   }
 }
 
@@ -883,6 +918,57 @@ export async function removeModel(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ kind, model }),
   })
+}
+
+/** Pause a running download (downloaded bytes are kept). */
+export async function pauseModelDownload(kind: ManagedModelKind): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  const res = await fetch(`${url}/models/pause`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(
+      (data as { detail?: string }).detail || `pause failed (${res.status})`,
+    )
+  }
+}
+
+/** Resume a paused download from where it stopped. */
+export async function resumeModelDownload(kind: ManagedModelKind): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  const res = await fetch(`${url}/models/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(
+      (data as { detail?: string }).detail || `resume failed (${res.status})`,
+    )
+  }
+}
+
+/** Stop an in-flight download; partial files stay for later resume. */
+export async function cancelModelDownload(kind: ManagedModelKind): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  const res = await fetch(`${url}/models/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(
+      (data as { detail?: string }).detail || `stop failed (${res.status})`,
+    )
+  }
 }
 
 // ---- Skills & MCP connectors (file-based in the app's user data folder) ---- //
@@ -1231,4 +1317,122 @@ export async function gitCommit(
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }
+}
+
+// --- زمان‌بندی تسک‌ها (مثل Codex) -------------------------------------------
+
+export interface ScheduleUpsert {
+  id?: string
+  name: string
+  prompt: string
+  cron: string
+  enabled: boolean
+  root: string
+  mode: string
+  provider_id?: string
+  model?: string
+}
+
+/** لیست تسک‌های زمان‌بندی (همراه next_run محاسبه‌شده). */
+export async function listSchedules(): Promise<ScheduledTask[] | { error: string }> {
+  const out = await sidecarGet<{ schedules: ScheduledTask[] }>('/schedules')
+  if ('error' in out) return out
+  return out.schedules ?? []
+}
+
+/** ساخت/ویرایش تسک زمان‌بندی (id خالی = ساخت جدید). */
+export async function saveSchedule(
+  task: ScheduleUpsert,
+): Promise<ScheduledTask | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(task),
+    })
+    const body = (await res.json().catch(() => ({}))) as {
+      schedule?: ScheduledTask
+      detail?: string
+    }
+    if (!res.ok || !body.schedule) return { error: body.detail || `save failed (${res.status})` }
+    return body.schedule
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** حذف تسک زمان‌بندی (تاریخچه اجراها نگه داشته می‌شود). */
+export async function deleteSchedule(id: string): Promise<{ ok: true } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}`, { method: "DELETE" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `delete failed (${res.status})` }
+    }
+    return { ok: true }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** اجرای دستی یک تسک (بدون انتظار برای سررسید). */
+export async function runScheduleNow(id: string): Promise<{ ok: true } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}/run`, { method: "POST" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `run failed (${res.status})` }
+    }
+    return { ok: true }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** تاریخچه اجراهای یک تسک (جدیدترین اول). */
+export async function listScheduleRuns(
+  id: string,
+  limit = 20,
+): Promise<ScheduleRun[] | { error: string }> {
+  const out = await sidecarGet<{ runs: ScheduleRun[] }>(
+    `/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`,
+  )
+  if ('error' in out) return out
+  return out.runs ?? []
+}
+
+/** پاک‌کردن چت اینباکس یک کرون: حذف همه اجراهای همان تسک. */
+export async function clearScheduleRuns(
+  id: string,
+): Promise<{ ok: true; removed: number } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}/runs`, { method: "DELETE" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `clear failed (${res.status})` }
+    }
+    const body = (await res.json().catch(() => ({}))) as { removed?: number }
+    return { ok: true, removed: typeof body.removed === 'number' ? body.removed : 0 }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** تازه‌ترین اجراهای همه تسک‌ها (برای Inbox؛ جدیدترین اول). */
+export async function listAllScheduleRuns(
+  limit = 50,
+): Promise<ScheduleRun[] | { error: string }> {
+  const out = await sidecarGet<{ runs: ScheduleRun[] }>(
+    `/schedule-runs?limit=${limit}`,
+  )
+  if ('error' in out) return out
+  return out.runs ?? []
 }

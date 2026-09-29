@@ -319,6 +319,22 @@ npx esbuild src/lib/tts.test.ts --bundle --platform=node --format=esm \
   --packages=external --outfile=tests/.tmp-tts.mjs --external:electron >/dev/null 2>&1
 node tests/.tmp-tts.mjs
 
-rm -f tests/.tmp-tts.mjs tests/.tmp-uc2.mjs tests/.tmp-ra.mjs tests/.tmp-rd.mjs tests/.tmp-rvs.mjs tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-mc.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-qdc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs tests/.tmp-tp.mjs tests/.tmp-pms.mjs tests/.tmp-snf.mjs tests/.tmp-mt.mjs src/lib/.tmp-shortcuts.mjs
+echo ""
+echo "── تست ۴۷: SchedulePanel (زمان‌بندی: formatNextRunFa + runStatusFa) ──"
+npx esbuild tests/schedule.ssr.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
+  --outfile=tests/.tmp-sch.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-sch.mjs
+
+echo ""
+echo "── تست ۴۸: SettingsModal Fetch models (دکمه‌ی دستی + حذف فچ خودکار هنگام ویرایش) ──"
+npx esbuild src/components/SettingsModal.fetchModels.test.tsx --bundle --platform=node --format=esm \
+  --jsx=automatic --packages=external \
+  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
+  --outfile=tests/.tmp-sfm.mjs --external:electron >/dev/null 2>&1
+node tests/.tmp-sfm.mjs
+
+rm -f tests/.tmp-tts.mjs tests/.tmp-sfm.mjs tests/.tmp-sch.mjs tests/.tmp-uc2.mjs tests/.tmp-ra.mjs tests/.tmp-rd.mjs tests/.tmp-rvs.mjs tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-mc.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-qdc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs tests/.tmp-tp.mjs tests/.tmp-pms.mjs tests/.tmp-snf.mjs tests/.tmp-mt.mjs src/lib/.tmp-shortcuts.mjs
 echo ""
 echo "✅ همه تستهای فرانتاند پاس شدند"

@@ -10,6 +10,7 @@ dependencies = [
     "ddgs>=9.14.4",
     "cryptography>=42.0.0",
     "faster-whisper>=1.2.1",
+    "laya>=0.3.21",
     "numpy>=1.26",
     "onnxruntime>=1.18",
     "tokenizers>=0.19",
@@ -30,6 +31,8 @@ dependencies = [
     "ruff>=0.16.2",
     "tree-sitter-language-pack>=1.15.8",
     "langchain-anthropic",
+    "huggingface-hub>=0.23",
+    "hf-transfer>=0.1.8",
     "xa11y>=0.15.0",
     "websockets>=16.1.1",
 ]

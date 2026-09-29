@@ -98,6 +98,7 @@ import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
+import { shouldAutoOpenTodosPanel } from "./TodosPanel";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -2009,6 +2010,17 @@ export function ChatPanel() {
           plan: merged,
           retry: null,
         });
+        // تودوی تازه ساخته شد و پنل بسته است → پنل راست خودکار باز شود تا
+        // کاربر تودوها را ببیند. فقط ساختِ تازه (نه آپدیت وضعیت) باز می‌کند.
+        if (
+          shouldAutoOpenTodosPanel(
+            existing.length,
+            merged.length,
+            store.rightPanelOpen,
+          )
+        ) {
+          store.setRightPanelOpen(true);
+        }
       } else if (event.kind === "permission") {
         useStore.getState().setChatPendingPermission(chat.id, {
           id: event.id ?? "",

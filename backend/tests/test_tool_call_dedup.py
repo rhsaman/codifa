@@ -387,6 +387,46 @@ def test_normalize_reserves_orphan_tool_output_id():
     assert len(tool_ids) == len(set(tool_ids))
 
 
+def test_normalize_survives_chunk_rederivation():
+    """بای‌پس واقعی خطای 400 تکراری: شناسهٔ کهنه در ``tool_call_chunks`` پس از
+    ``model_copy``/unpickle بعدی ``tool_calls`` را بازنویسی می‌کرد و شناسهٔ
+    تکراری به وایر برمی‌گشت. تغییرنام باید در chunks هم بنشیند."""
+    import pickle
+
+    from langchain_core.messages import AIMessageChunk
+    from langchain_openai.chat_models.base import _convert_message_to_dict
+
+    def _chunk(cid, pattern):
+        return AIMessageChunk(
+            content="",
+            tool_calls=[{"name": "grep", "args": {"pattern": pattern}, "id": cid}],
+            tool_call_chunks=[
+                {
+                    "name": "grep",
+                    "args": f'{{"pattern": "{pattern}"}}',
+                    "id": cid,
+                    "index": 0,
+                    "type": "tool_call_chunk",
+                }
+            ],
+        )
+
+    msgs = [
+        _chunk("12", "a"),
+        ToolMessage(content="ra", tool_call_id="12"),
+        _chunk("12", "b"),
+        ToolMessage(content="rb", tool_call_id="12"),
+    ]
+    _llm.normalize_tool_transcript(msgs)
+    assert [tc["id"] for tc in msgs[2].tool_calls] == ["12#2"]
+    # بازاستخراج اعتبارسنج پس از unpickle نباید شناسهٔ کهنه را برگرداند
+    revived = pickle.loads(pickle.dumps(msgs[2]))
+    assert [tc["id"] for tc in revived.tool_calls] == ["12#2"]
+    # وایر هم شناسهٔ یکتا را می‌بیند
+    wire = _convert_message_to_dict(msgs[2]).get("tool_calls") or []
+    assert [t.get("id") for t in wire] == ["12#2"]
+
+
 if __name__ == "__main__":
     test_duplicate_calls_executed_only_once()
     print("  ✅ test_duplicate_calls_executed_only_once")
@@ -410,4 +450,6 @@ if __name__ == "__main__":
     print("  ✅ test_normalize_keeps_unique_ids_untouched")
     test_normalize_reserves_orphan_tool_output_id()
     print("  ✅ test_normalize_reserves_orphan_tool_output_id")
+    test_normalize_survives_chunk_rederivation()
+    print("  ✅ test_normalize_survives_chunk_rederivation")
     print("\n🎉 همه تست‌های dedup رد شد")

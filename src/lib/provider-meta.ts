@@ -1,6 +1,6 @@
 /**
  * Single source of truth for per-provider-kind metadata, shared by the store
- * (defaults), the Settings UI (labels / env-var hints / credential banner /
+ * (defaults), the Settings UI (labels / credential banner /
  * base-URL hints) and — mirrored on the Python side by
  * `backend/providers.py::_PROVIDERS` — the sidecar.
  *
@@ -15,11 +15,7 @@ export interface ProviderKindMeta {
   label: string
   /** Default provider-row name. */
   name: string
-  /** Default env-var name stored for this kind ('' = none). */
-  defaultEnvVar: string
-  /** Every env-var name this kind accepts (shown as hints to the user). */
-  envVars: string[]
-  /** True = the provider can never run without a credential (env var or saved
+  /** True = the provider can never run without a credential (a saved
    *  key); the UI blocks Save and the backend refuses to build the model. */
   requiresKey: boolean
   /** True = a fixed, built-in provider (no editable name, shown by default). */
@@ -48,8 +44,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'openrouter',
     label: 'OpenRouter',
     name: 'OpenRouter',
-    defaultEnvVar: 'OPENROUTER_API_KEY',
-    envVars: ['OPENROUTER_API_KEY'],
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://openrouter.ai/api/v1',
@@ -59,8 +53,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'google',
     label: 'Google',
     name: 'Google',
-    defaultEnvVar: 'GOOGLE_GENERATIVE_AI_API_KEY',
-    envVars: ['GOOGLE_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY'],
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://generativelanguage.googleapis.com/v1beta/openai',
@@ -71,8 +63,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'nvidia',
     label: 'NVIDIA',
     name: 'NVIDIA',
-    defaultEnvVar: 'NVIDIA_API_KEY',
-    envVars: ['NVIDIA_API_KEY'],
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://integrate.api.nvidia.com/v1',
@@ -83,8 +73,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'cloudflare',
     label: 'Cloudflare',
     name: 'Cloudflare',
-    defaultEnvVar: 'CLOUDFLARE_AUTH_TOKEN',
-    envVars: ['CLOUDFLARE_AUTH_TOKEN', 'CLOUDFLARE_API_TOKEN'],
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1',
@@ -96,8 +84,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'tokenrouter',
     label: 'TokenRouter',
     name: 'TokenRouter',
-    defaultEnvVar: 'TOKEN_ROUTER_API_KEY',
-    envVars: ['TOKEN_ROUTER_API_KEY', 'TOKENROUTER_API_KEY'],
     requiresKey: true,
     builtin: true,
     baseUrlHint: 'https://api.tokenrouter.com/v1',
@@ -108,8 +94,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'ollama',
     label: 'local',
     name: 'local',
-    defaultEnvVar: '',
-    envVars: [],
     requiresKey: false,
     builtin: true,
     local: true,
@@ -119,8 +103,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'custom',
     label: 'Custom API',
     name: 'Custom API',
-    defaultEnvVar: '',
-    envVars: [],
     requiresKey: false,
     builtin: false,
     editableBaseUrl: true,
@@ -130,8 +112,6 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     kind: 'anthropic',
     label: 'Anthropic-compatible',
     name: 'Anthropic',
-    defaultEnvVar: 'ANTHROPIC_API_KEY',
-    envVars: ['ANTHROPIC_API_KEY'],
     requiresKey: true,
     builtin: false,
     editableBaseUrl: true,

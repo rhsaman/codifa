@@ -255,6 +255,26 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await asyncio.to_thread(laya_decide.warmup_router)
     except Exception:  # noqa: BLE001, S110 — warmup اختیاری است
         pass
+    # Preload the embedding ONNX model in the background (fire-and-forget):
+    # the first chat turn runs laya rerank before the LLM call, and a cold
+    # load (tokenizer + session, hundreds of MB) blocks the first token for
+    # many seconds. Warming here moves that cost to startup, off the chat path.
+    # Skipped silently when no embedding model is downloaded.
+    async def _bg_embed() -> None:
+        try:
+            import asyncio as _aio
+
+            from embeddings import model_dir
+
+            if not model_dir():
+                return
+            from embeddings import _load as _embed_load
+
+            await _aio.to_thread(_embed_load)
+        except Exception:  # noqa: BLE001, S110 — warmup اختیاری است
+            pass
+
+    asyncio.create_task(_bg_embed())
     yield
     try:
         _stop.set()
@@ -837,6 +857,7 @@ class ChatRequest(BaseModel):
         return self
     api_key: str = ""
     env_var: str = ""
+    api_keys: list[str] = []
     base_url: str = ""
     model: str = ""
     root: str = ""
@@ -922,6 +943,7 @@ class CompactRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     env_var: str = ""
+    api_keys: list[str] = []
     # The user-configured provider id (several rows can share a kind) so the
     # returned usage event groups under the REAL provider. Mirrors
     # ChatRequest.provider_id.
@@ -933,6 +955,7 @@ class CompactRequest(BaseModel):
     fallback_base_url: str = ""
     fallback_api_key: str = ""
     fallback_env_var: str = ""
+    fallback_api_keys: list[str] = []
     fallback_provider_id: str = ""
     # Conversation history to compact — full-fidelity turns (role, content,
     # toolActivity, plan, mode, preservedToolSummary) so the summarizer sees
@@ -950,6 +973,7 @@ class ModelsRequest(BaseModel):
     provider: str = "custom"
     api_key: str = ""
     env_var: str = ""
+    api_keys: list[str] = []
     base_url: str = ""
 
 
@@ -1300,7 +1324,7 @@ async def oauth_google_result(state: str = "") -> dict:
 async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
         ids = await providers.list_models(
-            req.provider, req.base_url, req.api_key, req.env_var
+            req.provider, req.base_url, req.api_key, req.env_var, req.api_keys
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1311,7 +1335,7 @@ async def models(req: Annotated[ModelsRequest, Query()]) -> dict:
 async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
     try:
         return await providers.fetch_credits(
-            req.provider, req.base_url, req.api_key, req.env_var
+            req.provider, req.base_url, req.api_key, req.env_var, req.api_keys
         )
     except providers.ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1341,6 +1365,7 @@ async def models_test(req: ModelTestRequest) -> dict:
             req.base_url,
             req.api_key,
             req.env_var,
+            req.api_keys,
             timeout=MODEL_TEST_CLIENT_TIMEOUT,
         )
         text, _usage = await asyncio.wait_for(
@@ -1924,8 +1949,7 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     ):
         text += (
             "\n\nThe API key for this provider is invalid, expired, or missing. Open "
-            "Settings → Providers and check the API key field (or the env var it "
-            "references)."
+            "Settings → Providers and check the API keys list."
         )
     elif (
         "incomplete chunked read" in low
@@ -2023,9 +2047,7 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     ):
         text += (
             "\n\nThe Google provider has no usable credential. Open Settings → Providers → "
-            "Google and EITHER set a real environment variable (GOOGLE_API_KEY or "
-            "GOOGLE_GENERATIVE_AI_API_KEY) that exists in your environment, OR paste your "
-            "Gemini API key in 'Saved API key'. A variable name alone is not a key."
+            "Google and add an API key."
         )
     elif any(
         word in low
@@ -2114,6 +2136,7 @@ async def chat_compact(req: CompactRequest, request: Request):
         api_key: str,
         env_var: str,
         provider_id: str = "",
+        api_keys: list[str] | None = None,
     ):
         if not model:
             return None
@@ -2124,6 +2147,7 @@ async def chat_compact(req: CompactRequest, request: Request):
                 base_url,
                 api_key,
                 env_var,
+                api_keys,
                 temperature=0.0,
                 thinking_level="off",
                 max_tokens=8192,
@@ -2137,14 +2161,14 @@ async def chat_compact(req: CompactRequest, request: Request):
             _log(f"model build failed (provider={provider!r} model={model!r}): {exc!r}", level=logging.WARNING)
             return None
 
-    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.provider_id)
+    model = _build(req.provider, req.model, req.base_url, req.api_key, req.env_var, req.provider_id, req.api_keys)
     if model is None:
         _log(f"primary model failed to build (provider={req.provider!r} model={req.model!r})", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "invalid primary model"}
     fallback = _build(
         req.fallback_provider, req.fallback_model, req.fallback_base_url,
         req.fallback_api_key, req.fallback_env_var,
-        req.fallback_provider_id,
+        req.fallback_provider_id, req.fallback_api_keys,
     )
     _log(f"primary built={bool(model)} fallback built={bool(fallback)}; running _compact_history")
     ctx = int(req.context_window or 0)
@@ -2397,6 +2421,14 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     break
 
     async def event_gen():
+        # New user turn -> new trace turn so the Trace panel can group
+        # each turn's laya/llm/prompt/tool entries under one header.
+        try:
+            import trace_store as _trace_store
+
+            _trace_store.next_turn(str(req.chat_id or ""))
+        except Exception:  # noqa: BLE001, S110 — trace must never break the stream
+            pass
         # Create the agent generator so we can close it on disconnect
         agent_gen = run_agent(
             provider=req.provider,
@@ -2405,6 +2437,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             base_url=req.base_url,
             api_key=req.api_key,
             env_var=req.env_var,
+            api_keys=req.api_keys,
             root=req.root,
             mode=req.mode,
             prompt=req.prompt,

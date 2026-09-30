@@ -196,20 +196,34 @@ function relFromRoot(root: string, p: string): string | null {
 }
 
 export function ChatPanel() {
-  const chat = useStore(
-    (s) => s.chats.find((c) => c.id === s.activeChatId) ?? null,
-  );
+  // Subscribe by id first: the active chat object identity only changes when
+  // THAT chat's own record changes (message/stream/draft), so typing a draft
+  // in another chat or streaming elsewhere never re-renders this panel.
+  const activeChatId = useStore((s) => s.activeChatId);
+  const chat = useStore((s) => {
+    const id = s.activeChatId;
+    for (const c of s.chats) if (c.id === id) return c;
+    return null;
+  });
   const provider = useStore((s) => {
     // Per-chat provider override: a chat that picked its own provider/model in
     // the composer runs on that, falling back to the global active provider.
-    const ch = s.chats.find((c) => c.id === s.activeChatId) ?? null;
-    const overrideId = ch?.providerId;
+    // Read the override id without subscribing to the whole chats array: only
+    // the override + provider list participate in the result.
+    let overrideId: string | undefined;
+    for (const c of s.chats) {
+      if (c.id === s.activeChatId) {
+        overrideId = c.providerId;
+        break;
+      }
+    }
     return (
       s.settings.providers.find(
         (x) => x.id === (overrideId ?? s.settings.activeProviderId),
       ) ?? s.settings.providers[0]
     );
   });
+  void activeChatId;
   const activeModel = chat?.model ?? provider.model;
   const allProviders = useStore((s) => s.settings.providers);
 
@@ -321,8 +335,79 @@ export function ChatPanel() {
     chat ? (s.settings.systemPrompts?.[chat.mode] ?? "") : "",
   );
 
+  // The panel now stays mounted across chat switches (no key={activeChatId}),
+  // so per-chat UI state must reset explicitly when the active chat changes.
   const [input, setInput] = useState(chat?.draft?.input ?? "");
-  const [busyLocal, setBusy] = useState(false);
+  const [attachments, setAttachments] = useState<string[]>(
+    chat?.draft?.attachments ?? [],
+  );
+  const [images, setImages] = useState<
+    Array<{
+      path: string;
+      name: string;
+      dataUrl?: string;
+      origPath?: string;
+    }>
+  >(chat?.draft?.images ?? []);
+  const [attLen, setAttLen] = useState(0);
+  const prevChatIdRef = useRef(chat?.id ?? "");
+  useEffect(() => {
+    const id = chat?.id ?? "";
+    if (prevChatIdRef.current === id) return;
+    prevChatIdRef.current = id;
+    // Flush the outgoing draft synchronously so no keystroke is lost, then
+    // load the incoming chat's draft. Cancel the pending debounce first.
+    if (draftTimerRef.current) {
+      clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    const prevId = useStore.getState().activeChatId;
+    void prevId;
+    setInput(chat?.draft?.input ?? "");
+    setAttachments(chat?.draft?.attachments ?? []);
+    setImages(chat?.draft?.images ?? []);
+    setCmdOpen(null);
+    setCmdQuery("");
+    setSkillMention(null);
+    setSkillMentionQuery("");
+    setAskFreeText("");
+    setNvimMentioned(false);
+    setMsgLimit(MSG_PAGE);
+    stickToBottom.current = !chat?.scrollPos || chat.scrollPos.atBottom;
+    restoredRef.current = false;
+    restoreTargetRef.current = null;
+    lastScrollPosRef.current = null;
+    chatIdRef.current = id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat?.id]);
+  // Per-chat isolation: the panel stays mounted across switches (no
+  // key={activeChatId}), so ALL per-turn mutable state must be keyed by chatId.
+  // A single boolean/ref would leak the Stop button, aborts, watchdog timers
+  // and error banners across chats. Each chat tracks its own local busy flag;
+  // the message-level `streaming` flag stays the source of truth for activity.
+  const chatIdRef = useRef(chat?.id ?? "");
+  const [busyMap, setBusyMap] = useState<Record<string, boolean>>({});
+  const setBusyFor = useCallback((chatId: string, v: boolean) => {
+    setBusyMap((m) => {
+      if (v) {
+        if (m[chatId]) return m;
+        return { ...m, [chatId]: true };
+      }
+      if (!m[chatId]) return m;
+      const n = { ...m };
+      delete n[chatId];
+      return n;
+    });
+  }, []);
+  const setBusy = useCallback(
+    (v: boolean) => {
+      const id = chatIdRef.current || chat?.id;
+      if (!id) return;
+      setBusyFor(id, v);
+    },
+    [chat?.id, setBusyFor],
+  );
+  const busyLocal = chat?.id ? (busyMap[chat.id] ?? false) : false;
   // This chat is busy when THIS chat has a streaming assistant message (so
   // another chat streaming in the background doesn't lock this composer). The
   // message-level streaming flag is the source of truth — the global
@@ -344,18 +429,7 @@ export function ChatPanel() {
    *  between the user's message and the incoming content. */
   const retryingMsg = chat?.messages.find((m) => m.retry) ?? null;
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
-  const [attachments, setAttachments] = useState<string[]>(
-    chat?.draft?.attachments ?? [],
-  );
-  const [attLen, setAttLen] = useState(0);
-  const [images, setImages] = useState<
-    Array<{
-      path: string;
-      name: string;
-      dataUrl?: string;
-      origPath?: string;
-    }>
-  >(chat?.draft?.images ?? []);
+
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
@@ -495,12 +569,16 @@ export function ChatPanel() {
   /** Bumped to force the transcript to the bottom even when the user scrolled
    *  up (send / queue / steer). The auto-scroll effect depends on it. */
   const [scrollTick, setScrollTick] = useState(0);
+  // Per-chat abort controllers: single ref would abort the WRONG chat after a
+  // switch (stop in B would kill A's stream). The store's `chatAborts` map is
+  // authoritative; this mirror lets stop() abort instantly without a store read
+  // race. Keyed by chatId.
+  const abortMapRef = useRef<Map<string, AbortController>>(new Map());
   const abortRef = useRef<AbortController | null>(null);
-  /** Set to true when the user manually stops the turn. Prevents trailing
-   *  retry / retry_giveup events (from the backend's asyncio.sleep loop) from
-   *  re-activating the retry banner after the user explicitly dismissed it. */
+  /** Per-chat stop flags: prevents trailing retry events from re-activating
+   *  another chat's banner after the user stopped THIS chat. */
+  const stoppedMapRef = useRef<Map<string, boolean>>(new Map());
   const stoppedRef = useRef(false);
-  const chatIdRef = useRef(chat?.id ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
   // Container for the @skill mention popup, so the highlighted row can be
@@ -728,13 +806,30 @@ export function ChatPanel() {
   // Keep the pending composer state (input text + chips) scoped to THIS chat by
   // persisting it into the chat's draft whenever it changes. The ChatPanel is
   // keyed by activeChatId so switching chats remounts with that chat's own draft.
+  // Debounced (~250ms): typing must never write the store per keystroke — each
+  // write rebuilds the chat object and re-renders every subscriber of that chat
+  // (transcript, sidebar row). The local `input` state stays the typing source
+  // of truth; the store only receives the settled value.
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!chat) return;
-    useStore.getState().setChatDraft(chat.id, {
-      input,
-      attachments,
-      images,
-    });
+    const id = chat.id;
+    if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = setTimeout(() => {
+      draftTimerRef.current = null;
+      useStore.getState().setChatDraft(id, {
+        input,
+        attachments,
+        images,
+      });
+    }, 250);
+    return () => {
+      if (draftTimerRef.current) {
+        clearTimeout(draftTimerRef.current);
+        draftTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id, input, attachments, images]);
   // NOTE: نقشه‌های context/pricing/reasoning هر پروایدر فقط در استارت‌آپ
   // (App.tsx → fetchAndPersist) و هنگام افزودن/ویرایش پروایدر (SettingsModal)
@@ -1249,20 +1344,28 @@ export function ChatPanel() {
     continueAssistantId?: string,
     forceScroll = false,
     overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] },
+    forChatId?: string,
   ) => {
-    stoppedRef.current = false;
-    // Per-turn flag: set when a create_mcp tool event arrives, consumed by the
-    // `done` handler. Reset here so a stale flag from a previous turn can't
-    // trigger a spurious refresh.
-    mcpChangedRef.current = false;
+    // Per-chat isolation: resolve the ORIGIN chat first (background drains via
+    // registry must target their own chat, not the currently viewed one), then
+    // keep ALL turn-local mutable state in locals/maps keyed by that origin so
+    // two chats streaming concurrently never share watchdog clocks, abort
+    // controllers, stop flags or busy flags.
     const s = useStore.getState();
     // Use THIS panel's chat (captured at render), never s.activeChatId: a
     // queued turn drained while the user is viewing ANOTHER chat must still
     // target this chat's messages/usage.
-    // Read fresh from store using the chat ID from render scope to avoid stale chatIdRef closure.
-    const chatId = chatIdRef.current;
+    // `forChatId` pins the ORIGIN chat for background drains / watchdog
+    // retries (which fire while another chat is active). Without it, `send`
+    // would read `chatIdRef.current` (the viewed chat) and inject A's turn
+    // into B — the cross-chat contamination reported by users.
+    const chatId = forChatId ?? chatIdRef.current;
     const chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
+    stoppedMapRef.current.set(chatId, false);
+    // Per-turn local state (was shared refs — now locals so concurrent chats
+    // don't race). stop() coordinates via stoppedMapRef + chatAborts store.
+    let mcpChanged = false;
     // Messages that ask to create/install skills or MCP connectors also grant
     // the create_skill/create_mcp tools — in EVERY mode (ask, plan, coder).
     // The grant is sticky across the conversation: check the current message AND
@@ -1496,13 +1599,16 @@ export function ChatPanel() {
     const history = allHistory as StreamParams["history"];
 
     const abort = new AbortController();
-    abortRef.current = abort;
+    abortMapRef.current.set(chat.id, abort);
     useStore.getState().setChatAbort(chat.id, abort);
-    setBusy(true);
-    lastEventAt.current = Date.now();
-    stalledSinceRef.current = null;
-    watchdogAbortedRef.current = false;
-    watchdogAutoRetriedRef.current = 0;
+    setBusyFor(chat.id, true);
+    // Turn-local watchdog clock/counters: locals (not shared refs) so two
+    // chats streaming at once never overwrite each other's timers.
+    let lastEventAtMs = Date.now();
+    let stalledSinceMs: number | null = null;
+    let watchdogAborted = false;
+    let watchdogAutoRetried = 0;
+    const toolRunning = { current: 0 };
     useStore.getState().setStreaming(true, false);
 
     // Append a text slice to the message's segment list, merging into the
@@ -1546,24 +1652,24 @@ export function ChatPanel() {
       // as a stall and never force-abort, no matter how long the user takes.
       const chatState = useStore.getState().chats.find((c) => c.id === chat.id);
       if (chatState?.pendingPermission || chatState?.pendingAsk) {
-        stalledSinceRef.current = null;
+        stalledSinceMs = null;
         return;
       }
       // A tool that's still running gets a much longer leash — it's doing real
       // work, not stalled on the provider.
-      const limit = isToolRunning(toolRunningRef) ? 900_000 : 300_000;
-      const elapsed = Date.now() - lastEventAt.current;
+      const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
+      const elapsed = Date.now() - lastEventAtMs;
       if (elapsed <= limit) {
-        stalledSinceRef.current = null;
+        stalledSinceMs = null;
         return;
       }
-      if (stalledSinceRef.current == null) stalledSinceRef.current = Date.now();
+      if (stalledSinceMs == null) stalledSinceMs = Date.now();
       // Auto-retry on a loop with exponential backoff. Each retry re-sends the
       // last user turn; the backend's own retry loop handles transient failures.
       // Only force-abort if we've exhausted the retries AND the silence drags on
       // far past the last one (a genuinely dead connection).
-      if (watchdogAutoRetriedRef.current < WATCHDOG_MAX_RETRIES) {
-        watchdogAutoRetriedRef.current += 1;
+      if (watchdogAutoRetried < WATCHDOG_MAX_RETRIES) {
+        watchdogAutoRetried += 1;
         // Read the latest messages from the store, not the closure. The stall
         // watchdog fires 10s apart on a stable `setInterval`; reading
         // `chat.messages` from the closure would let it see a stale chat object
@@ -1579,7 +1685,7 @@ export function ChatPanel() {
           // from its checkpoint rather than starting over).
           useStore.getState().updateMessage(assistantMsg.id, {
             retry: {
-              attempt: watchdogAutoRetriedRef.current,
+              attempt: watchdogAutoRetried,
               maxAttempts: WATCHDOG_MAX_RETRIES,
               delay: 0,
               reason:
@@ -1593,7 +1699,10 @@ export function ChatPanel() {
           // which deletes every message after the user turn. Abort the stalled
           // stream first, then re-send the same user message so the backend
           // continues from where it was cut off — no messages are lost.
+          // Pin the ORIGIN chat: the watchdog can fire while the user views
+          // another chat; without forChatId the retry would land in the wrong chat.
           if (!abort.signal.aborted) abort.abort();
+          const originId = chat.id;
           setTimeout(
             () =>
               send(
@@ -1603,14 +1712,17 @@ export function ChatPanel() {
                 false,
                 lastUser.id,
                 assistantMsg.id,
+                false,
+                undefined,
+                originId,
               ),
             0,
           );
         }
         return;
       }
-      if (Date.now() - stalledSinceRef.current > HARD_STALL_GRACE_MS) {
-        watchdogAbortedRef.current = true;
+      if (Date.now() - (stalledSinceMs ?? Date.now()) > HARD_STALL_GRACE_MS) {
+        watchdogAborted = true;
         abort.abort();
       }
     }, 10_000);
@@ -1701,10 +1813,10 @@ export function ChatPanel() {
       // only a socket that stops emitting keepalives (a genuinely dead one)
       // should trip the stall watchdog. No UI work needed.
       if (event.kind === "keepalive") {
-        lastEventAt.current = Date.now();
+        lastEventAtMs = Date.now();
         return;
       }
-      lastEventAt.current = Date.now();
+      lastEventAtMs = Date.now();
       const store = useStore.getState();
       const findMsg = () =>
         store.chats
@@ -1809,11 +1921,11 @@ export function ChatPanel() {
           );
         }
       } else if (event.kind === "tool") {
-        bumpToolRunning(toolRunningRef);
+        bumpToolRunning(toolRunning);
         clearTransientRetry();
         // A create_mcp call this turn means the connector list in the store is
         // stale — flag it so the `done` handler re-fetches from the sidecar.
-        if (event.tool === "create_mcp") mcpChangedRef.current = true;
+        if (event.tool === "create_mcp") mcpChanged = true;
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
         // the running task card, not as top-level cards — so a task turn shows
@@ -1851,7 +1963,8 @@ export function ChatPanel() {
       } else if (event.kind === "retry") {
         // If the user already clicked Stop, ignore any trailing retry events
         // that the backend may still be emitting during its asyncio.sleep delay.
-        if (stoppedRef.current) return;
+        // Per-chat: only THIS origin chat's stop flag matters, not another chat's.
+        if (stoppedMapRef.current.get(chat.id) === true) return;
         const info = {
           attempt: event.attempt ?? 1,
           maxAttempts: event.max_attempts ?? 3,
@@ -1892,7 +2005,7 @@ export function ChatPanel() {
           });
         }
       } else if (event.kind === "retry_giveup") {
-        if (stoppedRef.current) return;
+        if (stoppedMapRef.current.get(chat.id) === true) return;
         store.updateMessage(assistantMsg.id, {
           retry: {
             attempt: event.attempt ?? 1,
@@ -1906,7 +2019,7 @@ export function ChatPanel() {
           },
         });
       } else if (event.kind === "tool_result") {
-        dropToolRunning(toolRunningRef);
+        dropToolRunning(toolRunning);
         clearTransientRetry();
         // `resolveToolResult` resolves sub-agent results by branch/call_id even
         // when the parent branch card (or its nested child) is already "done",
@@ -1959,7 +2072,7 @@ export function ChatPanel() {
         // Treat the compaction like a running tool so the watchdog grants the
         // 900s leash (not the 300s non-tool limit) — a slow mid-turn compact
         // must not be mistaken for a stalled stream and force-aborted.
-        bumpToolRunning(toolRunningRef);
+        bumpToolRunning(toolRunning);
         useStore.getState().setChatCompacting(chat.id, true);
         useStore.getState().setChatCompactNotice(chat.id, null);
         useStore.getState().setChatCompactError(chat.id, null);
@@ -1972,7 +2085,7 @@ export function ChatPanel() {
         // the summary mid-stream (previously via scrollIntoView) is exactly
         // what caused the chat to suddenly jump away from the live reply. The
         // summary is still fully visible by scrolling up whenever the user wants.
-        dropToolRunning(toolRunningRef);
+        dropToolRunning(toolRunning);
         useStore.getState().setChatCompacting(chat.id, false);
         const chatId = chat.id;
         if (chatId) {
@@ -2006,7 +2119,7 @@ export function ChatPanel() {
         // the retry banner so the user can compact manually (the manual path
         // runs the summarizer as a read-only ask request with the parent model,
         // which succeeds even when the compact subagent model is invalid).
-        dropToolRunning(toolRunningRef);
+        dropToolRunning(toolRunning);
         useStore.getState().setChatCompacting(chat.id, false);
         useStore
           .getState()
@@ -2223,14 +2336,14 @@ export function ChatPanel() {
         // The backend signals the end of the stream with a "done" event.
         // Refresh the watchdog clock so a queued stall-timer callback can't
         // re-set it after the stream closes.
-        lastEventAt.current = Date.now();
+        lastEventAtMs = Date.now();
         resolveStuckCards();
         // A create_mcp ran this turn: the connector was saved to the app's user
         // data folder by the backend, but the store's mcpServers snapshot is only hydrated
         // once at app startup — re-fetch so Settings → MCP shows it without a
         // restart. Fire-and-forget: a failure here must not break the turn.
-        if (mcpChangedRef.current) {
-          mcpChangedRef.current = false;
+        if (mcpChanged) {
+          mcpChanged = false;
           void listMcp().then((db) => {
             useStore.getState().setMcpServers(db.mcpServers ?? {});
           }).catch(() => { });
@@ -2261,6 +2374,15 @@ export function ChatPanel() {
     };
 
     try {
+      // Fresh per-origin reads: background drains (watchdog/queue) fire while
+      // another chat is active, so closure-captured thinkingLevel/nvim would be
+      // the VIEWED chat's values. Read the origin chat's own level; only attach
+      // nvim context for foreground sends from the active chat.
+      const originThinking =
+        (useStore.getState().chats.find((c) => c.id === chat.id)
+          ?.thinkingLevel ?? thinkingLevel) as typeof thinkingLevel;
+      const isForeground =
+        useStore.getState().activeChatId === chat.id;
       await streamChat(
         {
           provider: activeProvider,
@@ -2279,7 +2401,7 @@ export function ChatPanel() {
             activeProvider.kind,
             modelReasoning(activeProvider, activeProvider.model),
           )
-            ? thinkingLevel
+            ? originThinking
             : "",
           modelReasoning:
             modelReasoning(activeProvider, activeProvider.model) ??
@@ -2295,8 +2417,9 @@ export function ChatPanel() {
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerAllowed,
-          nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
-          nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
+          nvimFile:
+            isForeground && nvimMentioned ? nvimRel || undefined : undefined,
+          nvimDiagnostics: isForeground && nvimMentioned ? nvimDiags : undefined,
           vectorDbPath: s.vectorDbPath,
           vectorConfig: {
             ttl_days: s.ragWebTtlDays,
@@ -2318,7 +2441,7 @@ export function ChatPanel() {
       // stall watchdog, or a backend/stream error that THROWS. `preserveToolActivity`
       // is defined above and folded tool calls into `content`, so a manual retry
       // knows what this turn already did instead of redoing it from scratch.
-      if (watchdogAbortedRef.current) {
+      if (watchdogAborted) {
         // Forced by the stall watchdog, not the user clicking Stop — the
         // connection was silent for minutes straight. Surface a RETRY banner
         // (with a Retry button that re-sends the same message) instead of a
@@ -2350,17 +2473,29 @@ export function ChatPanel() {
       // Neutralize any stall-timer callback already queued: with a fresh clock
       // its 180s check can't fire and re-show "Still waiting" after the stream
       // has actually ended.
-      lastEventAt.current = Date.now();
-      stalledSinceRef.current = null;
-      toolRunningRef.current = 0;
-      setBusy(false);
+      lastEventAtMs = Date.now();
+      stalledSinceMs = null;
+      toolRunning.current = 0;
+      setBusyFor(chat.id, false);
       useStore.getState().setChatCompacting(chat.id, false);
       useStore.getState().setChatPendingAsk(chat.id, null);
       useStore.getState().setChatPendingPermission(chat.id, null);
       resolveStuckCards();
-      abortRef.current = null;
+      abortMapRef.current.delete(chat.id);
       useStore.getState().setChatAbort(chat.id, null);
-      useStore.getState().setStreaming(false, false);
+      // Global streaming flag is only a persist gate — clear it only when NO
+      // OTHER chat is still streaming. Note: this chat's own assistant message
+      // still has streaming:true here (cleared below), so exclude it from the
+      // check, otherwise the gate would never clear.
+      {
+        const st = useStore.getState();
+        const otherStreaming = st.chats.some((c) =>
+          c.messages.some((m) => m.streaming && m.id !== assistantMsg.id),
+        );
+        if (!otherStreaming) {
+          st.setStreaming(false, false);
+        }
+      }
       // Keep the retry banner when this turn ended in a failure the user can
       // act on (retry_giveup / watchdog / backend error). Clearing `retry`
       // here would make the banner vanish the instant the stream closes, and
@@ -2411,13 +2546,25 @@ export function ChatPanel() {
   };
 
   // Expose this chat's latest `send` so queued turns can be drained even while
-  // this panel is unmounted (user viewing another chat). Registered every
-  // render; NEVER deregistered on unmount.
-  registerChatSend(chatIdRef.current, send);
+  // this panel shows another chat. The wrapper PINs the chatId VALUE at
+  // registration time — never read chatIdRef inside the drain, otherwise A's
+  // queued turn would inject into the currently-viewed B (cross-chat leak).
+  // Registered every render; NEVER deregistered on unmount.
+  {
+    const boundId = chatIdRef.current;
+    if (boundId) {
+      registerChatSend(boundId, (text, atts, imgs, allowCreate, reuseMsgId, continueAssistantId, forceScroll, overrides) =>
+        void send(text, atts, imgs, allowCreate, reuseMsgId, continueAssistantId, forceScroll, overrides, boundId),
+      );
+    }
+  }
 
   const compactContext = async () => {
     let s = useStore.getState();
-    let ch = s.chats.find((c) => c.id === s.activeChatId);
+    // Per-chat: compact the panel's own chat, not "active" at await-resume time
+    // (the user may have switched while streaming). chatIdRef tracks the viewed
+    // chat and is updated synchronously on switch.
+    let ch = s.chats.find((c) => c.id === chatIdRef.current) ?? null;
     if (!ch) return;
 
     // How long the manual /compact call may run before we give up. Slow/free
@@ -2440,7 +2587,7 @@ export function ChatPanel() {
       return c?.messages.some((m) => m.streaming) ?? false;
     };
     if (chatStreaming()) {
-      setBusy(true);
+      setBusyFor(chatId, true);
       useStore.getState().setChatCompacting(chatId, true);
       await new Promise<void>((resolve) => {
         const unsub = useStore.subscribe((state) => {
@@ -2455,18 +2602,18 @@ export function ChatPanel() {
 
     // Re-read state after the wait — messages may have changed while streaming.
     s = useStore.getState();
-    ch = s.chats.find((c) => c.id === chatId);
+    ch = s.chats.find((c) => c.id === chatId) ?? null;
     if (!ch) return;
     const msgs = ch.messages.filter(
       (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
     );
     if (msgs.length === 0) {
-      setBusy(false);
+      setBusyFor(chatId, false);
       useStore.getState().setChatCompacting(chatId, false);
       return;
     }
     const rootDir = ch.root || s.root;
-    setBusy(true);
+    setBusyFor(ch.id, true);
     useStore.getState().setChatCompactError(ch.id, null);
     useStore.getState().setChatCompactNotice(ch.id, null);
     useStore.getState().setChatCompacting(ch.id, true);
@@ -2539,7 +2686,7 @@ export function ChatPanel() {
       clearTimeout(timeout);
     }
 
-    setBusy(false);
+    setBusyFor(ch.id, false);
     useStore.getState().setChatCompacting(ch.id, false);
     // No auto-refresh of the credit chip after compact either — see the
     // credits block above. Strictly click-to-refresh.
@@ -2696,12 +2843,14 @@ export function ChatPanel() {
     // throttle, streaming reply, etc.), pressing Retry must cancel that run
     // FIRST — otherwise the "Retry" click is silently swallowed by the `busy`
     // guard below and nothing happens, even after the user changed the model.
-    const active = useStore.getState().chatAborts[chatIdRef.current];
+    // Per-chat: abort THIS panel's chat only, never another chat's stream.
+    const originId = chatIdRef.current;
+    const active = useStore.getState().chatAborts[originId];
     if (active && !active.signal.aborted) {
       active.abort();
     }
     const s = useStore.getState();
-    const ch = s.chats.find((c) => c.id === s.activeChatId);
+    const ch = s.chats.find((c) => c.id === originId);
     if (!ch) return;
     const msg = ch.messages.find((m) => m.id === id);
     if (!msg) return;
@@ -2741,6 +2890,9 @@ export function ChatPanel() {
       // retry banner, and keeps the failed assistant message in history so
       // the model sees the partial work + preserved tool list and continues
       // (promptWithResume reinforces the plan continuation).
+      // Pin origin so the resume lands in THIS chat even if the user switched
+      // during the abort tick.
+      const targetId = ch.id;
       setTimeout(
         () =>
           send(
@@ -2749,6 +2901,10 @@ export function ChatPanel() {
             userMsg.images ?? [],
             false,
             userMsg.id,
+            undefined,
+            false,
+            undefined,
+            targetId,
           ),
         0,
       );
@@ -2761,11 +2917,16 @@ export function ChatPanel() {
     // Give the abort's finally block a tick to reset busy/streaming state
     // before re-sending (send() re-sets busy=true itself, but the abort's
     // finally would otherwise clear it mid-run).
-    setTimeout(
-      () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
-      0,
-    );
-  }, []);
+    {
+      const targetId = ch.id;
+      const atts = userMsg.attachments ?? [];
+      const imgs = userMsg.images ?? [];
+      setTimeout(
+        () => send(text, atts, imgs, false, undefined, undefined, false, undefined, targetId),
+        0,
+      );
+    }
+  }, [send]);
 
   // Stable identity for memoized children: ChatMessageView is React.memo'd, so a
   // recreated `onRetry` per render would defeat it. Route through a ref instead.
@@ -2781,13 +2942,14 @@ export function ChatPanel() {
   const restartFromMessage = useCallback(
     (id: string) => {
       // Cancel any active stream first — otherwise the `busy` guard in send()
-      // would swallow the re-send.
-      const active = useStore.getState().chatAborts[chatIdRef.current];
+      // would swallow the re-send. Per-chat: only this panel's chat.
+      const originId = chatIdRef.current;
+      const active = useStore.getState().chatAborts[originId];
       if (active && !active.signal.aborted) {
         active.abort();
       }
       const s = useStore.getState();
-      const ch = s.chats.find((c) => c.id === s.activeChatId);
+      const ch = s.chats.find((c) => c.id === originId);
       if (!ch) return;
       const msg = ch.messages.find((m) => m.id === id);
       if (!msg) return;
@@ -2811,11 +2973,16 @@ export function ChatPanel() {
       const text = userMsg.content;
       // Give the abort's finally block a tick to reset busy/streaming state
       // before re-sending (send() re-sets busy=true itself, but the abort's
-      // finally would otherwise clear it mid-run).
-      setTimeout(
-        () => send(text, userMsg.attachments ?? [], userMsg.images ?? []),
-        0,
-      );
+      // finally would otherwise clear it mid-run). Pin origin chat.
+      {
+        const targetId = ch.id;
+        const atts = userMsg.attachments ?? [];
+        const imgs = userMsg.images ?? [];
+        setTimeout(
+          () => send(text, atts, imgs, false, undefined, undefined, false, undefined, targetId),
+          0,
+        );
+      }
     },
     [send],
   );
@@ -3048,8 +3215,7 @@ export function ChatPanel() {
       ? {
           kind: sttCfg.kind,
           baseUrl: sttCfg.baseUrl ?? "",
-          apiKey: sttCfg.apiKey ?? "",
-          envVar: sttCfg.envVar ?? "",
+          apiKeys: [...(sttCfg.apiKeys ?? (sttCfg.apiKey ? [sttCfg.apiKey] : []))],
           model: sttModel,
         }
       : undefined;
@@ -3416,9 +3582,12 @@ export function ChatPanel() {
   };
 
   const stop = () => {
-    stoppedRef.current = true;
-    useStore.getState().setChatPendingAsk(chatIdRef.current, null);
-    useStore.getState().setChatPendingPermission(chatIdRef.current, null);
+    // Per-chat stop: only THIS viewed chat is affected. Aborting another chat's
+    // controller here was the cross-chat kill (Stop in B ended A's stream).
+    const originId = chatIdRef.current;
+    stoppedMapRef.current.set(originId, true);
+    useStore.getState().setChatPendingAsk(originId, null);
+    useStore.getState().setChatPendingPermission(originId, null);
     // Clear any retry banner immediately. The banner's visibility
     // (`effectiveRetry = retryingMsg?.retry ?? ...`) depends ONLY on
     // `message.retry`, not on `busy` — so without this, a live "Provider
@@ -3434,27 +3603,39 @@ export function ChatPanel() {
     if (target?.retry) {
       useStore.getState().updateMessage(target.id, { retry: null });
     }
-    // Abort both the local controller and the store-level one. The store
-    // controller is the "authoritative" one used by the stall watchdog and
-    // retryMessage, so always try it. Wrap in try/catch because abort()
-    // throws if the controller was already used.
+    // Abort ONLY this chat's controller (per-chat mirror + store-level
+    // authoritative one). Never touch the legacy shared ref — it points at
+    // whichever chat sent last, so aborting it kills the WRONG chat.
     try {
-      abortRef.current?.abort();
+      abortMapRef.current.get(originId)?.abort();
     } catch {
       /* already aborted */
     }
     try {
-      const ctrl = useStore.getState().chatAborts?.[chatIdRef.current];
+      const ctrl = useStore.getState().chatAborts?.[originId];
       if (ctrl && !ctrl.signal.aborted) ctrl.abort();
     } catch {
       /* already aborted */
     }
-    // Force-clear busy + streaming so the Stop button vanishes immediately.
-    // Normally the send() finally block handles this, but if abortRef was
+    // Force-clear THIS chat's busy so its Stop button vanishes immediately.
+    // Normally the send() finally block handles this, but if abort was
     // already null (e.g. reconnect race) the finally block never ran, leaving
-    // busy stuck as true and the Stop button permanently visible.
-    setBusy(false);
-    useStore.getState().setStreaming(false, false);
+    // busy stuck as true and the Stop button permanently visible. Do NOT touch
+    // other chats' busy flags, and only clear the global streaming gate when
+    // no chat is still streaming.
+    setBusyFor(originId, false);
+    // Only clear the global gate when no OTHER chat is still streaming —
+    // this chat's own streaming flag is still true here (cleared by send's
+    // finally after abort propagates), so exclude this chat from the check.
+    {
+      const st = useStore.getState();
+      const otherStreaming = st.chats.some(
+        (c) => c.id !== originId && c.messages.some((m) => m.streaming),
+      );
+      if (!otherStreaming) {
+        st.setStreaming(false, false);
+      }
+    }
   };
 
   // Dismiss the retry banner WITHOUT deleting the turn: clear the message's

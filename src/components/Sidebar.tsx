@@ -7,9 +7,24 @@ import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { shouldFocusSearch } from "../lib/shortcuts";
 
-function titleOf(chat: Chat): string {
+type ChatSummary = {
+  id: string;
+  title: string;
+  root: string;
+  updatedAt: number;
+  createdAt: number;
+  hasStreaming: boolean;
+  pendingPermission: { action: string; path?: string } | null;
+  pendingAsk: { question: string } | null;
+  firstUser: string;
+};
+
+function titleOf(chat: Pick<Chat, "title" | "messages"> | ChatSummary): string {
   if (chat.title && chat.title !== "New chat") return chat.title;
-  const firstUser = chat.messages.find((m) => m.role === "user");
+  if ("firstUser" in chat && typeof chat.firstUser === "string") {
+    return chat.firstUser ? chat.firstUser : "New chat";
+  }
+  const firstUser = (chat as Chat).messages.find((m) => m.role === "user");
   return firstUser ? firstUser.content.slice(0, 48) : "New chat";
 }
 
@@ -20,11 +35,11 @@ function rootName(root: string): string {
   return last || root;
 }
 
-interface Group {
+interface Group<T = Chat | ChatSummary> {
   key: string;
   label: string;
   root: string | null;
-  chats: Chat[];
+  chats: T[];
 }
 
 /** Persisted sidebar UI state (localStorage `coder:sidebarUi`): collapse
@@ -41,13 +56,13 @@ interface SidebarUiState {
  * Workspace order is user-controlled — only the chats INSIDE each workspace
  * sort by recency. Pinned workspaces float to the very top (in pin order).
  */
-export function buildGroups(
-  chats: Chat[],
+export function buildGroups<T extends { id: string; root?: string | null; updatedAt: number; createdAt: number }>(
+  chats: T[],
   workspaces: Workspace[],
   pinnedWorkspaces: string[],
   pinnedChats: string[],
-): Group[] {
-  const chatsByRoot = new Map<string, Chat[]>();
+): Group<T>[] {
+  const chatsByRoot = new Map<string, T[]>();
   for (const c of chats) {
     const key = workspaceKey(c.root ?? "");
     if (!chatsByRoot.has(key)) chatsByRoot.set(key, []);
@@ -60,7 +75,7 @@ export function buildGroups(
     const i = pinnedChats.indexOf(id);
     return i === -1 ? Infinity : i;
   };
-  const sortChats = (list: Chat[]) => {
+  const sortChats = (list: T[]) => {
     list.sort((a, b) => {
       const ar = pinRankChat(a.id);
       const br = pinRankChat(b.id);
@@ -69,7 +84,7 @@ export function buildGroups(
     });
   };
 
-  const groups: Group[] = [];
+  const groups: Group<T>[] = [];
   for (const ws of workspaces) {
     const list = chatsByRoot.get(ws.key) ?? [];
     sortChats(list);
@@ -136,7 +151,33 @@ export function Sidebar() {
 }
 
 function SidebarContent() {
-  const chats = useStore((s) => s.chats);
+  // Subscribe to a lightweight chat SUMMARY (id/title/root/timestamps + flags),
+  // not the full chat objects: message/stream/draft edits rebuild the chat
+  // record but leave the summary identical, so the sidebar list does not
+  // re-render on every streamed token or composer keystroke.
+  const chats = useStore((s) =>
+    s.chats.map((c) => ({
+      id: c.id,
+      title: c.title,
+      root: c.root ?? "",
+      updatedAt: c.updatedAt,
+      createdAt: c.createdAt,
+      hasStreaming: c.messages.some(
+        (m) => m.streaming || m.retry?.reconnecting === true,
+      ),
+      pendingPermission: c.pendingPermission
+        ? {
+            action: c.pendingPermission.action,
+            path: c.pendingPermission.path,
+          }
+        : null,
+      pendingAsk: c.pendingAsk ? { question: c.pendingAsk.question } : null,
+      firstUser: (() => {
+        const m = c.messages.find((x) => x.role === "user");
+        return m ? m.content.slice(0, 48) : "";
+      })(),
+    })),
+  );
   const workspaces = useStore((s) => s.workspaces);
   const activeChatId = useStore((s) => s.activeChatId);
   const workspaceColors = useStore((s) => s.workspaceColors);
@@ -346,24 +387,34 @@ function SidebarContent() {
     [chats, workspaces, pinnedWorkspaces, pinnedChats],
   );
 
-  // Sidebar search: match chat title or any message content (case-insensitive).
-  // While searching, groups keep their workspace context but only matching
-  // chats are shown and empty groups are hidden.
-  const searching = search.trim().length > 0;
-  const matchesQuery = (chat: Chat, q: string): boolean => {
+  // Sidebar search: debounced, title-only (never scans message bodies — that
+  // walks every token of every chat on each keystroke). While searching, groups
+  // keep their workspace context but only matching chats are shown.
+  const [debouncedSearch, setDebouncedSearch] = useState(search);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 200);
+    return () => clearTimeout(t);
+  }, [search]);
+  const searching = debouncedSearch.trim().length > 0;
+  const matchesQuery = (chat: ChatSummary, q: string): boolean => {
     const query = q.trim().toLowerCase();
     if (!query) return true;
     if ((chat.title || "").toLowerCase().includes(query)) return true;
-    return chat.messages.some((m) => m.content.toLowerCase().includes(query));
+    return chat.firstUser.toLowerCase().includes(query);
   };
-  const visibleGroups = searching
-    ? groups
-      .map((g) => ({
-        ...g,
-        chats: g.chats.filter((c) => matchesQuery(c, search)),
-      }))
-      .filter((g) => g.chats.length > 0)
-    : groups;
+  const visibleGroups = useMemo(
+    () =>
+      searching
+        ? groups
+          .map((g) => ({
+            ...g,
+            chats: g.chats.filter((c) => matchesQuery(c, debouncedSearch)),
+          }))
+          .filter((g) => g.chats.length > 0)
+        : groups,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [groups, searching, debouncedSearch],
+  );
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();
@@ -416,7 +467,7 @@ function SidebarContent() {
     });
   };
 
-  const startRename = (chat: Chat) => {
+  const startRename = (chat: Chat | ChatSummary) => {
     setRenamingId(chat.id);
     setRenameValue(titleOf(chat) === "New chat" ? "" : titleOf(chat));
   };
@@ -884,15 +935,9 @@ function SidebarContent() {
                 >
                   {g.chats.map((c) => {
                     const isPinnedChat = pinnedChats.includes(c.id);
-                    // A chat is "live" (agent working) when it has a streaming
-                    // message OR is mid-reconnect (the SSE socket dropped and the
-                    // client is self-healing from the checkpoint — `streaming`
-                    // flips to false the instant the socket drops, before the
-                    // `retry`/`reconnecting` event lands, so we must count both).
-                    const hasStreaming =
-                      c.messages.some(
-                        (m) => m.streaming || m.retry?.reconnecting === true,
-                      ) ?? false;
+                    // "Live" (agent working) comes precomputed from the summary
+                    // subscription — no message scan per row per render.
+                    const hasStreaming = c.hasStreaming;
                     const hasUnread =
                       !hasStreaming &&
                       c.id !== activeChatId &&

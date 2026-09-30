@@ -11,7 +11,7 @@ import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import { diffStatsFromUnified, terminalOutputText } from "../lib/toolActivity";
 import { reviewPathOf } from "../lib/reviewTurn";
-import { parseDiffRows } from "../lib/reviewDiff";
+import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
 import { copyToClipboard } from "../lib/clipboard";
 import { useReviewPanel } from "../lib/reviewPanel";
@@ -644,24 +644,66 @@ function highlightParts(
   return out;
 }
 
-/** دیف به سبک کدکس — تک‌ستونی با گاتر سبز/قرمز و شماره‌ی خط.
+/** آستانه‌ی پیش‌فرض عرض (پیکسل) برای سوییچ خودکار دیف به دوستونی. */
+export const DIFF_SIDE_BY_SIDE_THRESHOLD = 640;
+
+/** حالت نمای دیف: خودکار (بر اساس عرض)، تک‌ستونی اجباری، یا دوستونی اجباری. */
+export type DiffLayoutMode = "auto" | "unified" | "side-by-side";
+
+/** تصمیم خالص برای نمایش دوستونی — جدا نگه داشته شده تا مستقیم تست شود. */
+export function shouldShowSideBySide(
+  width: number,
+  threshold: number = DIFF_SIDE_BY_SIDE_THRESHOLD,
+): boolean {
+  return width >= threshold;
+}
+
+/** دیف به سبک کدکس — واکنش‌گرا: در عرض کم تک‌ستونی، در عرض زیاد دوستونی.
  *  هر جفت delete+add به دو خط جدا (قرمز سپس سبز) باز می‌شود.
  *  `query` رخدادهای جست‌وجو را هایلایت می‌کند؛ `activeHit` ایندکس محلی
- *  رخداد فعال داخل همین دیف است (‎-1‎ یعنی هیچ‌کدام) که خودکار اسکرول می‌شود. */
+ *  رخداد فعال داخل همین دیف است (‎-1‎ یعنی هیچ‌کدام) که خودکار اسکرول می‌شود.
+ *  `layout` حالت نما را اجبار می‌کند (`auto` عرض کانتینر را با ناظر تغییراندازه
+ *  می‌سنجد) و `threshold` آستانه‌ی سوییچ خودکار است. */
 export function DiffView({
   diff,
   path,
   query,
   activeHit = -1,
+  layout = "auto",
+  threshold = DIFF_SIDE_BY_SIDE_THRESHOLD,
 }: {
   diff: string;
   path?: string;
   query?: string;
   activeHit?: number;
+  layout?: DiffLayoutMode;
+  threshold?: number;
 }) {
   const rows = parseDiffRows(diff);
+  const sideItems = parseSideBySide(diff);
   if (rows.length === 0) return null;
   const drag = useDragScroll<HTMLDivElement>();
+  const measureRef = useRef<HTMLDivElement | null>(null);
+  const [measuredWidth, setMeasuredWidth] = useState(0);
+  useEffect(() => {
+    const el = measureRef.current;
+    if (!el) return;
+    const update = (w: number) => setMeasuredWidth(w);
+    update(el.clientWidth || 0);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      update(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [diff]);
+  const showSide =
+    layout === "side-by-side"
+      ? true
+      : layout === "unified"
+        ? false
+        : shouldShowSideBySide(measuredWidth, threshold);
   const activeRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest" });
@@ -696,7 +738,102 @@ export function DiffView({
     );
   };
 
-  return (
+  // سلول یک سمت نمای دوستونی با هایلایت جست‌وجو و شماره‌ی خط.
+  const renderSideCell = (
+    key: number | string,
+    cls: string,
+    lineNo: number,
+    text: string,
+    empty: boolean,
+  ) => {
+    const q = (query ?? "").trim();
+    const base = hitCursor;
+    if (q && !empty) hitCursor += countOccurrences(text, q);
+    return (
+      <span key={key} className={`diff-line ${cls}`}>
+        <span className="diff-u-num">{!empty && lineNo >= 0 ? lineNo : ""}</span>
+        <span className="diff-u-text">
+          {!empty ? (
+            <DiffLineText
+              text={text}
+              path={path}
+              query={query}
+              hitBase={base}
+              activeHit={activeHit}
+              activeRef={activeRef}
+            />
+          ) : (
+            "\u00a0"
+          )}
+        </span>
+      </span>
+    );
+  };
+
+  const renderSide = () => (
+    <div className="diff-columns" dir="ltr" {...drag}>
+      {sideItems.map((item) => {
+        if (item.kind === "gap") {
+          return (
+            <div key={item.key} className="diff-gap">
+              {item.count} unmodified lines
+            </div>
+          );
+        }
+        const metas = item.rows.filter((r) => "text" in r);
+        const contents = item.rows.filter((r) => !("text" in r));
+        return (
+          <div key={item.key} className="diff-hunk-pair">
+            {metas.map((m, mi) => (
+              <div key={`${item.key}-m${mi}`} className={`diff-u-meta ${m.type}`}>
+                {"text" in m ? m.text : ""}
+              </div>
+            ))}
+            <div className="diff-col diff-col-before">
+              <div className="diff-col-header">Before</div>
+              <pre className="diff-col-code">
+                {contents.map((r, ri) => {
+                  if ("text" in r) return null;
+                  if (r.type === "same")
+                    return renderSideCell(`${ri}-b`, "", r.bLine, r.before, false);
+                  if (r.type === "del" || r.type === "mod")
+                    return renderSideCell(
+                      `${ri}-b`,
+                      "diff-line-del",
+                      r.bLine,
+                      r.before,
+                      false,
+                    );
+                  return renderSideCell(`${ri}-b`, "diff-line-empty", -1, "", true);
+                })}
+              </pre>
+            </div>
+            <div className="diff-col diff-col-after">
+              <div className="diff-col-header">After</div>
+              <pre className="diff-col-code">
+                {contents.map((r, ri) => {
+                  if ("text" in r) return null;
+                  if (r.type === "same")
+                    return renderSideCell(`${ri}-a`, "", r.aLine, r.after, false);
+                  if (r.type === "add" || r.type === "mod")
+                    return renderSideCell(
+                      `${ri}-a`,
+                      "diff-line-add",
+                      r.aLine,
+                      r.after,
+                      false,
+                    );
+                  return renderSideCell(`${ri}-a`, "diff-line-empty", -1, "", true);
+                })}
+              </pre>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const renderUnified = () => (
     <div className="diff-unified" dir="ltr" {...drag}>
       {rows.flatMap((row, i) => {
         if ("text" in row) {
@@ -718,6 +855,16 @@ export function DiffView({
           renderRow(`${i}-a`, "diff-u-add", "+", row.aLine, row.after),
         ];
       })}
+    </div>
+  );
+
+  return (
+    <div
+      ref={measureRef}
+      className="diff-responsive"
+      data-layout={showSide ? "side-by-side" : "unified"}
+    >
+      {showSide ? renderSide() : renderUnified()}
     </div>
   );
 }

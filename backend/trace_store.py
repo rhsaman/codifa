@@ -24,6 +24,12 @@ _current_chat: contextvars.ContextVar[str] = contextvars.ContextVar(
     "trace_current_chat", default=""
 )
 
+_current_turn: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "trace_current_turn", default=0
+)
+
+_turn_counter: dict[str, int] = {}
+
 
 def _clean_text(value: object, limit: int = 20000) -> str:
     try:
@@ -55,6 +61,53 @@ def get_current_chat() -> str:
         return ""
 
 
+def set_current_turn(turn: int):
+    """Set the ambient turn number for this task; returns a token to reset."""
+    try:
+        return _current_turn.set(int(turn or 0))
+    except Exception:  # noqa: BLE001 — trace must never fail
+        return None
+
+
+def reset_current_turn(token) -> None:
+    try:
+        if token is not None:
+            _current_turn.reset(token)
+    except Exception:  # noqa: BLE001, S110 — reset must never fail
+        pass
+
+
+def get_current_turn() -> int:
+    try:
+        return int(_current_turn.get() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def next_turn(chat_id: str) -> int:
+    """Start a new turn for a chat. Returns the new turn number (1-based)."""
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return get_current_turn()
+    with _lock:
+        n = int(_turn_counter.get(cid, 0) or 0) + 1
+        _turn_counter[cid] = n
+    try:
+        _current_turn.set(n)
+    except Exception:  # noqa: BLE001, S110 — trace must never fail
+        pass
+    return n
+
+
+def latest_turn(chat_id: str) -> int:
+    """Latest turn number started for a chat (0 when unknown)."""
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return get_current_turn()
+    with _lock:
+        return int(_turn_counter.get(cid, 0) or 0)
+
+
 def append(
     chat_id: str,
     kind: str,
@@ -72,10 +125,14 @@ def append(
     k = (kind or "").strip().lower()
     if not cid or k not in _VALID_KINDS:
         return None
+    turn = get_current_turn()
+    if turn <= 0:
+        turn = latest_turn(cid)
     entry = {
         "id": uuid.uuid4().hex[:12],
         "at": time.time(),
         "kind": k,
+        "turn": int(turn or 0),
         "summary": str(summary or "")[:500],
         "detail": dict(detail or {}),
         "model": str(model or ""),
@@ -107,7 +164,7 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
                 if entry.get("kind") != "tool":
                     continue
                 detail = entry.get("detail") or {}
-                if str(detail.get("call_id") or "").strip() == want:
+                if str(detail.get("call_id") or "").strip() == want or str(entry.get("id") or "") == want:
                     entry["result"] = text
                     if error:
                         entry["error"] = str(error)[:2000]
@@ -115,13 +172,23 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
                     detail["result_chars"] = len(text)
                     entry["detail"] = detail
                     return dict(entry)
-        # Fallback: latest running tool entry.
+        # Fallback: latest running tool entry (or latest tool entry when the
+        # caller never stamped status/call_id, e.g. direct append in tests).
         for entry in reversed(items):
             if entry.get("kind") == "tool" and (entry.get("detail") or {}).get("status") == "running":
                 entry["result"] = text
                 if error:
                     entry["error"] = str(error)[:2000]
                 (entry.get("detail") or {}).update({"status": "error" if error else "done", "result_chars": len(text)})
+                return dict(entry)
+        for entry in reversed(items):
+            if entry.get("kind") == "tool":
+                entry["result"] = text
+                if error:
+                    entry["error"] = str(error)[:2000]
+                detail = entry.get("detail") or {}
+                detail.update({"status": "error" if error else "done", "result_chars": len(text)})
+                entry["detail"] = detail
                 return dict(entry)
     return None
 

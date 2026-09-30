@@ -657,9 +657,10 @@ def _subagent_target(
     parent_env_var: str,
     provider_lookup: Callable[[str], dict | None],
     parent_provider_id: str = "",
-) -> tuple[str, str, str, str, str, str] | None:
+    parent_api_keys: list[str] | None = None,
+) -> tuple[str, str, str, str, str, str, list[str]] | None:
     """Resolve a subagent model entry to (provider_kind, model, base_url,
-    api_key, env_var, provider_id), or None to use the parent
+    api_key, env_var, provider_id, api_keys), or None to use the parent
     model.
 
     ``entry`` may be a bare model id ("Qwen3.5-4B-Q4_K_S.gguf") resolved
@@ -704,6 +705,7 @@ def _subagent_target(
                     "baseUrl": _expand_base(meta.get("base_url") or "", head),
                     "apiKey": "",
                     "envVar": "",
+                    "apiKeys": [],
                 }
             else:
                 # Unrecognized provider prefix: drop it and fall back to the
@@ -730,13 +732,20 @@ def _subagent_target(
         # Free Models Router — instead of silently falling back to the parent.
         if kind == "openrouter" and "/" not in model_part:
             model_part = _OPENROUTER_FREE_FALLBACK
+        row_keys: list[str] = []
+        raw_keys = p.get("apiKeys")
+        if isinstance(raw_keys, list):
+            row_keys = [k for k in raw_keys if isinstance(k, str) and k]
+        if not row_keys and isinstance(p.get("apiKey"), str) and p.get("apiKey"):
+            row_keys = [str(p.get("apiKey"))]
         return (
             kind,
             model_part,
             p.get("baseUrl") or "",
-            p.get("apiKey") or "",
+            p.get("apiKey") or (row_keys[0] if row_keys else ""),
             p.get("envVar") or "",
             str(p.get("id") or pid or kind),
+            row_keys,
         )
     return (
         parent_provider,
@@ -745,6 +754,7 @@ def _subagent_target(
         parent_api_key,
         parent_env_var,
         parent_provider_id,
+        list(parent_api_keys or []),
     )
 
 
@@ -955,7 +965,9 @@ _SEARCH_RULE = (
     "(e.g. ranges=['a.ts:100:80','b.ts:1:60']) instead of one read per window. "
     "Same file, different windows MUST also be ONE read call via ranges "
     "(e.g. ranges=['tools.py:640:60','tools.py:2089:80']) — never two reads "
-    "on the same file.\n"
+    "on the same file. NEVER re-read the same path:window twice — reuse the "
+    "earlier result. If you already read a window (single or batch), do NOT "
+    "re-issue it single+batch or batch+single; use the result you have.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
     "tools (read/grep/glob) in one turn for TARGETED lookups (clause 4), and "
     "(b) launching several explore SUB-AGENTS in parallel for BROAD / multi-file "
@@ -1547,8 +1559,16 @@ def _tool_reuse_note(history: list[dict]) -> str:
     the identical tool calls (the classic 'ادامه بده repeats the same fetch_url'
     bug when only plain text history was sent). Returns "" when nothing useful
     exists.
+    Two tiers (deterministic, no model call needed): the full listing is only
+    worth its tokens when the model ALREADY repeated something — the same tool
+    with the same arguments succeeding twice means real loop risk. Otherwise a
+    one-line reminder preserves the preventive value for ~40 tokens instead of
+    up to ~12k. Error entries never count as repetition: retrying a failed call
+    is legitimate, not a loop.
     """
     entries: list[str] = []
+    seen: set[str] = set()
+    repeated = False
     for turn in reversed(history):
         acts = turn.get("toolActivity")
         if not isinstance(acts, list):
@@ -1571,12 +1591,32 @@ def _tool_reuse_note(history: list[dict]) -> str:
             if status == "error":
                 line += " [FAILED]"
             entries.append(line)
+            if status == "done" and not repeated:
+                try:
+                    sig = (
+                        f"{tool}("
+                        f"{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                        ")"
+                    )
+                except Exception:  # noqa: BLE001 — signature is best-effort
+                    sig = f"{tool}({arg_str})"
+                if sig in seen:
+                    repeated = True
+                else:
+                    seen.add(sig)
             if len(entries) >= 30:  # keep the note bounded
                 break
         if len(entries) >= 30:
             break
     if not entries:
         return ""
+    if not repeated:
+        return (
+            "Earlier in this conversation you already ran tools and their FULL "
+            "results are in the transcript above — re-read them there instead "
+            "of re-running the same calls. Only use tools for NEW information "
+            "this turn actually needs."
+        )
     return (
         "Earlier in this conversation you ALREADY ran these tool calls and their "
         "FULL results are in the transcript above — re-read them there instead of "
@@ -4148,17 +4188,20 @@ def _append_app_log(line: str) -> None:
         pass
 
 
-def laya_precheck(prompt: str, mode: str = "", history_len: int = 0) -> dict | None:
+def laya_precheck(
+    prompt: str,
+    mode: str = "",
+    history_len: int = 0,
+    chat_id: str = "",
+    emit: object = None,
+) -> dict | None:
     """تلاش سریع محلی با laya قبل از صدازدن مدل بزرگ (best-effort).
 
     سؤال تایپ‌دار ``choice`` می‌سازد (ادامه محلی در برابر مدل بزرگ) و اگر
     laya با اطمینان بالا «ادامه محلی» را انتخاب کرد، نتیجه را به‌صورت دیکشنری
     برمی‌گرداند؛ در غیر این صورت ``None`` تا فراخواننده فقط همان مورد سخت را
     به مدل بزرگ بفرستد. هرگز استثنا بیرون نمی‌دهد تا مسیر اصلی چت نشکند.
-
-    توجه: در حال حاضر هیچ فراخواننده‌ای ندارد (فقط graph.py از decide مستقیم
-    استفاده می‌کند)؛ نگه داشته شده تا مسیر آینده «ادامه محلی» بدون بازنویسی
-    وصل شود. حذفش نکنید.
+    هر مشورت (حتی واگذاری) در trace/رویداد زنده ثبت می‌شود تا در chat trace دیده شود.
     """
     try:
         import laya_decide
@@ -4166,9 +4209,24 @@ def laya_precheck(prompt: str, mode: str = "", history_len: int = 0) -> dict | N
         decision = laya_decide.decide(
             {"prompt": prompt or "", "mode": mode or "", "history_len": int(history_len or 0)},
             {"type": "choice", "options": ["handle_locally", "needs_big_model"]},
+            chat_id=str(chat_id or ""),
         )
     except Exception:  # noqa: BLE001 — laya اختیاری است
         return None
+    try:
+        import laya_decide as _laya_mod
+
+        _laya_mod.report_secondary(
+            decision,
+            route="normal",
+            sub="precheck",
+            chat_id=str(chat_id or ""),
+            emit=emit,
+            prompt=str(prompt or "")[:2000],
+            options=["handle_locally", "needs_big_model"],
+        )
+    except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+        pass
     try:
         if decision.handled and str(decision.value or "") == "handle_locally":
             return {
@@ -4204,6 +4262,7 @@ async def run_agent(
     model_reasoning: bool = False,
     context_window: int = 0,
     env_var: str = "",
+    api_keys: list[str] | None = None,
     mcp_servers: dict | None = None,
     skills: list[str] | None = None,
     allow_create: bool = False,
@@ -4248,6 +4307,7 @@ async def run_agent(
         "model_name": model_name,
         "base_url": base_url,
         "api_key": api_key,
+        "api_keys": list(api_keys or []),
         "root": root,
         "mode": mode or "ask",
         "request": prompt or "",

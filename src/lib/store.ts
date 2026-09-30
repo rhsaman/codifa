@@ -373,6 +373,13 @@ export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.name]),
 ) as Record<ProviderKind, string>
 
+export function providerApiKeys(p: Pick<ProviderConfig, 'apiKeys'> & { apiKey?: string }): string[] {
+  const raw = Array.isArray(p.apiKeys) ? p.apiKeys : []
+  const out = raw.map((k) => (typeof k === 'string' ? k : '')).filter((k) => k.trim() !== '')
+  if (out.length === 0 && typeof p.apiKey === 'string' && p.apiKey.trim() !== '') out.push(p.apiKey)
+  return out
+}
+
 function defaultProviders(): ProviderConfig[] {
   const row = (id: ProviderKind, extra: Partial<ProviderConfig> = {}): ProviderConfig => {
     const meta = PROVIDER_META[id]
@@ -380,8 +387,7 @@ function defaultProviders(): ProviderConfig[] {
       id: id === 'ollama' ? 'local' : id,
       name: meta.name,
       kind: id,
-      apiKey: '',
-      envVar: meta.defaultEnvVar,
+      apiKeys: [],
       baseUrl: meta.defaultBaseUrl ?? '',
       model: '',
       ...extra,
@@ -399,19 +405,26 @@ function defaultProviders(): ProviderConfig[] {
 
 function normalizeProvider(p: ProviderConfig): ProviderConfig {
   // 'opencode' rows from older builds: the kind no longer exists — keep the
-  // row alive as a custom provider (id, baseUrl, envVar unchanged) so saved
+  // row alive as a custom provider (id, baseUrl unchanged) so saved
   // chats and the active-provider pointer keep resolving.
   const rawKind = (p.kind || '') as string
   const kind: ProviderKind = rawKind === 'opencode' ? 'custom' : p.kind || 'custom'
   const meta = PROVIDER_META[kind]
+  const raw = p as unknown as Record<string, unknown>
+  const keys: string[] = []
+  if (Array.isArray(raw.apiKeys)) {
+    for (const k of raw.apiKeys) if (typeof k === 'string' && k.trim() !== '') keys.push(k)
+  }
+  if (keys.length === 0 && typeof raw.apiKey === 'string' && (raw.apiKey as string).trim() !== '') {
+    keys.push((raw.apiKey as string))
+  }
   return {
     // The local llama.cpp provider's id was historically 'ollama'; keep it
     // stable by migrating any legacy rows to the canonical 'local' id.
     id: p.id === 'ollama' ? 'local' : p.id || 'custom',
     name: p.name || PROVIDER_NAMES[kind] || 'Custom API',
     kind,
-    apiKey: p.apiKey || '',
-    envVar: p.envVar ?? defaultEnvVar(kind),
+    apiKeys: keys,
     // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
     baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
     model: p.model || '',
@@ -427,9 +440,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
   }
 }
 
-function defaultEnvVar(kind: ProviderKind): string {
-  return PROVIDER_META[kind]?.defaultEnvVar ?? ''
-}
+
 
 /** سقف مدل‌های پین‌شده در لیست اخیر — پین‌شده‌ها همیشه بالای لیست‌اند و از حذف خودکار مصون‌اند. */
 export const MAX_PINNED_RECENT_MODELS = 3
@@ -787,6 +798,38 @@ export function dedupeChats(chats: Chat[]): Chat[] {
   return out
 }
 
+/**
+ * Decide which chat list wins on `load()` so a transient backend miss never
+ * wipes the sidebar ("workspaces show but chats disappear").
+ *
+ * - `incoming` empty + held chats + missing settings + settings file on disk
+ *   = full transient miss → caller keeps everything (`emptyMiss`).
+ * - `incoming` empty + held chats (settings arrived or first run has no file)
+ *   = partial miss → keep the held chats (`kept`).
+ * - Otherwise the fresh payload wins (genuine wipe / fresh profile settles
+ *   to empty, normal refresh replaces).
+ *
+ * Pure for test (no store access).
+ */
+export function selectLoadedChats(
+  prev: Chat[],
+  incoming: Chat[] | null | undefined,
+  opts: { settingsMissing: boolean; hasSettingsFile: boolean },
+): { chats: Chat[]; kept: boolean; emptyMiss: boolean } {
+  const fresh = incoming && incoming.length > 0 ? incoming : []
+  if (fresh.length === 0 && prev.length > 0) {
+    if (opts.settingsMissing && opts.hasSettingsFile) {
+      return { chats: prev, kept: true, emptyMiss: true }
+    }
+    if (!opts.settingsMissing) {
+      return { chats: prev, kept: true, emptyMiss: false }
+    }
+    // Genuine wipe (no settings file on disk at all): settle to empty.
+    return { chats: [], kept: false, emptyMiss: false }
+  }
+  return { chats: fresh, kept: false, emptyMiss: false }
+}
+
 function makeChat(mode: AgentMode = 'ask'): Chat {
   const now = Date.now()
   const s = useStore.getState()
@@ -938,7 +981,22 @@ export const useStore = create<State>((set, get) => ({
     } catch {
       /* keep the persisted value */
     }
-    const loadedChats0 = chats && chats.length > 0 ? chats : []
+    // Never downgrade on a transient backend miss: a background refresh (e.g.
+    // `sidecar:changed` after a sidecar restart) that observes an empty payload
+    // while the store already holds chats must not wipe the sidebar — that is
+    // the "workspaces show but chats disappear" bug. A genuine wipe (no
+    // settings file on disk) or a fresh profile still settles to empty.
+    const prevChats = get().chats
+    const picked = selectLoadedChats(prevChats, chats, {
+      settingsMissing: settings == null,
+      hasSettingsFile,
+    })
+    if (picked.emptyMiss) {
+      set({ loaded: true })
+      return
+    }
+    const keptChats = picked.kept
+    const loadedChats0 = picked.chats
     // Drop any duplicate chat ids (last occurrence wins) so two chats sharing an
     // id can never both render — that would make the 3-dot menu open for BOTH
     // rows, since the menu is keyed on chat id. The backend already de-duplicates
@@ -967,7 +1025,11 @@ export const useStore = create<State>((set, get) => ({
       const next = migrated ? { ...clean, usage: migrated } : clean
       return next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
     }) as Chat[]
-    const activeId = loadedChats[loadedChats.length - 1]?.id ?? ''
+    const prevActiveId = get().activeChatId
+    const activeId =
+      keptChats && prevChats.some((c) => c.id === prevActiveId)
+        ? prevActiveId
+        : (loadedChats[loadedChats.length - 1]?.id ?? '')
     // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
     // the in-memory store always works with plaintext.
     const raw = await decryptSettings((settings ?? {}) as Partial<Settings> & { provider?: ProviderConfig })
@@ -996,10 +1058,10 @@ export const useStore = create<State>((set, get) => ({
         id: oldP.id || 'custom',
         name: name || oldP.name || 'Custom API',
         kind,
-        apiKey: oldP.apiKey || '',
+        apiKeys: typeof oldP.apiKey === 'string' && oldP.apiKey ? [oldP.apiKey] : [],
         baseUrl: kind === 'custom' || kind === 'ollama' ? oldP.baseUrl || '' : '',
         model: oldP.model || '',
-      })
+      } as ProviderConfig)
       const defs = defaultProviders().filter((p) => p.id !== legacy.id)
       providers = [legacy, ...defs]
       activeProviderId = legacy.id
@@ -1063,6 +1125,20 @@ export const useStore = create<State>((set, get) => ({
       const known = new Set(workspaces.map((w) => w.key))
       for (const r of chatRoots) {
         if (!known.has(workspaceKey(r))) workspaces.push(makeWorkspace(r))
+      }
+    }
+    if (settings == null && get().workspaces.length > 0) {
+      // Transient settings miss: keep the held workspace entries (custom
+      // labels/order) and only backfill roots the held list lacks.
+      const cur = get().workspaces
+      const known = new Set(cur.map((w) => w.key))
+      workspaces = [...cur]
+      for (const r of chatRoots) {
+        const k = workspaceKey(r)
+        if (!known.has(k)) {
+          known.add(k)
+          workspaces.push(makeWorkspace(r))
+        }
       }
     }
 
@@ -1232,7 +1308,7 @@ export const useStore = create<State>((set, get) => ({
       id,
       name: 'New provider',
       kind: 'custom',
-      apiKey: '',
+      apiKeys: [],
       baseUrl: '',
       model: '',
       models: [],
@@ -2023,11 +2099,31 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setChatDraft: (id, patch) => {
-    set((s) => ({
-      chats: s.chats.map((c) =>
-        c.id === id ? { ...c, draft: { ...c.draft, ...patch } } : c,
-      ),
-    }))
+    // Draft writes happen on every keystroke: keep the `chats` array (and every
+    // other chat object) referentially stable so Sidebar / ChatPanel subscribers
+    // that don't depend on this chat's draft never re-render. Only the edited
+    // chat gets a new object, and only when the merged draft actually changed.
+    // No persist: drafts are transient composer state, flushed with the next
+    // real change (or the quit flush).
+    set((s) => {
+      const idx = s.chats.findIndex((c) => c.id === id)
+      if (idx === -1) return {}
+      const cur = s.chats[idx]
+      const next = { ...cur.draft, ...patch }
+      const prev = cur.draft ?? {}
+      const keys = new Set([...Object.keys(prev), ...Object.keys(next)])
+      let changed = false
+      for (const k of keys) {
+        if ((prev as Record<string, unknown>)[k] !== (next as Record<string, unknown>)[k]) {
+          changed = true
+          break
+        }
+      }
+      if (!changed) return {}
+      const chats = s.chats.slice()
+      chats[idx] = { ...cur, draft: next }
+      return { chats }
+    })
   },
   setChatThinkingLevel: (id, level) => {
     set((s) => ({

@@ -204,7 +204,40 @@ function codeFilePath(children: ReactNode): string {
   return "";
 }
 
-function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
+// Highlight cache: CodeBlock re-renders whenever its parent message re-renders
+// (e.g. every streamed token of a long reply re-renders the whole transcript
+// window). hljs.highlight over a big block on every token is the main CPU cost
+// of streaming. Cache by (lang + source) so unchanged blocks pay zero.
+// FIFO-bounded like preparedCache so long sessions can't leak memory.
+const highlightCache = new Map<string, string[]>();
+const HIGHLIGHT_CACHE_MAX = 150;
+function getHighlightedLines(whole: string, lang: string): string[] {
+  const key = `${lang}\n${whole}`;
+  const hit = highlightCache.get(key);
+  if (hit) return hit;
+  let lines: string[];
+  try {
+    const html =
+      lang && hljs.getLanguage(lang)
+        ? hljs.highlight(whole, { language: lang }).value
+        : hljs.highlightAuto(whole).value;
+    // highlight.js round-trips whatever the model wrote into the code block
+    // (e.g. unterminated tags, stray attributes) into the highlighted HTML.
+    // Sanitize the result so a malicious payload can't smuggle an event
+    // handler or a javascript: URL into the chat via a code block.
+    lines = splitHighlightedHtml(sanitizeHtml(html));
+  } catch {
+    lines = whole.split("\n").map(escapeHtml);
+  }
+  if (highlightCache.size >= HIGHLIGHT_CACHE_MAX) {
+    const oldest = highlightCache.keys().next().value;
+    if (oldest !== undefined) highlightCache.delete(oldest);
+  }
+  highlightCache.set(key, lines);
+  return lines;
+}
+
+const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const [copied, setCopied] = useState(false);
   const code = textFromChildren(props.children).replace(/^\n+|\n+$/g, "");
   const lang = codeLang(props.children);
@@ -237,22 +270,13 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   // numbers are rendered as a VISUAL-ONLY gutter (the real file line number when
   // the fence carries `lang:start-end`, otherwise 1-based) with `user-select:
   // none`, so selecting/copying the block copies just the code, never the numbers.
-  let highlightedLines: string[];
-  try {
-    const whole = codeLines.join("\n");
-    const html =
-      lang && hljs.getLanguage(lang)
-        ? hljs.highlight(whole, { language: lang }).value
-        : hljs.highlightAuto(whole).value;
-    // highlight.js round-trips whatever the model wrote into the code block
-    // (e.g. unterminated tags, stray attributes) into the highlighted HTML.
-    // Sanitize the result so a malicious payload can't smuggle an event
-    // handler or a javascript: URL into the chat via a code block.
-    const safeHtml = sanitizeHtml(html);
-    highlightedLines = splitHighlightedHtml(safeHtml);
-  } catch {
-    highlightedLines = codeLines.map(escapeHtml);
-  }
+  // Memoized on (code + lang): re-renders caused by streaming tokens elsewhere
+  // in the message reuse the cached highlight instead of re-running hljs.
+  const highlightedLines = useMemo(
+    () => getHighlightedLines(codeLines.join("\n"), lang),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [code, lang],
+  );
 
   const lines = codeLines.map((_line, i) => {
     const num = startLine > 0 ? startLine + i : i + 1;
@@ -287,7 +311,7 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
       </pre>
     </div>
   );
-}
+});
 
 // ── Video-embed detection ────────────────────────────────────────────────
 // Detects YouTube / Vimeo links and returns metadata for a clickable
@@ -1379,25 +1403,28 @@ export function renderSegments(
   return nodes;
 }
 
-export const ChatMessageView = memo(function ChatMessageView({
-  message,
-  onRetry,
-}: {
-  message: ChatMessage;
-  onRetry?: (id: string) => void;
-}) {
+export const ChatMessageView = memo(
+  function ChatMessageView({
+    message,
+    onRetry,
+  }: {
+    message: ChatMessage;
+    onRetry?: (id: string) => void;
+  }) {
   const isUser = message.role === "user";
   const dir = useStore((s) => s.dir);
-  const settings = useStore((s) => s.settings);
-  const ttsProviderId = useStore((s) => s.ttsProviderId);
-  const ttsModel = useStore((s) => s.ttsModel);
-  const ttsVoice = useStore((s) => s.ttsVoice);
+  // Narrow subscriptions: reading the whole settings object re-rendered EVERY
+  // message on ANY settings change. Only the mode label is needed for render;
+  // TTS config is read lazily from getState() inside toggleSpeak.
+  const modeLabelStr = useStore((s) =>
+    message.mode ? getMode(s.settings, message.mode).label : "",
+  );
   const [copied, setCopied] = useState(false);
   const { status: ttsStatus, toggle: ttsToggle, stop: ttsStop } = useTtsPlayback();
   const [ttsError, setTtsError] = useState<string | null>(null);
   const [ttsRetrying, setTtsRetrying] = useState(false);
 
-  const modeLabel = (id: string) => getMode(settings, id).label;
+  const modeLabel = (_id: string) => modeLabelStr;
 
   const copyMessage = async () => {
     try {
@@ -1413,7 +1440,8 @@ export const ChatMessageView = memo(function ChatMessageView({
   // کلیک تند هرگز دو پخش همزمان نمی‌سازد. لغو دستی (AbortError) خطا نیست.
   const toggleSpeak = async () => {
     setTtsError(null);
-    const provider = settings.providers.find((p) => p.id === ttsProviderId);
+    const st = useStore.getState();
+    const provider = st.settings.providers.find((p) => p.id === st.ttsProviderId);
     if (!provider) {
       setTtsError("برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید");
       return;
@@ -1422,10 +1450,9 @@ export const ChatMessageView = memo(function ChatMessageView({
       await ttsToggle(stripBidiMarks(fixZwsp(message.content)), {
         kind: provider.kind,
         baseUrl: provider.baseUrl ?? "",
-        apiKey: provider.apiKey ?? "",
-        envVar: provider.envVar ?? "",
-        model: ttsModel,
-        voice: ttsVoice,
+        apiKeys: [...(provider.apiKeys ?? (provider.apiKey ? [provider.apiKey] : []))],
+        model: st.ttsModel,
+        voice: st.ttsVoice,
       });
     } catch (err) {
       const friendly = friendlyTtsError(err);
@@ -1795,4 +1822,40 @@ export const ChatMessageView = memo(function ChatMessageView({
       )}
     </div>
   );
-});
+  },
+  // Custom comparator: every streamed token rebuilds the active chat object,
+  // so the parent re-renders with a fresh `chat.messages` array. Unchanged
+  // messages keep their object identity (see updateMessage) and skip via the
+  // fast path; the field-wise fallback also skips when the store recreates an
+  // identical record. Only a real content/state change re-parses markdown.
+  (prev, next) => {
+    if (prev.onRetry !== next.onRetry) return false;
+    const a = prev.message;
+    const b = next.message;
+    if (a === b) return true;
+    return (
+      a.id === b.id &&
+      a.role === b.role &&
+      a.content === b.content &&
+      a.streaming === b.streaming &&
+      a.thinking === b.thinking &&
+      a.thinkingActive === b.thinkingActive &&
+      a.thinkingStartedAt === b.thinkingStartedAt &&
+      a.workingStartedAt === b.workingStartedAt &&
+      a.error === b.error &&
+      a.retry === b.retry &&
+      a.toolActivity === b.toolActivity &&
+      a.segments === b.segments &&
+      a.plan === b.plan &&
+      a.attachments === b.attachments &&
+      a.images === b.images &&
+      a.usage === b.usage &&
+      a.compacted === b.compacted &&
+      a.mode === b.mode &&
+      a.modeSwitch === b.modeSwitch &&
+      a.steerPending === b.steerPending &&
+      a.steerInterleaved === b.steerInterleaved &&
+      a.interrupted === b.interrupted
+    );
+  },
+);

@@ -57,19 +57,53 @@ def rank_with_laya(query: str, candidates: list[dict] | list[str], top_k: int | 
         return []
 
 
-def _apply_laya_rerank(query: str, ranked_tags: list[Tag], root_real: str = "") -> list[Tag]:
-    """اعمال laya rank روی فایل‌ها — در نبود سیگنال ترتیب قبلی حفظ می‌شود."""
+def _apply_laya_rerank(
+    query: str,
+    ranked_tags: list[Tag],
+    root_real: str = "",
+    rank_info: dict | None = None,
+) -> list[Tag]:
+    """اعمال laya rank روی فایل‌ها — در نبود سیگنال ترتیب قبلی حفظ می‌شود.
+
+    The embedding rerank runs before the LLM call on every turn, so it must
+    stay off the slow path: only the top files by PageRank order are embedded
+    (bounded work regardless of repo size) and the rest keep their order.
+    Embedding the whole repo (hundreds of files through ONNX on CPU) is what
+    made the first token take 10s+ on large workspaces.
+    """
     if not query or not str(query).strip() or not ranked_tags:
         return ranked_tags
+    # Bound embedding work: rerank at most this many top files, keep the tail
+    # in PageRank order. 120 files ≈ 4 ONNX batches — ~1s on CPU instead of 10s+.
+    _RERANK_MAX_FILES = 120
     try:
         by_file: dict[str, list[Tag]] = defaultdict(list)
         for t in ranked_tags:
             by_file[t.rel_fname].append(t)
+        # by_file preserves first-occurrence order of the PageRank-sorted tags,
+        # so candidates are already best-first: head gets embedded, tail stays.
+        all_rels = list(by_file.keys())
+        head_rels = all_rels[:_RERANK_MAX_FILES]
         candidates: list[dict] = []
-        for rel, tags in by_file.items():
+        for rel in head_rels:
+            tags = by_file[rel]
             desc = " ".join(t.name for t in tags[:20])
             candidates.append({"name": rel, "description": desc})
+        _start = time.monotonic()
         ranked = rank_with_laya(str(query), candidates, top_k=len(candidates))
+        try:
+            _elapsed = int((time.monotonic() - _start) * 1000)
+        except Exception:  # noqa: BLE001
+            _elapsed = 0
+        if rank_info is not None:
+            try:
+                rank_info["ranked"] = ranked
+                rank_info["elapsed_ms"] = _elapsed
+                rank_info["query"] = str(query)
+                rank_info["candidates"] = [str(c.get("name") or "") for c in candidates]
+                rank_info["total_files"] = len(all_rels)
+            except Exception:  # noqa: BLE001, S110
+                pass
         if not ranked:
             return ranked_tags
         order = {str(r.get("name") or ""): i for i, r in enumerate(ranked)}
@@ -418,7 +452,15 @@ def _extract_symbols(rel_path: str, text: str) -> list[tuple[str, int, str]]:
 # گراف ارجاع + PageRank (مشابه aider.get_ranked_tags)
 # --------------------------------------------------------------------------
 
-def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real: str = "", query: str | None = None):
+def _get_ranked_tags(
+    chat_fnames,
+    other_fnames,
+    mentioned_fnames,
+    mentioned_idents,
+    root_real: str = "",
+    query: str | None = None,
+    rank_info: dict | None = None,
+):
     """رتبه‌بندی تگ‌ها با PageRank + personalization (مثل aider) + laya rank اختیاری."""
     defines = defaultdict(set)
     references = defaultdict(list)
@@ -506,7 +548,7 @@ def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_iden
     ranked_tags.sort(key=lambda x: -x[0])
     out = [t for _, t in ranked_tags]
     if query and str(query).strip():
-        out = _apply_laya_rerank(str(query), out, root_real)
+        out = _apply_laya_rerank(str(query), out, root_real, rank_info=rank_info)
     return out
 
 
@@ -568,9 +610,20 @@ def _token_count(text: str) -> int:
     return len(text) // 4
 
 
-def _get_ranked_tags_map(chat_fnames, other_fnames, max_map_tokens, mentioned_fnames, mentioned_idents, root_real: str = "", query: str | None = None) -> str:
+def _get_ranked_tags_map(
+    chat_fnames,
+    other_fnames,
+    max_map_tokens,
+    mentioned_fnames,
+    mentioned_idents,
+    root_real: str = "",
+    query: str | None = None,
+    rank_info: dict | None = None,
+) -> str:
     """ساخت نقشه با بودجه توکنی پویا (binary search روی تعداد تگ‌ها)."""
-    ranked_tags = _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real, query=query)
+    ranked_tags = _get_ranked_tags(
+        chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real, query=query, rank_info=rank_info
+    )
     if not ranked_tags:
         return ""
 
@@ -677,6 +730,7 @@ def format_symbol_map(
     mentioned_fnames: set[str] | None = None,
     mentioned_idents: set[str] | None = None,
     query: str | None = None,
+    rank_info: dict | None = None,
 ) -> str:
     """فرمت‌بندی نقشه به متن درختی فشرده برای الصاق به پرامپت (مثل aider.get_repo_map).
 
@@ -716,7 +770,14 @@ def format_symbol_map(
 
     try:
         tree = _get_ranked_tags_map(
-            chat_fnames, other_fnames, max_map_tokens, mentioned_abs, mentioned_idents, root_real, query=query
+            chat_fnames,
+            other_fnames,
+            max_map_tokens,
+            mentioned_abs,
+            mentioned_idents,
+            root_real,
+            query=query,
+            rank_info=rank_info,
         )
     except Exception:  # noqa: BLE001
         tree = ""

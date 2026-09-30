@@ -73,6 +73,8 @@ from agents import normalize_mode
 from llm import (
     _batchable_nudge,
     _BatchStreakTracker,
+    _clone_model_with_key,
+    _is_key_error,
     _is_parallel_calls_error,
     _is_reasoning_effort_error,
     _is_stream_options_error,
@@ -87,11 +89,15 @@ from llm import (
     chat_model_settings,
     dedupe_step_tool_call_ids,
     llm_generate,
+    model_key_fallback,
     normalize_tool_transcript,
 )
 from mcp_bridge import build_mcp_tools, describe_tools, is_browser_mcp_tool
 from tool_batching import execute_readonly_calls
-from tool_message_projection import project_tool_results
+from tool_message_projection import project_tool_results, stable_tool_order
+
+# Alias kept for existing call sites; logic lives in tool_message_projection.
+_stable_tool_order = stable_tool_order
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 
 # Tool calls in this set mutate persistent state (files, terminal, saved
@@ -508,6 +514,7 @@ class AgentState(TypedDict, total=False):
     base_url: str
     api_key: str
     env_var: str
+    api_keys: list
     context_window: int
     thinking_level: str
     # Whether the selected model is reasoning-capable (from the /models
@@ -572,6 +579,10 @@ class AgentState(TypedDict, total=False):
     # lose grants made via "Always allow" / an in-turn Allow-once, re-prompting
     # the user on every agent step.
     _permit: dict
+    # Laya precheck flag: True when laya confidently said "answer directly
+    # without tools" (handle_locally). Set in build_turn_context; read in
+    # _run_mode_turn to skip the tool loop for simple answers.
+    laya_no_tools: bool
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1003,66 @@ def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     return note
 
 
+# Confidence floor for the CODE MAP laya gate. Kept high on purpose:
+# a wrongly skipped map costs MORE tokens (extra grep/read rounds to find
+# the file) than sending it, so only high-confidence "no_code_map" skips.
+_CODE_MAP_GATE_THRESHOLD = 0.8
+_CODE_MAP_GATE_OPTIONS = ["needs_code_map", "no_code_map"]
+
+
+def _code_map_gate_skips(
+    mentioned_fnames: set[str],
+    mentioned_idents: set[str],
+    gate_decision: object,
+) -> bool:
+    """Pure predicate behind the CODE MAP laya gate (fail-open).
+
+    Returns True only when ALL hold: no file/code mentions in the history,
+    and the laya choice decision is a high-confidence "no_code_map".
+    Every other input — abstain, low confidence, timeout/busy (handled=False),
+    malformed decision, unexpected exception — returns False so the caller
+    sends the map exactly as before the gate existed.
+    """
+    try:
+        if mentioned_fnames or mentioned_idents:
+            return False
+        return bool(
+            getattr(gate_decision, "handled", False)
+            and str(getattr(gate_decision, "value", "") or "") == "no_code_map"
+            and float(getattr(gate_decision, "confidence", 0.0) or 0.0)
+            >= _CODE_MAP_GATE_THRESHOLD
+        )
+    except Exception:  # noqa: BLE001 — doubt sends the map
+        return False
+
+
+def _mcp_note_for_turn(mcp_tools: list, browser_live: bool, chat_id: str) -> str:
+    """Full MCP note on first sight / server change, one-line reminder after.
+
+    The connector list + naming rules rarely change mid-chat, so resending
+    the full block every turn is pure input-token overhead. The behavioral
+    rule (web_search disabled when a browser MCP is live) IS repeated in the
+    short form — dropping it would risk the model calling a disabled tool and
+    burning a full wasted round trip, which costs more than the reminder.
+    Per-chat signature cache; any server-set change re-sends the full note.
+    """
+    servers = sorted({s for s in (_mcp_server_of(t) for t in mcp_tools) if s})
+    sig = ",".join(servers) + ("|browser" if browser_live else "")
+    cache = getattr(_mcp_note_for_turn, "_last_sig", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        _mcp_note_for_turn._last_sig = cache  # type: ignore[attr-defined]
+    if sig and cache.get(chat_id) == sig:
+        short = f"MCP connectors live: {', '.join(servers)} (tools callable under short names)."
+        if browser_live:
+            short += " web_search is DISABLED — do web research via browser tools only."
+        return short
+    if len(cache) > 500:
+        cache.clear()
+    cache[chat_id] = sig
+    return _mcp_tools_note(mcp_tools, browser_live)
+
+
 # ---------------------------------------------------------------------------
 # Sub-agent model resolution (web / compact / vision) -> LangChain models
 # ---------------------------------------------------------------------------
@@ -1008,6 +1079,7 @@ def resolve_subagent_model(
     provider_lookup: Any = None,
     timeout: float | None = None,
     parent_provider_id: str = "",
+    parent_api_keys: Any = None,
 ) -> Any:
     """Resolve a single sub-agent slot entry to a LangChain model.
 
@@ -1032,6 +1104,7 @@ def resolve_subagent_model(
                 base_url,
                 api_key,
                 env_var,
+                parent_api_keys,
                 temperature=0.2,
                 timeout=timeout,
                 cache=True,
@@ -1050,6 +1123,7 @@ def resolve_subagent_model(
                     base_url,
                     api_key,
                     env_var,
+                    parent_api_keys,
                     temperature=0.2,
                     timeout=timeout,
                     cache=True,
@@ -1068,10 +1142,11 @@ def resolve_subagent_model(
         env_var,
         provider_lookup or (lambda pid: None),
         parent_provider_id,
+        parent_api_keys,
     )
     if not target:
         return None
-    kind, model, burl, akey, env, spid = target
+    kind, model, burl, akey, env, spid, akeys = target
     if not model:
         return None
     return build_chat_model(
@@ -1080,6 +1155,7 @@ def resolve_subagent_model(
         burl,
         akey,
         env,
+        akeys,
         temperature=0.2,
         timeout=timeout,
         cache=True,
@@ -1256,18 +1332,140 @@ async def _vision_analyze_cached(
     return result
 
 
-def _rank_candidates(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+def _rank_candidates(
+    query: str,
+    candidates: list[dict],
+    top_k: int,
+    chat_id: str = "",
+    emit: Callable[[dict], None] | None = None,
+    sub: str = "rank",
+    route: str = "normal",
+    prompt: str = "",
+) -> list[dict]:
     """Best-effort relevance ranking via laya_decide.rank (never raises).
 
     Returns ranked [{name, confidence, ...}] or [] on no-signal — callers must
     keep their previous behaviour (full list, original order) when empty.
+    Every non-empty rank is logged to chat trace via report_secondary so laya
+    rows are visible in the Trace panel even for pre-ranks.
     """
     try:
         import laya_decide
 
-        return laya_decide.rank(query or "", candidates or [], top_k=top_k)
+        out = laya_decide.rank(query or "", candidates or [], top_k=top_k)
     except Exception:  # noqa: BLE001 — ranking is best-effort
         return []
+    if out:
+        try:
+            laya_decide.report_secondary(
+                None,
+                route=route,
+                sub=sub,
+                chat_id=str(chat_id or ""),
+                emit=emit,
+                prompt=str(prompt or query or "")[:2000],
+                ranked=out,
+            )
+        except Exception:  # noqa: BLE001, S110 — observability never breaks ranking
+            pass
+    return out
+
+
+# A prompt/history shows task signal when a skill, tool, or code symbol could
+# plausibly be needed this turn: a long enough prompt, a code/file token in
+# the prompt, or earlier tool activity / code tokens in the history. Short
+# chit-chat ("hi", greetings, thanks) with no code anywhere returns False —
+# those turns get zero skill tokens: no rank call, no auto-inlined body, no
+# catalog. Explicitly @mentioned skills are unaffected (their bodies inline
+# via manual_names regardless of this gate).
+_TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}"
+
+
+def _turn_task_signal(prompt: str, history: list) -> bool:
+    """Pure predicate: could this turn need skills/tools/code symbols?"""
+    try:
+        p = (prompt or "").strip()
+        if len(p) >= 32:
+            return True
+        if p and re.search(_TASK_SIGNAL_RE, p):
+            return True
+        for turn in history or []:
+            if not isinstance(turn, dict):
+                continue
+            if turn.get("toolActivity") or turn.get("plan"):
+                return True
+            c = turn.get("content") or ""
+            if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — doubt keeps the skills path
+        return True
+
+
+# Minimum confidence and top-1/runner-up margin for auto-inlining a skill
+# body the model never asked for. Embedding scores on chit-chat are flat
+# noise (everything ~0.7): without a margin any greeting "matches" some
+# skill and injects a ~10k-char body. A genuine match stands out instead.
+_SKILL_AUTO_CONF = 0.7
+_SKILL_AUTO_MARGIN = 0.05
+
+
+def _skill_auto_pick(ranked: list[dict], task_signal: bool) -> str:
+    """Pure predicate: name of the skill body to auto-inline, or "".
+
+    Only a strong, distinctive top-1 on a task-signal turn qualifies. All
+    other cases return "" and the model self-serves via load_skill + catalog.
+    """
+    try:
+        if not task_signal or not ranked:
+            return ""
+        top = ranked[0] if isinstance(ranked[0], dict) else {}
+        try:
+            top_conf = float(top.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        name = str(top.get("name") or "").strip()
+        if not name or top_conf < _SKILL_AUTO_CONF:
+            return ""
+        second_conf = 0.0
+        if len(ranked) > 1 and isinstance(ranked[1], dict):
+            try:
+                second_conf = float(ranked[1].get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                second_conf = 0.0
+        if top_conf - second_conf < _SKILL_AUTO_MARGIN:
+            return ""
+        return name
+    except Exception:  # noqa: BLE001 — doubt inlines nothing
+        return ""
+
+
+def _obvious_non_code_turn(prompt: str, history: list) -> bool:
+    """Pure predicate: chit-chat turn that cannot need the symbol map.
+
+    Short prompt, no code/file tokens in it, and history (if any) with no
+    tool activity and no code tokens. The caller skips the map AND the laya
+    consult entirely — this also removes the laya-timeout stalls seen on
+    greetings. Anything doubtful returns False (fail-open: laya gate, then
+    the map as before).
+    """
+    try:
+        p = (prompt or "").strip()
+        if not p or len(p) >= 32:
+            return False
+        if re.search(_TASK_SIGNAL_RE, p):
+            return False
+        for turn in history or []:
+            if not isinstance(turn, dict):
+                continue
+            if turn.get("toolActivity") or turn.get("plan"):
+                return False
+            c = turn.get("content") or ""
+            if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — doubt sends the map
+        return False
 
 
 def _build_skills_section(
@@ -1459,6 +1657,16 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     equivalent to the previous behaviour.
     """
     import os
+    import time as _tctx_time
+
+    _tctx_marks: dict[str, float] = {}
+    _tctx_t0 = _tctx_time.monotonic()
+
+    def _tctx_mark(name: str) -> None:
+        try:
+            _tctx_marks[name] = _tctx_time.monotonic() - _tctx_t0
+        except Exception:  # noqa: BLE001, S110 — timing never breaks the turn
+            pass
 
     root = state["root"]
     mode = state["mode"]
@@ -1509,6 +1717,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 state["base_url"],
                 state["api_key"],
                 state["env_var"],
+                state.get("api_keys"),
             )
         except Exception:  # noqa: BLE001
             ctx = 0
@@ -1539,6 +1748,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["model_name"],
         provider_lookup=_provider_lookup,
         parent_provider_id=state.get("provider_id", ""),
+        parent_api_keys=state.get("api_keys"),
     )
     compact_model = resolve_subagent_model(
         state["provider"],
@@ -1552,6 +1762,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # instead of hanging the turn when the provider is slow/unreachable.
         timeout=50,
         parent_provider_id=state.get("provider_id", ""),
+        parent_api_keys=state.get("api_keys"),
     )
     vision_model = resolve_subagent_model(
         state["provider"],
@@ -1567,6 +1778,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # in _vision_analyze covers transient blips within this budget.
         timeout=30,
         parent_provider_id=state.get("provider_id", ""),
+        parent_api_keys=state.get("api_keys"),
     )
     explore_model = resolve_subagent_model(
         state["provider"],
@@ -1578,6 +1790,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         default_to_parent=True,
         provider_lookup=_provider_lookup,
         parent_provider_id=state.get("provider_id", ""),
+        parent_api_keys=state.get("api_keys"),
     )
 
     settings = await chat_model_settings(
@@ -1590,6 +1803,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["api_key"],
         state["env_var"],
         _agents._detect_scope(prompt),
+        api_keys=state.get("api_keys"),
     )
     model = build_chat_model(
         state["provider"],
@@ -1597,6 +1811,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         state["base_url"],
         state["api_key"],
         state["env_var"],
+        state.get("api_keys"),
         temperature=settings["temperature"],
         max_tokens=settings["max_tokens"],
         thinking_level=settings["thinking_level"],
@@ -1670,6 +1885,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 prompt,
                 _describe_mcp_tools(mcp_tools),
                 len(mcp_tools),
+                str(chat_id or ""),
+                lambda ev: queue.put_nowait(ev),
+                "mcp_rank",
+                "normal",
+                prompt,
             )
             if _mcp_ranked:
                 _mcp_order = {
@@ -1685,6 +1905,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001, S110 — ranking is best-effort
             pass
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
+    _tctx_mark("mcp")
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
     # strips it). When it is NOT available we must fall back to attaching the
     # image directly to the main model, otherwise the model could never see it.
@@ -1824,17 +2045,22 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             system_final += _ws_summary
 
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
-    # (name + description) is always in the prompt (except small-context
-    # models, where every token counts) so the model can auto-trigger a skill
-    # via load_skill; @mentioned bodies are inlined in full. Laya pre-ranks
-    # the catalog by relevance (reorder-only, full fallback) so the model
-    # sees the most relevant skills first without hiding any.
+    # (name + description) is in the prompt (except small-context models)
+    # so the model can auto-trigger a skill via load_skill; @mentioned bodies
+    # are inlined in full. Laya pre-ranks the catalog by relevance
+    # (reorder-only, full fallback) so the model sees relevant skills first.
+    # Chit-chat turns (no task signal) get ZERO skill tokens: no rank call,
+    # no auto-inlined body, no catalog — a greeting must never inject a
+    # ~10k-char skill body. @mentioned skills still inline (manual_names path
+    # ignores the catalog flag).
     _skill_rank_order: list[str] | None = None
-    if not small_ctx and prompt:
+    _skill_ranked: list[dict] = []
+    _task_signal = _turn_task_signal(prompt, state.get("history") or [])
+    if prompt and _task_signal:
         try:
             _rank_skills = _agents._load_skills(root) or []
             if len(_rank_skills) > 1:
-                _ranked = await asyncio.to_thread(
+                _skill_ranked = await asyncio.to_thread(
                     _rank_candidates,
                     prompt,
                     [
@@ -1842,20 +2068,39 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         for s in _rank_skills
                     ],
                     len(_rank_skills),
+                    str(chat_id or ""),
+                    lambda ev: queue.put_nowait(ev),
+                    "skill_rank",
+                    "normal",
+                    prompt,
                 )
-                if _ranked:
+                if _skill_ranked:
                     _skill_rank_order = [
                         str(r.get("name") or "")
-                        for r in _ranked
+                        for r in _skill_ranked
                         if str(r.get("name") or "").strip()
                     ] or None
         except Exception:  # noqa: BLE001 — ranking is best-effort
             _skill_rank_order = None
+            _skill_ranked = []
+    # Auto-inline: only a strong, distinctive top-1 on a task-signal turn —
+    # never noise (flat ~0.7 scores on greetings must not load bodies).
+    try:
+        _auto_name = _skill_auto_pick(_skill_ranked, _task_signal)
+        if _auto_name:
+            _picked = list(skills or [])
+            if not any(str(n or "").strip().casefold() == _auto_name.casefold() for n in _picked):
+                _picked.append(_auto_name)
+                skills = _picked
+    except Exception:  # noqa: BLE001, S110 — auto-pick never breaks the turn
+        pass
+    if small_ctx:
+        _skill_rank_order = None
     system_final += _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
-        catalog=not small_ctx,
+        catalog=not small_ctx and _task_signal,
         rank_order=_skill_rank_order,
     )
 
@@ -1872,7 +2117,35 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # فقط برای مودهای کد تزریق می‌شه (ask/reader/chat نماد نمی‌خوان) و
     # به user turn اضافه می‌شه (نه سیستم‌پرامپت) تا کشِ پیشوند نشکنه.
     code_map_block = ""
-    if mode in ("coder", "plan", "ask"):
+    # Fast path: obvious chit-chat skips the map AND the laya consult (no
+    # laya-timeout stalls on greetings either). A trace row is still emitted
+    # so the skip stays visible in the Laya panel.
+    _map_fast_skip = _obvious_non_code_turn(prompt, state.get("history") or [])
+    if _map_fast_skip:
+        with contextlib.suppress(Exception):
+            import types as _skip_types
+
+            import laya_decide as _laya_skip_mod
+
+            _laya_skip_mod.report_secondary(
+                _skip_types.SimpleNamespace(
+                    handled=True,
+                    value="no_code_map",
+                    confidence=1.0,
+                    abstained=False,
+                    reason="deterministic-fast-path",
+                    kind="choice",
+                    provider_id="local",
+                    model="",
+                ),
+                route="normal",
+                sub="code_map_gate",
+                chat_id=str(chat_id or ""),
+                emit=lambda ev: queue.put_nowait(ev),
+                prompt=str(prompt or "")[:2000],
+                options=list(_CODE_MAP_GATE_OPTIONS),
+            )
+    if mode in ("coder", "plan", "ask") and not _map_fast_skip:
         try:
             from symbol_index import _looks_like_code_ident, format_symbol_map
 
@@ -1906,6 +2179,54 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
             # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
             # تکراری کم بشه.
+            # Laya gate for CODE MAP injection (save input tokens without
+            # quality loss): skip building/injecting the map when the turn
+            # clearly needs no code symbols (greetings, general Q&A).
+            # Fail-open — ALL conditions must hold to skip, any doubt sends
+            # the map as before. (1) no file/code mentions anywhere in the
+            # history; (2) laya choice "no_code_map" with high confidence.
+            # The laya consult runs only when (1) already holds, so
+            # code-heavy turns pay zero extra latency. Under-injecting would
+            # cost MORE tokens (extra grep/read rounds to find the file), so
+            # the threshold stays high (0.8) and every laya failure mode
+            # (timeout/busy/abstain/bad-question) falls through to sending.
+            _skip_code_map = False
+            if not _mentioned_fnames and not _mentioned_idents:
+                try:
+                    import laya_decide as _laya_gate_mod
+
+                    _gate_decision = await asyncio.to_thread(
+                        _laya_gate_mod.decide,
+                        {"prompt": prompt or "", "mode": mode or ""},
+                        {
+                            "type": "choice",
+                            "options": list(_CODE_MAP_GATE_OPTIONS),
+                        },
+                        _CODE_MAP_GATE_THRESHOLD,
+                        "",
+                        str(chat_id or ""),
+                    )
+                    try:
+                        _laya_gate_mod.report_secondary(
+                            _gate_decision,
+                            route="normal",
+                            sub="code_map_gate",
+                            chat_id=str(chat_id or ""),
+                            emit=lambda ev: queue.put_nowait(ev),
+                            prompt=str(prompt or "")[:2000],
+                            options=list(_CODE_MAP_GATE_OPTIONS),
+                        )
+                    except Exception:  # noqa: BLE001, S110 — trace is optional
+                        pass
+                    try:
+                        _skip_code_map = _code_map_gate_skips(
+                            _mentioned_fnames, _mentioned_idents, _gate_decision
+                        )
+                    except Exception:  # noqa: BLE001 — doubt sends the map
+                        _skip_code_map = False
+                except Exception:  # noqa: BLE001 — gate is optional, send map
+                    _skip_code_map = False
+            _map_rank_info: dict = {}
             code_map_block = (
                 await asyncio.to_thread(
                     format_symbol_map,
@@ -1914,12 +2235,41 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     mentioned_fnames=_mentioned_fnames,
                     mentioned_idents=_mentioned_idents,
                     query=prompt,
+                    rank_info=_map_rank_info,
                 )
-                if root
+                if root and not _skip_code_map
                 else ""
             )
+            if _skip_code_map:
+                # A skipped turn leaves no map in the transcript, so drop the
+                # cached hash: the next turn must send the full map, never a
+                # "see previous turn" marker pointing at this gap.
+                with contextlib.suppress(Exception):
+                    _gate_hash_cache = getattr(
+                        build_turn_context, "_code_map_hash_cache", None
+                    )
+                    if isinstance(_gate_hash_cache, dict):
+                        _gate_hash_cache.pop(chat_id, None)
+            try:
+                import laya_decide as _laya_mod
+
+                _ranked = _map_rank_info.get("ranked") if isinstance(_map_rank_info, dict) else None
+                if isinstance(_ranked, list) and _ranked:
+                    _laya_mod.report_secondary(
+                        None,
+                        route="normal",
+                        sub="code_map_rank",
+                        chat_id=chat_id,
+                        emit=lambda ev: queue.put_nowait(ev),
+                        elapsed_ms=int(_map_rank_info.get("elapsed_ms") or 0),
+                        prompt=str(_map_rank_info.get("query") or prompt or ""),
+                        ranked=_ranked,
+                    )
+            except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+                pass
         except Exception:  # noqa: BLE001
             code_map_block = ""
+    _tctx_mark("codemap")
 
     # کش هش نقشه: اگه نقشه نسبت به تورن قبلی عوض نشده، کل نقشه رو نمی‌فرستیم
     # بلکه یه marker کوتاه می‌فرستیم (توکن کمتر، چون محتوای یکسانه). این با
@@ -2132,7 +2482,29 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             f"format and constraints of any earlier turns; they are only history."
         )
     if mcp_tools:
-        user_parts.append(_mcp_tools_note(mcp_tools, browser_mcp_live))
+        user_parts.append(
+            _mcp_note_for_turn(mcp_tools, browser_mcp_live, str(chat_id or ""))
+        )
+    # پیش‌بررسی laya: پاسخ ساده بدون ابزار (handle_locally) — قبل از هر کار
+    # گران (مدل‌ها، RAG، رتبه‌بندی) تا پاسخ ساده وارد حلقه ابزار نشود.
+    # فقط وقتی handle_locally با اطمینان برگشت، پرچم روی state می‌ماند تا
+    # _run_mode_turn حلقه ابزار را رد کند؛ در غیر این صورت رفتار قبلی ادامه می‌یابد.
+    try:
+        _pre = await asyncio.to_thread(
+            _agents.laya_precheck,
+            prompt or "",
+            mode or "",
+            len(state.get("history") or []),
+            str(chat_id or ""),
+            queue.put_nowait,
+        )
+    except Exception:  # noqa: BLE001 — پیش‌بررسی اختیاری است
+        _pre = None
+    try:
+        if isinstance(_pre, dict) and _pre.get("handled"):
+            state["laya_no_tools"] = True
+    except Exception:  # noqa: BLE001, S110
+        pass
     # مسیر سریع laya: برای همه چت‌ها اجرا می‌شود تا چت معمولی هم رویداد
     # laya بگیرد و پنل خالی نماند؛ decide همگام در نخ جدا (to_thread) تا حلقه بلوکه نشود.
     # مصرف laya (لوکال صفرتوکنی یا توکن واقعی پروایدر) مثل tools با sub=True
@@ -2223,18 +2595,23 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 _cu_step = laya_decide.computer_next_step(prompt or "", "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
             except Exception:  # noqa: BLE001 — میان‌بر اختیاری است
                 _cu_step = None
+            try:
+                _cu_mode = laya_decide.computer_act_mode(prompt or "", "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
+            except Exception:  # noqa: BLE001 — میان‌بر اختیاری است
+                _cu_mode = None
+            _cu_tail = " Prefer action='act' over 'input'." if _cu_mode == "act" else (" Batch into ONE action='sequence' call." if _cu_mode == "sequence" else "")
             if _cu_step == "act_direct":
                 user_parts.append(
                     "FAST ROUTE: computer — call `computer` action='act' DIRECTLY "
                     "with a selector (no read first); batch multi-step flows into "
-                    "ONE action='sequence' call."
+                    f"ONE action='sequence' call.{_cu_tail}"
                 )
             else:
                 user_parts.append(
                     "FAST ROUTE: computer — ONE `computer` action='read_screen' "
                     "(shallow tree is enough), then ONE action='sequence' call. "
                     "Never re-read after every step; never use 'see' when the "
-                    "tree answers."
+                    f"tree answers.{_cu_tail}"
                 )
         elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
             try:
@@ -2267,6 +2644,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 )
     except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
         pass
+    _tctx_mark("laya")
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
     # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
     if filtered.get("computer") is not None:
@@ -2398,6 +2776,24 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
         for name, t in filtered.items()
     ]
+    _tctx_mark("done")
+    try:
+        _tctx_total = _tctx_marks.get("done", 0.0)
+        _tctx_parts = []
+        _tctx_prev = 0.0
+        for _k in ("mcp", "codemap", "laya", "done"):
+            _v = float(_tctx_marks.get(_k, 0.0))
+            _tctx_parts.append(f"{_k}={_v - _tctx_prev:.1f}s")
+            _tctx_prev = _v
+        logger.info(
+            "[turn-ctx] total=%.1fs %s mode=%s chat=%s",
+            _tctx_total,
+            " ".join(_tctx_parts),
+            mode,
+            str(chat_id or "")[:8],
+        )
+    except Exception:  # noqa: BLE001, S110 — timing never breaks the turn
+        pass
 
     return {
         "model": model,
@@ -2911,6 +3307,36 @@ async def _maybe_auto_compact(
                         _tid = _tc.get("id")
                         if _tid and _tid not in _call_meta:
                             _call_meta[_tid] = (str(_tc.get("name") or "tool"), _tc.get("args") or {})
+            # Exemption: never truncate a result the recent conversation still
+            # refers to — collect distinctive tokens (file paths, snake_case
+            # and CamelCase identifiers) from the last few non-tool messages;
+            # an older ToolMessage containing any of them stays verbatim.
+            # Without this the model could lose a result it is actively
+            # discussing and pay a full extra round trip to re-read it, which
+            # would wipe out the truncation saving. Common words are excluded
+            # by construction (paths need a slash/extension, idents need an
+            # underscore or mixed case), so this stays narrow.
+            _recent_refs: set[str] = set()
+            try:
+                _recent_non_tool = [
+                    m for m in msgs if getattr(m, "type", "") != "tool"
+                ][-3:]
+                for _m in _recent_non_tool:
+                    _rc = str(getattr(_m, "content", "") or "")
+                    for _tok in re.findall(r"[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}", _rc):
+                        _t = _tok.strip("./-")
+                        if len(_t) >= 4:
+                            _recent_refs.add(_t)
+                    for _tok in re.findall(r"[a-z]+(?:_[a-z0-9]+)+", _rc):
+                        if len(_tok) >= 4:
+                            _recent_refs.add(_tok)
+                    for _tok in re.findall(r"[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+", _rc):
+                        if len(_tok) >= 4:
+                            _recent_refs.add(_tok)
+                    if len(_recent_refs) > 200:
+                        break
+            except Exception:  # noqa: BLE001 — exemption is best-effort
+                _recent_refs = set()
             _truncated_any = False
             for _i, _m in enumerate(msgs):
                 if not isinstance(_m, ToolMessage):
@@ -2923,6 +3349,8 @@ async def _maybe_auto_compact(
                 if len(_cs) <= 120:
                     continue
                 if _cs.startswith("[truncated ") and _cs.endswith("re-issue if still needed]"):
+                    continue
+                if _recent_refs and any(_ref in _cs for _ref in _recent_refs):
                     continue
                 _name, _args = _call_meta.get(_tid, (getattr(_m, "name", "") or "tool", {}))
                 try:
@@ -3027,6 +3455,26 @@ async def _run_mode_turn(
     except Exception:  # noqa: BLE001 — trace context must never break the turn
         _trace_token = None
     tctx = await build_turn_context(state, queue)
+    # Laya precheck: simple answer without tools — bind no tools and tell
+    # the model to answer directly. Best-effort: any failure falls back to
+    # the normal tool loop below.
+    if state.get("laya_no_tools"):
+        try:
+            tctx["lc_tools"] = []
+            tctx["tools"] = {}
+            messages_no_tools: list[BaseMessage] = list(tctx["messages"])
+            messages_no_tools.append(
+                HumanMessage(
+                    content=(
+                        "[laya precheck: this request can be answered directly "
+                        "from the conversation context — answer in text now "
+                        "without calling any tool.]"
+                    )
+                )
+            )
+            tctx["messages"] = messages_no_tools
+        except Exception:  # noqa: BLE001, S110 — fallback to normal loop
+            pass
     model = tctx["model"]
     # The real model id the LangChain client will hit (e.g. a sub-agent model
     # resolved for web/compact/vision), used to attribute usage correctly.
@@ -3429,7 +3877,9 @@ async def _run_mode_turn(
                 # function_call_output for call_id» درخواست را رد می‌کند.
                 normalize_tool_transcript(msgs)
 
-                request_messages = project_tool_results(msgs)
+                # ترتیب پایدار برای کش پرامپت: پیام‌های ابزار بر اساس شناسه
+                # مرتب می‌شوند تا جایگشت ترتیب اجرا، پیشوند کش را نشکند.
+                request_messages = project_tool_results(_stable_tool_order(msgs))
                 if _transient_msgs:
                     request_messages = [*request_messages, *_transient_msgs]
                 async for chunk in bound.astream(request_messages):
@@ -3692,6 +4142,13 @@ async def _run_mode_turn(
                     _no_pc = True
                     model = _strip_parallel_calls(model)
                     continue
+                # 9router-style key fallback: on key errors (invalid/expired/
+                # rate-limited) rebuild with the NEXT key and retry the step.
+                if _is_key_error(exc):
+                    _, _rest = model_key_fallback(model)
+                    if _rest:
+                        model = _clone_model_with_key(model, _rest[0])
+                        continue
                 # Some custom / reasoning-only model routes (e.g. o-series
                 # style endpoints) reject ``temperature`` with a 400. Strip it
                 # and retry once so the turn still works.
@@ -3977,13 +4434,6 @@ async def _run_mode_turn(
             _sequential = [
                 tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS
             ]
-            # Advisory batching reminder (same detector as the sub-agent loop):
-            # when this step's calls could have been ONE batch call — or the
-            # streak tracker sees one-at-a-time calls across consecutive
-            # steps — build the reminder now. It is delivered AFTER the tool
-            # results as a standalone HumanMessage (below): a suffix buried
-            # at the end of a multi-thousand-char result demonstrably never
-            # reached the model.
             # Always observe — `or` would short-circuit the tracker whenever
             # the per-step detector fires, so that step would never be
             # recorded and the cross-step count would restart from zero.
@@ -3995,7 +4445,7 @@ async def _run_mode_turn(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
                 )
 
-            _results = await execute_readonly_calls(_parallel, _run_readonly)
+            _results = await execute_readonly_calls(_parallel, _run_readonly, query=state.get("request") or "")
             for tc, result in zip(_parallel, _results):
                 append_tool_result(msgs, str(result), tc.get("id", ""))
             # Persist the completed parallel tool work ATOMICALLY — save once

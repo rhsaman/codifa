@@ -77,23 +77,48 @@ export async function decryptSecret(val: string): Promise<string> {
   }
 }
 
-const SECRET_KEYS = ['apiKey'] as const
+async function encryptKeyList(keys: unknown): Promise<string[]> {
+  if (!Array.isArray(keys)) return []
+  const out: string[] = []
+  for (const k of keys) {
+    if (typeof k !== 'string' || !k) continue
+    out.push(await encryptSecret(k))
+  }
+  return out
+}
+
+async function decryptKeyList(keys: unknown): Promise<string[]> {
+  if (!Array.isArray(keys)) return []
+  const out: string[] = []
+  for (const k of keys) {
+    if (typeof k !== 'string' || !k) continue
+    const d = await decryptSecret(k)
+    if (d) out.push(d)
+  }
+  return out
+}
 
 async function encryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
   const out: ProviderConfig = { ...p }
-  for (const key of SECRET_KEYS) {
-    const v = (out as unknown as Record<string, string | undefined>)[key]
-    ;(out as unknown as Record<string, string>)[key] = await encryptSecret(v || '')
+  out.apiKeys = await encryptKeyList((p as unknown as Record<string, unknown>).apiKeys)
+  // Migrate a legacy plaintext apiKey into the list so nothing is lost.
+  const legacy = (p as unknown as Record<string, unknown>).apiKey
+  if (out.apiKeys.length === 0 && typeof legacy === 'string' && legacy) {
+    out.apiKeys = [await encryptSecret(legacy)]
   }
+  delete (out as unknown as Record<string, unknown>).apiKey
   return out
 }
 
 async function decryptProvider(p: ProviderConfig): Promise<ProviderConfig> {
   const out: ProviderConfig = { ...p }
-  for (const key of SECRET_KEYS) {
-    const v = (out as unknown as Record<string, string | undefined>)[key]
-    ;(out as unknown as Record<string, string>)[key] = await decryptSecret(v || '')
+  out.apiKeys = await decryptKeyList((p as unknown as Record<string, unknown>).apiKeys)
+  const legacy = (p as unknown as Record<string, unknown>).apiKey
+  if (out.apiKeys.length === 0 && typeof legacy === 'string' && legacy) {
+    const d = await decryptSecret(legacy)
+    if (d) out.apiKeys = [d]
   }
+  delete (out as unknown as Record<string, unknown>).apiKey
   return out
 }
 
@@ -140,7 +165,7 @@ export async function decryptSettings(raw: Partial<Settings> & { provider?: Prov
       )
     : raw.searchPlugins
   const provider = raw.provider
-    ? { ...raw.provider, apiKey: await decryptSecret(raw.provider.apiKey || '') }
+    ? await decryptProvider(raw.provider)
     : raw.provider
   return { ...raw, providers, searchConsole, searchPlugins, provider }
 }

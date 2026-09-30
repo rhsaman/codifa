@@ -329,7 +329,12 @@ export default function App() {
         <ErrorBoundary>
           <Sidebar />
           <main className="main">
-            <ChatPanel key={activeChatId} />
+            {/* No key={activeChatId}: a full remount re-parses every markdown +
+              highlight block and re-runs all mount effects, which is the main
+              cost of switching chats. ChatPanel already resets its per-chat
+              state (input/draft/scroll/msgLimit) from the chat id, so keeping
+              the instance mounted across switches is safe and instant. */}
+            <ChatPanel />
           </main>
           {reviewOpen && <ReviewPanel />}
           {traceOpen && <TracePanel />}

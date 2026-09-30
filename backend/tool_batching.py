@@ -87,16 +87,71 @@ async def coalesce_io(
     return await current.submit(key, request, batch)
 
 
+def _rank_step_calls(calls: list[dict], query: str = "") -> list[dict]:
+    """Best-effort laya ordering of one step's parallel tool calls.
+
+    Read-only calls run concurrently either way; a better order only means
+    more relevant results resolve first when the model reads them in order.
+    Returns the calls reordered (most relevant first) or the original list
+    on no-signal. Never raises so the tool loop can never break on ranking.
+    """
+    try:
+        items = [c for c in (calls or []) if isinstance(c, dict)]
+        if len(items) < 2:
+            return list(calls or [])
+        import json as _json
+
+        import laya_decide
+
+        cands = []
+        for c in items:
+            try:
+                args_text = _json.dumps(c.get("args") or {}, ensure_ascii=False, sort_keys=True)[:300]
+            except Exception:  # noqa: BLE001
+                args_text = str(c.get("args") or "")[:300]
+            cands.append({"name": str(c.get("name") or c.get("id") or ""), "description": args_text})
+        ranked = laya_decide.rank(str(query or ""), cands, top_k=len(cands))
+        if not ranked:
+            return list(calls or [])
+        pos = {str(r.get("name") or ""): i for i, r in enumerate(ranked) if isinstance(r, dict)}
+        base = len(pos)
+        order = sorted(range(len(items)), key=lambda i: pos.get(str(items[i].get("name") or items[i].get("id") or ""), base))
+        return [items[i] for i in order]
+    except Exception:  # noqa: BLE001 — ranking is best-effort
+        try:
+            return list(calls or [])
+        except Exception:  # noqa: BLE001
+            return []
+
+
 async def execute_readonly_calls(
-    calls: list[dict], execute: Callable[[dict], Awaitable[Any]]
+    calls: list[dict], execute: Callable[[dict], Awaitable[Any]], query: str = ""
 ) -> list[Any]:
     """Preserve each callback and its result while sharing compatible raw I/O.
 
     Callers retain responsibility for separating mutating/blocking tools.
     The context is local to this step; it never buffers work across model turns.
+    ``query`` optionally reorders the step's calls by laya relevance first.
     """
     if not calls:
         return []
+    ordered = _rank_step_calls(calls, query) if query else list(calls)
+    # Map results back to the caller's original order: each ToolMessage is
+    # matched by tool_call_id downstream, but the returned list is zipped
+    # positionally, so restore the input order before returning.
+    if ordered is not calls and len(ordered) == len(calls):
+        index = {id(c): i for i, c in enumerate(calls)}
+        results_by_idx: dict[int, Any] = {}
+        batch = _StepBatch()
+        token = _CURRENT_BATCH.set(batch)
+        try:
+            ordered_results = list(await asyncio.gather(*(execute(call) for call in ordered)))
+        finally:
+            _CURRENT_BATCH.reset(token)
+            await batch.close()
+        for call, res in zip(ordered, ordered_results):
+            results_by_idx[index[id(call)]] = res
+        return [results_by_idx[i] for i in range(len(calls))]
     batch = _StepBatch()
     token = _CURRENT_BATCH.set(batch)
     try:

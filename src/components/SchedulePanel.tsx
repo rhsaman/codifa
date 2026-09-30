@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useStore } from "../lib/store";
+import { api } from "../lib/fs";
 import {
   deleteSchedule,
   listAllScheduleRuns,
@@ -344,9 +345,10 @@ export function ScheduleSection() {
   const formOpen = useStore((s) => s.scheduleFormOpen);
   const setFormOpen = useStore((s) => s.setScheduleFormOpen);
   const dir = useStore((s) => s.dir);
+  const loaded = useStore((s) => s.loaded);
   const activeRoot = useStore((s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root);
   const [collapsed, setCollapsed] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // مجموع توکن مصرفی هر تسک (از usage ران‌ها) — روی خود تسک نمایش داده می‌شود،
   // نه در model usage که فقط مصرف چت فعال است.
@@ -366,8 +368,24 @@ export function ScheduleSection() {
     if (!("error" in all)) setTaskTokens(taskTokenTotals(all));
   }, [setSchedules]);
 
+  // Load on mount AND when persisted state finishes loading: on app startup the
+  // panel can mount before `loaded` (and before the sidecar URL is known), so a
+  // mount-only fetch hits "Python agent not ready" once and gets stuck on the
+  // error/empty state. Gating on `loaded` retries the fetch as soon as the app
+  // is actually ready.
   useEffect(() => {
-    if (!collapsed) void refresh();
+    if (!collapsed && loaded) void refresh();
+  }, [collapsed, loaded, refresh]);
+
+  // The sidecar can (re)start after the first fetch failed (cold start, crash
+  // recovery): re-refresh when the main process announces a new sidecar URL so
+  // the list populates without requiring a manual Retry / collapse toggle.
+  useEffect(() => {
+    if (collapsed) return;
+    const unsub = api.onSidecarChanged(() => {
+      void refresh();
+    });
+    return unsub;
   }, [collapsed, refresh]);
 
   return (

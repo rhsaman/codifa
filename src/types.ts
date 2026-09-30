@@ -84,8 +84,10 @@ export interface ProviderConfig {
   id: string
   name: string
   kind: ProviderKind
-  apiKey: string
-  envVar?: string
+  /** Ordered API keys, top = tried first (9router-style fallback). */
+  apiKeys: string[]
+  /** Legacy single key (migrated into apiKeys on load). */
+  apiKey?: string
   baseUrl: string
   model: string
   enabled?: boolean
@@ -488,6 +490,8 @@ export interface TraceEntry {
   /** زمان ثبت (epoch ثانیه). */
   at: number
   kind: TraceKind
+  /** Chat turn number (1-based, from backend). 0/missing = legacy entry. */
+  turn?: number
   /** خلاصه یک‌خطی ردیف تاشو. */
   summary: string
   /** جزئیات ساخت‌یافته (مسیر/اطمینان/دلیل لایا، توکن LLM، آرگومان ابزار، …). */

@@ -32,19 +32,19 @@ def _abstained():
 def test_computer_next_step_shortcuts(monkeypatch):
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _handled("act_direct"),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _handled("act_direct"),
     )
     assert laya_decide.computer_next_step("click the OK button", "Notes") == "act_direct"
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _handled("read_first"),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _handled("read_first"),
     )
     assert laya_decide.computer_next_step("explore the window", "Notes") == "read_first"
     assert laya_decide.computer_act_mode("type hello") in ("act", "sequence", None)
     # واگذاری امن: اطمینان پایین یعنی None و رفتار قبلی
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _abstained(),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _abstained(),
     )
     assert laya_decide.computer_next_step("x", "y") is None
     assert laya_decide.browser_next_step("x") is None
@@ -101,7 +101,7 @@ def test_secondary_predict_skips_locked_router():
 def test_shallow_depth_accepts_borderline_confidence(monkeypatch):
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: laya_decide.LayaDecision(
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: laya_decide.LayaDecision(
             handled=True, kind="choice", value="shallow", confidence=0.51,
             abstained=False, reason="local-decision",
         ),
@@ -118,7 +118,7 @@ def test_dock_activate_error_hints_real_app():
 def test_browser_next_step_and_rank(monkeypatch):
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _handled("snapshot_first"),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _handled("snapshot_first"),
     )
     assert laya_decide.browser_next_step("read the page") == "snapshot_first"
     tools = [
@@ -140,7 +140,7 @@ def test_suggest_tree_depth_busy_app(monkeypatch):
     # تا تست سریع بماند و قفل/روتر全局 تست‌های بعدی را آلوده نکند.
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _abstained(),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _abstained(),
     )
     assert cu.suggest_tree_depth("Notes", "click") == cu.DEFAULT_MAX_DEPTH
 
@@ -185,7 +185,7 @@ def test_secondary_decisions_emit_trace_and_live(monkeypatch):
     seen: list = []
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: _handled("act_direct"),
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _handled("act_direct"),
     )
     trace_store.clear("chat-speed")
     out = laya_decide.computer_next_step("click ok", "Notes", chat_id="chat-speed", emit=seen.append)

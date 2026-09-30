@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
-import { useStore, flushStateNow } from '../lib/store'
+import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
 import { cancelModelDownload, downloadModel, getLayaStatus, getModelsStatus, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type LayaStatus, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
@@ -24,23 +24,16 @@ const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .map((m) => m.kind)
 const NEW_SKILL_KEY = '__new_skill__'
 
-/** بررسی می‌کنه آیا یک پروایدر تنظیم شده (کلید API یا OAuth یا env var داره).
- *  envVarVerified: برای پروایدر فعال، مقدار async-شده envVarValue رو بفرست. */
-function isProviderConfigured(p: ProviderConfig, envVarVerified?: boolean | null): boolean {
+/** بررسی می‌کنه آیا یک پروایدر تنظیم شده (حداقل یک کلید API دارد). */
+function isProviderConfigured(p: ProviderConfig): boolean {
   if (providerMeta(p.kind).local) return true
-  if (p.apiKey) return true
-  if (p.envVar) {
-    // فقط وقتی سبز باش که env var واقعاً وجود داشته باشه
-    if (envVarVerified !== undefined) return envVarVerified === true
-    // برای پروایدرهای غیرفعال نمی‌تونیم env var رو async چک کنیم → خاکستری
-    return false
-  }
-  return false
+  return providerApiKeys(p).length > 0
 }
 
 /** توضیح کوتاه بر اساس kind */
 function providerDescription(p: ProviderConfig): string {
-  if (p.envVar) return `Env: ${p.envVar}`
+  const n = providerApiKeys(p).length
+  if (n > 0) return `${n} key${n === 1 ? '' : 's'}`
   if (p.baseUrl) return p.baseUrl.replace(/^https?:\/\//, '').slice(0, 40)
   return KIND_LABELS[p.kind] || p.kind
 }
@@ -605,15 +598,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // Google OAuth sign-in progress: "" idle, "busy" while the consent window is
   // open, "ok"/"error" + message when the flow settles.
   const [oauthState, setOauthState] = useState<{ status: string; msg: string }>({ status: '', msg: '' })
-  const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
-  // وضعیت env var همه پروایدرها — برای dot تب‌ها استفاده می‌شه
-  const [providerEnvMap, setProviderEnvMap] = useState<Map<string, boolean>>(new Map())
-  // Which credential source the provider being edited will use: 'env' (an
-  // environment variable that must already exist) or 'key' (an API key stored
-  // encrypted at rest). Exactly ONE is active — the user picks, never both.
-  const [credMode, setCredMode] = useState<'env' | 'key'>(() => ((cfg.apiKey ?? '').trim() ? 'key' : 'env'))
   // True once Save was blocked for a provider that has no usable credential.
   const [credWarn, setCredWarn] = useState(false)
+  // New-key draft + per-row visibility for the multi-key list.
+  const [newKey, setNewKey] = useState('')
+  const [showKeys, setShowKeys] = useState<Record<number, boolean>>({})
   // ورودی «افزودن مدل دستی»: وقتی گیت‌وی فهرست مدل‌هایش را از /models نشان
   // نمی‌دهد (یا فچ شکست می‌خورد)، کاربر می‌تواند id مدل را مستقیم تایپ کند.
   const [manualModel, setManualModel] = useState('')
@@ -629,8 +618,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const fetchSeqRef = useRef(0)
   // Readiness checks for the provider being edited (drives the banner at the
   // top of the form so the problem is visible BEFORE a message is sent).
-  const hasSavedKey = !!(cfg.apiKey ?? '').trim()
-  const credentialReady = envVarValue === true || hasSavedKey
+  const keyCount = providerApiKeys(cfg).length
+  const credentialReady = keyCount > 0
   const requiresKey = providerMeta(cfg.kind).requiresKey
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>(() => {
     const d: Record<string, string> = {}
@@ -931,50 +920,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     fetchSeqRef.current++
   }, [editId, active.id])
 
-  // Derive the credential method when switching providers: a saved API key wins,
-  // otherwise show the env-var option (so the default env var names never look
-  // like configured keys).
+  // Reset the key draft + visibility when switching providers.
   useEffect(() => {
-    setCredMode((cfg.apiKey ?? '').trim() ? 'key' : 'env')
+    setNewKey('')
+    setShowKeys({})
     setCredWarn(false)
   }, [editId, active.id])
-
-  // Check whether the provider's env var currently has a value in the environment.
-  useEffect(() => {
-    let cancelled = false
-    const ev = (cfg.envVar || '').trim()
-    if (!ev) {
-      setEnvVarValue(null)
-      return
-    }
-    void (async () => {
-      const val = await api.getEnv(ev)
-      if (!cancelled) setEnvVarValue(!!val)
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [cfg.envVar, active.id])
-
-  // چک کردن env var همه پروایدرها هنگام باز شدن modal — نتیجه برای dot تب‌ها
-  useEffect(() => {
-    let cancelled = false
-    void (async () => {
-      const results = new Map<string, boolean>()
-      await Promise.all(
-        providers.map(async (p) => {
-          const ev = (p.envVar || '').trim()
-          if (!ev) return
-          try {
-            const val = await api.getEnv(ev)
-            results.set(p.id, !!val)
-          } catch { /* ignore */ }
-        }),
-      )
-      if (!cancelled) setProviderEnvMap(results)
-    })()
-    return () => { cancelled = true }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // فچ دستی با دکمه‌ی «Fetch models» — فچ خودکار هنگام افزودن/ویرایش/تعویض
   // پروایدر حذف شد و فقط با کلیک صریح اجرا می‌شود. نتیجه‌ی در پرواز هنگام
@@ -1029,12 +980,25 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setOauthState({ status: 'ok', msg: 'Google account disconnected.' })
   }
 
-  // Switching to the env-var method drops any stored API key so only ONE
-  // credential ever applies (the backend prefers a stored key over an env var).
-  const switchCredMode = (m: 'env' | 'key') => {
+  // Multi-key list helpers: keys are tried top-to-bottom (9router-style fallback).
+  const cfgKeys = providerApiKeys(cfg)
+  const addKey = () => {
+    const v = newKey.trim()
+    if (!v) return
+    setCfg({ ...cfg, apiKeys: [...cfgKeys, v] })
+    setNewKey('')
     setCredWarn(false)
-    if (m === 'env') setCfg({ ...cfg, apiKey: '' })
-    setCredMode(m)
+  }
+  const removeKey = (idx: number) => {
+    setCfg({ ...cfg, apiKeys: cfgKeys.filter((_, i) => i !== idx) })
+  }
+  const moveKey = (idx: number, dir: -1 | 1) => {
+    const j = idx + dir
+    if (j < 0 || j >= cfgKeys.length) return
+    const next = [...cfgKeys]
+    const [k] = next.splice(idx, 1)
+    next.splice(j, 0, k)
+    setCfg({ ...cfg, apiKeys: next })
   }
 
   // ورودی عددی طول کانتکست فقط برای kind‌هایی معنا دارد که /models‌شان پنجره‌ی
@@ -1314,8 +1278,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 onClick={() => setEditId(p.id)}
               >
                 <span
-                  className={`provider-tab-dot ${isProviderConfigured(p, providerEnvMap.get(p.id)) ? 'ok' : 'off'}`}
-                  title={isProviderConfigured(p, providerEnvMap.get(p.id)) ? 'Configured' : 'Not configured'}
+                  className={`provider-tab-dot ${isProviderConfigured(p) ? 'ok' : 'off'}`}
+                  title={isProviderConfigured(p) ? 'Configured' : 'Not configured'}
                 />
                 <span className="provider-tab-name">{p.name}</span>
                 {!BUILTIN_KINDS.includes(p.kind) && providers.length > 1 && (
@@ -1352,22 +1316,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             ) : credentialReady ? (
               <div className="env-key-hint ok">
                 <span className="status-dot ok" />
-                Ready — authenticated via{' '}
-                {hasSavedKey ? 'saved API key' : cfg.envVar ? `env var ${cfg.envVar}` : 'the default env var'}
-                .
+                Ready — {keyCount} API key{keyCount === 1 ? '' : 's'} configured. The top key is tried first; on key errors the next one is used automatically.
               </div>
             ) : requiresKey ? (
               <div className="env-key-hint fail">
                 <span className="status-dot fail" />
-                No credential configured. Choose either an environment variable or a saved API key below —
+                No API key configured. Add at least one key below —
                 otherwise this provider can't connect.
                 {credWarn && ' Save was blocked until you configure one.'}
               </div>
             ) : (
               <div className="env-key-hint fail">
                 <span className="status-dot fail" />
-                No API key set — the provider will use an environment variable if one is available, or may
-                work without a key.
+                No API key set — the provider may work without a key.
               </div>
             )}
             {!BUILTIN_KINDS.includes(cfg.kind) && (
@@ -1413,77 +1374,109 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
             {!providerMeta(cfg.kind).local && (
               <div className="field">
-                <label>Credential — pick one method</label>
-                <div className="cred-mode-toggle">
-                  <button
-                    type="button"
-                    className={credMode === 'env' ? 'active' : ''}
-                    onClick={() => switchCredMode('env')}
-                  >
-                    Environment variable
-                  </button>
-                  <button
-                    type="button"
-                    className={credMode === 'key' ? 'active' : ''}
-                    onClick={() => switchCredMode('key')}
-                  >
-                    Saved API key (encrypted)
-                  </button>
+                <div className="field-head">
+                  <label>API keys</label>
+                  {cfgKeys.length > 0 && (
+                    <span className="field-value-badge" title="Keys are tried top to bottom; on a key error the next one is used">
+                      {cfgKeys.length} key{cfgKeys.length === 1 ? '' : 's'} · top first
+                    </span>
+                  )}
                 </div>
                 <div className="hint">
-                  Codifa uses the method you choose — never both. Picking a name in "Env var name" alone is
-                  not a key: the variable must actually exist in your environment.
+                  The first key is used first; if it fails with a key error (invalid, expired,
+                  rate-limited), the next key is tried automatically. Keys are encrypted (AES-256-GCM)
+                  when you press Save.
                 </div>
-
-                {credMode === 'env' ? (
-                  <div className="cred-block">
-                    <label className="field-label">Env var name</label>
-                    <input
-                      value={cfg.envVar ?? ''}
-                      onChange={(e) => setCfg({ ...cfg, envVar: e.target.value.trim(), apiKey: '' })}
-                      placeholder="e.g. OPENROUTER_API_KEY — must be set in your environment"
-                      dir="ltr"
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                    {envVarValue === false && (
-                      <div className="hint fail" style={{ marginTop: 4 }}>
-                        Env var not found in your environment. Switch to "Saved API key" mode to paste a key directly.
+                <div className="api-key-list">
+                  {cfgKeys.map((k, i) => (
+                    <div key={i} className="api-key-row">
+                      <span className="api-key-order" title={i === 0 ? 'Tried first' : `Fallback #${i + 1} — tried after key ${i}`}>{i + 1}</span>
+                      <input
+                        className="api-key-input"
+                        type={showKeys[i] ? 'text' : 'password'}
+                        value={k}
+                        onChange={(e) => {
+                          const next = [...cfgKeys]
+                          next[i] = e.target.value
+                          setCfg({ ...cfg, apiKeys: next })
+                        }}
+                        placeholder={`API key ${i + 1}`}
+                        dir="ltr"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <div className="api-key-actions">
+                        <button type="button" className={`icon-btn${showKeys[i] ? ' on' : ''}`} title={showKeys[i] ? 'Hide key' : 'Show key'} aria-label={showKeys[i] ? 'Hide key' : 'Show key'} onClick={() => setShowKeys((s) => ({ ...s, [i]: !s[i] }))}>
+                          {showKeys[i] ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" /><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" /><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" /><line x1="2" y1="2" x2="22" y2="22" /></svg>
+                          ) : (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
+                          )}
+                        </button>
+                        <span className="api-key-sep" aria-hidden="true" />
+                        <button type="button" className="icon-btn" title="Move up" aria-label="Move key up" disabled={i === 0} onClick={() => moveKey(i, -1)}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6" /></svg>
+                        </button>
+                        <button type="button" className="icon-btn" title="Move down" aria-label="Move key down" disabled={i === cfgKeys.length - 1} onClick={() => moveKey(i, 1)}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+                        </button>
+                        <span className="api-key-sep" aria-hidden="true" />
+                        <button type="button" className="icon-btn danger" title="Remove key" aria-label="Remove key" onClick={() => removeKey(i)}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                        </button>
                       </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="cred-block">
-                    <label className="field-label">API key — skip environment variables entirely</label>
+                    </div>
+                  ))}
+                  <div className="api-key-row add">
+                    <span className="api-key-order new" title="New key">+</span>
                     <input
-                      type="password"
-                      value={cfg.apiKey ?? ''}
-                      onChange={(e) => setCfg({ ...cfg, apiKey: e.target.value })}
-                      placeholder="Paste your real Gemini key here"
+                      className="api-key-input"
+                      type={showKeys[-1] ? 'text' : 'password'}
+                      value={newKey}
+                      onChange={(e) => setNewKey(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          addKey()
+                        }
+                      }}
+                      placeholder="Paste a new API key — press Enter to add"
                       dir="ltr"
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    <div className="hint" style={{ marginTop: 4 }}>
-                      Nothing is stored yet — paste the actual key value here and it will be encrypted
-                      (AES-256-GCM) when you press Save. This is an alternative to the environment
-                      variable method, not the place to type a variable name.
+                    <div className="api-key-actions">
+                      <button type="button" className={`icon-btn${showKeys[-1] ? ' on' : ''}`} title={showKeys[-1] ? 'Hide' : 'Show'} aria-label={showKeys[-1] ? 'Hide' : 'Show'} onClick={() => setShowKeys((s) => ({ ...s, [-1]: !s[-1] }))}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
+                      </button>
+                      <button type="button" className="btn tiny primary" disabled={!newKey.trim()} onClick={addKey}>
+                        Add
+                      </button>
                     </div>
                   </div>
-                )}
+                </div>
               </div>
             )}
 
             <div className="field">
               <label>Models catalog</label>
-              <button type="button" className="btn" disabled={fetching} onClick={() => void fetchModelsNow()}>
-                {fetching ? 'Fetching…' : 'Fetch models'}
-              </button>
-              {fetchMsg && <div className="hint">{fetchMsg}</div>}
-              <div className="hint">
-                Pulls the live /models list for this provider (ids, context windows, pricing), repairs a
-                stale selected model and heals chats. Nothing is fetched automatically while you edit —
-                run it after changing the base URL or credential.
+              <div className="models-catalog-card">
+                <div className="models-catalog-row">
+                  <button type="button" className={`fetch-models-btn${fetching ? ' busy' : ''}`} disabled={fetching} onClick={() => void fetchModelsNow()}>
+                    <svg className={`fetch-models-icon${fetching ? ' spin' : ''}`} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+                    {fetching ? 'Fetching…' : 'Fetch models'}
+                  </button>
+                  {fetchMsg ? (
+                    <span className={`fetch-models-status${/fail|error|not|no /i.test(fetchMsg) ? ' fail' : ' ok'}`}>{fetchMsg}</span>
+                  ) : (
+                    <span className="fetch-models-count">{(active.models?.length ?? 0) > 0 ? `${active.models!.length} models` : 'No models yet'}</span>
+                  )}
+                </div>
+                <div className="hint">
+                  Pulls the live /models list for this provider (ids, context windows, pricing), repairs a
+                  stale selected model and heals chats. Nothing is fetched automatically while you edit —
+                  run it after changing the base URL or credential.
+                </div>
               </div>
             </div>
 

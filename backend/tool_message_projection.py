@@ -66,6 +66,36 @@ def _omit_overlapping_rows(content: str, shown: dict[str, dict[int, str]]) -> st
     return _READ_BLOCK_RE.sub(_sub, content)
 
 
+def stable_tool_order(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """Stable order of tool messages for prompt caching.
+
+    Single source of truth for both the main-agent loop (graph.py) and the
+    sub-agent loop (llm.py): only consecutive ``ToolMessage`` runs are
+    sorted by ``tool_call_id`` so parallel-execution permutations do not
+    break the prompt-cache prefix. All other messages keep their order.
+    """
+    out: list[BaseMessage] = []
+    run: list[BaseMessage] = []
+
+    def _flush() -> None:
+        if len(run) > 1:
+            try:
+                run.sort(key=lambda m: str(getattr(m, "tool_call_id", "") or ""))
+            except Exception:  # noqa: BLE001, S110 — best-effort ordering
+                pass
+        out.extend(run)
+        run.clear()
+
+    for m in messages or []:
+        if isinstance(m, ToolMessage):
+            run.append(m)
+            continue
+        _flush()
+        out.append(m)
+    _flush()
+    return out
+
+
 def project_tool_results(
     messages: Sequence[BaseMessage],
     *,

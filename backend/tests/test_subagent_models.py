@@ -154,7 +154,7 @@ def test_cross_provider_routing():
         lookup,
     )
     assert t is not None
-    kind, model, base_url, api_key, _, _ = t
+    kind, model, base_url, api_key = t[0], t[1], t[2], t[3]
     assert kind == "local"
     assert model == "gemma-4-E2B-it-Q4_K_M.gguf"
     assert base_url == "http://localhost:1234/v1"

@@ -51,7 +51,9 @@ EXPLORE_SYSTEM = (
     "→ pattern + patterns=[...] (filters via include + includes=[...]).\n"
     "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, …) — "
     "grep first, then read ONLY the needed windows in ONE call via ranges=[...]. "
-    "NEVER re-read the same path:window twice — reuse the earlier result.\n"
+    "NEVER re-read the same path:window twice — reuse the earlier result. "
+    "If you already read a window single, do NOT re-issue it inside a batch "
+    "(or vice versa); use the result you have.\n"
     "5. External docs: web_search + fetch_url only when the answer needs them.\n"
     "Do NOT create/modify files. Do NOT run mutating bash. Avoid emojis.\n\n"
     # Progressive batching (mirrors _SEARCH_RULE so explore also batches):

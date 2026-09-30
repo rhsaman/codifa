@@ -156,7 +156,7 @@ def test_subagent_target_saved_row_returns_row_id():
         provider_lookup=lambda pid: row if pid == "my-or" else None,
     )
     assert t is not None
-    assert len(t) == 6
+    assert len(t) == 7
     assert t[0] == "openrouter"
     assert t[5] == "my-or"
 

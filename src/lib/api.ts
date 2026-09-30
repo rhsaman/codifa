@@ -102,12 +102,19 @@ export interface ModelsResult {
   reasoning: Record<string, boolean>
 }
 
+/** Ordered keys for a provider (top = tried first). Sent as api_keys. */
+export function providerKeys(cfg: Pick<ProviderConfig, 'apiKeys'> & { apiKey?: string }): string[] {
+  const raw = Array.isArray(cfg.apiKeys) ? cfg.apiKeys : []
+  const out = raw.filter((k): k is string => typeof k === 'string' && k.trim() !== '')
+  if (out.length === 0 && typeof cfg.apiKey === 'string' && cfg.apiKey.trim() !== '') out.push(cfg.apiKey)
+  return out
+}
+
 /** Remote STT provider details forwarded to POST /transcribe. Omit for local Whisper. */
 export interface TranscribeProviderOpts {
   kind: string
   baseUrl: string
-  apiKey?: string
-  envVar?: string
+  apiKeys?: string[]
   model?: string
 }
 
@@ -115,8 +122,7 @@ export interface TranscribeProviderOpts {
 export interface SpeakProviderOpts {
   kind: string
   baseUrl: string
-  apiKey?: string
-  envVar?: string
+  apiKeys?: string[]
   model?: string
   voice?: string
 }
@@ -159,8 +165,8 @@ export async function speakTextStream(
   }
   if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
   if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
-  if (opts.apiKey) body.api_key = opts.apiKey
-  if (opts.envVar) body.env_var = opts.envVar
+  const speakKeys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
+  if (speakKeys.length > 0) body.api_keys = JSON.stringify(speakKeys)
   const timeoutSignal = AbortSignal.timeout(120_000)
   const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
   const signal =
@@ -293,8 +299,8 @@ export async function transcribeAudio(
   if (opts) {
     form.append('provider', opts.kind)
     form.append('base_url', opts.baseUrl)
-    if (opts.apiKey) form.append('api_key', opts.apiKey)
-    if (opts.envVar) form.append('env_var', opts.envVar)
+    const sttKeys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
+    if (sttKeys.length > 0) form.append('api_keys', JSON.stringify(sttKeys))
     if (opts.model) form.append('model', opts.model)
   }
   if (onModelLoading) onModelLoading(true)
@@ -357,9 +363,8 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
   const params = new URLSearchParams({
     provider: cfg.kind,
     base_url: cfg.baseUrl,
-    api_key: cfg.apiKey,
+    api_keys: JSON.stringify(providerKeys(cfg)),
   })
-  if (cfg.envVar) params.set('env_var', cfg.envVar)
   const p = (async () => {
     const res = await fetch(`${url}/models?${params}`, { signal: AbortSignal.timeout(90_000) })
     if (!res.ok) {
@@ -406,13 +411,12 @@ export interface ModelTestResult { ok: boolean; reply: string }
 export async function testModel(cfg: ProviderConfig, model: string): Promise<ModelTestResult> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
-  const body: Record<string, string> = {
+  const body: Record<string, unknown> = {
     provider: cfg.kind,
     base_url: cfg.baseUrl ?? '',
-    api_key: cfg.apiKey ?? '',
+    api_keys: providerKeys(cfg),
     model,
   }
-  if (cfg.envVar) body.env_var = cfg.envVar
   const res = await fetch(`${url}/models/test`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -432,8 +436,7 @@ function providerRequestKey(cfg: ProviderConfig): string {
     cfg.id,
     cfg.kind,
     cfg.baseUrl ?? "",
-    cfg.apiKey ?? "",
-    cfg.envVar ?? "",
+    providerKeys(cfg).join(','),
   ].join("|")
 }
 
@@ -457,9 +460,8 @@ export async function fetchCredits(cfg: ProviderConfig): Promise<Partial<Credits
   const params = new URLSearchParams({
     provider: cfg.kind,
     base_url: cfg.baseUrl,
-    api_key: cfg.apiKey,
+    api_keys: JSON.stringify(providerKeys(cfg)),
   })
-  if (cfg.envVar) params.set('env_var', cfg.envVar)
   const p = (async () => {
     try {
       const res = await fetch(`${url}/credits?${params}`, { signal: AbortSignal.timeout(15_000) })
@@ -648,8 +650,7 @@ export async function streamChat(
           // provider even when several providers share the same kind.
           provider: params.provider.kind,
           provider_id: params.provider.id,
-          api_key: params.provider.apiKey,
-          env_var: params.provider.envVar ?? '',
+          api_keys: providerKeys(params.provider),
           base_url: params.provider.baseUrl,
           model: params.provider.model,
           root: params.root,
@@ -778,8 +779,7 @@ export interface CompactProvider {
   kind: string
   model: string
   baseUrl: string
-  apiKey: string
-  envVar?: string
+  apiKeys: string[]
   /** User-configured provider id — usage attribution groups by this, not kind. */
   id?: string
 }
@@ -841,14 +841,12 @@ export async function triggerCompact(params: {
       provider: params.provider.kind,
       model: params.provider.model,
       base_url: params.provider.baseUrl,
-      api_key: params.provider.apiKey,
-      env_var: params.provider.envVar ?? '',
+      api_keys: params.provider.apiKeys,
       provider_id: params.provider.id ?? '',
       fallback_provider: params.fallback.kind,
       fallback_model: params.fallback.model,
       fallback_base_url: params.fallback.baseUrl,
-      fallback_api_key: params.fallback.apiKey,
-      fallback_env_var: params.fallback.envVar ?? '',
+      fallback_api_keys: params.fallback.apiKeys,
       fallback_provider_id: params.fallback.id ?? '',
       history: params.history,
       context_window: params.contextWindow ?? 0,

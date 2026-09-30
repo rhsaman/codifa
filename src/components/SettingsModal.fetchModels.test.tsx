@@ -52,7 +52,7 @@ useStore.setState({
         id: 'fetch-btn',
         name: 'FetchBtn',
         kind: 'custom',
-        apiKey: 'k',
+        apiKeys: ['k'],
         baseUrl: 'https://a/v1',
         model: 'old',
         pricingMap: {},
@@ -114,7 +114,7 @@ console.log('۲) fetchProviderModels — یک درخواست + پیام نتیج
   const msgs: string[] = []
   let refreshed = 0
   await fetchProviderModels(
-    { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKey: 'k', baseUrl: 'https://a/v1', model: 'old' } as any,
+    { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKeys: ['k'], baseUrl: 'https://a/v1', model: 'old' } as any,
     {
       setFetching: (b) => busy.push(b),
       setMsg: (m) => msgs.push(m),
@@ -131,7 +131,7 @@ console.log('۲) fetchProviderModels — یک درخواست + پیام نتیج
   // skip: بدون base URL هیچ درخواستی نمی‌رود و پیام دلیل skip داده می‌شود.
   modelsCalls = 0
   await fetchProviderModels(
-    { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKey: '', baseUrl: '', model: '' } as any,
+    { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKeys: [], baseUrl: '', model: '' } as any,
     {
       setFetching: () => {},
       setMsg: (m) => msgs.push(m),
@@ -149,7 +149,7 @@ console.log('۲) fetchProviderModels — یک درخواست + پیام نتیج
   try {
     await fetchProviderModels(
       // baseUrl متفاوت تا کش dedup درخواست‌های همزمان، سناریو را جواب ندهد.
-      { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKey: 'k', baseUrl: 'https://b/v1', model: 'old' } as any,
+      { id: 'fetch-btn', name: 'FetchBtn', kind: 'custom', apiKeys: ['k'], baseUrl: 'https://b/v1', model: 'old' } as any,
       {
         setFetching: () => {},
         setMsg: (m) => msgs.push(m),

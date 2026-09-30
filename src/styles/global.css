@@ -67,6 +67,7 @@
   --z-reading-mode: 90;
   --z-review-overlay: 95;
   --z-ws-menu: 110;
+  --z-usage-popover: 96;
 
   /* ── layout tokens ──────────────────────────────────────────────────── */
   --titlebar-h: 38px;
@@ -1613,7 +1614,7 @@ textarea {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  z-index: var(--z-popover);
+  z-index: var(--z-usage-popover);
   min-width: 320px;
   max-width: 400px;
   max-height: min(60vh, 440px);
@@ -6281,6 +6282,247 @@ textarea {
   margin-top: 8px;
 }
 
+/* ── API key list (provider settings, 9router-style fallback) ──────────────
+   One bordered card per key: order badge + input + grouped icon actions.
+   The add-row is dashed so it reads as "new", not saved. */
+.api-key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 6px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.api-key-row:hover {
+  border-color: color-mix(in srgb, var(--border) 55%, var(--accent) 45%);
+}
+
+.api-key-row:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.api-key-row.add {
+  background: transparent;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--text) 26%, transparent);
+}
+
+.api-key-row.add:focus-within {
+  border-color: var(--accent);
+  border-style: solid;
+}
+
+.api-key-order {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.api-key-order.new {
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.api-key-row .api-key-input {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+}
+
+.api-key-row .api-key-input:focus {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.api-key-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.api-key-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 3px;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.api-key-actions .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.api-key-actions .icon-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.api-key-actions .icon-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.api-key-actions .icon-btn.on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.api-key-actions .icon-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+
+.api-key-actions .btn.tiny.primary {
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* ── Models catalog card (provider settings) ───────────────────────────────
+   A bordered card grouping the fetch action + live status, matching the
+   settings-group language (border + hover lift, no floating pill). */
+.models-catalog-card {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.models-catalog-card:hover {
+  border-color: color-mix(in srgb, var(--border) 60%, var(--accent) 40%);
+}
+
+.models-catalog-card .hint {
+  margin: 0;
+}
+
+.models-catalog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.fetch-models-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 15px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.fetch-models-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+}
+
+.fetch-models-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.fetch-models-btn:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.fetch-models-btn.busy {
+  cursor: wait;
+}
+
+.fetch-models-icon.spin {
+  animation: fetch-models-spin 0.9s linear infinite;
+}
+
+@keyframes fetch-models-spin {
+  to { transform: rotate(360deg); }
+}
+
+.fetch-models-status {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.fetch-models-status.ok {
+  color: var(--success);
+}
+
+.fetch-models-status.fail {
+  color: var(--danger);
+}
+
+.fetch-models-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.api-key-actions .btn.tiny.primary:disabled {
+  opacity: 0.4;
+}
+
 /* ردیف «افزودن مدل دستی»: input + دکمه Add در یک خط */
 .manual-model-row {
   display: flex;
@@ -9353,6 +9595,12 @@ textarea {
   background: none;
 }
 
+/* ریشه‌ی واکنش‌گرای دیف: عرض کانتینر را برای سوییچ تک/دوستونی می‌سنجد. */
+.diff-responsive {
+  width: 100%;
+  min-width: 0;
+}
+
 .diff-columns {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -9363,6 +9611,11 @@ textarea {
      والد (.review-diff) هیچ overflow نمی‌دید — پس ستون After غیرقابل
      دسترس می‌ماند. auto اجازهٔ اسکرول افقی کل ناحیهٔ دیف را می‌دهد. */
   overflow: auto;
+}
+
+/* در عرض کم، ستون‌ها زیر هم می‌افتند (سقوط به تک‌ستون). */
+.diff-responsive[data-layout="unified"] .diff-columns {
+  grid-template-columns: 1fr;
 }
 
 /* جداکنندهٔ «N unmodified lines» بین دو هانک (سبک کدکس). */
@@ -9378,13 +9631,28 @@ textarea {
 }
 
 /* یک هانک = دو ستون before|after کنار هم در گرید پنل Review.
-   هر ستون حداقل نصف پهنای کانتینر را می‌گیرد تا ستون After زیر Before
-   نرود و با اسکرول افقی والد دیده شود. */
+   در حالت دوستونی هر ستون حداقل نصف پهنای کانتینر را می‌گیرد تا ستون
+   After زیر Before نرود و با اسکرول افقی والد دیده شود؛ در حالت تک‌ستونی
+   (عرض کم) ستون‌ها زیر هم می‌افتند. */
 .diff-hunk-pair {
   grid-column: 1 / -1;
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
   min-width: max-content;
+}
+
+.diff-responsive[data-layout="unified"] .diff-hunk-pair {
+  grid-template-columns: 1fr;
+  min-width: 0;
+}
+
+.diff-responsive[data-layout="unified"] .diff-columns {
+  min-width: 0;
+}
+
+.diff-line-empty {
+  background: transparent;
+  opacity: 0.35;
 }
 
 .diff-col {
@@ -14815,7 +15083,6 @@ mark.diff-hit-active {
   border: 0;
   border-bottom: 1px solid var(--hairline);
   color: var(--text-dim);
-  cursor: pointer;
   text-align: left;
   font-size: 11px;
   font-weight: 700;
@@ -14825,6 +15092,27 @@ mark.diff-hit-active {
 
 .trace-panel-step-head:hover {
   color: var(--text);
+}
+
+.trace-panel-step-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+
+.trace-panel-step-head .trace-copy-btn {
+  flex: 0 0 auto;
 }
 
 .trace-panel-step-chev {
@@ -14849,6 +15137,25 @@ mark.diff-hit-active {
 .trace-panel-step-rows {
   display: flex;
   flex-direction: column;
+}
+
+.trace-jump-latest {
+  position: absolute;
+  bottom: 14px;
+  inset-inline-end: 20px;
+  z-index: 5;
+  padding: 6px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--hairline);
+  background: var(--bg-alt, #0d1117);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.trace-jump-latest:hover {
+  border-color: var(--accent);
 }
 
 .trace-panel-item {

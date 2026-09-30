@@ -170,7 +170,7 @@ def test_prefer_tree_over_see_gate(monkeypatch):
     monkeypatch.setattr(cu, "LAYA_SEE_GATE_ENABLED", True)
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: laya_decide.LayaDecision(
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: laya_decide.LayaDecision(
             handled=True, kind="choice", value="prefer_tree", confidence=0.9,
             abstained=False, reason="local-decision",
         ),
@@ -187,7 +187,7 @@ def test_laya_distill_choice_gate(monkeypatch):
 
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="": laya_decide.LayaDecision(
+        lambda state, options, threshold=0.65, provider_id="", **_kw: laya_decide.LayaDecision(
             handled=True, kind="choice", value="raw", confidence=0.9,
             abstained=False, reason="local-decision",
         ),
@@ -196,7 +196,7 @@ def test_laya_distill_choice_gate(monkeypatch):
     # ورودی طول کل نتایج را هم به laya می‌دهد تا با دید کامل تصمیم بگیرد
     seen: dict = {}
 
-    def _spy(state, options, threshold=0.65, provider_id=""):
+    def _spy(state, options, threshold=0.65, provider_id="", **_kw):
         seen.update(state)
         return laya_decide.LayaDecision(
             handled=True, kind="choice", value="distill", confidence=0.9,
@@ -209,7 +209,7 @@ def test_laya_distill_choice_gate(monkeypatch):
     # واگذاری (اطمینان پایین) → None یعنی رفتار قبلی
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="": laya_decide.LayaDecision(
+        lambda state, options, threshold=0.65, provider_id="", **_kw: laya_decide.LayaDecision(
             handled=False, kind="choice", value="raw", confidence=0.2,
             abstained=False, reason="low-confidence:0.20",
         ),

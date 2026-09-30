@@ -28,22 +28,28 @@ export interface ReviewFileItem {
 
 interface GitFile extends ReviewFileItem {}
 
+/** آستانه‌ی پیش‌فرض عرض پنل (پیکسل) برای نمایش دوستونی دیف. */
+export const REVIEW_SIDE_BY_SIDE_THRESHOLD = 640;
+
 /** آکاردئون خالص لیست فایل‌ها: هر ردیف فایل، دیف خودش را دقیقاً زیر همان
  *  ردیف باز می‌کند. بدون وابستگی به استور تا در SSR هم قابل تست باشد؛
  *  `selectedPath` خالی یعنی همه بسته. `query` رخدادهای جست‌وجو را هایلایت می‌کند
- *  و `activeHit` ایندکس محلی رخداد فعال داخل فایل باز است. */
+ *  و `activeHit` ایندکس محلی رخداد فعال داخل فایل باز است.
+ *  `wide` وقتی پنل پهن (یا فول‌اسکرین) است دیف را دوستونی می‌کند. */
 export function ReviewFileAccordion({
   files,
   selectedPath,
   onSelect,
   query = "",
   activeHit = -1,
+  wide = false,
 }: {
   files: ReviewFileItem[];
   selectedPath: string;
   onSelect: (path: string) => void;
   query?: string;
   activeHit?: number;
+  wide?: boolean;
 }) {
   return (
     <div className="review-files">
@@ -77,6 +83,7 @@ export function ReviewFileAccordion({
                     path={f.path}
                     query={query}
                     activeHit={activeHit}
+                    layout={wide ? "side-by-side" : "auto"}
                   />
                 ) : (
                   <div className="review-empty">
@@ -354,6 +361,7 @@ export function ReviewPanel() {
   // می‌بندد؛ فقط یک فایل هم‌زمان باز می‌ماند (`selectedPath`).
   // `query` لیست را به فایل‌های منطبق فیلتر می‌کند و رخدادها را هایلایت می‌کند؛
   // رخداد فعال فقط داخل فایل باز هایلایت متمایز می‌گیرد.
+  const wide = fullscreen || width >= REVIEW_SIDE_BY_SIDE_THRESHOLD;
   const renderFileList = (list: GitFile[]) => {
     const openIdx = list.findIndex((f) => f.path === (selected?.path ?? ""));
     const openLocal =
@@ -367,6 +375,7 @@ export function ReviewPanel() {
         onSelect={selectPath}
         query={query}
         activeHit={openLocal}
+        wide={wide}
       />
     );
   };

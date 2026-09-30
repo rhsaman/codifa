@@ -53,7 +53,10 @@ from providers import (
     qualify_model_id,
 )
 from tool_batching import execute_readonly_calls
-from tool_message_projection import project_tool_results
+from tool_message_projection import project_tool_results, stable_tool_order
+
+# Alias kept for existing call sites; logic lives in tool_message_projection.
+_stable_tool_order = stable_tool_order
 
 # _strip_think_tags و _is_repeating از _common import می‌شوند (single source of truth).
 
@@ -163,13 +166,42 @@ class ProviderError(RuntimeError):
     """Raised when a provider configuration is unusable (no key, no model)."""
 
 
+def resolve_keys(
+    provider: str = "",
+    api_key: str = "",
+    env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
+) -> list[str]:
+    """Ordered API keys for a provider, top = tried first.
+
+    Accepts the new ``api_keys`` list plus the legacy single ``api_key`` /
+    ``env_var`` shapes so old settings keep working; env chain is kept as a
+    last-resort fallback only.
+    """
+    out: list[str] = []
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    for k in list(api_keys or []):
+        if isinstance(k, str) and k.strip() and k.strip() not in out:
+            out.append(k.strip())
+    if isinstance(api_key, str) and api_key.strip() and api_key.strip() not in out:
+        out.append(api_key.strip())
+    if not out:
+        env = env_key(provider=provider, env_var=env_var or "")
+        if env and env not in out:
+            out.append(env)
+    return out
+
+
 def resolve_key(
     provider: str,
     api_key: str,
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> str:
-    """Resolve the effective credential (api_key > env chain)."""
-    return api_key or env_key(provider=provider, env_var=env_var) or ""
+    """Resolve the effective credential (first of ``resolve_keys``)."""
+    keys = resolve_keys(provider, api_key, env_var, api_keys)
+    return keys[0] if keys else ""
 
 
 def _extra_headers(
@@ -232,12 +264,67 @@ def _is_anthropic_model(model: str) -> bool:
     return m.startswith(("anthropic/", "claude"))
 
 
+def _is_key_error(exc: Exception) -> bool:
+    """True when the failure looks like a bad/expired/over-quota key.
+
+    Only these errors are worth retrying with the NEXT key in the list
+    (top-to-bottom fallback). Anything else (bad model, bad URL, context
+    overflow) would fail identically on every key, so it surfaces at once.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    if status is None:
+        m = re.search(r"(?:error\s+code|status_code|code)[:=\s]+(\d{3})", str(exc))
+        if m:
+            try:
+                status = int(m.group(1))
+            except (TypeError, ValueError):
+                status = None
+    if status in (401, 403, 429):
+        return True
+    low = str(exc).lower()
+    # Never treat context overflow as a key error, even when the message
+    # happens to contain a generic word like "insufficient" or "expired".
+    if any(
+        w in low
+        for w in (
+            "context length",
+            "context_length",
+            "context window",
+            "context_window",
+            "max tokens",
+            "max_tokens",
+            "too many tokens",
+            "token limit",
+        )
+    ):
+        return False
+    return any(
+        w in low
+        for w in (
+            "invalid api key",
+            "invalid_api_key",
+            "incorrect api key",
+            "invalid key",
+            "unauthorized",
+            "rate limit",
+            "rate_limit",
+            "quota",
+            "quota_exceeded",
+            "resource exhausted",
+        )
+    )
+
+
 def build_chat_model(
     provider: str,
     model: str,
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
     *,
     temperature: float = 0.0,
     max_tokens: int = 0,
@@ -264,12 +351,12 @@ def build_chat_model(
         raise ProviderError("no model selected")
     meta = _provider_meta(provider)
     model = qualify_model_id(provider, model)
-    key = resolve_key(provider, api_key, env_var)
+    keys = resolve_keys(provider, api_key, env_var, api_keys)
+    key = keys[0] if keys else ""
     if meta.get("requires_key") and not key:
         raise ProviderError(
             f"No {meta.get('name', provider)} credential configured. Open Settings "
-            f"→ Providers → {meta.get('name', provider)} and set an API key / "
-            "environment variable."
+            f"→ Providers → {meta.get('name', provider)} and add an API key."
         )
 
     model_class = meta.get("model_class") or "openai"
@@ -313,6 +400,21 @@ def build_chat_model(
         tkwargs["stream_options"] = {"include_usage": True}
     base = normalize_base_url(provider, base_url)
 
+    # Fallback keys (9router-style): tried top-to-bottom on key errors.
+    # Stamped on the model so the runner can rebuild with the next key.
+    extra_keys = keys[1:] if len(keys) > 1 else []
+    _bk: dict[str, Any] = {
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "thinking_level": thinking_level,
+        "model_reasoning": model_reasoning,
+        "timeout": timeout,
+        "cache": cache,
+        "session_id": session_id,
+        "provider_id": provider_id,
+        "parallel_tool_calls": parallel_tool_calls,
+        "env_var": env_var,
+    }
     if model_class == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -330,7 +432,7 @@ def build_chat_model(
             "max": 32768,
         }
         thinking_budget = google_thinking.get((thinking_level or "").strip())
-        return _stamp_provider(
+        m = _stamp_provider(
             ChatGoogleGenerativeAI(
                 model=model.removeprefix("models/") or model,
                 google_api_key=key or None,
@@ -343,6 +445,7 @@ def build_chat_model(
             provider,
             provider_id,
         )
+        return _stamp_key_fallback(m, provider, model, base_url, keys, extra_keys, _bk)
 
     if model_class == "anthropic":
         from langchain_anthropic import ChatAnthropic
@@ -360,7 +463,7 @@ def build_chat_model(
         _anthropic_cache_kwargs: dict[str, Any] = {}
         if cache:
             _anthropic_cache_kwargs["cache_control"] = {"type": "ephemeral"}
-        return _stamp_provider(
+        m = _stamp_provider(
             ChatAnthropic(
                 model=model,
                 api_key=key or None,
@@ -375,6 +478,7 @@ def build_chat_model(
             provider,
             provider_id,
         )
+        return _stamp_key_fallback(m, provider, model, base_url, keys, extra_keys, _bk)
 
     # stream_chunk_timeout: maximum seconds between two consecutive streaming
     # chunks.  The default in langchain_openai is 120 s, which is too aggressive
@@ -409,7 +513,123 @@ def build_chat_model(
         lc_kwargs["extra_body"] = {"cache_control": {"type": "ephemeral"}}
     # Use the reasoning-normalizing subclass so gateways that stream thinking
     # under delta.reasoning (opencode) don't leak it into the visible content.
-    return _stamp_provider(ReasoningChatOpenAI(**lc_kwargs), provider, provider_id)
+    m = _stamp_provider(ReasoningChatOpenAI(**lc_kwargs), provider, provider_id)
+    return _stamp_key_fallback(m, provider, model, base_url, keys, extra_keys, _bk)
+
+
+def _stamp_key_fallback(
+    m: Any,
+    provider: str,
+    model: str,
+    base_url: str,
+    keys: list[str],
+    extra_keys: list[str],
+    build_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    """Stamp the ordered key list on a built model for top-down fallback.
+
+    ``build_kwargs`` carries the exact ``build_chat_model`` kwargs
+    (temperature, timeout, thinking_level, ...) so
+    :func:`_clone_model_with_key` can rebuild a fresh model with the next
+    key instead of ``model_copy``-ing the old HTTP client.
+    """
+    try:
+        object.__setattr__(m, "_codifa_api_keys", list(keys or []))
+        object.__setattr__(m, "_codifa_api_keys_rest", list(extra_keys or []))
+        object.__setattr__(m, "_codifa_provider_name", provider)
+        object.__setattr__(m, "_codifa_model_name", model)
+        object.__setattr__(m, "_codifa_base_url", base_url)
+        if build_kwargs is not None:
+            object.__setattr__(m, "_codifa_build_kwargs", dict(build_kwargs))
+    except Exception:  # noqa: BLE001, S110 — attribution must never break a build
+        pass
+    return m
+
+
+def model_key_fallback(model: Any) -> tuple[list[str], list[str]]:
+    """(all keys, remaining keys) stamped by ``build_chat_model``."""
+    try:
+        all_keys = list(getattr(model, "_codifa_api_keys", None) or [])
+        rest = list(getattr(model, "_codifa_api_keys_rest", None) or [])
+        return all_keys, rest
+    except Exception:  # noqa: BLE001
+        return [], []
+
+
+def _clone_model_with_key(model: Any, new_key: str) -> Any:
+    """Return a model authenticated with ``new_key``.
+
+    Rebuilds via :func:`build_chat_model` from the stamped provider/model/
+    base_url/build-kwargs so langchain-openai creates a FRESH HTTP client.
+    ``model_copy`` + field assignment is not enough: with langchain-openai
+    1.6.0 the underlying ``async_client`` is shared and keeps sending the
+    old key. Falls back to the old copy + client-cache reset when the
+    stamp is missing (legacy/test models) so fallback never breaks a turn.
+    """
+    try:
+        provider = str(getattr(model, "_codifa_provider_name", "") or "")
+        model_name = str(getattr(model, "_codifa_model_name", "") or "")
+        base_url = str(getattr(model, "_codifa_base_url", "") or "")
+        rest = list(getattr(model, "_codifa_api_keys_rest", None) or [])
+        bk = dict(getattr(model, "_codifa_build_kwargs", None) or {})
+        if provider and model_name:
+            remaining = rest[1:] if rest and rest[0] == new_key else list(rest)
+            try:
+                return build_chat_model(
+                    provider,
+                    model_name,
+                    base_url,
+                    "",
+                    bk.get("env_var", ""),
+                    [new_key, *remaining] if new_key else list(remaining),
+                    temperature=float(bk.get("temperature", 0.0) or 0.0),
+                    max_tokens=int(bk.get("max_tokens", 0) or 0),
+                    thinking_level=str(bk.get("thinking_level", "") or ""),
+                    model_reasoning=bool(bk.get("model_reasoning", False)),
+                    timeout=float(bk.get("timeout", 0) or 0),
+                    cache=bool(bk.get("cache", False)),
+                    session_id=str(bk.get("session_id", "") or ""),
+                    provider_id=str(bk.get("provider_id", "") or ""),
+                    parallel_tool_calls=bool(bk.get("parallel_tool_calls", False)),
+                )
+            except Exception:  # noqa: BLE001, S110 — fall through to copy fallback
+                pass
+    except Exception:  # noqa: BLE001, S110 — stamp read must never break fallback
+        pass
+    try:
+        clone = model.model_copy(deep=False)
+    except Exception:  # noqa: BLE001
+        return model
+    try:
+        if hasattr(clone, "openai_api_key"):
+            clone.openai_api_key = new_key or "sk-noauth"
+        if hasattr(clone, "api_key"):
+            try:
+                clone.api_key = new_key or None
+            except Exception:  # noqa: BLE001, S110
+                pass
+        if hasattr(clone, "google_api_key"):
+            try:
+                clone.google_api_key = new_key or None
+            except Exception:  # noqa: BLE001, S110
+                pass
+        # Force langchain to drop the shared HTTP client carrying the old key.
+        for _attr in ("client", "async_client", "_client", "_async_client"):
+            try:
+                if hasattr(clone, _attr):
+                    object.__setattr__(clone, _attr, None)
+            except Exception:  # noqa: BLE001, S110
+                pass
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        rest = list(getattr(clone, "_codifa_api_keys_rest", None) or [])
+        if rest and rest[0] == new_key:
+            rest = rest[1:]
+        object.__setattr__(clone, "_codifa_api_keys_rest", rest)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return clone
 
 
 def _stamp_provider(m: Any, kind: str, pid: str) -> Any:
@@ -443,7 +663,12 @@ def bind_tools_parallel(model: Any, lc_tools: list, enabled: bool = True) -> Any
     N full-context round trips."""
     kind, _ = model_provider(model)
     if enabled and kind and _provider_meta(kind).get("parallel_calls"):
-        return model.bind_tools(lc_tools, parallel_tool_calls=True)
+        try:
+            return model.bind_tools(lc_tools, parallel_tool_calls=True)
+        except TypeError:
+            # مدل‌هایی که پارامتر parallel_tool_calls را نمی‌شناسند (مثل ماک‌های تست
+            # یا نسخه‌های قدیمی لن‌گ‌چین) — بدون آن ادامه می‌دهیم.
+            return model.bind_tools(lc_tools)
     return model.bind_tools(lc_tools)
 
 
@@ -805,6 +1030,7 @@ async def chat_model_settings(
     api_key: str,
     env_var: str = "",
     scope: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> dict[str, Any]:
     """Compute LangChain-compatible model kwargs from mode + context window.
 
@@ -820,7 +1046,7 @@ async def chat_model_settings(
         from providers import model_max_output
 
         max_output = await model_max_output(
-            provider, model_name, base_url, api_key, env_var
+            provider, model_name, base_url, api_key, env_var, api_keys
         )
     except Exception:  # noqa: BLE001
         max_output = 0
@@ -923,6 +1149,13 @@ async def llm_generate(
         # Some local servers reject `stream_options`; retry once without it.
         if _is_stream_options_error(exc):
             model = _strip_stream_options(model)
+            res = await model.ainvoke(msgs)
+        elif _is_key_error(exc):
+            # 9router-style fallback: retry the same prompt with the next key.
+            _, rest = model_key_fallback(model)
+            if not rest:
+                raise
+            model = _clone_model_with_key(model, rest[0])
             res = await model.ainvoke(msgs)
         else:
             try:
@@ -1374,22 +1607,21 @@ _BATCHABLE_TOOLS = {"grep", "glob", "read"}
 def _batch_rest(name: str, args: dict) -> dict:
     """Non-primary args that must match for two calls to merge into one.
 
-    For grep/glob, the scan scope (``path``) may DIFFER — a merge via
-    ``paths=[...]`` scans several scopes in one call — and the file filter
-    (``include``) may differ too — a merge via ``includes=[...]`` scans
-    several filters in one call. For read, ``offset``/``limit`` are per-file
-    windows — a batch expresses differing windows via
-    ``ranges=['path:offset:limit', ...]`` — so they are excluded and reads
-    with different windows still merge, even two windows on the SAME file.
+    For read, ``offset``/``limit`` are per-file windows — a batch expresses
+    differing windows via ``ranges=['path:offset:limit', ...]`` — so they
+    are excluded and reads with different windows still merge, even two
+    windows on the SAME file. For grep/glob the scope (``path``) and file
+    filter (``include``) must be IDENTICAL: merging ``foo@src`` +
+    ``bar@backend`` into ``foo|bar`` over both scopes is a Cartesian
+    expansion that changes semantics and returns more tokens, so such
+    calls are intentionally NOT mergeable — the model should fire them
+    as parallel calls in ONE step instead (still one round-trip).
     """
     primary = "filePath" if name == "read" else "pattern"
     rest = {k: v for k, v in args.items() if k != primary}
     if name == "read":
         rest.pop("offset", None)
         rest.pop("limit", None)
-    else:
-        rest.pop("path", None)  # scope merges via paths=[...]
-        rest.pop("include", None)  # file filter merges via includes=[...]
     return rest
 
 
@@ -1429,8 +1661,10 @@ def _batch_example(name: str, calls: list[dict]) -> str:
             + ", ".join(repr(f"{p}:{o}:{l}") for p, o, l in windows)
             + "])"
         )
-    # grep / glob — scope (path) and file filter (include) may differ; merge
-    # via paths=[...] / includes=[...].
+    # grep / glob — scope (path) and file filter (include) are identical
+    # here (enforced by _batch_rest), so the example keeps that scope and
+    # only merges the patterns. Different scopes must stay parallel calls
+    # in one step, never a Cartesian paths=/includes= merge.
     scopes = [str(c.get("path") or "") for c in calls]
     includes = [str(c.get("include") or "") for c in calls]
     primary = "filePath" if name == "read" else "pattern"
@@ -1441,14 +1675,10 @@ def _batch_example(name: str, calls: list[dict]) -> str:
     arg_bits = [f"{primary}={terms[0]!r}"]
     if len(terms) > 1:
         arg_bits.append(f"patterns={terms[1:]!r}")
-    if any(scopes):
+    if scopes[0]:
         arg_bits.append(f"path={scopes[0]!r}")
-        if len(set(scopes)) > 1:
-            arg_bits.append(f"paths={sorted(set(scopes) - {scopes[0]})!r}")
-    if any(includes):
+    if includes[0]:
         arg_bits.append(f"include={includes[0]!r}")
-        if len(set(includes)) > 1:
-            arg_bits.append(f"includes={sorted(set(includes) - {includes[0]})!r}")
     for k, v in extra.items():
         arg_bits.append(f"{k}={v!r}")
     return f"{name}(" + ", ".join(arg_bits) + ")"
@@ -1458,11 +1688,12 @@ def _batchable_nudge(tcs: list) -> str:
     """Return a reminder suffix when a step's tool calls could be merged.
 
     Detects, per batchable tool name, whether ≥2 calls share the same
-    non-batch parameters (path/include for grep/glob; other args except
-    filePath/offset/limit for read) — i.e. they differ only in the primary
+    non-primary parameters — i.e. they differ only in the primary
     argument (pattern / filePath) or the read window (offset/limit) and
     would have been a single call with `patterns=[...]` / `filePaths=[...]` /
-    `ranges=[...]`. Reads with different windows merge via
+    `ranges=[...]`. Grep/glob calls with different path/include are NOT
+    mergeable (Cartesian over-scan); fire those as parallel calls in ONE
+    step instead. Reads with different windows merge via
     `ranges=['path:offset:limit', ...]` — even two windows on the SAME file.
     Calls that ALREADY pass a batch parameter are ignored (the model is
     already batching). Returns "" when nothing is mergeable.
@@ -1495,10 +1726,11 @@ def _batchable_nudge(tcs: list) -> str:
     if not hints:
         return ""
     return (
-        "\n\n💡 BATCHING REMINDER: these calls could have been ONE tool call:\n"
+        "\n\n💡 BATCHING REMINDER: these calls could have been ONE parallel step:\n"
         + "\n".join(f"- {h}" for h in hints)
-        + "\nThose calls already ran — do NOT repeat them. Use this exact "
-        "shape for your NEXT calls to save tokens and round-trips."
+        + "\nThose calls already ran — do NOT repeat them. Fire the remaining "
+        "calls together in ONE step (parallel tool calls, or the merged shape "
+        "above when scopes match) to save round-trips."
     )
 
 
@@ -1509,12 +1741,12 @@ class _BatchStreakTracker:
     calls in ONE step. But most models (especially via gateways where
     ``parallel_tool_calls`` is not sent) emit exactly ONE tool call per step —
     so the per-step detector never fires and the model burns 6+ round-trips
-    on 6 separate reads/greps. This tracker counts PER TOOL (not per scope —
-    the reported regression showed 9 greps with different scopes that never
-    built a streak): when the same batchable tool is called one-at-a-time for
-    ``threshold`` steps in a row, it returns a reminder built from the
-    model's OWN recent calls (a concrete merged-call example) so the model
-    batches the remaining calls.
+    on 6 separate reads/greps. This tracker counts PER TOOL: when the same
+    batchable tool is called one-at-a-time for ``threshold`` steps in a row,
+    it returns a reminder. Same-scope calls get a concrete merged-call
+    example; different-scope grep/glob calls get a parallel-step reminder
+    (a Cartesian paths=/includes= merge would change semantics and cost
+    more tokens).
 
     A batch call resets that tool's streak; steps with no batchable call
     leave streaks intact (real turns interleave reads with searches and
@@ -1577,19 +1809,27 @@ class _BatchStreakTracker:
                 fired.append((name, recent, n))
         if not fired:
             return ""
-        lines = [
-            f"- {_batch_example(name, calls)}"
-            for name, calls, _ in fired
-        ]
+        lines = []
+        for name, calls, _ in fired:
+            rests = [_batch_rest(name, a) for a in calls]
+            if name != "read" and any(r != rests[0] for r in rests[1:]):
+                # Different scopes/filters: a single merged call would be a
+                # Cartesian over-scan. Advise parallel calls in one step.
+                lines.append(
+                    f"- fire remaining {name} calls together in ONE parallel "
+                    "step (same scopes as before, one call per scope/pattern)"
+                )
+            else:
+                lines.append(f"- {_batch_example(name, calls)}")
         return (
             "\n\n💡 BATCHING REMINDER: you have called {tool} one-at-a-time "
-            "{n} times. Batch the remaining calls into ONE tool call:\n".format(
+            "{n} times. Fire the remaining calls together in ONE parallel step:\n".format(
                 tool=" + ".join(name for name, _, _ in fired),
                 n=max(n for _, _, n in fired),
             )
             + "\n".join(lines)
             + "\nThe example is built from calls that ALREADY ran — do NOT "
-            "re-issue them. Use this exact shape for your NEXT calls."
+            "re-issue them. Use parallel calls for your NEXT searches."
         )
 
 
@@ -1682,7 +1922,7 @@ async def langchain_tool_loop(
         # نگهبان نهایی ترنسکریپت (یکتاسازی شناسه‌ها + حذف بی‌جواب‌ها + یک
         # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
         normalize_tool_transcript(msgs, _logger)
-        _req = [*project_tool_results(msgs), *_transient]
+        _req = [*project_tool_results(_stable_tool_order(msgs)), *_transient]
         try:
             ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
         except Exception as _pc_exc:  # noqa: BLE001
@@ -1773,6 +2013,12 @@ async def langchain_tool_loop(
                     len(_dup_ids),
                 )
             tcs = _deduped
+        # Always observe — `or` would short-circuit the tracker whenever the
+        # per-step detector fires, so that step would never be recorded and
+        # the cross-step count would restart from zero.
+        _step_hint = _batchable_nudge(tcs)
+        _streak_hint = _streak.observe(tcs)
+        _batch_hint = _step_hint or _streak_hint
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -1787,18 +2033,6 @@ async def langchain_tool_loop(
             tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
         ]
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
-        # Advisory batching reminder: when this step's calls could have been
-        # merged into one batch call — or the streak tracker sees
-        # one-at-a-time calls across consecutive steps — build the reminder
-        # now. It is delivered AFTER the tool results as a standalone
-        # HumanMessage (below): a suffix buried at the end of a huge result
-        # demonstrably never reached the model.
-        # Always observe — `or` would short-circuit the tracker whenever the
-        # per-step detector fires, so that step would never be recorded and
-        # the cross-step count would restart from zero.
-        _step_hint = _batchable_nudge(tcs)
-        _streak_hint = _streak.observe(tcs)
-        _batch_hint = _step_hint or _streak_hint
         _results = await execute_readonly_calls(_parallel, _exec)
         for tc, result in zip(_parallel, _results):
             append_tool_result(msgs, str(result), tc.get("id", ""))

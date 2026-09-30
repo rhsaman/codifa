@@ -143,9 +143,10 @@ async def test_agent_emits_usage_event_with_true_counts(run_events, mock_server)
     mock.script = [text_reply("تمام شد.")]
     events = await run_events("سلام", mode="ask")
 
-    usage = [e for e in events if e.get("kind") == "usage"]
+    usage = [e for e in events if e.get("kind") == "usage" and not e.get("laya")]
     assert usage, f"no usage event emitted; kinds={[e.get('kind') for e in events]}"
-    # Exactly one model call for a single-turn reply.
+    # Exactly one NON-laya model call for a single-turn reply (laya emits
+    # its own zero-token observability usage event separately).
     assert len(usage) == 1, f"expected 1 usage event, got {len(usage)}"
     ev = usage[0]
     # Recompute the true counts the mock derived from the actual request it

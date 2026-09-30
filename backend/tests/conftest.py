@@ -69,6 +69,43 @@ def _reset_mock(request):
 
 
 @pytest.fixture(autouse=True)
+def _reset_tool_contextvars():
+    """Reset tool ContextVars leaked by sync unit tests.
+
+    ``graph.filter_tools_for_mode`` records the mode-filtered toolset in
+    ``tools._PARENT_TOOLS_CTX`` as a side effect. Sync tests that call it
+    directly (e.g. test_perf_fixes) run in the shared thread context, so the
+    fake ``{"computer": ..., "read": ...}`` dict would otherwise leak into
+    later tests — a general sub-agent would then inherit lambdas instead of
+    real tools and emit no ``sub=True`` read events (test_task_general_agent).
+    Production sets this fresh every turn, so resetting per test is safe.
+    """
+    try:
+        from tools import _PARENT_TOOLS_CTX, _SUB_AGENT_BRANCH_CTX, _TASK_DEPTH_CTX
+    except ImportError:
+        yield
+        return
+    _parent_token = _PARENT_TOOLS_CTX.set(None)
+    _branch_token = _SUB_AGENT_BRANCH_CTX.set(0)
+    _depth_token = _TASK_DEPTH_CTX.set(0)
+    try:
+        yield
+    finally:
+        try:
+            _PARENT_TOOLS_CTX.reset(_parent_token)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            _TASK_DEPTH_CTX.reset(_depth_token)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
+@pytest.fixture(autouse=True)
 def _no_retry(monkeypatch):
     """Disable the OpenAI client's automatic retries so fatal HTTP errors
     (e.g. 500) surface immediately instead of being silently retried and

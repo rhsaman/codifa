@@ -1095,6 +1095,7 @@ async def fetch_credits(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> dict:
     """Fetch the provider account's remaining credit balance.
 
@@ -1104,24 +1105,37 @@ async def fetch_credits(
     if provider != "openrouter":
         return {}
     url = f"{OPENROUTER_BASE}/credits"
-    headers: dict[str, str] = {}
-    key = api_key or env_key(provider, env_var)
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            total = float(data.get("total_credits") or 0)
-            usage = float(data.get("total_usage") or 0)
-            return {
-                "balance": round(total - usage, 6),
-                "total_credits": total,
-                "total_usage": usage,
-            }
-    except Exception as exc:
-        raise ProviderError(f"credits lookup failed: {exc}") from exc
+        from llm import resolve_keys as _resolve_keys
+        keys = _resolve_keys(provider, api_key, env_var, api_keys)
+    except Exception:
+        keys = [k for k in [api_key, env_key(provider, env_var)] if k]
+    if not keys:
+        keys = [""]
+    last_exc: Exception | None = None
+    for key in keys:
+        headers: dict[str, str] = {}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code in (401, 403, 429) and key != keys[-1]:
+                    last_exc = ProviderError(f"credits lookup failed: {resp.status_code}")
+                    continue
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+                total = float(data.get("total_credits") or 0)
+                usage = float(data.get("total_usage") or 0)
+                return {
+                    "balance": round(total - usage, 6),
+                    "total_credits": total,
+                    "total_usage": usage,
+                }
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise ProviderError(f"credits lookup failed: {last_exc}") from last_exc
 
 
 async def list_models(
@@ -1129,6 +1143,7 @@ async def list_models(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> list[dict]:
     """Fetch available models for a provider (cached for 120s).
 
@@ -1149,14 +1164,21 @@ async def list_models(
     if cached and time.monotonic() - cached[0] < _MODEL_CACHE_TTL:
         return cached[1]
 
+    try:
+        from llm import resolve_keys as _resolve_keys2
+        _keys = _resolve_keys2(provider, api_key, env_var, api_keys)
+    except Exception:
+        _keys = [k for k in [api_key, env_key(provider, env_var)] if k]
+    if not _keys:
+        _keys = [""]
     headers = {}
     if provider == "anthropic":
         # Anthropic-native auth: x-api-key header, not Authorization Bearer.
-        key = api_key or env_key(provider, env_var)
+        key = _keys[0]
         headers["x-api-key"] = key
         headers["anthropic-version"] = "2023-06-01"
-    elif api_key or env_key(provider, env_var):
-        headers["Authorization"] = f"Bearer {api_key or env_key(provider, env_var)}"
+    elif _keys[0]:
+        headers["Authorization"] = f"Bearer {_keys[0]}"
 
     timeout = _provider_meta(provider).get("models_timeout") or 10.0
     try:
@@ -1173,6 +1195,18 @@ async def list_models(
                 for ua in UA_LADDER:
                     retry = await client.get(url, headers={**headers, "User-Agent": ua})
                     if getattr(retry, "status_code", None) != 401:
+                        resp = retry
+                        break
+            # Top-down key fallback: a dead first key falls through to the next.
+            if getattr(resp, "status_code", None) in (401, 403, 429) and len(_keys) > 1:
+                for alt in _keys[1:]:
+                    alt_headers = dict(headers)
+                    if provider == "anthropic":
+                        alt_headers["x-api-key"] = alt
+                    elif alt:
+                        alt_headers["Authorization"] = f"Bearer {alt}"
+                    retry = await client.get(url, headers=alt_headers)
+                    if getattr(retry, "status_code", None) not in (401, 403, 429):
                         resp = retry
                         break
             resp.raise_for_status()
@@ -1358,6 +1392,7 @@ async def model_context(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> int:
     """Resolve a specific model's context-window length (tokens).
 
@@ -1384,7 +1419,7 @@ async def model_context(
         return ctx
     try:
         enlisted = await list_models(
-            provider, base_url, api_key, env_var
+            provider, base_url, api_key, env_var, api_keys
         )
         for entry in enlisted:
             if entry.get("id") == model and entry.get("context"):
@@ -1406,6 +1441,7 @@ async def model_max_output(
     base_url: str = "",
     api_key: str = "",
     env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
 ) -> int:
     """Resolve a specific model's max output tokens (best-effort).
 
@@ -1434,7 +1470,7 @@ async def model_max_output(
         return 0
     try:
         enlisted = await list_models(
-            provider, base_url, api_key, env_var
+            provider, base_url, api_key, env_var, api_keys
         )
         for entry in enlisted:
             if entry.get("id") == model and entry.get("max_output"):

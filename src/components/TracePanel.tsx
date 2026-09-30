@@ -40,6 +40,45 @@ export function filterTraces(entries: TraceEntry[], query: string): TraceEntry[]
   });
 }
 
+/** یک ورودی تریس به متن ساده برای کپی — عنوان، متا، پرامپت/نتیجه و جزئیات. خالص برای تست. */
+export function formatTraceEntryAsText(entry: TraceEntry): string {
+  const detail = (entry.detail ?? {}) as Record<string, unknown>;
+  const lines = [`[${timeLabel(entry.at)}] ${entry.kind.toUpperCase()} ${traceRowTitle(entry)}`];
+  const meta: string[] = [];
+  if (typeof entry.turn === "number" && Number.isFinite(entry.turn) && Number(entry.turn) > 0)
+    meta.push(`turn=${Number(entry.turn)}`);
+  if (entry.model) meta.push(`model=${entry.model}`);
+  if (entry.tokens?.total) meta.push(`tokens=${entry.tokens.total}`);
+  if (typeof detail.step === "number") meta.push(`step=${Number(detail.step)}`);
+  const status = String(detail.status || (entry.error ? "error" : "") || "");
+  if (status) meta.push(`status=${status}`);
+  if (meta.length > 0) lines.push(`  ${meta.join(" · ")}`);
+  if (entry.error) lines.push(`  error: ${entry.error}`);
+  if (entry.prompt) lines.push(`  prompt:\n${entry.prompt}`);
+  const result = String((entry as { result?: string }).result || "");
+  if (result) lines.push(`  result:\n${result}`);
+  if (!entry.prompt && !result) lines.push(`  detail: ${JSON.stringify(entry.detail ?? {})}`);
+  return lines.join("\n");
+}
+
+/** کل نمای فعلی (فیلترشده با تب/سرچ) به متن ساده برای کپی یک‌جا. خالص برای تست. */
+export function formatTracesAsText(entries: TraceEntry[]): string {
+  return entries.map(formatTraceEntryAsText).join("\n\n");
+}
+
+/** One turn group as plain text for per-turn copy — header + entries. Pure. */
+export function formatTurnAsText(
+  turn: number | null,
+  inferred: number,
+  entries: TraceEntry[],
+): string {
+  const label = turn !== null ? `Turn ${turn}` : `Turn ${inferred}`;
+  const preview = turnUserPreview(entries);
+  const head = preview ? `${label}: ${preview}` : label;
+  const body = formatTracesAsText(entries);
+  return body ? `${head}\n${body}` : head;
+}
+
 /** زمان نمایشی کوتاه (HH:MM:SS). */
 function timeLabel(at: number): string {
   try {
@@ -103,7 +142,7 @@ function highlightHits(
 }
 
 /** دکمه کپی مطمئن (الکترون + وب + fallback) با فیدبک Copied. */
-function CopyButton({ text, label }: { text: string; label: string }) {
+function CopyButton({ text, label, title }: { text: string; label: string; title?: string }) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | null>(null);
   useEffect(() => {
@@ -111,10 +150,13 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       if (timer.current !== null) window.clearTimeout(timer.current);
     };
   }, []);
+  const hint = title ?? (typeof label === "string" ? label : "Copy");
   return (
     <button
       type="button"
       className="trace-copy-btn"
+      title={hint}
+      aria-label={hint}
       onClick={(e) => {
         e.stopPropagation();
         void (async () => {
@@ -128,6 +170,48 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       }}
     >
       {copied ? "Copied ✓" : label}
+    </button>
+  );
+}
+
+/** دکمه کپی نمای فعلی تریس (با تب/سرچ فیلترشده) — بدون فیلتر همه، با فیلتر فقط همان‌ها. */
+function CopyTracesButton({ entries, query, tab }: { entries: TraceEntry[]; query: string; tab: TraceTab }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (timer.current !== null) window.clearTimeout(timer.current);
+    };
+  }, []);
+  const filtered = query.trim() !== "" || tab !== "all";
+  const title = entries.length === 0
+    ? "Nothing to copy"
+    : filtered
+      ? `Copy filtered traces (${entries.length})`
+      : `Copy all traces (${entries.length})`;
+  return (
+    <button
+      type="button"
+      className="review-header-btn"
+      title={title}
+      aria-label={title}
+      disabled={entries.length === 0}
+      onClick={() => {
+        void (async () => {
+          const ok = await copyToClipboard(formatTracesAsText(entries));
+          if (ok) {
+            setCopied(true);
+            if (timer.current !== null) window.clearTimeout(timer.current);
+            timer.current = window.setTimeout(() => setCopied(false), 1500);
+          }
+        })();
+      }}
+    >
+      {copied ? (
+        <span aria-hidden="true">✓</span>
+      ) : (
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+      )}
     </button>
   );
 }
@@ -164,31 +248,62 @@ function TextBlock({
   );
 }
 
-/** شماره قدم یک ورودی (از detail.step) — مبنای گروه‌بندی پنل. خالص برای تست. */
+/** Step number of an entry (from detail.step) — shown as a chip on the row. */
 export function traceStep(entry: TraceEntry): number | null {
   const s = (entry.detail as Record<string, unknown> | undefined)?.step;
   return typeof s === "number" && Number.isFinite(s) ? s : null;
 }
 
-/** کلید پایدار یک گروه قدم — لنگر به قدیمی‌ترین ردیف گروه تا با prepend لاگ جدید (پولینگ) کلید گروه‌های موجود عوض نشود و حالت باز آن‌ها نپرد. خالص برای تست. */
-export function traceGroupKey(step: number | null, entries: TraceEntry[]): string {
-  const anchor = entries.length > 0 ? entries[entries.length - 1].id : "empty";
-  return step !== null ? `step-${step}-${anchor}` : `other-${anchor}`;
+/** Chat turn number of an entry (from entry.turn) — basis for turn grouping. */
+export function traceTurn(entry: TraceEntry): number | null {
+  const t = (entry as { turn?: unknown }).turn;
+  return typeof t === "number" && Number.isFinite(t) && t > 0 ? Math.floor(t) : null;
 }
 
-/** گروه‌بندی consecutive بر اساس step — ترتیب ورودی حفظ می‌شود، خالص برای تست. */
-export function groupTracesByStep(entries: TraceEntry[]): Array<{ step: number | null; entries: TraceEntry[] }> {
-  const groups: Array<{ step: number | null; entries: TraceEntry[] }> = [];
+/** Group entries (chronological, oldest first) by chat turn.
+ *  Entries with a known turn group by it; legacy entries without a turn
+ *  start a new inferred group on each prompt entry. Pure, for tests. */
+export function groupTracesByTurn(
+  entries: TraceEntry[],
+): Array<{ turn: number | null; inferred: number; entries: TraceEntry[] }> {
+  const groups: Array<{ turn: number | null; inferred: number; entries: TraceEntry[] }> = [];
+  let inferred = 0;
   for (const e of entries) {
-    const s = traceStep(e);
+    const t = traceTurn(e);
     const last = groups[groups.length - 1];
-    if (last && last.step === s) last.entries.push(e);
-    else groups.push({ step: s, entries: [e] });
+    if (t !== null) {
+      if (last && last.turn === t) last.entries.push(e);
+      else {
+        inferred += 1;
+        groups.push({ turn: t, inferred, entries: [e] });
+      }
+    } else {
+      // Legacy entry without turn: a prompt entry starts a new turn.
+      if (last && last.turn === null && e.kind !== "prompt") last.entries.push(e);
+      else {
+        inferred += 1;
+        groups.push({ turn: null, inferred, entries: [e] });
+      }
+    }
   }
   return groups;
 }
 
-/** بخش‌های قابل‌جست‌وجوی یک ورودی — همان ترتیبی که `TraceRow` رندر می‌کند. */
+/** Short user-text preview for a turn group, from its prompt entry. */
+export function turnUserPreview(entries: TraceEntry[]): string {
+  const p = entries.find((e) => e.kind === "prompt");
+  const full = (p?.prompt || "").trim();
+  if (!full) {
+    const first = (entries[0]?.summary || "").trim();
+    return first.slice(0, 100);
+  }
+  const marker = "[user]";
+  const idx = full.lastIndexOf(marker);
+  const userText = (idx >= 0 ? full.slice(idx + marker.length) : full).trim().replace(/\s+/g, " ");
+  return userText.slice(0, 120);
+}
+
+/** Searchable parts of an entry — same order as `TraceRow` renders. */
 export function traceEntrySearchParts(entry: TraceEntry): {
   title: string;
   prompt: string;
@@ -360,17 +475,19 @@ export function TraceRow({
   );
 }
 
-/** سربرگ تاشوی یک قدم — ردیف‌های هم‌قدم را زیر یک هدر جمع می‌کند. */
-export function TraceStepGroup({
-  step,
+/** Collapsible header for one chat turn — its traces listed flat below it. */
+export function TraceTurnGroup({
+  turn,
+  inferred,
   entries,
   query,
   hitBases,
   activeHit = -1,
   activeRef,
-  defaultOpen = false,
+  defaultOpen = true,
 }: {
-  step: number | null;
+  turn: number | null;
+  inferred: number;
   entries: TraceEntry[];
   query?: string;
   hitBases?: number[];
@@ -378,27 +495,36 @@ export function TraceStepGroup({
   activeRef?: ActiveRef;
   defaultOpen?: boolean;
 }) {
-  // دیفالت بسته؛ فقط هنگام سرچ خودکار باز شود تا رخدادها دیده شوند.
-  // با پاک شدن سرچ به حالت دیفالت (بسته) برمی‌گردد.
+  // Default open so traces stay visible; auto-open on search to show hits.
   const [open, setOpen] = useState(Boolean(defaultOpen));
   useEffect(() => {
     if (query?.trim()) setOpen(true);
     else setOpen(Boolean(defaultOpen));
   }, [query, defaultOpen]);
   const tokens = entries.reduce((n, e) => n + (e.tokens?.total ?? 0), 0);
+  const label = turn !== null ? `Turn ${turn}` : `Turn ${inferred}`;
+  const copyText = useMemo(
+    () => formatTurnAsText(turn, inferred, entries),
+    [turn, inferred, entries],
+  );
   return (
-    <section className="trace-panel-step" aria-label={step !== null ? `Step ${step}` : "Other"}>
-      <button
-        className="trace-panel-step-head"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="trace-panel-step-chev" aria-hidden="true">{open ? "▾" : "▸"}</span>
-        <span className="trace-panel-step-title">{step !== null ? `Step ${step}` : "Other"}</span>
-        <span className="trace-panel-step-meta">
-          {entries.length} events{tokens > 0 ? ` · ${tokens} tok` : ""}
-        </span>
-      </button>
+    <section className="trace-panel-step" aria-label={label}>
+      <div className="trace-panel-step-head">
+        <button
+          type="button"
+          className="trace-panel-step-toggle"
+          aria-expanded={open}
+          aria-label={`${label} — toggle traces`}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span className="trace-panel-step-chev" aria-hidden="true">{open ? "▾" : "▸"}</span>
+          <span className="trace-panel-step-title">{label}</span>
+          <span className="trace-panel-step-meta">
+            {entries.length} events{tokens > 0 ? ` · ${tokens} tok` : ""}
+          </span>
+        </button>
+        <CopyButton text={copyText} label="Copy" title={`Copy ${label} traces (${entries.length})`} />
+      </div>
       {open && (
         <div className="trace-panel-step-rows">
           {entries.map((entry, i) => (
@@ -418,9 +544,7 @@ export function TraceStepGroup({
   );
 }
 
-/** پنل لاگ چت جاری — مثل گیت‌دیف به‌صورت اورلی روی چت باز می‌شود؛
- *  همه لاگ‌ها در یک صفحه با تب‌های فیلتر (All/Laya/LLM/Prompts/Tools)،
- *  ردیف‌های تاشو، سرچ داخل پرامپت/پاسخ و به‌روزرسانی زنده مثل لنگ‌اسمیت. */
+/** Chat trace panel — overlay over chat, flat trace list with filter tabs. */
 export function TracePanel() {
   const { tab, setTab, close } = useTracePanel();
   const activeChatId = useStore((s) => s.activeChatId);
@@ -546,9 +670,11 @@ export function TracePanel() {
 
   const visible = useMemo(() => {
     const byTab = tab === "all" ? entries : entries.filter((e) => e.kind === tab);
-    const filtered = filterTraces(byTab, query);
-    return filtered.slice().reverse();
+    // Chronological: oldest at top, newest at bottom (scroll up for history).
+    return filterTraces(byTab, query);
   }, [entries, tab, query]);
+
+  const turnGroups = useMemo(() => groupTracesByTurn(visible), [visible]);
 
   const totalTokens = useMemo(
     () => entries.reduce((n, e) => n + (e.tokens?.total ?? 0), 0),
@@ -589,6 +715,26 @@ export function TracePanel() {
     return m;
   }, [visible, hitCounts]);
 
+  // Stick to bottom on new traces (chronological list); scrolling up pauses it.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const stickRef = useRef(true);
+  const [stuck, setStuck] = useState(true);
+  const onListScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    stickRef.current = nearBottom;
+    setStuck(nearBottom);
+  }, []);
+  useEffect(() => {
+    if (stickRef.current) listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+  }, [visible.length, tab, activeChatId]);
+  const jumpToLatest = useCallback(() => {
+    stickRef.current = true;
+    setStuck(true);
+    listRef.current?.scrollTo({ top: listRef.current?.scrollHeight ?? 0, behavior: "smooth" });
+  }, []);
+
 
   const panel = (
     <div
@@ -626,6 +772,7 @@ export function TracePanel() {
             <span className="trace-live-dot" title="Live — auto refresh every 2s">
               <span className="trace-live-pulse" aria-hidden="true" /> Live
             </span>
+            <CopyTracesButton entries={visible} query={query} tab={tab} />
             <button
               className="review-header-btn"
               title="Refresh"
@@ -731,11 +878,12 @@ export function TracePanel() {
             {query.trim() ? `No traces match “${query.trim()}”.` : "No traces yet for this chat."}
           </div>
         ) : (
-          <div className="trace-panel-list">
-            {groupTracesByStep(visible).map((g) => (
-              <TraceStepGroup
-                key={traceGroupKey(g.step, g.entries)}
-                step={g.step}
+          <div className="trace-panel-list" ref={listRef} onScroll={onListScroll}>
+            {turnGroups.map((g) => (
+              <TraceTurnGroup
+                key={g.turn !== null ? `turn-${g.turn}` : `turn-inferred-${g.inferred}`}
+                turn={g.turn}
+                inferred={g.inferred}
                 entries={g.entries}
                 query={query}
                 hitBases={g.entries.map((e) => baseById.get(e.id) ?? 0)}
@@ -744,6 +892,16 @@ export function TracePanel() {
               />
             ))}
           </div>
+        )}
+        {!stuck && visible.length > 0 && (
+          <button
+            type="button"
+            className="trace-jump-latest"
+            onClick={jumpToLatest}
+            title="Jump to latest traces"
+          >
+            ↓ Latest
+          </button>
         )}
       </aside>
     </div>

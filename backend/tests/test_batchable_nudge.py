@@ -4,23 +4,24 @@ The model keeps firing one grep/glob/read per turn even though the tools
 accept batch parameters (grep ``patterns=[...]``, read ``filePaths=[...]`` /
 ``ranges=[...]``). ``_batchable_nudge`` detects, per step, whether ≥2 calls
 of the same batchable tool differ only in their primary argument (pattern /
-filePath) — i.e. they could have been ONE call — and returns a reminder
-that the loops deliver as a standalone HumanMessage AFTER the tool results
-(a suffix buried at the end of a huge result never reached the model).
+filePath) — i.e. they could have been ONE parallel step — and returns a
+reminder that the loops deliver as a standalone HumanMessage AFTER the tool
+results (a suffix buried at the end of a huge result never reached the model).
 
 Covers:
 1. Two greps with different patterns, same path/include → nudge fires.
 2. Two reads with different filePaths, same offset/limit → nudge fires.
 3. A call that already passes patterns=[...] → NO nudge (already batching).
-4. Two greps with DIFFERENT paths (same include) → nudge fires with a
-   concrete merged example using paths=[...] (scopes merge in one call).
-5. Two greps with DIFFERENT includes → nudge fires with includes=[...]
-   (file filters merge in one call); ranges members are always quoted.
+4. Two greps with DIFFERENT paths → NO single-call merge (Cartesian
+   over-scan); parallel calls in one step are the correct shape.
+5. Two greps with DIFFERENT includes → NO single-call merge;
+   ranges members are always quoted.
 6. Mixed tools (grep + read) → nudge mentions both.
 7. Single call per tool → NO nudge.
 8. End-to-end: the sub-agent loop delivers the nudge as a HumanMessage.
 9. Cross-step streak tracker: per-TOOL counting, threshold=2, repeated
-   reminders with a concrete merged example built from the model's own calls.
+   reminders; same-scope merges show a concrete example, different scopes
+   advise parallel calls.
 """
 
 import asyncio
@@ -74,30 +75,25 @@ def test_already_batched_call_no_nudge():
     assert _batchable_nudge(tcs) == ""
 
 
-def test_different_paths_now_merge_via_paths():
-    """Scopes merge via paths=[...] — two greps with different paths (same
-    include) SHOULD nudge with a concrete merged example."""
+def test_different_paths_no_single_call_merge():
+    """Different scopes must NOT suggest a single Cartesian merge — foo@src +
+    bar@backend into foo|bar over both scopes changes semantics and costs
+    more tokens. No per-step single-call nudge; parallel calls in one step
+    are the correct shape."""
     tcs = [
         {"name": "grep", "args": {"pattern": "alpha", "path": "src"}, "id": "a"},
         {"name": "grep", "args": {"pattern": "beta", "path": "backend"}, "id": "b"},
     ]
-    out = _batchable_nudge(tcs)
-    assert "BATCHING REMINDER" in out
-    assert "paths=" in out
-    assert "pattern='alpha'" in out and "patterns=['beta']" in out
+    assert _batchable_nudge(tcs) == ""
 
 
-def test_different_includes_now_merge_via_includes():
-    """File filters merge via includes=[...] — two greps with different
-    includes (same path) SHOULD nudge with a concrete merged example."""
+def test_different_includes_no_single_call_merge():
+    """Different file filters must NOT suggest a Cartesian includes= merge."""
     tcs = [
         {"name": "grep", "args": {"pattern": "alpha", "include": "*.ts"}, "id": "a"},
         {"name": "grep", "args": {"pattern": "beta", "include": "*.py"}, "id": "b"},
     ]
-    out = _batchable_nudge(tcs)
-    assert "BATCHING REMINDER" in out
-    assert "includes=" in out
-    assert "include='*.ts'" in out and "includes=['*.py']" in out
+    assert _batchable_nudge(tcs) == ""
 
 
 def test_ranges_members_are_quoted():
@@ -164,6 +160,78 @@ def test_empty_and_none_safe():
     assert _batchable_nudge(None) == ""
 
 
+# ── read batching: same-step merge hint via ranges/filePaths ─────────────
+
+def test_read_batch_hint_uses_ranges_for_different_windows():
+    """Four same-step reads hint a single ranges call covering all windows."""
+    tcs = [
+        {"name": "read", "args": {"filePath": "backend/agents.py", "offset": 740, "limit": 80}, "id": "a"},
+        {"name": "read", "args": {"filePath": "backend/graph.py", "offset": 2800, "limit": 80}, "id": "b"},
+        {"name": "read", "args": {"filePath": "backend/graph.py", "offset": 4980, "limit": 60}, "id": "c"},
+        {"name": "read", "args": {"filePath": "backend/agents.py", "offset": 3630, "limit": 80}, "id": "d"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "BATCHING REMINDER" in out
+    assert "ranges=" in out
+    assert "backend/agents.py:740:80" in out
+    assert "backend/graph.py:2800:80" in out
+
+
+def test_read_batch_hint_same_file_windows_keep_both():
+    """Two windows on one file stay as two ranges members, not collapsed."""
+    tcs = [
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 640, "limit": 60}, "id": "a"},
+        {"name": "read", "args": {"filePath": "tools.py", "offset": 2089, "limit": 80}, "id": "b"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "BATCHING REMINDER" in out
+    assert "'tools.py:640:60'" in out
+    assert "'tools.py:2089:80'" in out
+
+
+def test_read_batch_hint_single_call_untouched():
+    """A single call must not trigger a batch hint."""
+    tcs = [{"name": "read", "args": {"filePath": "a.py"}, "id": "a"}]
+    assert _batchable_nudge(tcs) == ""
+
+
+def test_read_batch_hint_already_batched_untouched():
+    """A call that already batches must not trigger another hint."""
+    tcs = [
+        {"name": "read", "args": {"filePath": "a.py", "ranges": ["a.py:1:50"]}, "id": "a"},
+        {"name": "read", "args": {"filePath": "b.py"}, "id": "b"},
+    ]
+    assert _batchable_nudge(tcs) == ""
+
+
+def test_duplicate_results_projected_request_local():
+    """Identical read-only results are shortened per-request by
+    project_tool_results, never by mutating the durable transcript."""
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    from tool_message_projection import project_tool_results
+
+    body = "\n".join(f"{i} | line {i}" for i in range(1, 101))
+    full = f"<path>a.py</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+    assert len(full) >= 512
+    msgs = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "read", "args": {"filePath": "a.py"}, "id": "first"},
+                {"name": "read", "args": {"filePath": "a.py"}, "id": "second"},
+            ],
+        ),
+        ToolMessage(content=full, tool_call_id="first"),
+        ToolMessage(content=full, tool_call_id="second"),
+    ]
+    out = project_tool_results(msgs)
+    assert str(msgs[2].content) == full
+    ref = str(out[2].content)
+    assert len(ref) < len(full)
+    assert "first" in ref
+
+
 # ── cross-step streak tracker (one call per step) ──────────────────────────
 
 def _read_tc(path: str, i: int) -> dict:
@@ -203,9 +271,8 @@ def test_streak_fires_across_same_file_different_windows():
 
 
 def test_streak_fires_across_different_scopes():
-    """The reported regression (screenshot): 9 greps with DIFFERENT scopes —
-    one grep per step. Scopes merge via paths=[...], so the per-tool count
-    must build and fire with a concrete merged example."""
+    """Consecutive greps with different scopes still fire, but advise
+    parallel calls in one step — never a Cartesian paths= merge."""
     t = _BatchStreakTracker(threshold=2)
     assert t.observe([
         {"name": "grep", "args": {"pattern": "alpha", "path": "src"}, "id": "a"}
@@ -214,14 +281,12 @@ def test_streak_fires_across_different_scopes():
         {"name": "grep", "args": {"pattern": "beta", "path": "backend"}, "id": "b"}
     ])
     assert "BATCHING REMINDER" in out
-    assert "paths=" in out
-    assert "pattern='alpha'" in out and "patterns=['beta']" in out
+    assert "parallel" in out.lower()
+    assert "paths=" not in out
 
 
 def test_streak_fires_across_different_includes():
-    """The reported regression (screenshot): consecutive greps with DIFFERENT
-    file filters (include='tools.py' vs include='graph.py'). Filters merge via
-    includes=[...], so the per-tool count must build and fire."""
+    """Consecutive greps with different filters advise parallel calls."""
     t = _BatchStreakTracker(threshold=2)
     assert t.observe([
         {"name": "grep", "args": {"pattern": "alpha", "include": "tools.py"}, "id": "a"}
@@ -230,8 +295,8 @@ def test_streak_fires_across_different_includes():
         {"name": "grep", "args": {"pattern": "beta", "include": "graph.py"}, "id": "b"}
     ])
     assert "BATCHING REMINDER" in out
-    assert "includes=" in out
-    assert "include='tools.py'" in out and "includes=['graph.py']" in out
+    assert "parallel" in out.lower()
+    assert "includes=" not in out
 
 
 def test_streak_survives_interleaved_non_batchable_work():
@@ -615,10 +680,10 @@ if __name__ == "__main__":
     print("  ✅ two reads same window")
     test_already_batched_call_no_nudge()
     print("  ✅ already batched → no nudge")
-    test_different_paths_now_merge_via_paths()
-    print("  ✅ different paths → merge via paths")
-    test_different_includes_now_merge_via_includes()
-    print("  ✅ different includes → merge via includes")
+    test_different_paths_no_single_call_merge()
+    print("  ✅ different paths → no Cartesian merge")
+    test_different_includes_no_single_call_merge()
+    print("  ✅ different includes → no Cartesian merge")
     test_ranges_members_are_quoted()
     print("  ✅ ranges members quoted")
     test_mixed_tools_nudge_mentions_both()

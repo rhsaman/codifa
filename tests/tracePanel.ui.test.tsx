@@ -1,5 +1,5 @@
-// تست SSR پنل Trace — ردیف فشرده، گروه‌بندی step و فیلتر تب‌ها.
-// Mock پل الکترون قبل از import کامپوننت.
+// SSR test for Trace panel — compact row, turn grouping, tab filter, per-turn copy.
+// Mocks the electron bridge before importing the component.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -14,7 +14,7 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { TraceRow, TraceStepGroup, groupTracesByStep, traceStep, traceGroupKey, traceEntrySearchParts } = await import(
+const { TraceRow, TraceTurnGroup, groupTracesByTurn, traceStep, traceTurn, turnUserPreview, traceEntrySearchParts, formatTraceEntryAsText, formatTracesAsText, formatTurnAsText, filterTraces } = await import(
   '../src/components/TracePanel'
 )
 const { countTraceEntryHits, countTraceHits, stepHitIndex, locateHit } = await import(
@@ -32,72 +32,64 @@ function check(name: string, cond: boolean, extra?: unknown) {
 }
 
 const rows = [
-  { id: '1', at: 1, kind: 'tool', summary: 'read', detail: { name: 'read', step: 6 } },
-  { id: '2', at: 2, kind: 'llm', summary: '', model: 'm', tokens: { total: 100 }, detail: { step: 6 } },
-  { id: '3', at: 3, kind: 'tool', summary: 'grep', detail: { name: 'grep', step: 7 } },
+  { id: '1', at: 1, kind: 'laya', summary: 'normal', turn: 1, detail: { route: 'normal' } },
+  { id: '2', at: 2, kind: 'prompt', summary: 'chat', turn: 1, prompt: '[system]\ns\n\n[user]\nhello world' },
+  { id: '3', at: 3, kind: 'tool', summary: 'read', turn: 1, detail: { name: 'read', step: 2 } },
+  { id: '4', at: 4, kind: 'tool', summary: 'grep', turn: 2, detail: { name: 'grep', step: 1 } },
 ] as any
 
-console.log('1) گروه‌بندی step:')
+console.log('1) turn grouping:')
 {
-  check('step از detail خوانده می‌شود', traceStep(rows[0]) === 6)
-  check('step ناموجود null است', traceStep({ id: 'x', at: 1, kind: 'laya', summary: 's' } as any) === null)
-  const groups = groupTracesByStep(rows)
-  check('دو گروه ساخته شد', groups.length === 2)
-  check('گروه اول step 6 با دو ردیف است', groups[0].step === 6 && groups[0].entries.length === 2)
-  check('گروه دوم step 7 با یک ردیف است', groups[1].step === 7 && groups[1].entries.length === 1)
+  check('turn is read from entry', traceTurn(rows[0]) === 1)
+  check('missing turn is null', traceTurn({ id: 'x', at: 1, kind: 'laya', summary: 's' } as any) === null)
+  check('step still read from detail', traceStep(rows[2]) === 2)
+  const groups = groupTracesByTurn(rows)
+  check('two groups created', groups.length === 2)
+  check('first group is turn 1 with three rows', groups[0].turn === 1 && groups[0].entries.length === 3)
+  check('second group is turn 2 with one row', groups[1].turn === 2 && groups[1].entries.length === 1)
+  const legacy = groupTracesByTurn([
+    { id: 'a', at: 1, kind: 'llm', summary: 'm' },
+    { id: 'b', at: 2, kind: 'prompt', summary: 'p', prompt: 'hi' },
+  ] as any)
+  check('legacy entries without turn split on prompt', legacy.length === 2)
+  check('user preview extracted from prompt', turnUserPreview(rows[0].turn === 1 ? [rows[1]] : []) === 'hello world')
 }
 
-console.log('2) ردیف فشرده تک‌خطی چپ‌چین:')
+console.log('2) compact single-line row:')
 {
-  const html = renderToString(<TraceRow entry={rows[0]} />)
-  check('کلاس ردیف پنل دارد', html.includes('trace-panel-row'))
-  check('نقطه نوع دارد', html.includes('trace-panel-dot'))
-  check('عنوان فشرده دارد', html.includes('trace-panel-title'))
-  check('چیپ step دارد', /step(?:\s|<!-- -->)*6/.test(html))
-  check('ساعت دارد', html.includes('trace-panel-time'))
-  check('شورون دارد', html.includes('trace-panel-chev'))
-  check('کارت قدیمی ندارد', !html.includes('trace-row-block'))
-  check('دیفالت بسته است (بدنه رندر نشد)', !html.includes('trace-panel-body'))
-  const openRow = renderToString(<TraceRow entry={rows[0]} defaultOpen />)
-  check('با defaultOpen بدنه باز است', openRow.includes('trace-panel-body'))
+  const html = renderToString(<TraceRow entry={rows[2]} />)
+  check('has panel row class', html.includes('trace-panel-row'))
+  check('has kind dot', html.includes('trace-panel-dot'))
+  check('has compact title', html.includes('trace-panel-title'))
+  check('has step chip', /step(?:\s|<!-- -->)*2/.test(html))
+  check('has clock', html.includes('trace-panel-time'))
+  check('has chevron', html.includes('trace-panel-chev'))
+  check('has no legacy card', !html.includes('trace-row-block'))
+  check('default closed (body not rendered)', !html.includes('trace-panel-body'))
+  const openRow = renderToString(<TraceRow entry={rows[2]} defaultOpen />)
+  check('body open with defaultOpen', openRow.includes('trace-panel-body'))
 }
 
-console.log('3) سربرگ تاشوی step (دیفالت بسته):')
+console.log('3) turn group header (default open):')
 {
   const html = renderToString(
-    <TraceStepGroup step={6} entries={[rows[0], rows[1]]} />,
+    <TraceTurnGroup turn={1} inferred={1} entries={[rows[0], rows[1], rows[2]]} />,
   )
-  check('هدر step دارد', html.includes('trace-panel-step-head'))
-  check('عنوان Step 6 دارد', html.includes('Step 6'))
-  check('شمارش ردیف‌ها دارد', /2(?:<!-- -->)? events/.test(html))
-  check('دیفالت بسته است (ردیفی رندر نشد)', !(html.match(/trace-panel-row/g) || []).length)
-  const openHtml = renderToString(
-    <TraceStepGroup step={6} entries={[rows[0], rows[1]]} defaultOpen />,
-  )
-  check('با defaultOpen هر دو ردیف رندر شدند', (openHtml.match(/trace-panel-row/g) || []).length === 2)
+  check('has turn header', html.includes('trace-panel-step-head'))
+  check('has Turn 1 title', html.includes('Turn 1'))
+  check('has row count', /3(?:<!-- -->)? events/.test(html))
+  check('has per-turn copy button', html.includes('Copy') && html.includes('trace-copy-btn'))
+  check('default open (rows rendered)', (html.match(/trace-panel-row/g) || []).length === 3)
 }
 
-console.log('4) کلید پایدار گروه با لاگ جدید:')
+console.log('4) per-turn copy text:')
 {
-  const oldGroups = groupTracesByStep(rows)
-  const oldKeys = oldGroups.map((g) => traceGroupKey(g.step, g.entries))
-  const withNewStep = [
-    { id: '0', at: 0, kind: 'tool', summary: 'ls', detail: { name: 'ls', step: 8 } },
-    ...rows,
-  ] as any
-  const newGroups = groupTracesByStep(withNewStep)
-  const newKeys = newGroups.map((g) => traceGroupKey(g.step, g.entries))
-  check('گروه‌های قبلی کلیدشان حفظ شد', oldKeys.every((k) => newKeys.includes(k)))
-  const withNewRow = [
-    { id: '4', at: 4, kind: 'tool', summary: 'cat', detail: { name: 'cat', step: 7 } },
-    ...rows,
-  ] as any
-  const grownGroups = groupTracesByStep(withNewRow)
-  const grownKeys = grownGroups.map((g) => traceGroupKey(g.step, g.entries))
-  check('گروه step قبلی با ردیف جدید کلیدش حفظ شد', oldKeys.every((k) => grownKeys.includes(k)))
+  const text = formatTurnAsText(1, 1, [rows[0], rows[1]])
+  check('has turn header line', text.includes('Turn 1'))
+  check('has both rows', text.includes('normal') && text.includes('hello world'))
 }
 
-console.log('5) ناوبری سرچ (شمارش + چرخش جلو/عقب):')
+console.log('5) search navigation (count + forward/back rotation):')
 {
   const parts = traceEntrySearchParts({
     id: '9',
@@ -108,29 +100,43 @@ console.log('5) ناوبری سرچ (شمارش + چرخش جلو/عقب):')
     result: 'config ok',
     detail: { name: 'read' },
   } as any)
-  check('بخش‌های سرچ استخراج شد', parts.title === 'read config' && parts.prompt.includes('config'))
+  check('search parts extracted', parts.title === 'read config' && parts.prompt.includes('config'))
   const hits = countTraceEntryHits(parts, 'config')
-  check('سه رخداد شمرده شد', hits === 3, hits)
-  check('کوئری خالی صفر است', countTraceEntryHits(parts, '  ') === 0)
-  const list = [parts, traceEntrySearchParts(rows[0])]
-  check('جمع رخدادهای لیست درست است', countTraceHits(list, 'config') === 3, countTraceHits(list, 'config'))
-  check('جلو از آخر می‌چرخد', stepHitIndex(2, 3, 1) === 0)
-  check('عقب از اول می‌چرخد', stepHitIndex(0, 3, -1) === 2)
+  check('three hits counted', hits === 3, hits)
+  check('blank query is zero', countTraceEntryHits(parts, '  ') === 0)
+  const list = [parts, traceEntrySearchParts(rows[2])]
+  check('list hit sum correct', countTraceHits(list, 'config') === 3, countTraceHits(list, 'config'))
+  check('forward wraps from end', stepHitIndex(2, 3, 1) === 0)
+  check('back wraps from start', stepHitIndex(0, 3, -1) === 2)
   const loc = locateHit([3, 1], 3)
-  check('رخداد چهارم در ورودی دوم است', loc?.fileIndex === 1 && loc?.localIndex === 0, loc)
+  check('fourth hit is in second entry', loc?.fileIndex === 1 && loc?.localIndex === 0, loc)
 }
 
-console.log('6) رندر هایلایت فعال سرچ:')
+console.log('6) active search highlight render:')
 {
-  const html = renderToString(<TraceRow entry={rows[0]} query="read" hitBase={0} activeHit={0} />)
-  check('هایلایت فعال دارد', html.includes('trace-hit-active'))
-  const plain = renderToString(<TraceRow entry={rows[0]} query="read" />)
-  check('بدون ناوبری هایلایت فعال ندارد', !plain.includes('trace-hit-active'))
+  const html = renderToString(<TraceRow entry={rows[2]} query="read" hitBase={0} activeHit={0} />)
+  check('has active highlight', html.includes('trace-hit-active'))
+  const plain = renderToString(<TraceRow entry={rows[2]} query="read" />)
+  check('no active highlight without navigation', !plain.includes('trace-hit-active'))
+}
+
+console.log('7) whole-trace copy (filtered only when filtered):')
+{
+  const text = formatTraceEntryAsText(rows[2])
+  check('has kind and title', text.includes('TOOL') && text.includes('read'))
+  check('has step', text.includes('step=2'))
+  check('has turn', text.includes('turn=1'))
+  const all = formatTracesAsText(rows)
+  check('all rows in text', all.includes('read') && all.includes('grep'))
+  check('empty list is empty text', formatTracesAsText([]) === '')
+  const onlyTools = filterTraces(rows, 'read')
+  check('filter keeps only matching row', onlyTools.length === 1 && onlyTools[0]?.id === '3')
+  check('filtered text is only that row', formatTracesAsText(onlyTools).includes('read') && !formatTracesAsText(onlyTools).includes('grep'))
 }
 
 if (failed > 0) {
-  console.error(`\n${failed} تست شکست خورد ❌`)
+  console.error(`\n${failed} tests failed ❌`)
   process.exit(1)
 }
-console.log('\nهمه تستها پاس شدند ✅')
+console.log('\nAll tests passed ✅')
 process.exit(0)

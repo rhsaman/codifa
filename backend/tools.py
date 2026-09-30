@@ -1222,7 +1222,47 @@ def _web_search_auto_fetch() -> int:
     return max(0, min(10, n))
 
 
-def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0, chat_id: str = "") -> str | None:
+def _laya_tool_gate(tool_name: str, query: str, chat_id: str = "", emit: Any = None) -> bool | None:
+    """Score gate for expensive tools (web_search / vision / fetch_url).
+
+    Returns True when laya confidently says the call is worthwhile, False
+    when it confidently says skip, None on no-signal (caller keeps old
+    behaviour). Never raises. Every handled decision is logged to chat
+    trace via report_secondary so laya rows stay visible.
+    """
+    try:
+        import laya_decide
+    except Exception:  # noqa: BLE001 — laya is optional
+        return None
+    try:
+        decision = laya_decide.score(
+            {"tool": (tool_name or "")[:80], "query": (query or "")[:500]},
+            f"call-{tool_name or 'tool'}",
+            chat_id=str(chat_id or ""),
+        )
+    except Exception:  # noqa: BLE001 — gate is best-effort
+        return None
+    try:
+        laya_decide.report_secondary(
+            decision,
+            route="normal",
+            sub=f"tool_gate:{tool_name or 'tool'}",
+            chat_id=str(chat_id or ""),
+            emit=emit,
+            prompt=str(query or "")[:2000],
+            options=[f"call-{tool_name or 'tool'}", "skip"],
+        )
+    except Exception:  # noqa: BLE001, S110 — observability never breaks the gate
+        pass
+    try:
+        if getattr(decision, "handled", False):
+            return str(getattr(decision, "value", "") or "").startswith("call-")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0, chat_id: str = "", emit: Any = None) -> str | None:
     """گیت laya روی خلاصه‌سازی وب: «distill» / «raw» / None.
 
     فقط تصمیم اطراف distill (لزوم خلاصه) گرفته می‌شود، نه تولید متن.
@@ -1247,6 +1287,18 @@ def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0, cha
         )
     except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
         return None
+    try:
+        laya_decide.report_secondary(
+            decision,
+            route="normal",
+            sub="web_distill",
+            chat_id=str(chat_id or ""),
+            emit=emit,
+            prompt=str(query or "")[:2000],
+            options=["distill", "raw"],
+        )
+    except Exception:  # noqa: BLE001, S110 — observability never breaks the gate
+        pass
     try:
         if decision.handled and str(decision.value or "") in ("distill", "raw"):
             return str(decision.value)
@@ -3500,8 +3552,8 @@ def make_tool_callbacks(
     # backstops the case where the model keeps asking for small adjacent windows
     # anyway. Both live for this run only, reset each time make_tool_callbacks
     # is called (same lifetime as _plan_nudge_state above).
-    _NARROW_READ_FLOOR = 60          # اگه limit خیلی کوچیک بود، به این گرد می‌کنیم
-    _NARROW_READ_HINT_LIMIT = 30     # زیر این حد، مشمول floor می‌شه
+    _NARROW_READ_FLOOR = 100         # اگه limit خیلی کوچیک بود، به این گرد می‌کنیم
+    _NARROW_READ_HINT_LIMIT = 50     # زیر این حد، مشمول floor می‌شه
     _narrow_read_state = {"last_target": None, "small_adjacent": 0}
 
     def _narrow_read_floor(target: str, offset: int, limit: int, total: int = 0) -> tuple[int, str | None]:
@@ -3548,14 +3600,9 @@ def make_tool_callbacks(
     # Read-window hygiene (code-enforced, not prompt-only). Session telemetry
     # showed ~70% of tool calls were `read`, one call per model step, and most
     # windows either overlapped an earlier one or slid a few lines past it —
-    # every extra step re-sends the whole context. So (1) overlapping/adjacent
-    # windows of the SAME file inside one call are merged into one block, and
-    # (2) every window is widened forward to at least _READ_MIN_WINDOW lines so
-    # the follow-up "next 60 lines" read is not needed. Small files / EOF are
-    # unaffected (the excerpt reader simply stops at the end of the file).
-    _READ_MIN_WINDOW = 150
-    _READ_MERGE_GAP = 30
-
+    # every extra step re-sends the whole context. Overlapping/adjacent
+    # windows of the SAME file inside one call are merged into one block.
+    # Small files / EOF are unaffected (the excerpt reader stops at EOF).
     def _widen_and_merge_windows(
         wins: list[tuple[str, int, int]],
     ) -> list[tuple[str, int, int]]:
@@ -3569,12 +3616,12 @@ def make_tool_callbacks(
             ss.sort()
             merged = [ss[0]]
             for a, b in ss[1:]:
-                if a <= merged[-1][1] + _READ_MERGE_GAP + 1:
+                if a <= merged[-1][1] + 1:
                     merged[-1][1] = max(merged[-1][1], b)
                 else:
                     merged.append([a, b])
             for a, b in merged:
-                out.append((p, a, max(b - a + 1, _READ_MIN_WINDOW)))
+                out.append((p, a, b - a + 1))
         return out
 
     def _plan_nudge_due() -> bool:
@@ -4492,20 +4539,51 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         )
         return raw
 
+    def _did_you_mean(target: str, filePath: str) -> str:
+        """Suggest close matches when a read path doesn't exist, so the model
+        self-corrects a hallucinated filename (e.g. a guessed test name)
+        instead of failing blind. Best-effort: never raises, empty on no match."""
+        try:
+            parent = os.path.dirname(target)
+            if not parent or not os.path.isdir(parent):
+                return ""
+            want = os.path.basename(target)
+            try:
+                names = os.listdir(parent)
+            except OSError:
+                return ""
+            close = difflib.get_close_matches(want, names, n=3, cutoff=0.6)
+            if not close:
+                return ""
+            rels = []
+            for n in close:
+                try:
+                    rels.append(os.path.relpath(os.path.join(parent, n), root))
+                except ValueError:
+                    rels.append(n)
+            return " — did you mean: " + ", ".join(rels) + "?"
+        except Exception:  # noqa: BLE001 — suggestions never break the read
+            return ""
+
     async def _read_target(
-        filePath: str, offset: int, limit: int, _main_name: str
+        filePath: str, offset: int, limit: int, _main_name: str,
+        quiet: bool = False,
     ) -> str:
         """Read ONE file/dir path and emit its own tool_result/error event.
         Shared by the single-path and batch branches of read_tool below so
         both paths get identical per-file behavior (error messages, paging
         notes, directory listing) — batch just calls this once per path
         concurrently instead of the caller looping one read_tool call at a
-        time."""
+        time. `quiet=True` suppresses the per-file events: the batch branch
+        emits ONE aggregate card instead, so a fast-failing missing file can
+        no longer hijack the whole batch card to red "file not found" while
+        the other files succeeded."""
         try:
             target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
-            emit(_error_result("read", msg))
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         # Cache keyed by the normalized absolute path (tool, target, offset,
         # limit). A re-read of the same region (the standard post-edit pattern)
@@ -4516,26 +4594,29 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         cache_key = ("read", target, str(offset), str(limit))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "read",
-                    "summary": "cached",
-                    "model": _main_name,
-                }
-            )
+            if not quiet:
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "read",
+                        "summary": "cached",
+                        "model": _main_name,
+                    }
+                )
             return cached
         if os.path.isdir(target):
-            raw = await _read_dir_tool(target, filePath, offset, limit, _main_name)
+            raw = await _read_dir_tool(target, filePath, offset, limit, _main_name, quiet=quiet)
             _parent_search_cache[cache_key] = raw
             return raw
         if not os.path.exists(target):
-            msg = "file not found"
-            emit(_error_result("read", msg))
+            msg = "file not found" + _did_you_mean(target, filePath)
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if not _is_text_path(target):
             msg = "binary file (read skipped)"
-            emit(_error_result("read", msg))
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         async def single_excerpt() -> dict:
             return await asyncio.to_thread(_read_lines_excerpt, target, offset, limit)
@@ -4551,7 +4632,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         )
         if excerpt.get("error"):
             msg = excerpt["error"]
-            emit(_error_result("read", msg))
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         lines = excerpt["lines"]
         start = excerpt["start"]
@@ -4565,7 +4647,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         limit, _narrow_hint = _narrow_read_floor(target, offset, limit, total)
         if not lines:
             msg = f"line offset {start} is past the end of the file ({total} lines)"
-            emit(_error_result("read", msg))
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
@@ -4582,15 +4665,16 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         else:
             body += f"\n\n(End of file - total {total} lines)"
-        emit(
-            {
-                "kind": "tool_result",
-                "tool": "read",
-                "summary": f"{len(lines)} lines",
-                "model": _main_name,
-                "results": [{"path": filePath, "content": body[:8000]}],
-            }
-        )
+        if not quiet:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": f"{len(lines)} lines",
+                    "model": _main_name,
+                    "results": [{"path": filePath, "content": body[:8000]}],
+                }
+            )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
         if _narrow_hint:
             raw += f"\n\n{_narrow_hint}"
@@ -4608,7 +4692,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
 
 BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
 
-NOTE: very small limits (<30 lines) on a first read of a file are auto-widened to ~60 lines to avoid line-by-line probing — ask for a wide window (limit=100+) if you need more context around a region. Repeated tiny adjacent reads of the same file trigger a hint telling you to read one wide window instead.
+NOTE: very small limits (<50 lines) on a first read of a file are auto-widened to ~100 lines to avoid line-by-line probing — ask for a wide window (limit=150+) if you need more context around a region. Repeated tiny adjacent reads of the same file trigger a hint telling you to read one wide window instead.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -4669,8 +4753,11 @@ When you need to read several files, read multiple independent files in parallel
         # parallel read-only tool calls elsewhere in the graph, just applied
         # WITHIN one tool call instead of across several parallel tool calls.
         # tasks تکراری‌های هم‌فایل را حفظ می‌کند (هر ranges یک job جدا).
+        # Per-file events are suppressed (quiet=True): the batch emits ONE
+        # aggregate card below, so a fast-failing missing file can no longer
+        # win the race and paint the whole batch red while siblings succeed.
         results = await asyncio.gather(
-            *(_read_target(p, o, l, _main_name) for p, o, l in tasks)
+            *(_read_target(p, o, l, _main_name, quiet=True) for p, o, l in tasks)
         )
         # فوتر خلاصه: اگر بعضی فایل‌ها خطا داده‌اند ولی بقیه موفق بوده‌اند،
         # مدل نباید فکر کند کل batch شکست خورده (رفع «خواندن دسته‌ای خطا
@@ -4681,19 +4768,49 @@ When you need to read several files, read multiple independent files in parallel
             for (p, _, _), r in zip(tasks, results)
             if str(r).startswith("ERROR")
         ]
+        _oks = [
+            (p, r)
+            for (p, _, _), r in zip(tasks, results)
+            if not str(r).startswith("ERROR")
+        ]
         if _errs and len(_errs) < len(results):
-            _ok = [
-                r for r in results if not str(r).startswith("ERROR")
-            ]
             _foot = (
-                f"[batch] {len(_ok)}/{len(results)} files read OK; "
+                f"[batch] {len(_oks)}/{len(results)} files read OK; "
                 + "; ".join(f"{p}: {str(r).split(':', 1)[-1].strip()}" for p, r in _errs)
             )
-            return "\n\n".join(_ok) + "\n\n" + _foot
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": f"{len(_oks)}/{len(results)} files · missing: "
+                    + ", ".join(p for p, _ in _errs),
+                    "model": _main_name,
+                    "results": [{"path": p} for p, _ in _oks],
+                }
+            )
+            return "\n\n".join(r for _, r in _oks) + "\n\n" + _foot
+        if not _errs:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": f"{len(results)} file" + ("s" if len(results) != 1 else ""),
+                    "model": _main_name,
+                    "results": [{"path": p} for p, _, _ in tasks],
+                }
+            )
+            return "\n\n".join(results)
+        emit(
+            _error_result(
+                "read",
+                "; ".join(f"{p}: {str(r).split(':', 1)[-1].strip()}" for p, r in _errs),
+            )
+        )
         return "\n\n".join(results)
 
     async def _read_dir_tool(
-        target: str, filePath: str, offset: int, limit: int, _model: str = ""
+        target: str, filePath: str, offset: int, limit: int, _model: str = "",
+        quiet: bool = False,
     ) -> str:
         """Directory branch of the read tool (opencode-style listing)."""
         try:
@@ -4702,7 +4819,8 @@ When you need to read several files, read multiple independent files in parallel
             )
         except PermissionError:
             msg = "permission denied"
-            emit(_error_result("read", msg))
+            if not quiet:
+                emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         entries: list[str] = []
         for name in names:
@@ -4722,15 +4840,16 @@ When you need to read several files, read multiple independent files in parallel
             else f"\n({len(entries)} entries)"
         )
         body = "\n".join(window) if window else "(empty directory)"
-        emit(
-            {
-                "kind": "tool_result",
-                "tool": "read",
-                "summary": f"directory · {len(entries)} entries",
-                "model": _model,
-                "results": [{"path": filePath or "/", "content": "\n".join(window[:100])}],
-            }
-        )
+        if not quiet:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": f"directory · {len(entries)} entries",
+                    "model": _model,
+                    "results": [{"path": filePath or "/", "content": "\n".join(window[:100])}],
+                }
+            )
         return f"<path>{filePath or '/'}</path>\n<type>directory</type>\n<entries>\n{body}\n{footer}\n</entries>"
 
     async def task_tool(
@@ -4969,6 +5088,7 @@ When you need to read several files, read multiple independent files in parallel
                                     if _looks_like_code_ident(_m):
                                         _mentioned_idents.add(_m)
 
+                        _map_rank_info: dict = {}
                         _code_map = (
                             await asyncio.to_thread(
                                 format_symbol_map,
@@ -4977,10 +5097,28 @@ When you need to read several files, read multiple independent files in parallel
                                 mentioned_fnames=_mentioned_fnames,
                                 mentioned_idents=_mentioned_idents,
                                 query=prompt,
+                                rank_info=_map_rank_info,
                             )
                             if root
                             else ""
                         )
+                        try:
+                            import laya_decide as _laya_mod
+
+                            _ranked = _map_rank_info.get("ranked") if isinstance(_map_rank_info, dict) else None
+                            if isinstance(_ranked, list) and _ranked:
+                                _laya_mod.report_secondary(
+                                    None,
+                                    route="normal",
+                                    sub="code_map_rank",
+                                    chat_id=str(_chat_id or ""),
+                                    emit=emit,
+                                    elapsed_ms=int(_map_rank_info.get("elapsed_ms") or 0),
+                                    prompt=str(_map_rank_info.get("query") or prompt or ""),
+                                    ranked=_ranked,
+                                )
+                        except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+                            pass
                     except Exception:  # noqa: BLE001
                         _code_map = ""
                     if _code_map:
@@ -5334,7 +5472,7 @@ When you need to read several files, read multiple independent files in parallel
         try:
             _raw_total = sum(len(ln) for ln in lines)
             _laya_skip_distill = await asyncio.to_thread(
-                _laya_distill_choice, query, len(results), _raw_total, str(_chat_id or "")
+                _laya_distill_choice, query, len(results), _raw_total, str(_chat_id or ""), emit
             ) == "raw"
         except Exception:  # noqa: BLE001 — گیت اختیاری است
             _laya_skip_distill = False

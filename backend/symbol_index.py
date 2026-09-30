@@ -44,6 +44,41 @@ def _looks_like_code_ident(ident: str) -> bool:
     return len(ident) >= 8 and ("_" in ident or "-" in ident or ident != ident.lower())
 
 
+def rank_with_laya(query: str, candidates: list[dict] | list[str], top_k: int | None = None) -> list[dict]:
+    """رتبه‌بندی معنایی با laya rank — امن با fallback به [] در نبود سیگنال."""
+    if not query or not str(query).strip() or not candidates:
+        return []
+    try:
+        from laya_decide import rank as _laya_rank
+
+        k = int(top_k) if top_k is not None else len(candidates)  # type: ignore[arg-type]
+        return _laya_rank(str(query), candidates, top_k=k)
+    except Exception:  # noqa: BLE001 — ranking is best-effort
+        return []
+
+
+def _apply_laya_rerank(query: str, ranked_tags: list[Tag], root_real: str = "") -> list[Tag]:
+    """اعمال laya rank روی فایل‌ها — در نبود سیگنال ترتیب قبلی حفظ می‌شود."""
+    if not query or not str(query).strip() or not ranked_tags:
+        return ranked_tags
+    try:
+        by_file: dict[str, list[Tag]] = defaultdict(list)
+        for t in ranked_tags:
+            by_file[t.rel_fname].append(t)
+        candidates: list[dict] = []
+        for rel, tags in by_file.items():
+            desc = " ".join(t.name for t in tags[:20])
+            candidates.append({"name": rel, "description": desc})
+        ranked = rank_with_laya(str(query), candidates, top_k=len(candidates))
+        if not ranked:
+            return ranked_tags
+        order = {str(r.get("name") or ""): i for i, r in enumerate(ranked)}
+        base = len(order)
+        return sorted(ranked_tags, key=lambda t: (order.get(t.rel_fname, base), ranked_tags.index(t)))
+    except Exception:  # noqa: BLE001 — ranking is best-effort
+        return ranked_tags
+
+
 # لیست پسوندهای متنی که نماد استخراج می‌کنیم (مطابق با ابزارهای فایل).
 _TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -383,8 +418,8 @@ def _extract_symbols(rel_path: str, text: str) -> list[tuple[str, int, str]]:
 # گراف ارجاع + PageRank (مشابه aider.get_ranked_tags)
 # --------------------------------------------------------------------------
 
-def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real: str = ""):
-    """رتبه‌بندی تگ‌ها با PageRank + personalization (مثل aider)."""
+def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real: str = "", query: str | None = None):
+    """رتبه‌بندی تگ‌ها با PageRank + personalization (مثل aider) + laya rank اختیاری."""
     defines = defaultdict(set)
     references = defaultdict(list)
     definitions = defaultdict(set)
@@ -469,7 +504,10 @@ def _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_iden
             rank = ranked_definitions.get((fname, t.name), 0.0)
             ranked_tags.append((rank, t))
     ranked_tags.sort(key=lambda x: -x[0])
-    return [t for _, t in ranked_tags]
+    out = [t for _, t in ranked_tags]
+    if query and str(query).strip():
+        out = _apply_laya_rerank(str(query), out, root_real)
+    return out
 
 
 def _read_file_tags(fname: str) -> list[Tag]:
@@ -530,9 +568,9 @@ def _token_count(text: str) -> int:
     return len(text) // 4
 
 
-def _get_ranked_tags_map(chat_fnames, other_fnames, max_map_tokens, mentioned_fnames, mentioned_idents, root_real: str = "") -> str:
+def _get_ranked_tags_map(chat_fnames, other_fnames, max_map_tokens, mentioned_fnames, mentioned_idents, root_real: str = "", query: str | None = None) -> str:
     """ساخت نقشه با بودجه توکنی پویا (binary search روی تعداد تگ‌ها)."""
-    ranked_tags = _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real)
+    ranked_tags = _get_ranked_tags(chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real, query=query)
     if not ranked_tags:
         return ""
 
@@ -638,6 +676,7 @@ def format_symbol_map(
     chat_files: list[str] | None = None,
     mentioned_fnames: set[str] | None = None,
     mentioned_idents: set[str] | None = None,
+    query: str | None = None,
 ) -> str:
     """فرمت‌بندی نقشه به متن درختی فشرده برای الصاق به پرامپت (مثل aider.get_repo_map).
 
@@ -677,7 +716,7 @@ def format_symbol_map(
 
     try:
         tree = _get_ranked_tags_map(
-            chat_fnames, other_fnames, max_map_tokens, mentioned_abs, mentioned_idents, root_real
+            chat_fnames, other_fnames, max_map_tokens, mentioned_abs, mentioned_idents, root_real, query=query
         )
     except Exception:  # noqa: BLE001
         tree = ""

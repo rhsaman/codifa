@@ -9474,6 +9474,8 @@ textarea {
 .trace-row-expand {
   /* هم‌تراز با .trace-row-head (12px) تا محتوای DURATION/SUMMARY/ARGS
      به لبهٔ کارت نچسبد */
+  width: 100%;
+  box-sizing: border-box;
   padding: 6px 12px;
   border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.08));
   /* سطح بدنه مشتق از خود تم (--bg-inset): نوشته‌ها (DURATION/SUMMARY/ARGS)
@@ -9482,6 +9484,9 @@ textarea {
 }
 
 .trace-expand-section {
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
   padding: 6px 0;
 }
 
@@ -9517,8 +9522,22 @@ textarea {
   border-radius: 6px;
   padding: 6px 8px;
   margin: 0;
+  width: 100%;
+  box-sizing: border-box;
   max-height: 200px;
-  overflow-y: auto;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* خروجی ترمینال (run_terminal): متن بلند با اسکرول عمودی، تمام‌عرض پنل */
+.trace-terminal-output {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .trace-expand-diff {
@@ -14482,6 +14501,20 @@ mark.diff-hit-active {
   font-size: var(--chat-font-size);
   line-height: 1.68;
   color: var(--text);
+}
+
+/* جهت متن اینباکس مثل چت از dir والد پیروی می‌کند (نه dir="auto" که با شروع
+   لاتین مثل EUR/USD متن فارسی را چپ‌چین می‌کرد). */
+.schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-markdown,
+.schedule-inbox-overlay[dir="rtl"] .schedule-inbox-markdown {
+  direction: rtl;
+  text-align: right;
+}
+
+.schedule-inbox-overlay[data-dir="ltr"] .schedule-inbox-markdown,
+.schedule-inbox-overlay[dir="ltr"] .schedule-inbox-markdown {
+  direction: ltr;
+  text-align: left;
 }
 
 .schedule-inbox-markdown ::selection {

@@ -1222,7 +1222,7 @@ def _web_search_auto_fetch() -> int:
     return max(0, min(10, n))
 
 
-def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0) -> str | None:
+def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0, chat_id: str = "") -> str | None:
     """گیت laya روی خلاصه‌سازی وب: «distill» / «raw» / None.
 
     فقط تصمیم اطراف distill (لزوم خلاصه) گرفته می‌شود، نه تولید متن.
@@ -1243,7 +1243,7 @@ def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0) -> 
                 "total_chars": int(total_chars or 0),
             },
             ["distill", "raw"],
-            chat_id=str(_chat_id or ""),
+            chat_id=str(chat_id or ""),
         )
     except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
         return None
@@ -4976,6 +4976,7 @@ When you need to read several files, read multiple independent files in parallel
                                 max_map_tokens=1024,
                                 mentioned_fnames=_mentioned_fnames,
                                 mentioned_idents=_mentioned_idents,
+                                query=prompt,
                             )
                             if root
                             else ""
@@ -5333,7 +5334,7 @@ When you need to read several files, read multiple independent files in parallel
         try:
             _raw_total = sum(len(ln) for ln in lines)
             _laya_skip_distill = await asyncio.to_thread(
-                _laya_distill_choice, query, len(results), _raw_total
+                _laya_distill_choice, query, len(results), _raw_total, str(_chat_id or "")
             ) == "raw"
         except Exception:  # noqa: BLE001 — گیت اختیاری است
             _laya_skip_distill = False

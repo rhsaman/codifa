@@ -66,7 +66,7 @@ function InboxMarkdown({ text }: { text: string }) {
   const dir = useStore((s) => s.dir);
   const prepared = useMemo(() => prepareContent(text, dir), [text, dir]);
   return (
-    <div className="chat-message markdown-body schedule-inbox-markdown" dir="auto">
+    <div className="chat-message markdown-body schedule-inbox-markdown" dir={dir}>
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
         {prepared}
       </ReactMarkdown>

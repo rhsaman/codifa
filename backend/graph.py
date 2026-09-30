@@ -1913,6 +1913,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     max_map_tokens=max_map_tokens,
                     mentioned_fnames=_mentioned_fnames,
                     mentioned_idents=_mentioned_idents,
+                    query=prompt,
                 )
                 if root
                 else ""
@@ -3023,7 +3024,7 @@ async def _run_mode_turn(
         import trace_store as _trace_store
 
         _trace_token = _trace_store.set_current_chat(str(chat_id or ""))
-    except Exception:  # noqa: BLE001, S110 — trace context must never break the turn
+    except Exception:  # noqa: BLE001 — trace context must never break the turn
         _trace_token = None
     tctx = await build_turn_context(state, queue)
     model = tctx["model"]
@@ -3135,7 +3136,7 @@ async def _run_mode_turn(
                 model=str(model_id or ""),
                 prompt=_args_text,
             )
-        except Exception:  # noqa: BLE001, S110 — trace must never break the tool
+        except Exception:  # noqa: BLE001 — trace must never break the tool
             _tool_entry = None
         try:
             if isinstance(fn, StructuredTool):
@@ -3989,9 +3990,9 @@ async def _run_mode_turn(
             _step_hint = _batchable_nudge(_pending)
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
-            async def _run_readonly(tc) -> str:
+            async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
-                    tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", steps
+                    tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
                 )
 
             _results = await execute_readonly_calls(_parallel, _run_readonly)

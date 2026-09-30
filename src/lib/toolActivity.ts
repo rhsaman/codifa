@@ -227,6 +227,25 @@ export function resolveToolResult(
   return activities.map((a) => resolved(a, true));
 }
 
+/** Extract plain terminal text from tool result rows (`results`/`items`).
+ *  `run_terminal` emits `[{content: "$ cmd\nEXIT CODE: …\n…"}]` — no
+ *  `file`/`path`/`url` fields — so `FileResultLinks`/`WebResultLinks` render
+ *  nothing. This helper reads `content`/`snippet`/`text` first and falls back
+ *  to the other row fields, so RESULTS never stays empty. */
+export function terminalOutputText(items: unknown): string {
+  if (!Array.isArray(items)) return "";
+  const parts: string[] = [];
+  for (const row of items as Array<Record<string, unknown>>) {
+    if (!row || typeof row !== "object") continue;
+    const value =
+      row.content ?? row.snippet ?? row.text ?? row.title ?? row.url ?? row.path ?? row.file;
+    if (value !== undefined && value !== null && String(value) !== "") {
+      parts.push(String(value));
+    }
+  }
+  return parts.join("\n");
+}
+
 /**
  * Force all "running" cards (including nested children) to "done" with an
  * elapsed time. Used by `resolveStuckCards` in Chat.tsx when a stream ends

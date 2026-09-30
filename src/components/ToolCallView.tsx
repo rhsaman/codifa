@@ -9,7 +9,7 @@ import {
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
-import { diffStatsFromUnified } from "../lib/toolActivity";
+import { diffStatsFromUnified, terminalOutputText } from "../lib/toolActivity";
 import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
@@ -418,6 +418,26 @@ export const WebResultLinks = memo(function WebResultLinks({
     </ul>
   );
 });
+
+/** متن خروجی ترمینال (`run_terminal`): آیتم‌ها فقط فیلد `content` دارند
+ *  (بدون `file`/`path`/`url`) پس `FileResultLinks` خالی رندر می‌شود.
+ *  خروجی بلند با `trace-expand-pre` اسکرول عمودی می‌خورد. */
+export const TerminalResultText = function TerminalResultText({
+  items,
+}: {
+  items: unknown;
+}) {
+  const text = terminalOutputText(items);
+  if (!text) return null;
+  return (
+    <pre
+      className="trace-expand-val trace-expand-pre trace-terminal-output"
+      dir="ltr"
+    >
+      {text}
+    </pre>
+  );
+};
 
 /** نمایش نتایج grep/glob به‌صورت لیست مسیر فایل (با شمارهٔ خط) — نه لینک وب.
  *  آیتم‌های این ابزارها فیلد `url` ندارند، پس نباید از WebResultLinks (مخصوص
@@ -1119,17 +1139,27 @@ const TraceRow = memo(function TraceRow({
               </pre>
             </div>
           )}
-          {activity.items && activity.items.length > 0 && (
+          {(activity.items ?? activity.results) &&
+            (activity.items ?? activity.results)!.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
               {activity.tool === "web_search" ||
                 activity.tool === "fetch_url" ? (
-                <WebResultLinks items={activity.items} />
+                <WebResultLinks
+                  items={(activity.items ?? activity.results)!}
+                />
+              ) : activity.tool === "run_terminal" ? (
+                <TerminalResultText
+                  items={activity.items ?? activity.results}
+                />
               ) : (
                 <FileResultLinks
                   tool={activity.tool}
                   items={
-                    activity.items as unknown as Array<Record<string, unknown>>
+                    (activity.items ??
+                      activity.results) as unknown as Array<
+                      Record<string, unknown>
+                    >
                   }
                 />
               )}
@@ -1419,17 +1449,27 @@ export const ToolSingleRow = memo(function ToolSingleRow({
               </pre>
             </div>
           )}
-          {activity.items && activity.items.length > 0 && (
+          {(activity.items ?? activity.results) &&
+            (activity.items ?? activity.results)!.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
               {activity.tool === "web_search" ||
                 activity.tool === "fetch_url" ? (
-                <WebResultLinks items={activity.items} />
+                <WebResultLinks
+                  items={(activity.items ?? activity.results)!}
+                />
+              ) : activity.tool === "run_terminal" ? (
+                <TerminalResultText
+                  items={activity.items ?? activity.results}
+                />
               ) : (
                 <FileResultLinks
                   tool={activity.tool}
                   items={
-                    activity.items as unknown as Array<Record<string, unknown>>
+                    (activity.items ??
+                      activity.results) as unknown as Array<
+                      Record<string, unknown>
+                    >
                   }
                 />
               )}
@@ -1721,9 +1761,16 @@ export const ToolCallView = memo(function ToolCallView({
               </div>
             )}
           {activity.tool === "web_search" &&
-            activity.items &&
-            activity.items.length > 0 && (
-              <WebResultLinks items={activity.items} />
+            (activity.items ?? activity.results) &&
+            (activity.items ?? activity.results)!.length > 0 && (
+              <WebResultLinks items={(activity.items ?? activity.results)!} />
+            )}
+          {activity.tool === "run_terminal" &&
+            (activity.items ?? activity.results) &&
+            (activity.items ?? activity.results)!.length > 0 && (
+              <TerminalResultText
+                items={activity.items ?? activity.results}
+              />
             )}
           {/* فقط ابزارهای غیر-ویرایش دیف را در چت نشان می‌دهند. */}
           {activity.diff && (

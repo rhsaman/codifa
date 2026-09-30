@@ -109,3 +109,40 @@ def test_looks_like_code_ident_filter():
     assert _looks_like_code_ident("buildSymbolMap")
     assert _looks_like_code_ident("HttpRequest")
     assert _looks_like_code_ident("cache_manager")
+
+
+def test_rank_with_laya_empty_query_fallback():
+    """وقتی query خالی است باید بدون خطا [] برگردد (fallback)."""
+    from symbol_index import rank_with_laya
+
+    assert rank_with_laya("", [{"name": "a.py", "description": "foo"}]) == []
+    assert rank_with_laya("   ", [{"name": "a.py"}]) == []
+
+
+def test_rank_with_laya_no_signal_fallback(monkeypatch):
+    """وقتی laya سیگنالی ندارد، ترتیب قبلی حفظ شود."""
+    import symbol_index
+
+    monkeypatch.setattr(symbol_index, "rank_with_laya", lambda q, c, top_k=None: [])
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    pass\n")
+        out = format_symbol_map(d, query="something unrelated xyz")
+        assert "a.py" in out and "b.py" in out
+
+
+def test_rank_with_laya_reorders(monkeypatch):
+    """وقتی laya سیگنال دارد، فایل مرتبط باید اول بیاید."""
+    import symbol_index
+
+    def fake_rank(query, candidates, top_k=None):
+        # b.py را مرتبط‌تر نشان بده
+        ordered = sorted(candidates, key=lambda c: 0 if c["name"] == "b.py" else 1)
+        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in ordered]
+
+    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    pass\n")
+        out = format_symbol_map(d, query="bar feature")
+        assert out.find("b.py") < out.find("a.py")

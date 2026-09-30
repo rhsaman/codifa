@@ -57,9 +57,12 @@ console.log('2) ردیف فشرده تک‌خطی چپ‌چین:')
   check('ساعت دارد', html.includes('trace-panel-time'))
   check('شورون دارد', html.includes('trace-panel-chev'))
   check('کارت قدیمی ندارد', !html.includes('trace-row-block'))
+  check('دیفالت بسته است (بدنه رندر نشد)', !html.includes('trace-panel-body'))
+  const openRow = renderToString(<TraceRow entry={rows[0]} defaultOpen />)
+  check('با defaultOpen بدنه باز است', openRow.includes('trace-panel-body'))
 }
 
-console.log('3) سربرگ تاشوی step:')
+console.log('3) سربرگ تاشوی step (دیفالت بسته):')
 {
   const html = renderToString(
     <TraceStepGroup step={6} entries={[rows[0], rows[1]]} />,
@@ -67,7 +70,11 @@ console.log('3) سربرگ تاشوی step:')
   check('هدر step دارد', html.includes('trace-panel-step-head'))
   check('عنوان Step 6 دارد', html.includes('Step 6'))
   check('شمارش ردیف‌ها دارد', /2(?:<!-- -->)? events/.test(html))
-  check('هر دو ردیف رندر شدند', (html.match(/trace-panel-row/g) || []).length === 2)
+  check('دیفالت بسته است (ردیفی رندر نشد)', !(html.match(/trace-panel-row/g) || []).length)
+  const openHtml = renderToString(
+    <TraceStepGroup step={6} entries={[rows[0], rows[1]]} defaultOpen />,
+  )
+  check('با defaultOpen هر دو ردیف رندر شدند', (openHtml.match(/trace-panel-row/g) || []).length === 2)
 }
 
 console.log('4) کلید پایدار گروه با لاگ جدید:')

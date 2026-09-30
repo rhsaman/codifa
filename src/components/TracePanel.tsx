@@ -225,10 +225,11 @@ export function TraceRow({
   const result = String((entry as { result?: string }).result || "");
   const status = String(detail.status || (entry.error ? "error" : "") || "").toLowerCase();
 
-  // هنگام سرچ، ردیف‌های منطبق خودکار باز شوند تا پرامپت/پاسخ دیده شود.
+  // دیفالت بسته؛ فقط هنگام سرچ خودکار باز شود تا پرامپت/پاسخ دیده شود.
+  // با پاک شدن سرچ به حالت دیفالت (بسته) برمی‌گردد.
   useEffect(() => {
     if (query?.trim()) setOpen(true);
-    else if (defaultOpen !== undefined) setOpen(Boolean(defaultOpen));
+    else setOpen(Boolean(defaultOpen));
   }, [query, defaultOpen]);
 
   const tokens = entry.tokens;
@@ -367,6 +368,7 @@ export function TraceStepGroup({
   hitBases,
   activeHit = -1,
   activeRef,
+  defaultOpen = false,
 }: {
   step: number | null;
   entries: TraceEntry[];
@@ -374,11 +376,15 @@ export function TraceStepGroup({
   hitBases?: number[];
   activeHit?: number;
   activeRef?: ActiveRef;
+  defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(true);
+  // دیفالت بسته؛ فقط هنگام سرچ خودکار باز شود تا رخدادها دیده شوند.
+  // با پاک شدن سرچ به حالت دیفالت (بسته) برمی‌گردد.
+  const [open, setOpen] = useState(Boolean(defaultOpen));
   useEffect(() => {
     if (query?.trim()) setOpen(true);
-  }, [query]);
+    else setOpen(Boolean(defaultOpen));
+  }, [query, defaultOpen]);
   const tokens = entries.reduce((n, e) => n + (e.tokens?.total ?? 0), 0);
   return (
     <section className="trace-panel-step" aria-label={step !== null ? `Step ${step}` : "Other"}>
@@ -400,7 +406,7 @@ export function TraceStepGroup({
               key={entry.id}
               entry={entry}
               query={query}
-              defaultOpen={i === 0}
+              defaultOpen={false}
               hitBase={hitBases?.[i] ?? -1}
               activeHit={activeHit}
               activeRef={activeRef}

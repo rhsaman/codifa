@@ -15009,6 +15009,12 @@ mark.diff-hit-active {
   padding: 0 1px;
 }
 
+.trace-hit-active,
+mark.trace-hit-active {
+  background: color-mix(in srgb, var(--accent) 65%, transparent);
+  outline: 1px solid var(--accent);
+}
+
 .trace-row-title {
   font-size: 12px;
   font-weight: 600;

@@ -202,6 +202,9 @@ export interface Settings {
   maxSteps?: number
   /** Tool result cache TTL in minutes (default 60). */
   cacheTtlMinutes?: number
+  /** Schedule run ids already seen in the inbox (badge state). Persisted so
+   *  read runs stay read across restarts. */
+  scheduleRunsSeen?: string[]
 }
 
 /** A first-class workspace in the sidebar. ``root`` is the project folder; may

@@ -347,22 +347,28 @@ export function ScheduleSection() {
   const activeRoot = useStore((s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root);
   const [collapsed, setCollapsed] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   // مجموع توکن مصرفی هر تسک (از usage ران‌ها) — روی خود تسک نمایش داده می‌شود،
   // نه در model usage که فقط مصرف چت فعال است.
   const [taskTokens, setTaskTokens] = useState<Record<string, number>>({});
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setError(null);
     const out = await listSchedules();
     setLoading(false);
-    if (!("error" in out)) setSchedules(out);
+    if ("error" in out) {
+      setError(out.error);
+    } else {
+      setSchedules(out);
+    }
     const all = await listAllScheduleRuns(200);
     if (!("error" in all)) setTaskTokens(taskTokenTotals(all));
   }, [setSchedules]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (!collapsed) void refresh();
+  }, [collapsed, refresh]);
 
   return (
     <div className="sidebar-panel schedule-docked" dir={dir}>
@@ -411,6 +417,13 @@ export function ScheduleSection() {
           )}
           {loading && schedules.length === 0 ? (
             <div className="schedule-runs-empty">Loading…</div>
+          ) : error && schedules.length === 0 && !formOpen ? (
+            <div className="schedule-runs-empty">
+              <span>{error}</span>
+              <button className="btn secondary" onClick={() => void refresh()}>
+                Retry
+              </button>
+            </div>
           ) : schedules.length === 0 && !formOpen ? (
             <div className="schedule-runs-empty">No scheduled tasks — press ＋ to create one</div>
           ) : (

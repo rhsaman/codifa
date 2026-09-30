@@ -53,6 +53,7 @@ from providers import (
     qualify_model_id,
 )
 from tool_batching import execute_readonly_calls
+from tool_message_projection import project_tool_results
 
 # _strip_think_tags و _is_repeating از _common import می‌شوند (single source of truth).
 
@@ -1662,6 +1663,10 @@ async def langchain_tool_loop(
     # and reminds it to batch after a few consecutive same-scope steps.
     _streak = _BatchStreakTracker()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
+    # Reminders / steering are TRANSIENT: sent with the very next request only,
+    # never stored in msgs. Stored copies were re-sent on every later step (one
+    # more per step while a streak lasted), growing the context for no benefit.
+    _transient: list[Any] = []
     while steps < max_steps:
         steps += 1
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -1677,15 +1682,16 @@ async def langchain_tool_loop(
         # نگهبان نهایی ترنسکریپت (یکتاسازی شناسه‌ها + حذف بی‌جواب‌ها + یک
         # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
         normalize_tool_transcript(msgs, _logger)
+        _req = [*project_tool_results(msgs), *_transient]
         try:
-            ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(msgs)
+            ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
         except Exception as _pc_exc:  # noqa: BLE001
             # Some gateways/models reject `parallel_tool_calls` with a 400 —
             # retry this step once without it (same fallback as graph.py).
             if _no_pc or not _is_parallel_calls_error(_pc_exc):
                 raise
             _no_pc = True
-            ai = await bind_tools_parallel(model, lc_tools, False).ainvoke(msgs)
+            ai = await bind_tools_parallel(model, lc_tools, False).ainvoke(_req)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The
         # main-agent loop emits usage from agents.py; sub-agents run through this
@@ -1814,8 +1820,9 @@ async def langchain_tool_loop(
         # results (same placement as the steering messages below) — a
         # standalone message is impossible to miss, unlike a suffix at the
         # end of a huge result.
+        _transient.clear()
         if _batch_hint:
-            msgs.append(HumanMessage(content=_batch_hint.strip()))
+            _transient.append(HumanMessage(content=_batch_hint.strip()))
         # --- soft tool-call budget nudge ---
         # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or
         # summarizing — mirrors the doom-loop guard but for "too many calls" rather
@@ -1827,7 +1834,7 @@ async def langchain_tool_loop(
             # without violating chat templates that require SystemMessage only
             # at position 0 (e.g. Qwen3.5 / llama.cpp). This mirrors the same
             # fix applied in graph.py for plan/tool-reuse notes.
-            msgs.append(
+            _transient.append(
                 HumanMessage(
                     content=(
                         f"[steering] You have made {_tool_call_count} tool calls so far "

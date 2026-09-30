@@ -138,3 +138,33 @@ export function filterFilesByQuery<T extends { path: string; diff: string }>(
   if (!query.trim()) return files;
   return files.filter((f) => fileMatchesQuery(f, query));
 }
+
+/** یک ورودی trace برای شمارش رخدادهای جست‌وجو — همان ترتیبی که `TraceRow`
+ *  رندر و هایلایت می‌کند (عنوان، پرامپت، پاسخ، جزئیات). */
+export interface TraceSearchEntry {
+  title: string;
+  prompt?: string;
+  result?: string;
+  detailJson?: string;
+}
+
+/** تعداد رخدادهای قابل‌ناوبری داخل یک ورودی trace. */
+export function countTraceEntryHits(entry: TraceSearchEntry, query: string): number {
+  const q = query.trim();
+  if (!q) return 0;
+  return (
+    countOccurrences(entry.title || "", q) +
+    countOccurrences(entry.prompt || "", q) +
+    countOccurrences(entry.result || "", q) +
+    countOccurrences(entry.detailJson || "", q)
+  );
+}
+
+/** تعداد رخدادهای قابل‌ناوبری داخل لیست ورودی‌های trace. */
+export function countTraceHits(entries: TraceSearchEntry[], query: string): number {
+  const q = query.trim();
+  if (!q) return 0;
+  let n = 0;
+  for (const e of entries) n += countTraceEntryHits(e, q);
+  return n;
+}

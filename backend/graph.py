@@ -1087,7 +1087,9 @@ def resolve_subagent_model(
     )
 
 
-async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
+async def _vision_analyze(
+    model: Any, image_uris: list[str], chat_id: str = ""
+) -> str | None:
     """One-shot vision analysis of attached images using ``model`` (the
     configured vision model). Returns the analysis text, or ``None`` on any
     failure. The caller injects the result into the main model's context so it
@@ -1144,7 +1146,7 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
                 user=user,
                 images=image_uris,
                 sub=True,
-                chat_id=str(state.get("chat_id", "") or ""),
+                chat_id=str(chat_id or ""),
             )
             result = (text or "").strip()
             if result:
@@ -1234,7 +1236,9 @@ _VISION_BACKOFF_BASE = 1.0
 _VISION_TOTAL_BUDGET = 90.0
 
 
-async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | None:
+async def _vision_analyze_cached(
+    model: Any, image_uris: list[str], chat_id: str = ""
+) -> str | None:
     if not image_uris:
         return None
     import hashlib
@@ -1243,7 +1247,7 @@ async def _vision_analyze_cached(model: Any, image_uris: list[str]) -> str | Non
     cached = _VISION_CACHE.get(key)
     if cached is not None:
         return cached
-    result = await _vision_analyze(model, image_uris)
+    result = await _vision_analyze(model, image_uris, chat_id)
     if result:
         _VISION_CACHE[key] = result
         if len(_VISION_CACHE) > _VISION_CACHE_MAX:
@@ -1962,7 +1966,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             lc_history = history_to_langchain_messages(history, current_mode=mode)
         else:
             _older = history[: len(history) - len(_recent)]
-            _summary = await _summarize_history_head(compact_model, _older, root)
+            _summary = await _summarize_history_head(
+                compact_model, _older, root, chat_id
+            )
             lc_history = history_to_langchain_messages(_recent, current_mode=mode)
             lc_history.insert(0, HumanMessage(content=_summary))
             # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
@@ -2298,7 +2304,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     prefetch_model = vision_model or model
     _analysis = None
     if image_uris and prefetch_model:
-        _analysis = await _vision_analyze_cached(prefetch_model, image_uris)
+        _analysis = await _vision_analyze_cached(prefetch_model, image_uris, chat_id)
         if _analysis:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
@@ -2629,7 +2635,9 @@ _HISTORY_SUMMARY_CACHE: dict = {}  # key=(root, hash) -> summary text
 _HISTORY_SUMMARY_CACHE_MAX = 200  # bound growth; summaries are stable per (root, hash)
 
 
-async def _summarize_history_head(compact_model: Any, older: list, root: str) -> str:
+async def _summarize_history_head(
+    compact_model: Any, older: list, root: str, chat_id: str = ""
+) -> str:
     """Summarize the OLDER turns (dropped by historyLimit) into one block.
 
     The block is prefixed with "[Compacted earlier context]" so the
@@ -2666,7 +2674,7 @@ async def _summarize_history_head(compact_model: Any, older: list, root: str) ->
                     "and errors. Prefix the summary with '[Compacted earlier context]'."
                 ),
                 user=_serialized[:20000],
-                chat_id=str(state.get("chat_id", "") or ""),
+                chat_id=str(chat_id or ""),
             )
             if not str(_summary).startswith("[Compacted earlier context]"):
                 _summary = "[Compacted earlier context]\n" + str(_summary)
@@ -3280,6 +3288,10 @@ async def _run_mode_turn(
         # transcript valid: a tool_calls AIMessage must be followed by its
         # ToolMessages before any new HumanMessage).
         _nudge_pending = False
+        # Batching / repetition reminders are TRANSIENT: sent with the very next
+        # request only, never stored in msgs. Stored copies were re-sent on every
+        # later step (and saved into the turn history) with no added value.
+        _transient_msgs: list[Any] = []
         # رویداد warn تذکر batching فقط یک بار در هر نوبت به UI می‌رود.
         _batch_warned = False
         # Auto-continue guard for max-output truncation (mirrors opencode, which
@@ -3417,6 +3429,8 @@ async def _run_mode_turn(
                 normalize_tool_transcript(msgs)
 
                 request_messages = project_tool_results(msgs)
+                if _transient_msgs:
+                    request_messages = [*request_messages, *_transient_msgs]
                 async for chunk in bound.astream(request_messages):
                     # Check for cancellation at each chunk so the Stop button
                     # properly interrupts the provider call (llama.cpp / local servers).
@@ -4026,20 +4040,21 @@ async def _run_mode_turn(
             # a standalone message is impossible to miss, unlike a suffix at
             # the end of a huge result. Surfaced to the user once per turn so
             # the UI shows the nudge is actually firing.
+            _transient_msgs.clear()
             if _batch_hint:
                 if not _batch_warned:
                     _batch_warned = True
                     queue.put_nowait(
                         {"kind": "warn", "content": _batch_hint.strip()}
                     )
-                msgs.append(HumanMessage(content=_batch_hint.strip()))
+                _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
             # transcript stays valid (a tool_calls AIMessage must be followed by its
             # ToolMessages before any new HumanMessage). Gives the model a chance to
             # self-recover from a doom loop before the hard stop at _MAX_REPEAT.
             if _nudge_pending:
                 _nudge_pending = False
-                msgs.append(
+                _transient_msgs.append(
                     HumanMessage(
                         content=(
                             "REPETITION WARNING: you called the same tool with "

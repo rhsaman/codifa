@@ -49,6 +49,10 @@ MAX_FILES = 10_000
 MAX_TERMINAL_OUTPUT = 30_000
 TERMINAL_TIMEOUT = 120
 TERMINAL_TIMEOUT_MAX = 300
+_LONG_RUNNING_CMD_RE = re.compile(
+    r"\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck)\S*"
+    r"|pytest|vitest|jest|tsc|cargo\s+(?:test|build)|go\s+(?:test|build)|mvn|gradle)\b"
+)
 MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
 WEB_SEARCH_TIMEOUT = 15
@@ -4307,7 +4311,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
-        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself."""
+        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Parent search cache for terminal search commands
         if _is_terminal_search(command):
@@ -4341,6 +4345,11 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "model": _main_name if _is_search_cmd else "",
             }
         )
+        # Test / build / typecheck runs routinely exceed the 120s default;
+        # they were killed (exit -1) and re-run identically, burning a full
+        # round trip each time. Give them the maximum window up front.
+        if timeout == TERMINAL_TIMEOUT and _LONG_RUNNING_CMD_RE.search(command):
+            timeout = TERMINAL_TIMEOUT_MAX
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]

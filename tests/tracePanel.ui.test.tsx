@@ -14,8 +14,11 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { TraceRow, TraceStepGroup, groupTracesByStep, traceStep, traceGroupKey } = await import(
+const { TraceRow, TraceStepGroup, groupTracesByStep, traceStep, traceGroupKey, traceEntrySearchParts } = await import(
   '../src/components/TracePanel'
+)
+const { countTraceEntryHits, countTraceHits, stepHitIndex, locateHit } = await import(
+  '../src/lib/diffSearch.ts'
 )
 
 let failed = 0
@@ -85,6 +88,37 @@ console.log('4) کلید پایدار گروه با لاگ جدید:')
   const grownGroups = groupTracesByStep(withNewRow)
   const grownKeys = grownGroups.map((g) => traceGroupKey(g.step, g.entries))
   check('گروه step قبلی با ردیف جدید کلیدش حفظ شد', oldKeys.every((k) => grownKeys.includes(k)))
+}
+
+console.log('5) ناوبری سرچ (شمارش + چرخش جلو/عقب):')
+{
+  const parts = traceEntrySearchParts({
+    id: '9',
+    at: 9,
+    kind: 'tool',
+    summary: 'read config',
+    prompt: '{"path": "config"}',
+    result: 'config ok',
+    detail: { name: 'read' },
+  } as any)
+  check('بخش‌های سرچ استخراج شد', parts.title === 'read config' && parts.prompt.includes('config'))
+  const hits = countTraceEntryHits(parts, 'config')
+  check('سه رخداد شمرده شد', hits === 3, hits)
+  check('کوئری خالی صفر است', countTraceEntryHits(parts, '  ') === 0)
+  const list = [parts, traceEntrySearchParts(rows[0])]
+  check('جمع رخدادهای لیست درست است', countTraceHits(list, 'config') === 3, countTraceHits(list, 'config'))
+  check('جلو از آخر می‌چرخد', stepHitIndex(2, 3, 1) === 0)
+  check('عقب از اول می‌چرخد', stepHitIndex(0, 3, -1) === 2)
+  const loc = locateHit([3, 1], 3)
+  check('رخداد چهارم در ورودی دوم است', loc?.fileIndex === 1 && loc?.localIndex === 0, loc)
+}
+
+console.log('6) رندر هایلایت فعال سرچ:')
+{
+  const html = renderToString(<TraceRow entry={rows[0]} query="read" hitBase={0} activeHit={0} />)
+  check('هایلایت فعال دارد', html.includes('trace-hit-active'))
+  const plain = renderToString(<TraceRow entry={rows[0]} query="read" />)
+  check('بدون ناوبری هایلایت فعال ندارد', !plain.includes('trace-hit-active'))
 }
 
 if (failed > 0) {

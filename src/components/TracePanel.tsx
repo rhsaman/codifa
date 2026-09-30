@@ -5,7 +5,10 @@ import { useTracePanel, type TraceTab } from "../lib/tracePanel";
 import { clearChatTraces, getChatTraces } from "../lib/api";
 import { copyToClipboard } from "../lib/clipboard";
 import type { TraceEntry } from "../types";
+import { countOccurrences, countTraceEntryHits, stepHitIndex } from "../lib/diffSearch";
 import { layaConfidencePct, layaReasonLabel, layaRouteLabel } from "./LayaLabels";
+
+type ActiveRef = { current: HTMLElement | null };
 
 const TABS: Array<[TraceTab, string]> = [
   ["all", "All"],
@@ -47,8 +50,14 @@ function timeLabel(at: number): string {
   }
 }
 
-/** هایلایت رخدادهای کوئری داخل متن (برای سرچ داخل پرامپت/پاسخ). */
-function highlightHits(text: string, query: string): React.ReactNode {
+/** هایلایت رخدادهای کوئری داخل متن — مثل دیف با رخداد فعال و اسکرول خودکار. */
+function highlightHits(
+  text: string,
+  query: string,
+  base = -1,
+  active = -1,
+  activeRef?: ActiveRef,
+): React.ReactNode {
   const q = (query || "").trim();
   if (!q || !text) return text;
   const lower = text.toLowerCase();
@@ -56,6 +65,8 @@ function highlightHits(text: string, query: string): React.ReactNode {
   const parts: React.ReactNode[] = [];
   let i = 0;
   let key = 0;
+  let ordinal = 0;
+  const navigable = base >= 0 && active >= 0;
   while (i < text.length) {
     const hit = lower.indexOf(needle, i);
     if (hit < 0) {
@@ -63,8 +74,22 @@ function highlightHits(text: string, query: string): React.ReactNode {
       break;
     }
     if (hit > i) parts.push(text.slice(i, hit));
+    const idx = navigable ? base + ordinal : -1;
+    ordinal++;
+    const isActive = navigable && idx === active;
     parts.push(
-      <mark key={key++} className="trace-hit">
+      <mark
+        key={key++}
+        className={isActive ? "trace-hit trace-hit-active" : "trace-hit"}
+        {...(isActive ? { "aria-current": "true" as const } : {})}
+        ref={
+          isActive && activeRef
+            ? (el: HTMLElement | null) => {
+                activeRef.current = el;
+              }
+            : undefined
+        }
+      >
         {text.slice(hit, hit + q.length)}
       </mark>,
     );
@@ -113,11 +138,17 @@ function TextBlock({
   text,
   query,
   kind,
+  hitBase = -1,
+  activeHit = -1,
+  activeRef,
 }: {
   label: string;
   text: string;
   query?: string;
   kind: "prompt" | "result" | "json";
+  hitBase?: number;
+  activeHit?: number;
+  activeRef?: ActiveRef;
 }) {
   if (!text) return null;
   return (
@@ -127,7 +158,7 @@ function TextBlock({
         <CopyButton text={text} label="Copy" />
       </div>
       <pre className={kind === "json" ? "trace-detail-json" : "trace-prompt-text"}>
-        {query?.trim() ? highlightHits(text, query) : text}
+        {query?.trim() ? highlightHits(text, query, hitBase, activeHit, activeRef) : text}
       </pre>
     </div>
   );
@@ -157,8 +188,37 @@ export function groupTracesByStep(entries: TraceEntry[]): Array<{ step: number |
   return groups;
 }
 
+/** بخش‌های قابل‌جست‌وجوی یک ورودی — همان ترتیبی که `TraceRow` رندر می‌کند. */
+export function traceEntrySearchParts(entry: TraceEntry): {
+  title: string;
+  prompt: string;
+  result: string;
+  detailJson: string;
+} {
+  const title = traceRowTitle(entry);
+  const prompt = entry.prompt || "";
+  const result = String((entry as { result?: string }).result || "");
+  const detailJson =
+    !prompt && !result ? JSON.stringify(entry.detail ?? {}, null, 2) : "";
+  return { title, prompt, result, detailJson };
+}
+
 /** ردیف تاشوی یک ورودی لاگ — تک‌خطی فشرده چپ‌چین مثل لنگ‌اسمیت. */
-export function TraceRow({ entry, query, defaultOpen }: { entry: TraceEntry; query?: string; defaultOpen?: boolean }) {
+export function TraceRow({
+  entry,
+  query,
+  defaultOpen,
+  hitBase = -1,
+  activeHit = -1,
+  activeRef,
+}: {
+  entry: TraceEntry;
+  query?: string;
+  defaultOpen?: boolean;
+  hitBase?: number;
+  activeHit?: number;
+  activeRef?: ActiveRef;
+}) {
   const [open, setOpen] = useState(Boolean(defaultOpen));
   const detail = (entry.detail ?? {}) as Record<string, unknown>;
   const prompt = entry.prompt || "";
@@ -175,6 +235,14 @@ export function TraceRow({ entry, query, defaultOpen }: { entry: TraceEntry; que
   const tokenTotal = tokens?.total ?? 0;
   const step = traceStep(entry);
   const title = traceRowTitle(entry);
+  const q = (query || "").trim();
+  const titleCount = q ? countOccurrences(title, q) : 0;
+  const promptBase = hitBase >= 0 ? hitBase + titleCount : -1;
+  const promptCount = q ? countOccurrences(prompt, q) : 0;
+  const resultBase = promptBase >= 0 ? promptBase + promptCount : -1;
+  const resultCount = q ? countOccurrences(result, q) : 0;
+  const detailText = !prompt && !result ? JSON.stringify(detail, null, 2) : "";
+  const detailBase = resultBase >= 0 ? resultBase + resultCount : -1;
 
   return (
     <div className={`trace-panel-item${open ? " open" : ""}`}>
@@ -186,7 +254,9 @@ export function TraceRow({ entry, query, defaultOpen }: { entry: TraceEntry; que
         <span className={`trace-panel-dot kind-${entry.kind}`} aria-hidden="true" />
         <span className={`trace-kind-badge kind-${entry.kind}`}>{entry.kind}</span>
         <span className="trace-panel-title" title={title}>
-          {query?.trim() ? highlightHits(title, query) : title}
+          {query?.trim()
+            ? highlightHits(title, query, hitBase, activeHit, activeRef)
+            : title}
         </span>
         {tokenTotal > 0 ? <span className="trace-meta-chip trace-panel-chip">{tokenTotal} tok</span> : null}
         {step !== null ? <span className="trace-meta-chip trace-panel-chip">step {step}</span> : null}
@@ -260,6 +330,9 @@ export function TraceRow({ entry, query, defaultOpen }: { entry: TraceEntry; que
               text={prompt}
               query={query}
               kind="prompt"
+              hitBase={promptBase}
+              activeHit={activeHit}
+              activeRef={activeRef}
             />
           ) : null}
           {result ? (
@@ -268,13 +341,16 @@ export function TraceRow({ entry, query, defaultOpen }: { entry: TraceEntry; que
               text={result}
               query={query}
               kind="prompt"
+              hitBase={resultBase}
+              activeHit={activeHit}
+              activeRef={activeRef}
             />
           ) : null}
           {!prompt && !result ? (
             <pre className="trace-detail-json" dir="ltr">
               {query?.trim()
-                ? highlightHits(JSON.stringify(detail, null, 2), query)
-                : JSON.stringify(detail, null, 2)}
+                ? highlightHits(detailText, query, detailBase, activeHit, activeRef)
+                : detailText}
             </pre>
           ) : null}
         </div>
@@ -288,10 +364,16 @@ export function TraceStepGroup({
   step,
   entries,
   query,
+  hitBases,
+  activeHit = -1,
+  activeRef,
 }: {
   step: number | null;
   entries: TraceEntry[];
   query?: string;
+  hitBases?: number[];
+  activeHit?: number;
+  activeRef?: ActiveRef;
 }) {
   const [open, setOpen] = useState(true);
   useEffect(() => {
@@ -314,7 +396,15 @@ export function TraceStepGroup({
       {open && (
         <div className="trace-panel-step-rows">
           {entries.map((entry, i) => (
-            <TraceRow key={entry.id} entry={entry} query={query} defaultOpen={i === 0} />
+            <TraceRow
+              key={entry.id}
+              entry={entry}
+              query={query}
+              defaultOpen={i === 0}
+              hitBase={hitBases?.[i] ?? -1}
+              activeHit={activeHit}
+              activeRef={activeRef}
+            />
           ))}
         </div>
       )}
@@ -459,6 +549,41 @@ export function TracePanel() {
     [entries],
   );
 
+  const searchParts = useMemo(
+    () => (query.trim() ? visible.map((e) => traceEntrySearchParts(e)) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [query, tab, entries],
+  );
+  const hitCounts = useMemo(
+    () =>
+      query.trim()
+        ? searchParts.map((p) => countTraceEntryHits(p, query))
+        : [],
+    [searchParts, query],
+  );
+  const matchCount = hitCounts.reduce((n, c) => n + c, 0);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  useEffect(() => {
+    setActiveIndex(matchCount > 0 ? 0 : -1);
+  }, [query, tab, entries.length]);
+  const activeRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, query]);
+  const stepSearch = (dir: 1 | -1) => {
+    setActiveIndex((cur) => stepHitIndex(cur, matchCount, dir));
+  };
+  const baseById = useMemo(() => {
+    const m = new Map<string, number>();
+    let acc = 0;
+    for (let i = 0; i < visible.length; i++) {
+      m.set(visible[i].id, acc);
+      acc += hitCounts[i] ?? 0;
+    }
+    return m;
+  }, [visible, hitCounts]);
+
+
   const panel = (
     <div
       className={`review-overlay${fullscreen ? " fullscreen" : ""}`}
@@ -553,9 +678,41 @@ export function TracePanel() {
               placeholder="Search prompts, responses, args…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && matchCount > 0) {
+                  e.preventDefault();
+                  stepSearch(e.shiftKey ? -1 : 1);
+                }
+              }}
             />
             {query.trim() ? (
-              <span className="review-search-count">{visible.length} hits</span>
+              matchCount > 0 ? (
+                <span className="review-search-nav">
+                  <span className="review-search-count">
+                    {activeIndex + 1}/{matchCount}
+                  </span>
+                  <button
+                    type="button"
+                    className="review-search-btn"
+                    title="Previous match (Shift+Enter)"
+                    aria-label="Previous match"
+                    onClick={() => stepSearch(-1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    className="review-search-btn"
+                    title="Next match (Enter)"
+                    aria-label="Next match"
+                    onClick={() => stepSearch(1)}
+                  >
+                    ↓
+                  </button>
+                </span>
+              ) : (
+                <span className="review-search-count">0 hits</span>
+              )
             ) : null}
           </label>
         </div>
@@ -575,6 +732,9 @@ export function TracePanel() {
                 step={g.step}
                 entries={g.entries}
                 query={query}
+                hitBases={g.entries.map((e) => baseById.get(e.id) ?? 0)}
+                activeHit={activeIndex}
+                activeRef={activeRef}
               />
             ))}
           </div>

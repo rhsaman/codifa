@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { ScheduleSection } from "./SchedulePanel";
-import type { ChatMessage, LayaRun } from "../types";
+import type { ChatMessage } from "../types";
 
 /** دلیل آماده‌نبودن laya به فارسی برای تنظیمات (دقیق: نصب‌نیست در برابر وزن‌نیست). */
 export function layaReasonLabel(reason?: string): string {
@@ -15,26 +15,6 @@ export function layaReasonLabel(reason?: string): string {
   if (r.startsWith('low-confidence')) return 'اطمینان پایین — واگذاری'
   if (r === 'abstained') return 'نمی‌دانم — واگذاری'
   return r
-}
-
-/** برچسب فارسی مسیر تصمیم laya برای بج کارت. */
-export function layaRouteLabel(route: string): string {
-  const r = (route || "").trim().toLowerCase();
-  if (r === "computer") return "کامپیوتر";
-  if (r === "browser") return "مرورگر";
-  return "معمولی";
-}
-
-/** کلاس حالت کارت laya: لوکال / خارجی / واگذاری به مدل بزرگ. */
-export function layaCardTone(run: LayaRun): "local" | "external" | "fallback" {
-  if (run.abstained || !run.handled) return "fallback";
-  return (run.providerId || "local") === "local" ? "local" : "external";
-}
-
-/** درصد نمایشی اطمینان (۰ تا ۱۰۰، clamp شده). */
-export function layaConfidencePct(confidence: number): number {
-  if (!Number.isFinite(confidence)) return 0;
-  return Math.max(0, Math.min(100, Math.round(confidence * 100)));
 }
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -252,101 +232,6 @@ export function TodosSection() {
   );
 }
 
-/** آرایه خالی پایدار برای سلکتور laya — از ساخت آرایه تازه در هر رندر جلوگیری می‌کند. */
-const EMPTY_LAYA_RUNS: LayaRun[] = [];
-
-/** سکشن زنده تصمیم‌های laya زیر todos — فقط تاریخچه چت فعال (آخرین ~۲۰ تا)
- *  با بج مسیر و نوار اطمینان. خالی بودن یعنی هیچ تصمیمی هنوز برای این چت ثبت نشده. */
-export function LayaSection() {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const runs = useStore(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.layaRuns ?? EMPTY_LAYA_RUNS,
-  );
-  const dir = useStore((s) => s.dir);
-  const [collapsed, setCollapsed] = useState(false);
-
-  if (!activeChatId) return null;
-  if (runs.length === 0) {
-    return (
-      <div className="sidebar-panel laya-docked" dir={dir} aria-label="Laya decisions">
-        <div className="sidebar-panel-head">
-          <span className="sidebar-panel-title">Laya</span>
-          <span className="sidebar-panel-count">0</span>
-        </div>
-        <div className="laya-run-empty">هنوز تصمیمی برای این چت ثبت نشده</div>
-      </div>
-    );
-  }
-  const shown = runs.slice(-20).slice().reverse();
-
-  return (
-    <div
-      className={`sidebar-panel laya-docked${collapsed ? " collapsed" : ""}`}
-      dir={dir}
-      aria-label="Laya decisions"
-    >
-      <div
-        className="sidebar-panel-head"
-        role="button"
-        tabIndex={0}
-        title="Click to collapse"
-        onClick={() => setCollapsed((v) => !v)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setCollapsed((v) => !v);
-          }
-        }}
-      >
-        <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
-        <span className="sidebar-panel-title">Laya</span>
-        <span className="sidebar-panel-count">{runs.length}</span>
-      </div>
-      {!collapsed && (
-        <ul className="laya-run-list">
-          {shown.map((run, i) => {
-            const pct = layaConfidencePct(run.confidence);
-            const tone = layaCardTone(run);
-            const toneLabel =
-              tone === "local" ? "لوکال" : tone === "external" ? "خارجی" : "واگذاری";
-            return (
-              <li key={`${run.at}-${i}`} className={`laya-run-card laya-${tone}`}>
-                <div className="laya-run-top">
-                  <span className={`laya-route-badge route-${(run.route || "normal").toLowerCase()}`}>
-                    {layaRouteLabel(run.route)}
-                  </span>
-                  <span className={`laya-tone-badge tone-${tone}`}>{toneLabel}</span>
-                  <span className="laya-run-time">
-                    {run.elapsedMs > 0 ? `${run.elapsedMs}ms` : "—"}
-                  </span>
-                </div>
-                <div
-                  className="laya-confidence-track"
-                  role="progressbar"
-                  aria-valuenow={pct}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-label={`Laya confidence ${pct} percent`}
-                >
-                  <div className="laya-confidence-fill" style={{ width: `${pct}%` }} />
-                </div>
-                <div className="laya-run-meta">
-                  <span className="laya-confidence-num">{pct}٪</span>
-                  {run.reason ? (
-                    <span className="laya-run-reason" title={run.reason}>
-                      {layaReasonLabel(run.reason) || prepareContent(run.reason, dir)}
-                    </span>
-                  ) : null}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </div>
-  );
-}
-
 /** نگه‌داشت سازگاری: رندر شناور قدیمی حذف شد — همیشه null برمی‌گرداند تا
  *  مانت قدیمی در App بی‌اثر بماند. */
 export function TodosPanel() {
@@ -440,7 +325,6 @@ function RightPanelContent() {
       <div className="right-panel-body">
         <ScheduleSection />
         <TodosSection />
-        <LayaSection />
       </div>
     </aside>
   );

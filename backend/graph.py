@@ -82,13 +82,14 @@ from llm import (
     _strip_stream_options,
     _strip_temperature,
     append_tool_result,
+    bind_tools_parallel,
     build_chat_model,
     chat_model_settings,
     dedupe_step_tool_call_ids,
     llm_generate,
     normalize_tool_transcript,
 )
-from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
+from mcp_bridge import build_mcp_tools, describe_tools, is_browser_mcp_tool
 from tool_batching import execute_readonly_calls
 from tool_message_projection import project_tool_results
 from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
@@ -1143,6 +1144,7 @@ async def _vision_analyze(model: Any, image_uris: list[str]) -> str | None:
                 user=user,
                 images=image_uris,
                 sub=True,
+                chat_id=str(state.get("chat_id", "") or ""),
             )
             result = (text or "").strip()
             if result:
@@ -2141,6 +2143,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             laya_decide.decide,
             {"prompt": prompt or "", "mode": mode or ""},
             {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
+            laya_decide.DEFAULT_CONFIDENCE_THRESHOLD,
+            "",
+            str(chat_id or ""),
         )
         if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
             _fast_route = str(_fast_decision.value)
@@ -2179,16 +2184,80 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             }
             with contextlib.suppress(Exception):
                 queue.put_nowait(_laya_act)
+            # ثبت در trace_store برای پنل Trace (لایا) — best-effort.
+            with contextlib.suppress(Exception):
+                import trace_store
+
+                _laya_value = getattr(_fast_decision, "value", None)
+                _laya_kind = getattr(_fast_decision, "kind", "choice")
+                trace_store.append(
+                    str(chat_id or ""),
+                    "laya",
+                    f"{(_laya_act.get('route') or 'normal')!s} · {int(float(_laya_act.get('confidence') or 0.0) * 100)}٪",
+                    detail={
+                        "route": _laya_act.get("route"),
+                        "confidence": _laya_act.get("confidence"),
+                        "abstained": _laya_act.get("abstained"),
+                        "reason": _laya_act.get("reason"),
+                        "handled": _laya_act.get("handled"),
+                        "provider_id": _laya_act.get("provider_id"),
+                        "model": _laya_act.get("model"),
+                        "elapsed_ms": _laya_act.get("elapsed_ms"),
+                        "value": _laya_value,
+                        "kind": _laya_kind,
+                        "options": list(laya_decide.FAST_ROUTE_OPTIONS),
+                    },
+                    model=str(_laya_act.get("model") or ""),
+                    prompt=str(prompt or ""),
+                    result=str(_laya_value or "") + (f"\nreason: {_laya_act.get('reason')}" if _laya_act.get("reason") else ""),
+                )
         if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and _computer_live:
-            user_parts.append(
-                "FAST ROUTE: computer — start with the `computer` tool "
-                "(read_screen first, then ONE sequence call)."
-            )
+            try:
+                _cu_step = laya_decide.computer_next_step(prompt or "", "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
+            except Exception:  # noqa: BLE001 — میان‌بر اختیاری است
+                _cu_step = None
+            if _cu_step == "act_direct":
+                user_parts.append(
+                    "FAST ROUTE: computer — call `computer` action='act' DIRECTLY "
+                    "with a selector (no read first); batch multi-step flows into "
+                    "ONE action='sequence' call."
+                )
+            else:
+                user_parts.append(
+                    "FAST ROUTE: computer — ONE `computer` action='read_screen' "
+                    "(shallow tree is enough), then ONE action='sequence' call. "
+                    "Never re-read after every step; never use 'see' when the "
+                    "tree answers."
+                )
         elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
-            user_parts.append(
-                "FAST ROUTE: browser — start with the browser MCP tools "
-                "(navigate/snapshot first, avoid web_search)."
-            )
+            try:
+                _br_step = laya_decide.browser_next_step(prompt or "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
+            except Exception:  # noqa: BLE001
+                _br_step = None
+            try:
+                _br_ranked = laya_decide.rank_browser_tools(
+                    prompt or "", describe_tools(mcp_tools), top_k=3,
+                    chat_id=str(chat_id or ""), emit=queue.put_nowait,
+                )
+            except Exception:  # noqa: BLE001
+                _br_ranked = []
+            _br_hint = ""
+            try:
+                _names = [str(r.get("name", "")) for r in (_br_ranked or []) if isinstance(r, dict) and str(r.get("name", "")).strip()]
+                if _names:
+                    _br_hint = f" Prefer order: {', '.join(_names[:3])}."
+            except Exception:  # noqa: BLE001
+                _br_hint = ""
+            if _br_step == "act_direct":
+                user_parts.append(
+                    "FAST ROUTE: browser — act DIRECTLY with the ranked browser "
+                    f"MCP tool (no snapshot first, avoid web_search).{_br_hint}"
+                )
+            else:
+                user_parts.append(
+                    "FAST ROUTE: browser — ONE snapshot/read first, then act with "
+                    f"the ranked browser MCP tools (avoid web_search).{_br_hint}"
+                )
     except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
         pass
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
@@ -2279,6 +2348,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     messages: list[BaseMessage] = [SystemMessage(content=system_final)]
     messages.extend(lc_history)
     messages.append(HumanMessage(content=user_content))
+    # ثبت پرامپت نهایی هر نوبت در trace_store برای پنل Trace — best-effort.
+    with contextlib.suppress(Exception):
+        import trace_store
+
+        _prompt_text = user_content if isinstance(user_content, str) else "\n\n".join(
+            str(c.get("text", "")) for c in user_content if isinstance(c, dict)
+        )
+        _full_prompt = f"[system]\n{system_final}\n\n[user]\n{_prompt_text}"
+        trace_store.append(
+            str(chat_id or ""),
+            "prompt",
+            f"{mode} · {len(_full_prompt)} chars",
+            detail={"mode": mode, "system_chars": len(str(system_final)), "user_chars": len(str(_prompt_text))},
+            prompt=_full_prompt,
+        )
 
     with contextlib.suppress(Exception):
         _sys_chars = len(str(system_final))
@@ -2582,6 +2666,7 @@ async def _summarize_history_head(compact_model: Any, older: list, root: str) ->
                     "and errors. Prefix the summary with '[Compacted earlier context]'."
                 ),
                 user=_serialized[:20000],
+                chat_id=str(state.get("chat_id", "") or ""),
             )
             if not str(_summary).startswith("[Compacted earlier context]"):
                 _summary = "[Compacted earlier context]\n" + str(_summary)
@@ -2923,6 +3008,15 @@ async def _run_mode_turn(
     # otherwise a previous node's mode would leak into this turn's system prompt.
     state = dict(state)
     state["mode"] = mode
+    # Ambient chat id for trace_store so sub-agent llm_generate calls (which
+    # never receive chat_id explicitly) still land on the right chat.
+    _trace_token = None
+    try:
+        import trace_store as _trace_store
+
+        _trace_token = _trace_store.set_current_chat(str(chat_id or ""))
+    except Exception:  # noqa: BLE001, S110 — trace context must never break the turn
+        _trace_token = None
     tctx = await build_turn_context(state, queue)
     model = tctx["model"]
     # The real model id the LangChain client will hit (e.g. a sub-agent model
@@ -2999,12 +3093,42 @@ async def _run_mode_turn(
     else:
         MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 40))
 
-    async def _execute_tool(name: str, args: dict) -> str:
+    async def _execute_tool(name: str, args: dict, call_id: str = "", step: int = 0) -> str:
         import inspect
 
         fn = filtered.get(name)
         if fn is None:
             return f"ERROR: unknown tool {name!r}"
+        # Trace every tool call with its prompt/args so the Trace panel shows
+        # the full request like LangSmith (best-effort, never breaks the turn).
+        _tool_entry = None
+        try:
+            import json as _tjson
+
+            import trace_store as _ts
+
+            try:
+                _args_text = _tjson.dumps(args or {}, ensure_ascii=False, sort_keys=True)[:8000]
+            except Exception:  # noqa: BLE001
+                _args_text = str(args or "")[:8000]
+            _tool_summary = f"{name} · step {step}" if step else str(name)
+            _tool_entry = _ts.append(
+                str(chat_id or ""),
+                "tool",
+                _tool_summary,
+                detail={
+                    "name": name,
+                    "args": args or {},
+                    "call_id": str(call_id or ""),
+                    "step": int(step or 0),
+                    "model": str(model_id or ""),
+                    "status": "running",
+                },
+                model=str(model_id or ""),
+                prompt=_args_text,
+            )
+        except Exception:  # noqa: BLE001, S110 — trace must never break the tool
+            _tool_entry = None
         try:
             if isinstance(fn, StructuredTool):
                 res = await fn.ainvoke(args or {})
@@ -3012,8 +3136,20 @@ async def _run_mode_turn(
                 res = fn(**(args or {}))
                 if inspect.isawaitable(res):
                     res = await res
+            try:
+                import trace_store as _ts2
+
+                _ts2.finish_tool(str(chat_id or ""), call_id or ((_tool_entry or {}).get("id") if _tool_entry else ""), res)
+            except Exception:  # noqa: BLE001, S110
+                pass
             return res
         except Exception as exc:  # noqa: BLE001
+            try:
+                import trace_store as _ts3
+
+                _ts3.finish_tool(str(chat_id or ""), call_id or ((_tool_entry or {}).get("id") if _tool_entry else ""), "", error=f"{type(exc).__name__}: {exc}")
+            except Exception:  # noqa: BLE001, S110
+                pass
             return f"ERROR running {name}: {exc}"
 
     def _existing_tool_result(
@@ -3225,7 +3361,7 @@ async def _run_mode_turn(
                     {"kind": "steer_applied", "ids": [s.get("id", "") for s in steers]}
                 )
             try:
-                bound = model.bind_tools(lc_tools)
+                bound = bind_tools_parallel(model, lc_tools, not _no_pc)
                 ai: Any = None
                 _astream_count_local = 0
                 _thinking_active = False
@@ -3457,6 +3593,50 @@ async def _run_mode_turn(
                     state.get("provider", ""),
                     state.get("provider_id", ""),
                 )
+                # ثبت فراخوانی LLM در trace_store برای پنل Trace — همیشه، حتی وقتی
+                # usage_ev خالی است تا پرامپت هر استپ گم نشود (best-effort).
+                with contextlib.suppress(Exception):
+                    import trace_store
+
+                    _llm_prompt_text = ""
+                    try:
+                        _parts = []
+                        for _m in request_messages or []:
+                            _c = getattr(_m, "content", "")
+                            _t = type(_m).__name__
+                            if isinstance(_c, list):
+                                _c = " ".join(str(p.get("text", "")) for p in _c if isinstance(p, dict))
+                            _parts.append(f"[{_t}]\n{str(_c)[:4000]}")
+                        _llm_prompt_text = "\n\n".join(_parts)[:20000]
+                    except Exception:  # noqa: BLE001
+                        _llm_prompt_text = ""
+                    _uev = usage_ev or {}
+                    _utotal = int(_uev.get("total_tokens", 0) or 0)
+                    trace_store.append(
+                        str(state.get("chat_id", "") or chat_id or ""),
+                        "llm",
+                        f"{model_id} · step {steps} · {_utotal} tokens",
+                        detail={
+                            "provider": _uev.get("provider"),
+                            "provider_id": _uev.get("provider_id"),
+                            "input_tokens": _uev.get("input_tokens", 0),
+                            "output_tokens": _uev.get("output_tokens", 0),
+                            "total_tokens": _utotal,
+                            "cache_read_tokens": _uev.get("cache_read_tokens", 0),
+                            "cache_write_tokens": _uev.get("cache_write_tokens", 0),
+                            "reasoning_tokens": _uev.get("reasoning_tokens", 0),
+                            "step": steps,
+                            "has_usage": usage_ev is not None,
+                        },
+                        model=str(model_id or ""),
+                        tokens={
+                            "input": _uev.get("input_tokens", 0),
+                            "output": _uev.get("output_tokens", 0),
+                            "total": _utotal,
+                        },
+                        prompt=_llm_prompt_text,
+                        result=str(getattr(ai, "content", "") or "")[:8000],
+                    )
                 if usage_ev:
                     # Track the SAME token breakdown the frontend context meter
                     # shows, so auto-compaction fires off the exact value the meter
@@ -3797,7 +3977,7 @@ async def _run_mode_turn(
             _batch_hint = _step_hint or _streak_hint
             async def _run_readonly(tc) -> str:
                 return await _execute_tool(
-                    tc.get("name") or "", tc.get("args") or {}
+                    tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", steps
                 )
 
             _results = await execute_readonly_calls(_parallel, _run_readonly)
@@ -3820,7 +4000,7 @@ async def _run_mode_turn(
                 # The tool callback emits its own `tool` / `tool_result` events
                 # (via the emit callback wired into make_tool_callbacks), so we
                 # only execute it and feed the result back to the model.
-                result = await _execute_tool(name, args)
+                result = await _execute_tool(name, args, tc.get("id") or "", steps)
                 append_tool_result(msgs, str(result), tc.get("id", ""))
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
@@ -4095,6 +4275,13 @@ async def _run_mode_turn(
         if mcp_cleanup is not None:
             with contextlib.suppress(Exception):
                 await mcp_cleanup()
+        try:
+            import trace_store as _trace_store2
+
+            if _trace_token is not None:
+                _trace_store2.reset_current_chat(_trace_token)
+        except Exception:  # noqa: BLE001, S110
+            pass
     # opencode-style proactive auto-compaction: once the conversation reaches the
     # usable window, summarize the older turns and tell the frontend to fold.
     if reply and ctx and ctx > 0:

@@ -266,7 +266,7 @@ console.log("۱۷) باز شدن خودکار پنل — فقط ساخت تاز�
 
 console.log("۱۹) سکشن Laya — برچسب مسیر، لحن کارت و درصد اطمینان:")
 {
-  const { layaRouteLabel, layaCardTone, layaConfidencePct } = await import("../src/components/TodosPanel")
+  const { layaRouteLabel, layaCardTone, layaConfidencePct } = await import("../src/components/LayaLabels")
   check("مسیر computer فارسی می‌شود", layaRouteLabel("computer") === "کامپیوتر")
   check("مسیر browser فارسی می‌شود", layaRouteLabel("browser") === "مرورگر")
   check("مسیر normal فارسی می‌شود", layaRouteLabel("normal") === "معمولی")
@@ -303,6 +303,23 @@ console.log("۱۸) چت جدید — پنل راست دیفالت بسته اس�
   useStore.getState().setRightPanelOpen(true)
   useStore.getState().newChatInRoot("", "ask")
   check("newChatInRoot پنل باز را می‌بندد", useStore.getState().rightPanelOpen === false)
+}
+
+console.log("۲۱) پنل Trace — عنوان ردیف و فیلتر جست‌وجو:")
+{
+  const { traceRowTitle, filterTraces } = await import("../src/components/TracePanel")
+  check("summary خالی llm از مدل+توکن ساخته می‌شود", traceRowTitle({ id: "a", at: 1, kind: "llm", summary: "", model: "m", tokens: { total: 42 } } as any) === "m · 42 tokens")
+  check("summary موجود دست نمی‌خورد", traceRowTitle({ id: "b", at: 1, kind: "laya", summary: "normal · 90٪" } as any) === "normal · 90٪")
+  const rows = [
+    { id: "1", at: 1, kind: "laya", summary: "browser · 90٪", prompt: "open site" },
+    { id: "2", at: 2, kind: "llm", summary: "m · 10 tokens", model: "gpt" },
+    { id: "3", at: 3, kind: "tool", summary: "read", prompt: '{"path": "secret-file"}', result: "file-ok" },
+  ] as any
+  check("جست‌وجو ردیف منطبق را نگه می‌دارد", filterTraces(rows, "browser").length === 1)
+  check("جست‌وجو داخل پرامپت ابزار را پیدا می‌کند", filterTraces(rows, "secret-file").length === 1)
+  check("جست‌وجو داخل نتیجه ابزار را پیدا می‌کند", filterTraces(rows, "file-ok").length === 1)
+  check("جست‌وجوی خالی همه را برمی‌گرداند", filterTraces(rows, "").length === 3)
+  check("عنوان ابزار از نام ابزار ساخته می‌شود", traceRowTitle({ id: "t", at: 1, kind: "tool", summary: "", detail: { name: "read" } } as any) === "read")
 }
 
 if (failed > 0) {

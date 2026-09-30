@@ -12,11 +12,11 @@ import { formatTokens } from "../lib/context";
 import { taskTokenTotals } from "../lib/schedule-notify";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
-/** Format next_run for display (Today/Tomorrow/date). */
-export function formatNextRunFa(nextRun: number | null | undefined): string {
+/** Format next_run for display (Today/Tomorrow/date). `nowRef` is only for tests so the Today/Tomorrow boundary never depends on the wall clock. */
+export function formatNextRunFa(nextRun: number | null | undefined, nowRef?: Date): string {
   if (!nextRun) return "No next run";
   const d = new Date(nextRun * 1000);
-  const now = new Date();
+  const now = nowRef ?? new Date();
   const sameDay = d.toDateString() === now.toDateString();
   const tomorrow = new Date(now);
   tomorrow.setDate(now.getDate() + 1);

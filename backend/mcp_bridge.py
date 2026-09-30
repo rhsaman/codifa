@@ -39,6 +39,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -252,6 +253,10 @@ def _tool_input_schema(tool: Any) -> dict | None:
 _DESC_MAX_CHARS = 300
 _FIELD_DESC_MAX_CHARS = 80
 
+# سقف snapshot مرورگر قبل از رسیدن به مدل — هر کاراکتر اضافه با هر turn
+# دوباره فرستاده می‌شود؛ snapshotهای Playwright به‌راحتی ده‌ها هزار کاراکترند.
+_BROWSER_SNAPSHOT_MAX_CHARS = 12_000
+
 
 def _compact_description(text: str, max_chars: int = _DESC_MAX_CHARS) -> str:
     """توضیح ابزار MCP را به جمله(های) اولش محدود می‌کند.
@@ -355,6 +360,88 @@ async def _call_mcp_tool(
     return _flatten_tool_result(result, qualified, emit)
 
 
+def suggest_browser_snapshot_mode(task: str = "", chat_id: str = "", emit: Any = None) -> str | None:
+    """حالت snapshot مرورگر با laya: مستقیم act بزن یا اول snapshot بخوان؟
+
+    خروجی یکی از BROWSER_STEP_OPTIONS در laya_decide یا None (واگذاری).
+    هرگز استثنا نمی‌دهد تا مسیر اصلی ابزار نشکند.
+    """
+    try:
+        import laya_decide
+    except Exception:  # noqa: BLE001 — laya اختیاری است
+        return None
+    try:
+        return laya_decide.browser_next_step(task or "", chat_id=chat_id, emit=emit)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compact_browser_snapshot(text: str, task: str = "", max_chars: int = _BROWSER_SNAPSHOT_MAX_CHARS) -> str:
+    """snapshot حجیم Playwright را کم‌حجم می‌کند بدون از دست رفتن عناصر کلیدی.
+
+    خط‌های دارای ref (عناصر تعاملی) و خط‌های هم‌پوشان با تسک نگه داشته
+    می‌شوند؛ بقیه اول حذف می‌شوند. ترتیب اصلی خط‌ها حفظ می‌شود تا مدل
+    ساختار صفحه را گم نکند. هرگز استثنا نمی‌دهد.
+    """
+    try:
+        s = str(text or "")
+        if len(s) <= max_chars:
+            return s
+        lines = s.splitlines()
+        if not lines:
+            return s[:max_chars]
+        task_tokens = {t for t in re.findall(r"\w+", (task or "").lower()) if len(t) >= 3}
+        scored: list[tuple[int, int, str]] = []
+        for idx, line in enumerate(lines):
+            low = line.lower()
+            score = 0
+            if "ref=" in low:
+                score += 2
+            if any(k in low for k in ("button", "link", "textbox", "checkbox", "combobox", "heading", "url", "title", "dialog")):
+                score += 1
+            if task_tokens:
+                try:
+                    ltokens = set(re.findall(r"\w+", low))
+                    score += len(task_tokens & ltokens) * 2
+                except Exception:  # noqa: BLE001, S110 — امتیاز پایه کافی است
+                    pass
+            scored.append((score, idx, line))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        kept: list[tuple[int, str]] = []
+        total = 0
+        for _score, idx, line in scored:
+            cost = len(line) + 1
+            if total + cost > max_chars:
+                if not kept:
+                    kept.append((idx, line[:max_chars]))
+                    total = max_chars
+                continue
+            kept.append((idx, line))
+            total += cost
+            if total >= max_chars:
+                break
+        kept.sort(key=lambda item: item[0])
+        out = "\n".join(line for _, line in kept)
+        omitted = len(lines) - len(kept)
+        if omitted > 0:
+            out += f"\n...(snapshot truncated: {omitted} lines omitted, {len(s)} chars -> {len(out)} chars)"
+        return out
+    except Exception:  # noqa: BLE001 — fallback به برش ساده
+        try:
+            return str(text or "")[:max_chars]
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def _is_snapshot_tool(qualified: str) -> bool:
+    """True برای ابزارهای مرورگر با خروجی حجیم (snapshot/evaluate/…)."""
+    try:
+        low = str(qualified or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k in low for k in ("snapshot", "evaluate", "network", "console", "screenshot"))
+
+
 def _flatten_tool_result(result: Any, qualified: str, emit: Callable[[dict], None]) -> str:
     """MCP structured content را به متن تخت تبدیل و رویداد ``tool_result`` صادر
     می‌کند. در هر دو مسیر (موفقِ اولیه و تلاشِ دوباره پس از reconnect) یکسان
@@ -377,6 +464,11 @@ def _flatten_tool_result(result: Any, qualified: str, emit: Callable[[dict], Non
         else:
             parts.append("(no output)")
     summary = "\n".join(parts)
+    try:
+        if _is_snapshot_tool(qualified) and len(summary) > _BROWSER_SNAPSHOT_MAX_CHARS:
+            summary = compact_browser_snapshot(summary)
+    except Exception:  # noqa: BLE001, S110 — فشرده‌سازی اختیاری است
+        pass
     emit({"kind": "tool_result", "tool": qualified, "summary": summary[:500], "status": "ok"})
     return summary
 

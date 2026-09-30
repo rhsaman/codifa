@@ -432,6 +432,20 @@ def model_provider(model: Any) -> tuple[str, str]:
     )
 
 
+def bind_tools_parallel(model: Any, lc_tools: list, enabled: bool = True) -> Any:
+    """``model.bind_tools`` that also asks for parallel tool calls when the
+    provider is known to honor ``parallel_tool_calls`` (providers.py meta flag
+    ``parallel_calls``). Set at BIND time, not in model_kwargs, so it only ever
+    travels together with tools — compaction/web/vision calls (no tools) never
+    see it. ``enabled=False`` is the strip-on-400 fallback. Without this most
+    gateways return ONE tool call per step, so N independent reads/greps cost
+    N full-context round trips."""
+    kind, _ = model_provider(model)
+    if enabled and kind and _provider_meta(kind).get("parallel_calls"):
+        return model.bind_tools(lc_tools, parallel_tool_calls=True)
+    return model.bind_tools(lc_tools)
+
+
 # opencode's OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts):
 # when a model's real output limit is unknown, assume 32k -- NOT a ctx-derived
 # 8192 clamp. The old 128k ceiling let max_tokens balloon past the window and
@@ -879,6 +893,7 @@ async def llm_generate(
     user: str,
     images: list[str] | None = None,
     sub: bool = False,
+    chat_id: str = "",
 ) -> tuple[str, dict | None]:
     """Run a single LLM completion (no tools).
 
@@ -898,6 +913,9 @@ async def llm_generate(
         msgs.append(HumanMessage(content=content))
     else:
         msgs.append(HumanMessage(content=user))
+    _trace_prompt = f"[system]\n{system}\n\n[user]\n{user}" if (system or user) else ""
+    if images:
+        _trace_prompt += f"\n\n[{len(images)} image(s) attached]"
     try:
         res = await model.ainvoke(msgs)
     except Exception as exc:
@@ -906,6 +924,22 @@ async def llm_generate(
             model = _strip_stream_options(model)
             res = await model.ainvoke(msgs)
         else:
+            try:
+                import trace_store
+
+                _chat_err = str(chat_id or getattr(model, "_trace_chat_id", "") or "")
+                _ekind, _epid = model_provider(model)
+                trace_store.append(
+                    _chat_err,
+                    "llm",
+                    f"{model_name or 'llm'} · error",
+                    detail={"provider": _ekind, "provider_id": _epid, "sub": bool(sub)},
+                    model=model_name,
+                    error=f"{type(exc).__name__}: {exc}"[:2000],
+                    prompt=_trace_prompt,
+                )
+            except Exception:  # noqa: BLE001, S110 — trace must never break the call
+                pass
             raise
     content = getattr(res, "content", "")
     if isinstance(content, list):
@@ -925,6 +959,39 @@ async def llm_generate(
         provider=kind,
         provider_id=pid,
     )
+    # ثبت فراخوانی تک‌شات LLM (compact/vision/provider-decide) در trace_store — best-effort.
+    # همیشه ثبت می‌شود حتی وقتی usage None است تا پرامپت گم نشود.
+    # chat_id خالی هم قبول است چون trace_store از ambient context (set_current_chat) برمی‌دارد.
+    try:
+        import trace_store
+
+        _chat = str(chat_id or getattr(model, "_trace_chat_id", "") or "")
+        _u = usage or {}
+        _total = int(_u.get("total_tokens", 0) or 0)
+        trace_store.append(
+            _chat,
+            "llm",
+            f"{model_name or 'llm'} · {_total} tokens",
+            detail={
+                "provider": _u.get("provider"),
+                "provider_id": _u.get("provider_id"),
+                "input_tokens": _u.get("input_tokens", 0),
+                "output_tokens": _u.get("output_tokens", 0),
+                "total_tokens": _total,
+                "sub": bool(sub),
+                "has_usage": usage is not None,
+            },
+            model=model_name,
+            tokens={
+                "input": _u.get("input_tokens", 0),
+                "output": _u.get("output_tokens", 0),
+                "total": _total,
+            },
+            prompt=_trace_prompt,
+            result=str(text or "")[:8000],
+        )
+    except Exception:  # noqa: BLE001, S110 — trace must never break the call
+        pass
     return text, usage
 
 
@@ -934,6 +1001,7 @@ async def llm_complete(
     system: str = "",
     user: str,
     images: list[str] | None = None,
+    chat_id: str = "",
 ) -> tuple[str, dict | None]:
     """Run a single LLM completion (no tools) and return ``(text, usage_event)``.
 
@@ -941,7 +1009,7 @@ async def llm_complete(
     can accrue those tokens into the session total instead of silently dropping
     them.
     """
-    return await llm_generate(model, system=system, user=user, images=images)
+    return await llm_generate(model, system=system, user=user, images=images, chat_id=chat_id)
 
 
 def strip_orphaned_tool_calls(msgs: list, logger: Any = None) -> list:
@@ -1593,6 +1661,7 @@ async def langchain_tool_loop(
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
     _streak = _BatchStreakTracker()
+    _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
     while steps < max_steps:
         steps += 1
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
@@ -1608,7 +1677,15 @@ async def langchain_tool_loop(
         # نگهبان نهایی ترنسکریپت (یکتاسازی شناسه‌ها + حذف بی‌جواب‌ها + یک
         # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
         normalize_tool_transcript(msgs, _logger)
-        ai = await model.bind_tools(lc_tools).ainvoke(msgs)
+        try:
+            ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(msgs)
+        except Exception as _pc_exc:  # noqa: BLE001
+            # Some gateways/models reject `parallel_tool_calls` with a 400 —
+            # retry this step once without it (same fallback as graph.py).
+            if _no_pc or not _is_parallel_calls_error(_pc_exc):
+                raise
+            _no_pc = True
+            ai = await bind_tools_parallel(model, lc_tools, False).ainvoke(msgs)
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The
         # main-agent loop emits usage from agents.py; sub-agents run through this

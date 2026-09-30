@@ -705,7 +705,9 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
                 proc.kill()
             stdout, stderr = proc.communicate()
             output = (
-                f"[command timed out after {timeout}s]\n"
+                f"[command timed out after {timeout}s and was killed — do NOT "
+                f"re-run the same command; pass a larger `timeout` (max "
+                f"{TERMINAL_TIMEOUT_MAX}s) or run a narrower target]\n"
                 + (stdout or "")
                 + (stderr or "")
             )
@@ -1237,6 +1239,7 @@ def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0) -> 
                 "total_chars": int(total_chars or 0),
             },
             ["distill", "raw"],
+            chat_id=str(_chat_id or ""),
         )
     except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
         return None
@@ -3325,6 +3328,52 @@ def make_tool_callbacks(
                 if _pending_sub_calls.get(_fifo_key):
                     ev["call_id"] = _pending_sub_calls[_fifo_key].pop(0)
         orig_emit(ev)
+        # Live Trace panel log (LangSmith-style) — best-effort, never breaks tools.
+        try:
+            import json as _trace_json
+
+            import trace_store as _trace_store
+
+            if kind == "tool":
+                try:
+                    _args_text = _trace_json.dumps(ev.get("args") or {}, ensure_ascii=False, sort_keys=True)[:8000]
+                except Exception:  # noqa: BLE001
+                    _args_text = str(ev.get("args") or "")[:8000]
+                _trace_store.append(
+                    str(_chat_id or ""),
+                    "tool",
+                    str(tool or "tool"),
+                    detail={
+                        "name": str(tool or ""),
+                        "args": ev.get("args") or {},
+                        "call_id": str(ev.get("call_id") or ""),
+                        "model": str(ev.get("model") or ""),
+                        "branch": str(ev.get("branch") or ""),
+                        "sub": bool(ev.get("sub")),
+                        "status": "running",
+                    },
+                    model=str(ev.get("model") or ""),
+                    prompt=_args_text,
+                )
+            elif kind == "tool_result":
+                _res = ev.get("results")
+                if _res is None:
+                    _res = ev.get("content")
+                if _res is None:
+                    _res = ev.get("summary")
+                try:
+                    _res_text = _trace_json.dumps(_res, ensure_ascii=False, sort_keys=True)[:20000] if not isinstance(_res, str) else str(_res)[:20000]
+                except Exception:  # noqa: BLE001
+                    _res_text = str(_res or "")[:20000]
+                _is_err = str(ev.get("status") or "").lower() == "error" or str(_res_text).startswith("ERROR")
+                _trace_store.finish_tool(
+                    str(_chat_id or ""),
+                    ev.get("call_id") or "",
+                    _res_text,
+                    error=str(ev.get("summary") or _res_text)[:2000] if _is_err else "",
+                )
+        except Exception:  # noqa: BLE001, S110 — trace must never break tools
+            pass
 
     orig_emit = emit
     emit = _emit
@@ -3391,7 +3440,8 @@ def make_tool_callbacks(
         while True:
             try:
                 text, usage = await llm_generate(
-                    model, system=system_prompt, user=make_prompt(), sub=True
+                    model, system=system_prompt, user=make_prompt(), sub=True,
+                    chat_id=str(_chat_id or ""),
                 )
                 if usage:
                     emit(usage)
@@ -3490,6 +3540,38 @@ def make_tool_callbacks(
                 "region instead of paging 20-30 lines at a time."
             )
         return effective, hint
+
+    # Read-window hygiene (code-enforced, not prompt-only). Session telemetry
+    # showed ~70% of tool calls were `read`, one call per model step, and most
+    # windows either overlapped an earlier one or slid a few lines past it —
+    # every extra step re-sends the whole context. So (1) overlapping/adjacent
+    # windows of the SAME file inside one call are merged into one block, and
+    # (2) every window is widened forward to at least _READ_MIN_WINDOW lines so
+    # the follow-up "next 60 lines" read is not needed. Small files / EOF are
+    # unaffected (the excerpt reader simply stops at the end of the file).
+    _READ_MIN_WINDOW = 150
+    _READ_MERGE_GAP = 30
+
+    def _widen_and_merge_windows(
+        wins: list[tuple[str, int, int]],
+    ) -> list[tuple[str, int, int]]:
+        spans: dict[str, list[list[int]]] = {}
+        for p, off, lim in wins:
+            off = max(1, int(off or 1))
+            lim = max(1, int(lim or 2000))
+            spans.setdefault(p, []).append([off, off + lim - 1])
+        out: list[tuple[str, int, int]] = []
+        for p, ss in spans.items():  # dict keeps first-seen path order
+            ss.sort()
+            merged = [ss[0]]
+            for a, b in ss[1:]:
+                if a <= merged[-1][1] + _READ_MERGE_GAP + 1:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            for a, b in merged:
+                out.append((p, a, max(b - a + 1, _READ_MIN_WINDOW)))
+        return out
 
     def _plan_nudge_due() -> bool:
         """Call once per mutating tool call. Returns True (and resets the counter)
@@ -4551,12 +4633,16 @@ When you need to read several files, read multiple independent files in parallel
                     "model": _main_name,
                 }
             )
-            return await _read_target(filePath, offset, limit, _main_name)
+            _, _w_off, _w_lim = _widen_and_merge_windows(
+                [(filePath, offset, limit)]
+            )[0]
+            return await _read_target(filePath, _w_off, _w_lim, _main_name)
         job_paths = {p for p, _, _ in jobs}
         tasks: list[tuple[str, int, int]] = [
             (p, offset, limit) for p in base_paths if p not in job_paths
         ]
         tasks.extend(jobs)
+        tasks = _widen_and_merge_windows(tasks)
         emit(
             {
                 "kind": "tool",
@@ -5065,6 +5151,7 @@ When you need to read several files, read multiple independent files in parallel
         try:
             _output, usage = await llm_generate(
                 _vmodel, system=_sys, user=prompt, images=_imgs, sub=True,
+                chat_id=str(_chat_id or ""),
             )
             if usage:
                 emit(usage)
@@ -6423,9 +6510,31 @@ When you need to read several files, read multiple independent files in parallel
             if action == "check_access":
                 result = await asyncio.to_thread(cu.check_access)
             elif action == "read_screen":
+                try:
+                    _depth = cu.suggest_tree_depth(app, value or "", chat_id=_chat_id, emit=emit)
+                except Exception:  # noqa: BLE001 — عمق هوشمند اختیاری است
+                    _depth = depth
+                if not isinstance(_depth, int) or _depth <= 0:
+                    _depth = depth
+                try:
+                    _depth_int = int(_depth)
+                except Exception:  # noqa: BLE001
+                    _depth_int = int(depth)
+                try:
+                    _want_int = int(depth)
+                except Exception:  # noqa: BLE001
+                    _want_int = 14
+                _use_depth = _depth_int if _want_int == 14 else _want_int
                 result = await asyncio.to_thread(
-                    cu.read_screen, app_name=app, max_depth=depth
+                    cu.read_screen, app_name=app, max_depth=_use_depth
                 )
+                try:
+                    _targets = result.get("targets") if isinstance(result, dict) else None
+                    if isinstance(_targets, list) and _targets and (value or "").strip():
+                        result["targets"] = cu.rank_actionable_targets(value or "", _targets, chat_id=_chat_id, emit=emit)
+                        result["targets_ranked"] = True
+                except Exception:  # noqa: BLE001, S110 — رتبه‌بندی اختیاری است
+                    pass
             elif action == "read_element":
                 if not selector.strip():
                     result = {"error": "read_element needs a selector."}
@@ -6468,8 +6577,17 @@ When you need to read several files, read multiple independent files in parallel
                         _tree_first = None
                     else:
                         _tree_first = await asyncio.to_thread(
-                            cu.prefer_tree_over_see, value or "", app
+                            cu.prefer_tree_over_see, value or "", app, _chat_id, emit
                         )
+                        if _tree_first is None:
+                            try:
+                                import laya_decide as _laya_mod
+
+                                _step = _laya_mod.computer_next_step(value or "", app, chat_id=_chat_id, emit=emit)
+                                if _step == "read_first":
+                                    _tree_first = True
+                            except Exception:  # noqa: BLE001, S110 — میان‌بر اختیاری است
+                                pass
                 except Exception:  # noqa: BLE001 — گیت اختیاری است
                     _tree_first = None
                 if _tree_first is True:
@@ -6594,6 +6712,7 @@ When you need to read several files, read multiple independent files in parallel
                                     user=question,
                                     images=[shot["data_uri"]],
                                     sub=True,
+                                    chat_id=str(_chat_id or ""),
                                 )
                                 if usage:
                                     emit(usage)

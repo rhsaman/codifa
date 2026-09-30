@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -1590,6 +1590,36 @@ export async function deleteScheduleRun(
       return { error: body.detail || `delete failed (${res.status})` }
     }
     return { ok: true }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** لاگ‌های چت جاری برای پنل Trace (لایا / LLM / پرامپت) با فیلتر اختیاری نوع. */
+export async function getChatTraces(
+  chatId: string,
+  kind?: TraceKind,
+): Promise<TraceEntry[] | { error: string }> {
+  if (!chatId) return []
+  const q = kind ? `?kind=${encodeURIComponent(kind)}` : ''
+  const out = await sidecarGet<{ traces: TraceEntry[] }>(
+    `/chats/${encodeURIComponent(chatId)}/traces${q}`,
+  )
+  if ('error' in out) return out
+  return out.traces ?? []
+}
+
+/** پاک‌کردن لاگ چت جاری. */
+export async function clearChatTraces(chatId: string): Promise<{ ok: true; removed: number } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url || !chatId) return { error: 'Python agent not ready' }
+  try {
+    const res = await fetch(`${url}/chats/${encodeURIComponent(chatId)}/traces`, { method: 'DELETE' })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `clear failed (${res.status})` }
+    }
+    return (await res.json()) as { ok: true; removed: number }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }

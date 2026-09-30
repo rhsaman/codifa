@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,12 @@ FAST_ROUTE_COMPUTER = "computer"
 FAST_ROUTE_BROWSER = "browser"
 FAST_ROUTE_NORMAL = "normal"
 FAST_ROUTE_OPTIONS = (FAST_ROUTE_COMPUTER, FAST_ROUTE_BROWSER, FAST_ROUTE_NORMAL)
+
+# تصمیم‌های سریع computer/browser برای حذف رفت‌وبرگشت‌های کند مدل بزرگ.
+# هر کدام choice/rank امن با واگذاری None/[] هستند تا مسیر اصلی هرگز نشکند.
+COMPUTER_STEP_OPTIONS = ("act_direct", "read_first")
+COMPUTER_MODE_OPTIONS = ("act", "sequence")
+BROWSER_STEP_OPTIONS = ("act_direct", "snapshot_first")
 
 _ROUTER_LOCK = threading.Lock()
 # Only one torch forward at a time: native backends (notably MPS) abort
@@ -65,6 +72,12 @@ def _laya_device() -> str:
 # سقف‌های زمانی کوتاه تا حلقه رویداد بلوکه نشود.
 LOCAL_PREDICT_TIMEOUT = 4.0
 PROVIDER_DECIDE_TIMEOUT = 8.0
+# تصمیم‌های ثانویه (قدم بعدی computer/مرورگر، عمق درخت، گیت see) باید خیلی
+# سریع برگردند: FALLBACK بعد از ۱ ثانیه بهتر از ۴ ثانیه معطلی است.
+SECONDARY_PREDICT_TIMEOUT = 1.0
+# آستانه جداگانه برای عمق shallow: سؤال دودویی shallow/full ذاتاً مرزی است
+# (نمونه واقعی: ۵۱٪) و با آستانه عمومی ۰٫۶۵ همیشه واگذار می‌شد.
+SHALLOW_CONFIDENCE_THRESHOLD = 0.5
 
 
 @dataclass
@@ -336,7 +349,21 @@ def _get_router() -> Any | None:
 def warmup_router() -> bool:
     """پیش‌گرم‌کردن روتر هنگام بالا آمدن سایدکار (ساخت اول‌باره خارج از حلقه)."""
     try:
-        return _get_router() is not None
+        router = _get_router()
+        if router is None:
+            return False
+        # یک predict آزمایشی تا بارگذاری تنبل وزن‌ها هم همین‌جا انجام شود،
+        # نه وسط اولین ترن چت (همان ۴ ثانیه‌ای که laya-timeout می‌ساخت).
+        try:
+            _predict_local(
+                router,
+                {"warmup": "1"},
+                {"q": {"type": "choice", "instructions": "Pick one.", "criteria": ["a", "b"]}},
+                timeout=15.0,
+            )
+        except Exception:  # noqa: BLE001, S110 — predict آزمایشی اختیاری است
+            pass
+        return True
     except Exception:  # noqa: BLE001 — warmup اختیاری است
         return False
 
@@ -482,10 +509,25 @@ def _to_laya_questions(question: dict) -> dict:
     return {}
 
 
-def _predict_local(router: Any, state: dict, questions: dict) -> Any:
+def _predict_local(
+    router: Any,
+    state: dict,
+    questions: dict,
+    timeout: float = LOCAL_PREDICT_TIMEOUT,
+) -> Any:
     """اجرای Router.predict با سقف زمانی کوتاه (بدون بلوکه ماندن نخ)."""
     import concurrent.futures
 
+    try:
+        limit = float(timeout)
+    except (TypeError, ValueError):
+        limit = LOCAL_PREDICT_TIMEOUT
+    if limit <= 0:
+        limit = LOCAL_PREDICT_TIMEOUT
+    # عبور سریع: تصمیم ثانویه نباید پشت قفل predict صف شود. وقتی یک predict
+    # دیگر در حال اجراست، سریع واگذار کن تا تأخیرها روی هم انباشته نشوند.
+    if limit <= SECONDARY_PREDICT_TIMEOUT + 0.01 and _PREDICT_LOCK.locked():
+        raise TimeoutError("laya predict locked by another call")
     snapshot_state = dict(state or {})
     snapshot_questions = dict(questions or {})
 
@@ -501,7 +543,7 @@ def _predict_local(router: Any, state: dict, questions: dict) -> Any:
     try:
         fut = pool.submit(_call)
         try:
-            return fut.result(timeout=LOCAL_PREDICT_TIMEOUT)
+            return fut.result(timeout=limit)
         except BaseException:
             fut.cancel()
             raise
@@ -514,6 +556,8 @@ def decide(
     question: dict,
     threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     provider_id: str = "",
+    chat_id: str = "",
+    timeout: float = LOCAL_PREDICT_TIMEOUT,
 ) -> LayaDecision:
     """یک تصمیم سریع می‌گیرد؛ در صورت اطمینان پایین واگذار می‌کند.
 
@@ -527,7 +571,8 @@ def decide(
     kind = str((question or {}).get("type") or "choice").strip().lower() or "choice"
     provider = (provider_id or "").strip() or _laya_provider_id()
     if provider and provider != LAYA_PROVIDER_DEFAULT:
-        return _decide_via_provider(state or {}, question or {}, kind, threshold, provider)
+        return _decide_via_provider(state or {}, question or {}, kind, threshold, provider,
+                                      chat_id=chat_id)
     repo = _laya_repo()
     router = _get_router()
     if router is None:
@@ -544,7 +589,7 @@ def decide(
         # ignores the question shape. Try the raw question once so those
         # still resolve; real Router rejects it and we fall back below.
         try:
-            legacy = _predict_local(router, dict(state or {}), dict(question or {}))
+            legacy = _predict_local(router, dict(state or {}), dict(question or {}), timeout)
             value = _value_of(legacy)
             confidence = _confidence_of(legacy)
             abstained = _abstained_of(legacy, value)
@@ -567,9 +612,15 @@ def decide(
         if cand is not None and "candidate" not in eff_state:
             eff_state["candidate"] = cand
     try:
-        result = _predict_local(router, eff_state, questions)
+        result = _predict_local(router, eff_state, questions, timeout)
     except Exception as exc:  # noqa: BLE001 — خطای محلی = واگذاری به مدل بزرگ
-        reason = "laya-timeout" if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower() else f"laya-error: {exc}"
+        _exc_text = f"{type(exc).__name__}: {exc}".lower()
+        if "locked by another call" in _exc_text:
+            reason = "laya-busy"
+        elif "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
+            reason = "laya-timeout"
+        else:
+            reason = f"laya-error: {exc}"
         return LayaDecision(
             handled=False, kind=kind, value=None, confidence=0.0,
             abstained=True, reason=reason,
@@ -598,6 +649,7 @@ def _decide_via_provider(
     kind: str,
     threshold: float,
     provider_id: str,
+    chat_id: str = "",
 ) -> LayaDecision:
     """تصمیم سریع از طریق پروایدر بیرونی (مثل حالت ریموت STT).
 
@@ -647,7 +699,8 @@ def _decide_via_provider(
 
         def _run_provider() -> tuple[str, dict | None]:
             async def _one() -> tuple[str, dict | None]:
-                return await llm_generate(model, user=prompt, sub=True)
+                return await llm_generate(model, user=prompt, sub=True,
+                                          chat_id=str(chat_id or ""))
 
             try:
                 loop = asyncio.get_running_loop()
@@ -795,7 +848,7 @@ def fast_route(prompt: str) -> str:
     return FAST_ROUTE_NORMAL
 
 
-def choice(state: dict, options: list, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD, provider_id: str = "") -> LayaDecision:
+def choice(state: dict, options: list, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD, provider_id: str = "", timeout: float = LOCAL_PREDICT_TIMEOUT, chat_id: str = "") -> LayaDecision:
     """انتخاب از گزینه‌ها (کاندید خوب laya): خروجی ساخت‌یافته با اطمینان."""
     opts = [str(o) for o in (options or []) if str(o or "").strip()]
     if not opts:
@@ -804,12 +857,12 @@ def choice(state: dict, options: list, threshold: float = DEFAULT_CONFIDENCE_THR
             abstained=True, reason="choice-no-options",
             usage=None, provider_id=(provider_id or _laya_provider_id()), model="",
         )
-    return decide(state or {}, {"type": "choice", "options": opts}, threshold, provider_id)
+    return decide(state or {}, {"type": "choice", "options": opts}, threshold, provider_id, str(chat_id or ""), timeout)
 
 
-def score(state: dict, candidate: Any, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD, provider_id: str = "") -> LayaDecision:
+def score(state: dict, candidate: Any, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD, provider_id: str = "", chat_id: str = "") -> LayaDecision:
     """امتیازدهی یک کاندید (۰ تا ۱) با آستانه اطمینان و واگذاری امن."""
-    out = decide(state or {}, {"type": "score", "candidate": candidate}, threshold, provider_id)
+    out = decide(state or {}, {"type": "score", "candidate": candidate}, threshold, provider_id, str(chat_id or ""))
     try:
         num = float(out.value)
     except (TypeError, ValueError):
@@ -903,6 +956,328 @@ def rank(
     except Exception as exc:  # noqa: BLE001 — no signal, caller falls back
         logger.debug("laya rank keyword path failed: %s", exc)
         return []
+
+
+def report_secondary(
+    decision: Any | None,
+    *,
+    route: str = "",
+    sub: str = "",
+    chat_id: str = "",
+    emit: Any = None,
+    elapsed_ms: int = 0,
+    prompt: str = "",
+    options: Any = None,
+    ranked: Any = None,
+) -> None:
+    """انتشار مشاهده‌پذیری تصمیم ثانویه laya (trace + رویداد زنده) — best-effort.
+
+    هر مشورت laya (حتی abstain/low-confidence) یک ردیف در تب Laya می‌سازد تا
+    «فقط یک‌بار laya» دیده نشود. هرگز استثنا نمی‌دهد تا مسیر اصلی نشکند.
+    """
+    try:
+        r = (route or "").strip() or FAST_ROUTE_NORMAL
+        if r not in FAST_ROUTE_OPTIONS:
+            r = FAST_ROUTE_NORMAL
+        label = (sub or "").strip() or "laya"
+        conf = 0.0
+        handled = False
+        abstained = True
+        reason = ""
+        value: Any = None
+        provider_id = LAYA_PROVIDER_DEFAULT
+        model = ""
+        kind = "choice"
+        opts: list = []
+        try:
+            if decision is not None:
+                conf = float(getattr(decision, "confidence", 0.0) or 0.0)
+                handled = bool(getattr(decision, "handled", False))
+                abstained = bool(getattr(decision, "abstained", True))
+                reason = str(getattr(decision, "reason", "") or "")
+                value = getattr(decision, "value", None)
+                provider_id = str(getattr(decision, "provider_id", "") or LAYA_PROVIDER_DEFAULT)
+                model = str(getattr(decision, "model", "") or "")
+                kind = str(getattr(decision, "kind", "choice") or "choice")
+            elif isinstance(ranked, list) and ranked:
+                top = ranked[0] if isinstance(ranked[0], dict) else {}
+                try:
+                    conf = float(top.get("confidence", 0.0) or 0.0)
+                except Exception:  # noqa: BLE001
+                    conf = 0.0
+                value = top.get("name") if isinstance(top, dict) else None
+                handled = True
+                abstained = False
+                reason = str(top.get("reason", "") or "rank-ok")
+                kind = "rank"
+            else:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if not 0.0 <= conf <= 1.0:
+            conf = 0.0
+        try:
+            opts = list(options) if isinstance(options, (list, tuple)) else []
+        except Exception:  # noqa: BLE001
+            opts = []
+        summary = f"{r} · {int(conf * 100)}٪ · {label}"
+        if value is not None and str(value).strip():
+            summary += f" · {str(value).strip()[:80]}"
+        live = {
+            "kind": "laya",
+            "route": r,
+            "confidence": conf,
+            "abstained": abstained,
+            "reason": f"{label}: {reason}" if reason else label,
+            "handled": handled,
+            "provider_id": provider_id or LAYA_PROVIDER_DEFAULT,
+            "model": model,
+            "elapsed_ms": int(elapsed_ms or 0),
+        }
+        if emit is not None:
+            try:
+                emit(dict(live))
+            except Exception:  # noqa: BLE001, S110 — رویداد زنده اختیاری است
+                pass
+        try:
+            import trace_store
+
+            trace_store.append(
+                str(chat_id or ""),
+                "laya",
+                summary,
+                detail={
+                    "route": r,
+                    "confidence": conf,
+                    "abstained": abstained,
+                    "reason": reason,
+                    "handled": handled,
+                    "provider_id": provider_id,
+                    "model": model,
+                    "elapsed_ms": int(elapsed_ms or 0),
+                    "value": value,
+                    "kind": kind,
+                    "options": opts,
+                    "sub": label,
+                },
+                model=model,
+                prompt=str(prompt or "")[:2000],
+                result=str(value or "") + (f"\nreason: {reason}" if reason else ""),
+            )
+        except Exception:  # noqa: BLE001, S110 — trace اختیاری است
+            pass
+    except Exception:  # noqa: BLE001, S110 — مشاهده‌پذیری هرگز مسیر اصلی را نمی‌شکند
+        pass
+
+
+def computer_next_step(task: str, app: str = "", chat_id: str = "", emit: Any = None) -> str | None:
+    """قدم بعدی computer: مستقیم act بزن یا اول درخت بخوان؟
+
+    خروجی یکی از COMPUTER_STEP_OPTIONS یا None (واگذاری به رفتار قبلی).
+    هر مشورت (حتی abstain) در trace/رویداد زنده ثبت می‌شود تا فقط یک ردیف laya دیده نشود.
+    هرگز استثنا نمی‌دهد تا مسیر اصلی ابزار نشکند.
+    """
+    _start = time.monotonic()
+    try:
+        decision = choice(
+            {
+                "task": (task or "")[:500],
+                "app": (app or "")[:120],
+            },
+            list(COMPUTER_STEP_OPTIONS),
+            timeout=SECONDARY_PREDICT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
+        return None
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        report_secondary(
+            decision,
+            route=FAST_ROUTE_COMPUTER,
+            sub="computer_next_step",
+            chat_id=chat_id,
+            emit=emit,
+            elapsed_ms=_elapsed,
+            prompt=task or "",
+            options=list(COMPUTER_STEP_OPTIONS),
+        )
+    except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+        pass
+    try:
+        if not decision.handled:
+            return None
+        value = str(decision.value or "").strip()
+        if value in COMPUTER_STEP_OPTIONS:
+            return value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def computer_act_mode(task: str, app: str = "", chat_id: str = "", emit: Any = None) -> str | None:
+    """حالت اجرای computer: اکشن معنایی act یا sequence مختصاتی؟
+
+    خروجی یکی از COMPUTER_MODE_OPTIONS یا None (واگذاری به رفتار قبلی).
+    هر مشورت در trace/رویداد زنده ثبت می‌شود. هرگز استثنا نمی‌دهد.
+    """
+    _start = time.monotonic()
+    try:
+        decision = choice(
+            {
+                "task": (task or "")[:500],
+                "app": (app or "")[:120],
+            },
+            list(COMPUTER_MODE_OPTIONS),
+            timeout=SECONDARY_PREDICT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        report_secondary(
+            decision,
+            route=FAST_ROUTE_COMPUTER,
+            sub="computer_act_mode",
+            chat_id=chat_id,
+            emit=emit,
+            elapsed_ms=_elapsed,
+            prompt=task or "",
+            options=list(COMPUTER_MODE_OPTIONS),
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        if not decision.handled:
+            return None
+        value = str(decision.value or "").strip()
+        if value in COMPUTER_MODE_OPTIONS:
+            return value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def browser_next_step(task: str, chat_id: str = "", emit: Any = None) -> str | None:
+    """قدم بعدی Playwright: مستقیم act بزن یا اول snapshot بخوان؟
+
+    خروجی یکی از BROWSER_STEP_OPTIONS یا None (واگذاری به رفتار قبلی).
+    هر مشورت در trace/رویداد زنده ثبت می‌شود. هرگز استثنا نمی‌دهد.
+    """
+    _start = time.monotonic()
+    try:
+        decision = choice(
+            {"task": (task or "")[:500]},
+            list(BROWSER_STEP_OPTIONS),
+            timeout=SECONDARY_PREDICT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        report_secondary(
+            decision,
+            route=FAST_ROUTE_BROWSER,
+            sub="browser_next_step",
+            chat_id=chat_id,
+            emit=emit,
+            elapsed_ms=_elapsed,
+            prompt=task or "",
+            options=list(BROWSER_STEP_OPTIONS),
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        if not decision.handled:
+            return None
+        value = str(decision.value or "").strip()
+        if value in BROWSER_STEP_OPTIONS:
+            return value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def rank_selectors(task: str, selectors: Any, top_k: int = 5, chat_id: str = "", emit: Any = None) -> list[dict]:
+    """رتبه‌بندی selectorهای computer برای یک تسک (کدام محتمل‌تر است؟).
+
+    خروجی rank (حداکثر top_k) یا [] یعنی بدون سیگنال و حفظ رفتار قبلی.
+    نتیجه در trace/رویداد زنده ثبت می‌شود. هرگز استثنا نمی‌دهد.
+    """
+    _start = time.monotonic()
+    try:
+        out = rank(
+            str(task or ""),
+            selectors,
+            top_k=top_k,
+            instructions="Pick the most likely UI selector for this task.",
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        if out:
+            report_secondary(
+                None,
+                route=FAST_ROUTE_COMPUTER,
+                sub="rank_selectors",
+                chat_id=chat_id,
+                emit=emit,
+                elapsed_ms=_elapsed,
+                prompt=str(task or ""),
+                ranked=out,
+            )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return out
+
+
+def rank_browser_tools(task: str, tools: Any, top_k: int = 5, chat_id: str = "", emit: Any = None) -> list[dict]:
+    """رتبه‌بندی ابزارهای مرورگر Playwright برای یک تسک.
+
+    خروجی rank (حداکثر top_k) یا [] یعنی بدون سیگنال و حفظ رفتار قبلی.
+    نتیجه در trace/رویداد زنده ثبت می‌شود. هرگز استثنا نمی‌دهد.
+    """
+    _start = time.monotonic()
+    try:
+        out = rank(
+            str(task or ""),
+            tools,
+            top_k=top_k,
+            instructions="Pick the most likely browser tool for this task.",
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        if out:
+            report_secondary(
+                None,
+                route=FAST_ROUTE_BROWSER,
+                sub="rank_browser_tools",
+                chat_id=chat_id,
+                emit=emit,
+                elapsed_ms=_elapsed,
+                prompt=str(task or ""),
+                ranked=out,
+            )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return out
 
 
 def status() -> dict:

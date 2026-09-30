@@ -1,0 +1,146 @@
+"""In-memory per-chat trace log (LangSmith-style).
+
+Keeps a bounded queue of trace entries per chat id for live debugging:
+``laya`` decisions, ``llm`` calls (model + tokens + error), ``prompt``
+snapshots (full text + summary) and ``tool`` calls (name + args + result).
+In-memory only, never persisted.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import threading
+import time
+import uuid
+
+MAX_ENTRIES_PER_CHAT = 200
+
+_VALID_KINDS = ("laya", "llm", "prompt", "tool")
+
+_lock = threading.Lock()
+_store: dict[str, list[dict]] = {}
+
+_current_chat: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "trace_current_chat", default=""
+)
+
+
+def _clean_text(value: object, limit: int = 20000) -> str:
+    try:
+        text = str(value or "")
+    except Exception:  # noqa: BLE001 — trace must never fail
+        return ""
+    text = text.replace("\r\n", "\n")
+    if len(text) > limit:
+        return text[:limit] + "\n…[truncated]"
+    return text
+
+
+def set_current_chat(chat_id: str):
+    """Set the ambient chat id for this task; returns a token to reset."""
+    return _current_chat.set((chat_id or "").strip())
+
+
+def reset_current_chat(token) -> None:
+    try:
+        _current_chat.reset(token)
+    except Exception:  # noqa: BLE001, S110 — reset must never fail
+        pass
+
+
+def get_current_chat() -> str:
+    try:
+        return str(_current_chat.get() or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def append(
+    chat_id: str,
+    kind: str,
+    summary: str,
+    detail: dict | None = None,
+    *,
+    model: str = "",
+    tokens: dict | None = None,
+    error: str = "",
+    prompt: str = "",
+    result: str = "",
+) -> dict | None:
+    """Append one trace entry for a chat. Returns the entry or None."""
+    cid = (chat_id or "").strip() or get_current_chat()
+    k = (kind or "").strip().lower()
+    if not cid or k not in _VALID_KINDS:
+        return None
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "at": time.time(),
+        "kind": k,
+        "summary": str(summary or "")[:500],
+        "detail": dict(detail or {}),
+        "model": str(model or ""),
+        "tokens": dict(tokens or {}),
+        "error": str(error or "")[:2000],
+        "prompt": _clean_text(prompt),
+        "result": _clean_text(result),
+    }
+    with _lock:
+        items = _store.get(cid, [])
+        items.append(entry)
+        if len(items) > MAX_ENTRIES_PER_CHAT:
+            items = items[-MAX_ENTRIES_PER_CHAT:]
+        _store[cid] = items
+    return entry
+
+
+def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") -> dict | None:
+    """Attach a tool result to the matching running tool entry."""
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return None
+    want = str(call_id or "").strip()
+    text = _clean_text(result, limit=20000)
+    with _lock:
+        items = _store.get(cid, [])
+        if want:
+            for entry in reversed(items):
+                if entry.get("kind") != "tool":
+                    continue
+                detail = entry.get("detail") or {}
+                if str(detail.get("call_id") or "").strip() == want:
+                    entry["result"] = text
+                    if error:
+                        entry["error"] = str(error)[:2000]
+                    detail["status"] = "error" if error else "done"
+                    detail["result_chars"] = len(text)
+                    entry["detail"] = detail
+                    return dict(entry)
+        # Fallback: latest running tool entry.
+        for entry in reversed(items):
+            if entry.get("kind") == "tool" and (entry.get("detail") or {}).get("status") == "running":
+                entry["result"] = text
+                if error:
+                    entry["error"] = str(error)[:2000]
+                (entry.get("detail") or {}).update({"status": "error" if error else "done", "result_chars": len(text)})
+                return dict(entry)
+    return None
+
+
+def list_traces(chat_id: str, kind: str = "") -> list[dict]:
+    """Return a copy of a chat's traces, optionally filtered by kind."""
+    cid = (chat_id or "").strip()
+    k = (kind or "").strip().lower()
+    with _lock:
+        items = list(_store.get(cid, []))
+    if k and k in _VALID_KINDS:
+        items = [e for e in items if e.get("kind") == k]
+    return [dict(e) for e in items]
+
+
+def clear(chat_id: str) -> int:
+    """Drop all traces for a chat. Returns removed count."""
+    cid = (chat_id or "").strip()
+    with _lock:
+        removed = len(_store.get(cid, []))
+        _store.pop(cid, None)
+    return removed

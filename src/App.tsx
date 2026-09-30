@@ -4,7 +4,9 @@ import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
 import { ReviewPanel } from './components/ReviewPanel'
+import { TracePanel } from './components/TracePanel'
 import { useReviewPanel } from './lib/reviewPanel'
+import { useTracePanel } from './lib/tracePanel'
 import { RightPanel } from './components/TodosPanel'
 import { ScheduleInbox, ScheduleInboxButton } from './components/ScheduleInbox'
 import { SettingsModal } from './components/SettingsModal'
@@ -33,6 +35,7 @@ export default function App() {
   // می‌شود و ترنِ همان پیام را نشان می‌دهد.
   const reviewOpen = useReviewPanel((s) => s.open)
   const reviewSource = useReviewPanel((s) => s.source)
+  const traceOpen = useTracePanel((s) => s.open)
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -280,6 +283,18 @@ export default function App() {
           <ScheduleInboxButton />
           <button
             className="titlebar-icon-btn"
+            title="Chat traces — laya / LLM / prompts"
+            aria-label="Chat traces — laya / LLM / prompts"
+            aria-pressed={traceOpen}
+            onClick={() => useTracePanel.getState().openTraces()}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M4 6h16M4 12h10M4 18h7" />
+              <path d="M17 16l3 3m0-3l-3 3" />
+            </svg>
+          </button>
+          <button
+            className="titlebar-icon-btn"
             title="Git diff — uncommitted changes"
             aria-label="Git diff — uncommitted changes"
             aria-pressed={reviewOpen && reviewSource === 'uncommitted'}
@@ -317,6 +332,7 @@ export default function App() {
             <ChatPanel key={activeChatId} />
           </main>
           {reviewOpen && <ReviewPanel />}
+          {traceOpen && <TracePanel />}
           {codeMapPanelOpen && (
             <CodeMapPanel
               onJumpToFile={(path, line) => {

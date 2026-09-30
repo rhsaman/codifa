@@ -477,6 +477,27 @@ export interface Chat {
   updatedAt: number
 }
 
+/** یک ورودی لاگ چت جاری برای پنل Trace (لایا / LLM / پرامپت / ابزار) — مثل لنگ‌اسمیت. */
+export type TraceKind = 'laya' | 'llm' | 'prompt' | 'tool'
+
+export interface TraceEntry {
+  id: string
+  /** زمان ثبت (epoch ثانیه). */
+  at: number
+  kind: TraceKind
+  /** خلاصه یک‌خطی ردیف تاشو. */
+  summary: string
+  /** جزئیات ساخت‌یافته (مسیر/اطمینان/دلیل لایا، توکن LLM، آرگومان ابزار، …). */
+  detail?: Record<string, unknown>
+  model?: string
+  tokens?: { input?: number; output?: number; total?: number }
+  error?: string
+  /** متن کامل پرامپت (پرامپت نوبت، پرامپت تک‌شات LLM، یا آرگومان ابزار). */
+  prompt?: string
+  /** نتیجه ابزار (فقط kind=tool). */
+  result?: string
+}
+
 /** یک تصمیم سریع laya برای نمایش زنده زیر todos (فقط چت فعال، آخرین ~۲۰ تا). */
 export interface LayaRun {
   route: string

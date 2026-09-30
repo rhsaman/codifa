@@ -64,6 +64,15 @@ MAX_TARGETS = 60
 # (رفتار قبلی: انتخاب کاملاً با مدل، فقط راهنمای متنی). خاموش‌کردن هیچ مسیر دیگری را عوض نمی‌کند.
 LAYA_SEE_GATE_ENABLED = True
 
+# عمق هوشمند درخت: اپ‌های شلوغ (مرورگر/IDE) با عمق کم شروع می‌کنند تا توکن
+# و زمان پیمایش کم شود؛ درخت خالی/کم‌گره با عمق کامل خوانده می‌شود.
+_BUSY_APP_HINTS = (
+    "chrome", "chromium", "firefox", "safari", "edge", "browser",
+    "code", "vscode", "visual studio code", "idea", "pycharm", "webstorm",
+    "کروم", "مرورگر",
+)
+_SHALLOW_TREE_DEPTH = 8
+
 # اکشن‌های معنایی مجاز روی عنصر (نام متد Locator در xa11y)
 ELEMENT_ACTIONS = {
     "press",
@@ -247,6 +256,14 @@ def _friendly_error(exc: Exception) -> str:
     # gets the Darwin note even if the class name changes.
     if not hint and ("permission denied" in txt_lower or "enable accessibility" in txt_lower):
         hint = _ACCESS_NOTES.get(platform.system(), "")
+    # خطای -1708 یعنی اپ هدف (مثل Dock) قابل activate نیست — نه مشکل پرمیشن.
+    # فعال‌سازی Dock بی‌معناست؛ مدل باید مستقیم روی اپ واقعی کار کند.
+    if "-1708" in str(exc) or "can't continue activate" in txt_lower:
+        hint = (
+            "The target app cannot be activated (e.g. Dock/Finder background "
+            "process) — do NOT call open_app on it. Act on the real app window "
+            "instead (read_screen with the app name, or omit app for foreground)."
+        )
     out = f"{name}: {exc}"
     if hint:
         out += f" — {hint}"
@@ -593,6 +610,80 @@ def _actionable_targets(
     return lines, capped
 
 
+def suggest_tree_depth(app_name: str = "", task: str = "", chat_id: str = "", emit: Any = None) -> int:
+    """عمق پیشنهادی درخت با laya: اپ شلوغ → کم‌عمق، بقیه → کامل.
+
+    خروجی همیشه یک عدد معتبر است (واگذاری امن = DEFAULT_MAX_DEPTH).
+    هرگز استثنا نمی‌دهد تا مسیر اصلی read نشکند.
+    """
+    try:
+        low = (app_name or "").strip().lower()
+        if low and any(h in low for h in _BUSY_APP_HINTS):
+            return _SHALLOW_TREE_DEPTH
+        try:
+            import laya_decide
+        except Exception:  # noqa: BLE001 — laya اختیاری است
+            return DEFAULT_MAX_DEPTH
+        try:
+            decision = laya_decide.choice(
+                {
+                    "task": (task or "")[:300],
+                    "app": (app_name or "")[:120],
+                },
+                ["shallow", "full"],
+                threshold=laya_decide.SHALLOW_CONFIDENCE_THRESHOLD,
+                timeout=laya_decide.SECONDARY_PREDICT_TIMEOUT,
+                chat_id=str(chat_id or ""),
+            )
+        except Exception:  # noqa: BLE001
+            return DEFAULT_MAX_DEPTH
+        try:
+            laya_decide.report_secondary(
+                decision,
+                route="computer",
+                sub="suggest_tree_depth",
+                chat_id=chat_id,
+                emit=emit,
+                prompt=str(task or ""),
+                options=["shallow", "full"],
+            )
+        except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+            pass
+        if getattr(decision, "handled", False) and str(getattr(decision, "value", "")).strip() == "shallow":
+            return _SHALLOW_TREE_DEPTH
+    except Exception:  # noqa: BLE001
+        return DEFAULT_MAX_DEPTH
+    return DEFAULT_MAX_DEPTH
+
+
+def rank_actionable_targets(task: str, targets: list[str], top_k: int = 5, chat_id: str = "", emit: Any = None) -> list[str]:
+    """مرتب‌سازی targets خروجی read بر اساس احتمال تطبیق با تسک.
+
+    ورودی همان خط‌های ``selector -> center`` است؛ خروجی همان خط‌ها به ترتیب
+    رتبه laya است. بدون سیگنال (laya خاموش/خطا) ترتیب ورودی حفظ می‌شود.
+    هرگز استثنا نمی‌دهد.
+    """
+    try:
+        items = [str(t or "") for t in (targets or []) if str(t or "").strip()]
+        if not items or not (task or "").strip():
+            return list(targets or [])
+        try:
+            import laya_decide
+        except Exception:  # noqa: BLE001
+            return list(targets or [])
+        try:
+            ranked = laya_decide.rank_selectors(task, items, top_k=len(items), chat_id=chat_id, emit=emit)
+        except Exception:  # noqa: BLE001
+            return list(targets or [])
+        if not ranked:
+            return list(targets or [])
+        order = [str(r.get("name", "")) for r in ranked if isinstance(r, dict)]
+        pos = {name: i for i, name in enumerate(order)}
+        return sorted(items, key=lambda t: pos.get(t, len(order)))
+    except Exception:  # noqa: BLE001
+        return list(targets or [])
+
+
 def read_screen(app_name: str = "", max_depth: int = DEFAULT_MAX_DEPTH) -> dict[str, Any]:
     """درخت Accessibility اپ هدف (با نام، یا پیش‌فرض اپ فعال) به‌صورت متن فشرده."""
     if not _XA11Y_AVAILABLE:
@@ -631,7 +722,7 @@ def read_screen(app_name: str = "", max_depth: int = DEFAULT_MAX_DEPTH) -> dict[
         return {"error": _friendly_error(exc)}
 
 
-def prefer_tree_over_see(question: str = "", app_name: str = "") -> bool | None:
+def prefer_tree_over_see(question: str = "", app_name: str = "", chat_id: str = "", emit: Any = None) -> bool | None:
     """گیت آزمایشی: آیا درخت Accessibility به‌احتمال زیاد برای این سؤال کافی است؟
 
     سؤال دودویی ``choice`` از laya (``prefer_tree`` در برابر ``prefer_see``) با
@@ -654,9 +745,23 @@ def prefer_tree_over_see(question: str = "", app_name: str = "") -> bool | None:
                 "app": (app_name or "")[:120],
             },
             ["prefer_tree", "prefer_see"],
+            timeout=laya_decide.SECONDARY_PREDICT_TIMEOUT,
+            chat_id=str(chat_id or ""),
         )
     except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
         return None
+    try:
+        laya_decide.report_secondary(
+            decision,
+            route="computer",
+            sub="prefer_tree_over_see",
+            chat_id=chat_id,
+            emit=emit,
+            prompt=str(question or ""),
+            options=["prefer_tree", "prefer_see"],
+        )
+    except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
+        pass
     try:
         if not decision.handled:
             return None

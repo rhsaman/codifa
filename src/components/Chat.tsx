@@ -425,6 +425,11 @@ export function ChatPanel() {
   // scrolled up, don't auto-pin to the bottom on return.
   const [initialScrollPos] = useState(() => chat?.scrollPos ?? null);
   const stickToBottom = useRef(!initialScrollPos || initialScrollPos.atBottom);
+  // A jump-to-bottom smooth scroll started by the scroll-jump button is still
+  // in flight: while set, onChatScroll ignores the animation's intermediate
+  // scroll events so they can't unpin the view or pop the button back.
+  // Cleared on arrival at the bottom, or immediately on user wheel/touch.
+  const jumpScrollingRef = useRef(false);
   const [showJump, setShowJump] = useState(false);
   /** آستانهٔ نمایش فلش «پرش به پایین»: صفر یعنی محتوای چت هنوز پشت UI شناور
    *  پنهان نشده (کامپوزر روی فضای رزروشدهٔ انتهای چت شناور است)؛ تا وقتی
@@ -832,6 +837,16 @@ export function ChatPanel() {
       restoreTargetRef.current = null;
     }
     if (fromReanchor) return;
+    // Jump flight in progress: intermediate ticks of the smooth animation are
+    // not user scrolls — keep the pin and the hidden button until arrival.
+    if (jumpScrollingRef.current) {
+      if (isAtBottom(el)) {
+        jumpScrollingRef.current = false;
+        stickToBottom.current = true;
+        setShowJump(false);
+      }
+      return;
+    }
     const atBottom = isAtBottom(el);
     stickToBottom.current = atBottom;
     // Bail out when unchanged so scrolling doesn't re-render the whole panel on
@@ -2132,10 +2147,9 @@ export function ChatPanel() {
       } else if (event.kind === "laya") {
         // فعالیت زنده تصمیم سریع laya — جدا از رویداد usage (مصرف دست‌نخورده
         // می‌ماند)؛ در تاریخچه همان چت مبدأ استریم ثبت می‌شود (نه چت فعال لحظه‌ای)
-        // تا با سوییچ چت، تاریخچه قاطی نشود و پنل فقط مال چت فعال را نشان دهد.
+        // تا با سوییچ چت، تاریخچه قاطی نشود. لاگ کامل در trace_store بک‌اند است
+        // و از پنل Trace (آیکون اپ‌بار) دیده می‌شود — دیگر پنل راست باز نمی‌شود.
         const originChatId = chat.id;
-        const prevRuns =
-          store.chats.find((c) => c.id === originChatId)?.layaRuns?.length ?? 0;
         store.appendLayaRun(originChatId, {
           route: typeof event.route === "string" ? event.route : "normal",
           confidence: typeof event.confidence === "number" ? event.confidence : 0,
@@ -2149,11 +2163,6 @@ export function ChatPanel() {
           model: typeof event.model === "string" ? event.model : "",
           elapsedMs: typeof event.elapsed_ms === "number" ? event.elapsed_ms : 0,
         });
-        // اولین رویداد laya و پنل بسته است → پنل راست خودکار باز شود تا
-        // کاربر تصمیم را ببیند (مثل تودوها؛ فقط گذار ۰→۱ باز می‌کند).
-        if (prevRuns === 0 && !store.rightPanelOpen) {
-          store.setRightPanelOpen(true);
-        }
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -3579,7 +3588,17 @@ export function ChatPanel() {
   return (
     <div className="chat-panel">
       {titlebarEl ? createPortal(toolbar, titlebarEl) : toolbar}
-      <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
+      <div
+        className="chat-scroll"
+        ref={scrollRef}
+        onScroll={onChatScroll}
+        onWheel={() => {
+          jumpScrollingRef.current = false;
+        }}
+        onTouchStart={() => {
+          jumpScrollingRef.current = false;
+        }}
+      >
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
@@ -3940,14 +3959,25 @@ export function ChatPanel() {
       >
         {showJump && (
           <button
+            type="button"
             className="scroll-jump"
             title="Scroll to bottom"
             onClick={() => {
+              const el = scrollRef.current;
+              if (!el) return;
+              // The user explicitly asked for the bottom: drop any in-progress
+              // viewport restore so it can't fight the jump, then smooth-scroll.
+              restoreTargetRef.current = null;
               stickToBottom.current = true;
+              jumpScrollingRef.current = true;
               setShowJump(false);
-              scrollRef.current?.scrollTo({
-                top: scrollRef.current.scrollHeight,
+              programmaticScrollRef.current = true;
+              el.scrollTo({
+                top: el.scrollHeight,
                 behavior: "smooth",
+              });
+              requestAnimationFrame(() => {
+                programmaticScrollRef.current = false;
               });
             }}
           >

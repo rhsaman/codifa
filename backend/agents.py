@@ -3590,7 +3590,7 @@ async def _compact_history(
             )
         try:
             summary, usage = await llm_complete(
-                m, system=_COMPACTION_SYSTEM_PROMPT, user=user_prompt
+                m, system=_COMPACTION_SYSTEM_PROMPT, user=user_prompt,
             )
         except Exception as exc:  # noqa: BLE001
             _exc.append(f"summarizer error: {str(exc) or repr(exc)}")

@@ -170,7 +170,7 @@ def test_prefer_tree_over_see_gate(monkeypatch):
     monkeypatch.setattr(cu, "LAYA_SEE_GATE_ENABLED", True)
     monkeypatch.setattr(
         laya_decide, "choice",
-        lambda state, options, threshold=0.65, provider_id="": laya_decide.LayaDecision(
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0: laya_decide.LayaDecision(
             handled=True, kind="choice", value="prefer_tree", confidence=0.9,
             abstained=False, reason="local-decision",
         ),

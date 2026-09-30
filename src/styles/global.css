@@ -3325,7 +3325,8 @@ textarea {
 .composer-footer,
 .composer-diff-bar,
 .ask-card,
-.perm-card {
+.perm-card,
+.scroll-jump {
   pointer-events: auto;
 }
 
@@ -14752,6 +14753,429 @@ mark.diff-hit-active {
   padding: 4px 12px 12px;
   font-size: 11.5px;
   color: var(--text-dim);
+}
+
+/* ---- Trace panel (لاگ چت جاری مثل لنگ‌اسمیت): ردیف‌های تاشو + بلوک پرامپت تمیز ---- */
+.trace-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 12px 14px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.trace-panel-step {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trace-panel-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-dim);
+  cursor: pointer;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.trace-panel-step-head:hover {
+  color: var(--text);
+}
+
+.trace-panel-step-chev {
+  flex: 0 0 auto;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.trace-panel-step-title {
+  flex: 0 0 auto;
+}
+
+.trace-panel-step-meta {
+  margin-left: auto;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.trace-panel-step-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.trace-panel-item {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.trace-panel-item:last-child {
+  border-bottom: 0;
+}
+
+.trace-panel-item.open {
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.trace-panel-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+
+.trace-panel-row:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.trace-panel-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.7;
+}
+
+.trace-panel-dot.kind-laya {
+  background: var(--success);
+}
+
+.trace-panel-dot.kind-llm {
+  background: var(--accent);
+}
+
+.trace-panel-dot.kind-prompt {
+  background: var(--thinking);
+}
+
+.trace-panel-dot.kind-tool {
+  background: var(--warning);
+}
+
+.trace-panel-title {
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.trace-panel-chip {
+  flex: 0 0 auto;
+}
+
+.trace-panel-time {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.trace-panel-chev {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.trace-panel-body {
+  padding: 8px 8px 10px 22px;
+}
+
+.trace-row-block {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-panel) 60%, var(--bg) 40%),
+      var(--bg));
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.trace-row-block.open {
+  border-color: var(--border);
+}
+
+.trace-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  text-align: start;
+}
+
+.trace-kind-badge {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex: 0 0 auto;
+}
+
+.trace-kind-badge.kind-laya {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-llm {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-prompt {
+  color: var(--thinking);
+  border-color: color-mix(in srgb, var(--thinking) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-tool {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.trace-status-chip {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.trace-status-chip.status-done {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+
+.trace-status-chip.status-running {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.trace-status-chip.status-error {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.trace-block-label {
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-inline-end: auto;
+}
+
+.trace-hit {
+  background: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.trace-row-title {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.trace-row-time {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.trace-row-open {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.trace-row-body {
+  border-top: 1px solid var(--hairline);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.trace-laya-meta,
+.trace-llm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.trace-meta-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.trace-meta-reason {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+.trace-meta-error {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.trace-prompt-block {
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.trace-prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.trace-copy-btn {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  color: var(--text);
+  cursor: pointer;
+}
+
+.trace-prompt-text {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.trace-detail-json {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.trace-tab-count {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 1px 7px;
+  margin-inline-start: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.review-source-btn.active .trace-tab-count {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.trace-subheader {
+  display: flex;
+  align-items: center;
+  padding: 6px 14px 0;
+}
+
+.trace-subheader-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-live-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--success);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--success) 40%, var(--border));
+  white-space: nowrap;
+}
+
+.trace-live-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes trace-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
 }
 
 /* ---- Review overlay (مثل حالت مطالعه) — روی چت شناور می‌شود و چت را

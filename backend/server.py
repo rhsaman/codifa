@@ -1104,6 +1104,32 @@ async def checkpoints_restore(chat_id: str, seq: int, req: CheckpointRestoreRequ
     return out
 
 
+# --- traces (LangSmith-style per-chat log) -------------------------------- #
+# حافظه موقت لاگ هر چت برای پنل Trace (لایا / LLM / پرامپت) — فقط حافظه، بدون persist.
+
+
+@app.get("/chats/{chat_id}/traces")
+async def chat_traces(chat_id: str, kind: str = "") -> dict:
+    """لاگ‌های چت جاری با فیلتر اختیاری نوع (laya / llm / prompt / tool)."""
+    import trace_store
+
+    cid = (chat_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="missing chat id")
+    return {"traces": trace_store.list_traces(cid, kind)}
+
+
+@app.delete("/chats/{chat_id}/traces")
+async def chat_traces_clear(chat_id: str) -> dict:
+    """پاک‌کردن لاگ چت جاری."""
+    import trace_store
+
+    cid = (chat_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="missing chat id")
+    return {"ok": True, "removed": trace_store.clear(cid)}
+
+
 # --- git ------------------------------------------------------------------- #
 # ابزارهای git برای پنل فرانت‌اند (GitPanel) — همان توابع امنِ
 # backend/git_tools.py که ابزارهای مدل هم استفاده می‌کنند.

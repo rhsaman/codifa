@@ -59,18 +59,13 @@ console.log("۱) formatNextRunFa — بدون نوبت:")
 
 console.log("۲) formatNextRunFa — امروز/فردا:")
 {
-  const nowSec = Math.floor(Date.now() / 1000)
-  const today = formatNextRunFa(nowSec + 3600)
+  // زمان مرجع ثابت (ظهر، دور از مرز نیمه‌شب) تا تست به ساعت اجرای روز وابسته نباشد
+  const fixedNow = new Date(2026, 5, 15, 12, 0, 0)
+  const nowSec = Math.floor(fixedNow.getTime() / 1000)
+  const today = formatNextRunFa(nowSec + 3600, fixedNow)
   check("یک ساعت بعد Today است", today.startsWith("Today"), today)
-  const tomorrow = formatNextRunFa(nowSec + 86400)
-  // اگر ساعت +۲۴h روز بعد باشد «Tomorrow»، وگرنه تاریخ (مرز روز) — هر دو قابل‌قبول نیست؛ دقیق چک می‌کنیم
-  const d = new Date((nowSec + 86400) * 1000)
-  const isTomorrow = d.toDateString() === new Date(Date.now() + 86400000).toDateString()
-  if (isTomorrow) {
-    check("۲۴ ساعت بعد Tomorrow است", tomorrow.startsWith("Tomorrow"), tomorrow)
-  } else {
-    check("۲۴ ساعت بعد تاریخ دارد", !tomorrow.startsWith("Today"), tomorrow)
-  }
+  const tomorrow = formatNextRunFa(nowSec + 86400, fixedNow)
+  check("۲۴ ساعت بعد Tomorrow است", tomorrow.startsWith("Tomorrow"), tomorrow)
 }
 
 console.log("۳) formatNextRunFa — تاریخ دور:")

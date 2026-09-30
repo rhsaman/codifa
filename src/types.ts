@@ -366,6 +366,10 @@ export interface ChatMessage {
    *  active thinking) started — same remount-survival rationale as
    *  `thinkingStartedAt`: switching chats must not reset the elapsed timer. */
   workingStartedAt?: number
+  /** Final turn duration in ms, stamped when the turn ends (success, stop or
+   *  error) from `workingStartedAt`. Rendered statically in the message footer
+   *  so every finished turn keeps its working time visible in the chat. */
+  turnElapsedMs?: number
   /** True when this message was persisted mid-stream (heartbeat snapshot) and
    *  the app died before the turn completed — shown as "interrupted" after a
    *  crash/power cut instead of looking like a complete reply. Cleared by the

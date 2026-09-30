@@ -355,9 +355,13 @@ export const UsagePopover = memo(UsagePopoverImpl);
 
 /**
  * Titlebar chip: ONE pill holding the chat's grand total, the cached portion
- * and the reset button; hovering (or keyboard focus) opens the details
- * popover. Hidden entirely while the active chat has no usage yet — same rule
- * the old sidebar panel had.
+ * and the reset button; hovering opens the details popover (keyboard users
+ * toggle it explicitly with Enter/Space). Hidden entirely while the active
+ * chat has no usage yet — same rule the old sidebar panel had.
+ *
+ * NOTE: the popover must NOT open on focus alone — only genuine mouse hover
+ * (or an explicit keyboard/click toggle) opens it, so it never pops up while
+ * the pointer is elsewhere.
  */
 export function UsageChip() {
   const activeChatId = useStore((s) => s.activeChatId);
@@ -397,11 +401,36 @@ export function UsageChip() {
     cancelClose();
     // Anchor from the chip rect so the portaled popover sits just below it.
     // Guarded for SSR (no window/document) — falls back to CSS anchoring.
+    // Called ONLY from genuine mouse hover or an explicit keyboard/click
+    // toggle — never from focus alone — so the popover can't appear while
+    // the pointer is elsewhere.
     if (chipRef.current && typeof window !== "undefined") {
       const r = chipRef.current.getBoundingClientRect();
       setPos(computeUsagePopoverPos(r, window.innerWidth));
     }
     setOpen(true);
+  };
+  const toggleOpen = () => {
+    if (open) {
+      cancelClose();
+      setOpen(false);
+    } else {
+      openNow();
+    }
+  };
+  const handleBlur = (e: React.FocusEvent<HTMLDivElement>) => {
+    // Close only when focus truly leaves the chip (Tab away). Focusing the
+    // inner reset button bubbles through here but `contains` keeps it open.
+    // Never opens — close-only — so keyboard tabbing can't pop it up.
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    // If the pointer is still hovering the chip/popover, hover owns the
+    // open state — don't let blur steal it and flicker.
+    try {
+      if (chipRef.current?.matches?.(":hover")) return;
+    } catch {
+      /* ignore selector errors */
+    }
+    scheduleClose();
   };
   useEffect(() => cancelClose, []);
   // Keep the fixed popover glued under the chip on resize/scroll while open.
@@ -447,10 +476,18 @@ export function UsageChip() {
       aria-label={`Total chat tokens: ${formatTokens(view.totalTokens)}${view.totalCached > 0 ? ` · cached: ${formatTokens(view.totalCached)}` : ""}`}
       onMouseEnter={openNow}
       onMouseLeave={scheduleClose}
-      onFocus={openNow}
-      onBlur={scheduleClose}
+      onClick={(e) => {
+        // Clicking the inner reset button must not toggle the popover.
+        if ((e.target as HTMLElement | null)?.closest?.(".usage-reset"))
+          return;
+        toggleOpen();
+      }}
+      onBlur={handleBlur}
       onKeyDown={(e) => {
-        if (e.key === "Escape") {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleOpen();
+        } else if (e.key === "Escape") {
           e.stopPropagation();
           setOpen(false);
         }

@@ -1521,8 +1521,13 @@ export function ChatPanel() {
           streaming: true,
           retry: null,
           // Base for the "Working" elapsed timer — stored on the message so
-          // switching chats (unmount/remount) doesn't reset it to zero.
-          workingStartedAt: Date.now(),
+          // switching chats (unmount/remount) doesn't reset it to zero. Kept
+          // from the original turn start on continuations so the finished
+          // turn's persisted duration covers the whole turn, not just the
+          // resumed segment.
+          ...(existing.workingStartedAt
+            ? {}
+            : { workingStartedAt: Date.now() }),
         });
       } else {
         assistantMsg = s.addMessage(chat.id, {
@@ -1559,7 +1564,18 @@ export function ChatPanel() {
     for (const m of chat.messages) {
       if (m.id === assistantMsg.id) continue;
       if (m.retry) s.updateMessage(m.id, { retry: null });
-      if (m.streaming) s.updateMessage(m.id, { streaming: false });
+      // A stale streaming flag from a previous turn: close it AND stamp its
+      // duration so the finished turn keeps its working time in the footer.
+      if (m.streaming) {
+        const staleStart = m.workingStartedAt ?? m.thinkingStartedAt;
+        s.updateMessage(m.id, {
+          streaming: false,
+          workingStartedAt: undefined,
+          ...(staleStart != null
+            ? { turnElapsedMs: Math.max(0, Date.now() - staleStart) }
+            : {}),
+        });
+      }
     }
     // A skill warning from the previous turn (e.g. an @mention that resolved to
     // nothing) is stale by now — the new turn re-resolves its own mentions.
@@ -2509,10 +2525,16 @@ export function ChatPanel() {
         !!curMsg?.error ||
         (!!curMsg?.retry &&
           (curMsg.retry.gaveUp === true || curMsg.retry.watchdog === true));
+      // Persist the turn's working time on the message so it stays visible in
+      // the chat footer after the live "Working" indicator unmounts.
+      const turnStart = curMsg?.workingStartedAt ?? curMsg?.thinkingStartedAt;
+      const turnElapsedMs =
+        turnStart != null ? Math.max(0, Date.now() - turnStart) : undefined;
       useStore.getState().updateMessage(assistantMsg.id, {
         streaming: false,
         thinkingActive: false,
         workingStartedAt: undefined,
+        ...(turnElapsedMs != null ? { turnElapsedMs } : {}),
         ...(keepRetry ? {} : { retry: null }),
       });
       // No auto-refresh of the credit chip here — strictly click-to-refresh

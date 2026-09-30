@@ -18,6 +18,7 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
+import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
 import { friendlyTtsError, useTtsPlayback } from "../lib/tts";
 import { useStore } from "../lib/store";
@@ -1685,7 +1686,7 @@ export const ChatMessageView = memo(
         </div>
       )}
 
-      {!isUser && (message.content || message.usage || message.streaming) && (
+      {!isUser && (message.content || message.usage || message.streaming || message.turnElapsedMs != null) && (
         <div className="msg-actions">
           {message.usage && (
             <UsageBadge
@@ -1693,6 +1694,16 @@ export const ChatMessageView = memo(
               output={message.usage.outputTokens}
               total={message.usage.totalTokens}
             />
+          )}
+          {/* مدت نهایی ترن کنار بج usage — همیشه قابل مشاهده. */}
+          {!message.streaming && message.turnElapsedMs != null && (
+            <span
+              className="msg-elapsed"
+              title={`Working time for this turn: ${fmtElapsed(message.turnElapsedMs)}`}
+              dir="ltr"
+            >
+              {fmtElapsed(message.turnElapsedMs)}
+            </span>
           )}
           {message.content && (
             <>
@@ -1814,6 +1825,34 @@ export const ChatMessageView = memo(
             ) : (
               <ThinkingIndicator label="Working" startedAt={message.workingStartedAt} />
             ))}
+          {/* Finished turn without usage: the live indicator above unmounts, so
+              the stamped duration takes its place (same side of the footer). */}
+          {!message.streaming && message.turnElapsedMs != null && !message.usage && (
+            <span
+              className="msg-elapsed msg-elapsed-far"
+              title={`Working time for this turn: ${fmtElapsed(message.turnElapsedMs)}`}
+            >
+              <span dir="ltr">{fmtElapsed(message.turnElapsedMs)}</span>
+            </span>
+          )}
+          {/* Send time of this turn — far end of the footer, opposite the
+              usage/duration/buttons cluster (same spot the live Working
+              indicator occupied while streaming). Rendered only AFTER the turn
+              ends, and carrying the row's single auto margin only when the far
+              duration above is absent: two auto margins in one row would split
+              the free space and push the indicator/duration to the middle.
+              NOTE: no dir on the outer span — margin-inline-start must resolve
+              against the row direction (a dir="ltr" here would flip the margin
+              side in RTL and glue the time to the buttons). The inner span
+              keeps the digits LTR. */}
+          {!message.streaming && (
+            <span
+              className={`msg-time${message.usage || message.turnElapsedMs == null ? " msg-time-far" : ""}`}
+              title={fmtClockFull(message.createdAt)}
+            >
+              <span dir="ltr">{fmtClock(message.createdAt)}</span>
+            </span>
+          )}
         </div>
       )}
 
@@ -1842,6 +1881,7 @@ export const ChatMessageView = memo(
       a.thinkingActive === b.thinkingActive &&
       a.thinkingStartedAt === b.thinkingStartedAt &&
       a.workingStartedAt === b.workingStartedAt &&
+      a.turnElapsedMs === b.turnElapsedMs &&
       a.error === b.error &&
       a.retry === b.retry &&
       a.toolActivity === b.toolActivity &&

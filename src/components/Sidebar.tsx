@@ -5,6 +5,7 @@ import { themeById } from "../lib/themes";
 import type { Chat, Workspace } from "../types";
 import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
+import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
 
 type ChatSummary = {
@@ -185,6 +186,13 @@ function SidebarContent() {
   const pinnedWorkspaces = useStore((s) => s.pinnedWorkspaces);
   const pinnedChats = useStore((s) => s.pinnedChats);
   const unreadChats = useStore((s) => s.unreadChats);
+  // Clock for the relative "Xm ago" activity ages below: refreshed every 30s
+  // so a stale label never sits for long. One integer state, one interval.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, []);
   // Persisted sidebar UI state (collapse toggles + panel heights) — read once
   // per mount, same localStorage pattern as coder:sidebarWidth below.
   const [savedUi] = useState<SidebarUiState>(() => {
@@ -1137,6 +1145,12 @@ function SidebarContent() {
                                 </svg>
                               </span>
                             )}
+                            <span
+                              className="chat-item-time"
+                              title={fmtClockFull(c.updatedAt)}
+                            >
+                              <span dir="ltr">{fmtAgo(c.updatedAt, nowTick)}</span>
+                            </span>
                           </span>
                         )}
                       </div>

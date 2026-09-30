@@ -530,6 +530,18 @@ textarea {
   color: var(--accent);
 }
 
+/* Relative last-activity age per chat ("5m ago") — pushed to the row end so
+   long titles ellipsis before it, never under it. English-only string. */
+.chat-item-time {
+  margin-inline-start: auto;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
 /* Live streaming dot for chats whose agent is working in the background. */
 .chat-item-streaming {
   width: 8px;
@@ -8562,6 +8574,39 @@ textarea {
   color: var(--text-dim);
   opacity: 0.8;
   white-space: nowrap;
+}
+
+/* مدت نهایی هر ترن — کنار بج usage (همیشه قابل مشاهده برخلاف دکمه‌های
+   hover-only). بدون usage در انتهای مخالف فوتر (جای نشانگر live). */
+.msg-elapsed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+.msg-elapsed-far {
+  margin-inline-start: auto;
+}
+
+/* ساعت ارسال هر پیام — انتهای مخالف فوتر (روبه‌روی usage/دکمه‌ها)، همان‌جایی
+   که نشانگر live موقع استریم بود. عمداً ریزتر و کمرنگ‌تر از متن اصلی پیام.
+   مهم: این اسپن نباید dir="ltr" بگیرد — جهت منطقی margin باید از ردیف ارث
+   برسد، وگرنه در RTL ساعت به سمت دکمه‌ها می‌چسبد (متن داخلی dir جدا دارد).
+   فقط یکی از آیتم‌های ردیف باید auto داشته باشد (msg-thinking زنده،
+   msg-elapsed-far، یا msg-time-far) — دو auto فضا را نصف می‌کند و تایمر را
+   به وسط صفحه می‌برد. */
+.msg-time {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.55;
+  white-space: nowrap;
+}
+
+.msg-time-far {
+  margin-inline-start: auto;
 }
 
 /* ۳ نقطه لودینگ — از سمت راست شروع می‌کنند به پر شدن (نقطهٔ اول = سمت راست

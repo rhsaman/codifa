@@ -52,7 +52,12 @@ from providers import (
     normalize_base_url,
     qualify_model_id,
 )
-from tool_batching import execute_readonly_calls
+from tool_batching import (
+    drop_ledger_path,
+    execute_readonly_calls,
+    note_fetched_window,
+    reset_read_ledger,
+)
 from tool_message_projection import project_tool_results, stable_tool_order
 
 # Alias kept for existing call sites; logic lives in tool_message_projection.
@@ -565,7 +570,27 @@ def _clone_model_with_key(model: Any, new_key: str) -> Any:
     1.6.0 the underlying ``async_client`` is shared and keeps sending the
     old key. Falls back to the old copy + client-cache reset when the
     stamp is missing (legacy/test models) so fallback never breaks a turn.
+
+    Previously applied 400-strips (temperature / stream_options /
+    parallel_tool_calls) are re-applied to the rebuilt model: the rebuild
+    restores the original build kwargs, so without this a key rotation
+    would resurrect a rejected param and repeat the same 400.
     """
+    try:
+        _no_temp = bool(getattr(model, "_codifa_no_temp", False))
+        _no_so = bool(getattr(model, "_codifa_no_so", False))
+        _no_pc = bool(getattr(model, "_codifa_no_pc", False))
+        # Heuristic fallback for models stripped before the flags existed:
+        # build always sets a numeric temperature and stream_options, so
+        # None here means "was stripped".
+        if not _no_temp and getattr(model, "temperature", 0.0) is None:
+            _no_temp = True
+        if not _no_so and hasattr(model, "openai_api_key"):
+            _mk = dict(getattr(model, "model_kwargs", None) or {})
+            if getattr(model, "stream_options", None) is None and "stream_options" not in _mk:
+                _no_so = True
+    except Exception:  # noqa: BLE001
+        _no_temp = _no_so = _no_pc = False
     try:
         provider = str(getattr(model, "_codifa_provider_name", "") or "")
         model_name = str(getattr(model, "_codifa_model_name", "") or "")
@@ -575,7 +600,7 @@ def _clone_model_with_key(model: Any, new_key: str) -> Any:
         if provider and model_name:
             remaining = rest[1:] if rest and rest[0] == new_key else list(rest)
             try:
-                return build_chat_model(
+                rebuilt = build_chat_model(
                     provider,
                     model_name,
                     base_url,
@@ -592,6 +617,13 @@ def _clone_model_with_key(model: Any, new_key: str) -> Any:
                     provider_id=str(bk.get("provider_id", "") or ""),
                     parallel_tool_calls=bool(bk.get("parallel_tool_calls", False)),
                 )
+                if _no_temp:
+                    rebuilt = _strip_temperature(rebuilt)
+                if _no_so:
+                    rebuilt = _strip_stream_options(rebuilt)
+                if _no_pc:
+                    rebuilt = _strip_parallel_calls(rebuilt)
+                return rebuilt
             except Exception:  # noqa: BLE001, S110 — fall through to copy fallback
                 pass
     except Exception:  # noqa: BLE001, S110 — stamp read must never break fallback
@@ -629,6 +661,18 @@ def _clone_model_with_key(model: Any, new_key: str) -> Any:
         object.__setattr__(clone, "_codifa_api_keys_rest", rest)
     except Exception:  # noqa: BLE001, S110
         pass
+    # Copy fallback preserves the stripped params themselves via model_copy,
+    # but re-stamp the flags so a LATER key rotation still knows to strip.
+    for _flag, _val in (
+        ("_codifa_no_temp", _no_temp),
+        ("_codifa_no_so", _no_so),
+        ("_codifa_no_pc", _no_pc),
+    ):
+        if _val:
+            try:
+                object.__setattr__(clone, _flag, True)
+            except Exception:  # noqa: BLE001, S110
+                pass
     return clone
 
 
@@ -718,6 +762,10 @@ def _strip_stream_options(model: Any) -> Any:
             clone.stream_options = None
         except Exception:  # noqa: BLE001, S110
             pass
+    try:
+        object.__setattr__(clone, "_codifa_no_so", True)
+    except Exception:  # noqa: BLE001, S110
+        pass
     return clone
 
 
@@ -814,6 +862,10 @@ def _strip_parallel_calls(model: Any) -> Any:
             clone.parallel_tool_calls = None
         except Exception:  # noqa: BLE001, S110
             pass
+    try:
+        object.__setattr__(clone, "_codifa_no_pc", True)
+    except Exception:  # noqa: BLE001, S110
+        pass
     return clone
 
 
@@ -860,6 +912,10 @@ def _strip_temperature(model: Any) -> Any:
             clone.temperature = None
         except Exception:  # noqa: BLE001, S110
             pass
+    try:
+        object.__setattr__(clone, "_codifa_no_temp", True)
+    except Exception:  # noqa: BLE001, S110
+        pass
     return clone
 
 
@@ -1706,7 +1762,7 @@ def _batchable_nudge(tcs: list) -> str:
         args = tc.get("args") or {}
         if any(
             k in args
-            for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+            for k in ("patterns", "filePaths", "ranges", "paths", "includes", "symbols")
         ):
             continue  # already a batch call
         primary = "filePath" if name == "read" else "pattern"
@@ -1763,7 +1819,7 @@ class _BatchStreakTracker:
     def _batch_args(self, args: dict) -> bool:
         return any(
             k in (args or {})
-            for k in ("patterns", "filePaths", "ranges", "paths", "includes")
+            for k in ("patterns", "filePaths", "ranges", "paths", "includes", "symbols")
         )
 
     def observe(self, tcs: list) -> str:
@@ -1831,6 +1887,239 @@ class _BatchStreakTracker:
             + "\nThe example is built from calls that ALREADY ran — do NOT "
             "re-issue them. Use parallel calls for your NEXT searches."
         )
+
+
+# ── Re-read detection (shared by both tool loops) ─────────────────────────
+# A newly requested read window whose lines are mostly already fetched this
+# turn counts as "already read" at or above this coverage ratio.
+_READ_WINDOW_OVERLAP_MIN = 0.8
+# A requested window this many lines (or fewer) past a fetched region counts
+# as paging the same region — worth one reminder per path per turn.
+_READ_ADJACENT_GAP = 100
+
+
+def _read_windows(args: dict) -> list[tuple[str, int, int]]:
+    """Concrete (path, start1, end1) windows a read call will fetch.
+
+    Mirrors read_tool's own window resolution (offset/limit, filePaths,
+    ranges members). symbols= reads are precise by construction — they
+    resolve server-side and never trigger the re-read nudge, so they are
+    skipped here (which also steers the model toward symbols=).
+    """
+    args = args or {}
+    if args.get("symbols"):
+        return []
+    try:
+        offset = int(args.get("offset") or 1)
+    except (TypeError, ValueError):
+        offset = 1
+    try:
+        limit = int(args.get("limit") or 2000)
+    except (TypeError, ValueError):
+        limit = 2000
+    wins: list[tuple[str, int, int]] = []
+    for spec in args.get("ranges") or []:
+        parts = str(spec).split(":")
+        if (
+            len(parts) == 3
+            and parts[0].strip()
+            and parts[1].strip().isdigit()
+            and parts[2].strip().isdigit()
+        ):
+            o, li = int(parts[1]), int(parts[2])
+            wins.append((parts[0].strip(), max(1, o), max(1, o) + max(1, li) - 1))
+    ranged = {p for p, _, _ in wins}
+    for p in [args.get("filePath"), *list(args.get("filePaths") or [])]:
+        if p and str(p) not in ranged:
+            o = max(1, offset)
+            wins.append((str(p), o, o + max(1, limit) - 1))
+    return wins
+
+
+class _SeenWindows:
+    """Per-turn record of fetched read windows; nudges on re-reads.
+
+    The model re-reads the same file windows across steps (the #1 observed
+    round-trip waste): head re-reads after symbol reads, broadcast
+    offset/limit across files, paging loops. This tracker records every
+    requested read window and, when a newly requested window is mostly
+    (>= _READ_WINDOW_OVERLAP_MIN) covered by already-fetched lines,
+    returns a reminder naming the covered range so the model reuses it.
+    A requested window that merely CONTINUES a fetched region (small gap,
+    <= _READ_ADJACENT_GAP) gets a one-per-path paging reminder instead.
+    Advisory only — never blocks a call.
+
+    edit_file/write_file invalidate a path's record (post-edit re-reads are
+    legitimate). clear() drops everything (compaction may have discarded
+    the content). Each nudged window fires once per turn.
+    """
+
+    __slots__ = ("_adjacent_nudged", "_edited", "_nudged", "_seen")
+
+    def __init__(self) -> None:
+        self._seen: dict[str, list[tuple[int, int]]] = {}
+        self._nudged: set[tuple[str, int, int]] = set()
+        self._adjacent_nudged: set[str] = set()
+        self._edited: set[str] = set()
+
+    def clear(self) -> None:
+        self._seen.clear()
+        self._nudged.clear()
+        self._adjacent_nudged.clear()
+        self._edited.clear()
+        reset_read_ledger()
+
+    def mark_edited(self, path: str) -> None:
+        if path:
+            self._seen.pop(str(path), None)
+            self._edited.add(str(path))
+            drop_ledger_path(str(path))
+
+    @staticmethod
+    def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
+        return max(0, min(a1, b1) - max(a0, b0) + 1)
+
+    @staticmethod
+    def _separation(
+        start: int, end: int, have: list[tuple[int, int]]
+    ) -> int | None:
+        """Min line-gap between [start, end] and seen windows.
+
+        Returns None when the window overlaps any seen interval (the
+        overlap rule owns that case) or when there is nothing seen.
+        """
+        gaps: list[int] = []
+        for s0, s1 in have:
+            if s0 <= end and start <= s1:
+                return None
+            gaps.append((s0 - end - 1) if s0 > end else (start - s1 - 1))
+        return min(gaps) if gaps else None
+
+    def check_covered(self, tcs: list) -> dict[str, str]:
+        """Tool-call ids whose single read window is fully already fetched.
+
+        Call BEFORE observe() each step. A fully covered window means every
+        requested line is already in context and the file is unedited, so
+        re-sending its content is pure token waste — the caller substitutes
+        the stub for the tool result in the transcript (execution still runs,
+        so UI events and caches stay intact). Batches (multi-path reads),
+        symbols= reads, and edited paths always keep their content.
+        """
+        stubs: dict[str, str] = {}
+        for tc in tcs or []:
+            if (tc.get("name") or "").lower() != "read":
+                continue
+            args = tc.get("args") or {}
+            if args.get("symbols"):
+                continue
+            wins = _read_windows(args)
+            if len(wins) != 1:
+                continue
+            path, start, end = wins[0]
+            if path in self._edited:
+                continue
+            have = self._seen.get(path, [])
+            if not have:
+                continue
+            total = max(1, end - start + 1)
+            covered = sum(self._overlap(start, end, s0, s1) for s0, s1 in have)
+            if covered >= total:
+                stubs[str(tc.get("id") or "")] = (
+                    f"SKIPPED (already in context): {path} lines {start}-{end} "
+                    "were already fetched this turn — reusing that content; "
+                    "full text omitted to save tokens."
+                )
+        return stubs
+
+    def observe(self, tcs: list) -> str:
+        """Record this step's calls; remind on re-reads and paging.
+
+        Call once per step with ALL of that step's tool calls (before
+        execution, like _BatchStreakTracker.observe). Returns "" most steps.
+        """
+        # Register edits first: a re-read after an edit is legitimate.
+        edited_now: set[str] = set()
+        for tc in tcs or []:
+            if (tc.get("name") or "").lower() in ("edit_file", "write_file"):
+                _p = (tc.get("args") or {}).get("path") or ""
+                self.mark_edited(_p)
+                if _p:
+                    edited_now.add(str(_p))
+        notes: list[str] = []
+        fresh: list[tuple[str, int, int]] = []
+        for tc in tcs or []:
+            if (tc.get("name") or "").lower() != "read":
+                continue
+            for path, start, end in _read_windows(tc.get("args") or {}):
+                key = (path, start, end)
+                have = self._seen.get(path, [])
+                covered = sum(
+                    self._overlap(start, end, s0, s1) for s0, s1 in have
+                )
+                total = max(1, end - start + 1)
+                if (
+                    have
+                    and covered / total >= _READ_WINDOW_OVERLAP_MIN
+                    and key not in self._nudged
+                ):
+                    self._nudged.add(key)
+                    lo = min([s0 for s0, _ in have] + [start])
+                    hi = max([s1 for _, s1 in have] + [end])
+                    notes.append(
+                        f"- {path}: you already fetched lines {lo}-{hi} this turn, "
+                        f"covering {covered}/{total} of the requested "
+                        f"{start}-{end}. Reuse that content — do NOT re-read it."
+                    )
+                elif have and path not in self._adjacent_nudged:
+                    gap = self._separation(start, end, have)
+                    if gap is not None and 0 < gap <= _READ_ADJACENT_GAP:
+                        self._adjacent_nudged.add(path)
+                        ulo = min([s0 for s0, _ in have] + [start])
+                        uhi = max([s1 for _, s1 in have] + [end])
+                        notes.append(
+                            f"- {path}: lines "
+                            f"{min(s0 for s0, _ in have)}-"
+                            f"{max(s1 for _, s1 in have)} are already in "
+                            f"context and the requested {start}-{end} starts "
+                            f"only {gap} lines later — you now hold {ulo}-{uhi} "
+                            "in pieces. Do NOT page this file again; for "
+                            "further lines here read ONE wide window."
+                        )
+                fresh.append(key)
+        for path, start, end in fresh:
+            self._seen.setdefault(path, []).append((start, end))
+            note_fetched_window(path, start, end)
+            # A fresh fetch heals the post-edit caution for this path — unless
+            # the same step also edits it (reads execute BEFORE sequential
+            # edits, so that content is already stale).
+            if path not in edited_now:
+                self._edited.discard(path)
+        if not notes:
+            return ""
+        return (
+            "\n\n🔁 REREAD NOTE: the requested read window is already in your context:\n"
+            + "\n".join(notes[:3])
+            + "\nIf you need lines OUTSIDE the fetched range, read ONLY the missing "
+            "part — via symbols=[...] or ranges=[\"path:start:count\", ...] in ONE call."
+        )
+
+
+# ── Plan-only step detection (shared by both tool loops) ─────────────────
+# An update_plan call with no other tool call in the step burns a full
+# round-trip (a full-context LLM call) just to tick a checklist. update_plan
+# has no dependencies on sibling calls, so it is always batchable with the
+# step's real work — the model just has to fire them together.
+_PLAN_ONLY_NUDGE = (
+    "PLAN-ONLY STEP: that step did nothing but update_plan — a full "
+    "round-trip for a checklist tick. update_plan is batchable: always fire "
+    "it in the SAME step as your next tool calls (parallel calls), never alone."
+)
+
+
+def _is_plan_only_step(tcs: list) -> bool:
+    """True when the step's calls are all update_plan (pure overhead)."""
+    names = [(tc.get("name") or "").lower() for tc in tcs or []]
+    return bool(names) and all(n == "update_plan" for n in names)
 
 
 async def langchain_tool_loop(
@@ -1902,6 +2191,11 @@ async def langchain_tool_loop(
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
     _streak = _BatchStreakTracker()
+    # Re-read tracker: records fetched read windows per turn and reminds the
+    # model when a requested window is already in context (same mechanism as
+    # the batching streak above).
+    _reread = _SeenWindows()
+    reset_read_ledger()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
     # Reminders / steering are TRANSIENT: sent with the very next request only,
     # never stored in msgs. Stored copies were re-sent on every later step (one
@@ -2019,6 +2313,10 @@ async def langchain_tool_loop(
         _step_hint = _batchable_nudge(tcs)
         _streak_hint = _streak.observe(tcs)
         _batch_hint = _step_hint or _streak_hint
+        # Coverage check BEFORE observe records this step: fully covered
+        # reads get a stub in the transcript instead of re-sent content.
+        _cover_stubs = _reread.check_covered(tcs)
+        _reread_hint = _reread.observe(tcs)
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -2035,10 +2333,16 @@ async def langchain_tool_loop(
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
         _results = await execute_readonly_calls(_parallel, _exec)
         for tc, result in zip(_parallel, _results):
-            append_tool_result(msgs, str(result), tc.get("id", ""))
+            _cid = tc.get("id", "")
+            if _cid in _cover_stubs:
+                result = _cover_stubs[_cid]
+            append_tool_result(msgs, str(result), _cid)
         for tc in _sequential:
             result = await _exec(tc)
-            append_tool_result(msgs, str(result), tc.get("id", ""))
+            _cid = tc.get("id", "")
+            if _cid in _cover_stubs:
+                result = _cover_stubs[_cid]
+            append_tool_result(msgs, str(result), _cid)
         # Emit ToolMessages for duplicate tool calls that were deduped above so
         # the LLM sees a result for every tool_call_id it originally sent.
         if _dup_ids:
@@ -2057,6 +2361,10 @@ async def langchain_tool_loop(
         _transient.clear()
         if _batch_hint:
             _transient.append(HumanMessage(content=_batch_hint.strip()))
+        if _reread_hint:
+            _transient.append(HumanMessage(content=_reread_hint.strip()))
+        if _is_plan_only_step(tcs):
+            _transient.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
         # --- soft tool-call budget nudge ---
         # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or
         # summarizing — mirrors the doom-loop guard but for "too many calls" rather
@@ -2117,7 +2425,10 @@ async def langchain_tool_loop(
         # simply retries with the uncompacted transcript).
         if ctx > 0:
             with contextlib.suppress(Exception):
-                await _auto_compact_subagent(msgs, model, ctx, reserved, emit)
+                if await _auto_compact_subagent(msgs, model, ctx, reserved, emit):
+                    # Compaction may have discarded fetched content — drop the
+                    # seen-window record so re-reads are not wrongly nagged.
+                    _reread.clear()
     # The loop ended by hitting max_steps (not by the model returning a
     # final text reply). Recover the last textual answer the sub-agent
     # produced so it never returns an empty result to the parent.

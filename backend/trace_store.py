@@ -150,6 +150,56 @@ def append(
     return entry
 
 
+def claim_running_tool(
+    chat_id: str,
+    name: str,
+    sub: bool = False,
+    extra_detail: dict | None = None,
+) -> dict | None:
+    """Reuse the running tool entry for the same call instead of duplicating it.
+
+    The main agent loop appends a tool entry with the step number before
+    execution, then the tool wrapper emits its own ``tool`` event for the
+    SAME call. Claiming merges the wrapper fields (event call id, branch,
+    sub) into the existing running entry — matched by tool name + turn,
+    most recent unclaimed first — so each call shows exactly once in the
+    panel. Args are deliberately NOT compared: the wrapper normalizes them
+    (e.g. joins include/path lists) while the loop logs the raw model args.
+    The ``sub`` flag keeps sub-agent streams off the main entries and the
+    turn check keeps aborted-turn leftovers out of new turns.
+    Returns the merged entry, or None when there is no match (caller appends).
+    """
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return None
+    want_name = str(name or "")
+    want_sub = bool(sub)
+    turn = get_current_turn()
+    if turn <= 0:
+        turn = latest_turn(cid)
+    extra = dict(extra_detail or {})
+    with _lock:
+        items = _store.get(cid, [])
+        for entry in reversed(items):
+            if entry.get("kind") != "tool":
+                continue
+            detail = entry.get("detail") or {}
+            if detail.get("status") != "running":
+                continue
+            if detail.get("ev_call_id"):
+                continue
+            if str(detail.get("name") or "") != want_name:
+                continue
+            if bool(detail.get("sub")) != want_sub:
+                continue
+            if turn and int(entry.get("turn") or 0) != int(turn):
+                continue
+            detail.update(extra)
+            entry["detail"] = detail
+            return dict(entry)
+    return None
+
+
 def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") -> dict | None:
     """Attach a tool result to the matching running tool entry."""
     cid = (chat_id or "").strip() or get_current_chat()
@@ -164,7 +214,11 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
                 if entry.get("kind") != "tool":
                     continue
                 detail = entry.get("detail") or {}
-                if str(detail.get("call_id") or "").strip() == want or str(entry.get("id") or "") == want:
+                if (
+                    str(detail.get("call_id") or "").strip() == want
+                    or str(detail.get("ev_call_id") or "").strip() == want
+                    or str(entry.get("id") or "") == want
+                ):
                     entry["result"] = text
                     if error:
                         entry["error"] = str(error)[:2000]

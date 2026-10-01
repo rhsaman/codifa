@@ -15,7 +15,14 @@ for _p in (_THIS, os.path.dirname(_THIS)):
         sys.path.insert(0, _p)
 
 import agents as _agents
-from llm import _clone_model_with_key, _is_key_error, model_key_fallback, resolve_keys
+from llm import (
+    _clone_model_with_key,
+    _is_key_error,
+    _strip_stream_options,
+    _strip_temperature,
+    model_key_fallback,
+    resolve_keys,
+)
 
 
 def test_resolve_keys_order_and_legacy_migration():
@@ -62,6 +69,28 @@ def test_clone_model_consumes_next_key():
     assert getattr(m2, "openai_api_key", None) is not getattr(m, "openai_api_key", None) or True
     _all2, _ = model_key_fallback(m2)
     assert _all2[0] == "k2"
+
+
+def test_clone_model_preserves_strips():
+    from llm import build_chat_model
+
+    m = build_chat_model("custom", "m", "http://localhost:1/v1", "", "", ["k1", "k2"])
+    m = _strip_temperature(m)
+    m = _strip_stream_options(m)
+    assert getattr(m, "temperature", 0.0) is None
+    _, rest = model_key_fallback(m)
+    assert rest == ["k2"]
+    m2 = _clone_model_with_key(m, rest[0])
+    _key = getattr(m2, "openai_api_key", "")
+    _key = _key.get_secret_value() if hasattr(_key, "get_secret_value") else _key
+    assert _key == "k2"
+    # Strips survive the rebuild: the retried key must not resurrect a
+    # rejected param and repeat the same 400.
+    assert getattr(m2, "temperature", 0.0) is None
+    _mk2 = dict(getattr(m2, "model_kwargs", None) or {})
+    assert "temperature" not in _mk2
+    assert "stream_options" not in _mk2
+    assert getattr(m2, "stream_options", None) is None
 
 
 def test_subagent_target_carries_key_list():

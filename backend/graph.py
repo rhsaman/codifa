@@ -71,15 +71,18 @@ from _common import (
 )
 from agents import normalize_mode
 from llm import (
+    _PLAN_ONLY_NUDGE,
     _batchable_nudge,
     _BatchStreakTracker,
     _clone_model_with_key,
     _is_key_error,
     _is_parallel_calls_error,
+    _is_plan_only_step,
     _is_reasoning_effort_error,
     _is_stream_options_error,
     _is_temperature_error,
     _remap_reasoning_effort,
+    _SeenWindows,
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
@@ -93,7 +96,7 @@ from llm import (
     normalize_tool_transcript,
 )
 from mcp_bridge import build_mcp_tools, describe_tools, is_browser_mcp_tool
-from tool_batching import execute_readonly_calls
+from tool_batching import execute_readonly_calls, reset_read_ledger
 from tool_message_projection import project_tool_results, stable_tool_order
 
 # Alias kept for existing call sites; logic lives in tool_message_projection.
@@ -3731,6 +3734,10 @@ async def _run_mode_turn(
         # sent) and reminds it to batch after a few consecutive same-scope
         # steps — the per-step detector alone never sees those.
         _streak = _BatchStreakTracker()
+        # Re-read tracker: records fetched read windows per turn and reminds
+        # the model when a requested window is already in context.
+        _reread = _SeenWindows()
+        reset_read_ledger()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
         # the HumanMessage is appended AFTER the tool results (keeping the
@@ -4440,6 +4447,10 @@ async def _run_mode_turn(
             _step_hint = _batchable_nudge(_pending)
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
+            # Coverage check BEFORE observe records this step: fully covered
+            # reads get a stub in the transcript instead of re-sent content.
+            _cover_stubs = _reread.check_covered(_pending)
+            _reread_hint = _reread.observe(_pending)
             async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
@@ -4447,7 +4458,10 @@ async def _run_mode_turn(
 
             _results = await execute_readonly_calls(_parallel, _run_readonly, query=state.get("request") or "")
             for tc, result in zip(_parallel, _results):
-                append_tool_result(msgs, str(result), tc.get("id", ""))
+                _cid = tc.get("id", "")
+                if _cid in _cover_stubs:
+                    result = _cover_stubs[_cid]
+                append_tool_result(msgs, str(result), _cid)
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
             # half-finished checkpoint that orphans tool_calls on resume.
@@ -4466,7 +4480,10 @@ async def _run_mode_turn(
                 # (via the emit callback wired into make_tool_callbacks), so we
                 # only execute it and feed the result back to the model.
                 result = await _execute_tool(name, args, tc.get("id") or "", steps)
-                append_tool_result(msgs, str(result), tc.get("id", ""))
+                _cid = tc.get("id", "")
+                if _cid in _cover_stubs:
+                    result = _cover_stubs[_cid]
+                append_tool_result(msgs, str(result), _cid)
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
                 # Force the save on the LAST sequential call so the turn-end
@@ -4499,6 +4516,10 @@ async def _run_mode_turn(
                         {"kind": "warn", "content": _batch_hint.strip()}
                     )
                 _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
+            if _reread_hint:
+                _transient_msgs.append(HumanMessage(content=_reread_hint.strip()))
+            if _is_plan_only_step(_pending):
+                _transient_msgs.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
             # transcript stays valid (a tool_calls AIMessage must be followed by its
             # ToolMessages before any new HumanMessage). Gives the model a chance to
@@ -4520,7 +4541,7 @@ async def _run_mode_turn(
             # BOTH cheap truncation (old ToolMessage placeholders) AND heavier
             # LLM summarization when the threshold is crossed.
             if ctx > 0 and _compact_count < _MAX_COMPACT_PER_TURN:
-                _compact_count += await _maybe_auto_compact(
+                _compacted = await _maybe_auto_compact(
                     state,
                     queue,
                     model,
@@ -4530,6 +4551,11 @@ async def _run_mode_turn(
                     last_context_tokens=state.get("last_context_tokens"),
                     compact_at_percent=state.get("compact_at_percent", 80),
                 )
+                _compact_count += _compacted
+                if _compacted:
+                    # Compaction may have discarded fetched content — drop the
+                    # seen-window record so re-reads are not wrongly nagged.
+                    _reread.clear()
             # This step completed (the model responded and any tool calls
             # ran) — record the progress so the retry wrapper can tell a
             # mid-work failure from an idle one.

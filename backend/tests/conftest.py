@@ -89,6 +89,14 @@ def _reset_tool_contextvars():
     _branch_token = _SUB_AGENT_BRANCH_CTX.set(0)
     _depth_token = _TASK_DEPTH_CTX.set(0)
     try:
+        from tool_batching import reset_read_ledger
+    except ImportError:
+        reset_read_ledger = None  # type: ignore[assignment]
+    if reset_read_ledger is not None:
+        # Fresh per-turn read ledger: without this, ledger entries written
+        # by one test's tracker would leak into the next test's read footers.
+        reset_read_ledger()
+    try:
         yield
     finally:
         try:

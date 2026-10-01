@@ -74,6 +74,50 @@ class _StepBatch:
 _CURRENT_BATCH: ContextVar[_StepBatch | None] = ContextVar("tool_io_batch", default=None)
 
 
+# Per-turn read ledger: windows already fetched this turn, shared between
+# the agent loops (writers, via _SeenWindows in llm.py) and read_tool
+# (reader, for the "also fetched" footer). Turn-scoped: reset at turn
+# start, cleared on compaction, a path's entries dropped on edit.
+# Best-effort throughout — the ledger must never break a turn.
+_READ_LEDGER: ContextVar[dict[str, list[tuple[int, int]]] | None] = ContextVar(
+    "read_ledger", default=None
+)
+
+
+def reset_read_ledger() -> None:
+    """Start a fresh per-turn ledger (call once at turn start / on clear)."""
+    _READ_LEDGER.set({})
+
+
+def note_fetched_window(path: str, start: int, end: int) -> None:
+    """Record a fetched window; no-op when no ledger is active (e.g. tests)."""
+    led = _READ_LEDGER.get()
+    if led is None or not path:
+        return
+    try:
+        led.setdefault(str(path), []).append((int(start), int(end)))
+    except (TypeError, ValueError):
+        pass
+
+
+def drop_ledger_path(path: str) -> None:
+    """Forget a path (edit made earlier windows stale)."""
+    led = _READ_LEDGER.get()
+    if led is not None and path:
+        led.pop(str(path), None)
+
+
+def fetched_windows(path: str) -> list[tuple[int, int]]:
+    """Windows already fetched for ``path`` this turn (possibly empty)."""
+    led = _READ_LEDGER.get()
+    if led is None or not path:
+        return []
+    try:
+        return [w for w in led.get(str(path), []) if isinstance(w, tuple) and len(w) == 2]
+    except (TypeError, ValueError):
+        return []
+
+
 async def coalesce_io(
     key: Hashable,
     request: Any,

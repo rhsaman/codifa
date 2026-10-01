@@ -28,6 +28,7 @@ import re
 import threading
 import time
 from collections import defaultdict, namedtuple
+from typing import Any
 
 import networkx as nx
 
@@ -133,7 +134,7 @@ _TEXT_EXTENSIONS = {
 # توی language-pack نصب نیست (فقط "typescript"/"javascript" هست)؛ پس صریحاً
 # نگاشت می‌کنیم تا parser/tags.query پیدا بشه.
 _LANG_ALIASES = {
-    ".tsx": "typescript",
+    ".tsx": "tsx",
     ".jsx": "javascript",
     ".mts": "typescript",
     ".cts": "typescript",
@@ -242,13 +243,27 @@ _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 60.0  # بودن ۱۰ ثانیه باعث miss مدام توی مکالمه‌های عادی می‌شد؛
                    # invalidation بر اساس signature هست پس بالا بردنش امنه.
 
-# نام نماد + مکان (مشابه aider.Tag).
-Tag = namedtuple("Tag", ["rel_fname", "fname", "line", "name", "kind"])
+# Symbol name + location (aider.Tag-like). ``end_line`` is the 0-indexed
+# closing line of the definition (-1 when unknown); ``top_level`` marks
+# module/class-scope definitions — nested helpers are resolvable for
+# read(symbols=) but hidden from the 20 display slots so top-level names
+# like DiffView are not buried behind inner closures.
+Tag = namedtuple(
+    "Tag",
+    ["rel_fname", "fname", "line", "name", "kind", "end_line", "top_level"],
+    defaults=[-1, True],
+)
 
 
 # --------------------------------------------------------------------------
 # استخراج def + ref با tree-sitter
 # --------------------------------------------------------------------------
+
+# Max bytes read per file for symbol extraction. Backend sources run past
+# 300 KB (tools.py ~322k chars); the old 200 KB cap truncated them
+# mid-statement, so AST parsing raised SyntaxError and the file silently
+# indexed to ZERO symbols (cached that way until mtime changed).
+_MAX_SYMBOL_BYTES = 2_000_000
 
 # کش queryهای زبان (get_tags_query کنده — برای هر زبان یه بار).
 _SCM_CACHE: dict[str, str | None] = {}
@@ -333,7 +348,7 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
     if not code:
         try:
             with open(fname, "r", encoding="utf-8", errors="replace") as fh:
-                code = fh.read(200_000)
+                code = fh.read(_MAX_SYMBOL_BYTES)
         except OSError:
             return []
 
@@ -361,6 +376,7 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
             for node in nodes:
                 node_name[id(node)] = node.text.decode("utf-8", "replace")
 
+    _nested: dict[tuple[str, int], bool] = {}
     for tag, nodes in captures.items():
         if tag.startswith("definition."):
             kind = tag.split(".")[-1]
@@ -375,6 +391,9 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
                         name = ident.text.decode("utf-8", "replace")
                 if name:
                     defs.append((node.start_point[0], name, kind))
+                    _nested.setdefault(
+                        (name, node.start_point[0]), _is_nested(node)
+                    )
         elif tag.startswith("reference."):
             for node in nodes:
                 # نود reference معمولاً خودش بچهٔ identifier داره که نام رو می‌ده
@@ -388,9 +407,64 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
                 if name:
                     refs.append((node.start_point[0], name))
 
+    # Direct TypeScript/JavaScript range extraction (no query string): the
+    # language-pack tags query only knows function_signature/interface/module,
+    # so function_declaration / arrow declarators / methods never appear and
+    # the model cannot learn where DiffView-style symbols live. Merge ranges
+    # here so both the prompt map and read(symbols=) see start AND end lines.
+    _ts_ends: dict[tuple[str, int], int] = {}
+    try:
+        _ts_ranges = _get_ts_ranges(lang, code)
+        _seen = {(n, s) for s, n, _ in defs}
+        for _ts_name, _ts_start, _ts_end, _ts_kind, _ts_top in _ts_ranges:
+            _ts_ends[(_ts_name, _ts_start)] = _ts_end
+            _nested.setdefault((_ts_name, _ts_start), not _ts_top)
+            if (_ts_name, _ts_start) not in _seen:
+                defs.append((_ts_start, _ts_name, _ts_kind))
+                _seen.add((_ts_name, _ts_start))
+    except Exception:  # noqa: BLE001, S110 — range merge must never break tags
+        pass
+
+    # Python end lines via AST (tree-sitter Tags carry start only): map
+    # (name, start1) -> end0 so the map shows Lstart-end like TS does.
+    # Module-level assignments are also indexed here as constants.
+    _py_ends: dict[tuple[str, int], int] = {}
+    if lang == "python":
+        try:
+            _py_tree = ast.parse(code)
+            _py_seen = {(n, s) for s, n, _ in defs}
+            for _nd in ast.walk(_py_tree):
+                if isinstance(
+                    _nd, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    _e = int(getattr(_nd, "end_lineno", 0) or 0) or _nd.lineno
+                    _py_ends.setdefault((_nd.name, _nd.lineno), _e - 1)
+            for _nd in _py_tree.body:
+                if isinstance(_nd, ast.Assign):
+                    _targets = _nd.targets
+                elif isinstance(_nd, (ast.AnnAssign, ast.AugAssign)):
+                    _targets = [_nd.target]
+                else:
+                    continue
+                for _t in _targets:
+                    if isinstance(_t, ast.Name) and (_t.id, _nd.lineno - 1) not in _py_seen:
+                        defs.append((_nd.lineno - 1, _t.id, "constant"))
+                        _py_seen.add((_t.id, _nd.lineno - 1))
+                        _nested.setdefault((_t.id, _nd.lineno - 1), False)
+                        _e = int(getattr(_nd, "end_lineno", 0) or 0) or _nd.lineno
+                        _py_ends.setdefault((_t.id, _nd.lineno), _e - 1)
+        except Exception:  # noqa: BLE001, S110 — ends are best-effort
+            pass
+
     tags = []
     for line, name, kind in defs:
-        tags.append(Tag(rel_fname, fname, line, name, kind))
+        _end = _ts_ends.get((name, line), -1)
+        if _end < 0 and lang == "python":
+            _end = _py_ends.get((name, line + 1), -1)
+        tags.append(Tag(
+            rel_fname, fname, line, name, kind, _end,
+            not _nested.get((name, line), False),
+        ))
     # ارجاعات رو به‌عنوان تگ‌های جداگانه (با kind=reference) برمی‌گردونیم تا
     # توی ساخت گراف ارجاع استفاده بشن.
     for line, name in refs:
@@ -398,8 +472,119 @@ def _get_tags_raw(fname: str, rel_fname: str, code: str = ""):
     return tags
 
 
+# Node types that define a named symbol in the TypeScript/JavaScript grammar.
+_TS_DEF_KINDS = {
+    "function_declaration": "function",
+    "function_signature": "function",
+    "class_declaration": "class",
+    "interface_declaration": "interface",
+    "type_alias_declaration": "type",
+    "enum_declaration": "enum",
+    "method_definition": "method",
+}
+
+# Value node types that make a variable_declarator a function definition.
+_TS_FUNC_VALUES = {"arrow_function", "function_expression", "function"}
+
+# Ancestor node types that make a definition nested (a closure inside a
+# function body). Methods (parent: class body) have no such ancestor and
+# count as top-level display symbols.
+_TS_FUNC_SCOPES = {
+    "arrow_function", "function_expression", "function",
+    "function_declaration", "function_definition", "statement_block",
+    "method_definition",
+}
+
+
+def _is_nested(node: Any) -> bool:
+    """True when a definition node sits inside a function body."""
+    try:
+        parent = node.parent
+        while parent is not None:
+            if parent.type in _TS_FUNC_SCOPES:
+                return True
+            parent = parent.parent
+    except Exception:  # noqa: BLE001, S110 — unknown shape counts as top-level
+        pass
+    return False
+
+
+def _get_ts_ranges(lang: str, code: str) -> list[tuple[str, int, int, str, bool]]:
+    """Direct-tree ranges for TS/JS-family languages.
+
+    Returns ``(name, start0, end0, kind, is_top)`` with 0-indexed lines.
+    Walks the parse tree instead of a query string so grammar-version drift
+    cannot silently drop node types again. Top-level non-function
+    declarators (``const X = ...``) are indexed as ``constant`` so names
+    like DIFF_SIDE_BY_SIDE_THRESHOLD resolve; nested non-function
+    declarators are noise and skipped. Non-TS/JS languages return [].
+    """
+    if lang not in ("typescript", "javascript", "tsx"):
+        return []
+    _, parser, _ = _get_lang_objs(lang)
+    if parser is None:
+        return []
+    try:
+        tree = parser.parse(bytes(code, "utf-8"))
+    except Exception:  # noqa: BLE001 — invalid text
+        return []
+    out: list[tuple[str, int, int, str, bool]] = []
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        try:
+            children = node.children
+        except Exception:  # noqa: BLE001, S112
+            continue
+        t = node.type
+        if t == "variable_declarator":
+            try:
+                value = node.child_by_field_name("value")
+                is_func = value is not None and value.type in _TS_FUNC_VALUES
+                top = not _is_nested(node)
+                if not is_func and not top:
+                    continue
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    out.append((
+                        name_node.text.decode("utf-8", "replace"),
+                        node.start_point[0],
+                        node.end_point[0],
+                        "function" if is_func else "constant",
+                        top,
+                    ))
+            except Exception:  # noqa: BLE001, S110
+                pass
+        elif t in _TS_DEF_KINDS:
+            try:
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    for c in children:
+                        if c.type in ("identifier", "type_identifier", "property_identifier"):
+                            name_node = c
+                            break
+                if name_node is not None:
+                    out.append((
+                        name_node.text.decode("utf-8", "replace"),
+                        node.start_point[0],
+                        node.end_point[0],
+                        _TS_DEF_KINDS[t],
+                        not _is_nested(node),
+                    ))
+            except Exception:  # noqa: BLE001, S110
+                pass
+        stack.extend(children)
+    return out
+
+
 def _extract_python(text: str) -> list[tuple[str, int, str]]:
-    """استخراج توابع/کلاس‌ها از کد پایتون با AST (fallback برای .py)."""
+    """Top-level functions/classes + class methods (fallback for .py).
+
+    Nested closures are intentionally excluded here: this feeds the display
+    map (and the server endpoint), where they would crowd out top-level
+    names. Nested definitions stay resolvable via get_symbol_ranges, which
+    walks the full tree for read(symbols=).
+    """
     out: list[tuple[str, int, str]] = []
     try:
         tree = ast.parse(text)
@@ -410,6 +595,9 @@ def _extract_python(text: str) -> list[tuple[str, int, str]]:
             out.append((node.name, node.lineno, "function"))
         elif isinstance(node, ast.ClassDef):
             out.append((node.name, node.lineno, "class"))
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append((sub.name, sub.lineno, "method"))
     return out
 
 
@@ -564,7 +752,8 @@ def _read_file_tags(fname: str) -> list[Tag]:
 # نمایش فشردهٔ امضا (مشابه aider.to_tree — بدون بدنهٔ تابع)
 # --------------------------------------------------------------------------
 
-def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
+def _to_tree(tags, chat_rel_fnames, root_real: str = "",
+             mentioned: set[str] | None = None) -> str:
     """ساخت نمایش درختی از تگ‌های رتبه‌بندی‌شده (مثل aider.to_tree).
 
     فقط امضا (نام + خط + نوع) رو نشون می‌ده — نه بدنهٔ تابع. aider همین‌کار
@@ -572,13 +761,26 @@ def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
     read(file:line)، نه اینکه خودش کد رو اینجا پیچ کنه. رندر کردن بدنه باعث
     می‌شد بودجهٔ ۱۰۲۴ توکن فقط برای ۱-۲ فایل تموم بشه و بقیهٔ پروژه از نقشه
     حذف بشه → مدل مجبور بود با read تکی دنبال فایل‌ها بگرده.
+
+    فقط نمادهای سطح بالا (top-level + class methods) نمایش داده می‌شن —
+    closureهای تودرتو اسلات‌های ۲۰تایی رو پر نمی‌کنن. نمادهای هم‌نام با
+    ``mentioned`` (شناسه‌های تاریخچه/سؤال) اول میان.
     """
     if not tags:
         return ""
+    try:
+        _mentioned = {str(m).lower() for m in (mentioned or set())}
+    except Exception:  # noqa: BLE001
+        _mentioned = set()
     # گروه‌بندی بر اساس فایل — ترتیب رو از tags (که قبلاً رتبه‌بندی شد) حفظ می‌کنیم
     by_file: dict[str, list[Tag]] = defaultdict(list)
     file_order: list[str] = []
     for t in tags:
+        try:
+            if not getattr(t, "top_level", True):
+                continue  # nested helper: resolvable, not displayable
+        except Exception:  # noqa: BLE001, S110
+            pass
         if t.rel_fname not in by_file:
             file_order.append(t.rel_fname)
         by_file[t.rel_fname].append(t)
@@ -587,7 +789,13 @@ def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
     for fname in file_order:
         if fname in chat_rel_fnames:
             continue  # فایل‌های چت رو رد می‌کنیم (aider همین‌کار رو می‌کنه)
-        tags_in_file = by_file[fname]
+        tags_in_file = sorted(
+            by_file[fname],
+            key=lambda t: (
+                0 if str(t.name or "").lower() in _mentioned else 1,
+                t.line if isinstance(t.line, int) else 0,
+            ),
+        )
         # محدودیت تگ در فایل: مثل aider و _simple_tree، فقط ۲۰ تا اول رو نشون میدیم
         # تا بودجه توکنی روی فایل‌های بیشتری توزیع بشه
         MAX_TAGS_PER_FILE = 20
@@ -595,7 +803,14 @@ def _to_tree(tags, chat_rel_fnames, root_real: str = "") -> str:
         for t in tags_in_file[:MAX_TAGS_PER_FILE]:
             line = (t.line + 1) if t.line is not None and t.line >= 0 else 0
             kind = t.kind if t.kind else "def"
-            lines.append(f"  ├─ {kind} {t.name} (L{line})")
+            try:
+                _end = getattr(t, "end_line", -1)
+            except Exception:  # noqa: BLE001
+                _end = -1
+            if isinstance(_end, int) and _end >= 0 and (_end + 1) > line:
+                lines.append(f"  ├─ {kind} {t.name} (L{line}-{_end + 1})")
+            else:
+                lines.append(f"  ├─ {kind} {t.name} (L{line})")
         if len(tags_in_file) > MAX_TAGS_PER_FILE:
             lines.append(f"  └─ ... و {len(tags_in_file) - MAX_TAGS_PER_FILE} نماد دیگر")
     return "\n".join(lines)
@@ -633,13 +848,13 @@ def _get_ranked_tags_map(
     while lo <= hi:
         mid = (lo + hi) // 2
         candidate = ranked_tags[:mid]
-        tree = _to_tree(candidate, set(), root_real)
+        tree = _to_tree(candidate, set(), root_real, mentioned_idents)
         if _token_count(tree) <= max_map_tokens:
             best = candidate
             lo = mid + 1
         else:
             hi = mid - 1
-    return _to_tree(best, set(), root_real)
+    return _to_tree(best, set(), root_real, mentioned_idents)
 
 
 # --------------------------------------------------------------------------
@@ -650,7 +865,7 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     """بساز نقشه‌ی نمادها برای کل درخت ``root``.
 
     برمی‌گردونه ``{rel_path: [(name, line, type), ...]}``. فقط فایل‌های متنی
-    کوچک (زیر ۲۰۰ کیلوبایت) رو می‌خونه تا سریع بمونه. نتیجه ۱۰ ثانیه کش می‌شه.
+    زیر ۲ مگابایت رو می‌خونه تا سریع بمونه. نتیجه ۱۰ ثانیه کش می‌شه.
     """
     root_real = os.path.realpath(os.path.abspath(root))
     tree_mtime = 0.0
@@ -689,7 +904,7 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
             rel = os.path.relpath(abs_path, root_real).replace(os.sep, "/")
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                    text = fh.read(200_000)
+                    text = fh.read(_MAX_SYMBOL_BYTES)
             except OSError:
                 continue
             first = text.split("\n", 1)[0]
@@ -795,22 +1010,174 @@ def format_symbol_map(
 
 
 def _simple_tree(sym_map: dict[str, list[tuple[str, int, str]]]) -> str:
-    """نمایش سادهٔ درختی (fallback وقتی رتبه‌بندی خالی شد)."""
+    """Simple tree view (fallback when ranking is empty)."""
     lines = []
     for rel in sorted(sym_map):
         syms = sym_map[rel][:20]
         if not syms:
             continue
         lines.append(f"📄 {rel}")
-        for name, line, typ in syms:
-            lines.append(f"  ├─ {typ} {name} (L{line})")
+        for _sym in syms:
+            # 3-tuple (name, line, kind); tolerate a 4th end-line element.
+            name, line, typ = _sym[0], _sym[1], _sym[2]
+            _end = _sym[3] if len(_sym) > 3 else line
+            if isinstance(_end, int) and _end > line:
+                lines.append(f"  ├─ {typ} {name} (L{line}-{_end})")
+            else:
+                lines.append(f"  ├─ {typ} {name} (L{line})")
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# Symbol ranges for read(symbols=) and grep annotation
+# --------------------------------------------------------------------------
+
+# abs_path -> (mtime, {lower_name: (start1, end1, kind)}, {lower_name: orig})
+_SYMBOL_RANGE_CACHE: dict[
+    str, tuple[float, dict[str, tuple[int, int, str]], dict[str, str]]
+] = {}
+_SYMBOL_RANGE_LOCK = threading.Lock()
+
+_TS_EXT_LANG = {
+    ".ts": "typescript", ".tsx": "tsx", ".mts": "typescript",
+    ".cts": "typescript", ".js": "javascript", ".jsx": "javascript",
+    ".mjs": "javascript", ".cjs": "javascript",
+}
+
+
+def get_symbol_ranges(abs_path: str) -> dict[str, tuple[int, int, str]]:
+    """Map lowercase symbol name to (start1, end1, kind) for one file.
+
+    1-indexed inclusive lines. TS/JS uses the direct tree walk (precise
+    ends); Python uses AST end_lineno (nested included); other languages
+    fall back to names with end == start. mtime-guarded cache.
+    """
+    try:
+        mtime = os.path.getmtime(abs_path)
+    except OSError:
+        return {}
+    with _SYMBOL_RANGE_LOCK:
+        cached = _SYMBOL_RANGE_CACHE.get(abs_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    ranges: dict[str, tuple[int, int, str]] = {}
+    orig: dict[str, str] = {}
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read(_MAX_SYMBOL_BYTES)
+    except OSError:
+        return {}
+    ext = os.path.splitext(abs_path)[1].lower()
+
+    def _add(name: str, s: int, e: int, kind: str) -> None:
+        key = name.lower()
+        if key not in ranges:
+            ranges[key] = (s, e, kind)
+            orig[key] = name
+
+    try:
+        if ext == ".py":
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _end = int(getattr(node, "end_lineno", 0) or 0) or node.lineno
+                    _add(node.name, node.lineno, _end, "function")
+                elif isinstance(node, ast.ClassDef):
+                    _end = int(getattr(node, "end_lineno", 0) or 0) or node.lineno
+                    _add(node.name, node.lineno, _end, "class")
+            for node in tree.body:
+                # Module-level assignments (MAX_FOO = 1, x: int = 2) as
+                # constants so read(symbols=) and grep resolve them.
+                if isinstance(node, ast.Assign):
+                    _targets = node.targets
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                    _targets = [node.target]
+                else:
+                    continue
+                for _t in _targets:
+                    if isinstance(_t, ast.Name):
+                        _end = int(getattr(node, "end_lineno", 0) or 0) or node.lineno
+                        _add(_t.id, node.lineno, _end, "constant")
+        elif ext in _TS_EXT_LANG:
+            for name, s0, e0, kind, _top in _get_ts_ranges(_TS_EXT_LANG[ext], text):
+                _add(name, s0 + 1, e0 + 1, kind)
+        else:
+            for name, line, kind in _extract_symbols(abs_path, text):
+                _add(name, line, line, kind)
+    except Exception:  # noqa: BLE001 — ranges are best-effort
+        # A parse failure (e.g. truncated text) must NOT be cached: an empty
+        # map cached by mtime would hide every symbol until the file changes.
+        return dict(ranges)
+    with _SYMBOL_RANGE_LOCK:
+        _SYMBOL_RANGE_CACHE[abs_path] = (mtime, ranges, orig)
+    return ranges
+
+
+def symbol_display_name(abs_path: str, lower_name: str) -> str:
+    """Original-case symbol name for display (falls back to the key)."""
+    try:
+        mtime = os.path.getmtime(abs_path)
+    except OSError:
+        return lower_name
+    with _SYMBOL_RANGE_LOCK:
+        cached = _SYMBOL_RANGE_CACHE.get(abs_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[2].get(lower_name, lower_name)
+    get_symbol_ranges(abs_path)
+    with _SYMBOL_RANGE_LOCK:
+        cached = _SYMBOL_RANGE_CACHE.get(abs_path)
+        if cached is not None:
+            return cached[2].get(lower_name, lower_name)
+    return lower_name
+
+
+def find_symbol_range(abs_path: str, name: str) -> tuple[int, int, str] | None:
+    """(start1, end1, kind) for ``name`` in the file, or None."""
+    if not name:
+        return None
+    return get_symbol_ranges(abs_path).get(str(name).strip().lower())
+
+
+def enclosing_symbol(abs_path: str, line1: int) -> tuple[str, int, int, str] | None:
+    """Innermost (name, start1, end1, kind) containing 1-indexed ``line1``."""
+    try:
+        ln = int(line1)
+    except (TypeError, ValueError):
+        return None
+    best: tuple[str, int, int, str] | None = None
+    for key, (s, e, kind) in get_symbol_ranges(abs_path).items():
+        if s <= ln <= e and (best is None or (e - s) < (best[2] - best[1])):
+            best = (symbol_display_name(abs_path, key), s, e, kind)
+    return best
+
+
+def resolve_symbol_ranges(
+    abs_path: str, names: list[str]
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Split symbol names into ([(start1, line_count)], [missing])."""
+    windows: list[tuple[int, int]] = []
+    missing: list[str] = []
+    for n in names or []:
+        hit = find_symbol_range(abs_path, n)
+        if hit is None:
+            missing.append(str(n))
+        else:
+            s, e, _ = hit
+            windows.append((max(1, s), max(1, e - s + 1)))
+    return windows, missing
+
+
 def clear_symbol_cache(root: str | None = None) -> None:
-    """پاک کردن کش نماد (مثلاً بعد از ویرایش فایل‌ها)."""
+    """Clear the symbol cache (e.g. after editing files)."""
     with _CACHE_LOCK:
         if root is None:
             _CACHE.clear()
         else:
             _CACHE.pop(os.path.realpath(os.path.abspath(root)), None)
+    with _SYMBOL_RANGE_LOCK:
+        if root is None:
+            _SYMBOL_RANGE_CACHE.clear()
+        else:
+            _prefix = os.path.realpath(os.path.abspath(root)) + os.sep
+            for _k in [k for k in _SYMBOL_RANGE_CACHE if k.startswith(_prefix)]:
+                _SYMBOL_RANGE_CACHE.pop(_k, None)

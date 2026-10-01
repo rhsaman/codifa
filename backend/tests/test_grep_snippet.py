@@ -59,6 +59,19 @@ async def test_grep_returns_path_line_text():
     # پس خط ۲ (setup_one) نمایش داده نمی‌شه — این رفتار درسته.
 
 
+async def test_grep_annotates_enclosing_symbol():
+    """Each hit names its enclosing symbol with range — straight to
+    read(symbols=[...]) with no line guessing. The `path:line:` prefix
+    stays intact for existing consumers."""
+    root = _make_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]("TARGET")
+    assert "app.py:4:" in out
+    assert "in alpha (L1-4)" in out
+    out2 = await cbs["grep"]("gamma")
+    assert "in gamma (L7-8)" in out2
+
+
 async def test_grep_snippet_stays_bounded():
     """A broad match still respects the per-match snippet width cap."""
     root = _make_wide_ws()

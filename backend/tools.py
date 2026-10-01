@@ -1063,6 +1063,39 @@ def read_file(root: str, path: str, permit: dict | None = None) -> dict:
 MAX_LINE_LENGTH = 2000  # chars; lines longer are truncated like opencode's read tool
 MAX_READ_EXCERPT_BYTES = 50_000  # total read-tool output cap, like opencode's read tool (50 KB)
 
+# Block-snapped reads: a window ending mid-block forces a follow-up read, so
+# every file window is extended (up to _SNAP_LOOKAHEAD lines past the
+# requested limit) to the first block boundary: a closing bracket at column
+# 0, or a blank line followed by a column-0 line (top-level def boundary).
+# Files at or under _SMALL_FILE_LINES are returned whole from the offset.
+_SNAP_LOOKAHEAD = 40
+_SMALL_FILE_LINES = 300
+_CLOSER_RE = re.compile(r"^[}\])]+[;,)]*$")
+
+
+def _snap_end(
+    rows: list[dict], limit: int, lookahead: int = _SNAP_LOOKAHEAD
+) -> list[dict]:
+    """Trim over-read ``rows`` to the requested ``limit`` snapped to a boundary.
+
+    ``rows`` holds at most ``limit + lookahead`` ``{"line", "text"}`` dicts.
+    Returns ``rows`` unchanged when the file ended within the limit; otherwise
+    scans from ``limit - 1`` for the first block boundary and cuts there.
+    Falls back to exactly ``limit`` rows when no boundary is in range.
+    """
+    if len(rows) <= limit:
+        return rows
+    end = len(rows)
+    for i in range(limit - 1, end):
+        text = rows[i].get("text", "")
+        if _CLOSER_RE.match(text):
+            return rows[: i + 1]
+        if not text.strip() and i + 1 < end:
+            nxt = rows[i + 1].get("text", "")
+            if nxt.strip() and not nxt[0].isspace():
+                return rows[: i + 1]
+    return rows[:limit]
+
 
 def _read_lines_excerpt(path: str, offset: int, limit: int) -> dict:
     """Read a slice of ``path``'s lines, opencode ``read``-style.
@@ -3395,22 +3428,36 @@ def make_tool_callbacks(
                     _args_text = _trace_json.dumps(ev.get("args") or {}, ensure_ascii=False, sort_keys=True)[:8000]
                 except Exception:  # noqa: BLE001
                     _args_text = str(ev.get("args") or "")[:8000]
-                _trace_store.append(
+                # The main loop already appended a running entry with the step
+                # number for this same call — claim it instead of logging twice.
+                _claimed = _trace_store.claim_running_tool(
                     str(_chat_id or ""),
-                    "tool",
-                    str(tool or "tool"),
-                    detail={
-                        "name": str(tool or ""),
-                        "args": ev.get("args") or {},
-                        "call_id": str(ev.get("call_id") or ""),
-                        "model": str(ev.get("model") or ""),
+                    str(tool or ""),
+                    bool(ev.get("sub")),
+                    {
+                        "ev_call_id": str(ev.get("call_id") or ""),
                         "branch": str(ev.get("branch") or ""),
                         "sub": bool(ev.get("sub")),
-                        "status": "running",
                     },
-                    model=str(ev.get("model") or ""),
-                    prompt=_args_text,
                 )
+                if _claimed is None:
+                    _trace_store.append(
+                        str(_chat_id or ""),
+                        "tool",
+                        str(tool or "tool"),
+                        detail={
+                            "name": str(tool or ""),
+                            "args": ev.get("args") or {},
+                            "call_id": str(ev.get("call_id") or ""),
+                            "ev_call_id": str(ev.get("call_id") or ""),
+                            "model": str(ev.get("model") or ""),
+                            "branch": str(ev.get("branch") or ""),
+                            "sub": bool(ev.get("sub")),
+                            "status": "running",
+                        },
+                        model=str(ev.get("model") or ""),
+                        prompt=_args_text,
+                    )
             elif kind == "tool_result":
                 _res = ev.get("results")
                 if _res is None:
@@ -3546,56 +3593,6 @@ def make_tool_callbacks(
     # and no nudge ever fired. 1 nudges after EVERY mutating call while stuck, so
     # even a single-tool-call task gets reminded before the model's final reply.
     _PLAN_NUDGE_EVERY = 1
-
-    # Narrow-read guard: stop line-by-line probing of one file. A proactive floor
-    # widens tiny first reads so the pattern never starts; a reactive hint
-    # backstops the case where the model keeps asking for small adjacent windows
-    # anyway. Both live for this run only, reset each time make_tool_callbacks
-    # is called (same lifetime as _plan_nudge_state above).
-    _NARROW_READ_FLOOR = 100         # اگه limit خیلی کوچیک بود، به این گرد می‌کنیم
-    _NARROW_READ_HINT_LIMIT = 50     # زیر این حد، مشمول floor می‌شه
-    _narrow_read_state = {"last_target": None, "small_adjacent": 0}
-
-    def _narrow_read_floor(target: str, offset: int, limit: int, total: int = 0) -> tuple[int, str | None]:
-        """پهنای خواندن رو proactive تنظیم می‌کنه تا probe خط‌به‌خط شروع نشه.
-
-        - فقط برای فایل‌ها و فقط اولین read (offset=1) اعمال می‌شه — نه دایرکتوری‌ها
-          (که pagination معنادار دارن) و نه ادامهٔ pagination (offset>1).
-        - اگه limit خیلی کوچیکه (< _NARROW_READ_HINT_LIMIT) و این اولین read روی
-          این فایل تو این taskـه و فایل بزرگ‌تر از floorـه → به _NARROW_READ_FLOOR
-          گرد می‌کنیم (floor)؛ الگو اصلاً شروع نمی‌شه و مدل کل ناحیه رو یه‌جا می‌بینه.
-        - اگه باز هم روی همون فایل بازهٔ کوچیک/مجاور زده شد → hint قاطع برمی‌گردونه.
-        برمی‌گردونه: (limitِ اصلاح‌شده، hint یا None)
-        """
-        st = _narrow_read_state
-        is_small = 0 < limit < _NARROW_READ_HINT_LIMIT
-        is_same = st["last_target"] == target
-        if is_small and is_same:
-            st["small_adjacent"] += 1
-        else:
-            st["small_adjacent"] = 0
-        st["last_target"] = target
-        effective = limit
-        hint = None
-        # فقط فایل + اولین read (offset=1) + فایل بزرگ‌تر از floor: دایرکتوری،
-        # pagination، و فایل‌های کوچیک مستثنی‌اند (برای اونا limit کوچیک بی‌ضرره).
-        if (
-            is_small
-            and st["small_adjacent"] == 0
-            and not os.path.isdir(target)
-            and offset == 1
-            and total > _NARROW_READ_FLOOR
-        ):
-            # اولین read کوچیک روی این فایل بزرگ → floor بزن (الگو اصلاً شروع نشه)
-            effective = _NARROW_READ_FLOOR
-        elif st["small_adjacent"] >= 1:
-            # دومین/بعدیِ کوچیکِ مجاور → hint قاطع
-            hint = (
-                "HINT: stop reading tiny adjacent slices of this file. "
-                "Read one wide window (limit=100+) covering the whole target "
-                "region instead of paging 20-30 lines at a time."
-            )
-        return effective, hint
 
     # Read-window hygiene (code-enforced, not prompt-only). Session telemetry
     # showed ~70% of tool calls were `read`, one call per model step, and most
@@ -4304,6 +4301,14 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         lines: list[str] = []
         total = 0
         _adaptive = 3 if min(len(matches), max_results) <= 5 else 1
+        try:
+            from symbol_index import enclosing_symbol as _enclosing_symbol
+        except ImportError:
+            _enclosing_symbol = None  # type: ignore[assignment]
+        # Phase 1: pick shown matches and render bodies (budget check on the
+        # unsuffixed text; the ~30-char annotation cannot flip it).
+        _shown_ms: list[dict] = []
+        _bodies: list[str] = []
         for shown, m in enumerate(matches):
             if shown >= max_results:
                 break
@@ -4319,13 +4324,46 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     f"{'>' if cl['line'] == m['line'] else ' '} {cl['line']} | {(cl.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
                     for cl in ctx_lines
                 )
-                entry = f"{m['file']}:{m['line']}:\n{body}"
             else:
-                entry = f"{m['file']}:{m['line']}:{(m.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
-            if lines and total + len(entry) + 2 > tool_out_chars:
+                body = (m.get("text") or "")[:SNIPPET_LINE_WIDTH]
+            entry = f"{m['file']}:{m['line']}:\n{body}" if ctx_lines else f"{m['file']}:{m['line']}:{body}"
+            # +64 headroom: the phase-2 ` in Name (L..)` suffix (~35 chars)
+            # must not push a capped budget over.
+            if lines and total + len(entry) + 2 + 64 > tool_out_chars:
                 break
+            _shown_ms.append(m)
+            _bodies.append(body)
             lines.append(entry)
             total += len(entry) + 2
+        # Phase 2: enclosing-symbol annotations off the event loop. The first
+        # parse of a file compiles the grammar (~seconds once), later hits
+        # are mtime-cached (~ms) — either way never block the tool loop.
+        # Kept after the `file:line:` prefix so existing `path:line:`
+        # consumers keep matching.
+        if _enclosing_symbol is not None and _shown_ms:
+            def _annotate_one(mm: dict) -> str:
+                try:
+                    _hit = _enclosing_symbol(
+                        os.path.join(root, str(mm["file"])), mm["line"]
+                    )
+                    if _hit is not None:
+                        return f" in {_hit[0]} (L{_hit[1]}-{_hit[2]})"
+                except Exception:  # noqa: BLE001, S110 — annotation never breaks grep
+                    pass
+                return ""
+
+            try:
+                _suffixes = await asyncio.gather(
+                    *(asyncio.to_thread(_annotate_one, mm) for mm in _shown_ms)
+                )
+            except Exception:  # noqa: BLE001
+                _suffixes = [""] * len(_shown_ms)
+            for _i, (_mm, _suffix) in enumerate(zip(_shown_ms, _suffixes)):
+                if _suffix:
+                    _old = lines[_i]
+                    _head, _sep, _rest = _old.partition(":")
+                    _ln, _sep2, _body = _rest.partition(":")
+                    lines[_i] = f"{_head}:{_ln}:{_suffix}{_sep2}{_body}"
         _shown = len(lines)
         _hidden = len(matches) - _shown
         if _hidden > 0:
@@ -4618,17 +4656,28 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             if not quiet:
                 emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
+        offset = int(offset or 1)
+        limit = int(limit or 2000)
+        # Block-snapped over-read: fetch up to _SNAP_LOOKAHEAD lines past the
+        # requested limit (bulk reads >= 1000 lines are exempt — they already
+        # cover whole regions) so the window can end on a block boundary
+        # instead of mid-function. The byte cap still bounds total output.
+        want = limit + _SNAP_LOOKAHEAD if limit < 1000 else limit
+
         async def single_excerpt() -> dict:
-            return await asyncio.to_thread(_read_lines_excerpt, target, offset, limit)
+            return await asyncio.to_thread(_read_lines_excerpt, target, offset, want)
 
         async def batch_excerpts(windows: list[tuple[int, int]]) -> list[dict]:
-            if len(windows) == 1:
-                return [await asyncio.to_thread(_read_lines_excerpt, target, *windows[0])]
-            return await asyncio.to_thread(_read_lines_excerpts, target, windows)
+            widened = [
+                (o, (l + _SNAP_LOOKAHEAD) if l < 1000 else l) for o, l in windows
+            ]
+            if len(widened) == 1:
+                return [await asyncio.to_thread(_read_lines_excerpt, target, *widened[0])]
+            return await asyncio.to_thread(_read_lines_excerpts, target, widened)
 
         excerpt = await coalesce_io(
             ("read", root, target, id(permit), _search_generations.get(root, 0)),
-            (offset, limit), single_excerpt, batch_excerpts,
+            (offset, want), single_excerpt, batch_excerpts,
         )
         if excerpt.get("error"):
             msg = excerpt["error"]
@@ -4638,33 +4687,73 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         lines = excerpt["lines"]
         start = excerpt["start"]
         total = excerpt["total"]
-        # Narrow-read guard: widen tiny first reads (proactive floor) and hint
-        # if the model keeps probing small adjacent windows on the same file.
-        # Applied AFTER we know `total` so small files keep their exact limit
-        # (pagination still works) and only large files get widened.
-        offset = int(offset or 1)
-        limit = int(limit or 2000)
-        limit, _narrow_hint = _narrow_read_floor(target, offset, limit, total)
+        cut = bool(excerpt.get("cut"))
         if not lines:
             msg = f"line offset {start} is past the end of the file ({total} lines)"
             if not quiet:
                 emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
+        # Small files come back whole from the offset: one read instead of
+        # offset/limit paging across two or more round-trips. Larger files
+        # snap to the first block boundary past the requested limit.
+        if not cut and total <= _SMALL_FILE_LINES:
+            if lines[-1]["line"] < total:
+                tail = await asyncio.to_thread(
+                    _read_lines_excerpt, target, lines[-1]["line"] + 1, total
+                )
+                if not tail.get("error") and tail.get("lines"):
+                    lines = [*lines, *tail["lines"]]
+                    cut = bool(tail.get("cut"))
+        else:
+            lines = _snap_end(lines, limit)
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
-        next_line = last + 1
-        if excerpt["cut"]:
+        more = last < total
+        if cut:
             body += (
                 f"\n\n(Output capped at {MAX_READ_EXCERPT_BYTES // 1024} KB. "
-                f"Showing lines {start}-{last}. Use offset={next_line} to continue.)"
+                f"Showing lines {start}-{last}. Read the needed sections with "
+                f"symbols=[...] or ranges=[\"path:start:count\", ...] in one call.)"
             )
-        elif excerpt["more"]:
+        elif more:
             body += (
                 f"\n\n(Showing lines {start}-{last} of {total}. "
-                f"Use offset={next_line} to continue.)"
+                f"Read all needed sections with symbols=[...] or "
+                f"ranges=[\"path:start:count\", ...] in one call, "
+                f"or locate them with grep first.)"
             )
         else:
             body += f"\n\n(End of file - total {total} lines)"
+        # Turn ledger: remind the model what ELSE of this file it already
+        # fetched this turn, so it reuses context instead of re-reading.
+        # Best-effort and silent when no ledger is active (e.g. unit tests).
+        try:
+            from tool_batching import fetched_windows as _fetched_windows
+
+            _prior = [
+                (s0, s1)
+                for s0, s1 in _fetched_windows(filePath)
+                if s1 < start or s0 > last
+            ]
+            if _prior:
+                _prior.sort()
+                _merged: list[list[int]] = []
+                for _a, _b in _prior:
+                    if _merged and _a <= _merged[-1][1] + 1:
+                        _merged[-1][1] = max(_merged[-1][1], _b)
+                    else:
+                        _merged.append([_a, _b])
+                _ranges = ", ".join(
+                    f"lines {_a}-{_b}" for _a, _b in _merged[:4]
+                )
+                if len(_merged) > 4:
+                    _ranges += f" (+{len(_merged) - 4} more)"
+                body += (
+                    f"\n\n(Also fetched this turn: {_ranges} of this file — "
+                    "reuse that content, do NOT re-read it.)"
+                )
+        except Exception:  # noqa: BLE001, S110 — ledger never breaks a read
+            pass
         if not quiet:
             emit(
                 {
@@ -4676,8 +4765,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 }
             )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
-        if _narrow_hint:
-            raw += f"\n\n{_narrow_hint}"
         _parent_search_cache[cache_key] = raw
         return raw
 
@@ -4687,12 +4774,15 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         limit: int = 2000,
         filePaths: list[str] | None = None,
         ranges: list[str] | None = None,
+        symbols: list[str] | None = None,
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
 BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
 
-NOTE: very small limits (<50 lines) on a first read of a file are auto-widened to ~100 lines to avoid line-by-line probing — ask for a wide window (limit=150+) if you need more context around a region. Repeated tiny adjacent reads of the same file trigger a hint telling you to read one wide window instead.
+SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`.
+
+WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. When a file has more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -4709,6 +4799,27 @@ When you need to read several files, read multiple independent files in parallel
             if not p or not o.isdigit() or not l.isdigit():
                 continue
             jobs.append((p, int(o), int(l)))
+        # `symbols=[...]` resolves to concrete windows on filePath via the
+        # symbol index (CODE MAP) — one call instead of guessing line numbers.
+        _symbol_missing: list[str] = []
+        if symbols:
+            try:
+                _sym_target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+            except PathEscapeError as exc:
+                return f"ERROR reading {filePath}: invalid path: {exc}"
+            if os.path.isdir(_sym_target):
+                return f"ERROR reading {filePath}: symbols= needs a file, not a directory"
+            try:
+                from symbol_index import resolve_symbol_ranges as _resolve_syms
+            except ImportError:
+                return f"ERROR reading {filePath}: symbols= is unavailable (symbol index missing)"
+            _wins, _symbol_missing = _resolve_syms(_sym_target, [str(s) for s in symbols])
+            if not _wins:
+                return (
+                    f"ERROR reading {filePath}: no such symbol(s): "
+                    f"{', '.join(_symbol_missing)}. Check the CODE MAP for exact names."
+                )
+            jobs.extend((filePath, _o, _l) for _o, _l in _wins)
         base_paths = [filePath] + [
             p for p in (filePaths or []) if p and p != filePath
         ]
@@ -4745,6 +4856,7 @@ When you need to read several files, read multiple independent files in parallel
                     "offset": offset,
                     "limit": limit,
                     **({"ranges": list(ranges)} if ranges else {}),
+                    **({"symbols": list(symbols)} if symbols else {}),
                 },
                 "model": _main_name,
             }
@@ -4778,6 +4890,14 @@ When you need to read several files, read multiple independent files in parallel
                 f"[batch] {len(_oks)}/{len(results)} files read OK; "
                 + "; ".join(f"{p}: {str(r).split(':', 1)[-1].strip()}" for p, r in _errs)
             )
+            # Broadcast-window guard: one shared offset/limit across files of
+            # different sizes past-EOFs on the short ones. Steer to per-file
+            # windows instead of another broadcast guess.
+            if any("past the end of the file" in str(r) for _, r in _errs):
+                _foot += (
+                    " Files differ in size — use ranges=[\"path:start:count\", ...] "
+                    "with a per-file window, not one shared offset/limit."
+                )
             emit(
                 {
                     "kind": "tool_result",
@@ -4799,7 +4919,14 @@ When you need to read several files, read multiple independent files in parallel
                     "results": [{"path": p} for p, _, _ in tasks],
                 }
             )
-            return "\n\n".join(results)
+            _out = "\n\n".join(results)
+            if _symbol_missing:
+                _out += (
+                    "\n\n(symbols not found: "
+                    + ", ".join(_symbol_missing)
+                    + ". Check the CODE MAP for exact names.)"
+                )
+            return _out
         emit(
             _error_result(
                 "read",

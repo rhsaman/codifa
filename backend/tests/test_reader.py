@@ -344,14 +344,33 @@ async def test_read_file_xml_format(tmp_path):
 
 @pytest.mark.asyncio
 async def test_read_file_more_footer(tmp_path):
+    # File over _SMALL_FILE_LINES so the `more` branch applies (small files
+    # come back whole). Plain lines carry no block boundary, so the window
+    # is exactly limit lines and the footer points at symbols=/ranges=.
+    f = tmp_path / "a.py"
+    f.write_text("".join(f"line{i}\n" for i in range(1, 401)))
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py", offset=1, limit=5)
+    assert "(Showing lines 1-5 of 400." in out
+    assert "symbols=[...]" in out
+    assert "Use offset=" not in out
+    assert "<path>a.py</path>" in out
+    assert "<type>file</type>" in out
+
+
+@pytest.mark.asyncio
+async def test_read_small_file_returns_whole(tmp_path):
+    # Files at or under _SMALL_FILE_LINES come back whole from the offset:
+    # one read instead of offset/limit paging across round-trips.
     f = tmp_path / "a.py"
     f.write_text("".join(f"line{i}\n" for i in range(1, 21)))
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(filePath="a.py", offset=1, limit=5)
-    assert "(Showing lines 1-5 of 20. Use offset=6 to continue.)" in out
-    assert "<path>a.py</path>" in out
-    assert "<type>file</type>" in out
+    assert "1 | line1" in out
+    assert "20 | line20" in out
+    assert "(End of file - total 20 lines)" in out
 
 
 @pytest.mark.asyncio
@@ -365,7 +384,8 @@ async def test_read_file_cut_footer(tmp_path):
     read, _ = _make_read(root)
     out = await read(filePath="big.py", offset=1, limit=2000)
     assert "Output capped at" in out
-    assert "Use offset=" in out
+    assert "symbols=[...]" in out
+    assert "Use offset=" not in out
     assert "(End of file" not in out
 
 
@@ -477,8 +497,8 @@ async def test_read_ranges_per_path_windows(tmp_path):
     (هر کدام کل مکالمه را دوباره به API می‌فرستاد). حالا یک فراخوانی با
     ranges همه‌ی پنجره‌ها را برمی‌گرداند.
     """
-    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 51)))
-    (tmp_path / "b.py").write_text("".join(f"other{i}\n" for i in range(1, 51)))
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 401)))
+    (tmp_path / "b.py").write_text("".join(f"other{i}\n" for i in range(1, 401)))
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(
@@ -501,7 +521,7 @@ async def test_read_ranges_per_path_windows(tmp_path):
 async def test_read_ranges_same_file_two_windows(tmp_path):
     """رگرسیون تصویر: ranges تکراری هم‌فایل (tools.py با 640:60 و 2089:80)
     باید هر دو بازه را برگرداند — نه فقط آخری (رفع collapse روی dict)."""
-    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 101)))
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 401)))
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(filePath="a.py", ranges=["a.py:10:5", "a.py:30:5"])
@@ -568,3 +588,60 @@ async def test_read_batch_partial_failure_footer(tmp_path):
     assert not out.startswith("ERROR")
     assert "missing.py" in out
     assert "1/2 files read OK" in out
+
+
+@pytest.mark.asyncio
+async def test_read_snaps_to_block_end(tmp_path):
+    """A window ending mid-function extends to the closing bracket instead
+    of forcing a follow-up read (the 640-859/860-899 pattern)."""
+    lines = [f"line{i}" for i in range(1, 401)]
+    lines[9] = "def foo():"
+    lines[10] = "    x = 1"
+    lines[11] = "    return x"
+    # line12 stays "line12", line13 (index 12) becomes the closer
+    lines[12] = "}"
+    (tmp_path / "a.py").write_text("\n".join(lines) + "\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="a.py", offset=1, limit=10)
+    # Requested 1-10, but the block closes at line 13 -> snapped.
+    assert "10 | def foo():" in out
+    assert "13 | }" in out
+    assert "14 | line14" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_batch_broadcast_past_eof_guides_to_ranges(tmp_path):
+    """One shared offset/limit across different-size files past-EOFs on the
+    short ones — the footer must steer to per-file ranges= windows."""
+    (tmp_path / "big.py").write_text("".join(f"line{i}\n" for i in range(1, 401)))
+    (tmp_path / "small.py").write_text("only\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="big.py", filePaths=["small.py"], offset=300, limit=50)
+    assert "past the end of the file" in out
+    assert "ranges=" in out
+
+
+@pytest.mark.asyncio
+async def test_read_symbols_single_call(tmp_path):
+    """symbols=[...] reads named definitions in one call — no line guessing."""
+    (tmp_path / "m.py").write_text(
+        "def alpha():\n    return 1\n\ndef beta():\n    return 2\n"
+        + "".join(f"filler{i} = {i}\n" for i in range(400))
+    )
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="m.py", symbols=["beta"])
+    assert "return 2" in out
+    assert "return 1" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_symbols_missing(tmp_path):
+    (tmp_path / "m.py").write_text("def alpha():\n    return 1\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    out = await read(filePath="m.py", symbols=["nope"])
+    assert out.startswith("ERROR")
+    assert "nope" in out

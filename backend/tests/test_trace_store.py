@@ -53,6 +53,52 @@ def test_llm_always_logged_without_usage():
     assert trace_store.list_traces("c5", "llm")[0]["prompt"] == "[user]\nhello"
 
 
+def test_tool_claim_reuses_running_entry_no_duplicate():
+    trace_store.clear("c6")
+    trace_store.next_turn("c6")
+    first = trace_store.append(
+        "c6",
+        "tool",
+        "grep · step 1",
+        detail={"name": "grep", "args": {"pattern": "x"}, "call_id": "lc-1", "step": 1, "status": "running"},
+        prompt='{"pattern": "x"}',
+    )
+    assert first is not None
+    # Wrapper normalizes args — matching ignores args, uses name + turn.
+    claimed = trace_store.claim_running_tool(
+        "c6", "grep", False, {"ev_call_id": "ev-7", "sub": False}
+    )
+    assert claimed is not None
+    assert claimed["id"] == first["id"]
+    assert claimed["detail"]["step"] == 1
+    assert claimed["detail"]["ev_call_id"] == "ev-7"
+    assert len(trace_store.list_traces("c6", "tool")) == 1
+    # Second claim for the same call finds nothing (already claimed).
+    assert trace_store.claim_running_tool("c6", "grep", False, {}) is None
+    # Finish via the wrapper event id resolves the same single entry.
+    done = trace_store.finish_tool("c6", "ev-7", "MATCHES")
+    assert done is not None
+    assert done["id"] == first["id"]
+    assert done["result"] == "MATCHES"
+    assert len(trace_store.list_traces("c6", "tool")) == 1
+
+
+def test_tool_claim_miss_on_different_name_sub_or_turn():
+    trace_store.clear("c7")
+    trace_store.next_turn("c7")
+    trace_store.append(
+        "c7",
+        "tool",
+        "read · step 1",
+        detail={"name": "read", "args": {"path": "a"}, "call_id": "lc-1", "step": 1, "status": "running"},
+    )
+    assert trace_store.claim_running_tool("c7", "grep", False, {}) is None
+    assert trace_store.claim_running_tool("c7", "read", True, {}) is None
+    trace_store.next_turn("c7")
+    assert trace_store.claim_running_tool("c7", "read", False, {}) is None
+    assert len(trace_store.list_traces("c7", "tool")) == 1
+
+
 def test_cap_and_invalid():
     trace_store.clear("c3")
     assert trace_store.append("", "llm", "x") is None

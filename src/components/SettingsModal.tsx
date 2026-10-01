@@ -731,6 +731,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const runState = (kind: ManagedModelKind): ModelRunState | undefined =>
     (kind === 'whisper' ? mStatus?.whisper : kind === 'laya' ? mStatus?.laya : mStatus?.embedding)?.running
 
+  // Laya checkpoints are decision models, not embeddings: an old HF
+  // auto-download could leave a `models--convaiinnovations--laya` folder that
+  // used to surface here as an "incomplete" row. The backend filters those
+  // now; this keeps them out even if one slips through (stale sidecar).
+  const embeddingDirs = (mStatus?.embedding?.dirs ?? []).filter((d) => !isLayaRepo(d.repo))
+  const embeddingStatus = mStatus?.embedding ? { ...mStatus.embedding, dirs: embeddingDirs } : mStatus?.embedding
+
   const actDownload = async (kind: 'whisper' | 'embedding' | 'laya') => {
     const repo = kind === 'whisper' ? whisperModel : kind === 'laya' ? layaModel : 'intfloat/multilingual-e5-base'
     const base = kind === 'whisper' ? whisperBaseUrl : kind === 'laya' ? layaBaseUrl : ''
@@ -2247,14 +2254,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     <span className="model-card-title">Memory</span>
                     <span className="model-card-desc">Local embeddings for recall. Search still works without it.</span>
                   </div>
-                  <ModelBadge status={mStatus?.embedding} />
+                  <ModelBadge status={embeddingStatus} />
                 </div>
                 <div className="model-card-body">
                   <ModelProgress running={runState('embedding')} />
-                  <ModelStatusCard status={mStatus?.embedding} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
+                  <ModelStatusCard status={embeddingStatus} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
                   <ModelControls
                     running={runState('embedding')}
-                    canDownload={!(mStatus?.embedding?.dirs ?? []).some((d) => d.ready)}
+                    canDownload={!embeddingDirs.some((d) => d.ready)}
                     onDownload={() => actDownload('embedding')}
                     onPause={() => actPause('embedding')}
                     onResume={() => actResume('embedding')}
@@ -2524,6 +2531,11 @@ function fmtSpeed(bps?: number): string {
   if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB/s`
   if (v >= 1024) return `${Math.round(v / 1024)} KB/s`
   return `${Math.round(v)} B/s`
+}
+
+/** Laya repos are decision checkpoints, never embedding models. */
+function isLayaRepo(repo?: string): boolean {
+  return !!repo && (repo === 'convaiinnovations/laya' || repo.startsWith('convaiinnovations/laya-'))
 }
 
 /** Card status badge: Not downloaded · Downloading · Paused · Error · Ready. */

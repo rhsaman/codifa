@@ -3,12 +3,12 @@ import { useStore } from './lib/store'
 import { ChatPanel } from './components/Chat'
 import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
-import { ReviewPanel } from './components/ReviewPanel'
-import { TracePanel } from './components/TracePanel'
-import { useReviewPanel } from './lib/reviewPanel'
-import { useTracePanel } from './lib/tracePanel'
+import { ChatTabBar } from './components/ChatTabBar'
+import { ViewerTabBar } from './components/ViewerTabBar'
+import { ViewerContent } from './components/ViewerContent'
+import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
 import { RightPanel } from './components/TodosPanel'
-import { ScheduleInbox, ScheduleInboxButton } from './components/ScheduleInbox'
+import { ScheduleInboxButton } from './components/ScheduleInbox'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -31,13 +31,38 @@ export default function App() {
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
   const rightPanelOpen = useStore((s) => s.rightPanelOpen)
-  // پنل Review سمت راست (سبک کدکس): با کلیک روی کارت edit_file/write_file باز
-  // می‌شود و ترنِ همان پیام را نشان می‌دهد.
-  const reviewOpen = useReviewPanel((s) => s.open)
-  const reviewSource = useReviewPanel((s) => s.source)
-  const traceOpen = useTracePanel((s) => s.open)
+  const viewerTabs = useViewerTabs((s) => s.tabs)
+  const viewerActiveId = useViewerTabs((s) => s.activeId)
+  const viewerHasGit = viewerTabs.some((t) => t.kind === 'review')
+  const viewerHasTrace = viewerTabs.some((t) => t.kind === 'trace')
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // VSCode-style split between chat group and viewer group. Default half
+  // viewport, resizable via the dock handle, persisted in localStorage.
+  const [splitW, setSplitW] = useState(() => loadSplitWidth(0.5))
+  const splitDrag = useRef<{ startX: number; startW: number } | null>(null)
+  useEffect(() => {
+    const onResize = () => setSplitW((w) => clampSplitWidth(w))
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+  const startSplitResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    splitDrag.current = { startX: e.clientX, startW: splitW }
+    const onMove = (ev: MouseEvent) => {
+      if (!splitDrag.current) return
+      const w = clampSplitWidth(splitDrag.current.startW - (ev.clientX - splitDrag.current.startX))
+      setSplitW(w)
+      persistSplitWidth(w)
+    }
+    const onUp = () => {
+      splitDrag.current = null
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
 
   // Loads persisted state. On failure we surface the error on the loading
   // screen (with a Retry button) instead of trapping the user on an endless
@@ -199,6 +224,23 @@ export default function App() {
       if (togglePanelFromKey(e)) return
       if (!(e.metaKey || e.ctrlKey)) return
       const k = physicalKey(e)
+      // VSCode-style close tab: Cmd/Ctrl+W closes the active viewer tab first,
+      // otherwise the active chat tab. Skip while typing so a stray chord never
+      // eats the draft mid-sentence.
+      if (k === 'w' && !e.shiftKey && !e.altKey) {
+        const t = e.target as HTMLElement | null
+        const typing = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+        if (!typing) {
+          e.preventDefault()
+          const vt = useViewerTabs.getState()
+          if (vt.activeId) vt.closeViewer(vt.activeId)
+          else {
+            const st = useStore.getState()
+            if (st.activeChatId) st.closeChatTab(st.activeChatId)
+          }
+          return
+        }
+      }
       switch (k) {
         case ',': {
           e.preventDefault()
@@ -285,8 +327,8 @@ export default function App() {
             className="titlebar-icon-btn"
             title="Chat traces — laya / LLM / prompts"
             aria-label="Chat traces — laya / LLM / prompts"
-            aria-pressed={traceOpen}
-            onClick={() => useTracePanel.getState().openTraces()}
+            aria-pressed={viewerHasTrace}
+            onClick={() => useViewerTabs.getState().openTraces(activeChatId || undefined)}
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M4 6h16M4 12h10M4 18h7" />
@@ -297,8 +339,8 @@ export default function App() {
             className="titlebar-icon-btn"
             title="Git diff — uncommitted changes"
             aria-label="Git diff — uncommitted changes"
-            aria-pressed={reviewOpen && reviewSource === 'uncommitted'}
-            onClick={() => useReviewPanel.getState().openGitDiff()}
+            aria-pressed={viewerHasGit}
+            onClick={() => useViewerTabs.getState().openGitDiff()}
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <circle cx="6" cy="6" r="2.4" />
@@ -328,16 +370,38 @@ export default function App() {
       <div className="app-body">
         <ErrorBoundary>
           <Sidebar />
-          <main className="main">
-            {/* No key={activeChatId}: a full remount re-parses every markdown +
-              highlight block and re-runs all mount effects, which is the main
-              cost of switching chats. ChatPanel already resets its per-chat
-              state (input/draft/scroll/msgLimit) from the chat id, so keeping
-              the instance mounted across switches is safe and instant. */}
-            <ChatPanel />
-          </main>
-          {reviewOpen && <ReviewPanel />}
-          {traceOpen && <TracePanel />}
+          <div className="editor-area">
+            <section className="chat-group" aria-label="Chats">
+              <ChatTabBar />
+              <main className="main">
+                {/* No key={activeChatId}: a full remount re-parses every markdown +
+                  highlight block and re-runs all mount effects, which is the main
+                  cost of switching chats. ChatPanel already resets its per-chat
+                  state (input/draft/scroll/msgLimit) from the chat id, so keeping
+                  the instance mounted across switches is safe and instant. */}
+                <ChatPanel />
+              </main>
+            </section>
+            {viewerTabs.length > 0 && (
+              <>
+                <div
+                  className="dock-resize-handle"
+                  title="Drag to resize"
+                  onMouseDown={startSplitResize}
+                />
+                <section
+                  className="viewer-group"
+                  style={{ flexBasis: splitW, width: splitW } as React.CSSProperties}
+                  aria-label="Viewers"
+                >
+                  <ViewerTabBar />
+                  <div className="viewer-content" key={viewerActiveId ?? 'empty'}>
+                    <ViewerContent />
+                  </div>
+                </section>
+              </>
+            )}
+          </div>
           {codeMapPanelOpen && (
             <CodeMapPanel
               onJumpToFile={(path, line) => {
@@ -355,7 +419,6 @@ export default function App() {
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}
       {searchOpen && <SearchOverlay onClose={() => setSearchOpen(false)} />}
-      <ScheduleInbox />
     </div>
   )
 }

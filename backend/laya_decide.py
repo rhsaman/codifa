@@ -162,19 +162,25 @@ def router_unavailable_reason() -> str:
 
 
 def _router_cache_dir() -> str:
-    """پوشه کش laya داخل data-root (مشترک با model_download)."""
+    """Dedicated HF hub cache dir for laya auto-downloads.
+
+    Must NOT be the shared ``models/`` root: huggingface_hub lays out
+    downloads as ``models--<org>--<name>/`` there, and embedding_dirs()
+    scans exactly that prefix — a laya auto-download used to show up as an
+    "incomplete" row in the Settings Memory card.
+    """
     try:
         import model_download
 
-        return os.path.join(os.path.dirname(model_download._models_dir()), "models")
-    except Exception:  # noqa: BLE001 — fallback مستقل
+        return model_download.hub_cache_dir()
+    except Exception:  # noqa: BLE001 — standalone fallback
         try:
             from state_db import data_root
 
             root = data_root()
         except Exception:  # noqa: BLE001
             root = os.path.join(os.path.expanduser("~"), ".codifa")
-        return os.path.join(root, "models")
+        return os.path.join(root, "models", "hub-cache")
 
 
 def _laya_provider_id() -> str:

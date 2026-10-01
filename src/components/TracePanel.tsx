@@ -545,9 +545,23 @@ export function TraceTurnGroup({
 }
 
 /** Chat trace panel — overlay over chat, flat trace list with filter tabs. */
-export function TracePanel() {
-  const { tab, setTab, close } = useTracePanel();
-  const activeChatId = useStore((s) => s.activeChatId);
+export function TracePanel(props?: {
+  chatId?: string
+  initialTab?: TraceTab
+  docked?: boolean
+  onClose?: () => void
+}) {
+  const docked = props?.docked ?? false
+  const store = useTracePanel();
+  const storeTab = store.tab
+  const storeSetTab = store.setTab
+  const storeClose = store.close
+  const [dockedTab, setDockedTab] = useState<TraceTab>(props?.initialTab ?? 'all')
+  const tab = docked ? dockedTab : storeTab
+  const setTab = docked ? setDockedTab : storeSetTab
+  const close = props?.onClose ?? storeClose
+  const storeActiveChatId = useStore((s) => s.activeChatId);
+  const activeChatId = props?.chatId ?? storeActiveChatId;
   const [fullscreen, setFullscreen] = useState(false);
   const [width, setWidth] = useState(() => {
     if (typeof window === "undefined") return 720;
@@ -738,20 +752,20 @@ export function TracePanel() {
 
   const panel = (
     <div
-      className={`review-overlay${fullscreen ? " fullscreen" : ""}`}
+      className={docked ? undefined : `review-overlay${fullscreen ? " fullscreen" : ""}`}
       dir="ltr"
-      style={{ "--review-w": `${width}px` } as React.CSSProperties}
+      style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="review-scrim" aria-hidden="true" onClick={close} />
-      {!fullscreen && (
+      {!docked && <div className="review-scrim" aria-hidden="true" onClick={close} />}
+      {!docked && !fullscreen && (
         <div
           className="review-overlay-resize-handle"
           title="Drag to resize"
           onMouseDown={startResize}
         />
       )}
-      <aside className="review-panel review-floating-panel" dir="ltr" aria-label="Chat traces">
+      <aside className={docked ? "review-panel review-docked-panel" : "review-panel review-floating-panel"} dir="ltr" aria-label="Chat traces">
         <div className="review-header">
           <span className="review-source" role="tablist" aria-label="Trace filter">
             {TABS.map(([key, label]) => (
@@ -769,18 +783,7 @@ export function TracePanel() {
             ))}
           </span>
           <span className="review-header-actions">
-            <span className="trace-live-dot" title="Live — auto refresh every 2s">
-              <span className="trace-live-pulse" aria-hidden="true" /> Live
-            </span>
             <CopyTracesButton entries={visible} query={query} tab={tab} />
-            <button
-              className="review-header-btn"
-              title="Refresh"
-              aria-label="Refresh"
-              onClick={() => void fetchAll(false)}
-            >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>
-            </button>
             <button
               className="review-header-btn"
               title="Clear traces"
@@ -795,18 +798,20 @@ export function TracePanel() {
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /></svg>
             </button>
-            <button
-              className="review-header-btn"
-              title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-              aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-              onClick={() => setFullscreen((v) => !v)}
-            >
-              {fullscreen ? (
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
-              ) : (
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
-              )}
-            </button>
+            {!docked && (
+              <button
+                className="review-header-btn"
+                title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+                aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+                onClick={() => setFullscreen((v) => !v)}
+              >
+                {fullscreen ? (
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
+                ) : (
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
+                )}
+              </button>
+            )}
             <button
               className="review-header-btn"
               title="Close"
@@ -907,6 +912,6 @@ export function TracePanel() {
     </div>
   );
 
-  if (typeof document === "undefined") return panel;
+  if (docked || typeof document === "undefined") return panel;
   return createPortal(panel, document.body);
 }

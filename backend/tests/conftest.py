@@ -97,6 +97,34 @@ def _reset_tool_contextvars():
         # by one test's tracker would leak into the next test's read footers.
         reset_read_ledger()
     try:
+        from tool_batching import reset_turn_grep_cover
+    except ImportError:
+        reset_turn_grep_cover = None  # type: ignore[assignment]
+    if reset_turn_grep_cover is not None:
+        # Fresh per-test grep coverage: a complete grep in one test must not
+        # stub a subset grep in the next test.
+        reset_turn_grep_cover()
+    try:
+        from tool_batching import reset_cross_turn
+    except ImportError:
+        reset_cross_turn = None  # type: ignore[assignment]
+    if reset_cross_turn is not None:
+        # Cross-turn stores survive turns by design — but never across tests.
+        reset_cross_turn()
+    try:
+        from tool_batching import _TURN_CALLS
+    except ImportError:
+        _TURN_CALLS = None  # type: ignore[assignment]
+    if _TURN_CALLS is not None:
+        # Deactivate the per-turn duplicate-call registry: it is keyed
+        # WITHOUT the workspace root, so an active set leaks false
+        # "duplicate" stubs across tests with same relative paths. Tests
+        # that need it opt in explicitly via reset_turn_seen_calls().
+        try:
+            _TURN_CALLS.set(None)
+        except Exception:  # noqa: BLE001, S110 — isolation never breaks setup
+            pass
+    try:
         yield
     finally:
         try:

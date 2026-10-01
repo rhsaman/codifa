@@ -1,0 +1,130 @@
+import { useState } from "react";
+import { useStore } from "../lib/store";
+
+function chatTitle(chat: { title: string; messages: Array<{ role: string; content: string }> }): string {
+  if (chat.title && chat.title !== "New chat") return chat.title;
+  const firstUser = chat.messages.find((m) => m.role === "user");
+  return firstUser ? firstUser.content.slice(0, 32) || "New chat" : "New chat";
+}
+
+/** VSCode-style tab bar for the left editor group (chats only). Tabs can be
+ *  reordered with drag & drop; order persists across restarts. */
+export function ChatTabBar() {
+  const openChatIds = useStore((s) => s.openChatIds);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const chats = useStore((s) =>
+    s.chats.map((c) => ({
+      id: c.id,
+      title: c.title,
+      messages: c.messages
+        .filter((m) => m.role === "user")
+        .slice(0, 1)
+        .map((m) => ({ role: m.role, content: m.content })),
+      streaming: c.messages.some((m) => m.streaming || m.retry?.reconnecting === true),
+      pending: Boolean(c.pendingAsk || c.pendingPermission),
+      unread: s.unreadChats.includes(c.id),
+    })),
+  );
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+
+  const clearDrag = () => {
+    setDragId(null);
+    setDropTarget(null);
+  };
+
+  if (openChatIds.length === 0) return null;
+
+  return (
+    <div className="tab-bar chat-tabs" role="tablist" aria-label="Open chats">
+      {openChatIds.map((id) => {
+        const meta = chats.find((c) => c.id === id);
+        const title = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
+        const active = id === activeChatId;
+        const dropCls =
+          dropTarget?.id === id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
+        return (
+          <div
+            key={id}
+            role="tab"
+            aria-selected={active}
+            tabIndex={0}
+            draggable
+            className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging" : ""}${dropCls}`}
+            title={title}
+            onClick={() => useStore.getState().openChat(id)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                useStore.getState().openChat(id);
+              }
+            }}
+            onAuxClick={(e) => {
+              if (e.button === 1) useStore.getState().closeChatTab(id);
+            }}
+            onDragStart={(e) => {
+              e.dataTransfer.setData("text/plain", id);
+              e.dataTransfer.effectAllowed = "move";
+              setDragId(id);
+            }}
+            onDragOver={(e) => {
+              if (!dragId || dragId === id) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              const after = e.clientX - rect.left > rect.width / 2;
+              setDropTarget((prev) =>
+                prev?.id === id && prev.after === after ? prev : { id, after },
+              );
+            }}
+            onDragLeave={() => {
+              setDropTarget((prev) => (prev?.id === id ? null : prev));
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const from = e.dataTransfer.getData("text/plain") || dragId;
+              if (from && from !== id) {
+                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                const after = e.clientX - rect.left > rect.width / 2;
+                useStore.getState().moveChatTab(from, id, after);
+              }
+              clearDrag();
+            }}
+            onDragEnd={clearDrag}
+          >
+            {meta?.streaming ? (
+              <span className="editor-tab-dot busy" aria-hidden="true" />
+            ) : meta?.pending ? (
+              <span className="editor-tab-dot pending" aria-hidden="true" />
+            ) : meta?.unread ? (
+              <span className="editor-tab-dot unread" aria-hidden="true" />
+            ) : null}
+            <span className="editor-tab-label">{title}</span>
+            <button
+              type="button"
+              className="editor-tab-close"
+              title="Close chat tab"
+              aria-label={`Close ${title}`}
+              draggable={false}
+              onClick={(e) => {
+                e.stopPropagation();
+                useStore.getState().closeChatTab(id);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        className="editor-tab-new"
+        title="New chat"
+        aria-label="New chat"
+        onClick={() => useStore.getState().newChat()}
+      >
+        +
+      </button>
+    </div>
+  );
+}

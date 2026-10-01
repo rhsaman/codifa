@@ -149,7 +149,10 @@ def test_far_window_stays_silent():
     assert t.observe([_tc("read", {"filePath": "a.py", "offset": 500, "limit": 100})]) == ""
 
 
-def test_ledger_footer_lists_prior_windows(tmp_path):
+def test_ledger_footer_consolidated_to_step_line(tmp_path):
+    """The per-block "Also fetched this turn" note is gone: N blocks no
+    longer repeat N reminders. Coverage is reported once per step via
+    context_ledger_line (sent transiently with the next request)."""
     import tools
     from tool_batching import reset_read_ledger
 
@@ -165,7 +168,7 @@ def test_ledger_footer_lists_prior_windows(tmp_path):
     import asyncio
 
     out = asyncio.run(read(filePath="a.py", offset=200, limit=50))
-    assert "Also fetched this turn: lines 1-50" in out
+    assert "Also fetched this turn" not in out
 
 
 def test_ledger_empty_without_observe(tmp_path):

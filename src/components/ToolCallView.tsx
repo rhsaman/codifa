@@ -14,7 +14,7 @@ import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
 import { copyToClipboard } from "../lib/clipboard";
-import { useReviewPanel } from "../lib/reviewPanel";
+import { useViewerTabs } from "../lib/viewerTabs";
 import { api } from "../lib/fs";
 import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
@@ -133,7 +133,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
   onReverted?: (index: number) => void;
 }) {
   const [open, setOpen] = useState(true);
-  const openReview = useReviewPanel((s) => s.openReview);
+  const openReview = useViewerTabs((s) => s.openReview);
   const root = useStore((s) => s.root);
   const activeChatId = useStore((s) => s.activeChatId);
   const [reverting, setReverting] = useState<number | null>(null);
@@ -771,7 +771,11 @@ export function DiffView({
   };
 
   const renderSide = () => (
-    <div className="diff-columns" dir="ltr" {...drag}>
+    <div className="diff-columns" dir="ltr">
+      <div className="diff-columns-head">
+        <div className="diff-col-header diff-col-before">Before</div>
+        <div className="diff-col-header diff-col-after">After</div>
+      </div>
       {sideItems.map((item) => {
         if (item.kind === "gap") {
           return (
@@ -790,7 +794,6 @@ export function DiffView({
               </div>
             ))}
             <div className="diff-col diff-col-before">
-              <div className="diff-col-header">Before</div>
               <pre className="diff-col-code">
                 {contents.map((r, ri) => {
                   if ("text" in r) return null;
@@ -809,7 +812,6 @@ export function DiffView({
               </pre>
             </div>
             <div className="diff-col diff-col-after">
-              <div className="diff-col-header">After</div>
               <pre className="diff-col-code">
                 {contents.map((r, ri) => {
                   if ("text" in r) return null;
@@ -1503,7 +1505,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
-  const openReview = useReviewPanel((s) => s.openReview);
+  const openReview = useViewerTabs((s) => s.openReview);
 
   /** Compute +/- stats from diff — از مقدار ذخیره‌شده روی event در Chat.tsx
    *  استفاده می‌کند وگرنه خودش از روی متن حساب می‌کند. */
@@ -1644,7 +1646,7 @@ export const ToolCallView = memo(function ToolCallView({
   const [reverting, setReverting] = useState(false);
   // سبک کدکس: کارت ویرایش کوچک می‌ماند و دیف هرگز داخل چت باز نمی‌شود؛
   // کلیک روی خودِ کارت (یا دکمهٔ Review) دیف را در پنل سمت راست نشان می‌دهد.
-  const openReview = useReviewPanel((s) => s.openReview);
+  const openReview = useViewerTabs((s) => s.openReview);
   const root = useStore((s) => s.root);
   // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
   const activeChatId = useStore((s) => s.activeChatId);

@@ -34,7 +34,14 @@ import state_db as _state_db
 from agent_registry import AGENTS, agent_system, agent_tools
 from cache import Cache, cache_path_for
 from secret_utils import decrypt_secret
-from tool_batching import coalesce_io
+from tool_batching import (
+    coalesce_io,
+    fetched_windows,
+    has_served_map,
+    note_fetched_window,
+    note_served_map,
+    note_turn_call,
+)
 from vector_store import (
     KIND_WEB,
     StoreConfig,
@@ -64,6 +71,9 @@ SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 SEE_CAPTURE_TIMEOUT = 25
 SNIPPET_CONTEXT = 3  # surrounding lines (each side) grep returns inline so a `read` is usually unnecessary
 SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compact
+_GREP_PER_FILE_CAP = 8  # max hits shown per file when a dump truncates across many files
+_DEF_BODY_MAX_LINES = 60  # per-definition body lines expanded inline in grep hits
+_DEF_BODY_MAX_COUNT = 6  # max definition bodies expanded inline per grep call
 
 # Formatted results include output limits in their keys. In-flight sharing
 # covers only raw scans, scoped to a workspace, event loop and edit generation.
@@ -1070,6 +1080,23 @@ MAX_READ_EXCERPT_BYTES = 50_000  # total read-tool output cap, like opencode's r
 # Files at or under _SMALL_FILE_LINES are returned whole from the offset.
 _SNAP_LOOKAHEAD = 40
 _SMALL_FILE_LINES = 300
+# Paging auto-join: when a requested window starts/ends within this many lines
+# of an already-fetched window of the same file, bridge the gap (fetch it too).
+# Mirrors llm._READ_ADJACENT_GAP — the advisory "read ONE wide window" nudge
+# for that case is routinely ignored, so the join is enforced here instead.
+_READ_JOIN_GAP = 100
+# File map for blind head reads: a head read (offset 1) of more than
+# _HEAD_MAP_MIN_LINES lines with a bulk limit returns structure instead of a
+# 12k-token import dump — the first _HEAD_MAP_ROWS lines plus the symbol
+# index (name + line range per definition) with a copy-pasteable symbols=
+# example. Files without indexable symbols get _HEAD_MAP_ROWS_NO_SYMBOLS
+# head lines and a grep pointer instead. Explicit per-file windows
+# (ranges=/symbols= jobs) and small head windows are never mapped.
+_HEAD_MAP_MIN_LINES = 400
+_HEAD_MAP_MIN_LIMIT = 400
+_HEAD_MAP_ROWS = 40
+_HEAD_MAP_ROWS_NO_SYMBOLS = 60
+_HEAD_MAP_MAX_SYMBOLS = 50
 _CLOSER_RE = re.compile(r"^[}\])]+[;,)]*$")
 
 
@@ -3227,6 +3254,80 @@ def _load_skills_for_tool() -> list[dict]:
     return _load_skills("")
 
 
+def _duplicate_stub(emit: Callable[[dict], None], tool: str, args: dict, main_name: str, desc: str) -> str:
+    """Short-circuit a byte-identical repeat inside one turn (see note_turn_call).
+
+    The full result is already in this turn's transcript, so re-sending it is
+    pure token waste. UI events still fire (summary "duplicate") so the trace
+    stays intact.
+    """
+    emit({"kind": "tool", "tool": tool, "args": args, "model": main_name})
+    emit(
+        {
+            "kind": "tool_result",
+            "tool": tool,
+            "summary": "duplicate (already in context)",
+            "model": main_name,
+        }
+    )
+    return (
+        f"DUPLICATE of this turn's earlier `{tool}` call ({desc}) — "
+        "the full result is already in context above and is NOT re-sent (tokens saved)."
+    )
+
+
+def _cross_turn_stub(emit: Callable[[dict], None], tool: str, args: dict, main_name: str, desc: str, hint: str) -> str:
+    """Short-circuit a repeat of a PREVIOUS turn's call (cross-turn reuse).
+
+    The full result is in the conversation history and every file behind it
+    is byte-unchanged since, so re-sending it is pure token waste. UI events
+    still fire (summary "reused") so the trace stays intact.
+    """
+    emit({"kind": "tool", "tool": tool, "args": args, "model": main_name})
+    emit(
+        {
+            "kind": "tool_result",
+            "tool": tool,
+            "summary": "reused (previous turn, unchanged)",
+            "model": main_name,
+        }
+    )
+    return (
+        f"REUSED from an earlier `{tool}` call ({desc}) — files unchanged "
+        f"since, so the full result is NOT re-sent; reuse the rows in history above. {hint}"
+    )
+
+
+def _def_body_text(abs_path: str, match_line: int, start: int, end: int) -> str | None:
+    """Render a definition body (``start``..``end``) in grep-snippet style.
+
+    Only called when the match IS the definition's first line, so the model
+    sees the whole body inline and needs no follow-up ``read``. Capped at
+    ``_DEF_BODY_MAX_LINES`` with a pointer to the remaining lines. Never raises.
+    """
+    try:
+        count = min(end, start + _DEF_BODY_MAX_LINES - 1) - start + 1
+        if count <= 0:
+            return None
+        excerpt = _read_lines_excerpt(abs_path, start, count)
+        blines = excerpt.get("lines") or []
+        if not blines:
+            return None
+        out = "\n".join(
+            f"{'>' if cl['line'] == match_line else ' '} {cl['line']} | {(cl.get('text') or '')[:SNIPPET_LINE_WIDTH]}"
+            for cl in blines
+        )
+        rest = end - (start + len(blines) - 1)
+        if rest > 0:
+            out += (
+                f"\n  ... (+{rest} more lines to L{end} — "
+                f"read lines {start}-{end} for the rest)"
+            )
+        return out
+    except Exception:  # noqa: BLE001 — body expansion never breaks grep
+        return None
+
+
 def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
@@ -4168,7 +4269,32 @@ def make_tool_callbacks(
             + _format_plan_nudge_suffix(_plan_nudge_due())
         )
 
-    def _dedup_patterns(primary: str, extra: list[str] | None) -> list[str]:
+    def _coerce_str_list(value: list[str] | str | None) -> list[str]:
+        """Normalize a batch list arg that may arrive as a JSON-encoded string.
+
+        The model sometimes sends e.g. patterns='["a", "b"]' (a string)
+        instead of patterns=["a", "b"]. Iterating that string would silently
+        split it into characters and search garbage — so a JSON-array string
+        is parsed, any other string becomes a single item, and real lists
+        pass through unchanged.
+        """
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            return [value] if text else []
+        return [value]
+
+    def _dedup_patterns(primary: str, extra: list[str] | str | None) -> list[str]:
         """«pattern» + «patterns» را به یک لیست مرتب و بدون تکرار تبدیل می‌کند.
 
         ورودی‌های خالی حذف می‌شوند؛ اگر همه خالی بودند خودِ primary
@@ -4176,13 +4302,13 @@ def make_tool_callbacks(
         """
         seen: set[str] = set()
         out: list[str] = []
-        for p in (primary, *(extra or [])):
+        for p in (primary, *_coerce_str_list(extra)):
             if p and p not in seen:
                 seen.add(p)
                 out.append(p)
         return out or [primary]
 
-    def _dedup_scopes(primary: str, extra: list[str] | None) -> list[str]:
+    def _dedup_scopes(primary: str, extra: list[str] | str | None) -> list[str]:
         """«path» + «paths» را به لیست scope های یکتا تبدیل می‌کند.
 
         «» یعنی کل workspace؛ اگر کنار scope های مشخص بیاید حذف می‌شود
@@ -4190,11 +4316,28 @@ def make_tool_callbacks(
         """
         seen: set[str] = set()
         out: list[str] = []
-        for p in (str(primary or "").strip(), *(str(x or "").strip() for x in (extra or []))):
+        for p in (str(primary or "").strip(), *(str(x or "").strip() for x in _coerce_str_list(extra))):
             if p and p not in seen:
                 seen.add(p)
                 out.append(p)
         return out or [""]
+
+    def _grep_word_set(combined: str) -> frozenset:
+        """Significant words of a combined grep pattern for overlap checks.
+
+        Splits on non-word characters, lowercases, drops short tokens and
+        pure numbers (regex operators like ``\\s`` / ``.*`` carry no signal).
+        A later grep whose word set is a subset of a complete earlier search
+        on the same scope can only repeat rows already in context.
+        """
+        try:
+            return frozenset(
+                w.lower()
+                for w in re.split(r"[^A-Za-z0-9_]+", str(combined or ""))
+                if len(w) >= 3 and not w.isdigit()
+            )
+        except Exception:  # noqa: BLE001 — overlap never breaks a search
+            return frozenset()
 
     async def grep_tool(
         pattern: str,
@@ -4207,8 +4350,13 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        # Batch args sometimes arrive as JSON-encoded strings — coerce first
+        # so nothing downstream iterates a string character-by-character.
+        patterns = _coerce_str_list(patterns)
+        paths = _coerce_str_list(paths)
+        includes = _coerce_str_list(includes)
         # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
         combined = "|".join(_dedup_patterns(pattern, patterns))
         # چند scope در همان فراخوانی: path + paths=[...] → یک grep برای همه.
@@ -4219,6 +4367,55 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         inc_disp = "|".join(all_includes) if len(all_includes) > 1 else include
         generation = _search_generations.get(root, 0)
         cache_key = ("grep", combined, scope, inc_disp, root, str(max_results), str(tool_out_chars))
+        # Exact repeat inside this turn (generation folds in edits, so a
+        # post-edit repeat re-executes): stub it, the content is in context.
+        if note_turn_call(("dup", "grep", generation, combined, scope, inc_disp, str(max_results))):
+            return _duplicate_stub(
+                emit, "grep",
+                {"pattern": combined, "path": scope, "include": inc_disp},
+                _main_name, f"pattern={combined!r} under {scope or '/'}",
+            )
+        # Same-turn subset repeat: an earlier COMPLETE grep on this scope
+        # already showed every row these words can match (subset of its
+        # alternatives = subset of its rows). Stub it — re-scanning and
+        # re-sending is pure token waste. Broader patterns, other scopes,
+        # larger max_results, and post-edit generations still execute.
+        from tool_batching import grep_cover_check as _grep_cover_check
+        from tool_batching import grep_cover_note as _grep_cover_note
+
+        _words = _grep_word_set(combined)
+        _scope_key = (scope, inc_disp)
+        _cover = _grep_cover_check(generation, _scope_key, _words, max_results)
+        if _words and _cover:
+            return _duplicate_stub(
+                emit, "grep",
+                {"pattern": combined, "path": scope, "include": inc_disp},
+                _main_name,
+                f"pattern={combined!r} under {scope or '/'} is covered by "
+                f"this turn's earlier grep ({_cover}) — those rows are "
+                "already in context above; read exact ranges/symbols instead "
+                "of re-grepping",
+            )
+        # Cross-turn subset repeat: a PREVIOUS turn's COMPLETE grep on this
+        # scope already showed every row these words can match, and the
+        # matched files are byte-unchanged since (same generation + mtimes).
+        # Stub it — the rows are in history. Wider patterns, larger
+        # max_results, and edits (ours or external) still execute.
+        from tool_batching import cross_turn_grep_check as _cross_grep_check
+
+        _cross_cover = (
+            _cross_grep_check(root, generation, _scope_key, _words, max_results)
+            if _words else ""
+        )
+        if _cross_cover:
+            return _cross_turn_stub(
+                emit, "grep",
+                {"pattern": combined, "path": scope, "include": inc_disp},
+                _main_name,
+                f"pattern={combined!r} under {scope or '/'} was already "
+                f"searched ({_cross_cover})",
+                "To force a fresh scan, repeat with a wider pattern or larger max_results.",
+            )
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -4290,6 +4487,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
+            # A no-match search is trivially complete: a later subset
+            # pattern on this scope can match nothing either.
+            _grep_cover_note(generation, _scope_key, _words, max_results, combined)
             return f"No matches for {combined!r} under {scope or '/'}"
         # Output contract (spec §3, revised): each hit shows the match line plus
         # surrounding code (already computed by search_in_files above).
@@ -4307,11 +4507,31 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             _enclosing_symbol = None  # type: ignore[assignment]
         # Phase 1: pick shown matches and render bodies (budget check on the
         # unsuffixed text; the ~30-char annotation cannot flip it).
+        # Diversity cap: when the dump truncates across many files, one noisy
+        # file (docs, generated code) eats all slots and buries the signal the
+        # model then re-greps for. Cap per-file hits so the first page spans
+        # files; skipped hits fold into the hidden count with a pointer.
+        # Focused searches (few files) keep full depth — no cap.
+        _cap_per_file = False
+        if len(matches) > max_results:
+            try:
+                _cap_per_file = len({str(m.get("file")) for m in matches}) > 5
+            except Exception:  # noqa: BLE001 — fall back to uncapped
+                _cap_per_file = False
+        _file_counts: dict[str, int] = {}
+        _capped_files: set[str] = set()
         _shown_ms: list[dict] = []
         _bodies: list[str] = []
-        for shown, m in enumerate(matches):
-            if shown >= max_results:
+        _shown_n = 0
+        for m in matches:
+            if _shown_n >= max_results:
                 break
+            if _cap_per_file:
+                _fc = _file_counts.get(str(m.get("file")), 0)
+                if _fc >= _GREP_PER_FILE_CAP:
+                    _capped_files.add(str(m.get("file")))
+                    continue
+                _file_counts[str(m.get("file"))] = _fc + 1
             ctx_lines = m.get("context_lines") or []
             if _adaptive < SNIPPET_CONTEXT and ctx_lines:
                 _match = m.get("line")
@@ -4335,35 +4555,71 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             _bodies.append(body)
             lines.append(entry)
             total += len(entry) + 2
+            _shown_n += 1
         # Phase 2: enclosing-symbol annotations off the event loop. The first
         # parse of a file compiles the grammar (~seconds once), later hits
         # are mtime-cached (~ms) — either way never block the tool loop.
         # Kept after the `file:line:` prefix so existing `path:line:`
         # consumers keep matching.
         if _enclosing_symbol is not None and _shown_ms:
-            def _annotate_one(mm: dict) -> str:
+            def _annotate_one(mm: dict) -> tuple[str, str | None]:
                 try:
-                    _hit = _enclosing_symbol(
-                        os.path.join(root, str(mm["file"])), mm["line"]
-                    )
+                    _abs = os.path.join(root, str(mm["file"]))
+                    _hit = _enclosing_symbol(_abs, mm["line"])
                     if _hit is not None:
-                        return f" in {_hit[0]} (L{_hit[1]}-{_hit[2]})"
+                        _suffix = f" in {_hit[0]} (L{_hit[1]}-{_hit[2]})"
+                        # The match IS the definition's first line: inline the
+                        # body so no follow-up read is needed to see it.
+                        _body: str | None = None
+                        try:
+                            if int(_hit[1]) == int(mm["line"]):
+                                _body = _def_body_text(
+                                    _abs, int(mm["line"]), int(_hit[1]), int(_hit[2])
+                                )
+                        except (TypeError, ValueError):
+                            _body = None
+                        return _suffix, _body
                 except Exception:  # noqa: BLE001, S110 — annotation never breaks grep
                     pass
-                return ""
+                return "", None
 
             try:
-                _suffixes = await asyncio.gather(
+                _annotated = await asyncio.gather(
                     *(asyncio.to_thread(_annotate_one, mm) for mm in _shown_ms)
                 )
             except Exception:  # noqa: BLE001
-                _suffixes = [""] * len(_shown_ms)
-            for _i, (_mm, _suffix) in enumerate(zip(_shown_ms, _suffixes)):
+                _annotated = [("", None)] * len(_shown_ms)
+            # Phase 3: stitch suffixes + definition bodies. Bodies replace the
+            # ±3-line snippet (they contain it) while the output budget lasts;
+            # leftovers keep the snippet + its `in Name (L..)` line pointer.
+            _expanded = 0
+            _omitted_n = 0
+            _omitted: list[tuple[str, str]] = []
+            for _i, (_mm, (_suffix, _dbody)) in enumerate(zip(_shown_ms, _annotated)):
                 if _suffix:
                     _old = lines[_i]
                     _head, _sep, _rest = _old.partition(":")
                     _ln, _sep2, _body = _rest.partition(":")
                     lines[_i] = f"{_head}:{_ln}:{_suffix}{_sep2}{_body}"
+                if _dbody is None:
+                    continue
+                if (
+                    _expanded >= _DEF_BODY_MAX_COUNT
+                    or total + len(_dbody) + 2 > tool_out_chars
+                ):
+                    _omitted_n += 1
+                    _on = _suffix.strip().removeprefix("in ")
+                    _on = _on.split(" (L")[0].strip()
+                    if _on:
+                        _omitted.append((str(_mm.get("file")), _on))
+                    continue
+                _old_body = _bodies[_i]
+                if _old_body and lines[_i].endswith(_old_body):
+                    lines[_i] = lines[_i][: -len(_old_body)] + _dbody
+                else:
+                    lines[_i] = lines[_i] + "\n" + _dbody
+                total += len(_dbody) + 2 - len(_old_body)
+                _expanded += 1
         _shown = len(lines)
         _hidden = len(matches) - _shown
         if _hidden > 0:
@@ -4374,9 +4630,72 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         else:
             note = ""
+        if _capped_files:
+            _capped_list = sorted(_capped_files)[:3]
+            _extra = f" (+{len(_capped_files) - 3} more)" if len(_capped_files) > 3 else ""
+            note += (
+                f"\n(Per-file cap ({_GREP_PER_FILE_CAP}/file) hid more hits in "
+                f"{', '.join(_capped_list)}{_extra} — narrow the pattern to see "
+                f"more of one file.)"
+            )
+        if _omitted_n:
+            _by_file: dict[str, list[str]] = {}
+            for _of, _on in _omitted:
+                if _on not in _by_file.setdefault(_of, []):
+                    _by_file[_of].append(_on)
+            if _by_file:
+                _ef, _en = next(iter(_by_file.items()))
+                _more_files = len(_by_file) - 1
+                _more = (
+                    f" (+{_more_files} more file{'s' if _more_files != 1 else ''})"
+                    if _more_files else ""
+                )
+                note += (
+                    f"\n({_omitted_n} definition "
+                    f"{'body' if _omitted_n == 1 else 'bodies'} omitted — output budget. "
+                    f"Read them directly: read(filePath='{_ef}', "
+                    f"symbols={_en[:4]!r}){_more}.)"
+                )
+            else:
+                note += (
+                    f"\n({_omitted_n} definition "
+                    f"{'body' if _omitted_n == 1 else 'bodies'} omitted — output budget. "
+                    "The `in Name (L..)` tag above has the exact lines; "
+                    "read them or use symbols=[...].)"
+                )
         raw = f"MATCHES for {combined!r}\n" + "\n\n".join(lines) + note
         if _search_generations.get(root, 0) == generation:
             _parent_search_cache[cache_key] = raw
+        # Complete searches (nothing hidden, no per-file cap hid hits) cover
+        # later subset greps on this scope — record the word set so they stub
+        # out instead of re-sending the same rows.
+        if _hidden == 0 and not _capped_files:
+            _grep_cover_note(generation, _scope_key, _words, max_results, combined)
+            # Cross-turn reuse: remember the matched files' signatures so a
+            # later turn's repeat stubs out while they are unchanged.
+            from tool_batching import note_cross_turn_grep as _cross_grep_note
+
+            try:
+                _cross_files: list[str] = []
+                for _m in matches:
+                    _mf = _m.get("file") if isinstance(_m, dict) else None
+                    if not _mf:
+                        continue
+                    _ma = (
+                        str(_mf)
+                        if os.path.isabs(str(_mf))
+                        else os.path.join(root, str(_mf))
+                    )
+                    if _ma not in _cross_files:
+                        _cross_files.append(_ma)
+                _cross_grep_note(
+                    root, generation, _scope_key, _words, max_results, combined,
+                    f"{len(matches)} matches in "
+                    f"{len({_m.get('file') for _m in matches if isinstance(_m, dict)})} files",
+                    _cross_files,
+                )
+            except Exception:  # noqa: BLE001, S110 — reuse never breaks a search
+                pass
         # Send the structured results too (not just the summary) so a reconnect
         # can replay the tool without re-executing it (re-execution wastes
         # context). `items` carries the actual rows the model needs to see.
@@ -4475,6 +4794,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        patterns = _coerce_str_list(patterns)
+        paths = _coerce_str_list(paths)
         all_patterns = _dedup_patterns(pattern, patterns)
         # نمایش تک‌الگویی برای سازگاری پیام‌ها؛ برای batch همه‌ی الگوها با |.
         disp = all_patterns[0] if len(all_patterns) == 1 else "|".join(all_patterns)
@@ -4483,6 +4804,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         scope = "|".join(all_paths) if len(all_paths) > 1 else path
         generation = _search_generations.get(root, 0)
         cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
+        if note_turn_call(("dup", "glob", generation, cache_key)):
+            return _duplicate_stub(
+                emit, "glob",
+                {"pattern": disp, "path": scope},
+                _main_name, f"pattern={disp!r} under {scope or '/'}",
+            )
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -4603,9 +4930,84 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         except Exception:  # noqa: BLE001 — suggestions never break the read
             return ""
 
+    async def _serve_head_map(
+        filePath: str, target: str, head_lines: list[dict], total: int,
+        _main_name: str, quiet: bool, cache_key: tuple,
+    ) -> str:
+        """File map instead of a blind head dump (see _HEAD_MAP_* above).
+
+        Envelope matches normal read blocks so the projection and the
+        step-level ledger parse it; only the shown head rows count as
+        fetched (note_served_map keeps coverage checks honest).
+        """
+        try:
+            from symbol_index import get_symbol_ranges as _get_sym_ranges
+
+            _syms = await asyncio.to_thread(_get_sym_ranges, target)
+        except Exception:  # noqa: BLE001 — map never breaks a read
+            _syms = {}
+        _items: list[tuple[str, int, int, str]] = []
+        if isinstance(_syms, dict):
+            for _name, _span in _syms.items():
+                try:
+                    _s, _e, _k = int(_span[0]), int(_span[1]), str(_span[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                _items.append((str(_name), _s, _e, _k))
+        _items.sort(key=lambda t: (t[1], t[2]))
+        if _items:
+            _rows = head_lines[:_HEAD_MAP_ROWS]
+            _shown = _items[:_HEAD_MAP_MAX_SYMBOLS]
+            _sym_list = "\n".join(
+                f"- {_k} {_n} (L{_s}-{_e})" for _n, _s, _e, _k in _shown
+            )
+            if len(_items) > len(_shown):
+                _sym_list += f"\n- (+{len(_items) - len(_shown)} more definitions)"
+            _example = (
+                f"read(filePath={filePath!r}, symbols=['{_shown[0][0]}'])"
+            )
+            _body = (
+                "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+                + "\n" + _sym_list
+                + f"\n\n(file map: {filePath} has {total} lines — full head "
+                f"not shown. Read any definition with {_example} — one call, "
+                f"exact range. For other lines use "
+                f"ranges=['{filePath}:start:count'] in one call.)"
+            )
+            _summary = f"file map · {total} lines · {len(_items)} symbols"
+        else:
+            _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
+            _body = (
+                "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+                + f"\n\n(file map: {filePath} has {total} lines, no indexable "
+                f"symbols. Use grep to locate what you need, then read exact "
+                f"ranges.)"
+            )
+            _summary = f"file map · {total} lines"
+        _last = int(_rows[-1]["line"])
+        note_served_map(filePath)
+        note_fetched_window(filePath, 1, _last)
+        if not quiet:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": _summary,
+                    "model": _main_name,
+                    "results": [{"path": filePath, "content": _body[:8000]}],
+                }
+            )
+        raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{_body}\n</content>"
+        try:
+            _parent_search_cache[cache_key] = raw
+        except Exception:  # noqa: BLE001, S110 — cache never breaks a read
+            pass
+        return raw
+
     async def _read_target(
         filePath: str, offset: int, limit: int, _main_name: str,
-        quiet: bool = False,
+        quiet: bool = False, allow_head_map: bool = True,
+        _cache_hits: list[str] | None = None,
     ) -> str:
         """Read ONE file/dir path and emit its own tool_result/error event.
         Shared by the single-path and batch branches of read_tool below so
@@ -4632,6 +5034,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         cache_key = ("read", target, str(offset), str(limit))
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
+            if _cache_hits is not None:
+                _cache_hits.append(filePath)
             if not quiet:
                 emit(
                     {
@@ -4658,6 +5062,51 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             return f"ERROR reading {filePath}: {msg}"
         offset = int(offset or 1)
         limit = int(limit or 2000)
+        # Paging auto-join: bridge a small gap (<= _READ_JOIN_GAP) between the
+        # requested window and an already-fetched window of the same file, so
+        # no sliver is left behind to page. Nearest prior window per side only
+        # (provably disjoint from every recorded window, so coverage checks
+        # never double-count). Bounded, disclosed below, and only the gap
+        # itself is ledger-recorded here (the requested window is recorded by
+        # the agent loop as usual).
+        _join_note = ""
+        try:
+            from tool_batching import fetched_windows as _fetched_windows
+
+            _prior_all = _fetched_windows(filePath) or []
+        except Exception:  # noqa: BLE001 — join never breaks a read
+            _prior_all = []
+        if _prior_all:
+            _ns, _ne = offset, offset + limit - 1
+            _best_back: tuple[int, int] | None = None  # (gap, win_end)
+            _best_fwd: tuple[int, int] | None = None  # (gap, win_start)
+            for _s0, _s1 in _prior_all:
+                try:
+                    _s0, _s1 = int(_s0), int(_s1)
+                except (TypeError, ValueError):
+                    continue
+                _gb = _ns - _s1 - 1
+                if 0 < _gb <= _READ_JOIN_GAP and (
+                    _best_back is None or _gb < _best_back[0]
+                ):
+                    _best_back = (_gb, _s1)
+                _gf = _s0 - _ne - 1
+                if 0 < _gf <= _READ_JOIN_GAP and (
+                    _best_fwd is None or _gf < _best_fwd[0]
+                ):
+                    _best_fwd = (_gf, _s0)
+            if _best_back is not None:
+                note_fetched_window(filePath, _best_back[1] + 1, offset - 1)
+                _ns = _best_back[1] + 1
+            if _best_fwd is not None:
+                note_fetched_window(filePath, offset + limit, _best_fwd[1] - 1)
+                _ne = _best_fwd[1] - 1
+            if (_ns, _ne) != (offset, offset + limit - 1):
+                _join_note = (
+                    f"(Joined to lines fetched earlier this turn — returning "
+                    f"lines {_ns}-{_ne} with no gap left to page.)"
+                )
+                offset, limit = _ns, _ne - _ns + 1
         # Block-snapped over-read: fetch up to _SNAP_LOOKAHEAD lines past the
         # requested limit (bulk reads >= 1000 lines are exempt — they already
         # cover whole regions) so the window can end on a block boundary
@@ -4693,6 +5142,24 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             if not quiet:
                 emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
+        if allow_head_map and offset == 1 and limit >= _HEAD_MAP_MIN_LIMIT:
+            # One small probe fetch: big files serve a map (saving the bulk
+            # fetch entirely); small files fall through to the normal path
+            # below at the cost of one extra 60-line read.
+            _head = await asyncio.to_thread(
+                _read_lines_excerpt, target, 1, _HEAD_MAP_ROWS_NO_SYMBOLS
+            )
+            _htotal = int(_head.get("total") or 0)
+            if (
+                _htotal > _HEAD_MAP_MIN_LINES
+                and not _head.get("error")
+                and _head.get("lines")
+            ):
+                return await _serve_head_map(
+                    filePath, target, _head["lines"], _htotal,
+                    _main_name, quiet, cache_key,
+                )
+            # Small after all: fall through to the normal path below.
         # Small files come back whole from the offset: one read instead of
         # offset/limit paging across two or more round-trips. Larger files
         # snap to the first block boundary past the requested limit.
@@ -4709,7 +5176,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
         more = last < total
-        if cut:
+        if quiet:
+            # Batch member: one compact position marker. The batch call
+            # carries the paging guidance once at the end, so per-block
+            # guidance is not repeated for every file.
+            body += f"\n\n({filePath}: lines {start}-{last} of {total})"
+        elif cut:
             body += (
                 f"\n\n(Output capped at {MAX_READ_EXCERPT_BYTES // 1024} KB. "
                 f"Showing lines {start}-{last}. Read the needed sections with "
@@ -4724,36 +5196,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         else:
             body += f"\n\n(End of file - total {total} lines)"
-        # Turn ledger: remind the model what ELSE of this file it already
-        # fetched this turn, so it reuses context instead of re-reading.
-        # Best-effort and silent when no ledger is active (e.g. unit tests).
-        try:
-            from tool_batching import fetched_windows as _fetched_windows
-
-            _prior = [
-                (s0, s1)
-                for s0, s1 in _fetched_windows(filePath)
-                if s1 < start or s0 > last
-            ]
-            if _prior:
-                _prior.sort()
-                _merged: list[list[int]] = []
-                for _a, _b in _prior:
-                    if _merged and _a <= _merged[-1][1] + 1:
-                        _merged[-1][1] = max(_merged[-1][1], _b)
-                    else:
-                        _merged.append([_a, _b])
-                _ranges = ", ".join(
-                    f"lines {_a}-{_b}" for _a, _b in _merged[:4]
-                )
-                if len(_merged) > 4:
-                    _ranges += f" (+{len(_merged) - 4} more)"
-                body += (
-                    f"\n\n(Also fetched this turn: {_ranges} of this file — "
-                    "reuse that content, do NOT re-read it.)"
-                )
-        except Exception:  # noqa: BLE001, S110 — ledger never breaks a read
-            pass
+        if _join_note:
+            body += f"\n\n{_join_note}"
+        # NOTE: the per-file "already fetched" reminder used to live here.
+        # It is now consolidated into one step-level line (context_ledger_line,
+        # sent transiently with the next request) so N blocks no longer repeat
+        # N reminders.
         if not quiet:
             emit(
                 {
@@ -4766,6 +5214,25 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
         _parent_search_cache[cache_key] = raw
+        # Record what was ACTUALLY served (post-snap extents, not the request).
+        # observe() records requested windows pre-execution and records nothing
+        # for symbols= calls — without this, a symbols/ranges batch leaves no
+        # trace and the next read of the same lines re-serves them ("duplicate
+        # files"). Served truth here makes member-coverage exact. Errors and
+        # cache hits return before this point (nothing new served).
+        try:
+            note_fetched_window(filePath, start, last)
+        except Exception:  # noqa: BLE001, S110 — ledger never breaks a read
+            pass
+        # Cross-turn reuse: remember the served extent + file signature so a
+        # repeat in a LATER turn stubs out when the file is unchanged (only
+        # a changed file re-serves). Served maps return before this point.
+        try:
+            from tool_batching import note_cross_turn_read as _note_cross_read
+
+            _note_cross_read(root, filePath, start, last, target, total)
+        except Exception:  # noqa: BLE001, S110 — reuse never breaks a read
+            pass
         return raw
 
     async def read_tool(
@@ -4778,14 +5245,32 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region.
+        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (already-fetched members are skipped, one position marker per file, one guidance footer).
 
-SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`.
+SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
-WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. When a file has more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
+WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. A head read (offset 1, limit 400+) of a file over 400 lines returns a FILE MAP (first 40 lines + definition list) instead of a bulk dump — read definitions via symbols=[...] in one call, never re-read the head for content. Make the FIRST read of a file decisive — never open with a narrow slice and page forward one window per step (read 1-200, then 217-350, …). When you need more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        filePaths = _coerce_str_list(filePaths)
+        ranges = _coerce_str_list(ranges)
+        symbols = _coerce_str_list(symbols)
+        # Exact repeat inside this turn: stub it, the content is in context.
+        # Generation folds in edits, so the standard post-edit re-read (same
+        # args, bumped generation) always re-executes.
+        if note_turn_call(
+            (
+                "dup", "read", _search_generations.get(root, 0), filePath,
+                str(offset), str(limit),
+                tuple(filePaths or []), tuple(ranges or []), tuple(symbols or []),
+            )
+        ):
+            return _duplicate_stub(
+                emit, "read",
+                {"filePath": filePath, "offset": offset, "limit": limit},
+                _main_name, f"{filePath} offset={offset} limit={limit}",
+            )
         # بازه‌های per-path ("path:offset:limit") → پنجره‌ی اختصاصی هر فایل.
         # offset/limit سراسری همچنان برای مسیرهای بدون بازه‌ی اختصاصی اعمال می‌شود.
         # jobs فهرست است (نه dict روی path) تا ranges تکراری هم‌فایل
@@ -4828,24 +5313,141 @@ When you need to read several files, read multiple independent files in parallel
         for p, _, _ in jobs:
             if p not in base_paths:
                 base_paths.append(p)
-        if len(base_paths) == 1 and not jobs:
-            emit(
-                {
-                    "kind": "tool",
-                    "tool": "read",
-                    "args": {"filePath": filePath, "offset": offset, "limit": limit},
-                    "model": _main_name,
-                }
-            )
-            _, _w_off, _w_lim = _widen_and_merge_windows(
-                [(filePath, offset, limit)]
-            )[0]
-            return await _read_target(filePath, _w_off, _w_lim, _main_name)
+        # No single fast-path: EVERY read — even one file, one window — runs
+        # the batch pipeline below (member coverage-drop, widen+merge,
+        # quiet position markers, EOF refill, one aggregate card + footer).
+        # A separate single branch kept re-growing its own one-off behaviors
+        # (own footers, own events, no coverage-drop); uniformity kills that
+        # whole class of drift.
         job_paths = {p for p, _, _ in jobs}
         tasks: list[tuple[str, int, int]] = [
             (p, offset, limit) for p in base_paths if p not in job_paths
         ]
         tasks.extend(jobs)
+        # Byte-identical members twice in ONE call (same path in filePaths
+        # twice, same ranges entry twice) would serve the same block twice.
+        # Same-file DIFFERENT windows are kept — each is its own job.
+        _seen_tasks: set[tuple[str, int, int]] = set()
+        _uniq_tasks: list[tuple[str, int, int]] = []
+        for _t in tasks:
+            if _t in _seen_tasks:
+                continue
+            _seen_tasks.add(_t)
+            _uniq_tasks.append(_t)
+        tasks = _uniq_tasks
+        # Member-level coverage: drop batch members already served this turn.
+        # Loop-side stubs cover only single-window reads; a batch re-fetching
+        # one covered window among fresh ones would otherwise re-send it.
+        # Runs BEFORE widening: pre-widen tasks ARE the requested windows, so
+        # coverage is judged on exactly what was asked (widening only ever
+        # adds bonus context past the request).
+        # Requested windows were recorded pre-execution by observe(), so
+        # subtract this call's own requests first — coverage must come from
+        # EARLIER serving. Served windows are additionally recorded tool-side
+        # post-serve (with true snapped extents), which is what makes
+        # symbols=/ranges members droppable even though observe() records
+        # nothing for symbols= calls. Map-served paths are untrusted: never
+        # drop.
+        _requested: dict[str, list[tuple[int, int]]] = {}
+        if not symbols:
+            for _rp, _ro, _rl in tasks:
+                try:
+                    _requested.setdefault(str(_rp), []).append(
+                        (max(1, int(_ro)), max(1, int(_ro)) + max(1, int(_rl)) - 1)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+        # Members covered by a PREVIOUS turn (cross-turn keys): routed to the
+        # "previous turn, unchanged" message below instead of "this turn".
+        _cross_covered_keys: set[tuple[str, int, int]] = set()
+
+        def _member_covered(_mp: str, _mo: int, _ml: int) -> bool:
+            try:
+                if has_served_map(_mp):
+                    return False
+                _have = fetched_windows(_mp)
+                if _have:
+                    _rest = [(int(_a), int(_b)) for _a, _b in _have]
+                    for _w in _requested.get(_mp, []):
+                        try:
+                            _rest.remove((int(_w[0]), int(_w[1])))
+                        except (ValueError, TypeError):
+                            pass
+                    _ms, _me = int(_mo), int(_mo) + int(_ml) - 1
+                    _got = sum(
+                        max(0, min(_me, _b) - max(_ms, _a) + 1) for _a, _b in _rest
+                    )
+                    if _got >= _me - _ms + 1:
+                        return True
+                # Cross-turn fallback: served in a PREVIOUS turn and the file
+                # is byte-unchanged since (any edit — ours or external —
+                # misses and re-serves). observe() only records into the
+                # per-turn ledger, so no self-subtraction is needed here.
+                from tool_batching import cross_turn_read_covers as _cross_covers
+
+                try:
+                    _cs, _ce = int(_mo), int(_mo) + int(_ml) - 1
+                except (TypeError, ValueError):
+                    return False
+                if _cross_covers(root, _mp, _cs, _ce):
+                    _cross_covered_keys.add((str(_mp), int(_mo), int(_ml)))
+                    return True
+                return False
+            except Exception:  # noqa: BLE001 — coverage never breaks a read
+                return False
+
+        _dropped: list[str] = []
+        _dropped_cross: list[str] = []
+        _live: list[tuple[str, int, int]] = []
+        for _tp, _to, _tl in tasks:
+            if _member_covered(_tp, _to, _tl):
+                _label = f"{_tp} lines {_to}-{_to + _tl - 1}"
+                if (_tp, _to, _tl) in _cross_covered_keys:
+                    _dropped_cross.append(_label)
+                else:
+                    _dropped.append(_label)
+            else:
+                _live.append((_tp, _to, _tl))
+        _drop_note = ""
+        if _dropped or _dropped_cross:
+            _served_desc: list[str] = []
+            if _dropped:
+                _served_desc.append(
+                    ", ".join(_dropped) + " were already fetched this turn"
+                )
+            if _dropped_cross:
+                _served_desc.append(
+                    ", ".join(_dropped_cross)
+                    + " were fetched before and the file is "
+                    "unchanged since"
+                )
+            if not _live:
+                _msg = (
+                    "SKIPPED (already in context): "
+                    + "; ".join(_served_desc)
+                    + " — reusing that content; full text omitted to save tokens."
+                    + (
+                        " (If those rows are no longer in context, re-read a "
+                        "WIDER window to re-serve them.)"
+                        if _dropped_cross and not _dropped else ""
+                    )
+                )
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "read",
+                        "summary": "skipped (already in context)",
+                        "model": _main_name,
+                    }
+                )
+                return _msg
+            tasks = _live
+            _drop_note = (
+                "(already in context, skipped: "
+                + "; ".join(_served_desc)
+                + " — serving the rest below)"
+            )
         tasks = _widen_and_merge_windows(tasks)
         emit(
             {
@@ -4868,9 +5470,48 @@ When you need to read several files, read multiple independent files in parallel
         # Per-file events are suppressed (quiet=True): the batch emits ONE
         # aggregate card below, so a fast-failing missing file can no longer
         # win the race and paint the whole batch red while siblings succeed.
+        # Cache hits are collected (not per-member events — quiet stays
+        # quiet) so a fully-cached batch can report one "cached" card, the
+        # same signal the old single branch emitted per read.
+        _cache_hit_paths: list[str] = []
         results = await asyncio.gather(
-            *(_read_target(p, o, l, _main_name, quiet=True) for p, o, l in tasks)
+            *(
+                _read_target(p, o, l, _main_name, quiet=True,
+                             allow_head_map=(p not in job_paths),
+                             _cache_hits=_cache_hit_paths)
+                for p, o, l in tasks
+            )
         )
+        # Shared-offset guard: one offset/limit across files of different
+        # sizes past-EOFs on the short ones. Instead of burning another step
+        # on an error, serve each short file from line 1 with a note — the
+        # model almost always wanted "the file", not "an error".
+        _eof_tasks: list[tuple[int, str, int]] = []
+        for _i, _r in enumerate(results):
+            if "past the end of the file" not in str(_r):
+                continue
+            _m = re.search(r"past the end of the file \((\d+) lines\)", str(_r))
+            if _m and int(_m.group(1)) > 0:
+                _p, _o, _l = tasks[_i]
+                _eof_tasks.append((_i, _p, _l))
+        if _eof_tasks:
+            _refills = await asyncio.gather(
+                *(
+                    _read_target(p, 1, l, _main_name, quiet=True,
+                                 allow_head_map=False)
+                    for _, p, l in _eof_tasks
+                )
+            )
+            _results = list(results)
+            for (_i, _p, _l), _rr in zip(_eof_tasks, _refills):
+                if str(_rr).startswith("ERROR"):
+                    continue
+                _o = tasks[_i][1]
+                _results[_i] = (
+                    f"(offset {_o} is past the end of {_p}; "
+                    f"showing from line 1 instead)\n\n{_rr}"
+                )
+            results = _results
         # فوتر خلاصه: اگر بعضی فایل‌ها خطا داده‌اند ولی بقیه موفق بوده‌اند،
         # مدل نباید فکر کند کل batch شکست خورده (رفع «خواندن دسته‌ای خطا
         # داد» — مدل به read های جدا برمی‌گشت). خطاها جدا و موفق‌ها عادی
@@ -4908,24 +5549,54 @@ When you need to read several files, read multiple independent files in parallel
                     "results": [{"path": p} for p, _ in _oks],
                 }
             )
-            return "\n\n".join(r for _, r in _oks) + "\n\n" + _foot
+            _partial = "\n\n".join(r for _, r in _oks) + "\n\n" + _foot
+            return f"{_drop_note}\n\n{_partial}" if _drop_note else _partial
         if not _errs:
-            emit(
-                {
-                    "kind": "tool_result",
-                    "tool": "read",
-                    "summary": f"{len(results)} file" + ("s" if len(results) != 1 else ""),
-                    "model": _main_name,
-                    "results": [{"path": p} for p, _, _ in tasks],
-                }
-            )
+            # One assembly point for fresh and fully-cached serves: the cache
+            # holds pre-footer member bytes, so rebuilding identically keeps
+            # r1 == r2 for repeats (the cache contract the tests pin).
             _out = "\n\n".join(results)
+            if _drop_note:
+                _out = f"{_drop_note}\n\n{_out}"
+            _out += (
+                "\n\n(Batch complete — reuse this content, do NOT re-read "
+                "these windows. Page further windows with "
+                "ranges=[\"path:start:count\", ...] in one call.)"
+            )
             if _symbol_missing:
                 _out += (
                     "\n\n(symbols not found: "
                     + ", ".join(_symbol_missing)
                     + ". Check the CODE MAP for exact names.)"
                 )
+            if tasks and len(_cache_hit_paths) == len(tasks):
+                # Everything came from cache: one "cached" card, exactly what
+                # a repeated single read used to emit (no aggregate card).
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "read",
+                        "summary": "cached",
+                        "model": _main_name,
+                    }
+                )
+                return _out
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "read",
+                    "summary": f"{len(results)} file" + ("s" if len(results) != 1 else ""),
+                    "model": _main_name,
+                    # Single-file reads keep the old content preview on the
+                    # card (used to come from the single branch's per-file
+                    # event); multi-file batches stay path-only so one card
+                    # can't balloon to N×8KB in the trace.
+                    "results": [
+                        {"path": p, **({"content": r[:8000]} if len(results) == 1 else {})}
+                        for (p, _, _), r in zip(tasks, results)
+                    ],
+                }
+            )
             return _out
         emit(
             _error_result(

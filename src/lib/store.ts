@@ -219,6 +219,28 @@ function persistSoon(): void {
   persistTimer = setTimeout(() => useStore.getState().persist(), PERSIST_DEBOUNCE_MS)
 }
 
+const OPEN_CHATS_KEY = 'coder:openChats'
+
+function persistOpenChats(ids: string[]): void {
+  try {
+    localStorage.setItem(OPEN_CHATS_KEY, JSON.stringify(ids))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function loadOpenChats(): string[] {
+  try {
+    const raw = localStorage.getItem(OPEN_CHATS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((v): v is string => typeof v === 'string' && v.length > 0)
+  } catch {
+    return []
+  }
+}
+
 // Lightweight debounced write for panel visibility toggles (sidebar / right
 // panel / code-map). A toggle must feel instant: it only flips a boolean in
 // memory and schedules a settings-only write in the background — never the
@@ -511,6 +533,10 @@ interface State {
   /** Project roots whose workspace was deleted — their vector store is removed. */
   deletedWorkspaceRoots: string[]
   activeChatId: string
+  /** VSCode-style open chat tabs (editor group left). Subset of chat ids in
+   *  open order. Closing a tab does NOT delete the chat (sidebar keeps it).
+   *  Persisted in localStorage `coder:openChats` so tabs restore on restart. */
+  openChatIds: string[]
   /** Chat ids whose agent FINISHED a turn (sent a message) while the user was
    *  looking at another chat → steady green dot in the sidebar. Session-scoped
    *  (not persisted); cleared when the user opens the chat (setActiveChat). */
@@ -663,6 +689,12 @@ interface State {
   togglePinWorkspace: (key: string) => void
   togglePinChat: (id: string) => void
   setActiveChat: (id: string) => void
+  /** Open a chat tab (VSCode-style). Adds to openChatIds if missing and activates. */
+  openChat: (id: string) => void
+  /** Close a chat tab without deleting the chat data (sidebar keeps it). */
+  closeChatTab: (id: string) => void
+  /** VSCode-style drag reorder: move the dragged chat tab to the drop position. */
+  moveChatTab: (fromId: string, toId: string, after?: boolean) => void
   setChatMode: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
@@ -926,6 +958,7 @@ export const useStore = create<State>((set, get) => ({
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
   activeChatId: '',
+  openChatIds: [],
   focusComposer: false,
   unreadChats: [],
   prefixNotice: null,
@@ -1844,7 +1877,11 @@ export const useStore = create<State>((set, get) => ({
     const lastRoot = [...s.chats].reverse().find((c) => c.root)?.root
     chat.root = prevRoot ?? lastRoot ?? s.root
     const activeChatId = chat.id
-    set((st) => ({ chats: [...st.chats, chat], activeChatId, rightPanelOpen: false }))
+    set((st) => {
+      const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
+      persistOpenChats(openChatIds)
+      return { chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
+    })
     get().persist()
     return activeChatId
   },
@@ -1860,7 +1897,9 @@ export const useStore = create<State>((set, get) => ({
       if (!workspaces.some((w) => w.key === key)) {
         workspaces = [...workspaces, makeWorkspace(root ?? '')]
       }
-      return { workspaces, chats: [...st.chats, chat], activeChatId, rightPanelOpen: false }
+      const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
+      persistOpenChats(openChatIds)
+      return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
     })
     get().persist()
     return activeChatId
@@ -1895,10 +1934,19 @@ export const useStore = create<State>((set, get) => ({
   deleteChat: (id) => {
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
-      const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
+      const openChatIds = s.openChatIds.filter((cid) => cid !== id)
+      let activeChatId = s.activeChatId
+      if (s.activeChatId === id) {
+        const idx = s.openChatIds.indexOf(id)
+        const remaining = openChatIds
+        activeChatId = remaining[Math.min(Math.max(idx - 1, 0), remaining.length - 1)] ?? chats[chats.length - 1]?.id ?? ''
+        if (!remaining.includes(activeChatId) && activeChatId) remaining.push(activeChatId)
+      }
+      persistOpenChats(openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId])
       return {
         chats,
         activeChatId,
+        openChatIds: openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId],
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
@@ -1921,12 +1969,16 @@ export const useStore = create<State>((set, get) => ({
       const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
         ? s.activeChatId
         : chats[chats.length - 1]?.id ?? ''
+      const openChatIds = s.openChatIds.filter((cid) => !doomedIds.has(cid))
+      if (activeChatId && !openChatIds.includes(activeChatId)) openChatIds.push(activeChatId)
+      persistOpenChats(openChatIds)
       return {
         chats,
         workspaces,
         pinnedWorkspaces,
         pinnedChats,
         activeChatId,
+        openChatIds,
         unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
         deletedChatIds: [
           ...s.deletedChatIds,
@@ -2052,11 +2104,16 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setActiveChat: (id) => {
-    set((s) => ({
-      activeChatId: id,
-      // Opening a chat clears its green "new message" dot.
-      unreadChats: s.unreadChats.filter((cid) => cid !== id),
-    }))
+    set((s) => {
+      const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
+      persistOpenChats(openChatIds)
+      return {
+        activeChatId: id,
+        openChatIds,
+        // Opening a chat clears its green "new message" dot.
+        unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
+    })
     // Switching chats changes only TRANSIENT state: activeChatId and
     // unreadChats are never serialized (see writeStateNow), so the old
     // get().persist() here was pure overhead ON THE CLICK PATH — it
@@ -2066,6 +2123,54 @@ export const useStore = create<State>((set, get) => ({
     // took to copy (grows with TOTAL data, not the active chat's message
     // count). Debounce instead: a real change persists on its own, and
     // flushPendingPersist on beforeunload still covers a quick quit.
+    persistSoon()
+  },
+
+  openChat: (id) => {
+    set((s) => {
+      if (!s.chats.some((c) => c.id === id)) return {}
+      const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
+      persistOpenChats(openChatIds)
+      return {
+        activeChatId: id,
+        openChatIds,
+        unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
+    })
+    persistSoon()
+  },
+
+  closeChatTab: (id) => {
+    set((s) => {
+      if (!s.openChatIds.includes(id)) return {}
+      const idx = s.openChatIds.indexOf(id)
+      const openChatIds = s.openChatIds.filter((cid) => cid !== id)
+      persistOpenChats(openChatIds)
+      let activeChatId = s.activeChatId
+      if (s.activeChatId === id) {
+        activeChatId = openChatIds[Math.min(idx, openChatIds.length - 1)] ?? ''
+      }
+      return { openChatIds, activeChatId }
+    })
+    persistSoon()
+  },
+
+  moveChatTab: (fromId, toId, after = false) => {
+    set((s) => {
+      const from = s.openChatIds.indexOf(fromId)
+      if (from === -1 || !s.openChatIds.includes(toId) || fromId === toId) return {}
+      const rest = s.openChatIds.filter((cid) => cid !== fromId)
+      let dest = rest.indexOf(toId) + (after ? 1 : 0)
+      dest = Math.max(0, Math.min(rest.length, dest))
+      const openChatIds = rest.slice()
+      openChatIds.splice(dest, 0, fromId)
+      persistOpenChats(openChatIds)
+      return {
+        openChatIds,
+        activeChatId: fromId,
+        unreadChats: s.unreadChats.filter((cid) => cid !== fromId),
+      }
+    })
     persistSoon()
   },
 

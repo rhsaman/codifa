@@ -388,20 +388,32 @@ def _make_tools():
 
 
 def test_loop_delivers_nudge_as_human_message():
+    """Two same-scope greps in one step now execute as ONE merged grep —
+    the mechanical merge replaced the advisory nudge for this case, so no
+    nag is needed and the tool runs once."""
     model = _TwoGrepModel()
+    grep_calls: list[dict] = []
+
+    async def _counting_grep(**kwargs):
+        grep_calls.append(kwargs)
+        return "no matches"
+
     result = asyncio.run(
         _tool_loop(
             model,
             system="",
             user="find alpha and beta",
-            tools=_make_tools(),
+            tools={"grep": _counting_grep, "read": _make_tools()["read"]},
             max_steps=5,
             ctx=0,
             emit=None,
         )
     )
     assert result == "done"
-    assert model.saw_nudge, "the nudge must reach the model as a HumanMessage"
+    assert len(grep_calls) == 1, grep_calls
+    assert grep_calls[0].get("pattern") == "alpha", grep_calls
+    assert grep_calls[0].get("patterns") == ["beta"], grep_calls
+    assert not model.saw_nudge, "merged pair needs no batching nag"
 
 
 class _OneReadPerStepModel:

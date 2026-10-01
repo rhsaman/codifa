@@ -64,7 +64,7 @@
   --z-todos-float: 45;
   --z-right-panel: 60;
   --z-modal-overlay: 100;
-  --z-reading-mode: 90;
+  --z-reading-mode: 120;
   --z-review-overlay: 95;
   --z-ws-menu: 110;
   --z-usage-popover: 96;
@@ -9675,6 +9675,23 @@ textarea {
   user-select: none;
 }
 
+/* سرستون چسبان Before|After بالای نمای دوستونی — هم‌عرض با ستون‌های هانک‌ها. */
+.diff-columns-head {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
+  min-width: max-content;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-panel, #1e1e1e);
+  border-bottom: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+}
+
+.diff-columns-head .diff-col-header {
+  border-bottom: 0;
+}
+
 /* یک هانک = دو ستون before|after کنار هم در گرید پنل Review.
    در حالت دوستونی هر ستون حداقل نصف پهنای کانتینر را می‌گیرد تا ستون
    After زیر Before نرود و با اسکرول افقی والد دیده شود؛ در حالت تک‌ستونی
@@ -11786,7 +11803,9 @@ textarea {
 .reading-mode {
   position: fixed;
   inset: 0;
-  z-index: 90;
+  /* Always above diff / trace / inbox layers (review overlay sits at 95),
+     so the study panel never slides behind them. */
+  z-index: 120;
   pointer-events: none;
   /* Panel width — opens at half the viewport; the React component overrides
      this inline while the user drags the resize handle. */
@@ -11832,14 +11851,9 @@ textarea {
   flex-direction: column;
   border-radius: 18px;
   overflow: hidden;
-  background:
-    radial-gradient(120% 55% at 100% 0%,
-      color-mix(in srgb, var(--accent) 10%, transparent) 0%,
-      transparent 60%),
-    radial-gradient(90% 40% at 0% 100%,
-      color-mix(in srgb, var(--accent) 5%, transparent) 0%,
-      transparent 55%),
-    var(--bg-panel);
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
   border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
   box-shadow: var(--shadow-pop);
   pointer-events: auto;
@@ -11915,7 +11929,7 @@ textarea {
   gap: 16px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--hairline);
-  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  background: transparent;
   backdrop-filter: blur(12px);
   flex: 0 0 auto;
 }
@@ -15905,5 +15919,440 @@ mark.trace-hit-active {
   .model-controls .btn {
     flex: 1 1 auto;
     justify-content: center;
+  }
+}
+
+/* ============================================================
+   VSCode-style editor split: chat group + viewer group
+   ============================================================ */
+.editor-area {
+  flex: 1 1 auto;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.chat-group {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  min-height: 0;
+}
+
+.chat-group .main {
+  flex: 1 1 auto;
+}
+
+.viewer-group {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  max-width: calc(100% - 320px);
+  min-height: 0;
+  border-left: 1px solid color-mix(in srgb, var(--link) 22%, var(--border));
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
+  box-shadow: none;
+}
+
+.dock-resize-handle {
+  flex: 0 0 6px;
+  width: 6px;
+  margin-left: -3px;
+  margin-right: -3px;
+  cursor: ew-resize;
+  z-index: 20;
+  position: relative;
+}
+
+.dock-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.13s;
+}
+
+.dock-resize-handle:hover::after,
+.dock-resize-handle:active::after {
+  background: var(--accent);
+}
+
+.viewer-content {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  /* Container for width-aware docked layouts (e.g. inbox stacking). */
+  container-type: inline-size;
+  container-name: viewer;
+}
+
+.viewer-empty {
+  padding: 32px 20px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* Docked panels fill the viewer group (no floating card). */
+.review-panel.review-docked-panel {
+  position: static;
+  width: auto;
+  max-width: none;
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  animation: none;
+}
+
+.reading-mode.reading-docked {
+  position: static;
+  inset: auto;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.reading-mode.reading-docked .reading-mode-panel.reading-docked-panel {
+  position: static;
+  width: auto;
+  max-width: none;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
+}
+
+/* ---- Editor tab bars: chats vs viewers are visually distinct ----
+   Each group carries its own identity color drawn from the active theme:
+   chats use --accent, viewers use --link. Everything below derives from
+   --group so all themes stay harmonious automatically. */
+.tab-bar {
+  --group: var(--accent);
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 8px 10px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--group) 28%, var(--border));
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--group) 9%, transparent),
+      transparent 70%),
+    var(--bg-alt);
+  /* Soft fade at the scroll edges so overflowing tabs don't clip harshly. */
+  mask-image: linear-gradient(90deg, #000 96%, transparent);
+}
+
+.tab-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.tab-bar.chat-tabs {
+  --group: var(--accent);
+}
+
+.tab-bar.viewer-tabs {
+  --group: var(--link);
+}
+
+.editor-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 210px;
+  min-width: 0;
+  padding: 7px 8px 8px 12px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  cursor: grab;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.editor-tab:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--group) 10%, var(--bg-hover));
+  border-color: color-mix(in srgb, var(--group) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.editor-tab.active {
+  color: var(--text);
+  font-weight: 600;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--group) 16%, var(--bg-panel)),
+      color-mix(in srgb, var(--bg-panel) 88%, transparent));
+  border-color: color-mix(in srgb, var(--group) 38%, var(--border));
+  box-shadow: none;
+}
+
+/* Flat identity bar along the top edge of the active tab. */
+.editor-tab.active::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 10px;
+  right: 10px;
+  height: 2.5px;
+  border-radius: 0 0 3px 3px;
+  background: linear-gradient(90deg,
+      transparent,
+      var(--group) 25%,
+      var(--group) 75%,
+      transparent);
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.editor-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* VSCode-style close: revealed on hover or when the tab is active. */
+.editor-tab-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  transition: opacity 0.13s ease, background 0.13s ease, color 0.13s ease;
+}
+
+.editor-tab:hover .editor-tab-close,
+.editor-tab.active .editor-tab-close {
+  opacity: 0.6;
+}
+
+.editor-tab-close:hover {
+  opacity: 1;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.editor-tab-new {
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 11px;
+  margin-bottom: 3px;
+  border-radius: 999px;
+  transition: all 0.15s ease;
+}
+
+.editor-tab-new:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: none;
+}
+
+/* Status dots in their own theme color. */
+.editor-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.editor-tab-dot.busy {
+  background: var(--accent);
+  box-shadow: none;
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+.editor-tab-dot.pending {
+  background: var(--thinking);
+  box-shadow: none;
+}
+
+.editor-tab-dot.unread {
+  background: var(--success);
+  box-shadow: none;
+}
+
+/* Viewer kind icons tinted from the theme palette. */
+.viewer-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  font-size: 12px;
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
+}
+
+.viewer-tab.kind-trace .viewer-tab-icon {
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+  color: var(--thinking);
+}
+
+.viewer-tab.kind-inbox .viewer-tab-icon {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
+}
+
+.viewer-tab.active .viewer-tab-icon {
+  box-shadow: none;
+}
+
+/* Drag & drop reorder states. */
+.editor-tab.dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+  transform: scale(0.97);
+}
+
+.editor-tab.drop-before::after,
+.editor-tab.drop-after::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  width: 2.5px;
+  border-radius: 2px;
+  background: var(--group);
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.editor-tab.drop-before::after {
+  left: -3.5px;
+}
+
+.editor-tab.drop-after::after {
+  right: -3.5px;
+}
+
+/* Docked inbox: reuse the overlay markup but render it static in-flow. */
+.viewer-inbox-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.viewer-inbox-wrap .schedule-inbox-overlay {
+  position: static;
+  inset: auto;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.viewer-inbox-wrap .schedule-inbox-backdrop {
+  display: none;
+}
+
+.viewer-inbox-wrap .schedule-inbox {
+  position: static;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.viewer-inbox-wrap .schedule-inbox-resize-handle {
+  display: none;
+}
+
+/* Docked two-column mode: cap the task list so the message column always
+   keeps the majority of the width. */
+.viewer-inbox-wrap .schedule-inbox-list {
+  flex-basis: 200px;
+  max-width: 36%;
+}
+
+/* Narrow viewer (small monitor or slim split): stack the inbox vertically —
+   task list becomes a horizontal chip strip on top so the message column
+   keeps its full width instead of being squeezed to a sliver. */
+@container viewer (max-width: 619px) {
+  .viewer-inbox-wrap .schedule-inbox-body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-list {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: stretch;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
+    max-width: none;
+    max-height: 118px;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-item {
+    flex: 0 0 180px;
+    justify-content: center;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-orphan-toggle {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-chat {
+    flex: 1 1 auto;
+    overflow-y: visible;
+  }
+}
+
+@media (max-width: 900px) {
+  .viewer-group {
+    min-width: 280px;
+  }
+
+  .chat-group {
+    min-width: 0;
   }
 }

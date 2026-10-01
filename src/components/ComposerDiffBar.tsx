@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
 import { gitDiff, gitStatus } from "../lib/api";
 import { buildUncommittedFiles, sumDiffStats } from "../lib/uncommitted";
-import { useReviewPanel } from "../lib/reviewPanel";
+import { useViewerTabs } from "../lib/viewerTabs";
 
 /** نوار تغییرات بالای اینپوت به سبک کدکس: «N files changed +A -D».
  *  با کلیک، پنل گیت‌دیف (کل تغییرات uncommitted) باز می‌شود.
  *  وقتی تغییری نیست هیچ‌چیز رندر نمی‌کند. */
 export function ComposerDiffBar({ root }: { root: string | null }) {
-  const openGitDiff = useReviewPanel((s) => s.openGitDiff);
+  const openGitDiff = useViewerTabs((s) => s.openGitDiff);
   const [files, setFiles] = useState(0);
   const [adds, setAdds] = useState(0);
   const [dels, setDels] = useState(0);

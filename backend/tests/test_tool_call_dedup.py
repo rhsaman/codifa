@@ -188,13 +188,16 @@ def test_duplicate_calls_both_get_tool_messages():
 
 
 def test_mixed_calls_unique_and_deduped():
-    """Three calls: two identical + one unique → 2 executions."""
+    """Three calls: two identical + one unique → 1 execution.
+
+    The identical pair dedups; the two remaining same-scope greps merge
+    into one scan whose result fans out to both call ids."""
     global _exec_count
     _exec_count = 0
     result, _ = asyncio.run(_run_mixed())
     assert result == "done"
-    # Two unique signatures → two executions
-    assert _exec_count == 2, f"expected 2 execs, got {_exec_count}"
+    # One unique scan after sig-dedup + same-scope merge
+    assert _exec_count == 1, f"expected 1 exec, got {_exec_count}"
 
 
 class _SameIdCallModel:
@@ -252,11 +255,12 @@ async def _run_same_id():
 
 
 def test_same_id_calls_get_unique_outputs():
-    """دو فراخوانی با یک id مشترک در یک پیام → idهای یکتا و دو اجرای جدا."""
+    """Two calls sharing one id get unique ids and one merged execution."""
     result, model = asyncio.run(_run_same_id())
     assert result == "done"
-    # آرگومان‌ها متفاوت‌اند پس هر دو باید اجرا شوند
-    assert _exec_count == 2, f"expected 2 execs, got {_exec_count}"
+    # Different patterns but one scope, so they merge into a single scan;
+    # each id still gets its own ToolMessage below.
+    assert _exec_count == 1, f"expected 1 exec, got {_exec_count}"
     # پیامی که در مرحلهٔ دوم به مدل رفت باید به‌ازای هر فراخوانی دقیقاً یک
     # ToolMessage با id یکتا داشته باشد (خطای «Duplicate function_call_output»)
     second_request = model.seen[1]

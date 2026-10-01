@@ -64,6 +64,19 @@ LAYA_KNOWN_REPOS = (
     LAYA_TYPED_DECISIONS_REPO,
 )
 
+# Subfolder of the models root holding huggingface_hub's own cache layout.
+# Laya's Router.predict auto-downloads through HF_HOME, which must point here
+# — never at the shared models/ root, whose ``models--*`` folders are scanned
+# by embedding_dirs() for the Settings Memory card.
+_HUB_CACHE_DIRNAME = "hub-cache"
+
+
+def _is_laya_repo(repo: str) -> bool:
+    """True for laya-family repos, which are decision checkpoints — never
+    embedding models, so embedding_dirs() must skip them."""
+    r = (repo or "").strip()
+    return r in LAYA_KNOWN_REPOS or r.startswith("convaiinnovations/laya")
+
 
 _MIGRATE_LOCK = threading.Lock()
 _migrated = False
@@ -96,6 +109,11 @@ def _models_dir() -> str:
                 _migrate_legacy_models(target)
                 _migrated = True
     return target
+
+
+def hub_cache_dir() -> str:
+    """Dedicated huggingface_hub cache dir (laya auto-downloads land here)."""
+    return os.path.join(_models_dir(), _HUB_CACHE_DIRNAME)
 
 
 def _user_whisper_model() -> str:
@@ -160,6 +178,43 @@ def _embedding_dir(repo: str) -> str:
     return os.path.join(_models_dir(), f"models--{slug}") if slug else ""
 
 
+def _migrate_laya_orphans(target_root: str) -> None:
+    """Move laya HF-cache orphans out of the embedding scan dir.
+
+    Router.predict auto-downloads used to land directly in the shared models/
+    root (HF_HOME pointed there), so embedding_dirs() listed them as
+    "incomplete" rows in the Settings Memory card. Move them into hub-cache/
+    (top-level scan never recurses there; HF resumes the partial download).
+    Never deletes: when the dest already holds that repo, the stale copy is
+    left alone (invisible to the UI after the embedding_dirs filter).
+
+    Never calls _models_dir()/hub_cache_dir(): this runs under _MIGRATE_LOCK,
+    which is non-reentrant — re-entering _models_dir hung the sidecar at
+    startup. Everything derives from target_root (always the models dir).
+    """
+    dest_root = os.path.join(target_root, _HUB_CACHE_DIRNAME)
+    try:
+        names = os.listdir(target_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("models--"):
+            continue
+        if not _is_laya_repo(name[len("models--"):].replace("--", "/")):
+            continue
+        src = os.path.join(target_root, name)
+        if not os.path.isdir(src):
+            continue
+        dest = os.path.join(dest_root, name)
+        if os.path.isdir(dest):
+            continue
+        try:
+            os.makedirs(dest_root, exist_ok=True)
+            shutil.move(src, dest)
+        except Exception:  # noqa: BLE001, S112 — migration must never crash startup
+            continue
+
+
 def _migrate_legacy_models(target_root: str | None = None) -> None:
     """Move models previously stored under ``backend/whisper`` /
     ``backend/models--*`` into the data-root ``models/`` folder so an app that
@@ -189,6 +244,7 @@ def _migrate_legacy_models(target_root: str | None = None) -> None:
             shutil.move(src, dest)
         except Exception:  # noqa: BLE001, S112 — migration must never crash startup
             continue
+    _migrate_laya_orphans(target_root)
 
 
 # --- live download state (one entry per kind) --------------------------- #
@@ -741,7 +797,11 @@ def _embed_ready(root: str) -> bool:
 
 
 def embedding_dirs() -> list[dict]:
-    """All downloaded embedding model dirs, newest first."""
+    """All downloaded embedding model dirs, newest first.
+
+    Laya-family ``models--*`` folders (left by old HF auto-downloads) are
+    skipped — they are decision checkpoints, never embedding models.
+    """
     out: list[dict] = []
     root_dir = _models_dir()
     if not os.path.isdir(root_dir):
@@ -753,6 +813,8 @@ def embedding_dirs() -> list[dict]:
         if not os.path.isdir(root):
             continue
         repo = name[len("models--") :].replace("--", "/")
+        if _is_laya_repo(repo):
+            continue
         out.append(
             {
                 "repo": repo,

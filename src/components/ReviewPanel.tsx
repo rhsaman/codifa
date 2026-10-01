@@ -102,11 +102,32 @@ export function ReviewFileAccordion({
 /** پنل Review به سبک کدکس — تب `Review` با فیلتر منبع (ترن / uncommitted /
  *  committed)، لیست فایل‌های تغییرکرده، و دیف تک‌ستونی فایل انتخاب‌شده.
  *  داده‌ی ترن از `messageId` در استور خوانده می‌شود تا حین استریم زنده بماند.
- *  مثل حالت مطالعه به‌صورت اورلی روی چت باز می‌شود (چت کوچک نمی‌شود)؛ با
- *  درگ لبه بزرگ/کوچک و با دکمهٔ گوشه فول‌اسکرین می‌شود. */
-export function ReviewPanel() {
-  const { messageId, selectedPath, selectPath, close, source, setSource } =
-    useReviewPanel();
+ *  در حالت docked داخل گروه viewer رندر می‌شود (بدون اورلی/اسکریم/ریسایز)؛ در
+ *  غیر این صورت مثل حالت مطالعه به‌صورت اورلی روی چت باز می‌شود. */
+export function ReviewPanel(props?: {
+  messageId?: string | null
+  initialSource?: ReviewSource
+  initialPath?: string
+  initialRev?: string
+  docked?: boolean
+  onClose?: () => void
+}) {
+  const docked = props?.docked ?? false
+  const store = useReviewPanel();
+  const storeMessageId = store.messageId
+  const storeSelectedPath = store.selectedPath
+  const storeSelectPath = store.selectPath
+  const storeClose = store.close
+  const storeSource = store.source
+  const storeSetSource = store.setSource
+  const messageId = props?.messageId !== undefined ? props.messageId : storeMessageId
+  const close = props?.onClose ?? storeClose
+  const [dockedSource, setDockedSource] = useState<ReviewSource>(props?.initialSource ?? 'turn')
+  const [dockedPath, setDockedPath] = useState(props?.initialPath ?? '')
+  const source = docked ? dockedSource : storeSource
+  const setSource = docked ? setDockedSource : storeSetSource
+  const selectedPath = docked ? dockedPath : storeSelectedPath
+  const selectPath = docked ? setDockedPath : storeSelectPath
   // حالت فول‌اسکرین — پنل کل ویوپورت را می‌گیرد (مثل فول‌اسکرین دیف).
   const [fullscreen, setFullscreen] = useState(false);
 
@@ -199,7 +220,7 @@ export function ReviewPanel() {
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
   const [commits, setCommits] = useState<GitCommitInfo[]>([]);
-  const [rev, setRev] = useState("HEAD");
+  const [rev, setRev] = useState(props?.initialRev ?? "HEAD");
   const [query, setQuery] = useState("");
 
   // بارگذاری دیف uncommitted: ترکیب staged و unstaged تا فایل‌های استیج‌شده
@@ -361,7 +382,10 @@ export function ReviewPanel() {
   // می‌بندد؛ فقط یک فایل هم‌زمان باز می‌ماند (`selectedPath`).
   // `query` لیست را به فایل‌های منطبق فیلتر می‌کند و رخدادها را هایلایت می‌کند؛
   // رخداد فعال فقط داخل فایل باز هایلایت متمایز می‌گیرد.
-  const wide = fullscreen || width >= REVIEW_SIDE_BY_SIDE_THRESHOLD;
+  // در حالت docked همیشه `auto`: هر DiffView عرض واقعی کانتینر خودش را با
+  // ResizeObserver می‌سنجد و زیر ۶۴۰px تک‌ستونی می‌شود — پس در viewer باریک
+  // (مانیتور کوچک) دیف خوانا می‌ماند.
+  const wide = docked ? false : (fullscreen || width >= REVIEW_SIDE_BY_SIDE_THRESHOLD);
   const renderFileList = (list: GitFile[]) => {
     const openIdx = list.findIndex((f) => f.path === (selected?.path ?? ""));
     const openLocal =
@@ -382,22 +406,22 @@ export function ReviewPanel() {
 
   const panel = (
     <div
-      className={`review-overlay${fullscreen ? " fullscreen" : ""}`}
+      className={docked ? undefined : `review-overlay${fullscreen ? " fullscreen" : ""}`}
       dir="ltr"
-      style={{ "--review-w": `${width}px` } as React.CSSProperties}
+      style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
     >
       {/* اسکریم نرم — کلیک بیرون پنل می‌بندد (مثل حالت مطالعه). */}
-      <div className="review-scrim" aria-hidden="true" onClick={close} />
+      {!docked && <div className="review-scrim" aria-hidden="true" onClick={close} />}
       {/* دستگیره‌ی درگ لبه — تغییرعرض مثل مطالعه (در فول‌اسکرین مخفی). */}
-      {!fullscreen && (
+      {!docked && !fullscreen && (
         <div
           className="review-overlay-resize-handle"
           title="Drag to resize"
           onMouseDown={startResize}
         />
       )}
-      <aside className="review-panel review-floating-panel" dir="ltr">
+      <aside className={docked ? "review-panel review-docked-panel" : "review-panel review-floating-panel"} dir="ltr">
       <div className="review-header">
         <span className="review-source" role="tablist" aria-label="Diff source">
           {(
@@ -425,18 +449,20 @@ export function ReviewPanel() {
           </span>
         )}
         <span className="review-header-actions">
-          <button
-            className="review-header-btn"
-            title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            onClick={() => setFullscreen((v) => !v)}
-          >
-            {fullscreen ? (
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
-            ) : (
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
-            )}
-          </button>
+          {!docked && (
+            <button
+              className="review-header-btn"
+              title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+              aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+              onClick={() => setFullscreen((v) => !v)}
+            >
+              {fullscreen ? (
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
+              ) : (
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
+              )}
+            </button>
+          )}
           <button
             className="review-header-btn"
             title="Close"
@@ -544,7 +570,8 @@ export function ReviewPanel() {
 
   // مثل حالت مطالعه از پورتال به body رندر می‌شود تا `position: fixed`
   // نسبت به ویوپورت باشد و چت پشت آن کوچک نشود. در SSR (بدون document)
-  // مستقیم رندر می‌شود تا تست سلامت خروجی را ببیند.
-  if (typeof document === "undefined") return panel;
+  // مستقیم رندر می‌شود تا تست سلامت خروجی را ببیند. در حالت docked مستقیم
+  // داخل گروه viewer رندر می‌شود تا در split layout شرکت کند.
+  if (docked || typeof document === "undefined") return panel;
   return createPortal(panel, document.body);
 }

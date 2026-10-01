@@ -159,3 +159,201 @@ def project_tool_results(
                     message = message.model_copy(update={"content": trimmed})
         projected.append(message)
     return projected
+
+
+_READ_LEDGER_MAX_FILES = 8
+_READ_LEDGER_MAX_CHARS = 500
+_READ_LEDGER_MAX_RANGES_PER_FILE = 4
+
+
+def context_ledger_line(messages: Sequence[BaseMessage]) -> str:
+    """One-line summary of read windows already present in these messages.
+
+    Built from live messages only: files whose content was compacted away
+    are simply absent, so the line never claims coverage it cannot show.
+    Returns "" when there is nothing worth saying (no reads, or a single
+    file with a single window — that result speaks for itself).
+    """
+    covered: dict[str, list[list[int]]] = {}
+    order: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "status", "success") != "success":
+            continue
+        content = message.content
+        if not isinstance(content, str):
+            continue
+        for block in _READ_BLOCK_RE.finditer(content):
+            path = (block.group("path") or "").strip()
+            if not path:
+                continue
+            nums: list[int] = []
+            for row in block.group("body").split("\n"):
+                m = _ROW_RE.match(row)
+                if m:
+                    try:
+                        nums.append(int(m.group(1)))
+                    except ValueError:
+                        continue
+            if not nums:
+                continue
+            bucket = covered.setdefault(path, [])
+            if path not in order:
+                order.append(path)
+            for n in sorted(set(nums)):
+                if bucket and n <= bucket[-1][1] + 1:
+                    bucket[-1][1] = max(bucket[-1][1], n)
+                else:
+                    bucket.append([n, n])
+    if len(order) < 1:
+        return ""
+    if len(order) == 1 and len(covered[order[0]]) == 1:
+        return ""
+    prefix = "[already in context \u2014 do NOT re-read: "
+    suffix = "]"
+    parts: list[str] = []
+    added = 0
+    for path in order:
+        wins = covered[path]
+        shown = wins[:_READ_LEDGER_MAX_RANGES_PER_FILE]
+        text = ",".join(
+            f"{a}-{b}" if a != b else f"{a}" for a, b in shown
+        )
+        if len(wins) > len(shown):
+            text += f" (+{len(wins) - len(shown)} more)"
+        cand = f"{path} {text}"
+        if len(prefix + " | ".join([*parts, cand]) + suffix) > _READ_LEDGER_MAX_CHARS:
+            if not parts:
+                budget = _READ_LEDGER_MAX_CHARS - len(prefix) - len(suffix) - 3
+                parts.append(cand[: max(0, budget)] + "...")
+                added += 1
+            continue
+        parts.append(cand)
+        added += 1
+    # Files after the first overflow fold into a counter, keeping the line
+    # within budget without ever cutting a range mid-token.
+    skipped = len(order) - added
+    if skipped > 0:
+        parts.append(f"(+{skipped} more)")
+    return prefix + " | ".join(parts) + suffix
+
+
+_GREP_HIT_RE = re.compile(r"^MATCHES for (.*?)\s*$")
+_GREP_MISS_RE = re.compile(r"^No matches for (.*?) under (.*?)\s*$")
+_GREP_FOUND_RE = re.compile(r"Found (\d+) matches")
+_GLOB_HIT_RE = re.compile(r"^GLOB MATCHES for (.*?)\s*$")
+_GLOB_MISS_RE = re.compile(r"^No files match (.*?) under (.*?)\.\s*$")
+_GLOB_FOUND_RE = re.compile(r"\((\d+) matches found")
+_SEARCH_LEDGER_MAX_ITEMS = 6
+_SEARCH_LEDGER_MAX_CHARS = 400
+_SEARCH_LEDGER_MAX_PAT = 60
+
+
+def _unquote(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def search_ledger_line(messages: Sequence[BaseMessage]) -> str:
+    """One-line summary of grep/glob searches already run in these messages.
+
+    The model re-searches patterns it already ran (results seen, then
+    forgotten two steps later). Live messages only: a search whose result
+    was compacted away is simply absent, so the line never claims results
+    it cannot show. Silent until at least two searches ran — a single
+    search followed by action is the normal flow, not waste.
+    """
+    calls: dict[str, tuple[str, dict]] = {}
+    for message in messages or []:
+        if not isinstance(message, AIMessage):
+            continue
+        for call in message.tool_calls:
+            name = call.get("name")
+            if name in ("grep", "glob") and call.get("id"):
+                calls[call["id"]] = (name, call.get("args") or {})
+    if len(calls) < 2:
+        return ""
+    items: list[str] = []
+    seen: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "status", "success") != "success":
+            continue
+        content = message.content
+        if not isinstance(content, str):
+            continue
+        sig = calls.get(str(message.tool_call_id or ""))
+        if sig is None:
+            continue
+        name, args = sig
+        head = content.split("\n", 1)[0]
+        item = ""
+        if name == "grep":
+            m = _GREP_HIT_RE.match(head)
+            if m:
+                found = _GREP_FOUND_RE.search(content)
+                outcome = f"{found.group(1)} hits" if found else "hits"
+                item = _search_item(name, args, _unquote(m.group(1)), outcome)
+            else:
+                m = _GREP_MISS_RE.match(head)
+                if m:
+                    item = _search_item(name, args, _unquote(m.group(1)), "no matches")
+        else:
+            m = _GLOB_HIT_RE.match(head)
+            if m:
+                found = _GLOB_FOUND_RE.search(content)
+                outcome = f"{found.group(1)} hits" if found else "hits"
+                item = _search_item(name, args, _unquote(m.group(1)), outcome)
+            else:
+                m = _GLOB_MISS_RE.match(head)
+                if m:
+                    item = _search_item(name, args, _unquote(m.group(1)), "no matches")
+        if item and item not in seen:
+            seen.add(item)
+            items.append(item)
+    if not items:
+        return ""
+    prefix = "[already searched — do NOT re-search: "
+    suffix = "]"
+    shown = items[:_SEARCH_LEDGER_MAX_ITEMS]
+    parts: list[str] = []
+    for item in shown:
+        if len(prefix + " | ".join([*parts, item]) + suffix) > _SEARCH_LEDGER_MAX_CHARS:
+            break
+        parts.append(item)
+    skipped = len(items) - len(parts)
+    if skipped > 0:
+        parts.append(f"(+{skipped} more)")
+    return prefix + " | ".join(parts) + suffix
+
+
+def _search_item(name: str, args: dict, pattern: str, outcome: str) -> str:
+    """Compact `grep 'pat' in scope (filter): outcome` for the ledger."""
+    try:
+        scope = str(args.get("path") or "").strip() or "/"
+    except Exception:  # noqa: BLE001 — display-only
+        scope = "/"
+    try:
+        extra_scopes = args.get("paths") or []
+        if isinstance(extra_scopes, str):
+            extra_scopes = [extra_scopes]
+        extra_n = len(list(extra_scopes))
+        if extra_n > 0:
+            scope += f" +{extra_n}"
+    except Exception:  # noqa: BLE001, S110 — display-only
+        pass
+    filt = ""
+    try:
+        inc = str(args.get("include") or "").strip()
+        if inc:
+            filt = f" ({inc})"
+    except Exception:  # noqa: BLE001, S110 — display-only
+        pass
+    pat = (pattern or "").strip()
+    if len(pat) > _SEARCH_LEDGER_MAX_PAT:
+        pat = pat[: _SEARCH_LEDGER_MAX_PAT - 3] + "..."
+    return f"{name} '{pat}' in {scope}{filt}: {outcome}"

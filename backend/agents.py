@@ -851,27 +851,19 @@ _UNIVERSAL_RULES = (
     "4. PERSIAN TYPOGRAPHY: when replying in Persian, always use the half-space "
     "(ZWNJ, U+200C) between word components — e.g. کتابخانه‌ها, منسوخ‌شده‌اند, "
     "لایه‌به‌لایه, نمی‌خواهم — never glue the components together without it.\n"
-    "5. WORKSPACE SUMMARY: when you start a NEW chat in a workspace that has "
-    "prior chats, a short recap of those prior chats is auto-injected into the "
-    "system prompt as a 'WORKSPACE SUMMARY' block (see "
-    "state_db.get_workspace_summary and the build_turn_context injection point "
-    "in graph.py). Use it as context for the current task. It is a static "
-    "reference — there is no 'memory' or 'search_memory' tool to call; do not "
-    "try to refresh or re-fetch it from inside a turn. The recap is refreshed "
-    "only on the first message of a new chat.\n"
-    "6. CURRENT TIME: you do NOT know the current date/time — your knowledge has "
+    "5. CURRENT TIME: you do NOT know the current date/time — your knowledge has "
     "a training cutoff. Always call the `current_time` tool when the user asks "
     "about 'today', 'now', 'recent', 'latest', 'what day is it', 'current date', "
     "or any time-sensitive question. Do NOT guess or use your training data for "
     "the current date.\n"
-    "7. TOOL NARRATION: before EVERY tool call (or batch of parallel tool "
+    "6. TOOL NARRATION: before EVERY tool call (or batch of parallel tool "
     "calls) write ONE short narration line — in the user's language — saying "
     "what you are about to do and why (e.g. 'بذار ببینم X کجا تعریف "
     "شده...'). Keep it under ~15 words, plain text, no markdown/headers/code "
     "fences. That line renders as the caption of the tool row (Claude.ai-style) "
     "so the user always sees what you are doing while tools run. Never call a "
     "tool silently.\n"
-    "8. SKILLS ARE ALWAYS ENGLISH (HARD): skills created via create_skill "
+    "7. SKILLS ARE ALWAYS ENGLISH (HARD): skills created via create_skill "
     "(`name`, `description`, `content`) must ALWAYS be written entirely in "
     "English, regardless of the user's chat language. Never create Persian "
     "skills — this hard rule overrides the language-matching rules above for "
@@ -965,7 +957,11 @@ _SEARCH_RULE = (
     "(e.g. ranges=['a.ts:100:80','b.ts:1:60']) instead of one read per window. "
     "Same file, different windows MUST also be ONE read call via ranges "
     "(e.g. ranges=['tools.py:640:60','tools.py:2089:80']) — never two reads "
-    "on the same file. NEVER re-read the same path:window twice — reuse the "
+    "on the same file. symbols=[...] combines with ranges=[...] in that SAME "
+    "call when you need both definitions and raw windows — never a ranges "
+    "call plus a separate symbols call on the same file. NEVER batch several files under one shared "
+    "offset/limit — files differ in size and the short ones past-EOF; give "
+    "each file its own window via ranges. NEVER re-read the same path:window twice — reuse the "
     "earlier result. If you already read a window (single or batch), do NOT "
     "re-issue it single+batch or batch+single; use the result you have.\n"
     "NOTE: 'parallel' has TWO distinct meanings above — (a) firing several DIRECT "
@@ -977,9 +973,18 @@ _SEARCH_RULE = (
     "for.\n"
     "5. CONTEXT BUDGET: a subagent runs in an isolated context and only its "
     "compact report enters your context — so for multi-file research DELEGATE to "
-    "a subagent instead of reading many files yourself. When you DO read a large "
-    "file, page it with read offset/limit (e.g. limit=300) instead of dumping the "
-    "whole file into context.\n"
+    "a subagent instead of reading many files yourself. When you DO read a file "
+    "yourself, make the FIRST read decisive — never open with a narrow slice and "
+    "page forward one window per step (WRONG: read 1-200, next step 217-350, next "
+    "step symbols — 3 round-trips for one file). If you know the definition NAME, "
+    "read symbols=[...] (exact range, one call — use it even for small files: a "
+    "250-line file is served whole, so symbols saves ~200 lines). If you need to "
+    "survey a large file, read offset=1 limit=400+: you get a FILE MAP (head + "
+    "full definition list) instead of a bulk dump, then fetch definitions via "
+    "symbols=[...] in ONE call. Only page with offset/limit when you truly need "
+    "one small raw region. Do NOT read file heads (offset=1, small limit) just to explore "
+    "a large file — check the CODE MAP or grep first, then read symbols=[...] "
+    "directly.\n"
     "NOTE: explore is ONLY triggered when YOU explicitly call "
     "task(subagent_type='explore') — the system does NOT auto-route. If you need a "
     "broad / multi-file search, delegate to explore yourself; for targeted lookups "
@@ -2204,91 +2209,6 @@ def _read_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) 
             "===== END PROJECT MEMORY ====="
         )
     return ""
-
-
-# -- Workspace summary (cross-chat recap for new chats) --------------------- #
-
-_WORKSPACE_SUMMARY_MAX_BYTES = 2000
-
-
-def _workspace_summary_wrapper(content: str) -> str:
-    """Wrap summary text in a system-prompt-friendly block."""
-    body = (content or "").strip()
-    if not body:
-        return ""
-    if len(body) > _WORKSPACE_SUMMARY_MAX_BYTES:
-        body = (
-            body[:_WORKSPACE_SUMMARY_MAX_BYTES]
-            + "\n…(truncated — summary exceeds the auto-included limit)"
-        )
-    return (
-        "\n\n===== WORKSPACE SUMMARY (from earlier chats in this workspace) =====\n"
-        "Recap of what was done in previous chats of this same workspace. "
-        "Use it as context for the current task; ignore anything unrelated.\n"
-        f"{body}\n"
-        "===== END WORKSPACE SUMMARY ====="
-    )
-
-
-async def _select_relevant_summary(
-    full_content: str,
-    user_prompt: str,
-    model: Any,
-    fallback_model: Any | None,
-) -> str:
-    """Filter the cumulative workspace summary down to only the bullets
-    relevant to the user's first message in a new chat. Never invents
-    content -- only selects/trims from what's already in full_content.
-
-    Fails closed: returns "" if nothing is relevant or the call fails,
-    rather than falling back to the full (unfiltered) summary -- injecting
-    nothing is safer than injecting unrelated context.
-    """
-    full_content = (full_content or "").strip()
-    user_prompt = (user_prompt or "").strip()
-    if not full_content or not user_prompt:
-        return ""
-
-    # دروازه laya حذف شد: امتیازدهی پر-بولت همگام (N × ده‌ها تا صدها میلی‌ثانیه)
-    # حلقه رویداد را بلوکه می‌کرد، wait_for روی کد همگام اثر نداشت، و بولت‌های
-    # نامطمئن (handled=False) گم می‌شدند در حالی که مدل بزرگ هم آن‌ها را نمی‌دید.
-    # فیلتر مرتبط‌بودن فقط با همان یک تماس مدل بزرگ انجام می‌شود (رفتار قبلی).
-
-    system_prompt = (
-        "You will be given a cumulative summary of earlier work in this "
-        "workspace (a bullet list) and the user's first message in a "
-        "brand new chat.\n"
-        "Select ONLY the bullets relevant to what the user is about to "
-        "do. Copy them verbatim or lightly trimmed -- do NOT invent, "
-        "infer, or add anything not already in the summary.\n"
-        "If nothing in the summary is relevant, output nothing at all "
-        "(an empty response) -- that is the correct answer in that "
-        "case.\n"
-        "Maximum ~1200 characters. No preamble, no closing remarks, "
-        "bullets only."
-    )
-    user_msg = (
-        "WORKSPACE SUMMARY:\n"
-        + full_content
-        + "\n\nUSER'S FIRST MESSAGE:\n"
-        + user_prompt
-    )
-
-    filtered = ""
-    chosen = model or fallback_model
-    if chosen is not None:
-        try:
-            from llm import llm_generate
-
-            filtered, _ = await llm_generate(
-                chosen,
-                system=system_prompt,
-                user=user_msg,
-            )
-        except Exception:  # noqa: BLE001
-            filtered = ""
-
-    return _workspace_summary_wrapper(filtered)
 
 
 # The agent's OWN self-written memory (distinct from the user-authored AGENTS.md
@@ -3746,218 +3666,6 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
         "If this message continues that task, follow this plan. If it is a new, "
         "unrelated task, ignore it."
     )
-
-
-# -- Workspace summary refresh (LLM-backed, with safe fallback) ------------- #
-
-
-_WORKSPACE_SUMMARY_FILTER_TIMEOUT = 8.0
-
-_WORKSPACE_SUMMARY_BG_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn_background_task(coro) -> None:
-    """Fire-and-forget a coroutine, keeping a reference so it isn't
-    garbage-collected mid-flight (a common asyncio pitfall)."""
-    task = asyncio.create_task(coro)
-    _WORKSPACE_SUMMARY_BG_TASKS.add(task)
-    task.add_done_callback(_WORKSPACE_SUMMARY_BG_TASKS.discard)
-
-
-async def _maybe_refresh_workspace_summary(
-    root: str,
-    current_chat_id: str,
-    model: Any,
-    fallback_model: Any | None,
-    user_prompt: str = "",
-) -> str:
-    """Return the workspace-summary excerpt relevant to ``user_prompt`` for
-    a brand-new chat, WITHOUT blocking the response on a full re-merge.
-
-    Fast path (this is what the caller awaits): filter whatever's already
-    persisted on disk against ``user_prompt`` -- one small LLM call,
-    capped by a hard timeout so a slow/hanging provider can never stall
-    chat creation by more than a few seconds.
-
-    Slow path (never awaited here): if this workspace's chats have grown
-    since the persisted summary was built, a background task is spawned
-    to merge the new turns in. This chat doesn't wait for it -- the NEXT
-    new chat in this workspace will see the refreshed summary.
-
-    Returns "" whenever there's nothing to inject (no persisted summary
-    yet, nothing relevant, ``user_prompt`` empty, or the filter timed
-    out/failed).
-    """
-    try:
-        workspace_slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
-        prior = [
-            c
-            for c in state_db.iter_workspace_chats(workspace_slug)
-            if c.get("chat_id") and c["chat_id"] != current_chat_id
-        ]
-    except Exception:  # noqa: BLE001
-        return ""
-    if not prior:
-        return ""
-
-    current_counts = {c["chat_id"]: c["message_count"] for c in prior}
-    user_prompt = (user_prompt or "").strip()
-
-    existing: dict | None = None
-    try:
-        existing = state_db.get_workspace_summary(workspace_slug)
-    except Exception:  # noqa: BLE001
-        existing = None
-
-    prev_counts = (existing or {}).get("covered_message_counts") or {}
-    needs_refresh = not (
-        existing
-        and all(int(prev_counts.get(cid, 0)) == n for cid, n in current_counts.items())
-        and len(prev_counts) == len(current_counts)
-    )
-    if needs_refresh:
-        # Never awaited -- this chat doesn't wait on it. Persists (or
-        # silently gives up) in the background; the NEXT new chat in this
-        # workspace picks up whatever it managed to produce.
-        _spawn_background_task(
-            _refresh_workspace_summary_background(
-                root,
-                workspace_slug,
-                prior,
-                existing,
-                current_counts,
-                model,
-                fallback_model,
-            )
-        )
-
-    raw = (existing or {}).get("content") or ""
-    if not raw or not user_prompt:
-        return ""
-    try:
-        return await asyncio.wait_for(
-            _select_relevant_summary(raw, user_prompt, model, fallback_model),
-            timeout=_WORKSPACE_SUMMARY_FILTER_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        return ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-async def _refresh_workspace_summary_background(
-    root: str,
-    workspace_slug: str,
-    prior: list[dict],
-    existing: dict | None,
-    current_counts: dict,
-    model: Any,
-    fallback_model: Any | None,
-) -> None:
-    """Runs detached via _spawn_background_task -- never awaited by the
-    request path, so its latency (including a slow provider) never
-    delays chat creation. Any failure here is silent: it just means the
-    next new chat's fast-path filter still works off the older cached
-    content, and this same refresh is retried on the next new chat.
-    """
-    try:
-        prev_counts = (existing or {}).get("covered_message_counts") or {}
-        new_tail_lines: list[str] = []
-        ws_dir = os.path.join(
-            state_db.chats_dir(),
-            _safe_file(workspace_slug, "workspace"),
-        )
-        for c in prior:
-            cid = c["chat_id"]
-            prev_n = int(prev_counts.get(cid, 0))
-            new_n = int(c["message_count"])
-            if new_n <= prev_n:
-                continue
-            path = os.path.join(ws_dir, f"{_safe_file(cid, cid)}.json")
-            data = _read_json_chat(path)
-            if not isinstance(data, dict):
-                continue
-            turns = data.get("history") or data.get("messages") or []
-            if not isinstance(turns, list):
-                continue
-            for t in turns[prev_n:]:
-                role = str(t.get("role") or "")
-                content = str(t.get("content") or "")[:1500]
-                if not content.strip():
-                    continue
-                new_tail_lines.append(f"[{cid}] {role}: {content}")
-
-        if not new_tail_lines:
-            return
-
-        body = "\n".join(new_tail_lines)[:20000]
-        existing_content = (existing or {}).get("content") or ""
-        chosen = model or fallback_model
-        summary_text = await _merge_summary_only(existing_content, body, chosen)
-        if summary_text.strip():
-            state_db.save_workspace_summary(
-                workspace_slug,
-                summary_text,
-                current_counts,
-            )
-    except Exception:  # noqa: BLE001, S110 — summary save failure is non-critical
-        pass
-
-
-async def _merge_summary_only(
-    existing_content: str,
-    new_tail_body: str,
-    chosen: Any,
-) -> str:
-    """Single-purpose merge call: existing summary + new tail -> updated
-    summary. Returns "" on failure (caller keeps the old persisted copy).
-    """
-    if chosen is None:
-        return ""
-    system_prompt = (
-        "You maintain a running summary of this workspace across chats.\n"
-        "Below is the EXISTING summary (if any), followed by NEW turns "
-        "since the last update. Produce an UPDATED summary that merges "
-        "both — keep anything from the existing summary still relevant, "
-        "add what's new, drop what's now stale/superseded.\n"
-        "Format: concise bullet list covering tasks completed, files "
-        "changed, architectural decisions, unresolved issues.\n"
-        "Maximum ~2000 characters. "
-        "Write in the same language the turns use (Persian or English). "
-        "No preamble, no closing remarks — bullets only."
-    )
-    user_msg = new_tail_body
-    if existing_content.strip():
-        user_msg = (
-            "EXISTING SUMMARY:\n"
-            + existing_content.strip()
-            + "\n\nNEW TURNS:\n"
-            + new_tail_body
-        )
-    try:
-        from llm import llm_generate
-
-        text, _ = await llm_generate(chosen, system=system_prompt, user=user_msg)
-        return text or ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _safe_file(name: str, fallback: str = "item") -> str:
-    """Local copy of state_db._safe_file — avoids import cycle."""
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip()).strip(".-")
-    return safe or fallback
-
-
-def _read_json_chat(path: str) -> dict | None:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.loads(fh.read())
-    except Exception:  # noqa: BLE001
-        return None
 
 
 _IMAGE_EXTS: dict[str, str] = {

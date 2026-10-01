@@ -55,10 +55,19 @@ from providers import (
 from tool_batching import (
     drop_ledger_path,
     execute_readonly_calls,
+    has_served_map,
+    merge_same_scope_greps,
     note_fetched_window,
+    reset_cross_turn,
     reset_read_ledger,
+    reset_turn_seen_calls,
 )
-from tool_message_projection import project_tool_results, stable_tool_order
+from tool_message_projection import (
+    context_ledger_line,
+    project_tool_results,
+    search_ledger_line,
+    stable_tool_order,
+)
 
 # Alias kept for existing call sites; logic lives in tool_message_projection.
 _stable_tool_order = stable_tool_order
@@ -1968,6 +1977,10 @@ class _SeenWindows:
         self._adjacent_nudged.clear()
         self._edited.clear()
         reset_read_ledger()
+        reset_turn_seen_calls()
+        # Compaction may have evicted previous turns' content from history:
+        # cross-turn pointers would dangle, so forget them too.
+        reset_cross_turn()
 
     def mark_edited(self, path: str) -> None:
         if path:
@@ -2018,6 +2031,10 @@ class _SeenWindows:
             path, start, end = wins[0]
             if path in self._edited:
                 continue
+            if has_served_map(path):
+                # A file map was served instead of the requested window:
+                # coverage is untrusted, so never stub — serve real content.
+                continue
             have = self._seen.get(path, [])
             if not have:
                 continue
@@ -2052,7 +2069,11 @@ class _SeenWindows:
                 continue
             for path, start, end in _read_windows(tc.get("args") or {}):
                 key = (path, start, end)
-                have = self._seen.get(path, [])
+                # A served file map leaves phantom coverage in _seen (the
+                # requested head window was never content-served): nudge
+                # logic must not reference it, though fresh fetches still
+                # record normally below.
+                have = [] if has_served_map(path) else self._seen.get(path, [])
                 covered = sum(
                     self._overlap(start, end, s0, s1) for s0, s1 in have
                 )
@@ -2196,6 +2217,7 @@ async def langchain_tool_loop(
     # the batching streak above).
     _reread = _SeenWindows()
     reset_read_ledger()
+    reset_turn_seen_calls()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
     # Reminders / steering are TRANSIENT: sent with the very next request only,
     # never stored in msgs. Stored copies were re-sent on every later step (one
@@ -2309,8 +2331,9 @@ async def langchain_tool_loop(
             tcs = _deduped
         # Always observe — `or` would short-circuit the tracker whenever the
         # per-step detector fires, so that step would never be recorded and
-        # the cross-step count would restart from zero.
-        _step_hint = _batchable_nudge(tcs)
+        # the cross-step count would restart from zero. (The merge advice
+        # itself runs later on the merged call list — see below.)
+        _step_hint = ""
         _streak_hint = _streak.observe(tcs)
         _batch_hint = _step_hint or _streak_hint
         # Coverage check BEFORE observe records this step: fully covered
@@ -2331,8 +2354,14 @@ async def langchain_tool_loop(
             tc for tc in tcs if (tc.get("name") or "") not in _SEQUENTIAL_TOOLS
         ]
         _sequential = [tc for tc in tcs if (tc.get("name") or "") in _SEQUENTIAL_TOOLS]
-        _results = await execute_readonly_calls(_parallel, _exec)
-        for tc, result in zip(_parallel, _results):
+        # Same-scope back-to-back greps run as one scan (see tool_batching);
+        # the nudge reads the merged list so it never re-suggests the merge.
+        _exec_calls, _expand_merged = merge_same_scope_greps(_parallel)
+        _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
+        _batch_hint = _step_hint or _streak_hint
+        _results = await execute_readonly_calls(_exec_calls, _exec)
+        _expanded = _expand_merged(_results)
+        for tc, result in zip(_parallel, _expanded):
             _cid = tc.get("id", "")
             if _cid in _cover_stubs:
                 result = _cover_stubs[_cid]
@@ -2359,6 +2388,12 @@ async def langchain_tool_loop(
         # standalone message is impossible to miss, unlike a suffix at the
         # end of a huge result.
         _transient.clear()
+        _ledger_line = context_ledger_line(msgs)
+        if _ledger_line:
+            _transient.append(HumanMessage(content=_ledger_line))
+        _search_line = search_ledger_line(msgs)
+        if _search_line:
+            _transient.append(HumanMessage(content=_search_line))
         if _batch_hint:
             _transient.append(HumanMessage(content=_batch_hint.strip()))
         if _reread_hint:

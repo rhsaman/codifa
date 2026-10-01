@@ -36,9 +36,11 @@ async def run_scenario(monkeypatch, scenario):
             requests.append([m.model_copy(deep=True) for m in messages])
             if len(requests) == 1:
                 yield AIMessageChunk(content="", tool_calls=[
-                    {"name": "grep", "args": {"pattern": (
-                        cid if scenario == "parallel" else "مشترک"
-                    )}, "id": cid}
+                    {"name": "grep", "args": (
+                        {"pattern": cid, "path": ("r1" if cid == "اول" else "r2")}
+                        if scenario == "parallel"
+                        else {"pattern": "مشترک"}
+                    ), "id": cid}
                     for cid in requested
                 ])
             else:
@@ -47,7 +49,7 @@ async def run_scenario(monkeypatch, scenario):
     started = set()
     both_started = asyncio.Event()
 
-    async def grep(pattern):
+    async def grep(pattern, path=""):
         executions.append(pattern)
         if scenario == "parallel":
             started.add(pattern)

@@ -119,12 +119,17 @@ async def test_grep_patterns_batch_single_scan():
 
 async def test_grep_patterns_dedup_and_empty():
     """الگوی تکراری/خالی حذف می‌شود؛ بدون patterns رفتار تک‌الگویی می‌ماند."""
+    from tool_batching import reset_turn_seen_calls
+
+    reset_turn_seen_calls()  # opt in: turn-scoped dup/coverage registries
     root = _make_ws()
     cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
     out = await cbs["grep"]("TARGET", patterns=["TARGET", "", "gamma"])
     assert out.startswith("MATCHES for 'TARGET|gamma'"), out
+    # Subset of a complete same-scope search: stubs instead of re-sending
+    # the rows shown above (same-turn grep coverage).
     single = await cbs["grep"]("TARGET")
-    assert single.startswith("MATCHES for 'TARGET'"), single
+    assert "DUPLICATE" in single and "covered by" in single, single
 
 
 def _make_multi_scope_ws():

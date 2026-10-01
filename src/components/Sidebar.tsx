@@ -954,7 +954,7 @@ function SidebarContent() {
                       <div
                         key={c.id}
                         className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === g.key ? " selecting" : ""}`}
-                        onClick={() => useStore.getState().setActiveChat(c.id)}
+                        onClick={() => useStore.getState().openChat(c.id)}
                         title={prepareContent(titleOf(c), dir)}
                       >
                         {selectingWsKey === g.key ? (

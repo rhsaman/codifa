@@ -736,7 +736,6 @@ export function ScheduleInbox() {
  * ران‌های واقعاً جدید (نسبت به پولینگ قبلی و دیده‌نشده‌ها) اعلان سیستم‌عامل هم
  * می‌دهند تا حتی وقتی Inbox باز نیست، کاربر خبردار شود. */
 export function ScheduleInboxButton() {
-  const setOpen = useStore((s) => s.setScheduleInboxOpen);
   const seen = useStore((s) => s.scheduleRunsSeen);
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
   const prevIdsRef = useRef<Set<string> | null>(null);
@@ -755,7 +754,12 @@ export function ScheduleInboxButton() {
       if (prev !== null) {
         const fresh = findNewScheduleRuns(prev, out, seenNow);
         if (fresh.length > 0) {
-          const openInbox = () => useStore.getState().setScheduleInboxOpen(true);
+          const openInbox = () => {
+            void import("../lib/viewerTabs").then(({ useViewerTabs }) => {
+              useViewerTabs.getState().openInbox();
+            });
+            useStore.getState().setScheduleInboxOpen(true);
+          };
           if (await ensureScheduleNotificationPermission()) {
             if (fresh.length === 1) {
               const r = fresh[0];
@@ -785,7 +789,12 @@ export function ScheduleInboxButton() {
       title={unseen > 0 ? `${unseen} new schedule runs` : "Schedule inbox"}
       aria-label="Schedule inbox"
       aria-pressed={open}
-      onClick={() => setOpen(true)}
+      onClick={() => {
+        void import("../lib/viewerTabs").then(({ useViewerTabs }) => {
+          useViewerTabs.getState().openInbox();
+        });
+        useStore.getState().setScheduleInboxOpen(true);
+      }}
     >
       <svg
         width="17"
@@ -803,5 +812,24 @@ export function ScheduleInboxButton() {
       </svg>
       {unseen > 0 && <span className="schedule-inbox-badge">{unseen}</span>}
     </button>
+  );
+}
+
+/** Docked inbox for the right editor group: forces the inbox store open while
+ *  mounted and renders the same overlay content inside a static dock wrapper
+ *  (CSS makes the overlay static). Closing the inner X closes the viewer tab. */
+export function ScheduleInboxDocked({ onClose }: { onClose: () => void }) {
+  const open = useStore((s) => s.scheduleInboxOpen);
+  const setOpen = useStore((s) => s.setScheduleInboxOpen);
+  useEffect(() => {
+    setOpen(true);
+  }, [setOpen]);
+  useEffect(() => {
+    if (!open) onClose();
+  }, [open, onClose]);
+  return (
+    <div className="viewer-inbox-wrap">
+      <ScheduleInbox />
+    </div>
   );
 }

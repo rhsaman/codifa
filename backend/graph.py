@@ -96,8 +96,18 @@ from llm import (
     normalize_tool_transcript,
 )
 from mcp_bridge import build_mcp_tools, describe_tools, is_browser_mcp_tool
-from tool_batching import execute_readonly_calls, reset_read_ledger
-from tool_message_projection import project_tool_results, stable_tool_order
+from tool_batching import (
+    execute_readonly_calls,
+    merge_same_scope_greps,
+    reset_read_ledger,
+    reset_turn_seen_calls,
+)
+from tool_message_projection import (
+    context_ledger_line,
+    project_tool_results,
+    search_ledger_line,
+    stable_tool_order,
+)
 
 # Alias kept for existing call sites; logic lives in tool_message_projection.
 _stable_tool_order = stable_tool_order
@@ -2025,28 +2035,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if project_memory:
         system_final += project_memory
 
-    # Workspace summary — cross-chat recap, only on the first message of a
-    # new chat.  Skipped for continuing conversations to avoid context bloat.
-    # Filtered to what's relevant to THIS first message so unrelated earlier
-    # work doesn't bleed into the new chat. Only the (fast, timeout-capped)
-    # relevance filter blocks this response -- the heavier merge of new
-    # turns into the cumulative summary runs as a detached background task
-    # and never delays chat creation. See _maybe_refresh_workspace_summary's
-    # docstring for details.
-    if len(state.get("history") or []) <= 1:
-        try:
-            _ws_summary = await _agents._maybe_refresh_workspace_summary(
-                root,
-                current_chat_id=chat_id,
-                model=compact_model,
-                fallback_model=model,
-                user_prompt=prompt,
-            )
-        except Exception:  # noqa: BLE001
-            _ws_summary = ""
-        if _ws_summary:
-            system_final += _ws_summary
-
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
     # (name + description) is in the prompt (except small-context models)
     # so the model can auto-trigger a skill via load_skill; @mentioned bodies
@@ -3738,6 +3726,7 @@ async def _run_mode_turn(
         # the model when a requested window is already in context.
         _reread = _SeenWindows()
         reset_read_ledger()
+        reset_turn_seen_calls()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
         # the HumanMessage is appended AFTER the tool results (keeping the
@@ -4441,10 +4430,16 @@ async def _run_mode_turn(
             _sequential = [
                 tc for tc in _pending if (tc.get("name") or "") in _SEQUENTIAL_TOOLS
             ]
+            # Back-to-back greps on one scope run as ONE scan: merge first
+            # so the trace shows one row and the transcript carries the
+            # block once (siblings get a pointer). Habits are still tracked
+            # on the original calls; the merge advice runs on the merged
+            # list so it never re-suggests what the loop just did.
+            _exec_calls, _expand_merged = merge_same_scope_greps(_parallel)
             # Always observe — `or` would short-circuit the tracker whenever
             # the per-step detector fires, so that step would never be
             # recorded and the cross-step count would restart from zero.
-            _step_hint = _batchable_nudge(_pending)
+            _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
             # Coverage check BEFORE observe records this step: fully covered
@@ -4456,8 +4451,9 @@ async def _run_mode_turn(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
                 )
 
-            _results = await execute_readonly_calls(_parallel, _run_readonly, query=state.get("request") or "")
-            for tc, result in zip(_parallel, _results):
+            _results = await execute_readonly_calls(_exec_calls, _run_readonly, query=state.get("request") or "")
+            _expanded = _expand_merged(_results)
+            for tc, result in zip(_parallel, _expanded):
                 _cid = tc.get("id", "")
                 if _cid in _cover_stubs:
                     result = _cover_stubs[_cid]
@@ -4509,6 +4505,12 @@ async def _run_mode_turn(
             # the end of a huge result. Surfaced to the user once per turn so
             # the UI shows the nudge is actually firing.
             _transient_msgs.clear()
+            _ledger_line = context_ledger_line(msgs)
+            if _ledger_line:
+                _transient_msgs.append(HumanMessage(content=_ledger_line))
+            _search_line = search_ledger_line(msgs)
+            if _search_line:
+                _transient_msgs.append(HumanMessage(content=_search_line))
             if _batch_hint:
                 if not _batch_warned:
                     _batch_warned = True

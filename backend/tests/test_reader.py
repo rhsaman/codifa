@@ -339,7 +339,10 @@ async def test_read_file_xml_format(tmp_path):
     assert "1 | alpha" in out
     assert "2 | beta" in out
     assert "3 | gamma" in out
-    assert "(End of file - total 3 lines)" in out
+    # Single reads run the batch pipeline: compact position marker + one
+    # shared footer instead of the old per-read guidance footers.
+    assert "(a.py: lines 1-3 of 3)" in out
+    assert "Batch complete" in out
 
 
 @pytest.mark.asyncio
@@ -352,8 +355,8 @@ async def test_read_file_more_footer(tmp_path):
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(filePath="a.py", offset=1, limit=5)
-    assert "(Showing lines 1-5 of 400." in out
-    assert "symbols=[...]" in out
+    assert "(a.py: lines 1-5 of 400)" in out
+    assert "Batch complete" in out
     assert "Use offset=" not in out
     assert "<path>a.py</path>" in out
     assert "<type>file</type>" in out
@@ -370,23 +373,33 @@ async def test_read_small_file_returns_whole(tmp_path):
     out = await read(filePath="a.py", offset=1, limit=5)
     assert "1 | line1" in out
     assert "20 | line20" in out
-    assert "(End of file - total 20 lines)" in out
+    assert "(a.py: lines 1-20 of 20)" in out
+    assert "Batch complete" in out
 
 
 @pytest.mark.asyncio
 async def test_read_file_cut_footer(tmp_path):
-    # Many SHORT lines so the accumulated output crosses the 50 KB byte cap
-    # (MAX_READ_EXCERPT_BYTES) well before the line `limit`, exercising the
-    # `cut` branch (not `more`). Each line is ~100 bytes; 1000 lines > 50 KB.
+    # Bulk head read of a 1000-line file serves a file map instead of a
+    # capped dump: structure first, content via symbols=/ranges=.
+    # (Many SHORT lines: ~100 bytes each, 1000 lines > 50 KB.)
     f = tmp_path / "big.py"
     f.write_text("".join(f"x = {i:06d} " + "y" * 80 + "\n" for i in range(1000)))
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(filePath="big.py", offset=1, limit=2000)
-    assert "Output capped at" in out
-    assert "symbols=[...]" in out
-    assert "Use offset=" not in out
-    assert "(End of file" not in out
+    assert "file map" in out
+    assert "has 1000 lines" in out
+    assert "no indexable symbols" in out
+    assert "read exact ranges" in out
+    # The byte-cap branch itself still fires for non-head windows, but
+    # batch members carry only the compact position marker — the paging
+    # guidance lives once in the shared footer, not per block.
+    out2 = await read(filePath="big.py", offset=200, limit=2000)
+    assert "(big.py: lines" in out2
+    assert "Batch complete" in out2
+    assert "Output capped at" not in out2
+    assert "Use offset=" not in out2
+    assert "(End of file" not in out2
 
 
 @pytest.mark.asyncio
@@ -408,8 +421,9 @@ async def test_read_dir_xml_format(tmp_path):
 
 @pytest.mark.asyncio
 async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
-    """A re-read of the same region returns the cached bytes (no re-scan), and
-    an edit invalidates the cache so the next read reflects the new content."""
+    """An unchanged re-read is stubbed (no re-send); the byte cache underneath
+    still serves identical bytes (proven after clearing reuse memory), and an
+    edit invalidates everything so the next read reflects the new content."""
     f = tmp_path / "a.py"
     f.write_text("alpha\nbeta\n")
     root = str(tmp_path)
@@ -425,9 +439,20 @@ async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
 
     r1 = await read(filePath="a.py")
     assert "1 | alpha" in r1 and "2 | beta" in r1
-    # Second read of the same path/offset/limit hits the cache (summary "cached").
+    # Second read of the same path/offset/limit: file unchanged -> stubbed,
+    # full text NOT re-sent.
     r2 = await read(filePath="a.py")
-    assert r1 == r2
+    assert r2.startswith("SKIPPED (already in context)"), r2
+    assert "fetched before" in r2, r2
+    assert "1 | alpha" not in r2, r2
+
+    # The byte cache underneath is intact: with reuse memory cleared, the
+    # same read returns the cached bytes (summary "cached").
+    from tool_batching import reset_cross_turn
+
+    reset_cross_turn()
+    r2b = await read(filePath="a.py")
+    assert r1 == r2b
     assert any(
         e.get("kind") == "tool_result" and e.get("summary") == "cached" for e in captured
     )
@@ -464,9 +489,19 @@ async def test_read_cache_invalidates_across_path_spellings(tmp_path):
 
     r1 = await read(filePath="a.py")
     assert "1 | alpha" in r1
-    # Same path, different spelling -> must still hit the cache (same normalized key).
+    # Same path, different spelling -> spelling-normalized reuse stub
+    # (same normalized key), not a re-send.
     r2 = await read(filePath="./a.py")
-    assert r1 == r2
+    assert r2.startswith("SKIPPED (already in context)"), r2
+    assert "1 | alpha" not in r2, r2
+
+    # With reuse memory cleared the byte cache still matches across
+    # spellings (summary "cached").
+    from tool_batching import reset_cross_turn
+
+    reset_cross_turn()
+    r2b = await read(filePath="./a.py")
+    assert r1 == r2b
     assert any(
         e.get("kind") == "tool_result" and e.get("summary") == "cached" for e in captured
     )
@@ -611,15 +646,19 @@ async def test_read_snaps_to_block_end(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_batch_broadcast_past_eof_guides_to_ranges(tmp_path):
+async def test_read_batch_broadcast_past_eof_serves_from_line_one(tmp_path):
     """One shared offset/limit across different-size files past-EOFs on the
-    short ones — the footer must steer to per-file ranges= windows."""
+    short ones — the short file is served from line 1 with a note instead of
+    burning another step on an error, and the footer still steers to
+    per-file ranges= windows."""
     (tmp_path / "big.py").write_text("".join(f"line{i}\n" for i in range(1, 401)))
     (tmp_path / "small.py").write_text("only\n")
     root = str(tmp_path)
     read, _ = _make_read(root)
     out = await read(filePath="big.py", filePaths=["small.py"], offset=300, limit=50)
-    assert "past the end of the file" in out
+    assert "ERROR" not in out, out
+    assert "(offset 300 is past the end of small.py; showing from line 1 instead)" in out
+    assert "only" in out
     assert "ranges=" in out
 
 

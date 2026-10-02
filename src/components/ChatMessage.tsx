@@ -1498,7 +1498,21 @@ export const ChatMessageView = memo(
 
   // A steer confirmed by the backend (steer_applied) is rendered inline inside
   // the assistant message it interrupted — hide its own otherwise-bottom bubble.
-  if (isUser && message.steerInterleaved) return null;
+  // Fallback: if no assistant message actually references this steer as a
+  // segment (retry wiped segments, parent truncated/compacted), do NOT hide —
+  // otherwise the message suddenly vanishes with no inline copy.
+  if (isUser && message.steerInterleaved) {
+    const referenced = useStore
+      .getState()
+      .chats.some((c) =>
+        c.messages.some((m) =>
+          (m.segments ?? []).some(
+            (s) => s.kind === "user" && (s as { id: string }).id === message.id,
+          ),
+        ),
+      );
+    if (referenced) return null;
+  }
 
   // While the provider is retrying, the assistant message has no content yet —
   // hide the empty placeholder so the retry banner (rendered once, at the END
@@ -1823,7 +1837,10 @@ export const ChatMessageView = memo(
             (message.thinkingActive ? (
               <ThinkingIndicator startedAt={message.thinkingStartedAt} />
             ) : (
-              <ThinkingIndicator label="Working" startedAt={message.workingStartedAt} />
+              <ThinkingIndicator
+                label={message.statusText ? `Working · ${message.statusText}` : "Working"}
+                startedAt={message.workingStartedAt}
+              />
             ))}
           {/* Finished turn without usage: the live indicator above unmounts, so
               the stamped duration takes its place (same side of the footer). */}
@@ -1895,6 +1912,7 @@ export const ChatMessageView = memo(
       a.modeSwitch === b.modeSwitch &&
       a.steerPending === b.steerPending &&
       a.steerInterleaved === b.steerInterleaved &&
+      (a as { statusText?: string }).statusText === (b as { statusText?: string }).statusText &&
       a.interrupted === b.interrupted
     );
   },

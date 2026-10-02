@@ -167,3 +167,85 @@ def _await(value):
         return value
 
     return _coro()
+
+
+@pytest.mark.asyncio
+async def test_update_plan_repeat_without_progress_nudges(tmp_path):
+    # Re-sending an unchanged checklist after tool work ran must say so in the
+    # result string (the stuck-at-0/N pattern) instead of silently confirming —
+    # the todos panel only moves when statuses move.
+    import tools as tools_mod
+    from tools import make_tool_callbacks
+
+    chat = "c-nudge-repeat"
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+    tools = make_tool_callbacks(
+        root=str(tmp_path), emit=lambda _e: None, main_model=None, chat_id=chat
+    )
+    items = [
+        {"content": "step one", "status": "pending"},
+        {"content": "step two", "status": "pending"},
+    ]
+    r1 = await tools["update_plan"](items)
+    assert "without advancing" not in r1
+    # Real (mutating) tool work runs after the checklist was set...
+    w = await tools["write_file"](path="n.txt", content="hello")
+    assert "Successfully wrote" in w
+    # ...then the model re-sends the identical checklist: must be called out.
+    r2 = await tools["update_plan"](items)
+    assert "without advancing any status" in r2, r2
+    assert "solo update_plan is fine" in r2
+    # Advancing a status clears it: real progress → no note.
+    r3 = await tools["update_plan"](
+        [
+            {"content": "step one", "status": "completed"},
+            {"content": "step two", "status": "in_progress"},
+        ]
+    )
+    assert "without advancing" not in r3
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+
+
+@pytest.mark.asyncio
+async def test_plan_nudge_fires_with_all_pending_open_list(tmp_path):
+    # An all-pending checklist must still be reminded after mutating work —
+    # previously only an in_progress-stuck list was reminded, so an
+    # all-pending list went stale silently while edits ran (todos never ticked).
+    import tools as tools_mod
+    from tools import make_tool_callbacks
+
+    chat = "c-nudge-all-pending"
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+    tools = make_tool_callbacks(
+        root=str(tmp_path), emit=lambda _e: None, main_model=None, chat_id=chat
+    )
+    await tools["update_plan"](
+        [
+            {"content": "step one", "status": "pending"},
+            {"content": "step two", "status": "pending"},
+        ]
+    )
+    out = await tools["write_file"](path="n.txt", content="hello")
+    assert "checklist still has open steps" in out, out
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+
+
+@pytest.mark.asyncio
+async def test_plan_nudge_silent_without_checklist(tmp_path):
+    # No checklist → no nag on mutating tools (no spurious reminders on
+    # trivial single-step turns that correctly skipped update_plan).
+    import tools as tools_mod
+    from tools import make_tool_callbacks
+
+    chat = "c-nudge-none"
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+    tools = make_tool_callbacks(
+        root=str(tmp_path), emit=lambda _e: None, main_model=None, chat_id=chat
+    )
+    out = await tools["write_file"](path="n.txt", content="hello")
+    assert "checklist" not in out, out

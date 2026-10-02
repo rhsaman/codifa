@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { useTracePanel, type TraceTab } from "../lib/tracePanel";
+import { useViewerTabs } from "../lib/viewerTabs";
+import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { clearChatTraces, getChatTraces } from "../lib/api";
 import { copyToClipboard } from "../lib/clipboard";
 import type { TraceEntry } from "../types";
@@ -18,12 +20,36 @@ const TABS: Array<[TraceTab, string]> = [
   ["tool", "Tools"],
 ];
 
+/** Only top-level tool calls count as tools so the Tools tab matches chat cards. Chat shows one card per tool invocation, while the trace stream holds a separate tool_result entry per call, so tool_result must not be counted or listed in the Tools tab. Sub-agent calls (detail.sub) are nested under the parent card in chat, so they are excluded as well. */
+export function isToolTraceKind(kind: string): boolean {
+  return kind === "tool";
+}
+
+export function isSubToolTrace(entry: TraceEntry): boolean {
+  return Boolean((entry.detail as Record<string, unknown> | undefined)?.sub);
+}
+
+/** Pure tab counts for tests: All counts every entry, Tools counts only top-level tool calls. */
+export function getTraceTabCounts(entries: TraceEntry[]): Record<string, number> {
+  const c: Record<string, number> = { all: entries.length, laya: 0, llm: 0, prompt: 0, tool: 0 };
+  for (const e of entries) {
+    const raw = e.kind as string;
+    if (raw === "tool") {
+      if (isSubToolTrace(e)) continue;
+      c.tool += 1;
+    } else if (raw in c) {
+      c[raw] += 1;
+    }
+  }
+  return c;
+}
+
 /** خلاصه تمیز یک ورودی برای ردیف تاشو — fallback وقتی summary خالی است. */
 export function traceRowTitle(entry: TraceEntry): string {
   if ((entry.summary || "").trim()) return entry.summary;
   if (entry.kind === "llm") return `${entry.model || "llm"} · ${entry.tokens?.total ?? 0} tokens`;
   if (entry.kind === "prompt") return `prompt · ${(entry.prompt || "").length} chars`;
-  if (entry.kind === "tool") {
+  if (entry.kind === "tool" || (entry.kind as string) === "tool_result") {
     const name = String((entry.detail as Record<string, unknown> | undefined)?.name || entry.model || "tool");
     return name;
   }
@@ -601,11 +627,17 @@ export function TracePanel(props?: {
   }, []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") {
+        if (docked && useViewerTabs.getState().fullscreen) {
+          useViewerTabs.getState().setFullscreen(false);
+          return;
+        }
+        close();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
+  }, [close, docked]);
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -674,16 +706,15 @@ export function TracePanel(props?: {
     };
   }, [activeChatId, fetchAll]);
 
-  const counts = useMemo(() => {
-    const c: Record<string, number> = { all: entries.length, laya: 0, llm: 0, prompt: 0, tool: 0 };
-    for (const e of entries) {
-      if (e.kind in c) c[e.kind] += 1;
-    }
-    return c;
-  }, [entries]);
+  const counts = useMemo(() => getTraceTabCounts(entries), [entries]);
 
   const visible = useMemo(() => {
-    const byTab = tab === "all" ? entries : entries.filter((e) => e.kind === tab);
+    const byTab =
+      tab === "all"
+        ? entries
+        : tab === "tool"
+          ? entries.filter((e) => isToolTraceKind(e.kind as string) && !isSubToolTrace(e))
+          : entries.filter((e) => e.kind === tab);
     // Chronological: oldest at top, newest at bottom (scroll up for history).
     return filterTraces(byTab, query);
   }, [entries, tab, query]);
@@ -752,7 +783,7 @@ export function TracePanel(props?: {
 
   const panel = (
     <div
-      className={docked ? undefined : `review-overlay${fullscreen ? " fullscreen" : ""}`}
+      className={docked ? "review-docked-wrap" : `review-overlay${fullscreen ? " fullscreen" : ""}`}
       dir="ltr"
       style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
@@ -776,8 +807,9 @@ export function TracePanel(props?: {
                 className={`review-source-btn${tab === key ? " active" : ""}`}
                 onClick={() => setTab(key)}
                 title={key === "all" ? "Show everything" : `Filter: ${label}`}
+                aria-label={`${label}, ${counts[key] ?? 0} items`}
               >
-                {label}
+                <span className="trace-tab-label">{label}</span>
                 <span className="trace-tab-count">{counts[key] ?? 0}</span>
               </button>
             ))}
@@ -798,28 +830,17 @@ export function TracePanel(props?: {
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /></svg>
             </button>
+            {!docked && <ViewerFullscreenButton docked={docked} fullscreen={fullscreen} onToggleFullscreen={() => setFullscreen((v) => !v)} />}
             {!docked && (
               <button
                 className="review-header-btn"
-                title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-                aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-                onClick={() => setFullscreen((v) => !v)}
+                title="Close"
+                aria-label="Close"
+                onClick={close}
               >
-                {fullscreen ? (
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
-                ) : (
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
-                )}
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
               </button>
             )}
-            <button
-              className="review-header-btn"
-              title="Close"
-              aria-label="Close"
-              onClick={close}
-            >
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-            </button>
           </span>
         </div>
         <div className="trace-subheader">

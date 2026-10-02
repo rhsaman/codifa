@@ -10,7 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { resetStreamForRetry, isKeepTextRetry } from "../lib/retry";
+import { resetStreamForRetry, isKeepTextRetry, planRetry } from "../lib/retry";
 import {
   applyToolEvent,
   diffStatsFromUnified,
@@ -99,7 +99,6 @@ import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
-import { shouldAutoOpenTodosPanel } from "./TodosPanel";
 import { visibleChatMessages } from "../lib/compactDedupe";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
@@ -375,6 +374,13 @@ export function ChatPanel() {
     setMsgLimit(MSG_PAGE);
     stickToBottom.current = !chat?.scrollPos || chat.scrollPos.atBottom;
     restoredRef.current = false;
+    // The restore layout effect below must re-run for the NEW chat with the
+    // NEW chat's saved position (not the mount-time one): refresh the anchor
+    // and bump a tick so the effect fires even when every other state setter
+    // bails out identical. Without this, switching to a scrolled-up chat can
+    // land on a stale anchor — or the oldest-message fallback, i.e. the top.
+    initialScrollPosRef.current = chat?.scrollPos ?? null;
+    setRestoreTick((t) => t + 1);
     restoreTargetRef.current = null;
     lastScrollPosRef.current = null;
     chatIdRef.current = id;
@@ -494,11 +500,12 @@ export function ChatPanel() {
   );
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
-  // Per-chat scroll restoration: captured once per mount (the panel remounts on
-  // every chat switch via key={activeChatId}). If the user last left this chat
-  // scrolled up, don't auto-pin to the bottom on return.
-  const [initialScrollPos] = useState(() => chat?.scrollPos ?? null);
-  const stickToBottom = useRef(!initialScrollPos || initialScrollPos.atBottom);
+  // Per-chat scroll restoration: the panel stays mounted across chat
+  // switches (no key={activeChatId}), so the restore anchor is refreshed on
+  // every switch (see the chat-id effect above). If the user last left this
+  // chat scrolled up, don't auto-pin to the bottom on return.
+  const initialScrollPosRef = useRef(chat?.scrollPos ?? null);
+  const stickToBottom = useRef(!initialScrollPosRef.current || initialScrollPosRef.current.atBottom);
   // A jump-to-bottom smooth scroll started by the scroll-jump button is still
   // in flight: while set, onChatScroll ignores the animation's intermediate
   // scroll events so they can't unpin the view or pop the button back.
@@ -543,6 +550,9 @@ export function ChatPanel() {
   const prependAnchorRef = useRef<number | null>(null);
   /** True once the saved scroll position has been restored this mount. */
   const restoredRef = useRef(false);
+  /** Bumped on every chat switch so the restore layout effect below re-runs
+   *  for the incoming chat even when all other state setters bail out. */
+  const [restoreTick, setRestoreTick] = useState(0);
   /** Last computed scroll anchor (updated on every user scroll; flushed to the
    *  store on unmount / app close so a quick chat switch never loses the
    *  viewport). */
@@ -1095,10 +1105,10 @@ export function ChatPanel() {
 
   // Restore the saved scroll position once the anchor message is rendered.
   // Runs before paint, so the viewport lands where the user left it without a
-  // visible jump. Fires once per mount (restoredRef).
+  // visible jump. Fires on mount and on every chat switch (restoreTick).
   useLayoutEffect(() => {
     if (restoredRef.current) return;
-    const pos = initialScrollPos;
+    const pos = initialScrollPosRef.current;
     const el = scrollRef.current;
     if (!el) return;
     if (!pos || pos.atBottom) {
@@ -1159,7 +1169,7 @@ export function ChatPanel() {
     // as the browser actually renders the content around the anchor, until the
     // position stabilizes or the user scrolls away.
     restoreTargetRef.current = { id: anchorId, offset: pos.offset };
-  }, [initialScrollPos, msgLimit, chat]);
+  }, [restoreTick, msgLimit, chat]);
 
   // Flush the saved scroll position on unmount (chat switch) and on app close
   // (pagehide/beforeunload) so the last viewport is never lost. The store write
@@ -1343,7 +1353,7 @@ export function ChatPanel() {
     reuseMsgId?: string,
     continueAssistantId?: string,
     forceScroll = false,
-    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[] },
+    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[]; restart?: boolean },
     forChatId?: string,
   ) => {
     // Per-chat isolation: resolve the ORIGIN chat first (background drains via
@@ -1675,6 +1685,23 @@ export function ChatPanel() {
       // work, not stalled on the provider.
       const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
       const elapsed = Date.now() - lastEventAtMs;
+      // Early feedback (not a retry): after 25s of total silence the Working
+      // pill explains the wait instead of looking frozen. Cleared by any real
+      // event via statusText: undefined in text/tool/thinking handlers.
+      if (elapsed > 25_000 && elapsed <= limit) {
+        const cur = useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id)
+          ?.messages.find((m) => m.id === assistantMsg.id);
+        if (cur && !cur.statusText && !cur.retry) {
+          useStore.getState().updateMessage(assistantMsg.id, {
+            statusText: isToolRunning(toolRunning)
+              ? "tool running"
+              : "waiting for model",
+          });
+        }
+        return;
+      }
       if (elapsed <= limit) {
         stalledSinceMs = null;
         return;
@@ -1833,11 +1860,16 @@ export function ChatPanel() {
         return;
       }
       lastEventAtMs = Date.now();
-      const store = useStore.getState();
+      // Live reads: `useStore.getState()` on every event. A snapshot captured
+      // once per turn goes stale after the first updateMessage, and the second
+      // event then overwrites the first one's segments (steer segment lost when
+      // a tool card lands right after steer_applied — the vanish bug).
       const findMsg = () =>
-        store.chats
-          .find((c) => c.id === chat.id)
+        useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
+      const store = useStore.getState();
       // A transient retry banner ("Provider hiccup — retrying…") must retire
       // as soon as the turn shows ANY activity — not only text. After a
       // successful retry the model often resumes straight into a tool loop
@@ -1869,6 +1901,7 @@ export function ChatPanel() {
           segments: appendTextSegment(findMsg()?.segments, chunk),
           retry: null,
           thinkingActive: false,
+          statusText: undefined,
         });
       } else if (event.kind === "thinking") {
         // Lightweight signal: the backend now emits active:True ONLY when the
@@ -1882,6 +1915,7 @@ export function ChatPanel() {
           // retry resumed into a long thinking pass before the first text/tool
           // chunk arrives), clear it now — the model is clearly working again.
           retry: null,
+          ...(event.active ? { statusText: undefined } : {}),
         });
       } else if (event.kind === "skill") {
         // Successful @mention attachments are deliberately NOT rendered into
@@ -1949,8 +1983,22 @@ export function ChatPanel() {
         // fragments. `applyToolEvent` nests sub-events by branch even when the
         // parent card is already "done".
         if (event.sub) {
-          const next = applyToolEvent(findMsg()?.toolActivity ?? [], event);
-          store.updateMessage(assistantMsg.id, { toolActivity: next });
+          const currentSub = findMsg()?.toolActivity ?? [];
+          const next = applyToolEvent(currentSub, event);
+          // Orphan sub-events promoted to top-level cards (no matching task
+          // card) grow the list — they need their own segment, otherwise
+          // renderSegments never shows them (visible in trace, missing in chat).
+          if (next.length > currentSub.length) {
+            const toolIndex = currentSub.length;
+            store.updateMessage(assistantMsg.id, { toolActivity: next });
+            // Atomic segment append so a concurrent steer_applied cannot be
+            // overwritten by this wholesale segments replace (the vanish bug).
+            useStore.getState().appendMessageSegments(assistantMsg.id, [
+              { kind: "tool", index: toolIndex } as MessageSegment,
+            ]);
+          } else {
+            store.updateMessage(assistantMsg.id, { toolActivity: next });
+          }
         } else {
           // Top-level tool event. De-dupes against an existing card with the
           // same callId (provider-native id or LangChain numeric): the
@@ -1964,14 +2012,17 @@ export function ChatPanel() {
           // it dedupes — checking `next.length` against `current.length` is
           // the cheapest way to tell "new card" from "merged into existing".
           if (next.length > current.length) {
+            const toolIndex = current.length;
             store.updateMessage(assistantMsg.id, {
               toolActivity: next,
-              segments: [
-                ...(findMsg()?.segments ?? []),
-                { kind: "tool", index: current.length } as MessageSegment,
-              ],
               retry: null,
+              statusText: undefined,
             });
+            // Atomic segment append so a concurrent steer_applied cannot be
+            // overwritten by this wholesale segments replace (the vanish bug).
+            useStore.getState().appendMessageSegments(assistantMsg.id, [
+              { kind: "tool", index: toolIndex } as MessageSegment,
+            ]);
           } else {
             store.updateMessage(assistantMsg.id, { toolActivity: next });
           }
@@ -2149,40 +2200,15 @@ export function ChatPanel() {
           if (!sendPendingSteerNext(chat.id)) sendQueuedNext(chat.id);
         }, 0);
       } else if (event.kind === "plan") {
+        // Backend emits the authoritative merged checklist (preserves completed,
+        // handles steer edits/removals). Replace — never merge stale extras back.
         const incoming = event.items ?? [];
-        // Get current plan from store (not stale assistantMsg.plan)
-        const currentMsg = findMsg();
-        const existing = currentMsg?.plan ?? [];
-        const hasOverlap = incoming.some(
-          (n) => n.id && existing.some((e) => e.id === n.id),
-        );
-        const merged = hasOverlap
-          ? existing
-            .map((e) => {
-              const upd = incoming.find((n) => n.id && n.id === e.id);
-              return upd ? { ...e, ...upd } : e;
-            })
-            .concat(
-              incoming.filter(
-                (n) => !n.id || !existing.some((e) => e.id === n.id),
-              ),
-            )
-          : incoming;
         store.updateMessage(assistantMsg.id, {
-          plan: merged,
+          plan: incoming,
           retry: null,
         });
-        // تودوی تازه ساخته شد و پنل بسته است → پنل راست خودکار باز شود تا
-        // کاربر تودوها را ببیند. فقط ساختِ تازه (نه آپدیت وضعیت) باز می‌کند.
-        if (
-          shouldAutoOpenTodosPanel(
-            existing.length,
-            merged.length,
-            store.rightPanelOpen,
-          )
-        ) {
-          store.setRightPanelOpen(true);
-        }
+        // پنل راست هرگز خودکار باز نمی‌شود — حتی با ساخت تودوی تازه؛
+        // فقط کاربر با دکمه/میان‌بر آن را باز می‌کند.
       } else if (event.kind === "permission") {
         useStore.getState().setChatPendingPermission(chat.id, {
           id: event.id ?? "",
@@ -2252,27 +2278,64 @@ export function ChatPanel() {
         // result). Move each one inline: hide its own bottom bubble and append
         // a user segment to the CURRENT assistant message, right after the tool
         // call that carried it — so the agent's later text and tool calls all
-        // render BELOW the steer, in real order. Also clearthe steerPending flag
+        // render BELOW the steer, in real order. Also clear the steerPending flag
         // so the turn's finally block does NOT re-send it as a new turn.
+        // Atomic append (no wholesale segments replace) so a tool/text event
+        // landing right after cannot drop the steer segment. Only messages
+        // actually anchored as a segment are hidden — otherwise the bubble
+        // stays visible instead of vanishing.
         const ids = Array.isArray(event.ids) ? event.ids : [];
-        const segments = findMsg()?.segments ?? [];
-        const nextSegments = [...segments];
+        const live = useStore.getState();
+        const toAnchor: Array<{ kind: "user"; id: string }> = [];
         for (const id of ids) {
-          const userMsg = store.chats
+          const userMsg = live.chats
             .find((c) => c.id === chat.id)
             ?.messages.find((m) => m.id === id);
           if (!userMsg || userMsg.role !== "user") continue;
-          nextSegments.push({ kind: "user", id });
+          toAnchor.push({ kind: "user", id });
         }
-        if (nextSegments.length > segments.length) {
-          store.updateMessage(assistantMsg.id, { segments: nextSegments });
+        if (toAnchor.length > 0) {
+          live.appendMessageSegments(assistantMsg.id, toAnchor);
         }
-        for (const id of ids) {
-          store.updateMessage(id, {
+        // Re-read: appendMessageSegments dedupes, so verify each id actually
+        // has a segment before hiding its bubble.
+        const anchoredIds = new Set(
+          (useStore.getState().chats
+            .find((c) => c.id === chat.id)
+            ?.messages.find((m) => m.id === assistantMsg.id)?.segments ?? [])
+            .filter((s) => s.kind === "user")
+            .map((s) => (s as { id: string }).id),
+        );
+        for (const seg of toAnchor) {
+          if (!anchoredIds.has(seg.id)) continue;
+          useStore.getState().updateMessage(seg.id, {
             steerPending: false,
             steerInterleaved: true,
           });
         }
+      } else if (event.kind === "steer_dropped") {
+        // Backend discarded these steers without injecting (turn ended with no
+        // tool call to carry them). Keep them visible/pending so the auto-drain
+        // re-sends them as the next turn instead of losing them.
+        const ids = Array.isArray(event.ids) ? event.ids : [];
+        for (const id of ids) {
+          useStore.getState().updateMessage(id, {
+            steerPending: true,
+            steerInterleaved: false,
+          });
+        }
+      } else if (event.kind === "status") {
+        // Staged progress before first token (preparing context, contacting
+        // model, retrying). Shown in the Working pill so a slow turn does not
+        // look frozen. Cleared on first real text/tool/thinking content.
+        lastEventAtMs = Date.now();
+        const label =
+          typeof event.content === "string" && event.content.trim()
+            ? event.content.trim().slice(0, 120)
+            : typeof (event as { stage?: unknown }).stage === "string"
+              ? String((event as { stage?: unknown }).stage).slice(0, 120)
+              : "Working";
+        useStore.getState().updateMessage(assistantMsg.id, { statusText: label });
       } else if (event.kind === "laya") {
         // فعالیت زنده تصمیم سریع laya — جدا از رویداد usage (مصرف دست‌نخورده
         // می‌ماند)؛ در تاریخچه همان چت مبدأ استریم ثبت می‌شود (نه چت فعال لحظه‌ای)
@@ -2354,6 +2417,20 @@ export function ChatPanel() {
         // re-set it after the stream closes.
         lastEventAtMs = Date.now();
         resolveStuckCards();
+        useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined });
+        // Backend reports steers it discarded without injecting
+        // (dropped_steer_ids). Keep them pending/visible so the auto-drain
+        // below re-sends them as the next turn instead of losing them.
+        const dropped = (event as { dropped_steer_ids?: unknown }).dropped_steer_ids;
+        if (Array.isArray(dropped)) {
+          for (const id of dropped) {
+            if (typeof id !== "string" || !id) continue;
+            useStore.getState().updateMessage(id, {
+              steerPending: true,
+              steerInterleaved: false,
+            });
+          }
+        }
         // A create_mcp ran this turn: the connector was saved to the app's user
         // data folder by the backend, but the store's mcpServers snapshot is only hydrated
         // once at app startup — re-fetch so Settings → MCP shows it without a
@@ -2448,6 +2525,7 @@ export function ChatPanel() {
           ),
           compactAtPercent: s.settings.compactAtPercent ?? 80,
         maxSteps: s.maxSteps ?? 0,
+          restart: overrides?.restart ?? false,
           signal: abort.signal,
         },
         handleEvent,
@@ -2908,12 +2986,12 @@ export function ChatPanel() {
               m.content.includes("[Interrupted before finishing"))),
       );
     if (failed) {
-      // send() reuses the existing user bubble (no duplicate), clears the
-      // retry banner, and keeps the failed assistant message in history so
-      // the model sees the partial work + preserved tool list and continues
-      // (promptWithResume reinforces the plan continuation).
-      // Pin origin so the resume lands in THIS chat even if the user switched
-      // during the abort tick.
+      // RESUME via planRetry (banner semantics): reuse the existing user bubble
+      // (no duplicate) AND continue the SAME assistant bubble so toolActivity,
+      // plan and preservedToolSummary stay on one message. Backend resumes from
+      // its checkpoint (restart=false) instead of redoing completed tools.
+      const plan = planRetry(ch.messages, userMsg.id, 'banner');
+      const continueId = plan?.target.continueAssistantId ?? failed.id;
       const targetId = ch.id;
       setTimeout(
         () =>
@@ -2923,7 +3001,7 @@ export function ChatPanel() {
             userMsg.images ?? [],
             false,
             userMsg.id,
-            undefined,
+            continueId,
             false,
             undefined,
             targetId,
@@ -2996,12 +3074,13 @@ export function ChatPanel() {
       // Give the abort's finally block a tick to reset busy/streaming state
       // before re-sending (send() re-sets busy=true itself, but the abort's
       // finally would otherwise clear it mid-run). Pin origin chat.
+      // restart=true clears the backend checkpoint so old tool work is NOT replayed.
       {
         const targetId = ch.id;
         const atts = userMsg.attachments ?? [];
         const imgs = userMsg.images ?? [];
         setTimeout(
-          () => send(text, atts, imgs, false, undefined, undefined, false, undefined, targetId),
+          () => send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
           0,
         );
       }
@@ -4005,12 +4084,11 @@ export function ChatPanel() {
                 stalled={stalled}
                 startedAt={effectiveRetry.startedAt}
                 onRetry={() => {
-                  // Resume-only: re-send the last user turn WITHOUT deleting
-                  // anything. The error banner must never fall through to
-                  // retryMessage's truncate-and-restart branch (which wipes the
-                  // whole turn) — it only appears when there is no failed
-                  // assistant message to resume, so we go straight to the
-                  // resume path here.
+                  // Resume-only (banner semantics via planRetry): re-send the last
+                  // user turn WITHOUT deleting anything, reusing the user bubble
+                  // and continuing the failed assistant bubble so completed tools,
+                  // plan and preservedToolSummary are kept. Never falls through
+                  // to truncate-and-restart.
                   const msgs = chat?.messages ?? [];
                   const idx = retryingMsg
                     ? msgs.findIndex((m) => m.id === retryingMsg.id)
@@ -4021,12 +4099,14 @@ export function ChatPanel() {
                     .reverse()
                     .find((m) => m.role === "user");
                   if (userMsg) {
+                    const plan = planRetry(msgs, userMsg.id, 'banner');
                     send(
                       userMsg.content,
                       userMsg.attachments ?? [],
                       userMsg.images ?? [],
                       false,
                       userMsg.id,
+                      plan?.target.continueAssistantId ?? retryingMsg?.id,
                     );
                   }
                 }}

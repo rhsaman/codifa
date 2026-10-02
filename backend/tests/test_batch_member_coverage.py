@@ -179,6 +179,29 @@ async def test_path_spelling_normalized(tmp_path):
     assert out2.startswith("SKIPPED (already in context)"), out2
 
 
+async def test_same_turn_partial_overlap_omits_served_lines(tmp_path):
+    """Partial overlap within the same turn omits served lines, not re-sends.
+
+    Regression for back-to-back reads like 640-879 then 630-649: the second
+    body must skip the 640-649 lines already in context and serve only the
+    630-639 sliver (+ omission note), instead of duplicating 10 lines.
+    """
+    import tools
+
+    _fresh()
+    _ws(str(tmp_path), "a.py", 500, "aLINE")
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
+    out1 = await cbs["read"]("a.py", offset=1, limit=100)
+    # Sanity: first window served (1-100 of the 500-line file).
+    assert "aLINE90" in out1, out1
+    # Overlapping repeat: 80-179 overlaps served 1-100 on 80-100.
+    out2 = await cbs["read"]("a.py", offset=80, limit=100)
+    assert "already in context" in out2, out2
+    assert "omitted; showing only new lines" in out2, out2
+    assert "aLINE90" not in out2, out2
+    assert "aLINE150" in out2, out2
+
+
 async def test_identical_members_served_once(tmp_path):
     import tools
 

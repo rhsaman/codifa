@@ -40,6 +40,7 @@ EXPLORE_SYSTEM = (
     "You are a file-search specialist for research. "
     "Return a COMPACT report: a 3-5 line summary + a list of "
     "`path:line:snippet` findings (absolute paths). No prose.\n\n"
+    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries first, then fire ALL Glob/Grep discovery in ONE parallel batch — never one grep per turn. Then fire ALL reads in ONE batch via filePaths=[...] or ranges=[...]. Then report. NEVER interleave search→read→search→read across many rounds. If a result starts with DUPLICATE/REUSED/SKIPPED/cached/covered, that content is already in context — NEVER re-issue it; summarize immediately. Independent run_terminal checks chain in ONE call with `;` (e.g. lint then tests) — never one call per command.\n\n"
     "Procedure (strict order):\n"
     "1. Finish ALL Glob/Grep discovery FIRST, then read — never interleave "
     "search→read→search→read. Grep with context to locate exact lines, then read "
@@ -129,6 +130,7 @@ AGENTS: dict[str, dict] = {
             "search_console",
             "current_time",
             "laya",
+            "load_skill",
             "vision",
             # search_memory removed: exploration uses the CODE MAP (injected into
             # the system prompt) for structure, and web/fetch recall is the main

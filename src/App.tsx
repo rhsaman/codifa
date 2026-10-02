@@ -33,6 +33,8 @@ export default function App() {
   const rightPanelOpen = useStore((s) => s.rightPanelOpen)
   const viewerTabs = useViewerTabs((s) => s.tabs)
   const viewerActiveId = useViewerTabs((s) => s.activeId)
+  const viewerFull = useViewerTabs((s) => s.fullscreen)
+  const chatFull = useStore((s) => s.chatFullscreen)
   const viewerHasGit = viewerTabs.some((t) => t.kind === 'review')
   const viewerHasTrace = viewerTabs.some((t) => t.kind === 'trace')
   const [searchOpen, setSearchOpen] = useState(false)
@@ -328,7 +330,12 @@ export default function App() {
             title="Chat traces — laya / LLM / prompts"
             aria-label="Chat traces — laya / LLM / prompts"
             aria-pressed={viewerHasTrace}
-            onClick={() => useViewerTabs.getState().openTraces(activeChatId || undefined)}
+            onClick={() => {
+              const vt = useViewerTabs.getState();
+              const existing = vt.tabs.find((t) => t.kind === 'trace');
+              if (existing) vt.closeViewer(existing.id);
+              else vt.openTraces(activeChatId || undefined);
+            }}
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M4 6h16M4 12h10M4 18h7" />
@@ -340,7 +347,12 @@ export default function App() {
             title="Git diff — uncommitted changes"
             aria-label="Git diff — uncommitted changes"
             aria-pressed={viewerHasGit}
-            onClick={() => useViewerTabs.getState().openGitDiff()}
+            onClick={() => {
+              const vt = useViewerTabs.getState();
+              const existing = vt.tabs.find((t) => t.kind === 'review');
+              if (existing) vt.closeViewer(existing.id);
+              else vt.openGitDiff();
+            }}
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <circle cx="6" cy="6" r="2.4" />
@@ -370,7 +382,11 @@ export default function App() {
       <div className="app-body">
         <ErrorBoundary>
           <Sidebar />
-          <div className="editor-area">
+          <div className={
+            "editor-area" +
+            (viewerFull && viewerTabs.length > 0 && !chatFull ? " viewer-full" : "") +
+            (chatFull ? " chat-full" : "")
+          }>
             <section className="chat-group" aria-label="Chats">
               <ChatTabBar />
               <main className="main">
@@ -382,16 +398,18 @@ export default function App() {
                 <ChatPanel />
               </main>
             </section>
-            {viewerTabs.length > 0 && (
+            {viewerTabs.length > 0 && !chatFull && (
               <>
-                <div
-                  className="dock-resize-handle"
-                  title="Drag to resize"
-                  onMouseDown={startSplitResize}
-                />
+                {!viewerFull && (
+                  <div
+                    className="dock-resize-handle"
+                    title="Drag to resize"
+                    onMouseDown={startSplitResize}
+                  />
+                )}
                 <section
                   className="viewer-group"
-                  style={{ flexBasis: splitW, width: splitW } as React.CSSProperties}
+                  style={viewerFull ? undefined : ({ flexBasis: splitW, width: splitW } as React.CSSProperties)}
                   aria-label="Viewers"
                 >
                   <ViewerTabBar />

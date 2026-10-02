@@ -1,4 +1,5 @@
 import { useViewerTabs } from "../lib/viewerTabs";
+import { useStore } from "../lib/store";
 import { ReviewPanel } from "./ReviewPanel";
 import { TracePanel } from "./TracePanel";
 import { ScheduleInboxDocked } from "./ScheduleInbox";
@@ -16,7 +17,7 @@ export function ViewerContent() {
   if (active.kind === "review") {
     return (
       <ReviewPanel
-        key={active.id}
+        key={`review:${active.reviewSource ?? ""}:${active.reviewMessageId ?? ""}:${active.reviewPath ?? ""}:${active.reviewRev ?? ""}`}
         docked
         messageId={active.reviewMessageId ?? null}
         initialSource={active.reviewSource ?? "uncommitted"}
@@ -28,11 +29,12 @@ export function ViewerContent() {
   }
 
   if (active.kind === "trace") {
+    // No chatId passed on purpose: the trace always follows the active chat,
+    // so switching chats updates the trace view automatically.
     return (
       <TracePanel
         key={active.id}
         docked
-        chatId={active.traceChatId}
         initialTab={active.traceTab ?? "all"}
         onClose={() => useViewerTabs.getState().closeViewer(active.id)}
       />
@@ -42,7 +44,10 @@ export function ViewerContent() {
   return (
     <ScheduleInboxDocked
       key={active.id}
-      onClose={() => useViewerTabs.getState().closeViewer(active.id)}
+      onClose={() => {
+        useViewerTabs.getState().closeViewer(active.id);
+        useStore.getState().setScheduleInboxOpen(false);
+      }}
     />
   );
 }

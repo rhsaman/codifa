@@ -1,5 +1,16 @@
 import { useState } from "react";
 import { useStore } from "../lib/store";
+import { prepareContent } from "../lib/bidi";
+import { useViewerTabs } from "../lib/viewerTabs";
+import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
+
+function CloseIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+      <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+    </svg>
+  );
+}
 
 function chatTitle(chat: { title: string; messages: Array<{ role: string; content: string }> }): string {
   if (chat.title && chat.title !== "New chat") return chat.title;
@@ -12,6 +23,8 @@ function chatTitle(chat: { title: string; messages: Array<{ role: string; conten
 export function ChatTabBar() {
   const openChatIds = useStore((s) => s.openChatIds);
   const activeChatId = useStore((s) => s.activeChatId);
+  const dir = useStore((s) => s.dir);
+  const chatFull = useStore((s) => s.chatFullscreen);
   const chats = useStore((s) =>
     s.chats.map((c) => ({
       id: c.id,
@@ -39,7 +52,8 @@ export function ChatTabBar() {
     <div className="tab-bar chat-tabs" role="tablist" aria-label="Open chats">
       {openChatIds.map((id) => {
         const meta = chats.find((c) => c.id === id);
-        const title = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
+        const rawTitle = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
+        const title = prepareContent(rawTitle, dir);
         const active = id === activeChatId;
         const dropCls =
           dropTarget?.id === id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
@@ -99,7 +113,7 @@ export function ChatTabBar() {
             ) : meta?.unread ? (
               <span className="editor-tab-dot unread" aria-hidden="true" />
             ) : null}
-            <span className="editor-tab-label">{title}</span>
+            <span className="editor-tab-label" dir={dir}>{title}</span>
             <button
               type="button"
               className="editor-tab-close"
@@ -111,7 +125,7 @@ export function ChatTabBar() {
                 useStore.getState().closeChatTab(id);
               }}
             >
-              ×
+              <CloseIcon />
             </button>
           </div>
         );
@@ -124,6 +138,23 @@ export function ChatTabBar() {
         onClick={() => useStore.getState().newChat()}
       >
         +
+      </button>
+      <button
+        type="button"
+        className="editor-tab-full"
+        title={chatFull ? "Exit fullscreen" : "Fullscreen chat"}
+        aria-label={chatFull ? "Exit chat fullscreen" : "Fullscreen chat"}
+        aria-pressed={chatFull}
+        onClick={() => {
+          const st = useStore.getState();
+          const next = !st.chatFullscreen;
+          st.setChatFullscreen(next);
+          // Fullscreen modes are exclusive: maximizing the chat restores
+          // a maximized viewer.
+          if (next) useViewerTabs.getState().setFullscreen(false);
+        }}
+      >
+        {chatFull ? <CompressIcon /> : <ExpandIcon />}
       </button>
     </div>
   );

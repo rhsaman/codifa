@@ -7,7 +7,7 @@ def test_steer_text_only_is_single_text():
     msg = _steer_to_human_message([{"id": "m1", "prompt": "p1"}])
     assert isinstance(msg.content, str)
     assert "p1" in msg.content
-    assert "INTERRUPTION" in msg.content
+    assert "ADDITIONAL USER INPUT DURING THIS TASK" in msg.content
 
 
 def test_steer_attachments_appended_to_text():

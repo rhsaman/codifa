@@ -558,6 +558,10 @@ export interface StreamParams {
   compactAtPercent?: number
   /** Max tool-loop steps per turn. 0/undefined = backend auto from ctx. */
   maxSteps?: number
+  /** Explicit restart (message retry icon / truncate-and-restart). Backend
+   *  clears the interrupted-turn checkpoint and starts fresh instead of
+   *  resuming old tool work. Omit/false for normal sends and banner resumes. */
+  restart?: boolean
   signal?: AbortSignal
 }
 
@@ -680,6 +684,7 @@ export async function streamChat(
           compact_at_percent: params.compactAtPercent ?? 80,
           // Max tool-loop steps per turn (Settings → General, 0 = backend auto).
           max_steps: params.maxSteps ?? 0,
+          restart: params.restart ?? false,
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })

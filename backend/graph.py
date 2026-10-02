@@ -81,7 +81,9 @@ from llm import (
     _is_reasoning_effort_error,
     _is_stream_options_error,
     _is_temperature_error,
+    _plan_only_step_marks_progress,
     _remap_reasoning_effort,
+    _RevisitStreakTracker,
     _SeenWindows,
     _strip_parallel_calls,
     _strip_stream_options,
@@ -171,13 +173,19 @@ def _resume_thread_id(state: AgentState) -> str:
     return f"resume:{state.get('chat_id', '')}"
 
 
-async def _save_turn_checkpoint(thread_id: str, messages: list) -> None:
+async def _save_turn_checkpoint(
+    thread_id: str, messages: list, mode: str = "", plan: list | None = None
+) -> None:
     try:
         from langgraph.checkpoint.base import empty_checkpoint
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         ckpt = empty_checkpoint()
-        ckpt["channel_values"] = {"messages": messages}
+        ckpt["channel_values"] = {
+            "messages": messages,
+            "mode": mode or "",
+            "plan": list(plan or []),
+        }
         ckpt["channel_versions"] = {"messages": "v1"}
         ckpt["versions_seen"] = {}
         async with AsyncSqliteSaver.from_conn_string(
@@ -207,11 +215,10 @@ def _unanswered_tool_calls(msgs: list, calls: list) -> list:
     return [tc for tc in calls if tc.get("id") and tc.get("id") not in answered]
 
 
-# Throttle per-step checkpoint writes: persisting the full transcript to
-# sqlite on EVERY step adds latency that grows with the transcript. Save at
-# most every N steps (plus the final step of the turn, handled by the
-# caller), unless the transcript grew significantly since the last save.
-_CHECKPOINT_EVERY_N_STEPS = 3
+# Save every step (was every 3): a mid-turn disconnect between saves lost
+# the last 1-2 tool results and forced a redo. Sqlite aput on a single chat
+# thread is cheap compared to an LLM round-trip, so always persist.
+_CHECKPOINT_EVERY_N_STEPS = 1
 _CHECKPOINT_MIN_GROWTH_CHARS = 20_000
 _checkpoint_state: dict[str, dict] = {}
 
@@ -237,7 +244,13 @@ def _checkpoint_due(thread_id: str, msgs: list, *, force: bool = False) -> bool:
 
 
 async def _save_turn_checkpoint_valid(
-    thread_id: str, msgs: list, pending_calls: list = (), *, force: bool = False
+    thread_id: str,
+    msgs: list,
+    pending_calls: list = (),
+    *,
+    force: bool = False,
+    mode: str = "",
+    plan: list | None = None,
 ) -> None:
     """ذخیرهٔ چک‌پوینتی که ترنسکریپتش «همیشه» برای provider معتبر است.
 
@@ -255,7 +268,7 @@ async def _save_turn_checkpoint_valid(
         ToolMessage(content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"])
         for tc in _unanswered_tool_calls(msgs, pending_calls)
     ]
-    await _save_turn_checkpoint(thread_id, list(msgs) + patch)
+    await _save_turn_checkpoint(thread_id, list(msgs) + patch, mode=mode, plan=plan)
 
 
 def _sanitize_trailing_tool_calls(msgs: list) -> list:
@@ -297,6 +310,52 @@ def _append_resume_request(messages: list, request: str) -> list:
     ):
         return messages
     return list(messages) + [HumanMessage(content=req)]
+
+
+def _latest_plan_from_history(history: list | None) -> list[dict]:
+    """Return the latest non-empty frontend checklist (`plan`) for resume.
+
+    The checkpoint holds LangChain messages but not the UI checklist statuses;
+    without this the resumed turn loses which todos are done and re-executes
+    them. Frontend history carries `plan` on assistant messages — reuse the
+    latest one so the resumed turn continues pending steps only.
+    """
+    if not history:
+        return []
+    for turn in reversed(history):
+        if not isinstance(turn, dict):
+            continue
+        items = turn.get("plan")
+        if isinstance(items, list) and items:
+            clean: list[dict] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                content = str(it.get("content", "")).strip()
+                if not content:
+                    continue
+                status = str(it.get("status", "pending")).strip().lower()
+                if status not in ("pending", "in_progress", "completed"):
+                    status = "pending"
+                clean.append({"content": content[:200], "status": status})
+            if clean and not all(i["status"] == "completed" for i in clean):
+                return clean
+    return []
+
+
+def _plan_status_message(plan: list[dict]) -> HumanMessage | None:
+    """Fold a checklist into a resume message so completed steps are not redone."""
+    if not plan:
+        return None
+    lines = [f"- [{it['status']}] {it['content']}" for it in plan]
+    return HumanMessage(
+        content=(
+            "[Task checklist statuses — do NOT re-execute completed steps; "
+            "continue pending/in_progress via update_plan with the SAME items:\n"
+            + "\n".join(lines)
+            + "]"
+        )
+    )
 
 
 async def _load_turn_checkpoint(thread_id: str) -> list | None:
@@ -359,13 +418,19 @@ def _parse_checkpoint_ts(ts_raw) -> float | None:
 # checkpoint from a previous model, workspace, or mode is more dangerous than
 # useful: resuming it would re-execute already-done tool calls and could
 # produce a silently broken first reply. Drop and start fresh instead.
-_RESUME_MAX_AGE_S = 120 * 60  # 2 hours
+# TTL is 12h (was 2h): a checkpoint left overnight by an interrupted turn
+# must still resume instead of redoing all tool work. Size cap is 120 tool
+# messages (was 40): a real coder turn easily does 15-20 read/grep calls and
+# long multi-file tasks exceed 40 without being a loop — the repetition guard
+# (tool-signature based) already stops stuck loops, so the size guard only
+# catches absurd transcripts.
+_RESUME_MAX_AGE_S = 12 * 60 * 60  # 12 hours
 # سیاست حد ابزار: این حد فقط «تعداد فراخوانی» را می‌شمارد، نه حجم توکن را؛
 # پنجرهٔ کانتکست را auto-compact (آستانهٔ درصدی) محافظت می‌کند. یک turn واقعی
 # coder به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد، پس حدِ پایین (مثل ۸) عملاً
 # چک‌پوینت را همیشه می‌انداخت و رزومهٔ واقعی بی‌استفاده می‌شد — همان
 # «کانتکست کم می‌شود بعد از استپ» که کاربر می‌دید.
-_RESUME_MAX_TOOL_CALLS = 40
+_RESUME_MAX_TOOL_CALLS = 120
 
 
 async def _load_turn_checkpoint_valid(
@@ -425,18 +490,18 @@ async def _load_turn_checkpoint_valid(
             await _clear_turn_checkpoint(thread_id)
             return None
 
-    # Mode guard: a checkpoint from a different mode (ask / plan / coder) is
-    # almost always from a turn the user has since abandoned. Drop and start
-    # fresh so the model isn't fed a half-finished turn from another mode.
+    # Mode guard: a checkpoint from a different mode is NOT dropped anymore.
+    # Dropping forced a full redo (re-running all greps/reads) whenever the
+    # user switched modes mid-task. The turn now resumes the completed tool
+    # work regardless of mode; build_turn_context already re-orients the model
+    # with an explicit MODE / MODE SWITCHED note, so a stale style cannot leak.
     if current_mode:
         saved_mode = (ckpt.get("channel_values", {}) or {}).get("mode")
         if saved_mode and saved_mode != current_mode:
-            logger.warning(
-                "resume checkpoint mode mismatch (saved=%s current=%s); dropping",
+            logger.info(
+                "resume checkpoint mode switch (saved=%s current=%s); resuming tool work",
                 saved_mode, current_mode,
             )
-            await _clear_turn_checkpoint(thread_id)
-            return None
 
     # پاک‌سازی دفاعی: چک‌پوینت‌های قدیمیِ (خرابِ) روی دیسک ممکن است
     # tool_callهای بی‌جواب داشته باشند؛ قبل از برگرداندن، placeholder
@@ -596,6 +661,12 @@ class AgentState(TypedDict, total=False):
     # without tools" (handle_locally). Set in build_turn_context; read in
     # _run_mode_turn to skip the tool loop for simple answers.
     laya_no_tools: bool
+    # Explicit user restart (message retry icon / truncate-and-restart). When
+    # True the run MUST NOT resume from the interrupted-turn checkpoint — it
+    # starts fresh and clears any stale checkpoint so the next resume does
+    # not replay the discarded turn. Resume (banner Retry / watchdog /
+    # reconnect) leaves this False so the checkpoint is reused.
+    restart: bool
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +707,30 @@ def history_to_langchain_messages(
         # already done and skips re-executing — the UI never renders this
         # string (it lives on `preservedToolSummary` on the frontend message).
         preserved_summary = turn.get("preservedToolSummary") or ""
+        # Checklist statuses live on the frontend message (`plan`) but were
+        # never folded into the transcript — so the model could not tell done
+        # from pending and re-executed finished steps. Append them to the
+        # assistant content (same mechanism as preserved_summary).
+        _plan_items = turn.get("plan") or []
+        _plan_note = ""
+        if role == "assistant" and isinstance(_plan_items, list) and _plan_items:
+            _plan_lines = []
+            for _pi in _plan_items:
+                if not isinstance(_pi, dict):
+                    continue
+                _pt = str(_pi.get("content", "")).strip()
+                if not _pt:
+                    continue
+                _ps = str(_pi.get("status", "pending")).strip().lower()
+                if _ps not in ("pending", "in_progress", "completed"):
+                    _ps = "pending"
+                _plan_lines.append(f"- [{_ps}] {_pt[:200]}")
+            if _plan_lines:
+                _plan_note = (
+                    "\n[Task checklist statuses — do NOT re-execute completed steps:\n"
+                    + "\n".join(_plan_lines)
+                    + "]"
+                )
         tool_activity = turn.get("toolActivity") or []
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
@@ -724,11 +819,15 @@ def history_to_langchain_messages(
                         result = f"Diff:\n{_diff_text}"
                 tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             if tool_calls:
-                _ai_content = content + preserved_summary if preserved_summary else content
+                _ai_content = content
+                if preserved_summary:
+                    _ai_content += preserved_summary
+                if _plan_note:
+                    _ai_content += _plan_note
                 out.append(AIMessage(content=_ai_content, tool_calls=tool_calls))
                 out.extend(tool_msgs)
                 continue
-        if not content and not preserved_summary:
+        if not content and not preserved_summary and not _plan_note:
             continue
         # History system messages (compact summaries, mode-switch markers)
         # are injected as HumanMessage — never SystemMessage — so
@@ -743,7 +842,11 @@ def history_to_langchain_messages(
         if role == "system":
             out.append(HumanMessage(content=content))
         elif role == "assistant":
-            _ai_content = content + preserved_summary if preserved_summary else content
+            _ai_content = content
+            if preserved_summary:
+                _ai_content += preserved_summary
+            if _plan_note:
+                _ai_content += _plan_note
             out.append(AIMessage(content=_ai_content))
         else:
             out.append(HumanMessage(content=content))
@@ -925,7 +1028,11 @@ def filter_tools_for_mode(
 
     scoped = bool(scoped_paths)
     if scoped:
-        tools = {n: fn for n, fn in tools.items() if n not in ("glob", "task")}
+        # در حالت اسکوپ‌دار فقط glob حذف می‌شود (لیست کل workspace خارج از
+        # اسکوپ است). task نگه داشته می‌شود تا جست‌وجوی گسترده به ساب‌ایجنت
+        # ایزوله تفویض شود — ساب‌ایجنت همان grep/read اسکوپ‌شده والد را به ارث
+        # می‌برد، پس حلقه دستی grep در کانتکست اصلی شکل نمی‌گیرد.
+        tools = {n: fn for n, fn in tools.items() if n not in ("glob",)}
         if "grep" in tools:
             tools["grep"] = _agents._wrap_scoped_search(tools["grep"], scoped_paths)
         if "read" in tools:
@@ -3128,7 +3235,7 @@ def _apply_compaction_in_place(msgs: list, new_history: list[dict]) -> None:
     msgs[:] = rebuilt
 
 
-def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
+def _steer_to_human_message(steers: list[dict], steps_taken: int = 0) -> HumanMessage:
     """ساخت پیام تزریقی steer با همان قرارداد ترن عادی تا عکس هم به مدل برسد.
 
     متن + فایل‌های ضمیمه در بخش متنی می‌آیند و عکس‌ها (dataUrl یا مسیر) به
@@ -3151,7 +3258,7 @@ def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
         if isinstance(_servers, dict):
             _steer_mcp.update(_servers)
     _steer_text = (
-        "[NEW USER MESSAGE DURING THIS TASK -- INTERRUPTION]\n"
+        "[ADDITIONAL USER INPUT DURING THIS TASK]\n"
         + "\n".join(_steer_lines)
     )
     if _steer_atts:
@@ -3171,7 +3278,19 @@ def _steer_to_human_message(steers: list[dict]) -> HumanMessage:
             + ", ".join(f"`{n}`" for n in sorted(_steer_mcp))
             + " — their tools are bound under their short names and callable now."
         )
-    _steer_text += "\nAddress it before the next step."
+    _steer_text += (
+        "\nKeep your ongoing task, completed steps, and current plan in mind — "
+        "incorporate this input alongside them, do not drop or restart the work. "
+        "If it conflicts with the ongoing task, say so briefly, then continue. "
+        "If the user narrowed the scope (fewer items wanted), call update_plan "
+        "to shrink the checklist to the matching items so todos/plan reflect "
+        "the new scope."
+    )
+    if steps_taken > 0:
+        _steer_text += (
+            f"\nContext: you have already taken {steps_taken} step(s) this turn; "
+            "completed tool results above stay valid."
+        )
     _steer_uris = _agents._load_images(_steer_imgs)
     if _steer_uris:
         _steer_blocks: list = [{"type": "text", "text": _steer_text}]
@@ -3445,7 +3564,15 @@ async def _run_mode_turn(
         _trace_token = _trace_store.set_current_chat(str(chat_id or ""))
     except Exception:  # noqa: BLE001 — trace context must never break the turn
         _trace_token = None
+    try:
+        queue.put_nowait({"kind": "status", "stage": "preparing", "content": "Preparing context"})
+    except Exception:  # noqa: BLE001, S110 — progress must never break the turn
+        pass
     tctx = await build_turn_context(state, queue)
+    try:
+        queue.put_nowait({"kind": "status", "stage": "thinking", "content": "Contacting model"})
+    except Exception:  # noqa: BLE001, S110 — progress must never break the turn
+        pass
     # Laya precheck: simple answer without tools — bind no tools and tell
     # the model to answer directly. Best-effort: any failure falls back to
     # the normal tool loop below.
@@ -3659,21 +3786,35 @@ async def _run_mode_turn(
     # built by build_turn_context. We skip this for instruction-augmented turns
     # (reader/explore) which don't interrupt mid-tool-loop.
     _resume_thread = _resume_thread_id(state)
-    if not extra_instruction:
+    if state.get("restart"):
+        # Explicit user restart (message retry icon): never resume the
+        # discarded turn. Clear any stale checkpoint so the fresh run cannot
+        # replay old tool work, then start from the newly built context.
+        await _clear_turn_checkpoint(_resume_thread)
+    elif not extra_instruction:
         # Only resume from a checkpoint that is still fresh: if it is stale
-        # (older than the TTL), oversized (likely a loop), or from a different
-        # mode, drop it and start fresh instead of replaying a poisoned turn.
+        # (older than the TTL) or oversized (likely a loop), drop it and start
+        # fresh instead of replaying a poisoned turn. Mode switches resume too
+        # (tool work is reused; the MODE note re-orients the model).
         # See _load_turn_checkpoint_valid for the policy.
         _ckpt_msgs = await _load_turn_checkpoint_valid(
             _resume_thread, current_mode=state.get("mode", "")
         )
         if _ckpt_msgs:
-            # پیام تازهٔ کاربر («ادامه بده» یا دستور جدید) باید به مدل
-            # برسد؛ بدون این، resume متن جدید را دور می‌ریخت. Retryِ همان
-            # متن قبلی duplicate نمی‌شود (dedup داخل helper).
+            # New user text ("continue" or a steer/follow-up) must always reach
+            # the model; without this a resume silently drops it. Retrying the
+            # same text does not duplicate (dedup inside the helper).
             messages = _append_resume_request(
                 list(_ckpt_msgs), state.get("request") or ""
             )
+            # The checkpoint has no UI checklist statuses — re-attach the
+            # latest frontend plan so completed todos are not re-executed.
+            # History is otherwise cleared (checkpoint already holds the full
+            # transcript) to avoid duplicating the prompt.
+            _resume_plan = _latest_plan_from_history(state.get("history"))
+            _resume_plan_msg = _plan_status_message(_resume_plan)
+            if _resume_plan_msg is not None:
+                messages = list(messages) + [_resume_plan_msg]
             # The checkpoint already holds the full in-flight transcript
             # (prompt + tool calls + tool results). Don't also re-pull the
             # frontend history, or we'd duplicate the prompt.
@@ -3726,6 +3867,8 @@ async def _run_mode_turn(
         # the model when a requested window is already in context.
         _reread = _SeenWindows()
         reset_read_ledger()
+        # Revisit streak: same file/scope re-touched step after step.
+        _revisit = _RevisitStreakTracker()
         reset_turn_seen_calls()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
@@ -3758,7 +3901,7 @@ async def _run_mode_turn(
             steers = await _agents._drain_steer(chat_id)
             if steers:
                 # ساخت پیام چندبخشی با همان قرارداد ترن عادی تا عکس هم به مدل برسد
-                msgs.append(_steer_to_human_message(steers))
+                msgs.append(_steer_to_human_message(steers, steps_taken=steps))
                 # ابزارهای همراه steer: اسکیل‌ها به متن تزریق شدند؛ سرورهای MCP
                 # باید واقعاً وصل شوند تا ابزارشان قابل فراخوانی باشد.
                 _steer_mcp: dict = {}
@@ -4446,6 +4589,7 @@ async def _run_mode_turn(
             # reads get a stub in the transcript instead of re-sent content.
             _cover_stubs = _reread.check_covered(_pending)
             _reread_hint = _reread.observe(_pending)
+            _revisit_hint = _revisit.observe(_pending)
             async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
@@ -4467,7 +4611,7 @@ async def _run_mode_turn(
             # must be followed by tool messages" rejection).
             if _parallel:
                 await _save_turn_checkpoint_valid(
-                    _resume_thread, msgs, _sequential
+                    _resume_thread, msgs, _sequential, mode=mode
                 )
             for _seq_idx, tc in enumerate(_sequential):
                 name = tc.get("name") or ""
@@ -4486,7 +4630,7 @@ async def _run_mode_turn(
                 # state is always durable despite throttling.
                 await _save_turn_checkpoint_valid(
                     _resume_thread, msgs, _sequential[_seq_idx + 1:],
-                    force=_seq_idx == len(_sequential) - 1,
+                    force=_seq_idx == len(_sequential) - 1, mode=mode,
                 )
             # Emit ToolMessages for duplicate tool calls that were deduped above
             # so the LLM sees a result for every tool_call_id it originally sent.
@@ -4520,8 +4664,19 @@ async def _run_mode_turn(
                 _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
             if _reread_hint:
                 _transient_msgs.append(HumanMessage(content=_reread_hint.strip()))
+            if _revisit_hint:
+                _transient_msgs.append(HumanMessage(content=_revisit_hint.strip()))
             if _is_plan_only_step(_pending):
-                _transient_msgs.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
+                # Plan mode's required checklist call and any tick that marks
+                # step(s) completed (final tick has no following work by
+                # definition) are legitimate solo steps — scolding them taught
+                # the model to never call update_plan, leaving todos/plan
+                # stale. Nudge only when nothing was marked completed.
+                _wasteful = mode != "plan" and not _plan_only_step_marks_progress(
+                    _pending
+                )
+                if _wasteful:
+                    _transient_msgs.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
             # transcript stays valid (a tool_calls AIMessage must be followed by its
             # ToolMessages before any new HumanMessage). Gives the model a chance to

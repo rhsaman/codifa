@@ -113,17 +113,9 @@ export function heightForChat(
   return heights?.[chatId] ?? defaultHeightFor(todoCount);
 }
 
-/** آیا با رسیدن plan جدید باید پنل راست خودکار باز شود؟
- *  فقط وقتی تودوی تازه ساخته شده (قبلاً خالی، حالا غیرخالی) و پنل بسته است —
- *  به‌روزرسانی‌های بعدیِ وضعیت نباید پنلی که کاربر عمداً بسته را دوباره باز کنند.
- *  خالص (pure) تا تست بتواند مستقیم صدا بزند. */
-export function shouldAutoOpenTodosPanel(
-  existingCount: number,
-  incomingCount: number,
-  rightPanelOpen: boolean,
-): boolean {
-  return !rightPanelOpen && existingCount === 0 && incomingCount > 0;
-}
+/** پنل راست هرگز خودکار باز نمی‌شود — حتی با رسیدن plan/تودوی تازه؛
+ *  فقط کاربر با دکمه/میان‌بر آن را باز می‌کند. (تابع کمکی قبلیِ بازشدن خودکار
+ *  عمداً حذف شده تا هیچ مسیری نتواند پنل را بدون خواست کاربر باز کند.) */
 
 /** بخش تودوهای داخل پنل راست داک‌شده — بدون درگ و شناور بودن؛ ارتفاع
  *  کاملاً داینامیک از روی محتواست (بدون height ثابت؛ لیست خودش به‌اندازهٔ

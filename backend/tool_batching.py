@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import re
 from collections.abc import Awaitable, Callable, Hashable
 from contextvars import ContextVar
 from typing import Any
@@ -220,13 +221,52 @@ def reset_turn_grep_cover() -> None:
     _TURN_GREP_COVER.set({})
 
 
+# A grep `|`-branch with zero regex metacharacters (plain literal text).
+# When such a branch E of an earlier COMPLETE search sits inside a later
+# single-branch literal pattern L as a substring, every line matching L
+# contains E literally, so L's rows are a subset of E's rows on the same
+# scope — the later grep can stub. Anything with regex syntax is excluded:
+# claiming containment there is unsound (e.g. `renderSide?` contains
+# "renderSide" but also matches "renderSid").
+_LITERAL_ALT_RE = re.compile(r"[A-Za-z0-9_ \-\./:]+")
+_LITERAL_ALT_MIN_LEN = 3
+
+
+def _literal_alternatives(combined: str) -> tuple[str, ...]:
+    """Lowercased literal `|`-branches of a combined grep pattern.
+
+    Only branches entirely free of regex metacharacters qualify (see above).
+    Never raises.
+    """
+    try:
+        out: list[str] = []
+        for _b in str(combined or "").split("|"):
+            _s = _b.strip()
+            if (
+                len(_s) >= _LITERAL_ALT_MIN_LEN
+                and _LITERAL_ALT_RE.fullmatch(_s)
+                and _s.lower() not in out
+            ):
+                out.append(_s.lower())
+        return tuple(out)
+    except Exception:  # noqa: BLE001 — overlap never breaks a search
+        return ()
+
+
 def grep_cover_check(
-    generation: int, scope_key: tuple, words: frozenset, max_results: int
+    generation: int,
+    scope_key: tuple,
+    words: frozenset,
+    max_results: int,
+    combined: str = "",
 ) -> str:
     """Return the earlier pattern covering this grep, or "" when it must run.
 
     Covered = same generation+scope, earlier word set is a superset, earlier
-    max_results >= this one. No-op ("") when no turn is active.
+    max_results >= this one — or literal containment: the later pattern is a
+    single literal branch containing an earlier literal branch (then its rows
+    are a subset of the earlier complete search's rows). No-op ("") when no
+    turn is active.
     """
     if not words:
         return ""
@@ -238,9 +278,35 @@ def grep_cover_check(
         return ""
     try:
         entries = cover.get((int(generation), scope_key)) or []
-        for _w, _m, _p in entries:
+        for _e in entries:
+            try:
+                _w, _m, _p = _e[0], _e[1], _e[2]
+            except (TypeError, IndexError):
+                continue
             if int(max_results) <= int(_m) and words <= _w:
                 return str(_p)
+        # Literal containment (e.g. earlier `renderSide|...`, later
+        # `const renderSide` — the new word "const" defeats the word-subset
+        # rule, but every matching line still contains "renderside").
+        _lc = str(combined or "").strip()
+        if (
+            _lc
+            and "|" not in _lc
+            and len(_lc) >= _LITERAL_ALT_MIN_LEN
+            and _LITERAL_ALT_RE.fullmatch(_lc)
+        ):
+            _lcl = _lc.lower()
+            for _e in entries:
+                try:
+                    _m2, _p2 = _e[1], _e[2]
+                    _alts2 = _e[3] if len(_e) > 3 else ()
+                except (TypeError, IndexError):
+                    continue
+                if int(max_results) > int(_m2):
+                    continue
+                for _a in _alts2 or ():
+                    if _a and _a in _lcl:
+                        return str(_p2)
     except (TypeError, ValueError):
         return ""
     return ""
@@ -252,6 +318,7 @@ def grep_cover_note(
     words: frozenset,
     max_results: int,
     pattern_disp: str,
+    combined: str = "",
 ) -> None:
     """Record a COMPLETE grep so later subset greps on the scope stub out."""
     if not words:
@@ -265,10 +332,21 @@ def grep_cover_note(
     try:
         key = (int(generation), scope_key)
         entries = cover.setdefault(key, [])
-        for _w, _m, _ in entries:
+        for _e in entries:
+            try:
+                _w, _m = _e[0], _e[1]
+            except (TypeError, IndexError):
+                continue
             if words <= _w and int(max_results) <= int(_m):
                 return  # an earlier entry already covers this one
-        entries.append((frozenset(words), int(max_results), str(pattern_disp)[:120]))
+        entries.append(
+            (
+                frozenset(words),
+                int(max_results),
+                str(pattern_disp)[:120],
+                _literal_alternatives(combined or pattern_disp),
+            )
+        )
     except (TypeError, ValueError):
         pass
 
@@ -441,6 +519,65 @@ def note_cross_turn_grep(
         del entries[:-_CROSS_GREP_ENTRIES]
     except Exception:  # noqa: BLE001, S110 — reuse never breaks a search
         pass
+
+
+def cross_turn_served_spans(root: str, path: str) -> list[tuple[int, int]]:
+    """Sig-validated served extents for ``path`` (for line omission).
+
+    Same store as the cross-turn coverage above, but returns the extents
+    themselves so a PARTIALLY overlapping repeat can omit the already-served
+    lines from its body instead of re-sending them. Only extents whose
+    recorded signature matches the file's CURRENT signature are returned —
+    an edit (ours or external) yields [] and the repeat serves whole.
+    Map-served paths are never recorded upstream, so no map guard is needed
+    here (callers still skip map paths for defense in depth). Never raises.
+    """
+    try:
+        entries = _CROSS_READS.get((str(root or ""), _ledger_key(path)))
+        if not entries:
+            return []
+        sig_now = _cross_file_sig(entries[0][4])
+        if sig_now is None:
+            return []
+        out: list[tuple[int, int]] = []
+        for _e in entries:
+            try:
+                _s0, _s1, _mt, _sz, _, _ = _e
+                if (_mt, _sz) != sig_now:
+                    continue
+                out.append((int(_s0), int(_s1)))
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:  # noqa: BLE001 — omission never breaks a read
+        return []
+
+
+def cross_turn_sig_changed(root: str, path: str) -> bool:
+    """True when a recorded serve exists but the file changed since.
+
+    The per-turn ledger (fetched_windows) carries no signature, so same-turn
+    omission cannot tell an external edit happened — it would omit lines
+    served BEFORE the edit as if still current. The cross-turn store DOES
+    record the signature at serve time, so a mismatch here means "changed
+    since last serve": callers must drop same-turn spans for this path too
+    (and heal the per-turn ledger). False when nothing was recorded, the
+    file is unchanged, or the signature cannot be stated. Never raises.
+    """
+    try:
+        entries = _CROSS_READS.get((str(root or ""), _ledger_key(path)))
+        if not entries:
+            return False
+        sig_now = _cross_file_sig(entries[0][4])
+        if sig_now is None:
+            return False
+        try:
+            _mt, _sz = int(entries[0][2]), int(entries[0][3])
+        except (TypeError, ValueError, IndexError):
+            return False
+        return (_mt, _sz) != sig_now
+    except Exception:  # noqa: BLE001 — validation never breaks a read
+        return False
 
 
 def cross_turn_grep_check(

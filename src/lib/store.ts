@@ -220,6 +220,7 @@ function persistSoon(): void {
 }
 
 const OPEN_CHATS_KEY = 'coder:openChats'
+const ACTIVE_CHAT_KEY = 'coder:activeChat'
 
 function persistOpenChats(ids: string[]): void {
   try {
@@ -238,6 +239,47 @@ function loadOpenChats(): string[] {
     return parsed.filter((v): v is string => typeof v === 'string' && v.length > 0)
   } catch {
     return []
+  }
+}
+
+function persistActiveChat(id: string): void {
+  try {
+    if (id) localStorage.setItem(ACTIVE_CHAT_KEY, id)
+    else localStorage.removeItem(ACTIVE_CHAT_KEY)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function loadActiveChat(): string {
+  try {
+    const raw = localStorage.getItem(ACTIVE_CHAT_KEY)
+    return typeof raw === 'string' ? raw : ''
+  } catch {
+    return ''
+  }
+}
+
+function persistOpenState(ids: string[], activeId: string): void {
+  persistOpenChats(ids)
+  persistActiveChat(activeId)
+}
+
+const CHAT_FULL_KEY = 'coder:chatFull'
+
+function loadChatFullscreen(): boolean {
+  try {
+    return localStorage.getItem(CHAT_FULL_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistChatFullscreen(v: boolean): void {
+  try {
+    localStorage.setItem(CHAT_FULL_KEY, v ? '1' : '0')
+  } catch {
+    /* storage unavailable */
   }
 }
 
@@ -695,6 +737,11 @@ interface State {
   closeChatTab: (id: string) => void
   /** VSCode-style drag reorder: move the dragged chat tab to the drop position. */
   moveChatTab: (fromId: string, toId: string, after?: boolean) => void
+  /** Fullscreen toggle for the chat group (viewer group hides). Persisted in
+   *  localStorage so the layout survives restarts. */
+  chatFullscreen: boolean
+  setChatFullscreen: (v: boolean) => void
+  toggleChatFullscreen: () => void
   setChatMode: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
@@ -726,6 +773,11 @@ interface State {
   setPrefixNotice: (notice: string | null) => void
   addMessage: (chatId: string, message: Omit<ChatMessage, 'id' | 'createdAt'>) => ChatMessage
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
+  /** Atomically append segments to a message (no lost-update race between
+   *  concurrent SSE events). Reads the latest segments INSIDE set(), merges,
+   *  and dedupes identical user/compact/tool segments. Returns true when at
+   *  least one segment was added. */
+  appendMessageSegments: (id: string, segments: MessageSegment[]) => boolean
   /** Remove a message from a chat's thread (e.g. cancelling a pending steer). */
   removeMessage: (chatId: string, id: string) => void
   /** Record a message typed while the chat's agent is already working. */
@@ -957,8 +1009,9 @@ export const useStore = create<State>((set, get) => ({
   chats: [],
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
-  activeChatId: '',
-  openChatIds: [],
+  activeChatId: typeof window !== 'undefined' ? loadActiveChat() : '',
+  openChatIds: typeof window !== 'undefined' ? loadOpenChats() : [],
+  chatFullscreen: typeof window !== 'undefined' ? loadChatFullscreen() : false,
   focusComposer: false,
   unreadChats: [],
   prefixNotice: null,
@@ -1059,10 +1112,33 @@ export const useStore = create<State>((set, get) => ({
       return next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
     }) as Chat[]
     const prevActiveId = get().activeChatId
-    const activeId =
+    const memOpen = get().openChatIds
+    const fallbackActive =
       keptChats && prevChats.some((c) => c.id === prevActiveId)
         ? prevActiveId
         : (loadedChats[loadedChats.length - 1]?.id ?? '')
+    const validIds = new Set(loadedChats.map((c) => c.id))
+    let openChatIds: string[]
+    let activeId: string
+    if (keptChats && memOpen.length > 0) {
+      // Background refresh (sidecar:changed) while the app is already running:
+      // keep the live tab order, just drop ids whose chats vanished.
+      openChatIds = memOpen.filter((id) => validIds.has(id))
+      activeId = validIds.has(fallbackActive) ? fallbackActive : (openChatIds[openChatIds.length - 1] ?? '')
+      if (activeId && !openChatIds.includes(activeId)) openChatIds = [...openChatIds, activeId]
+      if (openChatIds.length === 0 && loadedChats.length > 0 && activeId) openChatIds = [activeId]
+    } else {
+      // Fresh startup: restore the previous session's tabs from localStorage.
+      const storedOpen = loadOpenChats().filter((id) => validIds.has(id))
+      const storedActive = loadActiveChat()
+      const candidate = validIds.has(storedActive) ? storedActive : fallbackActive
+      openChatIds = storedOpen
+      if (candidate && !openChatIds.includes(candidate)) openChatIds = [...openChatIds, candidate]
+      if (openChatIds.length === 0 && candidate) openChatIds = [candidate]
+      activeId = validIds.has(candidate) ? candidate : (openChatIds[openChatIds.length - 1] ?? '')
+      // Normalize storage so deleted ids never linger for the next launch.
+      if (openChatIds.length > 0 || activeId) persistOpenState(openChatIds, activeId)
+    }
     // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
     // the in-memory store always works with plaintext.
     const raw = await decryptSettings((settings ?? {}) as Partial<Settings> & { provider?: ProviderConfig })
@@ -1280,6 +1356,7 @@ export const useStore = create<State>((set, get) => ({
       workspaces,
       chats: loadedChats,
       activeChatId: activeId,
+      openChatIds,
     })
   },
 
@@ -1879,7 +1956,7 @@ export const useStore = create<State>((set, get) => ({
     const activeChatId = chat.id
     set((st) => {
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, activeChatId)
       return { chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
     })
     get().persist()
@@ -1898,7 +1975,7 @@ export const useStore = create<State>((set, get) => ({
         workspaces = [...workspaces, makeWorkspace(root ?? '')]
       }
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, activeChatId)
       return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
     })
     get().persist()
@@ -1942,11 +2019,12 @@ export const useStore = create<State>((set, get) => ({
         activeChatId = remaining[Math.min(Math.max(idx - 1, 0), remaining.length - 1)] ?? chats[chats.length - 1]?.id ?? ''
         if (!remaining.includes(activeChatId) && activeChatId) remaining.push(activeChatId)
       }
-      persistOpenChats(openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId])
+      const finalOpen = openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId]
+      persistOpenState(finalOpen, activeChatId)
       return {
         chats,
         activeChatId,
-        openChatIds: openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId],
+        openChatIds: finalOpen,
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
@@ -1971,7 +2049,7 @@ export const useStore = create<State>((set, get) => ({
         : chats[chats.length - 1]?.id ?? ''
       const openChatIds = s.openChatIds.filter((cid) => !doomedIds.has(cid))
       if (activeChatId && !openChatIds.includes(activeChatId)) openChatIds.push(activeChatId)
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, activeChatId)
       return {
         chats,
         workspaces,
@@ -2106,7 +2184,7 @@ export const useStore = create<State>((set, get) => ({
   setActiveChat: (id) => {
     set((s) => {
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, id)
       return {
         activeChatId: id,
         openChatIds,
@@ -2130,7 +2208,7 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       if (!s.chats.some((c) => c.id === id)) return {}
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, id)
       return {
         activeChatId: id,
         openChatIds,
@@ -2145,11 +2223,11 @@ export const useStore = create<State>((set, get) => ({
       if (!s.openChatIds.includes(id)) return {}
       const idx = s.openChatIds.indexOf(id)
       const openChatIds = s.openChatIds.filter((cid) => cid !== id)
-      persistOpenChats(openChatIds)
       let activeChatId = s.activeChatId
       if (s.activeChatId === id) {
         activeChatId = openChatIds[Math.min(idx, openChatIds.length - 1)] ?? ''
       }
+      persistOpenState(openChatIds, activeChatId)
       return { openChatIds, activeChatId }
     })
     persistSoon()
@@ -2164,7 +2242,7 @@ export const useStore = create<State>((set, get) => ({
       dest = Math.max(0, Math.min(rest.length, dest))
       const openChatIds = rest.slice()
       openChatIds.splice(dest, 0, fromId)
-      persistOpenChats(openChatIds)
+      persistOpenState(openChatIds, fromId)
       return {
         openChatIds,
         activeChatId: fromId,
@@ -2172,6 +2250,20 @@ export const useStore = create<State>((set, get) => ({
       }
     })
     persistSoon()
+  },
+
+  setChatFullscreen: (v) => {
+    set(() => {
+      persistChatFullscreen(v)
+      return { chatFullscreen: v }
+    })
+  },
+
+  toggleChatFullscreen: () => {
+    set((s) => {
+      persistChatFullscreen(!s.chatFullscreen)
+      return { chatFullscreen: !s.chatFullscreen }
+    })
   },
 
   setChatMode: (id, mode) => {
@@ -2395,6 +2487,47 @@ export const useStore = create<State>((set, get) => ({
     // (setStreaming(false) → the trailing updateMessage({streaming:false})) it
     // falls back to the normal debounced full persist.
     maybePersistMidStream()
+  },
+
+  appendMessageSegments: (id, segments) => {
+    if (!segments || segments.length === 0) return false
+    let added = false
+    set((s) => {
+      const targetChat = s.chats.find((c) => c.messages.some((m) => m.id === id))
+      if (!targetChat) return {}
+      const msg = targetChat.messages.find((m) => m.id === id)!
+      const cur = msg.segments ?? []
+      const next = [...cur]
+      for (const seg of segments) {
+        const dup = next.some((e) => {
+          if (e.kind !== seg.kind) return false
+          if (seg.kind === 'user' && e.kind === 'user') return e.id === (seg as { id: string }).id
+          if (seg.kind === 'compact' && e.kind === 'compact') return e.id === (seg as { id: string }).id
+          if (seg.kind === 'tool' && e.kind === 'tool')
+            return e.index === (seg as { index: number }).index
+          return false
+        })
+        if (!dup) {
+          next.push(seg)
+          added = true
+        }
+      }
+      if (!added) return {}
+      return {
+        chats: s.chats.map((c) =>
+          c.id === targetChat.id
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === id ? { ...m, segments: next } : m,
+                ),
+              }
+            : c,
+        ),
+      }
+    })
+    if (added) maybePersistMidStream()
+    return added
   },
 
   accrueChatUsage: (chatId, providerId, model, delta) => {

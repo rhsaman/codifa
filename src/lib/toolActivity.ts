@@ -100,13 +100,28 @@ export function applyToolEvent(
   };
   if (event.sub) {
     const branch = typeof event.branch === "number" ? event.branch : undefined;
-    return activities.map((a) => {
+    let matched = false;
+    // Legacy events without a branch id belong to the most recent task card
+    // only — nesting them into EVERY task card duplicated the same sub-tool
+    // across parallel explores.
+    let lastTaskIdx = -1;
+    if (branch === undefined) {
+      for (let i = 0; i < activities.length; i++) {
+        if (activities[i].tool === "task") lastTaskIdx = i;
+      }
+    }
+    const next = activities.map((a, idx) => {
       if (a.tool === "task") {
         // Parallel fan-out: nest each branch's sub-events under ITS OWN task
         // card. Legacy single-branch events (no branch id) nest into the task
         // card. Match regardless of status so a done parent still receives its
         // late children.
-        if (branch !== undefined && a.branch !== branch) return a;
+        if (branch !== undefined) {
+          if (a.branch !== branch) return a;
+        } else if (idx !== lastTaskIdx) {
+          return a;
+        }
+        matched = true;
         const childList = a.children ?? [];
         // De-dup a sub-event whose callId is already on the card.
         const dup = findExisting(childList);
@@ -119,14 +134,32 @@ export function applyToolEvent(
             args: act.args ?? dup.existing.args,
             model: act.model ?? dup.existing.model,
           };
-          const next = childList.slice();
-          next[dup.idx] = merged;
-          return { ...a, children: next };
+          const nextChildren = childList.slice();
+          nextChildren[dup.idx] = merged;
+          return { ...a, children: nextChildren };
         }
         return { ...a, children: [...childList, act] };
       }
       return a;
     });
+    if (matched) return next;
+    // Orphan sub-event: no task card (or no matching branch) exists — e.g.
+    // the parent card was trimmed, deduped, or never streamed. Dropping it
+    // here made the tool appear in the trace (unconditional trace write) but
+    // vanish from chat. Promote it to a top-level card so chat never loses a
+    // tool the trace shows.
+    const dupTop = findExisting(next);
+    if (dupTop) {
+      const merged: ToolActivity = {
+        ...dupTop.existing,
+        args: act.args ?? dupTop.existing.args,
+        model: act.model ?? dupTop.existing.model,
+      };
+      const arr = next.slice();
+      arr[dupTop.idx] = merged;
+      return arr;
+    }
+    return [...next, act];
   }
   // Top-level path: drop the duplicate if the same callId is already there.
   const dup = findExisting(activities);
@@ -169,7 +202,10 @@ export function resolveToolResult(
   const resolved = (act: ToolActivity, isTop: boolean): ToolActivity => {
     // Sub-results never resolve the top-level branch card directly (only its
     // nested children), so a still-running card isn't marked done prematurely.
-    if (sub && isTop) {
+    // Exception: an orphan sub-event promoted to a top-level card (no parent
+    // task card) carries `sub=true` itself — it must resolve by id like any
+    // other card, otherwise the promoted card stays "running" forever.
+    if (sub && isTop && act.sub !== true) {
       if (act.children && act.children.length > 0) {
         const children = act.children.map((c) => resolved(c, false));
         if (children.some((c, i) => c !== act.children![i])) {

@@ -72,3 +72,22 @@ def test_none_and_all_empty():
     assert _clean_ask_options(None) == []
     assert _clean_ask_options([]) == []
     assert _clean_ask_options(['""', "  "]) == []
+
+
+def test_screenshot_regression_jsonish_blob_with_braces_and_description():
+    """رگرسیون اسکرین‌شات جدید: بلاب {description: ...} نباید { و } و : و description را گزینه کند."""
+    raw = [
+        "{ description : روی نوار بالای کامپوزر (همان `files changed 37`) , داخل پنل Review کنار لیست فایل‌ها , هر دو جا }",
+    ]
+    assert _clean_ask_options(raw) == [
+        "روی نوار بالای کامپوزر (همان `files changed 37`)",
+        "داخل پنل Review کنار لیست فایل‌ها",
+        "هر دو جا",
+    ]
+
+
+def test_drops_bare_junk_fragments_and_dict_description():
+    assert _clean_ask_options(["{", "}", ":", "description", "  "]) == []
+    assert _clean_ask_options([{"description": "داخل پنل Review کنار لیست فایل‌ها"}]) == [
+        "داخل پنل Review کنار لیست فایل‌ها"
+    ]

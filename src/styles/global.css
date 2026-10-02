@@ -9644,18 +9644,25 @@ textarea {
 .diff-responsive {
   width: 100%;
   min-width: 0;
+  container-type: inline-size;
 }
 
 .diff-columns {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1px;
-  background: var(--hairline, rgba(128, 128, 128, 0.06));
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* پس‌زمینهٔ ستون‌ها باید مثل نمای تک‌ستونی شفاف بماند (ته‌رنگ .review-diff
+     از پشت دیده شود) — رنگ گپ گرید کل ناحیه را تیره می‌کرد؛ جداکننده با
+     border-left ستون After داده می‌شود. */
   border-radius: 8px;
-  /* overflow:hidden خطوط بلند را می‌برید و چون کلیپ می‌کرد، اسکرول افقی
-     والد (.review-diff) هیچ overflow نمی‌دید — پس ستون After غیرقابل
-     دسترس می‌ماند. auto اجازهٔ اسکرول افقی کل ناحیهٔ دیف را می‌دهد. */
-  overflow: auto;
+  /* هر ستون اسکرول افقی مستقل خودش را دارد (.diff-col-code) تا ستون After
+     هیچ‌وقت از کادر بیرون نرود و بریده دیده نشود. */
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* خط جداکنندهٔ عمودی بین دو ستون Before|After. */
+.diff-hunk-pair .diff-col-after {
+  border-left: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
 }
 
 /* در عرض کم، ستون‌ها زیر هم می‌افتند (سقوط به تک‌ستون). */
@@ -9679,12 +9686,13 @@ textarea {
 .diff-columns-head {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
-  min-width: max-content;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
   position: sticky;
   top: 0;
   z-index: 2;
-  background: var(--bg-panel, #1e1e1e);
+  /* هم‌رنگ پس‌زمینهٔ ستون‌ها تا هدر چسبان لکهٔ تیره‌تر نسازد. */
+  background: var(--bg, #1e1e2e);
   border-bottom: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
 }
 
@@ -9699,13 +9707,20 @@ textarea {
 .diff-hunk-pair {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
-  min-width: max-content;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
 }
 
 .diff-responsive[data-layout="unified"] .diff-hunk-pair {
   grid-template-columns: 1fr;
   min-width: 0;
+}
+
+/* هدر هانک داخل جفت دوستونی باید هر دو ستون را بگیرد تا ستون‌های Before/After سر جای خود بمانند. */
+.diff-hunk-pair .diff-u-meta {
+  grid-column: 1 / -1;
+  min-width: 0;
+  white-space: pre-wrap;
 }
 
 .diff-responsive[data-layout="unified"] .diff-columns {
@@ -9717,9 +9732,52 @@ textarea {
   opacity: 0.35;
 }
 
+/* سایدبای‌ساید واقعا واکنش‌گرا: وقتی کانتینر دیف باریک است (حتی اگر layout
+   اجباری side-by-side باشد) ستون‌ها زیر هم می‌افتند تا متن تنگ و بریده نشود. */
+@container (max-width: 767px) {
+  .diff-columns-head,
+  .diff-hunk-pair {
+    grid-template-columns: 1fr;
+  }
+  .diff-hunk-pair .diff-col-after {
+    border-left: 0;
+    border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.06));
+  }
+}
+
+/* ستون سایدبای‌ساید هیچ‌وقت از گرید بیرون نمی‌زند؛ اسکرول افقی فقط داخل هر pre است. */
 .diff-col {
-  background: var(--bg-panel, #1e1e1e);
+  overflow: hidden;
+  isolation: isolate;
+  background: transparent;
   min-width: 0;
+  max-width: 100%;
+}
+
+/* هر ستون دیف یک بلوک مستقل است: محتوای بلند ستون Before هیچ‌وقت
+   روی ستون After نمی‌لغزد؛ اسکرول افقی فقط داخل pre همان ستون است. */
+.diff-hunk-pair .diff-col {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.diff-col-code {
+  max-width: 100%;
+  min-width: 0;
+}
+.diff-col-code .diff-line {
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
+}
+.diff-col-code .diff-u-text {
+  min-width: 0;
+  flex: 1 0 auto;
+  white-space: pre;
+}
+
+.diff-columns .diff-u-num {
+  flex: 0 0 auto;
 }
 
 .diff-col-header {
@@ -9745,7 +9803,7 @@ textarea {
   font-family: var(--font-mono, monospace);
   font-size: 11px;
   line-height: 1.5;
-  color: var(--text-dim);
+  color: var(--text);
   background: transparent;
   border: none;
   white-space: pre;
@@ -9753,19 +9811,22 @@ textarea {
 }
 
 .diff-line {
-  display: block;
+  display: flex;
+  align-items: stretch;
+  white-space: pre;
   padding: 0 10px;
   min-height: 1.5em;
+  min-width: 0;
 }
 
 .diff-line-del {
-  background: color-mix(in srgb, #f87171 10%, transparent);
-  color: #fca5a5;
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--text);
 }
 
 .diff-line-add {
-  background: color-mix(in srgb, #4ade80 10%, transparent);
-  color: #86efac;
+  background: rgba(46, 160, 67, 0.15);
+  color: var(--text);
 }
 
 /* ——— Diff stats badge (header) ——— */
@@ -10295,8 +10356,10 @@ textarea {
    stay aligned with the other column by identical line-height. The rows
    themselves are grids (num | code). `min-width: max-content` lets the column
    grow to its longest line so long lines scroll horizontally instead of
-   overflowing into the other column. */
-.diff-col {
+   overflowing into the other column. Scoped to .diff-side: the Review
+   grid (.diff-hunk-pair .diff-col) must keep min-width:0 or Before/After
+   overlap. */
+.diff-side > .diff-col {
   flex: 1 1 0;
   min-width: max-content;
 }
@@ -13865,6 +13928,8 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
+  flex-shrink: 0;
   width: 30px;
   height: 30px;
   padding: 0;
@@ -13919,10 +13984,14 @@ textarea {
 .review-header {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 6px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  min-width: 0;
+  overflow: visible;
 }
 
 .review-title {
@@ -13954,7 +14023,10 @@ textarea {
 .review-header-actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: 4px;
+  flex: 0 0 auto;
+  flex-shrink: 0;
 }
 
 /* منوی More در هدر Review (کپی دیف / تغییر نما). */
@@ -14728,6 +14800,21 @@ mark.diff-hit-active {
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--hairline);
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.schedule-inbox-head .review-header-actions {
+  margin-left: auto;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.viewer-inbox-wrap .schedule-inbox-head {
+  min-width: 0;
+  overflow: hidden;
+  flex-wrap: nowrap;
 }
 
 .schedule-inbox-head-spacer {
@@ -15117,6 +15204,8 @@ mark.diff-hit-active {
 
 /* ---- Trace panel (لاگ چت جاری مثل لنگ‌اسمیت): ردیف‌های تاشو + بلوک پرامپت تمیز ---- */
 .trace-panel-list {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -15532,17 +15621,82 @@ mark.trace-hit-active {
 .trace-tab-count {
   font-size: 10px;
   font-weight: 800;
-  padding: 1px 7px;
-  margin-inline-start: 6px;
+  padding: 1px 6px;
+  margin-inline-start: 5px;
   border-radius: 999px;
   border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.review-source-btn:hover .trace-tab-count {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
 }
 
 .review-source-btn.active .trace-tab-count {
+  color: var(--on-accent);
+  background: color-mix(in srgb, var(--on-accent) 22%, transparent);
+  border-color: transparent;
+}
+
+.review-source {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 13px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 4%, var(--bg-alt));
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.review-source::-webkit-scrollbar {
+  display: none;
+}
+
+.review-source-btn {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 6px 9px;
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.16s ease, color 0.15s ease, border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.review-source-btn:hover {
   color: var(--text);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.review-source-btn.active {
+  color: var(--on-accent);
+  background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 82%, var(--link)));
+  border-color: transparent;
+  box-shadow: 0 6px 16px -8px color-mix(in srgb, var(--accent) 70%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.trace-tab-label {
+  line-height: 1.4;
 }
 
 .trace-subheader {
@@ -15984,6 +16138,27 @@ mark.trace-hit-active {
   background: var(--accent);
 }
 
+/* Viewer fullscreen toggle: chat group hides, viewer takes the full width. */
+.editor-area.viewer-full .chat-group {
+  display: none;
+}
+
+.editor-area.viewer-full .viewer-group {
+  flex: 1 1 auto;
+  max-width: none;
+  border-left: 0;
+}
+
+.editor-area.viewer-full .dock-resize-handle {
+  display: none;
+}
+
+/* Chat fullscreen toggle: viewer group hides, chat takes the full width. */
+.editor-area.chat-full .viewer-group,
+.editor-area.chat-full .dock-resize-handle {
+  display: none;
+}
+
 .viewer-content {
   flex: 1 1 auto;
   display: flex;
@@ -16002,9 +16177,16 @@ mark.trace-hit-active {
   text-align: center;
 }
 
-/* Docked panels fill the viewer group (no floating card). */
-.review-panel.review-docked-panel {
-  position: static;
+/* Docked panels fill the viewer group (no floating card). The docked wrapper
+   must not participate in layout at all — as a plain flex item it would size
+   to content (min-height: auto) and the lists inside would never scroll.
+   display: contents drops the box so the aside flexes against .viewer-content
+   directly. */
+.review-docked-wrap {
+  display: contents;
+}
+
+.review-panel.review-docked-panel {  position: static;
   width: auto;
   max-width: none;
   height: auto;
@@ -16015,6 +16197,14 @@ mark.trace-hit-active {
   box-shadow: none;
   background: transparent;
   animation: none;
+}
+
+/* Docked headers/rows never shrink — the file list owns all scrolling. */
+.review-panel.review-docked-panel > .review-header,
+.review-panel.review-docked-panel > .review-search-row,
+.review-panel.review-docked-panel > .review-rev-row,
+.review-panel.review-docked-panel > .trace-subheader {
+  flex: 0 0 auto;
 }
 
 .reading-mode.reading-docked {
@@ -16045,15 +16235,16 @@ mark.trace-hit-active {
   flex: 0 0 auto;
   display: flex;
   align-items: flex-end;
-  gap: 4px;
-  padding: 8px 10px 0;
+  gap: 6px;
+  padding: 10px 12px 0;
   overflow-x: auto;
   scrollbar-width: none;
-  border-bottom: 1px solid color-mix(in srgb, var(--group) 28%, var(--border));
+  border-bottom: 1px solid color-mix(in srgb, var(--group) 32%, var(--border));
   background:
     linear-gradient(180deg,
-      color-mix(in srgb, var(--group) 9%, transparent),
-      transparent 70%),
+      color-mix(in srgb, var(--group) 13%, transparent),
+      color-mix(in srgb, var(--group) 4%, transparent) 55%,
+      transparent 100%),
     var(--bg-alt);
   /* Soft fade at the scroll edges so overflowing tabs don't clip harshly. */
   mask-image: linear-gradient(90deg, #000 96%, transparent);
@@ -16075,59 +16266,76 @@ mark.trace-hit-active {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  max-width: 210px;
+  gap: 8px;
+  max-width: 220px;
   min-width: 0;
-  padding: 7px 8px 8px 12px;
-  border: 1px solid transparent;
+  padding: 8px 8px 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--group) 14%, transparent);
   border-bottom: 0;
-  border-radius: 10px 10px 0 0;
+  border-radius: 12px 12px 0 0;
   font-size: 12.5px;
   font-weight: 500;
+  letter-spacing: 0.01em;
   color: var(--text-dim);
+  background: color-mix(in srgb, var(--group) 5%, transparent);
   cursor: grab;
   white-space: nowrap;
   user-select: none;
   transition:
-    background 0.15s ease,
+    background 0.18s ease,
     color 0.15s ease,
-    border-color 0.15s ease,
-    transform 0.15s ease;
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
 }
 
 .editor-tab:hover {
   color: var(--text);
-  background: color-mix(in srgb, var(--group) 10%, var(--bg-hover));
-  border-color: color-mix(in srgb, var(--group) 22%, transparent);
+  background: color-mix(in srgb, var(--group) 13%, var(--bg-hover));
+  border-color: color-mix(in srgb, var(--group) 30%, transparent);
   transform: translateY(-1px);
+  box-shadow: 0 6px 16px -10px color-mix(in srgb, var(--group) 55%, transparent);
 }
 
 .editor-tab.active {
   color: var(--text);
-  font-weight: 600;
+  font-weight: 650;
   background:
     linear-gradient(180deg,
-      color-mix(in srgb, var(--group) 16%, var(--bg-panel)),
-      color-mix(in srgb, var(--bg-panel) 88%, transparent));
-  border-color: color-mix(in srgb, var(--group) 38%, var(--border));
-  box-shadow: none;
+      color-mix(in srgb, var(--group) 24%, var(--bg-panel)),
+      color-mix(in srgb, var(--bg-panel) 90%, transparent));
+  border-color: color-mix(in srgb, var(--group) 45%, var(--border));
+  box-shadow:
+    0 8px 20px -12px color-mix(in srgb, var(--group) 60%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
-/* Flat identity bar along the top edge of the active tab. */
+/* Identity bar along the top edge of the active tab. */
 .editor-tab.active::before {
   content: "";
   position: absolute;
   top: -1px;
-  left: 10px;
-  right: 10px;
-  height: 2.5px;
-  border-radius: 0 0 3px 3px;
+  left: 12px;
+  right: 12px;
+  height: 3px;
+  border-radius: 0 0 4px 4px;
   background: linear-gradient(90deg,
       transparent,
-      var(--group) 25%,
-      var(--group) 75%,
+      var(--group) 22%,
+      var(--group) 78%,
       transparent);
-  box-shadow: none;
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--group) 70%, transparent);
+  pointer-events: none;
+}
+
+.editor-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--bg-panel);
   pointer-events: none;
 }
 
@@ -16144,16 +16352,17 @@ mark.trace-hit-active {
   color: inherit;
   opacity: 0;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border-radius: 50%;
-  transition: opacity 0.13s ease, background 0.13s ease, color 0.13s ease;
+  border-radius: 7px;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease;
 }
 
 .editor-tab:hover .editor-tab-close,
@@ -16164,7 +16373,14 @@ mark.trace-hit-active {
 .editor-tab-close:hover {
   opacity: 1;
   color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  transform: scale(1.06);
+}
+
+.editor-tab-close:focus-visible {
+  opacity: 1;
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .editor-tab-new {
@@ -16187,28 +16403,60 @@ mark.trace-hit-active {
   box-shadow: none;
 }
 
+/* Chat fullscreen toggle next to the new-tab button. */
+.editor-tab-full {
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+  padding: 5px 9px;
+  margin-bottom: 3px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  transition: all 0.15s ease;
+}
+
+.editor-tab-full svg {
+  width: 13px;
+  height: 13px;
+}
+
+.editor-tab-full:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.editor-tab-full[aria-pressed="true"] {
+  color: var(--accent);
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
 /* Status dots in their own theme color. */
 .editor-tab-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   flex: 0 0 auto;
 }
 
 .editor-tab-dot.busy {
   background: var(--accent);
-  box-shadow: none;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
   animation: trace-pulse 1.6s ease-in-out infinite;
 }
 
 .editor-tab-dot.pending {
   background: var(--thinking);
-  box-shadow: none;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--thinking) 60%, transparent);
 }
 
 .editor-tab-dot.unread {
   background: var(--success);
-  box-shadow: none;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--success) 60%, transparent);
 }
 
 /* Viewer kind icons tinted from the theme palette. */
@@ -16216,12 +16464,200 @@ mark.trace-hit-active {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 7px;
   font-size: 12px;
-  background: color-mix(in srgb, var(--link) 14%, transparent);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.viewer-tab-icon {
+  background: color-mix(in srgb, var(--link) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--link) 26%, transparent);
   color: var(--link);
+}
+
+/* Chat tabs: flat floating pills, no shadow. */
+.tab-bar.chat-tabs {
+  gap: 6px;
+  padding: 8px 12px;
+  align-items: center;
+  background: transparent;
+  border-bottom: 1px solid var(--hairline);
+  mask-image: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab {
+  min-height: 32px;
+  max-width: 210px;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 7px 8px;
+  padding-inline-start: 11px;
+  font-size: 12.5px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: none;
+  transform: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.active {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.active::before,
+.tab-bar.chat-tabs .editor-tab.chat-tab.active::after {
+  display: none;
+}
+
+.tab-bar.chat-tabs .editor-tab-new,
+.tab-bar.chat-tabs .editor-tab-full,
+.tab-bar.viewer-tabs .editor-tab-full {
+  margin: 0;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.tab-bar.chat-tabs .editor-tab-new:hover,
+.tab-bar.chat-tabs .editor-tab-full:hover,
+.tab-bar.viewer-tabs .editor-tab-full:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab-full[aria-pressed="true"],
+.tab-bar.chat-tabs .editor-tab-full[aria-pressed="true"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+
+
+.tab-bar.chat-tabs .editor-tab-dot.busy,
+.tab-bar.chat-tabs .editor-tab-dot.pending,
+.tab-bar.chat-tabs .editor-tab-dot.unread {
+  box-shadow: none;
+  animation: none;
+}
+
+.tab-bar.chat-tabs .editor-tab-dot.busy {
+  animation: trace-pulse 1.6s ease-in-out infinite;
+}
+
+.tab-bar.chat-tabs .editor-tab-close:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.dragging {
+  box-shadow: none;
+  transform: none;
+  opacity: 0.6;
+}
+
+/* Viewer tabs: same flat pill shape as chat tabs, no shadow. */
+.tab-bar.viewer-tabs {
+  gap: 6px;
+  padding: 8px 12px;
+  align-items: center;
+  background: transparent;
+  border-bottom: 1px solid var(--hairline);
+  mask-image: none;
+  overflow-x: auto;
+}
+
+.tab-bar.viewer-tabs .editor-tab-full {
+  margin-left: auto;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab {
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 32px;
+  max-width: 210px;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  padding: 7px 8px;
+  padding-inline-start: 11px;
+  font-size: 12.5px;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: transparent;
+  color: var(--text);
+  box-shadow: none;
+  transform: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active {
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--link) 26%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active::before,
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.active::after {
+  display: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab-label {
+  direction: ltr;
+  white-space: nowrap;
+}
+
+.tab-bar.viewer-tabs .editor-tab-close:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.tab-bar.viewer-tabs .editor-tab.dragging {
+  box-shadow: none;
+  transform: none;
+  opacity: 0.6;
+}
+
+.viewer-tab-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: none;
 }
 
 .viewer-tab.kind-trace .viewer-tab-icon {
@@ -16234,15 +16670,22 @@ mark.trace-hit-active {
   color: var(--success);
 }
 
-.viewer-tab.active .viewer-tab-icon {
-  box-shadow: none;
+.viewer-tab.kind-review .viewer-tab-icon {
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
 }
 
 /* Drag & drop reorder states. */
 .editor-tab.dragging {
-  opacity: 0.45;
+  opacity: 0.5;
   cursor: grabbing;
-  transform: scale(0.97);
+  transform: scale(0.96);
+  box-shadow: 0 8px 22px -10px rgba(0, 0, 0, 0.5);
+}
+
+.editor-tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .editor-tab.drop-before::after,
@@ -16292,14 +16735,74 @@ mark.trace-hit-active {
   width: auto;
   max-width: none;
   min-width: 0;
+  min-height: 0;
   flex: 1 1 auto;
   border: 0;
   border-radius: 0;
   box-shadow: none;
 }
 
+.viewer-inbox-wrap .schedule-inbox-head {
+  flex: 0 0 auto;
+}
+
 .viewer-inbox-wrap .schedule-inbox-resize-handle {
   display: none;
+}
+
+/* Docked inbox closes via its viewer tab — the inner X is redundant. */
+.viewer-inbox-wrap .schedule-inbox-close {
+  display: none;
+}
+
+/* Docked panels use the ViewerTabBar fullscreen button — hide inner ones. */
+.viewer-inbox-wrap .viewer-fullscreen-btn,
+.review-docked-panel .viewer-fullscreen-btn,
+.viewer-inbox-wrap .review-header-btn[title="Fullscreen"],
+.viewer-inbox-wrap .review-header-btn[title="Exit fullscreen"],
+.review-docked-panel .review-header-btn[title="Fullscreen"],
+.review-docked-panel .review-header-btn[title="Exit fullscreen"],
+.viewer-inbox-wrap button[aria-label="Fullscreen"],
+.viewer-inbox-wrap button[aria-label="Exit fullscreen"] {
+  display: none !important;
+}
+
+/* Narrow headers: tabs wrap to show all, actions stay fixed on their own row. */
+.review-header {
+  flex-wrap: wrap;
+  row-gap: 6px;
+  overflow: visible;
+}
+
+.review-header .review-source {
+  flex: 1 1 100%;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  overflow: visible;
+}
+
+.review-header .review-source-btn {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.review-header .trace-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-header .trace-tab-count {
+  flex: 0 0 auto;
+}
+
+.review-header .review-header-actions {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 /* Docked two-column mode: cap the task list so the message column always

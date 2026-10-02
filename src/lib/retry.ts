@@ -4,6 +4,8 @@ export type RetrySource = 'message' | 'banner'
 
 export interface RetryTarget {
   userMsgId: string
+  /** Assistant bubble to continue streaming into on resume. Undefined on restart (fresh bubble). */
+  continueAssistantId?: string
   content: string
   attachments: string[]
   images: Array<{ path: string; name: string; dataUrl?: string }>
@@ -13,17 +15,48 @@ export type RetryPlan =
   | { action: 'restart'; target: RetryTarget }
   | { action: 'resume'; target: RetryTarget }
 
+/** True for resume (banner/watchdog): keep transcript, continue same work. */
+export function isResumePlan(plan: RetryPlan | null): boolean {
+  return plan?.action === 'resume'
+}
+
+/** True for restart (message icon): truncate transcript, start fresh. */
+export function isRestartPlan(plan: RetryPlan | null): boolean {
+  return plan?.action === 'restart'
+}
+
+/** Resume preserves completed work (toolActivity, plan, preservedToolSummary); restart drops it. */
+export function shouldPreserveWork(action: RetryPlan['action']): boolean {
+  return action === 'resume'
+}
+
+function findFailedAssistant(messages: ChatMessage[], userMsgId: string): ChatMessage | undefined {
+  const idx = messages.findIndex((m) => m.id === userMsgId)
+  if (idx === -1) return undefined
+  return messages.slice(idx + 1).find(
+    (m) =>
+      m.role === 'assistant' &&
+      (m.retry ||
+        m.error ||
+        (typeof m.content === 'string' && m.content.includes('[Interrupted before finishing'))),
+  )
+}
+
 /**
  * Decide what a retry click does. The two retry paths are deliberately
- * different:
+ * different and MUST stay distinct (mixing them causes redo loops):
  *
  *  - message retry button (`source: 'message'`) → RESTART: a deliberate "redo".
- *    Everything below the clicked user message (including any partial assistant
- *    reply) is deleted and a fresh reply is generated from that message.
+ *    Everything at/below the clicked user message is deleted (truncateTo) and a
+ *    fresh reply is generated. Backend checkpoint is cleared via `restart: true`
+ *    so old tool work is NOT replayed. `plan`, `toolActivity` and
+ *    `preservedToolSummary` are dropped.
  *  - banner error retry (`source: 'banner'`) → RESUME: a recovery. The
- *    interrupted assistant message (partial content + completed tool calls) is
- *    kept and the turn continues from where it was cut off, so completed work
- *    is not redone.
+ *    interrupted assistant message (partial content + completed tool calls +
+ *    plan + preservedToolSummary) is KEPT and the turn continues from the
+ *    backend checkpoint, so completed work is not redone. Reuses `userMsgId`
+ *    (no duplicate user bubble) and continues `continueAssistantId` (no
+ *    duplicate assistant bubble).
  *
  * Returns null when `userMsgId` doesn't reference a non-empty user message.
  */
@@ -34,25 +67,38 @@ export function planRetry(
 ): RetryPlan | null {
   const msg = messages.find((m) => m.id === userMsgId)
   if (!msg || msg.role !== 'user' || !msg.content.trim()) return null
+  if (source === 'banner') {
+    const failed = findFailedAssistant(messages, userMsgId)
+    const target: RetryTarget = {
+      userMsgId,
+      continueAssistantId: failed?.id,
+      content: msg.content,
+      attachments: msg.attachments ?? [],
+      images: msg.images ?? [],
+    }
+    return { action: 'resume', target }
+  }
   const target: RetryTarget = {
     userMsgId,
     content: msg.content,
     attachments: msg.attachments ?? [],
     images: msg.images ?? [],
   }
-  return source === 'banner' ? { action: 'resume', target } : { action: 'restart', target }
+  return { action: 'restart', target }
 }
 
 /**
- * وقتی بک‌اند یک رویداد `retry` می‌فرستد، attempt قبلی ممکن است چند chunk متن
- * واقعی را قبلاً stream کرده باشد. آن متن هرگز به تاریخچه (msgs) اضافه نشده —
- * فقط در UI مانده. قبل از شروع attempt بعدی باید پاک شود تا با پاسخ کامل جدید
- * ترکیب نشود.
+ * Reset streamed text/segments before the next attempt.
  *
- * به‌طور پیش‌فرض، همه‌چیز غیر از متن (tool / tool_result) حفظ می‌شود: در
- * حالت resume (banner retry) کار واقعی replay می‌شود. در حالت restart (دکمهٔ
- * retry روی پیام) attempt جدید tool callهای تازه می‌سازد، پس segments
- * و toolActivity هم باید پاک شوند. فراخوان با ``mode`` کنترل می‌کند.
+ * - resume (banner/watchdog): keep tool segments (work was done; the next
+ *   attempt continues from the same transcript) but drop text segments (the
+ *   next attempt re-streams its own answer). Caller MUST also keep the
+ *   message-level `toolActivity`, `plan` and `preservedToolSummary` fields —
+ *   they are NOT part of `segments` and are preserved by reusing the same
+ *   assistant bubble (`continueAssistantId`).
+ * - restart (message icon): new attempt re-issues tool calls and re-streams
+ *   text, so text AND tool segments are stale. User/compact segments are
+ *   history anchors (steered messages, compaction checkpoints) and are kept.
  */
 export type ResetMode = 'resume' | 'restart'
 
@@ -62,11 +108,13 @@ export function resetStreamForRetry(
   mode: ResetMode = 'resume',
 ): { content: string; segments: MessageSegment[] } {
   if (mode === 'restart') {
-    // Restart: tool calls are about to be re-issued by the model, so EVERY
-    // segment is stale. Drop them all so the new stream starts on a clean
-    // transcript and segments stay in 1:1 order with the new tool/text
-    // events.
-    return { content: '', segments: [] }
+    // Restart: the model re-issues tool calls and re-streams text, so text and
+    // tool segments are stale. BUT user/compact segments are history anchors
+    // (steered messages, compaction checkpoints) — not re-issuable. Dropping
+    // them here hid the steered bubble (steerInterleaved=true) with no inline
+    // copy left: the sudden steer vanish.
+    const kept = (segments ?? []).filter((s) => s.kind === 'user' || s.kind === 'compact')
+    return { content: '', segments: kept }
   }
   // Resume: keep tool segments (work was done; the next attempt continues
   // from the same transcript) but drop text segments (the next attempt will
@@ -76,19 +124,10 @@ export function resetStreamForRetry(
 }
 
 /**
- * آیا رویداد retry باید متنِ استریم‌شده را پاک کند؟
+ * Whether a backend `retry` event must keep already-streamed text.
  *
- * رویدادهای retry دو خانواده دارند:
- *  - «قطع و ازسرگیری» (reconnecting / fallback): پیامِ در حال استریم باید
- *    دست‌نخورده بماند — فقط بنر اطلاع‌رسانی روی آن می‌نشیند. پاک‌کردن متن
- *    در این خانواده باعث «ناپدید شدن پاسخ در حالی که ایجنت مشغول کار است»
- *    می‌شود (باگ گزارش‌شده: هم استریم می‌آمد هم بنر خطا).
- *  - «ری‌استارت کاربر» (بدون هیچ‌کدام): تلاش جدید از صفر جواب خودش را
- *    استریم می‌کند، پس متن قدیمی باید پاک شود.
- *
- * `fallback` رویدادی صرفاً اطلاع‌رسانی است: مدل ساب‌ایجنت (explore/web)
- * هارد-فیل شد و همان فراخوانی روی مدل اصلی اجرا شد — استریمِ در جریانِ
- * پیام دستیار نباید پاک شود.
+ * - reconnecting/fallback → keep text (turn still alive, banner is informational).
+ * - otherwise → user-triggered restart, wipe text + tool segments.
  */
 export function isKeepTextRetry(reconnecting: boolean | undefined, fallback: boolean | undefined): boolean {
   return reconnecting === true || fallback === true

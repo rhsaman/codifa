@@ -383,3 +383,41 @@ def test_strip_temperature_returns_original_on_clone_failure():
     m = _UnclonableModel()
     out = llm._strip_temperature(m)
     assert out is m
+
+
+# ---------------------------------------------------------------------------
+# Root cause: parallel_tool_calls defaults ON at bind time (round-trip fix)
+# ---------------------------------------------------------------------------
+
+
+def test_bind_tools_parallel_defaults_on():
+    """bind_tools_parallel must ask for parallel calls unless opted out.
+
+    Root cause of read/grep round-trip bloat in both the main agent and the
+    explore sub-agent: without ``parallel_tool_calls=True`` most gateways
+    return ONE tool call per step, so N independent reads/greps cost N
+    full-context round-trips. Default-on lets capable models batch N calls
+    in ONE round-trip; a 400 rejection still strips and retries once."""
+    seen: dict = {}
+
+    class _M:
+        def bind_tools(self, tools, parallel_tool_calls=False):
+            seen["pc"] = parallel_tool_calls
+            return self
+
+    out = llm.bind_tools_parallel(_M(), [])
+    assert out is not None
+    assert seen.get("pc") is True
+
+
+def test_bind_tools_parallel_respects_explicit_disable():
+    """enabled=False (strip-on-400 fallback) must not send the field."""
+    seen: dict = {}
+
+    class _M:
+        def bind_tools(self, tools, parallel_tool_calls=False):
+            seen["pc"] = parallel_tool_calls
+            return self
+
+    llm.bind_tools_parallel(_M(), [], enabled=False)
+    assert seen.get("pc") is False

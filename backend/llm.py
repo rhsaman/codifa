@@ -707,21 +707,32 @@ def model_provider(model: Any) -> tuple[str, str]:
 
 
 def bind_tools_parallel(model: Any, lc_tools: list, enabled: bool = True) -> Any:
-    """``model.bind_tools`` that also asks for parallel tool calls when the
-    provider is known to honor ``parallel_tool_calls`` (providers.py meta flag
-    ``parallel_calls``). Set at BIND time, not in model_kwargs, so it only ever
-    travels together with tools — compaction/web/vision calls (no tools) never
-    see it. ``enabled=False`` is the strip-on-400 fallback. Without this most
+    """``model.bind_tools`` that asks for parallel tool calls by default.
+    Set at BIND time, not in model_kwargs, so it only ever travels together
+    with tools — compaction/web/vision calls (no tools) never see it.
+    ``enabled=False`` is the strip-on-400 fallback. Without this most
     gateways return ONE tool call per step, so N independent reads/greps cost
-    N full-context round trips."""
+    N full-context round trips (the root cause of read/grep round-trip bloat
+    in both the main agent and the explore sub-agent).
+    Opt-OUT, not opt-in: every provider gets ``parallel_tool_calls=True``
+    unless its providers.py meta flag is explicitly ``parallel_calls=False``
+    (a gateway known to reject the field). A 400 rejection still strips the
+    field and retries once (see ``_is_parallel_calls_error``), so default-on
+    never kills a turn — it just lets capable models batch N calls in ONE
+    round-trip instead of N."""
     kind, _ = model_provider(model)
-    if enabled and kind and _provider_meta(kind).get("parallel_calls"):
+    if enabled:
         try:
-            return model.bind_tools(lc_tools, parallel_tool_calls=True)
-        except TypeError:
-            # مدل‌هایی که پارامتر parallel_tool_calls را نمی‌شناسند (مثل ماک‌های تست
-            # یا نسخه‌های قدیمی لن‌گ‌چین) — بدون آن ادامه می‌دهیم.
-            return model.bind_tools(lc_tools)
+            meta_off = _provider_meta(kind).get("parallel_calls") is False
+        except Exception:  # noqa: BLE001 — doubt enables parallel (safe fallback strips)
+            meta_off = False
+        if not meta_off:
+            try:
+                return model.bind_tools(lc_tools, parallel_tool_calls=True)
+            except TypeError:
+                # مدل‌هایی که پارامتر parallel_tool_calls را نمی‌شناسند (مثل ماک‌های تست
+                # یا نسخه‌های قدیمی لن‌گ‌چین) — بدون آن ادامه می‌دهیم.
+                return model.bind_tools(lc_tools)
     return model.bind_tools(lc_tools)
 
 
@@ -1661,7 +1672,20 @@ def dedupe_step_tool_call_ids(ai: Any, reserved_ids: set[str] | None = None) -> 
 # batchable tool that could have been ONE call, a short reminder is appended
 # to the LAST result of that tool so the model sees it with its own results
 # and self-corrects on the next step. Advisory only — never blocks a call.
-_BATCHABLE_TOOLS = {"grep", "glob", "read"}
+_BATCHABLE_TOOLS = {"grep", "glob", "read", "run_terminal", "computer"}
+
+# Only mutating computer actions belong in ONE sequence call. Read-only
+# actions (read_screen/read_element/list_apps/open_app/see/check_access)
+# must stay separate — merging a read into a sequence changes semantics.
+_COMPUTER_SEQUENCE_ACTIONS = frozenset({"act", "input", "sequence"})
+
+
+def _is_computer_sequence_call(args: dict) -> bool:
+    """True when a computer call is a mutating step that belongs in sequence."""
+    try:
+        return str((args or {}).get("action") or "").strip().lower() in _COMPUTER_SEQUENCE_ACTIONS
+    except Exception:  # noqa: BLE001
+        return False
 
 # Same-batch signature: the tool name + every arg EXCEPT the primary one
 # (pattern / filePath). Calls sharing this signature differ only in the
@@ -1682,11 +1706,21 @@ def _batch_rest(name: str, args: dict) -> dict:
     calls are intentionally NOT mergeable — the model should fire them
     as parallel calls in ONE step instead (still one round-trip).
     """
-    primary = "filePath" if name == "read" else "pattern"
+    if name == "read":
+        primary = "filePath"
+    elif name == "run_terminal":
+        primary = "command"
+    else:
+        primary = "pattern"
     rest = {k: v for k, v in args.items() if k != primary}
     if name == "read":
         rest.pop("offset", None)
         rest.pop("limit", None)
+    if name == "run_terminal":
+        rest.pop("timeout", None)
+    if name == "computer":
+        rest.pop("timeout", None)
+        rest.pop("depth", None)
     return rest
 
 
@@ -1725,6 +1759,16 @@ def _batch_example(name: str, calls: list[dict]) -> str:
             + ", ranges=["
             + ", ".join(repr(f"{p}:{o}:{l}") for p, o, l in windows)
             + "])"
+        )
+    if name == "run_terminal":
+        cmds = [str(c.get("command") or "").strip() for c in calls]
+        cmds = [c for c in cmds if c]
+        chained = "; ".join(cmds)
+        return f"run_terminal(command={chained!r})"
+    if name == "computer":
+        return (
+            "computer(action='sequence', steps=[...]) — merge the separate "
+            "act/input steps into ONE sequence call instead of one call per step"
         )
     # grep / glob — scope (path) and file filter (include) are identical
     # here (enforced by _batch_rest), so the example keeps that scope and
@@ -1774,13 +1818,33 @@ def _batchable_nudge(tcs: list) -> str:
             for k in ("patterns", "filePaths", "ranges", "paths", "includes", "symbols")
         ):
             continue  # already a batch call
-        primary = "filePath" if name == "read" else "pattern"
+        if name == "run_terminal" and (
+            ";" in str(args.get("command") or "")
+            or "&&" in str(args.get("command") or "")
+        ):
+            continue  # already chained in ONE call
+        if name == "read":
+            primary = "filePath"
+        elif name == "run_terminal":
+            primary = "command"
+        elif name == "computer":
+            primary = "action"
+        else:
+            primary = "pattern"
+        if name == "computer" and not _is_computer_sequence_call(args):
+            continue  # read-only computer actions never merge into sequence
         if not args.get(primary):
             continue
         per_tool.setdefault(name, []).append(args)
     hints: list[str] = []
     for name, calls in per_tool.items():
         if len(calls) < 2:
+            continue
+        if name == "computer":
+            # Any 2+ act/input/sequence calls merge into ONE sequence —
+            # selectors/targets always differ, so the identical-rests check
+            # below would wrongly skip them. Suggest sequence directly.
+            hints.append(_batch_example(name, calls))
             continue
         # A merge is only valid when the non-primary args are IDENTICAL —
         # e.g. two greps with different max_results must stay separate calls.
@@ -1826,10 +1890,18 @@ class _BatchStreakTracker:
         self._threshold = max(2, threshold)
 
     def _batch_args(self, args: dict) -> bool:
-        return any(
+        if any(
             k in (args or {})
             for k in ("patterns", "filePaths", "ranges", "paths", "includes", "symbols")
-        )
+        ):
+            return True
+        cmd = str((args or {}).get("command") or "")
+        if ";" in cmd or "&&" in cmd:
+            return True
+        if str((args or {}).get("action") or "") == "sequence":
+            steps = (args or {}).get("steps") or []
+            return isinstance(steps, list) and len(steps) >= 2
+        return False
 
     def observe(self, tcs: list) -> str:
         """Record this step's calls; return a reminder when a streak fires.
@@ -1850,7 +1922,16 @@ class _BatchStreakTracker:
             if self._batch_args(args):
                 batched.add(name)  # already a batch call
                 continue
-            primary = "filePath" if name == "read" else "pattern"
+            if name == "computer" and not _is_computer_sequence_call(args):
+                continue  # read-only computer actions never streak toward sequence
+            if name == "read":
+                primary = "filePath"
+            elif name == "run_terminal":
+                primary = "command"
+            elif name == "computer":
+                primary = "action"
+            else:
+                primary = "pattern"
             if not args.get(primary):
                 continue
             step_calls.setdefault(name, args)
@@ -1876,6 +1957,12 @@ class _BatchStreakTracker:
             return ""
         lines = []
         for name, calls, _ in fired:
+            if name == "computer":
+                # Any 2+ act/input steps belong in ONE sequence call —
+                # selectors/targets always differ, so never apply the
+                # identical-rests check here.
+                lines.append(f"- {_batch_example(name, calls)}")
+                continue
             rests = [_batch_rest(name, a) for a in calls]
             if name != "read" and any(r != rests[0] for r in rests[1:]):
                 # Different scopes/filters: a single merged call would be a
@@ -1895,6 +1982,132 @@ class _BatchStreakTracker:
             + "\n".join(lines)
             + "\nThe example is built from calls that ALREADY ran — do NOT "
             "re-issue them. Use parallel calls for your NEXT searches."
+        )
+
+
+# ── Revisit streak (shared by both tool loops) ──────────────────────────
+# Touches of the SAME file / grep scope across steps in one turn. The model
+# pages one file step after step (symbols, then a head window, then another
+# window) instead of finishing it in one decisive call — and every such step
+# is a full round-trip even when the result is a 2-line stub.
+_REVISIT_STREAK_TOUCHES = 3
+
+
+def _revisit_ranges(path: str) -> str:
+    """Compact 'A-B, C-D' of this turn's fetched windows for ``path``."""
+    try:
+        from tool_batching import fetched_windows as _fw
+
+        _wins = sorted((int(a), int(b)) for a, b in (_fw(path) or []))
+    except Exception:  # noqa: BLE001 — note text never breaks a turn
+        return ""
+    _merged: list[list[int]] = []
+    for _a, _b in _wins:
+        if _merged and _a <= _merged[-1][1] + 1:
+            _merged[-1][1] = max(_merged[-1][1], _b)
+        else:
+            _merged.append([_a, _b])
+    return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in _merged[:4])
+
+
+class _RevisitStreakTracker:
+    """Nudge when one file/scope is re-touched step after step in a turn.
+
+    Counts touches per read path / grep scope (already-merged batch greps
+    don't count — they are the desired shape). On the Nth touch it returns a
+    transient reminder naming the file/scope and what was seen so far,
+    telling the model to fetch everything still needed in ONE call and stop
+    re-touching it. Advisory only, once per key per turn, never blocks a
+    call. Steps without the key do NOT reset others (real turns interleave
+    files, searches and commands).
+    """
+
+    __slots__ = ("_nudged", "_recent", "_threshold", "_touches")
+
+    def __init__(self, threshold: int = _REVISIT_STREAK_TOUCHES) -> None:
+        self._touches: dict[str, int] = {}
+        self._nudged: set[str] = set()
+        self._recent: dict[str, list[str]] = {}
+        self._threshold = max(2, threshold)
+
+    def observe(self, tcs: list) -> str:
+        """Record this step's calls; remind on the Nth touch of one key."""
+        keys: list[tuple[str, str]] = []
+        for tc in tcs or []:
+            try:
+                if not isinstance(tc, dict):
+                    continue
+                name = (tc.get("name") or "").lower()
+                args = tc.get("args") or {}
+                if not isinstance(args, dict):
+                    continue
+            except Exception:  # noqa: BLE001, S112 — bad calls never break tracking
+                continue
+            if name == "read":
+                # symbols= reads resolve server-side (_read_windows skips them
+                # — precise, never overlap-nudge bait), but they still cost a
+                # round-trip, so they count as touches on the file.
+                if args.get("symbols") and args.get("filePath"):
+                    _k = ("read", str(args.get("filePath")))
+                    if _k not in keys:
+                        keys.append(_k)
+                for _p, _s, _e in _read_windows(args):
+                    _k = ("read", _p)
+                    if _k not in keys:
+                        keys.append(_k)
+            elif name == "grep":
+                if args.get("patterns") or args.get("paths") or args.get("includes"):
+                    continue  # merged batch grep: the desired shape, no streak
+                _scope = f"{args.get('path') or ''}|{args.get('include') or ''}"
+                _k = ("grep", _scope)
+                if _k not in keys:
+                    keys.append(_k)
+                _pat = str(args.get("pattern") or "")
+                if _pat:
+                    _recent = self._recent.setdefault(f"grep:{_scope}", [])
+                    if _pat not in _recent:
+                        _recent.append(_pat)
+                    del _recent[:-3]
+        notes: list[tuple[str, str]] = []
+        for kind, label in keys:
+            key = f"{kind}:{label}"
+            n = self._touches.get(key, 0) + 1
+            self._touches[key] = n
+            if n == self._threshold and key not in self._nudged:
+                self._nudged.add(key)
+                notes.append((kind, label))
+        if not notes:
+            return ""
+        _ord = {1: "1st", 2: "2nd", 3: "3rd"}.get(
+            self._threshold, f"{self._threshold}th"
+        )
+        lines = []
+        for kind, label in notes:
+            if kind == "read":
+                _ranges = _revisit_ranges(label)
+                _have = f" (you hold {_ranges} this turn)" if _ranges else ""
+                lines.append(
+                    f"- {label}: {_ord} step this turn touching "
+                    f"this file{_have}. Fetch EVERYTHING you still need from "
+                    "it in ONE call (ranges=[...]/symbols=[...]) and stop "
+                    "re-touching it — further windows are likely already in "
+                    "context."
+                )
+            else:
+                _pats = ", ".join(
+                    f"'{_p}'" for _p in self._recent.get(f"grep:{label}", [])[:3]
+                )
+                _scope_disp = label.split("|")[0] or "/"
+                lines.append(
+                    f"- grep under {_scope_disp}: {_ord} search "
+                    f"this turn on this scope ({_pats}). Merge any remaining "
+                    "terms into ONE call via patterns=[...] instead of "
+                    "another grep."
+                )
+        return (
+            "\n\n📌 REPEAT NOTE: one file/scope keeps getting re-touched "
+            "step after step (each step is a full round-trip):\n"
+            + "\n".join(lines[:3])
         )
 
 
@@ -2126,14 +2339,20 @@ class _SeenWindows:
 
 
 # ── Plan-only step detection (shared by both tool loops) ─────────────────
-# An update_plan call with no other tool call in the step burns a full
-# round-trip (a full-context LLM call) just to tick a checklist. update_plan
-# has no dependencies on sibling calls, so it is always batchable with the
-# step's real work — the model just has to fire them together.
+# A solo update_plan (no sibling tool call in the step) costs a full-context
+# LLM round-trip, so batching it with the step's real work is preferred.
+# But solo update_plan is LEGITIMATE when there is no next tool call to batch
+# with: plan mode's required initial checklist (all pending by contract), and
+# any tick that marks step(s) completed — especially the final tick, which by
+# definition has no following work. Scolding those cases taught the model to
+# never call update_plan at all, leaving todos/plan stale. Only a solo
+# update_plan that completes nothing is pure overhead.
 _PLAN_ONLY_NUDGE = (
-    "PLAN-ONLY STEP: that step did nothing but update_plan — a full "
-    "round-trip for a checklist tick. update_plan is batchable: always fire "
-    "it in the SAME step as your next tool calls (parallel calls), never alone."
+    "PLAN-ONLY STEP: that step did nothing but update_plan without marking "
+    "anything completed — a full round-trip for a checklist tick with no "
+    "progress. Batch update_plan with your next tool calls in the SAME step "
+    "(parallel calls) whenever there IS next work; solo update_plan is fine "
+    "when marking steps completed or creating the initial checklist."
 )
 
 
@@ -2141,6 +2360,28 @@ def _is_plan_only_step(tcs: list) -> bool:
     """True when the step's calls are all update_plan (pure overhead)."""
     names = [(tc.get("name") or "").lower() for tc in tcs or []]
     return bool(names) and all(n == "update_plan" for n in names)
+
+
+def _plan_only_step_marks_progress(tcs: list) -> bool:
+    """True when a plan-only step marks at least one item completed.
+
+    Final/progress ticks with no further tool work to batch with are
+    legitimate solo steps — not overhead. Only a solo update_plan that
+    completes nothing wastes a round-trip.
+    """
+    for tc in tcs or []:
+        if (tc.get("name") or "").lower() != "update_plan":
+            return False
+        args = tc.get("args") or {}
+        items = args.get("items") if isinstance(args, dict) else None
+        if isinstance(items, list):
+            for it in items:
+                if (
+                    isinstance(it, dict)
+                    and str(it.get("status", "")).strip().lower() == "completed"
+                ):
+                    return True
+    return False
 
 
 async def langchain_tool_loop(
@@ -2216,6 +2457,8 @@ async def langchain_tool_loop(
     # model when a requested window is already in context (same mechanism as
     # the batching streak above).
     _reread = _SeenWindows()
+    # Revisit streak: same file/scope re-touched step after step.
+    _revisit = _RevisitStreakTracker()
     reset_read_ledger()
     reset_turn_seen_calls()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
@@ -2241,7 +2484,7 @@ async def langchain_tool_loop(
         _req = [*project_tool_results(_stable_tool_order(msgs)), *_transient]
         try:
             ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
-        except Exception as _pc_exc:  # noqa: BLE001
+        except Exception as _pc_exc:
             # Some gateways/models reject `parallel_tool_calls` with a 400 —
             # retry this step once without it (same fallback as graph.py).
             if _no_pc or not _is_parallel_calls_error(_pc_exc):
@@ -2340,6 +2583,7 @@ async def langchain_tool_loop(
         # reads get a stub in the transcript instead of re-sent content.
         _cover_stubs = _reread.check_covered(tcs)
         _reread_hint = _reread.observe(tcs)
+        _revisit_hint = _revisit.observe(tcs)
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -2398,7 +2642,9 @@ async def langchain_tool_loop(
             _transient.append(HumanMessage(content=_batch_hint.strip()))
         if _reread_hint:
             _transient.append(HumanMessage(content=_reread_hint.strip()))
-        if _is_plan_only_step(tcs):
+        if _revisit_hint:
+            _transient.append(HumanMessage(content=_revisit_hint.strip()))
+        if _is_plan_only_step(tcs) and not _plan_only_step_marks_progress(tcs):
             _transient.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
         # --- soft tool-call budget nudge ---
         # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or

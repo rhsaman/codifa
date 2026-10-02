@@ -1,5 +1,8 @@
 import { useState } from "react";
+import { useStore } from "../lib/store";
+import { prepareContent } from "../lib/bidi";
 import { useViewerTabs, type ViewerKind } from "../lib/viewerTabs";
+import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 
 function ReviewIcon() {
   return (
@@ -35,11 +38,26 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   inbox: InboxIcon,
 };
 
+const KIND_LABEL: Record<ViewerKind, string> = {
+  review: 'Git',
+  trace: 'Trace',
+  inbox: 'Inbox',
+};
+
+function CloseIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+      <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+    </svg>
+  );
+}
+
 /** VSCode-style tab bar for the right editor group (diff / trace / inbox).
  *  Tabs can be reordered with drag & drop; order persists across restarts. */
 export function ViewerTabBar() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
+  const viewerFull = useViewerTabs((s) => s.fullscreen);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
 
@@ -54,6 +72,7 @@ export function ViewerTabBar() {
     <div className="tab-bar viewer-tabs" role="tablist" aria-label="Viewers">
       {tabs.map((t) => {
         const active = t.id === activeId;
+        const title = prepareContent(KIND_LABEL[t.kind] ?? t.title, "ltr");
         const dropCls =
           dropTarget?.id === t.id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
         const Icon = KIND_ICON[t.kind];
@@ -65,7 +84,7 @@ export function ViewerTabBar() {
             tabIndex={0}
             draggable
             className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging" : ""}${dropCls}`}
-            title={t.title}
+            title={title}
             onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
@@ -109,23 +128,38 @@ export function ViewerTabBar() {
             <span className="viewer-tab-icon" aria-hidden="true">
               <Icon />
             </span>
-            <span className="editor-tab-label">{t.title}</span>
+            <span className="editor-tab-label" dir="ltr">{title}</span>
             <button
               type="button"
               className="editor-tab-close"
               title="Close viewer"
-              aria-label={`Close ${t.title}`}
+              aria-label={`Close ${title}`}
               draggable={false}
               onClick={(e) => {
                 e.stopPropagation();
                 useViewerTabs.getState().closeViewer(t.id);
               }}
             >
-              ×
+              <CloseIcon />
             </button>
           </div>
         );
       })}
+      <button
+        type="button"
+        className="editor-tab-full"
+        title={viewerFull ? "Exit fullscreen" : "Fullscreen viewer"}
+        aria-label={viewerFull ? "Exit viewer fullscreen" : "Fullscreen viewer"}
+        aria-pressed={viewerFull}
+        onClick={() => {
+          const vt = useViewerTabs.getState();
+          const next = !vt.fullscreen;
+          vt.setFullscreen(next);
+          if (next) useStore.getState().setChatFullscreen(false);
+        }}
+      >
+        {viewerFull ? <CompressIcon /> : <ExpandIcon />}
+      </button>
     </div>
   );
 }

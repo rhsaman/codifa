@@ -40,7 +40,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from llm import _batchable_nudge, _BatchStreakTracker
+from llm import _batchable_nudge, _BatchStreakTracker, _RevisitStreakTracker
 from llm import langchain_tool_loop as _tool_loop
 
 # ── pure detector tests ────────────────────────────────────────────────────
@@ -685,6 +685,108 @@ async def test_scoped_read_batch_partial_scope():
     assert out2.startswith("ERROR")
 
 
+def test_revisit_read_fires_on_nth_touch_once():
+    """Same file re-touched step after step: silent until the Nth touch,
+    then one transient reminder (once per key per turn). symbols= reads
+    count as touches too (still a round-trip)."""
+    t = _RevisitStreakTracker(threshold=2)
+    w1 = [{"name": "read", "args": {"filePath": "a.py", "offset": 1, "limit": 50}, "id": "c1"}]
+    assert t.observe(w1) == ""
+    out = t.observe(
+        [{"name": "read", "args": {"filePath": "a.py", "offset": 51, "limit": 50}, "id": "c2"}]
+    )
+    assert "REPEAT NOTE" in out and "a.py" in out and "2nd" in out
+    assert "ONE call" in out
+    # Further touches stay silent (once per key).
+    assert t.observe(w1) == ""
+    # symbols-only steps touch the file too.
+    t2 = _RevisitStreakTracker(threshold=2)
+    s = lambda i: [
+        {"name": "read", "args": {"filePath": "m.py", "symbols": ["F"]}, "id": f"s{i}"}
+    ]
+    assert t2.observe(s(1)) == ""
+    assert "m.py" in t2.observe(s(2))
+
+
+def test_streak_survives_read_grep_terminal_interleave():
+    """ترکیب read + grep + run_terminal: مرحله بدون batch (ترمینال یا
+    چک‌لیست) نباید streak را پاک کند — مدل باید بعد از کار میانی همچنان
+    یادآوری دسته‌بندی بگیرد."""
+    from llm import _BatchStreakTracker
+
+    t = _BatchStreakTracker(threshold=2)
+    r1 = [{"name": "read", "args": {"filePath": "a.py"}, "id": "c1"}]
+    term = [{"name": "run_terminal", "args": {"command": "pytest -q"}, "id": "c2"}]
+    r2 = [{"name": "read", "args": {"filePath": "b.py"}, "id": "c3"}]
+    assert t.observe(r1) == ""
+    assert t.observe(term) == ""
+    out = t.observe(r2)
+    assert "BATCHING REMINDER" in out and "read" in out
+    g1 = [{"name": "grep", "args": {"pattern": "alpha", "path": "src"}, "id": "g1"}]
+    upd = [{"name": "update_plan", "args": {"items": []}, "id": "u1"}]
+    g2 = [{"name": "grep", "args": {"pattern": "beta", "path": "src"}, "id": "g2"}]
+    t2 = _BatchStreakTracker(threshold=2)
+    assert t2.observe(g1) == ""
+    assert t2.observe(upd) == ""
+    out2 = t2.observe(g2)
+    assert "BATCHING REMINDER" in out2 and "grep" in out2
+
+
+def test_revisit_grep_scope_patterns_and_merged_skip():
+    """Same grep scope re-searched: reminder lists seen patterns; other
+    scopes are independent; already-merged batch greps never streak."""
+    t = _RevisitStreakTracker(threshold=2)
+    g = lambda p, i: [
+        {"name": "grep", "args": {"pattern": p, "path": "src"}, "id": f"g{i}"}
+    ]
+    assert t.observe(g("alpha", 1)) == ""
+    out = t.observe(g("beta", 2))
+    assert "REPEAT NOTE" in out and "src" in out
+    assert "alpha" in out and "beta" in out and "patterns=" in out
+    # Another scope is untouched; merged batch greps never count.
+    assert t.observe(
+        [{"name": "grep", "args": {"pattern": "zzz", "path": "docs"}, "id": "g3"}]
+    ) == ""
+    t2 = _RevisitStreakTracker(threshold=2)
+    m = lambda i: [
+        {
+            "name": "grep",
+            "args": {"pattern": "a", "patterns": ["b"], "path": "src"},
+            "id": f"m{i}",
+        }
+    ]
+    assert t2.observe(m(1)) == "" and t2.observe(m(2)) == ""
+
+
+def test_computer_act_steps_suggest_sequence():
+    """Two mutating computer calls in one step suggest ONE sequence call."""
+    tcs = [
+        {"name": "computer", "args": {"action": "act", "selector": "a"}, "id": "c1"},
+        {"name": "computer", "args": {"action": "input", "selector": "b"}, "id": "c2"},
+    ]
+    out = _batchable_nudge(tcs)
+    assert "sequence" in out, out
+
+
+def test_computer_read_only_no_sequence_nudge():
+    """Read-only computer actions must never merge into a sequence nudge."""
+    tcs = [
+        {"name": "computer", "args": {"action": "read_screen"}, "id": "c1"},
+        {"name": "computer", "args": {"action": "read_element"}, "id": "c2"},
+    ]
+    assert _batchable_nudge(tcs) == ""
+
+
+def test_computer_streak_suggests_sequence():
+    """One act/input per step across steps fires a sequence reminder."""
+    t = _BatchStreakTracker(threshold=2)
+    s1 = [{"name": "computer", "args": {"action": "act"}, "id": "c1"}]
+    s2 = [{"name": "computer", "args": {"action": "input"}, "id": "c2"}]
+    assert t.observe(s1) == ""
+    out = t.observe(s2)
+    assert "sequence" in out, out
+
+
 if __name__ == "__main__":
     test_two_greps_same_scope_nudge_fires()
     print("  ✅ two greps same scope")
@@ -728,4 +830,10 @@ if __name__ == "__main__":
     print("  ✅ loop nudges one-at-a-time greps (different scopes)")
     test_loop_streak_counts_through_per_step_nudge_step()
     print("  ✅ streak counts through per-step-nudge steps")
+    test_revisit_read_fires_on_nth_touch_once()
+    print("  ✅ revisit read fires once")
+    test_revisit_grep_scope_patterns_and_merged_skip()
+    print("  ✅ revisit grep scope + merged skip")
+    test_streak_survives_read_grep_terminal_interleave()
+    print("  ✅ streak survives read+grep+terminal interleave")
     print("\n🎉 همه تست‌های batching nudge رد شد")

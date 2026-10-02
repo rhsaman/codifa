@@ -385,6 +385,10 @@ export interface ChatMessage {
    *  and it is instead rendered inline, right after the tool call that carried
    *  it, via a `{ kind: 'user' }` segment on the assistant message. */
   steerInterleaved?: boolean
+  /** Transient stage label while streaming (e.g. preparing context, contacting
+   *  model). Cleared on first real text/tool/thinking content. Never persisted
+   *  as model history. */
+  statusText?: string
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
@@ -523,7 +527,7 @@ export interface LayaRun {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'keepalive' | 'laya'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive' | 'laya'
   content?: string
   tool?: string
   args?: Record<string, unknown>

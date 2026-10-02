@@ -12,6 +12,7 @@ import {
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
+import { useViewerTabs } from "../lib/viewerTabs";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -326,7 +327,7 @@ export function ScheduleInbox() {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></svg>
             </button>
             <button
-              className="review-header-btn"
+              className="review-header-btn schedule-inbox-close"
               title="Close inbox"
               aria-label="Close inbox"
               onClick={() => setOpen(false)}
@@ -782,18 +783,23 @@ export function ScheduleInboxButton() {
   }, []);
 
   const unseen = unseenRunCount(runs, seen);
-  const open = useStore((s) => s.scheduleInboxOpen);
+  const hasTab = useViewerTabs((s) => s.tabs.some((t) => t.kind === 'inbox'));
   return (
     <button
       className="titlebar-icon-btn schedule-inbox-btn"
       title={unseen > 0 ? `${unseen} new schedule runs` : "Schedule inbox"}
       aria-label="Schedule inbox"
-      aria-pressed={open}
+      aria-pressed={hasTab}
       onClick={() => {
-        void import("../lib/viewerTabs").then(({ useViewerTabs }) => {
-          useViewerTabs.getState().openInbox();
-        });
-        useStore.getState().setScheduleInboxOpen(true);
+        const vt = useViewerTabs.getState();
+        const existing = vt.tabs.find((t) => t.kind === 'inbox');
+        if (existing) {
+          vt.closeViewer(existing.id);
+          useStore.getState().setScheduleInboxOpen(false);
+        } else {
+          vt.openInbox();
+          useStore.getState().setScheduleInboxOpen(true);
+        }
       }}
     >
       <svg

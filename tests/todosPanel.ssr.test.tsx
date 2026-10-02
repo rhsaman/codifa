@@ -255,13 +255,13 @@ console.log("۱۶) پنل راست — تاگل استور و لایه‌بند�
   check("زدایندکس پنل راست پشت اورلی دیف است", zRight < zReview, { zRight, zReview })
 }
 
-console.log("۱۷) باز شدن خودکار پنل — فقط ساخت تازه وقتی پنل بسته است:")
+console.log("۱۷) پنل راست هرگز خودکار باز نمی‌شود:")
 {
-  const { shouldAutoOpenTodosPanel } = await import("../src/components/TodosPanel")
-  check("بسته + تازه (۰→۳) → باز شود", shouldAutoOpenTodosPanel(0, 3, false) === true)
-  check("پنل باز است → باز نشود", shouldAutoOpenTodosPanel(0, 3, true) === false)
-  check("آپدیت وضعیت (۲→۳) → باز نشود", shouldAutoOpenTodosPanel(2, 3, false) === false)
-  check("بدون تودو (۰→۰) → باز نشود", shouldAutoOpenTodosPanel(0, 0, false) === false)
+  const mod = await import("../src/components/TodosPanel") as Record<string, unknown>
+  check("تابع بازشدن خودکار حذف شده است", mod["shouldAutoOpenTodosPanel"] === undefined)
+  const { readFileSync } = await import("node:fs")
+  const chatSrc = readFileSync("src/components/Chat.tsx", "utf8")
+  check("Chat.tsx پنل را خودکار باز نمی‌کند", !chatSrc.includes("setRightPanelOpen(true)"))
 }
 
 console.log("۱۹) سکشن Laya — برچسب مسیر، لحن کارت و درصد اطمینان:")

@@ -1,6 +1,6 @@
 // تست SSR برای دیف واکنش‌گرا — تک‌ستونی در عرض کم، دوستونی در عرض زیاد.
 // پوشش:
-//  - shouldShowSideBySide: آستانه‌ی عرض (پیش‌فرض ۶۴۰)
+//  - shouldShowSideBySide: آستانه‌ی عرض (پیش‌فرض ۷۶۸)
 //  - DiffView با layout اجباری unified → فقط .diff-unified
 //  - DiffView با layout اجباری side-by-side → .diff-columns + هدر Before/After + گپ
 //  - ReviewFileAccordion با wide → دوستونی، بدون wide → تک‌ستونی
@@ -40,8 +40,9 @@ const DIFF = [
 console.log("۱) shouldShowSideBySide: آستانه‌ی عرض:");
 {
   check("عرض کم تک‌ستونی", shouldShowSideBySide(320) === false);
-  check("عرض زیاد دوستونی", shouldShowSideBySide(900) === true);
-  check("مرز آستانه دوستونی", shouldShowSideBySide(640) === true);
+  check("زیر آستانه تک‌ستونی", shouldShowSideBySide(700) === false);
+  check("عرض متوسط دوستونی", shouldShowSideBySide(900) === true);
+  check("مرز آستانه دوستونی", shouldShowSideBySide(768) === true);
   check("آستانه‌ی سفارشی", shouldShowSideBySide(500, 400) === true);
 }
 

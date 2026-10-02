@@ -448,9 +448,10 @@ async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
 
     # The byte cache underneath is intact: with reuse memory cleared, the
     # same read returns the cached bytes (summary "cached").
-    from tool_batching import reset_cross_turn
+    from tool_batching import reset_cross_turn, reset_read_ledger
 
     reset_cross_turn()
+    reset_read_ledger()
     r2b = await read(filePath="a.py")
     assert r1 == r2b
     assert any(
@@ -497,9 +498,10 @@ async def test_read_cache_invalidates_across_path_spellings(tmp_path):
 
     # With reuse memory cleared the byte cache still matches across
     # spellings (summary "cached").
-    from tool_batching import reset_cross_turn
+    from tool_batching import reset_cross_turn, reset_read_ledger
 
     reset_cross_turn()
+    reset_read_ledger()
     r2b = await read(filePath="./a.py")
     assert r1 == r2b
     assert any(

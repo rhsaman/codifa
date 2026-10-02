@@ -204,6 +204,23 @@ function splitTooltip(
     .join(" · ");
 }
 
+/** Whether the usage popover may render (pure so it is testable).
+ *  The open state is scoped to the chat that opened it: switching chats (or
+ *  emptying usage, e.g. via reset) derives closed synchronously, so a stale
+ *  open from the previous chat can never make the popover appear on the
+ *  fresh chip without a genuine hover/toggle. */
+export function isUsagePopoverOpen(
+  openForChatId: string | null,
+  activeChatId: string | null,
+  groupCount: number,
+): boolean {
+  return (
+    openForChatId !== null &&
+    openForChatId === activeChatId &&
+    groupCount > 0
+  );
+}
+
 /** Viewport-aware anchor for the usage popover (pure so it is testable).
  *  Clamps the chip's left edge so the fixed popover never overflows the
  *  viewport horizontally; vertical anchor is always just below the chip. */
@@ -381,8 +398,24 @@ export function UsageChip() {
     [activeUsage, allProviders],
   );
 
-  const [open, setOpen] = useState(false);
+  const [openForChatId, setOpenForChatId] = useState<string | null>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const [prevChatId, setPrevChatId] = useState(activeChatId);
+  // Clear a stale open when the active chat changes (render-time adjustment,
+  // so no one-frame flash) — otherwise returning to the previous chat would
+  // reopen its old popover without a genuine hover/toggle.
+  if (prevChatId !== activeChatId) {
+    setPrevChatId(activeChatId);
+    setOpenForChatId(null);
+    setPos(null);
+  }
+  // Clear a stale open while the chip is hidden (empty usage, e.g. after
+  // reset) so the next first usage appears with a closed popover.
+  if (view.groups.length === 0 && openForChatId !== null) {
+    setOpenForChatId(null);
+    setPos(null);
+  }
+  const open = isUsagePopoverOpen(openForChatId, activeChatId ?? null, view.groups.length);
   const chipRef = useRef<HTMLDivElement | null>(null);
   const closeTimer = useRef<number | null>(null);
   const cancelClose = () => {
@@ -395,7 +428,7 @@ export function UsageChip() {
     cancelClose();
     // Small delay so moving the pointer from the chip to the popover (which
     // sits a few px below it) doesn't close it mid-flight.
-    closeTimer.current = window.setTimeout(() => setOpen(false), 180);
+    closeTimer.current = window.setTimeout(() => setOpenForChatId(null), 180);
   };
   const openNow = () => {
     cancelClose();
@@ -408,12 +441,12 @@ export function UsageChip() {
       const r = chipRef.current.getBoundingClientRect();
       setPos(computeUsagePopoverPos(r, window.innerWidth));
     }
-    setOpen(true);
+    setOpenForChatId(activeChatId ?? null);
   };
   const toggleOpen = () => {
     if (open) {
       cancelClose();
-      setOpen(false);
+      setOpenForChatId(null);
     } else {
       openNow();
     }
@@ -489,7 +522,7 @@ export function UsageChip() {
           toggleOpen();
         } else if (e.key === "Escape") {
           e.stopPropagation();
-          setOpen(false);
+          setOpenForChatId(null);
         }
       }}
     >

@@ -1,6 +1,7 @@
 """Project repeated read-only results without changing the durable transcript."""
 
 import json
+import posixpath
 import re
 from collections.abc import Sequence
 
@@ -357,3 +358,71 @@ def _search_item(name: str, args: dict, pattern: str, outcome: str) -> str:
     if len(pat) > _SEARCH_LEDGER_MAX_PAT:
         pat = pat[: _SEARCH_LEDGER_MAX_PAT - 3] + "..."
     return f"{name} '{pat}' in {scope}{filt}: {outcome}"
+
+
+def _live_key(path: str) -> str:
+    try:
+        return posixpath.normpath(str(path).strip())
+    except Exception:  # noqa: BLE001 — lookup only
+        return str(path).strip()
+
+
+_HISTORY_ROW_FIRST_RE = re.compile(r"^(?P<path>.+?): (?P<n>\d+) \| ")
+
+
+def live_read_lines(messages: Sequence[BaseMessage], path: str) -> frozenset[int]:
+    """Line numbers of ``path`` whose text is present in ``messages`` right now.
+
+    A cross-turn "already in context" stub is only honest when the rows are in
+    the CALLING agent's transcript. Two shapes carry rows: live read results
+    (``<path>..</path>`` blocks) and read results rebuilt from a previous
+    turn's saved activity (``path: N | text`` then ``N | text`` rows, capped
+    per item). Another chat, a sub-agent, and trimmed or compacted results
+    contribute nothing, so they can never be claimed as covered.
+    """
+    key = _live_key(path)
+    out: set[int] = set()
+    for message in messages or []:
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "status", "success") != "success":
+            continue
+        content = message.content
+        if not isinstance(content, str) or " | " not in content:
+            continue
+        if "<type>file</type>" in content:
+            for block in _READ_BLOCK_RE.finditer(content):
+                if _live_key(block.group("path") or "") != key:
+                    continue
+                for row in block.group("body").split("\n"):
+                    m = _ROW_RE.match(row)
+                    if m:
+                        out.add(int(m.group(1)))
+            continue
+        current = ""
+        for row in content.split("\n"):
+            first = _HISTORY_ROW_FIRST_RE.match(row)
+            if first:
+                current = _live_key(first.group("path"))
+                if current == key:
+                    out.add(int(first.group("n")))
+                continue
+            if current == key:
+                m = _ROW_RE.match(row)
+                if m:
+                    out.add(int(m.group(1)))
+    return frozenset(out)
+
+
+def live_grep_heads(messages: Sequence[BaseMessage]) -> list[str]:
+    """First line (``MATCHES for '...'``) of every live grep result."""
+    heads: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "status", "success") != "success":
+            continue
+        content = message.content
+        if isinstance(content, str) and content.startswith("MATCHES for "):
+            heads.append(content.split("\n", 1)[0])
+    return heads

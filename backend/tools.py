@@ -14,6 +14,7 @@ import difflib
 import glob as _pyglob
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -36,6 +37,7 @@ from cache import Cache, cache_path_for
 from secret_utils import decrypt_secret
 from tool_batching import (
     coalesce_io,
+    drop_ledger_path,
     fetched_windows,
     has_served_map,
     note_fetched_window,
@@ -80,6 +82,18 @@ _DEF_BODY_MAX_COUNT = 6  # max definition bodies expanded inline per grep call
 _parent_search_cache: dict[tuple[str, ...], str] = {}
 _search_generations: dict[str, int] = {}
 _search_inflight: dict[tuple, asyncio.Task[dict]] = {}
+
+# Live checklist per chat (session-only, in-memory). update_plan merges the
+# incoming full list with the stored one so a mid-run steer EDITS the open
+# plan instead of replacing it, and completed steps are never reverted to
+# pending/in_progress (the todo-redo bug). Frontend replaces its view with
+# the emitted merged list (single source of truth here).
+_PLAN_BY_CHAT: dict[str, list[dict]] = {}
+# Mutating tool calls since the last update_plan, per chat (module-global so
+# it survives across turns/callback rebuilds, unlike _plan_nudge_state).
+# Powers the no-progress-repeat guard in update_plan: re-sending an unchanged
+# checklist after real tool work ran means the panel is stuck.
+_PLAN_MUTATING_SINCE_UPDATE: dict[str, int] = {}
 
 
 async def _shared_search(
@@ -267,6 +281,11 @@ _ASK_MAX_OPTIONS = 8
 # حداقل کوتیشنِ داخلی برای بازکردن گزینهٔ چسبیده؛ کمتر از این، احتمالاً یک
 # عبارت کوتیشن‌دارِ عادی داخل گزینه است (مثل Use "strict" mode) و نباید بشکند.
 _ASK_GLUE_MIN_QUOTES = 3
+# مدل گاهی به‌جای رشته، آبجکت می‌فرستد (مثل {"description": "..."})؛ مقدار
+# خوانا از این کلیدها برداشته می‌شود و خرده‌ریزهای بلاب دور ریخته می‌شوند.
+_ASK_DICT_VALUE_KEYS = ("description", "label", "text", "title", "option", "value", "name")
+_ASK_JUNK_KEYS = frozenset({"description", "label", "text", "title", "option", "value", "name", "options", "question"})
+_ASK_JUNK_SINGLE = frozenset('{}[]():;,.،"\'«»“”„‹›')
 
 
 def _strip_outer_quotes(text: str) -> str:
@@ -277,21 +296,51 @@ def _strip_outer_quotes(text: str) -> str:
     return out
 
 
+def _is_ask_junk(text: str) -> bool:
+    """تشخیص خرده‌ریز بلاب JSON-ish — آکولاد/کروشه/کولن تنها یا کلیدهایی مثل description."""
+    s = text.strip().strip(",;،:[]{}").strip().strip("\"'«»“”„‹›").strip()
+    if not s:
+        return True
+    if len(s) == 1 and (s in _ASK_JUNK_SINGLE or not s.isalnum()):
+        return True
+    return s.casefold() in _ASK_JUNK_KEYS
+
+
 def _split_glued_option(text: str) -> list[str]:
     """بازکردن گزینه‌های به‌هم‌چسبیده به سگمنت‌های بین کوتیشن‌ها.
 
     وقتی مدل JSON آرگومان را خراب می‌نویسد، چند گزینه داخل «یک» رشته با
     کوتیشن‌های جداکننده می‌آیند (مثل a"b"c"d"e). هر سگمنتِ ناصفر یک گزینهٔ
-    مجزاست؛ ویرگول/سمی‌کولِ ابتدا و انتهای سگمنت هم پاک می‌شود.
+    مجزاست؛ ویرگول/سمی‌کول/آکولاد/کولن ابتدا و انتهای سگمنت هم پاک می‌شود و
+    خرده‌ریزهای بلاب JSON-ish (مثل { و } و : و description) دور ریخته می‌شوند.
     """
-    if text.count('"') < _ASK_GLUE_MIN_QUOTES:
-        return [text]
-    segments: list[str] = []
-    for part in text.split('"'):
-        part = part.strip().strip(",;،").strip()
-        if part:
-            segments.append(part)
-    return segments or [text]
+    if text.count('"') >= _ASK_GLUE_MIN_QUOTES:
+        segments: list[str] = []
+        for part in text.split('"'):
+            part = part.strip().strip(",;،:[]{}").strip().strip("\"'«»“”„‹›").strip()
+            if part and not _is_ask_junk(part):
+                segments.append(part)
+        return segments or [text]
+    # بلاب شبه‌JSON بدون کوتیشن کافی (مثل {description: ...}) — با آکولاد و کولن بشکن.
+    # اما JSON معتبر (مثل {"x": 1}) دست‌نخورده می‌ماند تا تست coerce نشکند.
+    if "{" in text and "}" in text and ":" in text:
+        try:
+            json.loads(text)
+            return [text]
+        except (ValueError, TypeError):
+            pass
+        blob = text
+        for ch in "{}[]:\n":
+            blob = blob.replace(ch, '"')
+        segments = []
+        for part in blob.split('"'):
+            for sub in re.split(r"[,;،؛]+", part):
+                sub = sub.strip().strip(",;،:[]{}").strip().strip("\"'«»“”„‹›").strip()
+                if sub and not _is_ask_junk(sub):
+                    segments.append(sub)
+        if segments:
+            return segments
+    return [text]
 
 
 def _clean_ask_options(raw: Any) -> list[str]:
@@ -314,13 +363,30 @@ def _clean_ask_options(raw: Any) -> list[str]:
             continue
         if isinstance(item, str):
             text = item
-        elif isinstance(item, (dict, list)):
-            text = json.dumps(item, ensure_ascii=False)
+        elif isinstance(item, dict):
+            text = ""
+            for k in _ASK_DICT_VALUE_KEYS:
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    text = v
+                    break
+            if not text:
+                for v in item.values():
+                    if isinstance(v, str) and v.strip():
+                        text = v
+                        break
+            if not text:
+                text = json.dumps(item, ensure_ascii=False)
+        elif isinstance(item, (list, tuple)):
+            text = json.dumps(list(item), ensure_ascii=False)
         else:
             text = str(item)
         for opt in _split_glued_option(_strip_outer_quotes(text)):
+            opt = opt.strip()
+            if not opt or _is_ask_junk(opt):
+                continue
             key = opt.casefold()
-            if opt and key not in seen:
+            if key not in seen:
                 seen.add(key)
                 cleaned.append(opt)
     return cleaned[:_ASK_MAX_OPTIONS]
@@ -2252,15 +2318,15 @@ def _format_verify_suffix(note: str | None) -> str:
 # Backstop for the 'forgets to check off a finished checklist step' failure mode.
 # Prompt instructions alone ('call update_plan again marking it completed') are
 # not reliably followed, so make_tool_callbacks tracks how many mutating tool
-# calls have happened since the plan was last updated while a step is still
-# 'in_progress', and a due nudge is piggybacked onto that tool's OWN reply
+# calls have happened since the plan was last updated while the checklist still
+# has open steps, and a due nudge is piggybacked onto that tool's OWN reply
 # (same trick as AUTO-VERIFY) so no extra message-injection machinery is needed.
 def _format_plan_nudge_suffix(due: bool) -> str:
     if not due:
         return ""
     return (
-        "\n\n💡 Reminder: your checklist still has a step marked 'in_progress' after "
-        "several tool calls — call update_plan now with the SAME full list, marking "
+        "\n\n💡 Reminder: your checklist still has open steps after "
+        "tool calls — call update_plan now with the SAME full list, marking "
         "any step you've actually finished 'completed' (and the next one 'in_progress')."
     )
 
@@ -3272,7 +3338,8 @@ def _duplicate_stub(emit: Callable[[dict], None], tool: str, args: dict, main_na
     )
     return (
         f"DUPLICATE of this turn's earlier `{tool}` call ({desc}) — "
-        "the full result is already in context above and is NOT re-sent (tokens saved)."
+        "the full result is already in context above and is NOT re-sent (tokens saved). "
+        "Do NOT repeat this call — continue the task."
     )
 
 
@@ -3294,8 +3361,153 @@ def _cross_turn_stub(emit: Callable[[dict], None], tool: str, args: dict, main_n
     )
     return (
         f"REUSED from an earlier `{tool}` call ({desc}) — files unchanged "
-        f"since, so the full result is NOT re-sent; reuse the rows in history above. {hint}"
+        f"since, so the full result is NOT re-sent; reuse the rows in history above. {hint} "
+        "Do NOT repeat this call — continue the task."
     )
+
+
+async def _grep_served_rows_stub(
+    root: str, scope: str, matches: list[dict], permit,
+) -> str:
+    """Pointer when every match of a single-file grep is already served.
+
+    Back-to-back greps on one file (grep, read the body, grep a narrower
+    term, ...) re-send rows the model already holds: the match lines sit
+    inside windows served earlier this turn or in a previous turn
+    (byte-unchanged). The disk scan above still ran (cheap); only the
+    re-send is skipped here.
+
+    Soundness: single-file scopes only; every match must be in that file;
+    every match line ±SNIPPET_CONTEXT must be covered by served spans; a
+    match on a definition's first line additionally requires its inlined
+    body span to be covered (otherwise the stub would hide a body never
+    shown). Tool edits drop the ledger and external edits trip the
+    signature guard, so changed files always serve whole. Map-served
+    paths are untrusted and never stub. Returns "" when the grep must
+    serve normally. Never raises.
+    """
+    try:
+        if not matches or not (scope or "").strip():
+            return ""
+        if has_served_map(scope):
+            return ""
+        try:
+            _target = resolve_safe(root, scope, allow_coder=True, permit=permit)
+        except PathEscapeError:
+            return ""
+        if not os.path.isfile(_target):
+            return ""
+        try:
+            from tool_batching import cross_turn_served_spans as _spans
+            from tool_batching import cross_turn_sig_changed as _changed
+        except ImportError:
+            return ""
+        try:
+            _stale = bool(_changed(root, scope))
+        except Exception:  # noqa: BLE001
+            _stale = False
+        if _stale:
+            try:
+                drop_ledger_path(scope)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            return ""
+        _spans_now: list[tuple[int, int]] = []
+        try:
+            for _a, _b in fetched_windows(scope) or []:
+                _spans_now.append((int(_a), int(_b)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            for _a, _b in (_spans(root, scope) or []):
+                _spans_now.append((int(_a), int(_b)))
+        except (TypeError, ValueError):
+            pass
+        if not _spans_now:
+            return ""
+        # Merge to a disjoint union first: summing raw spans double-counts
+        # their overlaps and could claim coverage of lines never served.
+        try:
+            _spans_now.sort()
+            _merged: list[list[int]] = []
+            for _a, _b in _spans_now:
+                if _merged and _a <= _merged[-1][1] + 1:
+                    _merged[-1][1] = max(_merged[-1][1], _b)
+                else:
+                    _merged.append([_a, _b])
+            _spans_now = [(int(_a), int(_b)) for _a, _b in _merged]
+        except (TypeError, ValueError):
+            pass
+        try:
+            _want = posixpath.normpath(str(scope))
+        except Exception:  # noqa: BLE001
+            return ""
+        _lines: list[int] = []
+        for _m in matches:
+            try:
+                if not isinstance(_m, dict):
+                    return ""
+                if posixpath.normpath(str(_m.get("file") or "")) != _want:
+                    return ""  # a hit outside the single file — serve
+                _ln = int(_m.get("line") or 0)
+                if _ln <= 0:
+                    return ""
+                _lines.append(_ln)
+            except (TypeError, ValueError):
+                return ""
+        if not _lines or len(_lines) > 200:
+            return ""
+
+        def _covered(_lo: int, _hi: int) -> bool:
+            try:
+                _lo = max(1, int(_lo))
+                _need = max(1, int(_hi)) - _lo + 1
+                _got = sum(
+                    max(0, min(int(_hi), _b) - max(_lo, _a) + 1)
+                    for _a, _b in _spans_now
+                )
+                return _got >= _need
+            except (TypeError, ValueError):
+                return False
+
+        for _ln in _lines:
+            if not _covered(_ln - SNIPPET_CONTEXT, _ln + SNIPPET_CONTEXT):
+                return ""
+        # Matches on a definition's first line would inline the body: hide
+        # nothing unless that body span was served before too. The symbol
+        # parse is mtime-cached (grammar compiles once per process).
+        try:
+            from symbol_index import enclosing_symbol as _enclosing
+        except ImportError:
+            return ""
+        if _enclosing is not None:
+            try:
+                _hits = await asyncio.gather(
+                    *(asyncio.to_thread(_enclosing, _target, _ln) for _ln in _lines)
+                )
+            except Exception:  # noqa: BLE001
+                return ""
+            for _ln, _hit in zip(_lines, _hits):
+                try:
+                    if _hit is None:
+                        continue
+                    _hs, _he = int(_hit[1]), int(_hit[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if _hs == _ln and not _covered(
+                    _hs, min(_he, _hs + _DEF_BODY_MAX_LINES - 1)
+                ):
+                    return ""
+        _n = len(_lines)
+        return (
+            f"All {_n} match{'es' if _n != 1 else ''} for this grep under "
+            f"{scope or '/'} sit on lines already served in context above — "
+            f"full rows NOT re-sent; reuse them. (If those rows are no longer "
+            f"in context, re-grep with a wider pattern or read exact "
+            f"ranges/symbols — otherwise do NOT re-grep; continue the task.)"
+        )
+    except Exception:  # noqa: BLE001 — coverage never breaks a search
+        return ""
 
 
 def _def_body_text(abs_path: str, match_line: int, start: int, end: int) -> str | None:
@@ -3722,12 +3934,39 @@ def make_tool_callbacks(
                 out.append((p, a, b - a + 1))
         return out
 
+    def _plan_open_count() -> int:
+        """Number of non-completed items on this chat's stored checklist.
+
+        Read from the module-global store (not the per-turn
+        ``_plan_nudge_state``) so the backstop works across turns and also
+        covers all-pending lists — previously only an ``in_progress``-stuck
+        list was reminded, and an all-pending checklist went stale silently
+        while edits ran (todos never ticked).
+        """
+        if not _chat_id:
+            return 0
+        try:
+            stored = _PLAN_BY_CHAT.get(_chat_id, [])
+        except Exception:  # noqa: BLE001 — backstop must never break a tool
+            return 0
+        return sum(
+            1
+            for s in stored
+            if isinstance(s, dict) and s.get("status") != "completed"
+        )
+
     def _plan_nudge_due() -> bool:
         """Call once per mutating tool call. Returns True (and resets the counter)
-        once every `_PLAN_NUDGE_EVERY` calls made while the plan still has a step
-        stuck 'in_progress' — fires repeatedly, not just once, until the model
-        actually updates the plan."""
-        if not _plan_nudge_state["has_in_progress"]:
+        once every `_PLAN_NUDGE_EVERY` calls made while the checklist still has
+        open steps — fires repeatedly, not just once, until the model actually
+        updates the plan."""
+        # Cross-turn work meter for the no-progress-repeat guard in update_plan
+        # (module-global: survives callback rebuilds between turns).
+        if _chat_id:
+            _PLAN_MUTATING_SINCE_UPDATE[_chat_id] = (
+                _PLAN_MUTATING_SINCE_UPDATE.get(_chat_id, 0) + 1
+            )
+        if _plan_open_count() == 0:
             return False
         _plan_nudge_state["since_update"] += 1
         if _plan_nudge_state["since_update"] >= _PLAN_NUDGE_EVERY:
@@ -3812,7 +4051,13 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
+        # Also drop per-turn served windows: same-turn omission must not omit
+        # lines served BEFORE this edit (they are stale now).
         _invalidate_read_cache_for(path, root)
+        try:
+            drop_ledger_path(path)
+        except Exception:  # noqa: BLE001, S110 — invalidation never breaks edit
+            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -3821,7 +4066,7 @@ def make_tool_callbacks(
         )
 
     async def update_plan(items: list[dict]) -> str:
-        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in."""
+        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in. If a checklist already exists (from history or a previous update_plan), EDIT it: resend the SAME items with updated statuses, adding/removing only what the new message changed — never start a fresh duplicate list. NEVER revert a 'completed' step back to pending/in_progress. Batch update_plan with your next tool calls in the SAME step when there IS next work; a solo update_plan is fine when marking steps completed with no further tool work needed (e.g. the final tick) or creating the initial checklist."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
@@ -3864,18 +4109,68 @@ def make_tool_callbacks(
         ]
         for i in in_progress_idx[:-1]:
             normalized[i]["status"] = "completed"
+        # No-progress repeat guard: re-sending the checklist with zero status
+        # movement after real tool work ran means the todos panel is stuck
+        # (the repeat-0/N pattern). Computed BEFORE the merge overwrites the
+        # store; the note goes into the result string the model reads at once.
+        _repeat_without_progress = False
+        if _chat_id:
+            _prev_plan = _PLAN_BY_CHAT.get(_chat_id, [])
+            if (
+                _prev_plan
+                and len(_prev_plan) == len(normalized)
+                and not all(
+                    i.get("status") == "completed" for i in normalized
+                )
+                and all(
+                    (a.get("status") if isinstance(a, dict) else None)
+                    == (b.get("status") if isinstance(b, dict) else None)
+                    for a, b in zip(_prev_plan, normalized)
+                )
+                and _PLAN_MUTATING_SINCE_UPDATE.get(_chat_id, 0) > 0
+            ):
+                _repeat_without_progress = True
+        # Merge with the stored open plan so a mid-run steer EDITS instead of
+        # replacing, and completed steps are never reverted (todo-redo fix).
+        # Match by normalized content (not positional id): the model rewords
+        # slightly between calls, but the same step keeps its status.
+        if _chat_id:
+            _stored = _PLAN_BY_CHAT.get(_chat_id, [])
+            if _stored and not all(s.get("status") == "completed" for s in _stored):
+                def _norm_key(s: str) -> str:
+                    return " ".join(str(s or "").strip().lower().split())[:200]
+
+                _stored_by_key = {_norm_key(s.get("content")): s for s in _stored if isinstance(s, dict)}
+                for it in normalized:
+                    _prev = _stored_by_key.get(_norm_key(it.get("content")))
+                    if _prev is None and len(normalized) == len(_stored):
+                        # Same length, likely same step reworded: match by index.
+                        try:
+                            _idx = int(str(it.get("id", "")).split("-")[-1])
+                            if 0 <= _idx < len(_stored):
+                                _prev = _stored[_idx]
+                        except Exception:  # noqa: BLE001 — index parse is best-effort
+                            _prev = None
+                    if _prev is not None and _prev.get("status") == "completed" and it.get("status") != "completed":
+                        it["status"] = "completed"
+                _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in normalized]
+            else:
+                _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in normalized]
+            if all(it.get("status") == "completed" for it in normalized):
+                _PLAN_BY_CHAT.pop(_chat_id, None)
+                _PLAN_MUTATING_SINCE_UPDATE.pop(_chat_id, None)
         # Feed the plan-nudge backstop (see _format_plan_nudge_suffix): reset the
         # since-last-update counter now that the plan was just touched, and record
         # whether a step is still open so mutating tools know whether to nudge.
         _plan_nudge_state["since_update"] = 0
+        if _chat_id:
+            _PLAN_MUTATING_SINCE_UPDATE[_chat_id] = 0
         _plan_nudge_state["has_in_progress"] = any(
             i["status"] == "in_progress" for i in normalized
         )
-        # The checklist is intentionally NOT persisted to disk anymore — it
-        # lives only for the current session/UI. Persisting it caused the
-        # checklist to be re-loaded and re-emitted on every message (and on
-        # every graph node), which clobbered in-turn edits and reloaded stale
-        # todos. We only emit it to the UI now.
+        # Session-only (in-memory per chat, see _PLAN_BY_CHAT): never on disk,
+        # so stale todos cannot reload on every message. The merged list is the
+        # single source of truth — the frontend replaces its view with it.
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
         emit(
@@ -3885,7 +4180,15 @@ def make_tool_callbacks(
                 "summary": f"{done}/{len(normalized)} done",
             }
         )
-        return f"Plan updated: {len(normalized)} steps, {done} completed."
+        _ret = f"Plan updated: {len(normalized)} steps, {done} completed."
+        if _repeat_without_progress:
+            _ret += (
+                f" Note: you re-sent the SAME checklist without advancing any status, "
+                f"yet tool work ran since the last update — the todos panel still shows "
+                f"{done}/{len(normalized)}. Mark finished steps 'completed' and the current "
+                f"one 'in_progress' NOW (a solo update_plan is fine for this)."
+            )
+        return _ret
 
     async def create_skill_tool(
         name: str,
@@ -4086,7 +4389,12 @@ def make_tool_callbacks(
         except Exception:  # noqa: BLE001
             skills = []
         match = next(
-            (s for s in skills if (s.get("name") or "").strip().casefold() == wanted),
+            (
+                s
+                for s in skills
+                if (s.get("name") or "").strip().casefold() == wanted
+                or (s.get("slug") or "").strip().casefold() == wanted
+            ),
             None,
         )
         if match is None:
@@ -4255,7 +4563,13 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
+        # Also drop per-turn served windows: same-turn omission must not omit
+        # lines served BEFORE this edit (they are stale now).
         _invalidate_read_cache_for(path, root)
+        try:
+            drop_ledger_path(path)
+        except Exception:  # noqa: BLE001, S110 — invalidation never breaks edit
+            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         _n_edits = int(result.get("edits_applied", 0) or 0)
         _head = (
@@ -4385,7 +4699,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
 
         _words = _grep_word_set(combined)
         _scope_key = (scope, inc_disp)
-        _cover = _grep_cover_check(generation, _scope_key, _words, max_results)
+        _cover = _grep_cover_check(
+            generation, _scope_key, _words, max_results, combined
+        )
         if _words and _cover:
             return _duplicate_stub(
                 emit, "grep",
@@ -4489,9 +4805,32 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
             # A no-match search is trivially complete: a later subset
             # pattern on this scope can match nothing either.
-            _grep_cover_note(generation, _scope_key, _words, max_results, combined)
+            _grep_cover_note(
+                generation, _scope_key, _words, max_results, combined, combined
+            )
             return f"No matches for {combined!r} under {scope or '/'}"
-        # Output contract (spec §3, revised): each hit shows the match line plus
+        # Single-file repeat of already-served rows (the back-to-back grep
+        # ping-pong: grep, read the body, grep a narrower term on the same
+        # file). The scan above ran; when every match sits on served lines,
+        # only the re-send is skipped. A `tool` event already fired above,
+        # so only the result event fires here (same as the cached path).
+        if len(all_paths) == 1 and len(all_includes) == 1:
+            try:
+                _served_stub = await _grep_served_rows_stub(
+                    root, all_paths[0], matches, permit,
+                )
+            except Exception:  # noqa: BLE001 — coverage never breaks a search
+                _served_stub = ""
+            if _served_stub:
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "grep",
+                        "summary": "duplicate (already in context)",
+                        "model": _main_name,
+                    }
+                )
+                return _served_stub        # Output contract (spec §3, revised): each hit shows the match line plus
         # surrounding code (already computed by search_in_files above).
         # Adaptive context: full ±3 lines for up to 5 results, ±1 line when
         # more are shown, so a broad search stays within the char budget
@@ -4556,6 +4895,28 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             lines.append(entry)
             total += len(entry) + 2
             _shown_n += 1
+        # Served truth for later repeats: the shown rows are now in context.
+        # Record their spans (same-turn + cross-turn) so a later read/grep of
+        # the same lines omits them instead of re-sending. Only SHOWN matches
+        # (hidden ones were never served). Definition bodies are recorded in
+        # Phase 3 where their served extents are known.
+        try:
+            from tool_batching import note_cross_turn_read as _note_cross_snip
+
+            for _sm in _shown_ms:
+                try:
+                    _sf = str(_sm.get("file") or "")
+                    _sl = int(_sm.get("line") or 0)
+                    if not _sf or _sl <= 0:
+                        continue
+                    _slo, _shi = max(1, _sl - _adaptive), _sl + _adaptive
+                    note_fetched_window(_sf, _slo, _shi)
+                    _sabs = _sf if os.path.isabs(_sf) else os.path.join(root, _sf)
+                    _note_cross_snip(root, _sf, _slo, _shi, _sabs, 0)
+                except (TypeError, ValueError):
+                    continue
+        except Exception:  # noqa: BLE001, S110 — ledger never breaks a search
+            pass
         # Phase 2: enclosing-symbol annotations off the event loop. The first
         # parse of a file compiles the grammar (~seconds once), later hits
         # are mtime-cached (~ms) — either way never block the tool loop.
@@ -4620,6 +4981,31 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     lines[_i] = lines[_i] + "\n" + _dbody
                 total += len(_dbody) + 2 - len(_old_body)
                 _expanded += 1
+                # The inlined body is now served: record its span so later
+                # repeats know these lines are in context (powers the
+                # single-file served-rows stub above).
+                try:
+                    _bm = re.search(r"\(L(\d+)-(\d+)\)", _suffix or "")
+                    _bf = str(_mm.get("file") or "")
+                    if _bm and _bf:
+                        _bs, _be = int(_bm.group(1)), int(_bm.group(2))
+                        _bl = min(_be, _bs + _DEF_BODY_MAX_LINES - 1)
+                        if _bl >= _bs:
+                            note_fetched_window(_bf, _bs, _bl)
+                            _babs = (
+                                _bf
+                                if os.path.isabs(_bf)
+                                else os.path.join(root, _bf)
+                            )
+                            from tool_batching import (
+                                note_cross_turn_read as _note_cross_body,
+                            )
+
+                            _note_cross_body(root, _bf, _bs, _bl, _babs, 0)
+                except (TypeError, ValueError):
+                    pass
+                except Exception:  # noqa: BLE001, S110 — ledger never breaks search
+                    pass
         _shown = len(lines)
         _hidden = len(matches) - _shown
         if _hidden > 0:
@@ -4670,7 +5056,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # later subset greps on this scope — record the word set so they stub
         # out instead of re-sending the same rows.
         if _hidden == 0 and not _capped_files:
-            _grep_cover_note(generation, _scope_key, _words, max_results, combined)
+            _grep_cover_note(
+                generation, _scope_key, _words, max_results, combined, combined
+            )
             # Cross-turn reuse: remember the matched files' signatures so a
             # later turn's repeat stubs out while they are unchanged.
             from tool_batching import note_cross_turn_grep as _cross_grep_note
@@ -5008,6 +5396,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         filePath: str, offset: int, limit: int, _main_name: str,
         quiet: bool = False, allow_head_map: bool = True,
         _cache_hits: list[str] | None = None,
+        _exclude: list[tuple[int, int]] | None = None,
     ) -> str:
         """Read ONE file/dir path and emit its own tool_result/error event.
         Shared by the single-path and batch branches of read_tool below so
@@ -5017,7 +5406,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         time. `quiet=True` suppresses the per-file events: the batch branch
         emits ONE aggregate card instead, so a fast-failing missing file can
         no longer hijack the whole batch card to red "file not found" while
-        the other files succeeded."""
+        the other files succeeded. `_exclude` (sig-validated already-served
+        spans) omits those lines from the body instead of re-sending them."""
         try:
             target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
         except PathEscapeError as exc:
@@ -5030,8 +5420,18 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # returns the cached bytes instead of re-scanning the file — no CPU
         # cost, just a cache hit. Normalizing means the key matches regardless
         # of how the model spelled the path, and lines up with the key
-        # _invalidate_read_cache_for() computes after edit/write.
+        # _invalidate_read_cache_for() computes after edit/write. The omission
+        # set changes the bytes, so it joins the key (empty omission keeps the
+        # legacy 3-tuple key).
         cache_key = ("read", target, str(offset), str(limit))
+        if _exclude:
+            try:
+                cache_key = (
+                    "read", target, str(offset), str(limit),
+                    repr(sorted((int(_a), int(_b)) for _a, _b in _exclude)),
+                )
+            except Exception:  # noqa: BLE001, S110 — key never breaks a read
+                pass
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             if _cache_hits is not None:
@@ -5173,9 +5573,53 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     cut = bool(tail.get("cut"))
         else:
             lines = _snap_end(lines, limit)
+        # Sliver-serve: omit already-served lines (sig-validated spans passed
+        # as _exclude) instead of re-sending them inside a partially
+        # overlapping window. The `line |` rows keep their numbers, so the
+        # gapped body stays coherent; the note names the omitted ranges.
+        _extent_last = lines[-1]["line"]
+        _omit_note = ""
+        if _exclude:
+            try:
+                _excl_set: set[int] = set()
+                for _ea, _eb in _exclude:
+                    _ea, _eb = int(_ea), int(_eb)
+                    if _ea > _eb or _eb - _ea > 200000:
+                        continue
+                    _excl_set.update(range(max(1, _ea), _eb + 1))
+            except Exception:  # noqa: BLE001 — omission never breaks a read
+                _excl_set = set()
+            if _excl_set:
+                _shown = [
+                    ln for ln in lines
+                    if int(ln.get("line", -1)) not in _excl_set
+                ]
+                if _shown and len(_shown) < len(lines):
+                    _runs: list[str] = []
+                    _n = int(start)
+                    while _n <= int(_extent_last):
+                        if _n in _excl_set:
+                            _r0 = _n
+                            while _n + 1 <= int(_extent_last) and (_n + 1) in _excl_set:
+                                _n += 1
+                            _runs.append(f"{_r0}-{_n}" if _n > _r0 else f"{_r0}")
+                        _n += 1
+                    _omit_note = (
+                        "\n\n(lines " + ", ".join(_runs) + " already in "
+                        "context above — omitted; showing only new lines.)"
+                    )
+                    lines = _shown
+                    start = int(lines[0]["line"])
+                elif not _shown:
+                    # Fully covered but missed member-drop (ledger quirk):
+                    # stub instead of an empty body, never break the batch.
+                    return (
+                        f"({filePath}: lines {start}-{_extent_last} already "
+                        "in context above — omitted.)"
+                    )
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
-        more = last < total
+        more = _extent_last < total
         if quiet:
             # Batch member: one compact position marker. The batch call
             # carries the paging guidance once at the end, so per-block
@@ -5198,6 +5642,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             body += f"\n\n(End of file - total {total} lines)"
         if _join_note:
             body += f"\n\n{_join_note}"
+        if _omit_note:
+            body += _omit_note
         # NOTE: the per-file "already fetched" reminder used to live here.
         # It is now consolidated into one step-level line (context_ledger_line,
         # sent transiently with the next request) so N blocks no longer repeat
@@ -5236,7 +5682,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return raw
 
     async def read_tool(
-        filePath: str,
+        filePath: str = "",
         offset: int = 1,
         limit: int = 2000,
         filePaths: list[str] | None = None,
@@ -5245,7 +5691,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (already-fetched members are skipped, one position marker per file, one guidance footer).
+        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (already-fetched members are skipped, one position marker per file, one guidance footer). Lines served before are omitted from bodies (named in a pointer note), never re-sent.
 
 SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
@@ -5288,6 +5734,8 @@ When you need to read several files, read multiple independent files in parallel
         # symbol index (CODE MAP) — one call instead of guessing line numbers.
         _symbol_missing: list[str] = []
         if symbols:
+            if not str(filePath or "").strip():
+                return "ERROR reading symbols=: symbols= needs `filePath` (the file holding the symbols) — pass filePath plus symbols=[...] in the SAME call."
             try:
                 _sym_target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
             except PathEscapeError as exc:
@@ -5305,7 +5753,7 @@ When you need to read several files, read multiple independent files in parallel
                     f"{', '.join(_symbol_missing)}. Check the CODE MAP for exact names."
                 )
             jobs.extend((filePath, _o, _l) for _o, _l in _wins)
-        base_paths = [filePath] + [
+        base_paths = ([filePath] if str(filePath or "").strip() else []) + [
             p for p in (filePaths or []) if p and p != filePath
         ]
         # مسیرهای فقط داخل ranges هم به batch اضافه می‌شوند (بدون تکرار
@@ -5313,6 +5761,8 @@ When you need to read several files, read multiple independent files in parallel
         for p, _, _ in jobs:
             if p not in base_paths:
                 base_paths.append(p)
+        if not base_paths and not jobs:
+            return "ERROR reading: no file specified — pass `filePath` (single file), `filePaths` (batch), or `ranges` (per-file windows)."
         # No single fast-path: EVERY read — even one file, one window — runs
         # the batch pipeline below (member coverage-drop, widen+merge,
         # quiet position markers, EOF refill, one aggregate card + footer).
@@ -5366,6 +5816,20 @@ When you need to read several files, read multiple independent files in parallel
             try:
                 if has_served_map(_mp):
                     return False
+                # External-edit guard (same as omission below): stale
+                # per-turn spans must not stub a re-serve after an outside
+                # edit. Healed here so later members see the dropped ledger.
+                try:
+                    from tool_batching import cross_turn_sig_changed as _chg
+
+                    if bool(_chg(root, _mp)):
+                        try:
+                            drop_ledger_path(_mp)
+                        except Exception:  # noqa: BLE001, S110 — never breaks
+                            pass
+                        return False
+                except Exception:  # noqa: BLE001, S110 — guard never breaks coverage
+                    pass
                 _have = fetched_windows(_mp)
                 if _have:
                     _rest = [(int(_a), int(_b)) for _a, _b in _have]
@@ -5426,7 +5890,8 @@ When you need to read several files, read multiple independent files in parallel
                 _msg = (
                     "SKIPPED (already in context): "
                     + "; ".join(_served_desc)
-                    + " — reusing that content; full text omitted to save tokens."
+                    + " — reusing that content; full text omitted to save tokens. "
+                    "Do NOT re-issue this read — continue the task with the content above."
                     + (
                         " (If those rows are no longer in context, re-read a "
                         "WIDER window to re-serve them.)"
@@ -5474,11 +5939,75 @@ When you need to read several files, read multiple independent files in parallel
         # quiet) so a fully-cached batch can report one "cached" card, the
         # same signal the old single branch emitted per read.
         _cache_hit_paths: list[str] = []
+        # Sliver-serve: per-path already-served spans (sig-validated, so an
+        # edited file yields none and serves whole). Each target omits those
+        # lines from its body instead of re-sending them. Map-served paths
+        # stay unfiltered (map coverage is untrusted).
+        from tool_batching import cross_turn_served_spans as _served_spans
+        from tool_batching import cross_turn_sig_changed as _sig_changed
+        from tool_batching import fetched_windows as _fetched_windows_fn
+
+        _excl_by_path: dict[str, list[tuple[int, int]]] = {}
+        _sig_changed_paths: set[str] = set()
+        for _ep, _eo, _el in tasks:
+            if _ep in _excl_by_path or has_served_map(_ep):
+                continue
+            try:
+                # External-edit guard: the per-turn ledger carries no
+                # signature, so without this an edit made OUTSIDE edit_file
+                # (IDE, git, test) leaves stale same-turn spans that omit
+                # lines served BEFORE the edit. The cross-turn store recorded
+                # the signature at serve time — a mismatch means changed.
+                try:
+                    _changed = bool(_sig_changed(root, _ep))
+                except Exception:  # noqa: BLE001 — validation never breaks read
+                    _changed = False
+                if _changed:
+                    _sig_changed_paths.add(_ep)
+                    try:
+                        drop_ledger_path(_ep)
+                    except Exception:  # noqa: BLE001, S110 — never breaks read
+                        pass
+                    continue
+                _combined: list[tuple[int, int]] = []
+                _sp = _served_spans(root, _ep) or []
+                for _a, _b in _sp:
+                    try:
+                        _combined.append((int(_a), int(_b)))
+                    except (TypeError, ValueError):
+                        continue
+                # Same-turn spans: omit lines already served earlier this
+                # turn (e.g. step-2 640-879, step-3 asks 630-649 -> omit
+                # 640-649, serve only the 630-639 sliver). observe() records
+                # this call's own windows pre-execution, so subtract them
+                # first — coverage must come from EARLIER serving only.
+                try:
+                    _prior = _fetched_windows_fn(_ep) or []
+                except Exception:  # noqa: BLE001 — omission never breaks a read
+                    _prior = []
+                if _prior:
+                    _rest: list[tuple[int, int]] = []
+                    for _w in _prior:
+                        try:
+                            _rest.append((int(_w[0]), int(_w[1])))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    for _w in _requested.get(_ep, []):
+                        try:
+                            _rest.remove((int(_w[0]), int(_w[1])))
+                        except (ValueError, TypeError):
+                            pass
+                    _combined.extend(_rest)
+                if _combined:
+                    _excl_by_path[_ep] = _combined
+            except Exception:  # noqa: BLE001, S112 — omission never breaks a read
+                continue
         results = await asyncio.gather(
             *(
                 _read_target(p, o, l, _main_name, quiet=True,
                              allow_head_map=(p not in job_paths),
-                             _cache_hits=_cache_hit_paths)
+                             _cache_hits=_cache_hit_paths,
+                             _exclude=_excl_by_path.get(p))
                 for p, o, l in tasks
             )
         )
@@ -5498,7 +6027,8 @@ When you need to read several files, read multiple independent files in parallel
             _refills = await asyncio.gather(
                 *(
                     _read_target(p, 1, l, _main_name, quiet=True,
-                                 allow_head_map=False)
+                                 allow_head_map=False,
+                                 _exclude=_excl_by_path.get(p))
                     for _, p, l in _eof_tasks
                 )
             )
@@ -7116,6 +7646,7 @@ When you need to read several files, read multiple independent files in parallel
     # filter (graph.filter_tools_for_mode) keeps git_commit coder-only.
     async def git_status_tool() -> str:
         """Show the git working-tree status: current branch and every modified/staged/untracked file. Use this before committing or when the user asks what changed."""
+        emit({"kind": "tool", "tool": "git_status", "args": {}})
         result = _git.git_status(root)
         text = json.dumps(result, ensure_ascii=False, default=str)
         emit({"kind": "tool_result", "tool": "git_status", "summary": text[:400], "status": "error" if "error" in result else "done"})
@@ -7123,6 +7654,7 @@ When you need to read several files, read multiple independent files in parallel
 
     async def git_diff_tool(path: str = "", staged: bool = False) -> str:
         """Show the unified diff of the workspace's uncommitted changes (or the staged changes when `staged` is true). Optionally restrict to one `path`."""
+        emit({"kind": "tool", "tool": "git_diff", "args": {"path": path, "staged": staged}})
         result = _git.git_diff(root, path, staged)
         text = json.dumps(result, ensure_ascii=False, default=str)
         emit({"kind": "tool_result", "tool": "git_diff", "summary": f"{len(result.get('diff', ''))} chars of diff", "status": "error" if "error" in result else "done"})
@@ -7130,6 +7662,7 @@ When you need to read several files, read multiple independent files in parallel
 
     async def git_commit_tool(message: str, add_all: bool = False) -> str:
         """Commit the staged changes with `message` (required, non-empty). When `add_all` is true, stage every change first (git add -A). Returns the new commit hash. Never push."""
+        emit({"kind": "tool", "tool": "git_commit", "args": {"message": message, "add_all": add_all}})
         result = _git.git_commit(root, message, add_all)
         text = json.dumps(result, ensure_ascii=False, default=str)
         emit({"kind": "tool_result", "tool": "git_commit", "summary": result.get("commit") or result.get("error", ""), "status": "error" if "error" in result else "done"})
@@ -7137,6 +7670,7 @@ When you need to read several files, read multiple independent files in parallel
 
     async def git_log_tool(limit: int = 20) -> str:
         """List the most recent git commits (hash, date, subject), newest first. Use this when the user asks about commit history."""
+        emit({"kind": "tool", "tool": "git_log", "args": {"limit": limit}})
         result = _git.git_log(root, limit)
         text = json.dumps(result, ensure_ascii=False, default=str)
         emit({"kind": "tool_result", "tool": "git_log", "summary": f"{len(result.get('commits', []))} commits", "status": "error" if "error" in result else "done"})
@@ -7146,8 +7680,9 @@ When you need to read several files, read multiple independent files in parallel
         """Return the current UTC date and time. Call this when the user asks about 'today', 'now', 'current date', 'recent', 'latest', or any time-sensitive question where you need the actual current timestamp."""
         import datetime as _dt
 
+        emit({"kind": "tool", "tool": "current_time", "args": {}})
         now = _dt.datetime.now(_dt.timezone.utc)
-        return json.dumps(
+        text = json.dumps(
             {
                 "utc": now.isoformat(),
                 "utc_date": now.strftime("%Y-%m-%d"),
@@ -7156,6 +7691,8 @@ When you need to read several files, read multiple independent files in parallel
                 "unix": int(now.timestamp()),
             }
         )
+        emit({"kind": "tool_result", "tool": "current_time", "summary": now.strftime("%Y-%m-%d %H:%M UTC"), "status": "done"})
+        return text
 
     async def laya_tool(
         operation: str = "choice",

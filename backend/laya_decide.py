@@ -367,8 +367,9 @@ def warmup_router() -> bool:
                 {"q": {"type": "choice", "instructions": "Pick one.", "criteria": ["a", "b"]}},
                 timeout=15.0,
             )
-        except Exception:  # noqa: BLE001, S110 — predict آزمایشی اختیاری است
-            pass
+        except Exception:  # cold predict failed, correctly report not-warm
+            logger.warning("laya warmup predict failed (non-fatal)", exc_info=True)
+            return False
         return True
     except Exception:  # noqa: BLE001 — warmup اختیاری است
         return False
@@ -1289,7 +1290,7 @@ def rank_browser_tools(task: str, tools: Any, top_k: int = 5, chat_id: str = "",
 def status() -> dict:
     """وضعیت کامل laya برای نمایش در رابط کاربری (نصب/آماده/ریپو/پروایدر/دلیل)."""
     available = is_available()
-    ready = is_ready()
+    ready = bool(available and is_ready())
     reason = ""
     if not available:
         reason = "laya-not-installed"

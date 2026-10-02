@@ -111,3 +111,47 @@ async def test_regex_operators_carry_no_signal(tmp_path):
     # "\\s" contributes no word: {embedding, laya} recorded, {laya} subsets.
     out2 = await cbs["grep"]("laya", path="")
     assert "DUPLICATE" in out2 and "covered by" in out2, out2
+
+
+async def test_literal_refinement_covered_by_earlier_alternative(tmp_path):
+    """A later literal pattern containing an earlier literal `|`-branch stubs.
+
+    Mirrors the trace ping-pong (broad `renderSide|...` grep, then a
+    `const renderSide` refinement): the new word "const" defeats the
+    word-subset rule, but every matching line still contains "renderside",
+    so its rows are a subset of the complete earlier search's rows.
+    """
+    import tools
+
+    _fresh()
+    _ws(str(tmp_path))
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None, main_model=None)
+    out1 = await cbs["grep"]("embedding|laya", path="")
+    assert "MATCHES for" in out1, out1
+    out2 = await cbs["grep"]("alpha embedding", path="")
+    assert "DUPLICATE" in out2, out2
+    assert "covered by" in out2, out2
+
+
+async def test_regex_refinement_still_runs(tmp_path):
+    """Regex syntax in the later pattern opts out of containment (unsound).
+
+    `embedding?` contains "embedding" as a string but also matches
+    "embeddin" — its rows are NOT a subset, so it must execute. (Here the
+    word-subset rule would stub it via {embedding}; that path is
+    unaffected — this test pins the containment gate itself via a word the
+    earlier search never saw.)
+    """
+    import tools
+
+    _fresh()
+    _ws(str(tmp_path))
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None, main_model=None)
+    out1 = await cbs["grep"]("gamma|laya", path="")
+    assert "MATCHES for" in out1, out1
+    # "gamma here?" has regex syntax (?), so containment is skipped; but its
+    # words {gamma, here} are not a subset of {gamma, laya} ("here" is new),
+    # so the search genuinely executes.
+    out2 = await cbs["grep"]("gamma here?", path="")
+    assert "MATCHES for" in out2 or "No matches" in out2, out2
+    assert "DUPLICATE" not in out2, out2

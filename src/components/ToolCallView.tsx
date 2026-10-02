@@ -25,6 +25,7 @@ const TOOL_LABEL: Record<string, string> = {
   write_file: "Write File",
   edit_file: "Edit File",
   list_files: "List Directory",
+  read: "Read File",
   grep: "Search Files",
   glob: "Search Files",
   web_search: "Web Search",
@@ -37,6 +38,15 @@ const TOOL_LABEL: Record<string, string> = {
   vision: "Vision",
   create_skill: "Create Skill",
   create_mcp: "Create MCP",
+  update_plan: "Update Plan",
+  git_status: "Git Status",
+  git_diff: "Git Diff",
+  git_commit: "Git Commit",
+  git_log: "Git Log",
+  current_time: "Current Time",
+  laya: "Laya",
+  computer: "Computer",
+  search_console: "Search Console",
 };
 
 /** Small glyph per tool category, shown at the head of each collapsed-group
@@ -45,6 +55,7 @@ const TOOL_LABEL: Record<string, string> = {
 const TOOL_ICON: Record<string, string> = {
   run_terminal: "❯",
   list_files: "📁",
+  read: "📄",
   grep: "🔍",
   glob: "🔍",
   web_search: "🌐",
@@ -56,6 +67,15 @@ const TOOL_ICON: Record<string, string> = {
   vision: "🖼",
   create_skill: "⚙",
   create_mcp: "🔌",
+  update_plan: "📝",
+  git_status: "🌿",
+  git_diff: "📊",
+  git_commit: "✅",
+  git_log: "🕘",
+  current_time: "🕒",
+  laya: "⚡",
+  computer: "🖥",
+  search_console: "🔎",
 };
 function toolIcon(tool: string): string {
   return TOOL_ICON[tool] ?? "•";
@@ -67,6 +87,7 @@ function toolIcon(tool: string): string {
 const TOOL_NOUN: Record<string, [string, string]> = {
   run_terminal: ["command", "commands"],
   list_files: ["file listing", "file listings"],
+  read: ["file read", "file reads"],
   grep: ["search", "searches"],
   glob: ["search", "searches"],
   web_search: ["web search", "web searches"],
@@ -78,6 +99,15 @@ const TOOL_NOUN: Record<string, [string, string]> = {
   vision: ["image lookup", "image lookups"],
   create_skill: ["skill saved", "skills saved"],
   create_mcp: ["connector added", "connectors added"],
+  update_plan: ["plan update", "plan updates"],
+  git_status: ["status check", "status checks"],
+  git_diff: ["diff check", "diff checks"],
+  git_commit: ["commit", "commits"],
+  git_log: ["log lookup", "log lookups"],
+  current_time: ["time check", "time checks"],
+  laya: ["decision", "decisions"],
+  computer: ["desktop action", "desktop actions"],
+  search_console: ["console query", "console queries"],
 };
 function groupSummary(activities: ToolActivity[]): string {
   const counts: Record<string, number> = {};
@@ -219,19 +249,6 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                     <span className="trace-row-review" aria-hidden="true">Review ↗</span>
                   )}
                 </button>
-                {entry.activity.diff && !entry.activity.reverted && (
-                  <button
-                    className="tool-revert-inline"
-                    disabled={reverting === entry.index}
-                    title="Undo this change"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void revertOne(entry);
-                    }}
-                  >
-                    {reverting === entry.index ? "Reverting…" : "↩ Undo"}
-                  </button>
-                )}
               </div>
             );
           })}
@@ -645,7 +662,7 @@ function highlightParts(
 }
 
 /** آستانه‌ی پیش‌فرض عرض (پیکسل) برای سوییچ خودکار دیف به دوستونی. */
-export const DIFF_SIDE_BY_SIDE_THRESHOLD = 640;
+export const DIFF_SIDE_BY_SIDE_THRESHOLD = 768;
 
 /** حالت نمای دیف: خودکار (بر اساس عرض)، تک‌ستونی اجباری، یا دوستونی اجباری. */
 export type DiffLayoutMode = "auto" | "unified" | "side-by-side";
@@ -698,11 +715,16 @@ export function DiffView({
     ro.observe(el);
     return () => ro.disconnect();
   }, [diff]);
+  // Forced side-by-side still respects a measured narrow container (SSR
+  // falls back to true until the first measure) so the view stays
+  // responsive instead of locking two columns in a narrow panel.
   const showSide =
-    layout === "side-by-side"
-      ? true
-      : layout === "unified"
-        ? false
+    layout === "unified"
+      ? false
+      : layout === "side-by-side"
+        ? measuredWidth > 0
+          ? shouldShowSideBySide(measuredWidth, threshold)
+          : true
         : shouldShowSideBySide(measuredWidth, threshold);
   const activeRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
@@ -771,7 +793,7 @@ export function DiffView({
   };
 
   const renderSide = () => (
-    <div className="diff-columns" dir="ltr">
+    <div className="diff-columns" dir="ltr" {...drag}>
       <div className="diff-columns-head">
         <div className="diff-col-header diff-col-before">Before</div>
         <div className="diff-col-header diff-col-after">After</div>
@@ -1851,19 +1873,6 @@ export const ToolCallView = memo(function ToolCallView({
               </span>
             ) : null;
           })()}
-        {isWrite && activity.diff && !activity.reverted && (
-          <button
-            className="tool-revert-inline"
-            disabled={reverting}
-            title="Undo this change"
-            onClick={(e) => {
-              e.stopPropagation();
-              revert();
-            }}
-          >
-            {reverting ? "Reverting…" : "↩ Undo"}
-          </button>
-        )}
         {isWrite && activity.diff && messageId && (
           <button
             className="tool-review-btn"

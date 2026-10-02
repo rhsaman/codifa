@@ -931,6 +931,9 @@ class ChatRequest(BaseModel):
     # Max tool-loop steps per turn (Settings → General). 0 = backend auto from
     # the context window (12–40). N > 0 = fixed budget (clamped 5–200).
     max_steps: int = 0
+    # Explicit restart (message retry icon / truncate-and-restart). Skips the
+    # interrupted-turn checkpoint and clears it so old tool work is not replayed.
+    restart: bool = False
 
 
 class CompactRequest(BaseModel):
@@ -2467,6 +2470,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             providers=req.providers,
             compact_at_percent=req.compact_at_percent,
             max_steps=req.max_steps,
+            restart=req.restart,
         )
         try:
             logger.warning(
@@ -2482,9 +2486,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
             # Clear any unconsumed steers for this chat so they don't leak into
             # a future run of the same chat (the frontend re-sends them as the
-            # next turn via its own queue).
-            await _drain_steer(req.chat_id)
-            yield _sse({"kind": "done"})
+            # next turn via its own queue). Report them so the frontend can keep
+            # them pending/visible instead of treating them as lost.
+            dropped = await _drain_steer(req.chat_id)
+            dropped_ids = [d.get("id", "") for d in dropped if d.get("id")]
+            yield _sse({"kind": "done", "dropped_steer_ids": dropped_ids})
 
     return StreamingResponse(
         event_gen(),

@@ -8,6 +8,8 @@ import { splitUnifiedDiffByFile } from "../lib/reviewDiff";
 import { diffStatsFromUnified } from "../lib/toolActivity";
 import { useStore } from "../lib/store";
 import { useReviewPanel, type ReviewSource } from "../lib/reviewPanel";
+import { useViewerTabs } from "../lib/viewerTabs";
+import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { gitDiff, gitLog, gitShow, gitStatus, type GitCommitInfo } from "../lib/api";
 import { DiffView } from "./ToolCallView";
 
@@ -29,7 +31,7 @@ export interface ReviewFileItem {
 interface GitFile extends ReviewFileItem {}
 
 /** آستانه‌ی پیش‌فرض عرض پنل (پیکسل) برای نمایش دوستونی دیف. */
-export const REVIEW_SIDE_BY_SIDE_THRESHOLD = 640;
+export const REVIEW_SIDE_BY_SIDE_THRESHOLD = 900;
 
 /** آکاردئون خالص لیست فایل‌ها: هر ردیف فایل، دیف خودش را دقیقاً زیر همان
  *  ردیف باز می‌کند. بدون وابستگی به استور تا در SSR هم قابل تست باشد؛
@@ -124,6 +126,15 @@ export function ReviewPanel(props?: {
   const close = props?.onClose ?? storeClose
   const [dockedSource, setDockedSource] = useState<ReviewSource>(props?.initialSource ?? 'turn')
   const [dockedPath, setDockedPath] = useState(props?.initialPath ?? '')
+  // Sync when the single review tab is updated in place (e.g. git diff open
+  // then Review clicked on a chat edit): ViewerContent remounts via key, but
+  // keep state in sync as well so the selected file/source never goes stale.
+  useEffect(() => {
+    if (props?.initialSource) setDockedSource(props.initialSource);
+  }, [props?.initialSource]);
+  useEffect(() => {
+    if (props?.initialPath !== undefined) setDockedPath(props.initialPath);
+  }, [props?.initialPath]);
   const source = docked ? dockedSource : storeSource
   const setSource = docked ? setDockedSource : storeSetSource
   const selectedPath = docked ? dockedPath : storeSelectedPath
@@ -165,14 +176,21 @@ export function ReviewPanel(props?: {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
-  // Esc پنل را می‌بندد (مثل حالت مطالعه).
+  // Esc پنل را می‌بندد (مثل حالت مطالعه). در حالت docked اگر viewer
+  // فول‌اسکرین باشد، Esc اول از فول‌اسکرین خارج می‌شود.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") {
+        if (docked && useViewerTabs.getState().fullscreen) {
+          useViewerTabs.getState().setFullscreen(false);
+          return;
+        }
+        close();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
+  }, [close, docked]);
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
@@ -221,6 +239,9 @@ export function ReviewPanel(props?: {
   const [gitError, setGitError] = useState<string | null>(null);
   const [commits, setCommits] = useState<GitCommitInfo[]>([]);
   const [rev, setRev] = useState(props?.initialRev ?? "HEAD");
+  useEffect(() => {
+    if (props?.initialRev !== undefined) setRev(props.initialRev);
+  }, [props?.initialRev]);
   const [query, setQuery] = useState("");
 
   // بارگذاری دیف uncommitted: ترکیب staged و unstaged تا فایل‌های استیج‌شده
@@ -353,18 +374,23 @@ export function ReviewPanel(props?: {
           dels: files.reduce((n, f) => n + f.dels, 0),
         };
 
-  // انتخاب پیش‌فرض: با تغییر منبع، فایل اول باز می‌شود؛ در غیر این صورت اگر
-  // انتخاب فعلی حین استریم ناپدید شد به اولین فایل برمی‌گردد. بستن دستی همهٔ
+  // انتخاب پیش‌فرض: اگر فایل درخواستی (کلیک Review روی ادیت چت یا تب باز)
+  // داخل لیست جدید هست همان باز می‌ماند؛ فقط وقتی انتخاب فعلی در لیست نیست
+  // (تعویض منبع، استریم جدید) به اولین فایل برمی‌گردد. بستن دستی همهٔ
   // فایل‌ها (`selectedPath` خالی) تا وقتی منبع عوض نشده حفظ می‌شود.
-  const prevSource = useRef(source);
+  // این منطق مشکل «گیت‌دیف باز است و کلیک Review فایل همان ادیت را باز نمی‌کند»
+  // را حل می‌کند: قبلاً با هر تعویض منبع بی‌قیدوشرط به فایل اول می‌پرید.
+  const dockedWant = docked ? (props?.initialPath ?? "") : "";
   useEffect(() => {
     if (files.length === 0) return;
-    const sourceChanged = prevSource.current !== source;
-    prevSource.current = source;
+    if (dockedWant && files.some((f) => f.path === dockedWant)) {
+      if (selectedPath !== dockedWant) selectPath(dockedWant);
+      return;
+    }
     const has = files.some((f) => f.path === selectedPath);
-    if (sourceChanged || (selectedPath && !has)) selectPath(files[0]?.path ?? "");
+    if (!selectedPath || !has) selectPath(files[0]?.path ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source, turn?.files, gitFiles]);
+  }, [source, turn?.files, gitFiles, dockedWant]);
 
   // فایل بازِ آکاردئون — وقتی کاربر همه را می‌بندد (`selectedPath` خالی) هیچ
   // فایلی باز نمی‌ماند، پس fallback به فایل اول نداریم.
@@ -383,7 +409,7 @@ export function ReviewPanel(props?: {
   // `query` لیست را به فایل‌های منطبق فیلتر می‌کند و رخدادها را هایلایت می‌کند؛
   // رخداد فعال فقط داخل فایل باز هایلایت متمایز می‌گیرد.
   // در حالت docked همیشه `auto`: هر DiffView عرض واقعی کانتینر خودش را با
-  // ResizeObserver می‌سنجد و زیر ۶۴۰px تک‌ستونی می‌شود — پس در viewer باریک
+  // ResizeObserver می‌سنجد و زیر آستانه دوستونی تک‌ستونی می‌شود — پس در viewer باریک
   // (مانیتور کوچک) دیف خوانا می‌ماند.
   const wide = docked ? false : (fullscreen || width >= REVIEW_SIDE_BY_SIDE_THRESHOLD);
   const renderFileList = (list: GitFile[]) => {
@@ -406,7 +432,7 @@ export function ReviewPanel(props?: {
 
   const panel = (
     <div
-      className={docked ? undefined : `review-overlay${fullscreen ? " fullscreen" : ""}`}
+      className={docked ? "review-docked-wrap" : `review-overlay${fullscreen ? " fullscreen" : ""}`}
       dir="ltr"
       style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}
       onClick={(e) => e.stopPropagation()}
@@ -449,28 +475,17 @@ export function ReviewPanel(props?: {
           </span>
         )}
         <span className="review-header-actions">
+          {!docked && <ViewerFullscreenButton docked={docked} fullscreen={fullscreen} onToggleFullscreen={() => setFullscreen((v) => !v)} />}
           {!docked && (
             <button
               className="review-header-btn"
-              title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-              aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
-              onClick={() => setFullscreen((v) => !v)}
+              title="Close"
+              aria-label="Close"
+              onClick={close}
             >
-              {fullscreen ? (
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="10" y1="14" x2="21" y2="3" /><line x1="14" y1="10" x2="3" y2="21" /></svg>
-              ) : (
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
-              )}
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
             </button>
           )}
-          <button
-            className="review-header-btn"
-            title="Close"
-            aria-label="Close"
-            onClick={close}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-          </button>
         </span>
       </div>
       <div className="review-search-row">

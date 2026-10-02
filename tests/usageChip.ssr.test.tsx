@@ -36,7 +36,7 @@ import type { ChatUsage, ProviderConfig } from "../src/types"
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).openExternal = async () => {}
 
-const { buildUsageView, UsagePopover, computeUsagePopoverPos } = await import("../src/components/UsageChip")
+const { buildUsageView, UsagePopover, computeUsagePopoverPos, isUsagePopoverOpen } = await import("../src/components/UsageChip")
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -164,6 +164,15 @@ console.log("۵) computeUsagePopoverPos (لنگر پاپ‌اور زیر چیپ�
   check("لبه چپ clamp می‌شود", nearLeft.left === 8, nearLeft.left)
   const html = renderToString(<UsagePopover view={buildUsageView({ entries: [{ providerId: "p1", model: "model-a", input: 10, output: 5, lastUsed: 1 }] }, providers)} style={{ position: "fixed", top: 46, left: 100 }} />)
   check("استایل fixed روی پاپ‌اور می‌نشیند", html.includes("position:fixed") && html.includes("top:46px"))
+}
+
+console.log("۶) isUsagePopoverOpen (پاپ‌اور بدون هاور باز نمی‌شود):")
+{
+  check("حالت اولیه بسته است", isUsagePopoverOpen(null, "chat-a", 2) === false)
+  check("بعد از هاور روی همان چت باز است", isUsagePopoverOpen("chat-a", "chat-a", 2) === true)
+  check("با عوض شدن چت، حالت باز چت قبلی باز نمی‌شود", isUsagePopoverOpen("chat-a", "chat-b", 2) === false)
+  check("با خالی شدن مصرف باز نمی‌شود", isUsagePopoverOpen("chat-a", "chat-a", 0) === false)
+  check("بدون چت فعال باز نمی‌شود", isUsagePopoverOpen("chat-a", null, 2) === false)
 }
 
 if (failed > 0) {

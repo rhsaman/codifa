@@ -609,7 +609,7 @@ def _live_key(path: str) -> str:
         return str(path).strip()
 
 
-_HISTORY_ROW_FIRST_RE = re.compile(r"^(?P<path>.+?): (?P<n>\d+) \| ")
+_HISTORY_ROW_FIRST_RE = re.compile(r"^(?!\d+ \| )(?P<path>.+?): (?P<n>\d+) \| ")
 
 
 def live_read_lines(messages: Sequence[BaseMessage], path: str) -> frozenset[int]:

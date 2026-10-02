@@ -4449,7 +4449,7 @@ export function ChatPanel() {
             return (
               <div
                 className="ask-card plan-approval"
-                dir={dir}
+                dir="ltr"
                 onKeyDown={(e) => {
                   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                     e.preventDefault();
@@ -4468,7 +4468,7 @@ export function ChatPanel() {
                   }
                 }}
               >
-                <div className="ask-card-head">
+                <div className="ask-card-head plan-approval-head">
                   <span className="ask-card-icon plan-approval-icon">
                     <svg
                       width="14"
@@ -4483,8 +4483,8 @@ export function ChatPanel() {
                       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                     </svg>
                   </span>
-                  <span className="plan-approval-chip">Permission required</span>
                   <span className="ask-card-title">Implementation plan</span>
+                  <span className="plan-approval-chip">Permission required</span>
                 </div>
                 <div className="plan-approval-options">
                   {options.map((opt, i) => {
@@ -4497,8 +4497,8 @@ export function ChatPanel() {
                         className={`plan-approval-option${i === sel ? " selected" : ""}`}
                         onClick={() => answerOption(i)}
                       >
-                        <span className="plan-approval-num">{i + 1}.</span>
-                        <span className="plan-approval-opt-text">
+                        <span className="plan-approval-num" dir="ltr">{i + 1}</span>
+                        <span className="plan-approval-opt-text" dir="auto">
                           <span className="plan-approval-opt-head">{head}</span>
                           {desc ? (
                             <span className="plan-approval-opt-desc">
@@ -4514,7 +4514,7 @@ export function ChatPanel() {
                   <textarea
                     className="ask-input"
                     rows={2}
-                    dir={dir}
+                    dir="auto"
                     value={askFreeText}
                     placeholder="Enter your answer…"
                     onChange={(e) => setAskFreeText(e.target.value)}
@@ -4528,8 +4528,9 @@ export function ChatPanel() {
                 </div>
                 <div className="plan-approval-footer">
                   <span className="plan-approval-hint">
-                    ⓘ Use Tab / arrow keys to choose, then Enter or Space to select
+                    Tab / ↑↓ to choose · Enter to select
                   </span>
+                  <span className="plan-approval-actions">
                   <button
                     type="button"
                     className="btn plan-approval-dismiss"
@@ -4551,6 +4552,7 @@ export function ChatPanel() {
                   >
                     Submit
                   </button>
+                  </span>
                 </div>
               </div>
             );

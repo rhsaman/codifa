@@ -24,7 +24,9 @@ for _p in (_THIS, os.path.dirname(_THIS)):
         sys.path.insert(0, _p)
 
 import llm as llm_mod
+import tools as tools_mod
 from agent_registry import EXPLORE_SYSTEM
+from agents import _is_retryable
 from tools import _explore_fail_note, make_tool_callbacks
 
 
@@ -166,10 +168,76 @@ async def test_explore_total_failure_returns_structured_note():
     assert "Do NOT read the whole codebase manually" in report
 
 
+async def test_upstream_connection_lost_is_retryable():
+    """Gateway 'upstream connection lost' must auto-retry instead of failing the turn."""
+    assert _is_retryable(RuntimeError("upstream connection lost")) is True
+    assert _is_retryable(RuntimeError("Upstream Connection Lost: proxy hiccup")) is True
+
+
+async def test_explore_auto_retry_emits_retry_and_fallback_events():
+    """Auto-retry must emit retry banner events during backoff and a fallback
+    event when falling back to the main model, so the UI never stays silent."""
+    events: list[dict] = []
+    calls = {"explore": 0, "main": 0}
+
+    async def fake_loop(model, **kwargs):
+        name = str(getattr(model, "model_name", "") or "")
+        if name == "explore-model":
+            calls["explore"] += 1
+            raise RuntimeError("explore model down")
+        calls["main"] += 1
+        return "MAIN MODEL RESULT"
+
+    main_model = _FailThenSucceedModel.__new__(_FailThenSucceedModel)
+    main_model.model_name = "main-model"
+    explore_model = _FailThenSucceedModel.__new__(_FailThenSucceedModel)
+    explore_model.model_name = "explore-model"
+
+    orig_sleep = tools_mod.asyncio.sleep
+
+    async def _no_sleep(_delay):
+        return None
+
+    tools_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    orig_loop = llm_mod.langchain_tool_loop
+    llm_mod.langchain_tool_loop = fake_loop  # type: ignore[assignment]
+    try:
+        ws = tempfile.mkdtemp(prefix="coder-test-explore-ws-")
+        with open(os.path.join(ws, "app.py"), "w") as fh:  # noqa: ASYNC230
+            fh.write("def main():\n    return 42\n")
+        cbs = make_tool_callbacks(
+            ws,
+            events.append,
+            main_model=main_model,
+            explore_model=explore_model,
+            reserved=20_000,
+        )
+        report = await cbs["task"](
+            description="inspect app.py",
+            prompt="Summarize app.py.",
+            subagent_type="explore",
+        )
+    finally:
+        tools_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+        llm_mod.langchain_tool_loop = orig_loop
+
+    assert "MAIN MODEL RESULT" in report
+    retries = [e for e in events if e.get("kind") == "retry"]
+    assert retries, "expected retry banner events during auto-retry backoff"
+    assert any(e.get("fallback") is True for e in retries), (
+        "expected a fallback retry event when switching to the main model"
+    )
+    assert any(
+        e.get("fallback") is not True and e.get("attempt", 0) >= 1 for e in retries
+    ), "expected transient retry events before the fallback"
+
+
 if __name__ == "__main__":
     asyncio.run(test_explore_system_prompt_is_compact_and_grep_first())
     asyncio.run(test_explore_system_batches_searches_and_bans_chunk_walking())
     asyncio.run(test_explore_fail_note_steers_to_narrower_scope())
     asyncio.run(test_explore_retries_then_falls_back_to_main_model())
     asyncio.run(test_explore_total_failure_returns_structured_note())
+    asyncio.run(test_upstream_connection_lost_is_retryable())
+    asyncio.run(test_explore_auto_retry_emits_retry_and_fallback_events())
     print("EXPLORE SUBAGENT TESTS PASSED")

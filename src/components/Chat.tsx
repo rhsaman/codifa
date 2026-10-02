@@ -1974,7 +1974,7 @@ export function ChatPanel() {
         store.updateMessage(assistantMsg.id, {
           content: prev + chunk,
           segments: appendTextSegment(findMsg()?.segments, chunk),
-          retry: null,
+          ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
           thinkingActive: false,
           statusText: undefined,
         });
@@ -1990,7 +1990,8 @@ export function ChatPanel() {
           // Safety net: if a retry banner is somehow still attached (e.g. a
           // retry resumed into a long thinking pass before the first text/tool
           // chunk arrives), clear it now — the model is clearly working again.
-          retry: null,
+          // Sub-agent fallback notice survives: it explains which model to fix.
+          ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
           ...(event.active ? { statusText: undefined } : {}),
         });
       } else if (event.kind === "skill") {
@@ -2092,7 +2093,7 @@ export function ChatPanel() {
             const toolIndex = current.length;
             store.updateMessage(assistantMsg.id, {
               toolActivity: next,
-              retry: null,
+              ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
               statusText: undefined,
             });
             // Atomic segment append so a concurrent steer_applied cannot be
@@ -2570,7 +2571,7 @@ export function ChatPanel() {
         const curMsg = findMsg();
         if (curMsg?.retry) {
           const r = curMsg.retry;
-          const isTerminal = r.gaveUp === true || r.watchdog === true;
+          const isTerminal = r.gaveUp === true || r.watchdog === true || r.fallback === true;
           const isFailedTurn = curMsg.error === true;
           if (!isTerminal && !isFailedTurn) {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });

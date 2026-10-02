@@ -1170,6 +1170,8 @@ _RETRYABLE_PHRASES = (
     "worker local",
     "request limit reached",
     "upstream error",
+    "upstream connection lost",
+    "connection lost",
     # Transport-level stream drops: the upstream TCP/TLS connection closes
     # mid-body with no HTTP status attached (often "peer closed connection
     # without sending complete message body (incomplete chunked read)").

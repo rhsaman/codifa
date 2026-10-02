@@ -311,6 +311,8 @@ async def _call_mcp_tool(
     emit: Callable[[dict], None],
     server_name: str,
     qualified: str,
+    analyze_images: Callable[[list[str], str], Awaitable[str | None]] | None = None,
+    turn_task: str = "",
     **kwargs: Any,
 ) -> str:
     """Invoke an MCP tool and return its textual result.
@@ -318,6 +320,12 @@ async def _call_mcp_tool(
     Mirrors the internal tools' UI contract: emit a ``tool`` event before the
     call and a ``tool_result`` event after, so MCP calls render in the live
     activity feed exactly like native tools.
+
+    When the result carries image content (e.g. a playwright screenshot),
+    ``analyze_images`` — the vision fallback wired by the graph — is awaited
+    with the data URIs and its text is appended, so a vision-less main model
+    still "sees" the image through the configured vision model. Without an
+    analyzer the result says so explicitly instead of silently dropping it.
 
     When the call fails because the browser/transport connection was closed
     (the user closed the tab, or the browser crashed between turns), the
@@ -351,13 +359,56 @@ async def _call_mcp_tool(
                     }
                 )
                 return msg
-            return _flatten_tool_result(result, qualified, emit)
+            return await _with_image_analysis(
+                result, qualified, emit, analyze_images, turn_task=turn_task
+            )
         msg = f"ERROR calling MCP tool {tool_name!r}: {exc}"
         emit({"kind": "tool_result", "tool": tool_name, "summary": msg, "status": "error"})
         return msg
 
     # MCP returns structured content; flatten it to text for the model.
-    return _flatten_tool_result(result, qualified, emit)
+    return await _with_image_analysis(
+        result, qualified, emit, analyze_images, turn_task=turn_task
+    )
+
+
+async def _with_image_analysis(
+    result: Any,
+    qualified: str,
+    emit: Callable[[dict], None],
+    analyze_images: Callable[[list[str], str], Awaitable[str | None]] | None,
+    turn_task: str = "",
+) -> str:
+    """Flatten an MCP result and route any images through the vision fallback.
+
+    A configured vision model is this app's contract for "the main model
+    cannot see images" — so when the analyzer is wired and returns text, the
+    analysis is appended as the model's ONLY view of the image. When there is
+    no vision model (analyzer returns None) the result says so explicitly
+    instead of leaving the model to wonder what the image contained.
+    """
+    summary, image_uris = _flatten_tool_result(result, qualified, emit, turn_task=turn_task)
+    if not image_uris:
+        return summary
+    analysis: str | None = None
+    if analyze_images is not None:
+        try:
+            analysis = await analyze_images(image_uris, qualified)
+        except Exception as exc:  # noqa: BLE001 — تحلیل نباید ابزار را بشکند
+            analysis = None
+            summary += f"\n\n[vision analysis of the image(s) failed: {exc}]"
+    if analysis:
+        summary += (
+            "\n\n=== IMAGE ANALYSIS (vision sub-agent) ===\n"
+            + str(analysis).strip()
+        )
+    elif "[vision analysis of the image(s) failed" not in summary:
+        summary += (
+            f"\n\n[{len(image_uris)} image(s) returned by this tool were NOT "
+            "analyzed — no vision model is configured. Set Settings → Tool "
+            "Models → Vision model to let the agent see screenshots.]"
+        )
+    return summary
 
 
 def suggest_browser_snapshot_mode(task: str = "", chat_id: str = "", emit: Any = None) -> str | None:
@@ -442,19 +493,48 @@ def _is_snapshot_tool(qualified: str) -> bool:
     return any(k in low for k in ("snapshot", "evaluate", "network", "console", "screenshot"))
 
 
-def _flatten_tool_result(result: Any, qualified: str, emit: Callable[[dict], None]) -> str:
+# سقف تعداد تصویرِ استخراج‌شده از یک نتیجهٔ MCP — هر تصویر یک دوررفتن به مدل
+# ویژن است؛ سرورهای درست (مثل playwright) در هر فراخوانی یک اسکرین‌شات می‌دهند.
+_MCP_MAX_IMAGES_PER_RESULT = 4
+# سقف reprِ بلوک‌های ناشناخته — reprِ pydantic می‌تواند بولک عظیمی باشد.
+_REPR_PART_MAX_CHARS = 2000
+
+
+def _flatten_tool_result(
+    result: Any, qualified: str, emit: Callable[[dict], None], turn_task: str = ""
+) -> tuple[str, list[str]]:
     """MCP structured content را به متن تخت تبدیل و رویداد ``tool_result`` صادر
     می‌کند. در هر دو مسیر (موفقِ اولیه و تلاشِ دوباره پس از reconnect) یکسان
-    استفاده می‌شود تا خروجی یکسانی به مدل برسد."""
+    استفاده می‌شود تا خروجی یکسانی به مدل برسد.
+
+    بلوک‌های تصویری (مثل اسکرین‌شات ``browser_take_screenshot``) به‌صورت
+    data URI جداگانه برگردانده می‌شوند تا در صورت پیکربندی، مدل ویژن تحلیلشان
+    کند — رشتهٔ پایه۶۴ هرگز مستقیم وارد متن مدل نمی‌شود (قبلاً reprِ کل بلوک
+    شامل base64 به متن فشرده‌شدهٔ ۱۲هزارکاراکتری snapshot آلوده می‌شد)."""
     parts: list[str] = []
+    image_uris: list[str] = []
     content = getattr(result, "content", None)
     if isinstance(content, list):
         for item in content:
             text = getattr(item, "text", None)
             if text is not None:
                 parts.append(str(text))
-            else:
-                parts.append(str(item))
+                continue
+            data = getattr(item, "data", None)
+            mime = getattr(item, "mimeType", None) or "image/png"
+            if isinstance(data, str) and data:
+                idx = len(image_uris) + 1
+                if len(image_uris) < _MCP_MAX_IMAGES_PER_RESULT:
+                    image_uris.append(f"data:{mime};base64,{data}")
+                parts.append(
+                    f"[image #{idx}: {mime}, {max(1, len(data) // 1024)} KB base64]"
+                )
+                continue
+            r = str(item)
+            parts.append(
+                r if len(r) <= _REPR_PART_MAX_CHARS
+                else r[:_REPR_PART_MAX_CHARS] + "…(truncated)"
+            )
     elif content is not None:
         parts.append(str(content))
     if not parts:
@@ -465,12 +545,16 @@ def _flatten_tool_result(result: Any, qualified: str, emit: Callable[[dict], Non
             parts.append("(no output)")
     summary = "\n".join(parts)
     try:
+        # ``turn_task`` is the turn prompt: it feeds the token-overlap scoring
+        # so snapshot compaction keeps the lines relevant to what was asked.
+        # Named turn_task (not task) so it can never collide with a tool's
+        # own ``task`` argument riding through **kwargs.
         if _is_snapshot_tool(qualified) and len(summary) > _BROWSER_SNAPSHOT_MAX_CHARS:
-            summary = compact_browser_snapshot(summary)
+            summary = compact_browser_snapshot(summary, task=turn_task)
     except Exception:  # noqa: BLE001, S110 — فشرده‌سازی اختیاری است
         pass
     emit({"kind": "tool_result", "tool": qualified, "summary": summary[:500], "status": "ok"})
-    return summary
+    return summary, image_uris
 
 
 async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> bool:
@@ -589,6 +673,8 @@ def _make_tool(
     session: ClientSession,
     emit: Callable[[dict], None],
     reserved_names: set[str] | None = None,
+    analyze_images: Callable[[list[str], str], Awaitable[str | None]] | None = None,
+    turn_task: str = "",
 ) -> StructuredTool:
     """Wrap a single MCP tool definition into a LangChain ``StructuredTool``.
 
@@ -598,6 +684,8 @@ def _make_tool(
     does it fall back to the fully qualified ``mcp__<server>__<tool>`` form.
     توضیح و schema هم قبل از ساخت فشرده می‌شوند (``_compact_description`` /
     ``_compact_schema``) تا هزینهٔ توکن فهرست ابزارها در هر turn کم بماند.
+    ``analyze_images`` همان فالبک ویژن است (به ``_call_mcp_tool`` پاس می‌شود).
+    ``turn_task`` پرامپت turn است و به فشرده‌سازی snapshot می‌رسد.
     """
     tool_name = getattr(tool, "name", None) or "tool"
     short = _short_tool_name(server_name, tool_name)
@@ -607,7 +695,14 @@ def _make_tool(
 
     async def _func(**kwargs: Any) -> str:
         return await _call_mcp_tool(
-            session, tool_name, emit, server_name, qualified=qualified, **kwargs
+            session,
+            tool_name,
+            emit,
+            server_name,
+            qualified=qualified,
+            analyze_images=analyze_images,
+            turn_task=turn_task,
+            **kwargs,
         )
 
     _func.__name__ = binding
@@ -715,6 +810,8 @@ async def build_mcp_tools(
     mcp_servers: dict | None,
     emit: Callable[[dict], None],
     reserved_names: set[str] | None = None,
+    analyze_images: Callable[[list[str], str], Awaitable[str | None]] | None = None,
+    task: str = "",
 ) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
     """Connect to every configured MCP server and return (tools, cleanup).
 
@@ -732,6 +829,10 @@ async def build_mcp_tools(
     tool's short binding (native tool names + MCP tools already bound this
     turn). An MCP tool whose short name collides falls back to its fully
     qualified ``mcp__<server>__<tool>`` name.
+
+    ``analyze_images`` is the vision fallback for image-bearing results (e.g.
+    playwright screenshots): an async ``(data_uris, qualified) -> text | None``
+    hook wired by the graph when a vision model is configured.
     """
     tools: list[StructuredTool] = []
     reserved = set(reserved_names or set())
@@ -745,7 +846,10 @@ async def build_mcp_tools(
         # --- cache hit: same config → reuse live session ---
         if cached and cached.config_hash == h:
             new_tools = [
-                _make_tool(name, t, cached.session, emit, reserved_names=reserved)
+                _make_tool(
+                    name, t, cached.session, emit,
+                    reserved_names=reserved, analyze_images=analyze_images, turn_task=task,
+                )
                 for t in cached.raw_tools
             ]
             tools.extend(new_tools)
@@ -765,7 +869,10 @@ async def build_mcp_tools(
             cached = _session_cache.get(name)
             if cached and cached.config_hash == h:
                 new_tools = [
-                    _make_tool(name, t, cached.session, emit, reserved_names=reserved)
+                    _make_tool(
+                        name, t, cached.session, emit,
+                        reserved_names=reserved, analyze_images=analyze_images, turn_task=task,
+                    )
                     for t in cached.raw_tools
                 ]
                 tools.extend(new_tools)
@@ -805,7 +912,10 @@ async def build_mcp_tools(
                         cfg=dict(cfg),
                     )
                     new_tools = [
-                        _make_tool(name, t, session, emit, reserved_names=reserved)
+                        _make_tool(
+                            name, t, session, emit,
+                            reserved_names=reserved, analyze_images=analyze_images, turn_task=task,
+                        )
                         for t in raw_tools
                     ]
                     tools.extend(new_tools)

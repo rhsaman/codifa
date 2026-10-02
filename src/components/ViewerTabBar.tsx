@@ -32,16 +32,28 @@ function InboxIcon() {
   );
 }
 
+function PlanIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="8" y="2" width="8" height="4" rx="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      <path d="M9 12h6M9 16h4" />
+    </svg>
+  );
+}
+
 const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   review: ReviewIcon,
   trace: TraceIcon,
   inbox: InboxIcon,
+  plan: PlanIcon,
 };
 
 const KIND_LABEL: Record<ViewerKind, string> = {
   review: 'Git',
   trace: 'Trace',
   inbox: 'Inbox',
+  plan: 'Plan',
 };
 
 function CloseIcon() {

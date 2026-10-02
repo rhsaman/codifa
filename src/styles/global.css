@@ -8276,6 +8276,120 @@ textarea {
   padding-bottom: 2px;
 }
 
+/* ---- composer pasted-text cards ---- */
+/* A long paste becomes a collapsed card above the input (Claude-style paste
+   chip): dim clamped preview starting with a wall-clock timestamp, a PASTED
+   badge + edit button on the foot row, and a floating X on the top edge. */
+.paste-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.paste-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 320px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, var(--text) 4%);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, var(--text) 20%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px rgba(0, 0, 0, 0.35);
+}
+
+.paste-card-preview {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 96px;
+  overflow: hidden;
+}
+
+.paste-card-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--text-dim) 80%, transparent);
+}
+
+.paste-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.paste-card-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 4px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.paste-card-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.paste-card-edit:hover {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+/* X floats ON the card's top edge (half outside), like a dismissible popover. */
+.paste-card-x {
+  position: absolute;
+  top: -9px;
+  inset-inline-end: -9px;
+  width: 22px;
+  height: 22px;
+  font-size: 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  z-index: 1;
+}
+
+/* Queued / steer bubbles fold long text exactly like a user bubble: same
+   max-height clamp, toggle button below the text (indented with it). */
+.queued-bubble-text.clamped {
+  max-height: 180px;
+  overflow: hidden;
+}
+
+.queued-bubble .msg-expand {
+  align-self: flex-start;
+}
+
+.chat-messages[data-dir="ltr"] .queued-bubble .msg-expand {
+  margin-left: 30px;
+}
+
+.chat-messages[data-dir="rtl"] .queued-bubble .msg-expand {
+  margin-right: 30px;
+}
+
 /* Pending messages rendered as bubbles at the END of the transcript (replaces
    the old chips above the composer). Distinct from real sent messages: dashed
    border + tinted background + pending icon/label, so a queued item never
@@ -11238,6 +11352,298 @@ textarea {
   }
 }
 
+/* Collapsed implementation-plan card on a Plan-mode reply (plan_card event):
+   title row + faded preview + "View full plan" pill. */
+.plan-doc-card {
+  margin: 8px 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-alt) 88%, transparent);
+  overflow: hidden;
+}
+
+.plan-doc-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px 7px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.plan-doc-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.plan-doc-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+
+.plan-doc-title {
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.plan-doc-spacer {
+  flex: 1 1 auto;
+}
+
+.plan-doc-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.plan-doc-copy:hover,
+.plan-doc-copy.copied {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.plan-doc-preview {
+  padding: 0 12px;
+  max-height: 132px;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-line;
+  word-break: break-word;
+  /* Fade the tail out so the truncation reads as "there is more", not "cut". */
+  mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent 100%);
+}
+
+.plan-doc-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 12px 10px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.plan-doc-open:hover {
+  background: var(--accent);
+  color: var(--on-accent, #111);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+
+/* Plan-approval card (ask style="plan_approval"): "Permission required —
+   Implementation plan" with a numbered Approve option, free-text edit box,
+   keyboard hints and Dismiss/Submit. */
+.plan-approval-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex: 0 0 auto;
+}
+
+.plan-approval-icon {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.plan-approval-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.plan-approval-option {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  text-align: left;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: none;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+  transition:
+    background 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.plan-approval-option:hover,
+.plan-approval-option.selected {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 14%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.plan-approval-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.plan-approval-num {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-approval-opt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.plan-approval-opt-head {
+  font-weight: 700;
+}
+
+.plan-approval-opt-desc {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.plan-approval-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.plan-approval-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-approval-dismiss {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.plan-approval-dismiss:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.plan-approval-submit {
+  flex: 0 0 auto;
+}
+
+/* Docked Plan viewer tab (PlanPanel): reuses the review-panel docked chrome.
+   Direction: the component sets an inline `direction` (the shared
+   .review-panel rule hard-codes ltr and would beat the dir attribute). */
+.plan-panel-source {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.plan-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.plan-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* Horizontal scroll states in an RTL container can land scrolled away from
+     the start edge, visually eating the right padding — never allow one:
+     wide tokens wrap instead. */
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  padding: 14px 18px 24px;
+}
+
+/* Long code chips inside the plan must wrap, not force the block wider. */
+.plan-panel-body :is(p, li, h1, h2, h3, h4) code,
+.plan-panel-body pre,
+.plan-panel-body pre code {
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+}
+
+.plan-panel-heading {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.plan-panel-empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-align: center;
+}
+
 /* ---- neovim open-file label (always visible, click to mention) ---- */
 .nvim-label {
   display: inline-flex;
@@ -14104,6 +14510,10 @@ textarea {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  /* Same RTL guard as .plan-panel-body: a stray horizontal scroll offset in
+     the docked review/git panel visually swallows the right inset. Wide diff
+     rows wrap instead of ever scrolling sideways. */
+  overflow-x: hidden;
 }
 
 .review-file-block {

@@ -1912,6 +1912,28 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
     )
+    # Step-model slot for mid-loop cheap routing: a mechanical follow-up step
+    # (e.g. the Nth browser click in a row) can run on this small model
+    # instead of the main one, gated by laya_decide.step_route. Unset (or
+    # resolving to the same model as the main one) disables the feature.
+    # Falls back to the compact ENTRY so a user who only configured a compact
+    # model still gets cheap steps; default_to_parent=False keeps it None
+    # when neither slot is configured.
+    step_model = resolve_subagent_model(
+        state["provider"],
+        subagent_models.get("step") or subagent_models.get("compact"),
+        state["base_url"],
+        state["api_key"],
+        state["env_var"],
+        state["model_name"],
+        default_to_parent=False,
+        provider_lookup=_provider_lookup,
+        # Bounded so an unreachable step-model provider fails the step (and
+        # the escalation guard takes over) instead of hanging the turn.
+        timeout=60,
+        parent_provider_id=state.get("provider_id", ""),
+        parent_api_keys=state.get("api_keys"),
+    )
 
     settings = await chat_model_settings(
         mode,
@@ -1980,6 +2002,22 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # and merge the live tools into the same `filtered` dict the tool loop
     # reads, plus expose a cleanup coroutine so the caller can close the
     # sessions when the turn ends.
+    async def _analyze_mcp_images(
+        image_uris: list[str], qualified: str = ""
+    ) -> str | None:
+        """Vision fallback for MCP results that carry images (e.g. a playwright
+        ``browser_take_screenshot``). The configured vision model is this app's
+        contract for images — the main model never receives them directly — so
+        the analysis text is the main model's ONLY view of the screenshot.
+        Returns None when no vision model is configured; the bridge then
+        annotates the tool result instead of silently dropping the image.
+        Cached like attachments so an unchanged screenshot is analyzed once."""
+        if vision_model is None or not image_uris:
+            return None
+        return await _vision_analyze_cached(
+            vision_model, image_uris, str(chat_id or "")
+        )
+
     mcp_tools: list = []
     mcp_cleanup = None
     _mcp_servers = state.get("mcp_servers") or {}
@@ -1991,6 +2029,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _mcp_servers,
             lambda ev: queue.put_nowait(ev),
             reserved_names=set(filtered),
+            analyze_images=_analyze_mcp_images,
+            # The turn prompt feeds snapshot compaction: browser snapshots
+            # keep the lines relevant to what was actually asked.
+            task=str(prompt or ""),
         )
     if mcp_tools and prompt:
         # Laya MCP pre-rank: most relevant server tools first (reorder-only;
@@ -2085,6 +2127,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         + _agents._DOING_TASKS
         + (_agents._LENGTH_RULE if mode in ("plan", "coder") else "")
         + (_agents._TEST_DIR_RULE if mode in ("plan", "coder") else "")
+        + (_agents._TEST_STYLE_RULE if mode in ("plan", "coder") else "")
     )
     # Language directive depends on the CURRENT prompt (Persian/English
     # detection), so it must NOT live in the system prompt — otherwise the cache
@@ -2491,15 +2534,20 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     f"and run the project's frontend command (npm run test:frontend / "
                     f"npx vitest run / npx jest). "
                 )
-            # Tell the Coder the EXACT commands to run so it runs the project's
-            # tests itself (there is no automatic test gate in the graph). This
-            # also keeps detect_test_commands() in active use instead of dead code.
+            # Tell the Coder the EXACT commands so it can run the project's
+            # tests itself (there is no automatic test gate in the graph) —
+            # but scope them to the END of the task: iterating on the full
+            # suite burns minutes per run, so targeted files come first.
             cmds = detect_test_commands(root)
             cmd_note = ""
             if cmds:
                 cmd_note = (
-                    " Run these project test command(s) yourself via run_terminal "
-                    "before finishing: " + "; ".join(cmds) + ". "
+                    " While iterating, run ONLY the specific test file(s) you "
+                    "wrote or touched (e.g. `uv run pytest tests/test_x.py -q`) "
+                    "— never the whole suite. Run the full project command(s) ("
+                    + "; ".join(cmds)
+                    + ") at most ONCE, at the very end of the task — skip them "
+                    "entirely when the targeted tests already cover the change. "
                 )
             lc_history.insert(
                 0,
@@ -2516,11 +2564,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "messages + logging, imports/sorting/dead code removal, "
                         "comments/docs/README, cosmetic/style/formatting. "
                         "Write AT MOST 1-2 focused tests per change, not a test suite. "
+                        "Keep them FAST (unit-level, no real sleeps — see the TEST "
+                        "STYLE RULE). "
                         "If a relevant test file already exists, ADD test cases there "
                         "— do NOT create a new file. "
-                        "Run them yourself "
-                        "(uv run pytest / npm test / cargo test / go test / mvn test / "
-                        "dotnet test / flutter test / dart test / ..."
+                        "Run ONLY the test file(s) you wrote or touched, never the "
+                        "whole suite while iterating "
+                        "(uv run pytest tests/test_x.py / npx vitest run "
+                        "path/to/file.test.ts / cargo test / go test / ..."
                         + fw_note
                         + ")."
                         + cmd_note
@@ -2904,9 +2955,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "web_model": web_model,
         "compact_model": compact_model,
         "vision_model": vision_model,
+        "step_model": step_model,
         "main_model": model,
         "prompt": prompt,
         "mcp_cleanup": mcp_cleanup,
+        # Vision fallback for image-bearing MCP results; the steer path's
+        # late build_mcp_tools call reuses this same hook.
+        "analyze_images": _analyze_mcp_images,
     }
 
 
@@ -3433,6 +3488,12 @@ async def _maybe_auto_compact(
                 ][-3:]
                 for _m in _recent_non_tool:
                     _rc = str(getattr(_m, "content", "") or "")
+                    # The path/ident regexes below are quadratic on inputs with
+                    # no match (pure backtracking scans) — an 800k-char paste
+                    # or tool dump would spin for minutes. This pass is
+                    # best-effort: scan a small window from both ends only.
+                    if len(_rc) > 8_000:
+                        _rc = _rc[:4_000] + "\n…\n" + _rc[-4_000:]
                     for _tok in re.findall(r"[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}", _rc):
                         _t = _tok.strip("./-")
                         if len(_t) >= 4:
@@ -3530,6 +3591,32 @@ async def _maybe_auto_compact(
         if _cid in _code_map_hash_cache:
             _code_map_hash_cache.pop(_cid, None)
     return 1
+
+
+def _prev_step_tool_summary(msgs: list) -> tuple[str, bool] | None:
+    """``(tool names, any_error)`` of the most recent tool step, or ``None``.
+
+    Input for the laya ``step_route`` gate: only a transcript whose tail is
+    tool results (the model just acted) is a continuation candidate. A
+    text-only reply, a steer message, or an empty transcript returns ``None``
+    so the gate is skipped and the step stays on the main model.
+    """
+    if not msgs or not isinstance(msgs[-1], ToolMessage):
+        return None
+    names: list[str] = []
+    any_error = False
+    for message in reversed(msgs):
+        if isinstance(message, ToolMessage):
+            if getattr(message, "status", "success") != "success":
+                any_error = True
+            continue
+        if isinstance(message, AIMessage):
+            calls = getattr(message, "tool_calls", None) or []
+            names = [str(tc.get("name") or "") for tc in calls if tc.get("name")]
+        break
+    if not names:
+        return None
+    return (", ".join(names), any_error)
 
 
 async def _run_mode_turn(
@@ -3635,6 +3722,22 @@ async def _run_mode_turn(
     # None when the user hasn't configured a compact/subagent model — in that
     # case obsolete tool results are dropped outright instead of summarized.
     compact_model = tctx.get("compact_model")
+    # Step model for mid-loop cheap routing (laya step_route gate). Disabled
+    # unless the user configured a step/compact model that is DIFFERENT from
+    # the main model — routing a step to the same model would only add a
+    # gate round-trip for nothing.
+    step_model_slot = tctx.get("step_model")
+    if (
+        step_model_slot is not None
+        and str(getattr(step_model_slot, "model_name", "") or "")
+        == str(getattr(model, "model_name", "") or "")
+    ):
+        step_model_slot = None
+    # Flipped off for the rest of the turn the first time the step model
+    # fails (provider error / empty response) — see the escalation guards in
+    # the step loop below. Survives _inner retries on purpose: one broken
+    # step model must not keep re-breaking an otherwise working turn.
+    _cheap_steps_ok = True
 
     if extra_instruction:
         # Inject as HumanMessage (not SystemMessage) so it lands mid-list
@@ -3829,7 +3932,7 @@ async def _run_mode_turn(
     _step_progress = 0
 
     async def _inner() -> str:
-        nonlocal model, _step_progress, mcp_cleanup
+        nonlocal model, _step_progress, mcp_cleanup, _cheap_steps_ok
         # NOTE: `msgs` aliases the OUTER `messages` list so completed tool work
         # (tool calls + their results) survives a retry. On a transient throttle
         # we re-run the loop from the SAME accumulated transcript -- the model
@@ -3882,6 +3985,10 @@ async def _run_mode_turn(
         _transient_msgs: list[Any] = []
         # رویداد warn تذکر batching فقط یک بار در هر نوبت به UI می‌رود.
         _batch_warned = False
+        # Set when a step ended in a provider exception / escalation, so the
+        # NEXT iteration re-binds the (possibly param-stripped) main model
+        # and skips the cheap-routing gate for that retry.
+        _prev_step_failed = False
         # Auto-continue guard for max-output truncation (mirrors opencode, which
         # treats finish_reason=="length" as a normal partial stop and keeps
         # generating until the answer is complete instead of ending the turn).
@@ -3919,6 +4026,7 @@ async def _run_mode_turn(
                             _steer_mcp,
                             lambda ev: queue.put_nowait(ev),
                             reserved_names=set(filtered),
+                            analyze_images=tctx.get("analyze_images"),
                         )
                         if _new_tools:
                             _browser_live = merge_mcp_tools(filtered, _new_tools, cap)
@@ -3960,8 +4068,45 @@ async def _run_mode_turn(
                 queue.put_nowait(
                     {"kind": "steer_applied", "ids": [s.get("id", "") for s in steers]}
                 )
+            # ── Per-step cheap routing (laya step_route) ────────────────────
+            # A mechanical follow-up (the model just ran tools and the gate
+            # expects another routine call) can run on the small step model;
+            # everything else stays on the main model. Laya only PICKS the
+            # route — the chosen model still generates every tool call.
+            _bind_model = model
+            _cheap_step_active = False
+            if (
+                step_model_slot is not None
+                and _cheap_steps_ok
+                and steps >= 2
+                and not _prev_step_failed
+            ):
+                _prev = _prev_step_tool_summary(msgs)
+                if _prev is not None:
+                    try:
+                        import laya_decide as _laya_step
+
+                        _route = await asyncio.to_thread(
+                            _laya_step.step_route,
+                            str(state.get("request") or state.get("prompt") or ""),
+                            _prev[0],
+                            _prev[1],
+                            steps,
+                            chat_id=str(chat_id or ""),
+                            emit=queue.put_nowait,
+                        )
+                    except Exception:  # noqa: BLE001 — routing is optional
+                        _route = None
+                    if _route == "cheap_step":
+                        _bind_model = step_model_slot
+                        _cheap_step_active = True
+            _prev_step_failed = False
+            # Usage/trace rows must name the model that ACTUALLY ran.
+            model_id = getattr(_bind_model, "model_name", None) or state.get(
+                "model_name", ""
+            )
             try:
-                bound = bind_tools_parallel(model, lc_tools, not _no_pc)
+                bound = bind_tools_parallel(_bind_model, lc_tools, not _no_pc)
                 ai: Any = None
                 _astream_count_local = 0
                 _thinking_active = False
@@ -4264,6 +4409,20 @@ async def _run_mode_turn(
                     type(exc).__name__,
                     str(exc),
                 )
+                _prev_step_failed = True
+                if _cheap_step_active:
+                    # The step model failed (context overflow, auth, 5xx…):
+                    # re-run THIS step on the main model and stop cheap
+                    # routing for the rest of the turn — a broken step model
+                    # must never break the turn.
+                    _cheap_steps_ok = False
+                    _cheap_step_active = False
+                    logger.warning(
+                        "[run_graph] step model failed; escalating step %s "
+                        "to the main model",
+                        steps,
+                    )
+                    continue
                 # A few local OpenAI-compatible servers (old llama.cpp / custom
                 # builds) reject `stream_options` even though most accept or
                 # ignore it. Retry the current step once with a model built
@@ -4414,6 +4573,14 @@ async def _run_mode_turn(
                 # a bounded number of times so the model can actually produce
                 # output, and only warn+break if it keeps returning nothing.
                 if not _partial.strip() and not (reply or "").strip():
+                    if _cheap_step_active:
+                        # A cheap step that produced NOTHING is the classic
+                        # small-model failure: escalate this step to the main
+                        # model, then stop cheap routing for the turn.
+                        _cheap_steps_ok = False
+                        _cheap_step_active = False
+                        _prev_step_failed = True
+                        continue
                     if _auto_cont < _MAX_AUTO_CONT:
                         _auto_cont += 1
                         msgs.append(HumanMessage(content="ادامه بده."))
@@ -6512,8 +6679,131 @@ def _route_reader_dispatch(state: AgentState) -> str:
     return "reader_answer"
 
 
+# Sentinel answers the frontend sends for the plan-approval card (it must never
+# depend on the visible option label, which is localized). Free-text answers are
+# revision feedback for the planner.
+PLAN_APPROVE_TOKEN = "__plan_approve__"
+PLAN_DISMISS_TOKEN = "__plan_dismiss__"
+# Capability map applied to the run when the user approves the plan: the request
+# arrived with Plan-mode (read-only) caps from the UI, and filter_tools_for_mode
+# trusts that map — without this upgrade the Coder turn that starts in the SAME
+# stream would have its write/edit/terminal tools stripped.
+CODER_CAPS = {"readFiles": True, "writeFiles": True, "runTerminal": True, "web": True}
+
+
+def _split_plan_reply(reply: str) -> tuple[str, str]:
+    """Split a planner reply into ``(preamble, plan_body)``.
+
+    The model is told to open with ``## Plan``, but it sometimes prefixes a
+    short lead-in or uses a variant header (``## plan``, ``### Plan``,
+    ``## Plan:``). The plan body starts at the header when one is present;
+    otherwise the whole reply IS the plan and the preamble is empty. The body
+    is what gets persisted (the "plan sometimes isn't saved" bug) and shown in
+    the Plan card/panel; the preamble stays visible as ordinary chat prose.
+    """
+    import re
+
+    text = (reply or "").strip()
+    if not text:
+        return "", ""
+    m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return "", text
+    return text[: m.start()].strip(), text[m.start() :]
+
+
+def _normalize_plan_reply(reply: str) -> str:
+    """Return the plan body to persist (see `_split_plan_reply`)."""
+    return _split_plan_reply(reply)[1]
+
+
+def _plan_title(plan_body: str) -> str:
+    """Human title for the Plan card: the first markdown heading if the planner
+    wrote a custom one (``## Plan: auth refactor``), else the generic label."""
+    import re
+
+    for line in (plan_body or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^#{1,6}\s+(.+)$", s)
+        if m:
+            title = m.group(1).strip().strip(":*#").strip()
+            # A bare "Plan" heading adds nothing over the card's own label.
+            if title.lower() in ("plan", "پلن"):
+                return ""
+            return title
+        break
+    return ""
+
+
+async def _request_plan_approval(queue: asyncio.Queue, gate: dict) -> str:
+    """Ask the user to approve / edit / dismiss the finished plan and WAIT.
+
+    Same ask-gate mechanics as the ask_user tool (future in ``ask_gates``,
+    resolved by POST /ask/respond) but deterministic — the graph raises the
+    gate itself after the plan is saved, so approval never depends on the
+    model deciding to call a tool. The ``style`` field tells the frontend to
+    render the "Permission required — Implementation plan" card.
+    """
+    import uuid
+
+    aid = f"a{uuid.uuid4().hex[:8]}"
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    gate[aid] = fut
+    queue.put_nowait(
+        {
+            "kind": "ask",
+            "id": aid,
+            "style": "plan_approval",
+            "question": "Implementation plan",
+            "options": [
+                "Approve — exit plan mode and start implementation",
+            ],
+        }
+    )
+    try:
+        answer = await fut
+    finally:
+        gate.pop(aid, None)
+    return answer if isinstance(answer, str) else ""
+
+
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
+    chat_id = state.get("chat_id", "")
+    attempts = int(state.get("plan_attempts", 0))
+    approved = False
+
+    def _save_and_emit(reply: str) -> str:
+        """Persist the plan, emit the Plan card event, return the plan body."""
+        from tools import slugify
+
+        ws = (
+            slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep)))
+            or "workspace"
+        )
+        preamble, plan_body = _split_plan_reply(reply)
+        try:
+            state_db.save_plan(ws, "plan", plan_body, chat_id=chat_id)
+        except Exception:
+            # Surface the failure instead of swallowing it: a silent drop is
+            # exactly the "plan sometimes isn't saved" bug.
+            logging.getLogger(__name__).exception("plan_build: save_plan failed")
+        try:
+            queue.put_nowait(
+                {
+                    "kind": "plan_card",
+                    "title": _plan_title(plan_body),
+                    "body": plan_body,
+                    "preamble": preamble,
+                }
+            )
+        except Exception:  # noqa: BLE001, S110 — the card must never break the run
+            pass
+        return plan_body
+
     reply = await _run_mode_turn(
         state, "plan", queue, run_flags=state.get("_run_flags")
     )
@@ -6521,40 +6811,68 @@ async def plan_build(state: AgentState) -> dict:
     # don't crash on .strip() — and never silently swallow a save failure.
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
+    attempts += 1
     if reply.strip():
-        from tools import slugify
-
-        ws = (
-            slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep)))
-            or "workspace"
+        reply = _save_and_emit(reply)
+        # Approval gate — but NOT when the planner just had a clarifying
+        # question answered mid-turn: _route_plan_build re-runs the planner
+        # against that fresh answer first, and the finalized plan gets its own
+        # gate on the next pass. Headless runs (no ask_gates) keep the old
+        # plan-and-stop behavior.
+        pending_answer = _ASK_ANSWERS.get(chat_id, "")
+        will_rerun = (
+            bool(pending_answer)
+            and pending_answer != state.get("_explored_ask_answer")
+            and attempts < 3
         )
-        plan_body = _normalize_plan_reply(reply)
-        try:
-            state_db.save_plan(ws, "plan", plan_body, chat_id=state.get("chat_id", ""))
-        except Exception:
-            # Surface the failure instead of swallowing it: a silent drop is
-            # exactly the "plan sometimes isn't saved" bug.
-            logging.getLogger(__name__).exception("plan_build: save_plan failed")
-        reply = plan_body
-    return {"plan": reply, "plan_attempts": int(state.get("plan_attempts", 0)) + 1}
-
-
-def _normalize_plan_reply(reply: str) -> str:
-    """Return the plan body to persist.
-
-    The model is told to open with ``## Plan``, but it sometimes prefixes a
-    short lead-in or uses a variant header (``## plan``, ``### Plan``,
-    ``## Plan:``). We still persist the plan in those cases instead of silently
-    dropping it (the "plan sometimes isn't saved" bug). If no header is present
-    at all but we're in plan mode, the whole reply IS the plan.
-    """
-    import re
-
-    text = (reply or "").strip()
-    if not text:
-        return ""
-    m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
-    return text[m.start() :] if m else text
+        gate = state.get("ask_gates")
+        if not will_rerun and gate is not None:
+            # Strictly user-bounded loop: every iteration blocks on the gate
+            # future, so another round only happens when the user submits
+            # another edit request on the approval card.
+            while True:
+                answer = await _request_plan_approval(queue, gate)
+                if answer == PLAN_APPROVE_TOKEN:
+                    approved = True
+                    try:
+                        queue.put_nowait({"kind": "mode_changed", "mode": "coder"})
+                    except Exception:  # noqa: BLE001, S110 — UI sync only
+                        pass
+                    break
+                # Dismiss (or empty): keep the saved plan, end plan mode. The
+                # user can switch to Coder manually later.
+                if not answer or answer == PLAN_DISMISS_TOKEN:
+                    break
+                # Edit request: revise the plan with the planner, then re-ask.
+                attempts += 1
+                revision = await _run_mode_turn(
+                    state,
+                    "plan",
+                    queue,
+                    extra_instruction=(
+                        "[PLAN REVISION REQUEST — non-user directive]\n"
+                        "The user reviewed your plan and asked for this change:\n"
+                        f"{answer}\n\n"
+                        "Here is the plan to revise:\n\n"
+                        f"{reply}\n\n"
+                        "Apply ONLY the requested change (keep everything that is "
+                        "still correct), then output the FULL revised plan in the "
+                        "same '## Plan' shape."
+                    ),
+                    run_flags=state.get("_run_flags"),
+                )
+                if not isinstance(revision, str) or not revision.strip():
+                    break
+                reply = _save_and_emit(revision)
+    return {
+        "plan": reply,
+        "plan_attempts": attempts,
+        # Approved → this run continues into the Coder node (implementation
+        # starts in the SAME stream, ZCode-style); _route_plan_build sees the
+        # switched mode and routes accordingly.
+        "mode": "coder" if approved else state.get("mode", "plan"),
+        **({"cap": dict(CODER_CAPS)} if approved else {}),
+    }
 
 
 def _route_plan_build(state: AgentState) -> str:

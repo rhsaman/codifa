@@ -58,7 +58,7 @@ async def run_scenario(monkeypatch, scenario):
             await asyncio.wait_for(both_started.wait(), 2)
         return BODY
 
-    async def save_checkpoint(thread_id, messages):
+    async def save_checkpoint(thread_id, messages, mode="", plan=None):
         checkpoints.append([m.model_copy(deep=True) for m in messages])
 
     monkeypatch.setattr(graph, "build_turn_context", AsyncMock(return_value={

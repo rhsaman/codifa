@@ -25,12 +25,15 @@ Covers:
 """
 
 import asyncio
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
 _TMP = tempfile.mkdtemp(prefix="coder-test-batchnudge-")
 os.environ["CODER_DATA_DIR"] = _TMP
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
 for _p in (_THIS, os.path.dirname(_THIS)):

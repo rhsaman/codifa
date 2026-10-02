@@ -352,6 +352,11 @@ export interface ChatMessage {
    *  messages persisted before this feature; they fall back to legacy layout. */
   segments?: MessageSegment[]
   plan?: Array<{ id?: string; content: string; status: string }>
+  /** Full implementation plan document produced by Plan mode (kind:"plan_card").
+   *  The chat bubble hides the plan portion of `content` and renders this as a
+   *  collapsed Plan card instead; "View full plan" opens it in the Plan viewer
+   *  tab. `preamble` is the prose the planner wrote before the plan header. */
+  planDoc?: { title: string; body: string; preamble?: string }
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
@@ -414,9 +419,19 @@ export interface ChatDraft {
   input?: string
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
+  /** Long texts pasted into the composer, kept as collapsed cards instead of
+   *  flooding the textarea. Joined back into the prompt on send. */
+  pasted?: PastedText[]
   /** True while the composer's mention of a Neovim file was active, so a queued
    *  turn started from another chat can reproduce the mention. */
   nvimMentioned?: string
+}
+
+/** A long paste captured by the composer as a collapsed card. */
+export interface PastedText {
+  id: string
+  text: string
+  createdAt: number
 }
 
 /** A message typed while the chat's agent is already working. `kind: 'steer'`
@@ -461,7 +476,7 @@ export interface Chat {
    *  lose the request (and the popup would never appear) if the user isn't
    *  looking at this exact chat when the `ask` event arrives, or switches away
    *  and back while the agent is still waiting for a response. */
-  pendingAsk?: { id: string; question: string; options: string[] } | null
+  pendingAsk?: { id: string; question: string; options: string[]; style?: string } | null
   /** A pending `permission` request from a RUNNING agent turn. Same rationale
    *  as `pendingAsk`: lives on the chat so it survives the ChatPanel remount
    *  on chat switch. `folder` = the backend-normalized approved folder (the
@@ -527,7 +542,7 @@ export interface LayaRun {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive' | 'laya'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive' | 'laya'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -599,6 +614,17 @@ export interface SidecarEvent {
   /** ask_user: the question text and, when multiple-choice, its options */
   question?: string
   options?: string[]
+  /** 'plan_approval' marks the deterministic end-of-plan approval card
+   *  (Approve / edit / dismiss); absent for regular agent questions. */
+  style?: string
+  /** plan_card: the full implementation plan document (+ the prose written
+   *  before its header) and its display title. */
+  title?: string
+  body?: string
+  preamble?: string
+  /** mode_changed: the backend switched the chat's workflow mode mid-run
+   *  (plan approval → coder); the frontend syncs chat.mode silently. */
+  mode?: string
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number

@@ -929,3 +929,153 @@ async def test_closed_browser_reconnect_failure_propagates_error(monkeypatch):
     # خطای اصلی (بسته‌شدن مرورگر) به مدل می‌رسد چون reconnect ممکن نبود
     assert "browser has been closed" in out
     await cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Image results (e.g. playwright screenshots) → vision-model fallback
+# ---------------------------------------------------------------------------
+
+def _fake_session_with_result(tools, result):
+    """Like ``_fake_session`` but the tool call returns a fixed result object."""
+    session = MagicMock()
+    mlist = MagicMock()
+    mlist.tools = tools
+    session.list_tools = AsyncMock(return_value=mlist)
+    session.initialize = AsyncMock()
+    session.call_tool = AsyncMock(return_value=result)
+    session.__aenter__.return_value = session
+    session.__aexit__.return_value = False
+    return session
+
+
+def _image_result(b64: str = "QUJD", mime: str = "image/png", text: str = "Screenshot saved"):
+    """A CallToolResult-shaped object carrying one image + one text block."""
+    image_block = SimpleNamespace(type="image", data=b64, mimeType=mime)
+    text_block = SimpleNamespace(type="text", text=text)
+    return SimpleNamespace(content=[text_block, image_block], isError=False)
+
+
+def _wire(monkeypatch, session):
+    monkeypatch.setattr(
+        "mcp_bridge.stdio_client", lambda params: _fake_stdio_client(session)
+    )
+    monkeypatch.setattr("mcp_bridge.ClientSession", lambda r, w: session)
+
+
+@pytest.mark.asyncio
+async def test_image_result_routed_through_vision_analyzer(monkeypatch):
+    """A configured vision fallback is awaited with data URIs and its analysis
+    is appended — the base64 itself never reaches the model's text."""
+    tool = _fake_tool("browser_take_screenshot", "Take a screenshot")
+    session = _fake_session_with_result([tool], _image_result())
+    _wire(monkeypatch, session)
+
+    analyzer = AsyncMock(return_value="The page shows a red button labeled Submit")
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}}
+    tools, cleanup = await build_mcp_tools(
+        servers, lambda ev: None, analyze_images=analyzer
+    )
+    out = await tools[0].ainvoke({})
+
+    # Analyzer got the image as a data URI.
+    assert analyzer.await_count == 1
+    uri_arg = analyzer.await_args.args[0]
+    assert uri_arg == ["data:image/png;base64,QUJD"]
+    # Analysis appended, clearly labeled; raw base64 NOT dumped into the text.
+    assert "=== IMAGE ANALYSIS (vision sub-agent) ===" in out
+    assert "red button labeled Submit" in out
+    assert "QUJD" not in out
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_image_result_without_vision_model_gets_explicit_note(monkeypatch):
+    """No vision model (analyzer=None): the result says the image was NOT
+    analyzed and points at the setting — never a silent drop."""
+    tool = _fake_tool("browser_take_screenshot", "Take a screenshot")
+    session = _fake_session_with_result([tool], _image_result())
+    _wire(monkeypatch, session)
+
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}}
+    tools, cleanup = await build_mcp_tools(servers, lambda ev: None)
+    out = await tools[0].ainvoke({})
+
+    assert "were NOT analyzed" in out
+    assert "Vision model" in out
+    assert "QUJD" not in out
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_vision_analyzer_failure_does_not_break_tool(monkeypatch):
+    """A crashing vision fallback degrades to the explicit note — the tool
+    result (and the turn) survives."""
+    tool = _fake_tool("browser_take_screenshot", "Take a screenshot")
+    session = _fake_session_with_result([tool], _image_result())
+    _wire(monkeypatch, session)
+
+    async def _boom(uris, qualified):
+        raise RuntimeError("vision provider down")
+
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}}
+    tools, cleanup = await build_mcp_tools(
+        servers, lambda ev: None, analyze_images=_boom
+    )
+    out = await tools[0].ainvoke({})
+
+    assert "vision analysis of the image(s) failed" in out
+    assert "Screenshot saved" in out
+    await cleanup()
+
+
+def test_flatten_tool_result_extracts_images_and_caps_reprs():
+    """_flatten_tool_result returns (text, data_uris): text blocks verbatim,
+    image blocks as data URIs + size markers, unknown blocks repr-capped."""
+    huge_repr = SimpleNamespace(type="audio", foo="x" * 5000)
+    result = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="text", text="hello"),
+            _image_result().content[1],
+            huge_repr,
+        ],
+        isError=False,
+    )
+    summary, uris = mcp_bridge._flatten_tool_result(result, "mcp__p__shot", lambda ev: None)
+    assert "hello" in summary
+    assert "[image #1: image/png" in summary
+    assert uris == ["data:image/png;base64,QUJD"]
+    # Unknown block's repr is capped below the raw 5000-char payload.
+    assert "…" in summary and len(summary) < 8000
+
+
+def test_flatten_tool_result_snapshot_compaction_is_task_aware():
+    """A big snapshot flattened with turn_task keeps the task-relevant line:
+    the turn prompt now reaches compact_browser_snapshot's token scoring."""
+    lines = [f"- generic filler line {i} with some words" for i in range(400)]
+    lines.append('- button "Buy now" [ref=e9] completes the purchase')
+    result = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="\n".join(lines))],
+        isError=False,
+    )
+    summary, uris = mcp_bridge._flatten_tool_result(
+        result,
+        "mcp__playwright__browser_snapshot",
+        lambda ev: None,
+        turn_task="complete the purchase",
+    )
+    assert uris == []
+    assert "ref=e9" in summary
+    assert "truncated" in summary
+
+
+def test_flatten_tool_result_short_snapshot_untouched():
+    result = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="tiny")], isError=False
+    )
+    summary, _ = mcp_bridge._flatten_tool_result(
+        result,
+        "mcp__playwright__browser_snapshot",
+        lambda ev: None,
+        turn_task="anything",
+    )
+    assert summary == "tiny"

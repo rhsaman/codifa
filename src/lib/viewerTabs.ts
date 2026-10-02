@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan'
 
 export interface ViewerTab {
   id: string
@@ -25,6 +25,9 @@ interface ViewerTabsState {
   openGitDiff: () => void
   openTraces: (chatId?: string, tab?: TraceTab) => void
   openInbox: () => void
+  /** Open the implementation-plan document of the active chat (Plan card's
+   *  "View full plan"). Follows the active chat like the trace tab. */
+  openPlan: () => void
   closeViewer: (id: string) => void
   setActiveViewer: (id: string) => void
   /** VSCode-style drag reorder: move the dragged tab to the drop position. */
@@ -44,7 +47,7 @@ function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
     if (!raw) return { tabs: [], activeId: null }
     const parsed = JSON.parse(raw) as { tabs?: ViewerTab[]; activeId?: string | null }
     const valid = Array.isArray(parsed.tabs)
-      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox'))
+      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan'))
       : []
     // Single tab per kind: collapse legacy multiples (e.g. review-turn-xxx,
     // trace-<chatId>) into one tab per kind, keeping the first of each.
@@ -176,6 +179,22 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         id,
         kind: 'inbox',
         title: 'Inbox',
+        createdAt: Date.now(),
+      }
+      const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const next = { tabs, activeId: id }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openPlan: () =>
+    set((s) => {
+      // Single plan tab: it always follows the active chat (PlanPanel reads the
+      // live activeChatId), so reopening only focuses it.
+      const id = 'plan'
+      const entry: ViewerTab = {
+        id,
+        kind: 'plan',
+        title: 'Plan',
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]

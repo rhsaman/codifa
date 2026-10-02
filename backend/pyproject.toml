@@ -52,6 +52,8 @@ exclude = ["tests/pytest-of-*"]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.16.2",
 ]
 
@@ -60,3 +62,6 @@ dev = [
 # uses async test functions; auto mode collects them without decorators.
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Parallel workers + a hard per-test timeout: the suite is big, and one
+# hanging test used to stall the whole serial run indefinitely.
+addopts = "-n auto --timeout=60 --durations=15"

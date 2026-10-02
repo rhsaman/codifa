@@ -8,9 +8,11 @@
 - session_id (sticky routing) lands in x-session-id for openrouter only.
 - Anthropic models on openrouter get a top-level cache_control (automatic
   prompt caching); other models/providers never receive it.
+- Direct Anthropic gets ChatAnthropic cache_control breakpoints via the
+  provider's ``prompt_cache`` flag (cache_headers alone never fired it).
 """
 
-from llm import _extra_headers, build_chat_model
+from llm import _extra_headers, build_chat_model, provider_prompt_cache
 from providers import UA_LADDER
 
 
@@ -165,6 +167,78 @@ def test_build_chat_model_anthropic_cache_disabled_no_cache_control(monkeypatch)
     assert "extra_body" not in captured
 
 
+def test_provider_prompt_cache_flags():
+    """openrouter (cache_headers) and anthropic (prompt_cache) cache; google/
+    ollama/custom do not."""
+    assert provider_prompt_cache("openrouter") is True
+    assert provider_prompt_cache("anthropic") is True
+    for provider in ("google", "ollama", "custom"):
+        assert provider_prompt_cache(provider) is False
+
+
+def test_build_chat_model_direct_anthropic_gets_cache_control(monkeypatch):
+    """Direct Anthropic + cache=True → ChatAnthropic cache_control breakpoints.
+    Regression: ``cache`` used to derive from cache_headers (openrouter-only),
+    so this branch was dead code and every step re-billed the full prefix."""
+    captured = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_anthropic.ChatAnthropic", FakeAnthropic)
+
+    build_chat_model(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        api_key="test-key",
+        cache=True,
+    )
+
+    assert captured.get("cache_control") == {"type": "ephemeral"}
+
+
+def test_build_chat_model_direct_anthropic_cache_disabled(monkeypatch):
+    captured = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_anthropic.ChatAnthropic", FakeAnthropic)
+
+    build_chat_model(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        api_key="test-key",
+        cache=False,
+    )
+
+    assert "cache_control" not in captured
+
+
+def test_build_chat_model_direct_anthropic_no_openrouter_header(monkeypatch):
+    """The x-openrouter-cache header must never reach a direct Anthropic
+    gateway — it is an OpenRouter-specific header."""
+    captured = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_anthropic.ChatAnthropic", FakeAnthropic)
+
+    build_chat_model(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        api_key="test-key",
+        cache=True,
+    )
+
+    headers = captured.get("default_headers") or {}
+    assert "x-openrouter-cache" not in headers
+
+
 def test_build_chat_model_custom_provider_never_gets_cache_control(monkeypatch):
     """Local/custom providers (Qwen on llama.cpp, ollama, …) must stay
     untouched — this guards the Jinja/small-context fixes."""
@@ -196,5 +270,9 @@ if __name__ == "__main__":
     test_build_chat_model_anthropic_gets_cache_control()
     test_build_chat_model_non_anthropic_no_cache_control()
     test_build_chat_model_anthropic_cache_disabled_no_cache_control()
+    test_provider_prompt_cache_flags()
+    test_build_chat_model_direct_anthropic_gets_cache_control()
+    test_build_chat_model_direct_anthropic_cache_disabled()
+    test_build_chat_model_direct_anthropic_no_openrouter_header()
     test_build_chat_model_custom_provider_never_gets_cache_control()
     print("BUILD CHAT MODEL CACHE TESTS PASSED")

@@ -33,6 +33,7 @@
   "scripts": {
     "setup": "uv sync --project backend",
     "dev": "vite",
+    "dev:web": "vite --mode webonly",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",

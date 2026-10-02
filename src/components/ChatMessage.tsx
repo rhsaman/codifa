@@ -39,6 +39,8 @@ import { ReadingMode } from "./ReadingMode";
 import { Mermaid } from "./Mermaid";
 import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
+import { useViewerTabs } from "../lib/viewerTabs";
+import { planDisplay } from "../lib/planDoc";
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
 // (dir toggles, parent re-renders that don't recreate the message, memo
@@ -73,6 +75,118 @@ function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
 function cachedPrepareText(text: string, dir?: "rtl" | "ltr"): string {
   if (!text) return text;
   return computePrepared(`t:${text}`, text, dir);
+}
+
+/** Collapsed implementation-plan card on a Plan-mode reply (kind:"plan_card").
+ *  Shows the plan's title, a faded plain-text preview and a "View full plan"
+ *  pill that opens the docked Plan viewer tab with the whole document. */
+function PlanDocCard({
+  planDoc,
+}: {
+  planDoc: { title: string; body: string };
+}) {
+  const [copied, setCopied] = useState(false);
+  // Follow the app's direction + bidi handling, like the chat bubble does.
+  const appDir = useStore((s) => s.dir);
+  const preview = useMemo(() => {
+    const text = planDoc.body
+      // Code blocks dominate the preview height — collapse them to a marker.
+      .replace(/```[\s\S]*?```/g, "\n[…]\n")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/[*`>]/g, "")
+      // A bare "Plan" first line repeats the card's own label.
+      .replace(/^plan\s*:?[ \t]*\n/i, "")
+      .trim();
+    const clipped = text.length > 600 ? `${text.slice(0, 600).trimEnd()}…` : text;
+    return prepareContent(clipped, appDir);
+  }, [planDoc.body, appDir]);
+  return (
+    <div className="plan-doc-card" dir={appDir}>
+      <div className="plan-doc-head">
+        <span className="plan-doc-icon" aria-hidden="true">
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="8" y="2" width="8" height="4" rx="1" />
+            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+          </svg>
+        </span>
+        <span className="plan-doc-label">Plan</span>
+        {planDoc.title ? (
+          <span className="plan-doc-title">{planDoc.title}</span>
+        ) : null}
+        <span className="plan-doc-spacer" />
+        <button
+          type="button"
+          className={`plan-doc-copy${copied ? " copied" : ""}`}
+          title="Copy plan"
+          aria-label="Copy plan"
+          onClick={() => {
+            void copyToClipboard(planDoc.body);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1200);
+          }}
+        >
+          {copied ? (
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M20 6L9 17l-5-5" />
+            </svg>
+          ) : (
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          )}
+        </button>
+      </div>
+      <div className="plan-doc-preview">{preview}</div>
+      <button
+        type="button"
+        className="plan-doc-open"
+        onClick={() => useViewerTabs.getState().openPlan()}
+      >
+        View full plan
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M5 12h14M13 6l6 6-6 6" />
+        </svg>
+      </button>
+    </div>
+  );
 }
 
 function textFromChildren(node: ReactNode): string {
@@ -898,6 +1012,16 @@ const ALWAYS_VISIBLE_TOOLS = new Set(["edit_file", "write_file"]);
 const USER_COLLAPSE_CHARS = 600;
 const USER_COLLAPSE_LINES = 10;
 
+/** True when text overflows a folded bubble: too many characters or too many
+ *  lines. Shared by user bubbles, queued/steer bubbles and the composer's
+ *  pasted-text cards so every surface folds at the same size. */
+export function isCollapsibleText(text: string): boolean {
+  return (
+    text.length > USER_COLLAPSE_CHARS ||
+    text.split("\n").length > USER_COLLAPSE_LINES
+  );
+}
+
 function UserMessageBubble({
   message,
   onRetry,
@@ -1016,6 +1140,40 @@ function UserMessageBubble({
             {copied ? "Copied" : "Copy"}
           </button>
         </div>
+      )}
+    </>
+  );
+}
+
+/** Foldable body text for queued / steer bubbles: long text clamps to the same
+ *  max-height as a folded user message, with the same Show more toggle. */
+export function QueuedCollapsibleText({
+  id,
+  text,
+}: {
+  id: string;
+  text: string;
+}) {
+  const dir = useStore((s) => s.dir);
+  const [expanded, setExpanded] = useState(false);
+  const isLong = isCollapsibleText(text);
+  const clamped = isLong && !expanded;
+  return (
+    <>
+      <div
+        className={`queued-bubble-text${clamped ? " clamped" : ""}`}
+        dir={detectDir(text)}
+      >
+        {cachedPrepare(id, text, dir) || "(empty)"}
+      </div>
+      {isLong && (
+        <button
+          className="msg-expand queued-expand"
+          onClick={() => setExpanded((e) => !e)}
+          aria-expanded={expanded}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
       )}
     </>
   );
@@ -1483,6 +1641,15 @@ export const ChatMessageView = memo(
   const isSummary = message.role === "system" && !message.modeSwitch;
   const isModeSwitch = message.modeSwitch === true;
 
+  // Plan card display filtering: when a planDoc landed on this message the
+  // plan portion of the streamed reply collapses into the Plan card BELOW the
+  // bubble (see planDisplay). Raw content/segments stay untouched — model
+  // history and "Copy message" keep the full text.
+  const planDoc = !isUser && !isSummary ? message.planDoc : undefined;
+  const display = planDisplay(message);
+  const displayContent = display.content;
+  const displaySegments = display.segments;
+
   // Reading mode: only assistant replies with ≥2 headed sections get the
   // "مطالعه" button — short answers don't need a two-pane viewer.
   const [reading, setReading] = useState(false);
@@ -1601,20 +1768,23 @@ export const ChatMessageView = memo(
       )}
 
       {(isSummary ||
-        message.content ||
-        (message.segments && message.segments.length > 0)) &&
+        displayContent ||
+        (displaySegments && displaySegments.length > 0)) &&
         (isModeSwitch ? (
           <div className="mode-switch-note" dir="ltr">
             {cachedPrepare(message.id, message.content, "ltr")}
           </div>
         ) : isSummary ? (
           <SummaryBlock message={message} />
-        ) : message.segments && message.segments.length > 0 ? (
+        ) : displaySegments && displaySegments.length > 0 ? (
           /* Claude-style interleaved rendering: text slices and tool cards follow
              each other in the exact order the agent produced them, with runs of
              2+ read-only tool calls collapsed into one summary (see renderSegments). */
           <div className="msg-bubble segmented">
-            {renderSegments(message, onRetry)}
+            {renderSegments(
+              { ...message, segments: displaySegments },
+              onRetry,
+            )}
           </div>
         ) : isUser && message.steerPending ? (
           <div className="queued-bubble steer" dir={dir}>
@@ -1654,12 +1824,7 @@ export const ChatMessageView = memo(
                 ×
               </button>
             </div>
-            <div
-              className="queued-bubble-text"
-              dir={detectDir(message.content)}
-            >
-              {cachedPrepare(message.id, message.content, dir)}
-            </div>
+            <QueuedCollapsibleText id={message.id} text={message.content} />
             {message.attachments && message.attachments.length > 0 && (
               <div className="msg-attachments" dir="ltr">
                 {message.attachments.map((a) => (
@@ -1687,11 +1852,13 @@ export const ChatMessageView = memo(
                 remarkPlugins={[remarkGfm]}
                 components={mdComponents}
               >
-                {cachedPrepare(message.id, message.content, dir)}
+                {cachedPrepare(message.id, displayContent, dir)}
               </ReactMarkdown>
             </div>
           </div>
         ))}
+
+      {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
       {!isUser && message.interrupted && (
         <div className="msg-interrupted" dir="auto">

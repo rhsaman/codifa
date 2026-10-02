@@ -110,7 +110,7 @@ console.log('3) ویرایش + ابزار فقط‌خواندنی → دو گر�
   )
 }
 
-console.log('4) هر ردیف گروه ویرایش Undo و Review تکی دارد:')
+console.log('4) هر ردیف گروه ویرایش Review تکی دارد (Undo کلاً حذف شده):')
 {
   const msg = makeMessage(
     [
@@ -122,7 +122,7 @@ console.log('4) هر ردیف گروه ویرایش Undo و Review تکی دار
   const html = renderToString(<ChatMessageView message={msg} />)
   const undoCount = (html.match(/↩ Undo/g) || []).length
   const reviewCount = (html.match(/Review ↗/g) || []).length
-  check('دو دکمه Undo تکی', undoCount === 2, `found ${undoCount}`)
+  check('دکمه Undo حذف شده است', undoCount === 0, `found ${undoCount}`)
   check('دو بج Review تکی', reviewCount === 2, `found ${reviewCount}`)
 }
 

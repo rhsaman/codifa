@@ -184,7 +184,10 @@ def test_run_cleanup_purges_expired_result_cache(monkeypatch):
         c.set("expired", "old", ttl_seconds=1)
         c.set("fresh", "new", ttl_seconds=3600)
         c.close()
-        _time.sleep(1.1)  # let the short TTL lapse
+        # Jump the clock past the short TTL instead of sleeping — keeps the
+        # suite fast and immune to slow-machine flakes.
+        _real_time = _time.time
+        monkeypatch.setattr(_time, "time", lambda: _real_time() + 5)
 
         report = run_cleanup(store=None, root="")
 

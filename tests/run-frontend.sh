@@ -1,378 +1,173 @@
 #!/usr/bin/env bash
-# Frontend sanity tests for the reading-mode / section-chat feature.
+# Frontend sanity tests — parallel runner.
+#
+# Every test is bundled with esbuild (plain-node ones excepted) and executed
+# in its own node process, JOBS at a time. Replaces the old sequential runner
+# that spawned a fresh `npx esbuild` per test one after another.
 # Run: npm run test:frontend
-set -e
+set -u
 cd "$(dirname "$0")/.."
 
-echo "── تست ۱: splitSections (منطق بخشبندی) ──"
-node tests/sections.test.ts
+# Keep the temp dir INSIDE the project: bundles marked --packages=external
+# resolve their imports at runtime, so node must be able to walk up from the
+# bundle to the project's node_modules.
+WORK="$(mktemp -d tests/.fe-run.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
 
-echo ""
-echo "── تست ۲: forkSection (ساخت چت جدید با زمینه بخش) ──"
-npx esbuild tests/forkSection.test.ts --bundle --platform=node --format=esm \
-  --outfile=tests/.tmp-fork.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-fork.mjs
+# Resolve the local esbuild binary directly — much faster than spawning
+# `npx esbuild` (npm exec) once per test.
+if [ -x node_modules/.bin/esbuild ]; then
+  ESBUILD="node_modules/.bin/esbuild"
+else
+  ESBUILD="npx esbuild"
+fi
+export ESBUILD
+WORK_LOG="$WORK"
+export WORK_LOG
 
-echo ""
-echo "── تست ۳: ReadingMode (رندر SSR مودال) ──"
-npx esbuild tests/readingMode.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-rm.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-rm.mjs
+NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+JOBS=$(( NCPU > 8 ? 8 : NCPU ))
 
-echo ""
-echo "── تست ۴: LoadingScreen (حالت خطا و Retry) ──"
-npx esbuild tests/loadingScreen.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-ls.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-ls.mjs
+# ---------------------------------------------------------------------------
+# Worker: bundle one job (id|entry|esbuild-extra-args) and run it.
+# "-" in the flags column = run the entry directly with plain node.
+# ---------------------------------------------------------------------------
+cat > "$WORK/one.sh" <<'ONE'
+#!/usr/bin/env bash
+set -u
+job="$1"
+id="$(cut -d'|' -f1 "$job")"
+entry="$(cut -d'|' -f2 "$job")"
+flags="$(cut -d'|' -f3- "$job")"
+if [ "$flags" = "-" ]; then
+  if node "$entry" >"$WORK_LOG/$id.log" 2>&1; then
+    echo PASS >"$WORK_LOG/$id.status"
+  else
+    echo FAIL >"$WORK_LOG/$id.status"
+  fi
+  exit 0
+fi
+bundle="$WORK_LOG/$id.mjs"
+# shellcheck disable=SC2086 — the flag string must word-split into args
+if ! "$ESBUILD" "$entry" --bundle --platform=node --format=esm $flags \
+     --outfile="$bundle" >"$WORK_LOG/$id.build" 2>&1; then
+  echo FAIL >"$WORK_LOG/$id.status"
+  exit 0
+fi
+if node "$bundle" >"$WORK_LOG/$id.log" 2>&1; then
+  echo PASS >"$WORK_LOG/$id.status"
+else
+  echo FAIL >"$WORK_LOG/$id.status"
+fi
+ONE
+chmod +x "$WORK/one.sh"
 
-echo ""
-echo "── تست ۵: updater-core (انتخاب asset اپدیت در همه OS ها) ──"
-node tests/updater-core.test.ts
+# ---------------------------------------------------------------------------
+# Job list: id|entry|esbuild-extra-args  ("-" = plain node, no bundling)
+# Same tests, same esbuild flags as the previous sequential runner.
+# ---------------------------------------------------------------------------
+JOBS_LIST="$WORK/jobs.txt"
+cat > "$JOBS_LIST" <<'EOF'
+sections|tests/sections.test.ts|-
+forkSection|tests/forkSection.test.ts|--external:electron
+readingMode|tests/readingMode.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+loadingScreen|tests/loadingScreen.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+updater-core|tests/updater-core.test.ts|-
+retry|tests/retry.test.ts|-
+retryStore|tests/retryStore.test.ts|--packages=external --external:electron
+retryStream|tests/retryStream.test.ts|--packages=external --external:electron
+contextWindow|tests/contextWindow.test.ts|--packages=external --external:electron
+persistHeartbeat|tests/persistHeartbeat.test.ts|--packages=external --external:electron
+scrollPos|tests/scrollPos.test.ts|--packages=external --external:electron
+scrollPadding|tests/scrollPadding.test.ts|--packages=external --external:electron
+usageContext|tests/usageContext.test.ts|--packages=external --external:electron
+contextUsed|tests/contextUsed.test.ts|--packages=external --external:electron
+link|tests/link.test.ts|-
+skills|tests/skills.test.ts|--packages=external --external:electron
+skillsCache|tests/skillsCache.test.ts|--packages=external --external:electron
+thinking|tests/thinking.test.ts|-
+ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electron
+transcribe|tests/transcribe.test.ts|--packages=external --external:electron
+voice|tests/voice.test.ts|-
+webResults|tests/webResults.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+engineBadge|tests/engineBadge.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+retryBanner|tests/retryBanner.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+streamChatReconnect|tests/streamChatReconnect.test.ts|--packages=external --external:electron
+thinkingIndicator|tests/thinkingIndicator.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+contextBudget|tests/contextBudget.test.ts|--packages=external --external:electron
+compactChat|tests/compactChat.test.ts|--packages=external --external:electron
+queue-during-compact|tests/queue-during-compact.test.ts|--packages=external --external:electron
+compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electron
+sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron
+usage|tests/usage.test.ts|-
+bidi|tests/bidi.test.ts|-
+diffContrast|tests/diffContrast.test.ts|-
+settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+toolNesting|tests/toolNesting.test.ts|
+codeBlock|tests/codeBlock.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+lineCaption|tests/lineCaption.test.ts|--external:electron
+watchdog|tests/watchdog.test.ts|-
+fetchAndPersist|tests/fetchAndPersist.test.ts|--packages=external --external:electron
+usageChip|tests/usageChip.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+traceNarration|tests/traceNarration.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+planApproval|tests/planApproval.test.ts|--packages=external --external:electron
+toolEditGroup|tests/toolEditGroup.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+settingsNoFetch|tests/settingsNoFetch.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --external:electron
+manualContext|tests/manualContext.test.ts|--packages=external --external:electron
+reviewDiff|tests/reviewDiff.test.ts|--packages=external --external:electron
+reviewStats|src/lib/reviewStats.test.ts|--packages=external --external:electron
+reviewAccordion|tests/reviewAccordion.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+diffSearch|tests/diffSearch.test.ts|-
+uncommitted|tests/uncommitted.test.ts|--packages=external --external:electron
+tts|src/lib/tts.test.ts|--packages=external --external:electron
+schedule|tests/schedule.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+fetchModels|src/components/SettingsModal.fetchModels.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+chatLag|tests/chatLag.test.ts|--packages=external --external:electron
+diffResponsive|tests/diffResponsive.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+chatLoad|tests/chatLoad.test.ts|--packages=external --external:electron
+time|tests/time.test.ts|-
+EOF
 
-echo ""
-echo "── تست ۶: retry logic (تصمیم restart/resume + گاردها) ──"
-node tests/retry.test.ts
+# Split into per-job files (zero-padded so glob order == list order).
+i=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  i=$((i + 1))
+  printf '%s\n' "$line" > "$WORK/$(printf '%03d' "$i").job"
+done < "$JOBS_LIST"
+TOTAL=$i
 
-echo ""
-echo "── تست ۷: retry store (پاک کردن زیر پیام + حفظ partial و tool call ها) ──"
-npx esbuild tests/retryStore.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-retry.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-retry.mjs
+echo "Frontend tests: $TOTAL jobs, running $JOBS at a time..."
+ls "$WORK"/*.job | xargs -P "$JOBS" -n 1 "$WORK/one.sh"
 
+# Report in the original list order; show output only for failures.
 echo ""
-echo "── تست ۷ب: resetStreamForRetry (پاک‌کردن متن نیمه‌کاره روی retry، حفظ tool/user) ──"
-npx esbuild tests/retryStream.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-rs.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-rs.mjs
-
+fail=0
+for f in "$WORK"/*.job; do
+  id="$(cut -d'|' -f1 "$f")"
+  entry="$(cut -d'|' -f2 "$f")"
+  status="$(cat "$WORK/$id.status" 2>/dev/null || echo FAIL)"
+  if [ "$status" = "PASS" ]; then
+    echo "PASS  $id ($entry)"
+  else
+    fail=$((fail + 1))
+    echo "FAIL  $id ($entry)"
+    if [ -s "$WORK/$id.build" ]; then
+      echo "  -- esbuild output --"
+      sed -n '1,25p' "$WORK/$id.build" | sed 's/^/  /'
+    fi
+    if [ -s "$WORK/$id.log" ]; then
+      echo "  -- test output --"
+      tail -n 25 "$WORK/$id.log" | sed 's/^/  /'
+    fi
+  fi
+done
 echo ""
-echo "── تست ۸: context_window (پنجرهٔ مخصوص مدل به بکاند، نه پنجرهٔ کلی پرووایدر) ──"
-npx esbuild tests/contextWindow.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-cw.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-cw.mjs
-
-echo ""
-echo "── تست ۹: persist heartbeat (ذخیرهٔ میان-استریم + تریم toolActivity + flag interrupted) ──"
-npx esbuild tests/persistHeartbeat.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-hb.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-hb.mjs
-
-echo ""
-echo "── تست ۱۰: scrollPos (ذخیرهٔ دقیق موقعیت اسکرول + بدون reorder + ماندن در snapshot) ──"
-npx esbuild tests/scrollPos.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-scroll.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-scroll.mjs
-
-echo ""
-echo "── تست ۱۱: scrollPadding (فاصلهٔ پایین اسکرول برای کامپوزر شناور + کارت‌های ask/perm) ──"
-npx esbuild tests/scrollPadding.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-sp.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-sp.mjs
-
-echo ""
-echo "── تست ۱۲: usageContext (مصرف واقعی هر مدل در ستون کناری + پنجره/درصد کانتکست در نوار بالا) ──"
-npx esbuild tests/usageContext.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-uc.mjs >/dev/null 2>&1
-node tests/.tmp-uc.mjs
-
-echo ""
-echo "── تست ۱۳: contextUsed (نوار بالا: مجموع توکنِ آخرین پیام دستیار = input+output+cache، مثل overflow.ts در opencode) ──"
-npx esbuild tests/contextUsed.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-cu.mjs >/dev/null 2>&1
-node tests/.tmp-cu.mjs
-
-echo ""
-echo "── تست ۱۴: link (هدایت لینک‌های خارجی به مرورگر سیستم) ──"
-node tests/link.test.ts
-
-echo ""
-echo "── تست ۱۵: skills (استخراج منشن @slug اسکیل + سازگاری نام نمایشی) ──"
-npx esbuild tests/skills.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-skills.mjs >/dev/null 2>&1
-node tests/.tmp-skills.mjs
-
-echo ""
-echo "── تست ۱۶: skills cache (رفرش لیست پس از ذخیره/حذف اسکیل) ──"
-npx esbuild tests/skillsCache.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-skillsCache.mjs >/dev/null 2>&1
-node tests/.tmp-skillsCache.mjs
-
-echo ""
-echo "── تست ۱۷: thinking (شناسایی مدل‌های reasoning مثل hy3-free برای فعال‌سازی قرص و reasoning_effort) ──"
-node tests/thinking.test.ts
-
-echo ""
-echo "── تست ۱۸: ensureSidecar (health-check قبل از کش + restart خودکار هنگام مرگ سرور) ──"
-npx esbuild tests/ensureSidecar.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-es.mjs >/dev/null 2>&1
-node tests/.tmp-es.mjs
-
-echo ""
-echo "── تست ۱۹: transcribeAudio (throw کردن detail سرور روی ۵۰۰ + برگرداندن متن روی ۲۰۰) ──"
-npx esbuild tests/transcribe.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-tr.mjs >/dev/null 2>&1
-node tests/.tmp-tr.mjs
-
-echo ""
-echo "── تست ۲۰: voice auto-send (اولین Space/Enter بعد از ترانسکریپشن پیام را می‌فرستد) ──"
-node tests/voice.test.ts
-
-echo ""
-echo "── تست ۲۱: web results (نمایش لینک‌های web_search در UI) ──"
-npx esbuild tests/webResults.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-wr.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-wr.mjs
-
-echo ""
-echo "── تست ۲۱ب: engine badge (badge تم‌محور نام پروایدر وب‌سرچ) ──"
-npx esbuild tests/engineBadge.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-eb.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-eb.mjs
-
-echo ""
-echo "── تست ۲۲: RetryBanner (نوتیفیکیشن خطای یکدست: stalled + rate-limit + gave-up) ──"
-npx esbuild tests/retryBanner.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-rb.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-rb.mjs
-
-echo ""
-echo "── تست ۲۳: streamChat reconnect (لایهٔ خودترمیم روی SSE: خطای اتصال/وسط استریم retry، قطع دستی/HTTP خیر) ──"
-npx esbuild tests/streamChatReconnect.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-sc.mjs >/dev/null 2>&1
-node tests/.tmp-sc.mjs
-
-echo ""
-echo "── تست ۲۴: ThinkingIndicator (۳ نقطه لودینگ به‌جای ✦ + نمایش در فوتر پیام) ──"
-npx esbuild tests/thinkingIndicator.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-ti.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-ti.mjs
-
-echo ""
-echo "── تست ۲۵: contextBudget (سوییچ mode کانتکست را کم نمی‌کند + هیچ پیامی هر turn ریخته نمی‌شود، مثل opencode) ──"
-npx esbuild tests/contextBudget.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-cb.mjs >/dev/null 2>&1
-node tests/.tmp-cb.mjs
-
-echo ""
-echo "── تست ۲۶: compactChat (فولد پیام‌های قدیمی + افزودن خلاصه در انتها + فولد خلاصهٔ قبلی) ──"
-npx esbuild tests/compactChat.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-cc.mjs >/dev/null 2>&1
-node tests/.tmp-cc.mjs
-
-echo ""
-echo "── تست ۲۶ب: queue حین compacting (صف‌شدن پیام + تخلیه بعد از کامپکت با حفظ عکس) ──"
-npx esbuild tests/queue-during-compact.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-qdc.mjs >/dev/null 2>&1
-node tests/.tmp-qdc.mjs
-
-echo ""
-echo "── تست ۲۶ج: compactDedupe (کامپکت وسط استریم: فقط سگمنت درون‌خطی، بدون پیام مستقل تکراری) ──"
-npx esbuild tests/compactDedupe.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-cd.mjs >/dev/null 2>&1
-node tests/.tmp-cd.mjs
-
-echo ""
-echo "── تست ۲۷: Sidebar (هدر یکپارچه: سرچ بالا + دکمهٔ فشرده) ──"
-npx esbuild tests/sidebar.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --alias:src/lib/store=./src/lib/store \
-  --outfile=tests/.tmp-sb.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-sb.mjs
-
-echo ""
-echo "── تست ۲۸: usage key (کلید صریح providerId/model + استخراج مستقیم پرووایدر بدون scoring) ──"
-node tests/usage.test.ts
-
-echo ""
-echo "── تست ۲۹: bidi (ایزوله‌کردن برچسب‌های فارسی/انگلیسی مخلوط در نمودار Mermaid) ──"
-node tests/bidi.test.ts
-
-echo ""
-echo "── تست ۳۰: کنتراست هایلایت diff (متن هایلایت نباید به --on-accent فال‌بک دهد) ──"
-node tests/diffContrast.test.ts
-
-echo ""
-echo "── تست ۳۱: Settings → Storage (Data & maintenance + TTL وب/fetch جداگانه) ──"
-npx esbuild tests/settingsStorage.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-set.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-set.mjs
-
-echo ""
-echo "── تست ۳۲: نست شدن sub-event زیر کارت task (حتی وقتی کارت done است) ──"
-npx esbuild tests/toolNesting.test.ts --bundle --platform=node --format=esm \
-  --outfile=tests/.tmp-tn.mjs >/dev/null 2>&1
-node tests/.tmp-tn.mjs
-
-echo ""
-echo "── تست ۳۳: CodeBlock (شماره‌خط بصری + حفظ هایلایت + واگذاری mermaid) ──"
-npx esbuild tests/codeBlock.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-cb2.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-cb2.mjs
-
-echo ""
-echo "── تست ۳۳ب: lineCaption (خط N: path → lang:START-END، normalize رنج معکوس) ──"
-npx esbuild tests/lineCaption.test.ts --bundle --platform=node --format=esm \
-  --outfile=tests/.tmp-lc.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-lc.mjs
-
-echo ""
-echo "── تست ۳۴: watchdog tool-counter (شمارنده به‌جای boolean برای tool موازی) ──"
-node tests/watchdog.test.ts
-
-echo ""
-echo "── تست ۳۵: fetchAndPersist (skip/merge/persist با fetchFn و store تزریقی) ──"
-npx esbuild tests/fetchAndPersist.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-fp.mjs >/dev/null 2>&1
-node tests/.tmp-fp.mjs
-
-echo ""
-echo "── تست ۳۶: UsageChip (چیپ مجموع توکن در اپ‌بار + پاپ‌اور جزئیات روی hover) ──"
-npx esbuild tests/usageChip.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-ucp.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-ucp.mjs
-
-echo ""
-echo "── تست ۳۷: traceNarration (ردیف روایت جدا بالای ابزار — مثل Claude.ai) ──"
-npx esbuild tests/traceNarration.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-tnr.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-tnr.mjs
-
-echo ""
-echo "── تست ۳۷ب: toolEditGroup (گروه ویرایش جدا برای edit_file/write_file پشت‌سرهم) ──"
-npx esbuild tests/toolEditGroup.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-teg.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-teg.mjs
-
-echo ""
-echo "── تست ۳۹: TodosPanel (پنل شناور: آخرین plan + مهاجرت ذخیره‌سازی + clamp) ──"
-npx esbuild tests/todosPanel.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-tp.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-tp.mjs
-
-echo ""
-echo "── تست ۴۰: ProviderModelSelect (پاپ‌آپ مدل‌ها را فچ نکند — فقط از store) ──"
-npx esbuild tests/providerModelSelect.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-pms.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-pms.mjs
-
-echo ""
-echo "── تست ۴۱: SettingsModal (مودال/پیکر subagent فچ نکند — فقط از store) ──"
-npx esbuild tests/settingsNoFetch.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-snf.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-snf.mjs
-
-echo ""
-echo "── تست ۴۲: modelTest (تست تک‌تک مدل‌ها: testModel + دکمهٔ ⚡) ──"
-npx esbuild tests/modelTest.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --outfile=tests/.tmp-mt.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-mt.mjs
-
-echo ""
-echo "── تست ۴۳: manualContext (کانتکست دستی مدل کاستوم + اولویت بر contextMap زنده) ──"
-npx esbuild tests/manualContext.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-mc.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-mc.mjs
-
-echo ""
-echo "── تست ۴۴: reviewDiff (پارسرهای دیف پنل Review: ردیف‌ها + گپ unmodified lines) ──"
-npx esbuild tests/reviewDiff.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-rd.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-rd.mjs
-
-echo ""
-echo "── تست ۴۵: reviewStats (جمع +N -M سطح ترن برای پنل Review) ──"
-npx esbuild src/lib/reviewStats.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-rvs.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-rvs.mjs
-
-echo ""
-echo "── تست ۴۵ب: reviewAccordion (دیف زیر هر فایل باز می‌شود، نه لیست بالا + دیف پایین) ──"
-npx esbuild tests/reviewAccordion.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-ra.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-ra.mjs
-
-echo ""
-echo "── تست ۴۶ب: diffSearch (هایلایت + فیلتر جست‌وجو داخل دیف) ──"
-node tests/diffSearch.test.ts
-
-echo ""
-echo "── تست ۴۶ج: uncommitted (ترکیب staged/unstaged + untracked) ──"
-npx esbuild tests/uncommitted.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-uc2.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-uc2.mjs
-
-echo ""
-echo "── تست ۴۶: tts single-play (پخش ویس جدید ویس قبلی را قطع می‌کند — بدون پخش همزمان) ──"
-npx esbuild src/lib/tts.test.ts --bundle --platform=node --format=esm \
-  --packages=external --outfile=tests/.tmp-tts.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-tts.mjs
-
-echo ""
-echo "── تست ۴۷: SchedulePanel (زمان‌بندی: formatNextRunFa + runStatusFa) ──"
-npx esbuild tests/schedule.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-sch.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-sch.mjs
-
-echo ""
-echo "── تست ۴۸: SettingsModal Fetch models (دکمه‌ی دستی + حذف فچ خودکار هنگام ویرایش) ──"
-npx esbuild src/components/SettingsModal.fetchModels.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-sfm.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-sfm.mjs
-
-echo ""
-echo "── تست ۴۹: chatLag (رگرسیون لگ: درفت فقط چت ویرایش‌شده را بازسازی می‌کند + توکن استریم چت‌های دیگر را بیدار نمی‌کند) ──"
-npx esbuild tests/chatLag.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-lag.mjs >/dev/null 2>&1
-node tests/.tmp-lag.mjs
-
-echo ""
-echo "── تست ۵۰ب: diffResponsive (دیف واکنش‌گرا: تک‌ستونی در عرض کم، دوستونی در عرض زیاد) ──"
-npx esbuild tests/diffResponsive.ssr.test.tsx --bundle --platform=node --format=esm \
-  --jsx=automatic --packages=external \
-  --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js \
-  --outfile=tests/.tmp-dr.mjs --external:electron >/dev/null 2>&1
-node tests/.tmp-dr.mjs
-
-echo ""
-echo "── تست ۵۰: chatLoad (رگرسیون لود: پاسخ خالی گذرا نباید چت‌های نگه‌داشته‌شده را پاک کند) ──"
-npx esbuild tests/chatLoad.test.ts --bundle --platform=node --format=esm \
-  --packages=external --external:electron --outfile=tests/.tmp-load.mjs >/dev/null 2>&1
-node tests/.tmp-load.mjs
-
-echo ""
-echo "── تست ۵۱: time (ساعت پیام‌ها + سن فشرده سایدبار) ──"
-node tests/time.test.ts
-
-rm -f tests/.tmp-dr.mjs tests/.tmp-tts.mjs tests/.tmp-sfm.mjs tests/.tmp-sch.mjs tests/.tmp-uc2.mjs tests/.tmp-ra.mjs tests/.tmp-rd.mjs tests/.tmp-rvs.mjs tests/.tmp-fork.mjs tests/.tmp-es.mjs tests/.tmp-mc.mjs tests/.tmp-rm.mjs tests/.tmp-ls.mjs tests/.tmp-retry.mjs tests/.tmp-cw.mjs tests/.tmp-hb.mjs tests/.tmp-scroll.mjs tests/.tmp-sp.mjs tests/.tmp-uc.mjs tests/.tmp-cu.mjs tests/.tmp-skills.mjs tests/.tmp-skillsCache.mjs tests/.tmp-tr.mjs tests/.tmp-wr.mjs tests/.tmp-eb.mjs tests/.tmp-rb.mjs tests/.tmp-sc.mjs tests/.tmp-ti.mjs tests/.tmp-cb.mjs tests/.tmp-sb.mjs tests/.tmp-cc.mjs tests/.tmp-cd.mjs tests/.tmp-qdc.mjs tests/.tmp-set.mjs tests/.tmp-rs.mjs tests/.tmp-tn.mjs tests/.tmp-cb2.mjs tests/.tmp-lc.mjs tests/.tmp-fp.mjs tests/.tmp-ucp.mjs tests/.tmp-tnr.mjs tests/.tmp-teg.mjs tests/.tmp-tp.mjs tests/.tmp-pms.mjs tests/.tmp-snf.mjs tests/.tmp-mt.mjs tests/.tmp-lag.mjs tests/.tmp-load.mjs src/lib/.tmp-shortcuts.mjs
-echo ""
-echo "✅ همه تستهای فرانتاند پاس شدند"
+if [ "$fail" -gt 0 ]; then
+  echo "FAILED: $fail of $TOTAL frontend tests"
+  exit 1
+fi
+echo "All $TOTAL frontend tests passed"

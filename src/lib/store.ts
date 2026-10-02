@@ -743,6 +743,10 @@ interface State {
   setChatFullscreen: (v: boolean) => void
   toggleChatFullscreen: () => void
   setChatMode: (id: string, mode: AgentMode) => void
+  /** Silent mode sync for backend-driven switches (plan approval → coder via
+   *  the `mode_changed` event): updates chat.mode WITHOUT the "[Mode switched
+   *  …]" marker message — the backend already narrates the transition. */
+  setChatModeQuiet: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
   setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
@@ -808,7 +812,7 @@ interface State {
    *  chat's ask request is silently lost and its popup never appears. */
   setChatPendingAsk: (
     chatId: string,
-    req: { id: string; question: string; options: string[] } | null,
+    req: { id: string; question: string; options: string[]; style?: string } | null,
   ) => void
   /** Set/clear a chat's pending `permission` request. Same rationale as
    *  `setChatPendingAsk`: stored on the chat so it survives the ChatPanel
@@ -2283,6 +2287,13 @@ export const useStore = create<State>((set, get) => ({
         }
         return { ...c, mode, messages: [...c.messages, modeMsg], updatedAt: Date.now() }
       }),
+    }))
+    get().persist()
+  },
+
+  setChatModeQuiet: (id, mode) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, mode, updatedAt: Date.now() } : c)),
     }))
     get().persist()
   },

@@ -309,7 +309,11 @@ def test_predict_local_serializes_concurrent_calls(monkeypatch):
     assert len(entered) == 1
     second = threading.Thread(target=_run)
     second.start()
-    time.sleep(0.5)
+    # Give the second thread a short bounded chance to (wrongly) enter
+    # predict; serialization with the lock must keep it out.
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline and len(entered) == 1:
+        time.sleep(0.01)
     # نخ دوم نباید وارد predict شده باشد (سریال‌سازی با قفل).
     assert len(entered) == 1
     gate.set()

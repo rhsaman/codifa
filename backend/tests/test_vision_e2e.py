@@ -231,15 +231,15 @@ async def test_vision_respects_total_budget(monkeypatch):
     # stop retrying once it is exhausted (no multi-minute turn lock).
     import asyncio
 
-    monkeypatch.setattr(graph, "_VISION_TOTAL_BUDGET", 2.0)
+    monkeypatch.setattr(graph, "_VISION_TOTAL_BUDGET", 0.3)
 
-    # Each attempt takes ~1s and fails transiently (500); with a 2s budget the
-    # loop must stop after at most 2 attempts, not run all 3.
+    # Each attempt takes ~0.2s and fails transiently (500); with a 0.3s budget
+    # the loop must stop after at most 2 attempts, not run all 3.
     calls = {"n": 0}
 
     async def _slow_fail(*args, **kwargs):
         calls["n"] += 1
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.2)
         raise RuntimeError("500: transient server error")
 
     monkeypatch.setattr(graph, "llm_generate", _slow_fail)
@@ -254,5 +254,5 @@ async def test_vision_respects_total_budget(monkeypatch):
     assert result is None, "vision should give up (None) when the budget is exhausted"
     assert calls["n"] <= 2, \
         "vision should stop retrying once the total budget is exhausted"
-    assert elapsed < 5.0, \
-        f"vision analysis blew past the 2s budget (took {elapsed:.1f}s)"
+    assert elapsed < 3.0, \
+        f"vision analysis blew past the 0.3s budget (took {elapsed:.1f}s)"

@@ -17,7 +17,9 @@ tests share:
 so no test ever touches the user's real data.
 """
 import asyncio
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -31,7 +33,10 @@ for _p in (_HERE, os.path.dirname(_HERE)):
         sys.path.insert(0, _p)
 
 # Hermetic data root BEFORE importing anything that binds state_db.
-os.environ.setdefault("CODER_DATA_DIR", tempfile.mkdtemp(prefix="coder-pytest-data-"))
+_CODER_DATA_DIR = os.environ.setdefault(
+    "CODER_DATA_DIR", tempfile.mkdtemp(prefix="coder-pytest-data-")
+)
+atexit.register(shutil.rmtree, _CODER_DATA_DIR, ignore_errors=True)
 
 from mock_openai import mock, start_server, stop_server
 

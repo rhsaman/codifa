@@ -71,6 +71,7 @@ import {
   uid2,
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
+import { fmtClock } from "../lib/time";
 import { isAtBottom, distanceFromBottom, classifyScrollEvent } from "../lib/scroll";
 import {
   GLOBAL_SHORTCUTS,
@@ -86,12 +87,18 @@ import type {
   McpServerConfig,
   MessageSegment,
   NvimDiagnostic,
+  PastedText,
   SidecarEvent,
   ThinkingLevel,
   ToolActivity,
   SearchResultItem,
 } from "../types";
-import { ChatMessageView, RetryBanner } from "./ChatMessage";
+import {
+  ChatMessageView,
+  QueuedCollapsibleText,
+  RetryBanner,
+  isCollapsibleText,
+} from "./ChatMessage";
 import { MessageImages } from "./MessageImages";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
@@ -100,6 +107,13 @@ import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
+
+// Sentinels the plan-approval card sends as the ask answer — must match
+// graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
+// is never sent, so localization can't break the protocol; free text goes
+// through verbatim as planner revision feedback.
+const PLAN_APPROVE_TOKEN = "__plan_approve__";
+const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 
 const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
   Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
@@ -348,6 +362,11 @@ export function ChatPanel() {
       origPath?: string;
     }>
   >(chat?.draft?.images ?? []);
+  // Long pastes captured as collapsed cards above the input (joined back into
+  // the prompt on send). Scoped to the chat like input/attachments/images.
+  const [pastedBlocks, setPastedBlocks] = useState<PastedText[]>(
+    chat?.draft?.pasted ?? [],
+  );
   const [attLen, setAttLen] = useState(0);
   const prevChatIdRef = useRef(chat?.id ?? "");
   useEffect(() => {
@@ -365,6 +384,7 @@ export function ChatPanel() {
     setInput(chat?.draft?.input ?? "");
     setAttachments(chat?.draft?.attachments ?? []);
     setImages(chat?.draft?.images ?? []);
+    setPastedBlocks(chat?.draft?.pasted ?? []);
     setCmdOpen(null);
     setCmdQuery("");
     setSkillMention(null);
@@ -479,6 +499,9 @@ export function ChatPanel() {
   const askReq = chat?.pendingAsk ?? null;
   const permissionReq = chat?.pendingPermission ?? null;
   const [askFreeText, setAskFreeText] = useState("");
+  // Selected row on the plan-approval card (index into its options; 0 = the
+  // pre-highlighted "Approve" option). Reset whenever a new ask lands.
+  const [planApprovalSel, setPlanApprovalSel] = useState(0);
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
   const setMcpEnabled = useStore((s) => s.setMcpEnabled);
@@ -831,6 +854,7 @@ export function ChatPanel() {
         input,
         attachments,
         images,
+        pasted: pastedBlocks,
       });
     }, 250);
     return () => {
@@ -840,7 +864,7 @@ export function ChatPanel() {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chat?.id, input, attachments, images]);
+  }, [chat?.id, input, attachments, images, pastedBlocks]);
   // NOTE: نقشه‌های context/pricing/reasoning هر پروایدر فقط در استارت‌آپ
   // (App.tsx → fetchAndPersist) و هنگام افزودن/ویرایش پروایدر (SettingsModal)
   // فچ می‌شوند — تعویض پروایدر در چت دیگر فچ اضافه‌ای انجام نمی‌دهد.
@@ -1654,6 +1678,44 @@ export function ChatPanel() {
       return cur;
     };
 
+    // Plan-card seal: when a plan_card lands on this bubble the reply is
+    // finished (the plan collapsed into a card). Whatever streams next belongs
+    // to a NEW logical reply — a planner revision after an edit request, or
+    // the approved Coder implementation — so the next streamed event rotates
+    // to a fresh assistant bubble. The sealed bubble keeps its FULL content
+    // (the model still sees the whole plan in later history); the chat renders
+    // only its preamble + the collapsed Plan card.
+    let bubbleSealed = false;
+    const rotateAssistantBubble = (mode?: string) => {
+      const s = useStore.getState();
+      const prev = s.chats
+        .find((c) => c.id === chat.id)
+        ?.messages.find((m) => m.id === assistantMsg.id);
+      if (prev) {
+        s.updateMessage(prev.id, {
+          streaming: false,
+          statusText: undefined,
+          thinkingActive: false,
+          ...(prev.workingStartedAt
+            ? { turnElapsedMs: Math.max(0, Date.now() - prev.workingStartedAt) }
+            : {}),
+        });
+      }
+      assistantMsg = s.addMessage(chat.id, {
+        role: "assistant",
+        content: "",
+        mode: mode ?? chat.mode,
+        toolActivity: [],
+        segments: [],
+        streaming: true,
+        workingStartedAt: Date.now(),
+      });
+      bubbleSealed = false;
+    };
+    const ensureLiveBubble = () => {
+      if (bubbleSealed) rotateAssistantBubble();
+    };
+
     // Watchdog: if the provider stalls (no SSE event at all), auto-retry ONCE
     // after a short silence instead of hanging. 30s because the backend's own
     // retry loop already covers transient 5xx/throttle blips with a 30s backoff
@@ -1894,6 +1956,7 @@ export function ChatPanel() {
         // Keep the current "isThinking" flag untouched — a text chunk must not
         // cancel the composer glow while the model is still reasoning.
         useStore.getState().setStreaming(true, useStore.getState().isThinking);
+        ensureLiveBubble();
         const prev = findMsg()?.content ?? "";
         const chunk = stripLeadingModeTag(event.content ?? "", prev);
         store.updateMessage(assistantMsg.id, {
@@ -1908,6 +1971,7 @@ export function ChatPanel() {
         // model actually produces reasoning content. Drive the per-message
         // thinking indicator from it (not from mere streaming).
         useStore.getState().setStreaming(true, !!event.active);
+        ensureLiveBubble();
         store.updateMessage(assistantMsg.id, {
           thinkingActive: !!event.active,
           ...(event.active ? { thinkingStartedAt: Date.now() } : {}),
@@ -1973,6 +2037,7 @@ export function ChatPanel() {
       } else if (event.kind === "tool") {
         bumpToolRunning(toolRunning);
         clearTransientRetry();
+        ensureLiveBubble();
         // A create_mcp call this turn means the connector list in the store is
         // stale — flag it so the `done` handler re-fetches from the sidecar.
         if (event.tool === "create_mcp") mcpChanged = true;
@@ -2209,6 +2274,37 @@ export function ChatPanel() {
         });
         // پنل راست هرگز خودکار باز نمی‌شود — حتی با ساخت تودوی تازه؛
         // فقط کاربر با دکمه/میان‌بر آن را باز می‌کند.
+      } else if (event.kind === "plan_card") {
+        // Plan mode finished: collapse the streamed plan into a Plan card.
+        // The bubble is sealed — the next streamed text (planner revision or
+        // the approved Coder run) opens a fresh reply bubble. The message keeps
+        // its full content for model history; ChatMessage renders only the
+        // preamble + card.
+        const body = typeof event.body === "string" ? event.body : "";
+        if (body) {
+          bubbleSealed = true;
+          store.updateMessage(assistantMsg.id, {
+            planDoc: {
+              title: typeof event.title === "string" ? event.title : "",
+              body,
+              preamble:
+                typeof event.preamble === "string" && event.preamble
+                  ? event.preamble
+                  : undefined,
+            },
+            statusText: undefined,
+          });
+        }
+      } else if (event.kind === "mode_changed") {
+        // Backend switched the workflow mode mid-run (plan approval → coder).
+        // Sync chat.mode silently (no "[Mode switched]" marker — the backend
+        // narrates through the stream) and rotate so the implementation gets
+        // its own reply bubble.
+        const mode = typeof event.mode === "string" ? event.mode : "";
+        if (mode) {
+          useStore.getState().setChatModeQuiet(chat.id, mode);
+          rotateAssistantBubble(mode);
+        }
       } else if (event.kind === "permission") {
         useStore.getState().setChatPendingPermission(chat.id, {
           id: event.id ?? "",
@@ -2220,6 +2316,7 @@ export function ChatPanel() {
         });
       } else if (event.kind === "ask") {
         setAskFreeText("");
+        setPlanApprovalSel(0);
         // آیتم‌های options ممکنه از سمت backend غیررشته باشن (object/array/null).
         // همه رو به string coerce می‌کنیم تا prepareContent کرش نکنه.
         const rawOpts: unknown[] = Array.isArray(event.options)
@@ -2241,6 +2338,7 @@ export function ChatPanel() {
           id: event.id ?? "",
           question: typeof event.question === "string" ? event.question : "",
           options,
+          style: typeof event.style === "string" ? event.style : undefined,
         });
       } else if (event.kind === "error") {
         // A backend error while the summarizer was supposedly running means the
@@ -2329,6 +2427,7 @@ export function ChatPanel() {
         // model, retrying). Shown in the Working pill so a slow turn does not
         // look frozen. Cleared on first real text/tool/thinking content.
         lastEventAtMs = Date.now();
+        ensureLiveBubble();
         const label =
           typeof event.content === "string" && event.content.trim()
             ? event.content.trim().slice(0, 120)
@@ -3102,14 +3201,17 @@ export function ChatPanel() {
   );
 
   const submit = () => {
-    const v = input.trim();
-    if (!v && images.length === 0) return;
-    if (v.startsWith("/")) {
+    const typed = input.trim();
+    if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
+    if (typed.startsWith("/")) {
+      // Slash commands act on the typed text only; pasted cards stay pinned to
+      // the composer for the next real message.
       setInput("");
       setCmdOpen(null);
-      void handleCommand(v);
+      void handleCommand(typed);
       return;
     }
+    const v = composePrompt(typed).trim();
     const ss = useStore.getState();
     const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
     if (!chatObj) return;
@@ -3146,6 +3248,7 @@ export function ChatPanel() {
         kind: "queue",
       });
       setInput("");
+      setPastedBlocks([]);
       setCmdOpen(null);
       forceScrollToBottom();
       return;
@@ -3167,6 +3270,7 @@ export function ChatPanel() {
         steerPending: true,
       });
       setInput("");
+      setPastedBlocks([]);
       setCmdOpen(null);
       forceScrollToBottom();
       void steerChat(chatObj.id, userMsg.id, v, atts, imgs, {
@@ -3176,13 +3280,15 @@ export function ChatPanel() {
       return;
     }
     setInput("");
+    setPastedBlocks([]);
     setCmdOpen(null);
     void send(v, atts, imgs, false, undefined, undefined, true);
   };
 
   const queueForLater = () => {
-    const v = input.trim();
-    if (!v && images.length === 0) return;
+    const typed = input.trim();
+    if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
+    const v = composePrompt(typed).trim();
     const ss = useStore.getState();
     const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
     if (!chatObj) return;
@@ -3203,6 +3309,7 @@ export function ChatPanel() {
     });
     forceScrollToBottom();
     setInput("");
+    setPastedBlocks([]);
     setAttachments([]);
     setImages([]);
   };
@@ -3257,6 +3364,44 @@ export function ChatPanel() {
         window.coder.getPathForFile(f) || (f as File & { path?: string }).path;
       if (p) addDroppedFile(p, f.name);
     }
+  };
+
+  // Long pastes never enter the textarea: they become a collapsed card above
+  // the input and are joined back into the prompt on send. Short pastes keep
+  // the native inline behavior; clipboard files fall through to the default
+  // handler.
+  const onComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if ((e.clipboardData.files?.length ?? 0) > 0) return;
+    const text = e.clipboardData.getData("text/plain");
+    if (!text || !isCollapsibleText(text)) return;
+    e.preventDefault();
+    setPastedBlocks((blocks) => [
+      ...blocks,
+      { id: uid2(), text: text.replace(/^\n+|\n+$/g, ""), createdAt: Date.now() },
+    ]);
+  };
+
+  /** Pasted cards + typed input become one prompt: cards first (they sit above
+   *  the input in the composer), then what the user typed. */
+  const composePrompt = (typed: string): string => {
+    const pasted = pastedBlocks.map((b) => b.text).join("\n\n");
+    if (pasted && typed) return `${pasted}\n\n${typed}`;
+    return typed || pasted;
+  };
+
+  // "Edit" on a paste card: fold the text back into the textarea (append after
+  // what's already typed) and drop the card.
+  const editPastedBlock = (id: string) => {
+    const block = pastedBlocks.find((b) => b.id === id);
+    if (!block) return;
+    setPastedBlocks((blocks) => blocks.filter((b) => b.id !== id));
+    setInput((prev) => (prev ? `${prev}\n${block.text}` : block.text));
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.selectionStart = el.selectionEnd = el.value.length;
+    });
   };
 
   const addShot = (shot: { path: string; dataUrl: string }) => {
@@ -4019,9 +4164,7 @@ export function ChatPanel() {
                       ×
                     </button>
                   </div>
-                  <div className="queued-bubble-text" dir={detectDir(q.text)}>
-                    {prepareContent(q.text, dir) || "(empty)"}
-                  </div>
+                  <QueuedCollapsibleText id={q.id} text={q.text} />
                   {q.attachments && q.attachments.length > 0 && (
                     <div className="msg-attachments" dir="ltr">
                       {q.attachments.map((a) => (
@@ -4278,6 +4421,142 @@ export function ChatPanel() {
           </button>
         )}
         {askReq &&
+          askReq.style === "plan_approval" &&
+          (() => {
+            const options = askReq.options;
+            const sel = Math.min(planApprovalSel, Math.max(0, options.length - 1));
+            const clearReq = () =>
+              useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+            // Option 0 is the Approve option (backend guarantees the order);
+            // its answer is the sentinel, never the visible label.
+            const answerOption = (i: number) => {
+              void respondAsk(
+                askReq.id,
+                i === 0 ? PLAN_APPROVE_TOKEN : (options[i] ?? ""),
+              );
+              clearReq();
+            };
+            const submitFreeText = () => {
+              if (!askFreeText.trim()) return;
+              void respondAsk(askReq.id, askFreeText.trim());
+              clearReq();
+            };
+            const splitOption = (opt: string) => {
+              const dash = opt.indexOf("—");
+              if (dash === -1) return [opt, ""];
+              return [opt.slice(0, dash).trim(), opt.slice(dash + 1).trim()];
+            };
+            return (
+              <div
+                className="ask-card plan-approval"
+                dir={dir}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setPlanApprovalSel((cur) => {
+                      const n = options.length;
+                      if (n <= 1) return 0;
+                      return e.key === "ArrowDown" ? (cur + 1) % n : (cur - 1 + n) % n;
+                    });
+                  } else if (e.key === "Enter" || e.key === " ") {
+                    const t = e.target as HTMLElement;
+                    if (t.tagName === "TEXTAREA" || t.tagName === "BUTTON") return;
+                    if (options[sel]) {
+                      e.preventDefault();
+                      answerOption(sel);
+                    }
+                  }
+                }}
+              >
+                <div className="ask-card-head">
+                  <span className="ask-card-icon plan-approval-icon">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                  </span>
+                  <span className="plan-approval-chip">Permission required</span>
+                  <span className="ask-card-title">Implementation plan</span>
+                </div>
+                <div className="plan-approval-options">
+                  {options.map((opt, i) => {
+                    const [head, desc] = splitOption(opt);
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        autoFocus={i === 0}
+                        className={`plan-approval-option${i === sel ? " selected" : ""}`}
+                        onClick={() => answerOption(i)}
+                      >
+                        <span className="plan-approval-num">{i + 1}.</span>
+                        <span className="plan-approval-opt-text">
+                          <span className="plan-approval-opt-head">{head}</span>
+                          {desc ? (
+                            <span className="plan-approval-opt-desc">
+                              {desc.charAt(0).toUpperCase() + desc.slice(1)}
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="plan-approval-freetext">
+                  <textarea
+                    className="ask-input"
+                    rows={2}
+                    dir={dir}
+                    value={askFreeText}
+                    placeholder="Enter your answer…"
+                    onChange={(e) => setAskFreeText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && askFreeText.trim()) {
+                        e.preventDefault();
+                        submitFreeText();
+                      }
+                    }}
+                  />
+                </div>
+                <div className="plan-approval-footer">
+                  <span className="plan-approval-hint">
+                    ⓘ Use Tab / arrow keys to choose, then Enter or Space to select
+                  </span>
+                  <button
+                    type="button"
+                    className="btn plan-approval-dismiss"
+                    onClick={() => {
+                      void respondAsk(askReq.id, PLAN_DISMISS_TOKEN);
+                      clearReq();
+                    }}
+                  >
+                    Dismiss
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ask-send plan-approval-submit"
+                    disabled={!askFreeText.trim() && !options[sel]}
+                    onClick={() => {
+                      if (askFreeText.trim()) submitFreeText();
+                      else if (options[sel]) answerOption(sel);
+                    }}
+                  >
+                    Submit
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        {askReq &&
+          askReq.style !== "plan_approval" &&
           (() => {
             const fa = detectDir(askReq.question) === "rtl";
             return (
@@ -4676,6 +4955,59 @@ export function ChatPanel() {
                 )}
               </div>
             )}
+            {pastedBlocks.length > 0 && (
+              <div className="paste-cards">
+                {pastedBlocks.map((b) => {
+                  const fa = detectDir(b.text) === "rtl";
+                  return (
+                    <div
+                      className="paste-card"
+                      key={b.id}
+                      dir={fa ? "rtl" : "ltr"}
+                    >
+                      <button
+                        className="chip-x paste-card-x"
+                        onClick={() =>
+                          setPastedBlocks((blocks) =>
+                            blocks.filter((x) => x.id !== b.id),
+                          )
+                        }
+                        title="Remove pasted text"
+                      >
+                        ×
+                      </button>
+                      <div className="paste-card-preview">
+                        <span className="paste-card-time">
+                          [{fmtClock(b.createdAt)}]
+                        </span>{" "}
+                        {b.text}
+                      </div>
+                      <div className="paste-card-foot">
+                        <span className="paste-card-badge">Pasted</span>
+                        <button
+                          className="paste-card-edit"
+                          onClick={() => editPastedBlock(b.id)}
+                          title="Edit pasted text"
+                        >
+                          <svg
+                            width="14"
+                            height="14"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {(attachments.length > 0 || images.length > 0) && (
               <div className="attachment-chips" dir="ltr">
                 {attachments.map((a) => {
@@ -4743,6 +5075,7 @@ export function ChatPanel() {
                 value={input}
                 onChange={onInputChange}
                 onKeyDown={onKeyDown}
+                onPaste={onComposerPaste}
               />
               <div className="composer-bottom-row">
                 <div className="composer-left-actions">
@@ -4867,7 +5200,11 @@ export function ChatPanel() {
                 ) : (
                   <button
                     className="send-circle-btn"
-                    disabled={!input.trim() && images.length === 0}
+                    disabled={
+                      !input.trim() &&
+                      pastedBlocks.length === 0 &&
+                      images.length === 0
+                    }
                     onClick={submit}
                     title="Send"
                   >

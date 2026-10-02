@@ -2163,7 +2163,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
             <div className="hint">
               Pick separate models for the built-in tools (web, vision,
-              compact, explore, schedule). Leave a field empty to use the main model (the one chosen in the
+              compact, step, explore, schedule). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
@@ -2188,6 +2188,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               label="Compact model"
               desc="Conversation summariser — compacts chat history to stay under the context window."
               current={subagentModels.compact || ''}
+              onSelect={setSubagentModel}
+            />
+            <ToolModelSelect
+              agent="step"
+              label="Step model"
+              desc="Small fast model for mechanical agent steps (e.g. repeated browser clicks) when a local Laya gate flags them as routine. Empty = the compact model if set, otherwise off."
+              current={subagentModels.step || ''}
               onSelect={setSubagentModel}
             />
             <ToolModelSelect

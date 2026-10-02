@@ -44,6 +44,10 @@ FAST_ROUTE_OPTIONS = (FAST_ROUTE_COMPUTER, FAST_ROUTE_BROWSER, FAST_ROUTE_NORMAL
 COMPUTER_STEP_OPTIONS = ("act_direct", "read_first")
 COMPUTER_MODE_OPTIONS = ("act", "sequence")
 BROWSER_STEP_OPTIONS = ("act_direct", "snapshot_first")
+# مسیریابی گام‌به‌گام حلقهٔ اصلی: گام مکانیکی بعدی (مثل کلیک تکراری مرورگر)
+# می‌تواند روی «مدل گام» کوچک اجرا شود؛ big_model یعنی مدل اصلی. فقط یک
+# برچسب است — هیچ tool callی توسط laya ساخته یا اجرا نمی‌شود.
+STEP_ROUTE_OPTIONS = ("big_model", "cheap_step")
 
 _ROUTER_LOCK = threading.Lock()
 # Only one torch forward at a time: native backends (notably MPS) abort
@@ -1207,6 +1211,63 @@ def browser_next_step(task: str, chat_id: str = "", emit: Any = None) -> str | N
             return None
         value = str(decision.value or "").strip()
         if value in BROWSER_STEP_OPTIONS:
+            return value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def step_route(
+    task: str,
+    last_tools: str = "",
+    last_error: bool = False,
+    step: int = 0,
+    chat_id: str = "",
+    emit: Any = None,
+) -> str | None:
+    """قدم بعدی حلقهٔ اصلی روی «مدل گام» کوچک اجرا شود یا مدل اصلی؟
+
+    ورودی عمداً کوچک است (نه ترنسکریپت چندده‌هزارتوکنی): تسک، نام ابزارهای
+    گام قبل، وضعیت خطا و شماره گام. خروجی یکی از STEP_ROUTE_OPTIONS یا None
+    (واگذاری به مدل اصلی). هر مشورت در trace/رویداد زنده ثبت می‌شود.
+    هرگز استثنا نمی‌دهد تا حلقهٔ اصلی نشکند.
+    """
+    _start = time.monotonic()
+    try:
+        decision = choice(
+            {
+                "task": (task or "")[:500],
+                "last_tools": (last_tools or "")[:120],
+                "last_error": "yes" if last_error else "no",
+                "step": str(int(step or 0)),
+            },
+            list(STEP_ROUTE_OPTIONS),
+            timeout=SECONDARY_PREDICT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 — خطا = ادامه با مدل اصلی
+        return None
+    try:
+        _elapsed = int((time.monotonic() - _start) * 1000)
+    except Exception:  # noqa: BLE001
+        _elapsed = 0
+    try:
+        report_secondary(
+            decision,
+            route=FAST_ROUTE_NORMAL,
+            sub="step_route",
+            chat_id=chat_id,
+            emit=emit,
+            elapsed_ms=_elapsed,
+            prompt=task or "",
+            options=list(STEP_ROUTE_OPTIONS),
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        if not decision.handled:
+            return None
+        value = str(decision.value or "").strip()
+        if value in STEP_ROUTE_OPTIONS:
             return value
     except Exception:  # noqa: BLE001
         return None

@@ -3,6 +3,7 @@ import { useStore } from "../lib/store";
 import { ReviewPanel } from "./ReviewPanel";
 import { TracePanel } from "./TracePanel";
 import { ScheduleInboxDocked } from "./ScheduleInbox";
+import { PlanPanel } from "./PlanPanel";
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
@@ -36,6 +37,17 @@ export function ViewerContent() {
         key={active.id}
         docked
         initialTab={active.traceTab ?? "all"}
+        onClose={() => useViewerTabs.getState().closeViewer(active.id)}
+      />
+    );
+  }
+
+  if (active.kind === "plan") {
+    // Follows the active chat too: the plan document belongs to the chat that
+    // produced it (PlanPanel reads the live activeChatId from the store).
+    return (
+      <PlanPanel
+        key={active.id}
         onClose={() => useViewerTabs.getState().closeViewer(active.id)}
       />
     );

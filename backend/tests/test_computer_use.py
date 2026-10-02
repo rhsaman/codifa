@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import threading
 import types
 from typing import Any, ClassVar
 
@@ -1152,12 +1153,10 @@ def test_capture_screenshot_rejects_selector_and_region(
 
 def test_screenshot_bounded_timeout(monkeypatch: pytest.MonkeyPatch):
     """xa11y.screenshot که hang می‌کند باید بعد از سقف TimeoutError بدهد."""
-    import time as _time
-
     mod = _make_xa11y()
 
     def _hang(**_kw):
-        _time.sleep(60)  # به اندازهٔ sleep کوتاه‌تر از join نیست
+        threading.Event().wait()  # block forever; the bounded call must time out first
 
     mod.screenshot = _hang  # type: ignore[attr-defined]
     monkeypatch.setattr(cu, "xa11y", mod, raising=False)
@@ -1184,12 +1183,10 @@ def test_capture_screenshot_cli_fallback_on_hang(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """hang در xa11y باید به screencapture CLI fallback برود و result برگردد."""
-    import time as _time
-
     mod = _make_xa11y()
 
     def _hang(**_kw):
-        _time.sleep(60)
+        threading.Event().wait()  # block forever; the bounded call must time out first
 
     mod.screenshot = _hang  # type: ignore[attr-defined]
     monkeypatch.setattr(cu, "xa11y", mod, raising=False)
@@ -1274,9 +1271,11 @@ def test_see_outer_capture_timeout(tool_env, monkeypatch: pytest.MonkeyPatch):
     )
 
     def _hang_capture(**_kw):
-        import time as _time
-
-        _time.sleep(60)
+        # Bounded hang: the see tool's wait_for aborts at 0.2s, but
+        # asyncio.run() later joins the to_thread executor — an unbounded
+        # block here would stall that shutdown (and trip the per-test
+        # timeout) instead of exercising the timeout path.
+        threading.Event().wait(timeout=1.0)
 
     monkeypatch.setattr(cu, "capture_screenshot", _hang_capture)
     monkeypatch.setattr(tools_mod, "SEE_CAPTURE_TIMEOUT", 0.2)

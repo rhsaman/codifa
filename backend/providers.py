@@ -130,6 +130,9 @@ class ProviderError(RuntimeError):
 #                        has no /models under /ai/v1).
 #   models_timeout       Optional HTTP timeout for the model-list request.
 #   cache_headers        Set openrouter_cache_* breakpoints (openrouter).
+#   prompt_cache         Native prompt caching via cache_control breakpoints
+#                        (direct Anthropic). Implies caching without the
+#                        OpenRouter-specific headers.
 #   auto_think           Gate auto-thinking level by context size (cloud LLMs).
 #   id_prefix            Provider prefix re-added to bare model ids on the
 #                        request (nvidia, openrouter).
@@ -193,6 +196,9 @@ _PROVIDERS: dict[str, dict] = {
         "models": "openai",
         "base_url": "",
         "editable_base_url": True,
+        # Native prompt caching: ChatAnthropic gets cache_control breakpoints
+        # (llm.build_chat_model). cache_headers stays OpenRouter-specific.
+        "prompt_cache": True,
     },
     "nvidia": {
         "name": "NVIDIA",

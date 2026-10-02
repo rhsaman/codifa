@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>codifa UI test harness</title>
+    <script>
+      // Stub the Electron preload bridge BEFORE any module loads, so the real
+      // renderer code (store, ChatPanel) boots inside a plain browser. Every
+      // unknown coder method resolves to null; callers that destructure the
+      // result fail inside their own catch / unhandled-rejection path and never
+      // break the React tree. This harness tests pure UI behavior — the Python
+      // sidecar is intentionally NOT running, so streaming/backend flows are out
+      // of scope here.
+      (function () {
+        var stub = new Proxy(
+          {},
+          {
+            get: function (target, prop) {
+              if (prop in target) return target[prop];
+              return function () {
+                return Promise.resolve(null);
+              };
+            },
+          },
+        );
+        stub.probeSidecar = function () {
+          return Promise.resolve(true);
+        };
+        window.coder = stub;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/tests/ui/harness.tsx"></script>
+  </body>
+</html>

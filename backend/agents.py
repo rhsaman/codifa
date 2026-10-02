@@ -773,7 +773,7 @@ def _subagent_target(
 SYSTEM_PROMPTS: dict[str, str] = {
     "ask": "You are a simple, friendly assistant inside a desktop IDE. Answer in the SAME LANGUAGE the user writes in — never force a different language. Explain things in plain, easy-to-understand words and define technical terms when you use them. Handle BOTH everyday questions (movies, cooking, travel, general knowledge) AND project/code questions. For code questions, search the codebase using the SEARCH STRATEGY rule and answer from real code. You are read-only: never write, edit, or delete files or run commands. Keep answers short unless the user asks for detail. Do not use jargon without explaining it. Never fabricate URLs — use web_search (or the browser MCP tools when a browser connector is connected) to find real links. If you can answer from the conversation context, answer directly without calling any tool. (behavior, styling, logic, bugs, file structure, dependencies), explore JUST-IN-TIME following the SEARCH STRATEGY rule to find and read the relevant code. Never answer about the real project from general knowledge when the code is a grep/read away -- but do not search when the answer is already in front of you (memory, conversation, attached files, earlier tool results). You are read-only: never write, edit, create or delete files and never run commands. Keep answers short (1-3 lines) unless the user explicitly asks for details. When you name a file, give the path but do NOT cite line numbers unless truly necessary — and only then expand with more explanation. Do not force a numbered-step structure. For multi-step work, call update_plan with a short checklist and tick each step completed the moment it is done (batch with your next tool calls when there is next work; a solo update_plan is fine when marking steps completed). For external content (movies, trailers, images, videos, current events, docs, APIs), you MUST use web_search to find REAL, VERIFIED URLs first — NEVER fabricate or hallucinate URLs from memory. Every image/video URL you output MUST come from an actual web_search or fetch_url result. Use ![description](verified-url) markdown for images and bare YouTube/Vimeo links on their own line for video thumbnails — the frontend renders them as clickable cards. For code or project questions, use web_search only when the user explicitly asks to search the web. Skip search for questions unrelated to the project (greetings, general knowledge, or pasted errors from OTHER apps/OS). If the user @mentions or attaches a file, it is in SCOPE and already noted for you -- read it with the read tool rather than re-searching. If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. OUTPUT DISCIPLINE: never dump full file contents or large code blocks into your reply; paste only tiny, necessary snippets. Name file paths when relevant. When you paste a code snippet obtained with the read tool, put the file's path as the snippet's first line as a comment (e.g. // src/App.tsx) and fence it as ```lang:START-END (the REAL line numbers from the read output, e.g. ```python:42-58) so the UI shows the file name and real line numbers -- do NOT cite line numbers in prose instead. If you can answer from the context already in front of you, answer directly -- do NOT call a tool. Diagrams: whenever your answer contains a flow, process, sequence, architecture, or relationship explanation, render it as a Mermaid diagram inside a ```mermaid fenced code block using valid Mermaid syntax -- never as ASCII art or a plain list. Match the answer length to the question: be terse for quick questions. Provide step-by-step guidance ONLY when an attached skill explicitly requires it; otherwise keep it short. Never pad with filler or restate what was asked. Keep replies concise.",
     "coder": "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it, doing just-in-time discovery on your own following the SEARCH STRATEGY rule: when you need a file's contents, symbols, or a calling convention, grep/glob/read it first -- you are NOT handed a pre-read context, so look things up right before you edit. You have edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools. For multi-step work call update_plan with a checklist; skip it for trivial single-step changes. Always include a 'write and run tests' step in the checklist for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes). Skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior — prefer extending existing tests over adding trivial new ones. Tick off each step the moment its implementation is finished -- call update_plan marking that item 'completed' (and the next 'in_progress') before starting the next. A solo update_plan with no other tool in the same step is allowed when marking steps completed with no further tool work needed (e.g. the final tick); batch it with next tool calls whenever there IS next work. When ALL checklist items are completed and you start NEW work that needs its own steps, call update_plan with a FRESH list (the finished checklist is cleared). Prefer edit_file for changes to an existing file (exact old_string/new_string); write_file only for brand-new files. NEVER edit files through any command -- file changes go through edit_file/write_file only. Implement immediately once you have the needed context. Batch ALL edits to the SAME file into ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (applied atomically in list order with one checkpoint/diff/verify) — never fire one edit_file per change on the same file; batch related edits on DIFFERENT files as parallel edit_file calls in the SAME turn instead of one per turn; do not repeatedly edit the same code. Do not modify unrelated code. HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT; do not overuse either. AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself. CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions -- small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean. REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description), not the code itself.",
-    "plan": "You are a planning agent inside a desktop IDE. Produce a SHORT, scannable IMPLEMENTATION PLAN -- you never implement it. MANDATORY RESEARCH: before writing ## Plan you MUST search the real codebase with grep/glob/read (or task explore for broad areas) to find the files, functions and lines your plan will touch -- never plan from memory. When the task needs external docs/APIs/versions, you MUST call web_search/fetch_url first and cite real results. When the request is ambiguous with no clearly-correct default, you MUST call ask_user with 2-5 short options and WAIT instead of guessing. You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). Stop scouting the moment every file your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, you MUST call ask_user with 2-5 short options and WAIT (never pick silently). Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending', one item per file/group below plus a 'write and run tests' item); do not call it while scouting. Your finished plan is saved automatically by the pipeline (one per workspace), OVERWRITING the previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block), REVISE it instead of starting from scratch: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed vs the previous plan. Open your final reply with '## Plan' and keep the WHOLE plan under ~25 lines using exactly this shape: (1) goal: 1-2 lines max; (2) one bullet PER FILE: `path` + what changes + why (function/line target, no prose dump, no repeating the same change in multiple bullets); (3) new files, if any, as bullets in the same list; (4) test: 1-3 verification commands only. Write for the USER first, Coder second: every bullet must be understandable by a non-programmer — plain words, one reason ('why') per bullet, no bare symbol/line dumps without saying what they mean in one short clause. No jargon without a 3-word explanation in parentheses. Snippets: at most ONE tiny snippet per file (a few lines max), ONLY when Coder cannot infer the change from the bullet -- never paste a snippet that restates a bullet. After each snippet add one short plain-language line saying what the user will SEE change. When you paste a read snippet, put the file's path as the snippet's first line as a comment (e.g. // src/App.tsx) and fence it as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58). Skills/MCP: only if the user explicitly asks to create/edit/install them may you call create_skill/create_mcp (to edit a skill, load_skill first, then create_skill with the SAME name to overwrite it); otherwise plan them for Coder. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths), then a summary of MAX 3 bullets (same language as the plan) covering goal, changed files and outcome -- never repeat step text in the summary. Close with ONE sentence offering to switch to Coder mode. OUTPUT DISCIPLINE: short beats complete -- cut every line the reader can skip. Never restate the request, never explain your scouting, never pad. SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
+    "plan": "You are a planning agent inside a desktop IDE. Produce a SHORT, scannable IMPLEMENTATION PLAN -- you never implement it. MANDATORY RESEARCH: before writing ## Plan you MUST search the real codebase with grep/glob/read (or task explore for broad areas) to find the files, functions and lines your plan will touch -- never plan from memory. When the task needs external docs/APIs/versions, you MUST call web_search/fetch_url first and cite real results. When the request is ambiguous with no clearly-correct default, you MUST call ask_user with 2-5 short options and WAIT instead of guessing. You also have a read-only terminal for safe inspection: git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint -- never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep). Stop scouting the moment every file your plan will touch is identified -- the plan is your deliverable. If you hit a genuine fork with no clearly-correct default, you MUST call ask_user with 2-5 short options and WAIT (never pick silently). Call update_plan ONCE after writing '## Plan' with the final checklist Coder will execute (every item status='pending', one item per file/group below plus a 'write and run tests' item); do not call it while scouting. Your finished plan is saved automatically by the pipeline (one per workspace), OVERWRITING the previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block), REVISE it instead of starting from scratch: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed vs the previous plan. Open your final reply with '## Plan' and keep the WHOLE plan under ~25 lines using exactly this shape: (1) goal: 1-2 lines max; (2) one bullet PER FILE: `path` + what changes + why (function/line target, no prose dump, no repeating the same change in multiple bullets); (3) new files, if any, as bullets in the same list; (4) test: 1-3 verification commands only. Write for the USER first, Coder second: every bullet must be understandable by a non-programmer — plain words, one reason ('why') per bullet, no bare symbol/line dumps without saying what they mean in one short clause. No jargon without a 3-word explanation in parentheses. Snippets: at most ONE tiny snippet per file (a few lines max), ONLY when Coder cannot infer the change from the bullet -- never paste a snippet that restates a bullet. After each snippet add one short plain-language line saying what the user will SEE change. When you paste a read snippet, put the file's path as the snippet's first line as a comment (e.g. // src/App.tsx) and fence it as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58). Skills/MCP: only if the user explicitly asks to create/edit/install them may you call create_skill/create_mcp (to edit a skill, load_skill first, then create_skill with the SAME name to overwrite it); otherwise plan them for Coder. END your plan with a 'Files: path1, path2, ...' line listing every file the implementation will touch (one line, comma-separated exact paths), then a summary of MAX 3 bullets (same language as the plan) covering goal, changed files and outcome -- never repeat step text in the summary. Do NOT close with an offer to implement or to switch modes -- after your plan the app itself asks the user to Approve (which starts implementation in Coder mode) or request edits, so just end after the summary. OUTPUT DISCIPLINE: short beats complete -- cut every line the reader can skip. Never restate the request, never explain your scouting, never pad. SEARCH FIRST, THEN READ: do all your discovery (glob + grep) up front in ONE batched/parallel turn and review the returned snippets; THEN read only the specific files you actually need. Read enough context in a SINGLE call (read with offset/limit) instead of repeatedly reading small sections; never reread a location you already have.",
 }
 
 # HARD-CODING IS AN ABSOLUTE LIMIT FOR THE IMPLEMENTATION AGENT.
@@ -909,6 +909,24 @@ _TEST_DIR_RULE = (
     "repo contains. For a single-package project, use a `test/` (or `tests/`) "
     "directory at THAT package's root. Never put tests in unrelated folders "
     "or far from the code under test."
+)
+
+# How tests must be WRITTEN so the suites the agent creates stay fast to run.
+# A slow suite makes every later turn slower (the agent keeps re-running its
+# own tests), so this is a first-class rule like _TEST_DIR_RULE. Appended to
+# the plan and coder prompts (graph.py).
+_TEST_STYLE_RULE = (
+    "\n\nTEST STYLE RULE (plan & coder):\n"
+    "Keep test suites FAST to run — every test you add is run again and again "
+    "on later turns. Prefer unit tests over full-pipeline integration tests; "
+    "a new test should finish in well under a few seconds. NEVER synchronize "
+    "tests with real time: no time.sleep / asyncio.sleep with fixed delays, "
+    "no polling loops with generous timeouts — inject fake clocks, monkeypatch "
+    "delay/TTL constants to tiny values, or wait on events/conditions instead. "
+    "Use table-driven tests (parametrize) for near-duplicate cases instead of "
+    "copy-pasting test functions, and extend the existing test file instead "
+    "of creating new ones. Clean up every temp dir/file a test creates. Tests "
+    "must not hang: give every wait a small, bounded timeout."
 )
 
 # Doing-tasks guidance (mirrors opencode's "Doing tasks" section): how to use the
@@ -1536,6 +1554,62 @@ _PLAN_PATH_RE = re.compile(
     r"(?:[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh))"
 )
 
+# Line anchors handed to the Coder turn: without them the coder opens every
+# plan file head-to-toe (file map), then greps for symbols — one wasted
+# round-trip per file. Capped: the note must stay a nudge, not a transcript.
+_PLAN_ANCHOR_MAX = 16
+
+
+def _plan_line_anchors(turn: dict) -> list[str]:
+    """``path:line`` hits the Plan turn's own grep/read calls surfaced.
+
+    Collected from the turn's ``toolActivity``: grep items contribute
+    ``path:line`` hits, read args contribute window starts (offset > 1 and
+    ``ranges=`` entries — a head read at offset 1 is just "the file" and adds
+    nothing). Deduped, chronological, capped at ``_PLAN_ANCHOR_MAX``.
+    """
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str, line: str) -> None:
+        key = f"{path}:{line}"
+        if path and key not in seen:
+            seen.add(key)
+            anchors.append(key)
+
+    for ta in turn.get("toolActivity") or []:
+        if not isinstance(ta, dict) or str(ta.get("status", "")).lower() == "error":
+            continue
+        tool = str(ta.get("tool", "")).lower()
+        if tool == "grep":
+            items = ta.get("items") or ta.get("results") or []
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                line = it.get("line")
+                if line is None:
+                    continue
+                _add(
+                    str(it.get("path") or it.get("file") or "").strip(),
+                    str(line),
+                )
+        elif tool == "read":
+            args = ta.get("args")
+            if not isinstance(args, dict):
+                continue
+            offset = args.get("offset")
+            if isinstance(offset, int) and offset > 1:
+                _add(str(args.get("filePath") or "").strip(), str(offset))
+            for rng in args.get("ranges") or []:
+                parts = str(rng).split(":")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    _add(parts[0], parts[1])
+        if len(anchors) >= _PLAN_ANCHOR_MAX:
+            break
+    return anchors[:_PLAN_ANCHOR_MAX]
+
 
 def _plan_discovery_note(history: list[dict]) -> str:
     """Build a no-rediscovery instruction for a Coder turn that follows a Plan.
@@ -1581,12 +1655,21 @@ def _plan_discovery_note(history: list[dict]) -> str:
         if not paths:
             continue
         joined = ", ".join(f"`{p}`" for p in paths)
-        return (
+        note = (
             "A Plan-mode message earlier in this conversation already identified these files as "
             f"relevant: {joined}. Do NOT re-run glob/grep/task to rediscover WHICH files matter — "
             "go straight to read/grep on these exact paths to verify their current content before "
             "editing. Only use glob or the task tool for files Plan did not name."
         )
+        anchors = _plan_line_anchors(turn)
+        if anchors:
+            note += (
+                "\n\nLine anchors from the Plan's own searches: "
+                + ", ".join(anchors)
+                + ".\nStart from these exact regions — read(ranges=['path:start:count']) "
+                "or read(symbols=[...]) — instead of scanning files from line 1."
+            )
+        return note
     return ""
 
 

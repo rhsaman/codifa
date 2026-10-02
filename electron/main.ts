@@ -377,10 +377,80 @@ function watchNvimFile(): void {
   }, 5000)
 }
 
+// --- window state persistence -----------------------------------------------
+// Restore the window at the position/size it had when it was last closed.
+// Stored in a tiny JSON file under userData (NOT the data root): window bounds
+// must be readable synchronously at window creation, before the sidecar (which
+// owns the data root) may even be up.
+
+interface WindowState {
+  width: number
+  height: number
+  x?: number
+  y?: number
+  maximized?: boolean
+}
+
+const DEFAULT_WINDOW_WIDTH = 1440
+const DEFAULT_WINDOW_HEIGHT = 900
+// How much of the window must land on a real display for the saved rect to be
+// usable — a monitor unplugged since last run must not strand it off-screen.
+const MIN_VISIBLE_PX = 100
+
+function windowStateFile(): string {
+  return path.join(app.getPath('userData'), 'window-state.json')
+}
+
+function loadWindowState(): WindowState | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(windowStateFile(), 'utf-8')) as WindowState
+    if (typeof raw.width !== 'number' || typeof raw.height !== 'number') return null
+    return raw
+  } catch {
+    /* missing or corrupt — first run / reset to defaults */
+    return null
+  }
+}
+
+/** True when the saved rect is at least partly on one of the connected
+ *  displays' work areas. A state without x/y (never positioned yet) is fine:
+ *  Electron centers the window when no position is given. */
+function windowRectIsVisible(state: WindowState): boolean {
+  if (typeof state.x !== 'number' || typeof state.y !== 'number') return true
+  return screen.getAllDisplays().some((d) => {
+    const b = d.workArea
+    return (
+      state.x! + MIN_VISIBLE_PX > b.x &&
+      state.y! + MIN_VISIBLE_PX > b.y &&
+      state.x! < b.x + b.width - MIN_VISIBLE_PX &&
+      state.y! < b.y + b.height - MIN_VISIBLE_PX
+    )
+  })
+}
+
+function saveWindowState(win: BrowserWindow): void {
+  if (!win || win.isDestroyed() || win.isMinimized()) return
+  // getNormalBounds() (not getBounds()): while maximized/fullscreen, getBounds
+  // reports the enlarged frame, and restoring that maximized rect as a normal
+  // window would grow it permanently. Normal bounds are the pre-maximize frame.
+  const state: WindowState = { ...win.getNormalBounds(), maximized: win.isMaximized() }
+  try {
+    fs.writeFileSync(windowStateFile(), JSON.stringify(state), 'utf-8')
+  } catch {
+    /* non-fatal — next run just gets defaults */
+  }
+}
+
 function createWindow(): void {
+  const saved = loadWindowState()
+  // Apply the saved size/position only when it still fits a connected display.
+  const restore = saved !== null && windowRectIsVisible(saved)
   mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
+    width: restore ? saved!.width : DEFAULT_WINDOW_WIDTH,
+    height: restore ? saved!.height : DEFAULT_WINDOW_HEIGHT,
+    ...(restore && typeof saved!.x === 'number' && typeof saved!.y === 'number'
+      ? { x: saved!.x, y: saved!.y }
+      : {}),
     minWidth: 980,
     minHeight: 640,
     title: 'Codifa',
@@ -395,11 +465,30 @@ function createWindow(): void {
     },
   })
 
+  // Maximize AFTER creation: the constructor has no maximize option, and the
+  // saved bounds are the pre-maximize frame (see saveWindowState).
+  if (restore && saved!.maximized) mainWindow.maximize()
+
   if (isDev && process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
   } else {
     mainWindow.loadFile(path.join(app.getAppPath(), 'dist', 'index.html'))
   }
+
+  // Dragging/resizing fires dozens of move/resize events per second; debounce
+  // the disk write. The final write happens synchronously on 'close', so a
+  // quick move-and-quit never loses the last position.
+  let saveTimer: ReturnType<typeof setTimeout> | null = null
+  const scheduleSave = (): void => {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = setTimeout(() => saveWindowState(mainWindow!), 500)
+  }
+  mainWindow.on('resize', scheduleSave)
+  mainWindow.on('move', scheduleSave)
+  mainWindow.on('close', () => {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveWindowState(mainWindow!)
+  })
 
   mainWindow.on('closed', () => {
     mainWindow = null

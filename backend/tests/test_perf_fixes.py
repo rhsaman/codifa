@@ -116,11 +116,15 @@ def test_computer_kept_via_history_intent():
 
 
 def test_checkpoint_throttled_and_forced():
+    # Default is save-every-step now (disconnects lost tool results), so pin
+    # the throttle MECHANISM with a wider window instead of the default.
     graph._checkpoint_state.pop("thr", None)
+    orig_n = graph._CHECKPOINT_EVERY_N_STEPS
+    graph._CHECKPOINT_EVERY_N_STEPS = 3
     msgs = [HumanMessage(content="hi")]
     calls = 0
 
-    async def _fake_save(thread_id, messages):
+    async def _fake_save(thread_id, messages, mode="", plan=None):
         nonlocal calls
         calls += 1
 
@@ -129,11 +133,12 @@ def test_checkpoint_throttled_and_forced():
     try:
         asyncio.run(graph._save_turn_checkpoint_valid("thr", msgs))
         asyncio.run(graph._save_turn_checkpoint_valid("thr", msgs))
-        assert calls <= 1, f"expected throttled saves, got {calls}"
+        assert calls == 1, f"expected throttled saves, got {calls}"
         asyncio.run(graph._save_turn_checkpoint_valid("thr", msgs, force=True))
-        assert calls >= 1
+        assert calls == 2
     finally:
         graph._save_turn_checkpoint = orig
+        graph._CHECKPOINT_EVERY_N_STEPS = orig_n
         graph._checkpoint_state.pop("thr", None)
 
 

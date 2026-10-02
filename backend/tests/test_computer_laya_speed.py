@@ -196,3 +196,33 @@ def test_secondary_decisions_emit_trace_and_live(monkeypatch):
     rows = trace_store.list_traces("chat-speed", "laya")
     assert any("computer_next_step" in str(r.get("detail", {}).get("sub", "")) for r in rows)
     trace_store.clear("chat-speed")
+
+
+def test_step_route_gate_routes_and_falls_back(monkeypatch):
+    monkeypatch.setattr(
+        laya_decide, "choice",
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _handled("cheap_step"),
+    )
+    assert laya_decide.step_route("click the next page", "browser_navigate", False, 3) == "cheap_step"
+    assert laya_decide.step_route("think hard", "read", False, 5) == "cheap_step"
+    # واگذاری امن: abstain یعنی None و گام روی مدل اصلی اجرا می‌شود.
+    monkeypatch.setattr(
+        laya_decide, "choice",
+        lambda state, options, threshold=0.65, provider_id="", timeout=4.0, **_kw: _abstained(),
+    )
+    assert laya_decide.step_route("x") is None
+
+
+def test_step_route_uses_short_timeout_and_small_state(monkeypatch):
+    seen: dict = {}
+
+    def _fake_choice(state, options, threshold=0.65, provider_id="", timeout=4.0):
+        seen["timeout"] = timeout
+        seen["state_keys"] = sorted(state.keys())
+        return _handled(options[0])
+
+    monkeypatch.setattr(laya_decide, "choice", _fake_choice)
+    laya_decide.step_route("click ok", "browser_navigate", True, 2)
+    assert seen["timeout"] == laya_decide.SECONDARY_PREDICT_TIMEOUT
+    # The gate state is deliberately small — no transcript ever reaches it.
+    assert seen["state_keys"] == ["last_error", "last_tools", "step", "task"]

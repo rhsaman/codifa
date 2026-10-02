@@ -1143,8 +1143,20 @@ async def chat_model_settings(
         "max_tokens": max_tokens,
         "thinking_level": thinking_level,
         "parallel_calls": bool(_provider_meta(provider).get("parallel_calls")),
-        "cache": bool(_provider_meta(provider).get("cache_headers")),
+        "cache": provider_prompt_cache(provider),
     }
+
+
+def provider_prompt_cache(provider: str) -> bool:
+    """Whether this provider supports prompt caching at all.
+
+    ``cache_headers`` (OpenRouter) implies it; ``prompt_cache`` marks native
+    cache_control providers (direct Anthropic). Deriving ``cache`` from
+    ``cache_headers`` alone left build_chat_model's Anthropic branch dead —
+    every step of a direct-Anthropic chat re-billed the full prefix.
+    """
+    meta = _provider_meta(provider)
+    return bool(meta.get("prompt_cache") or meta.get("cache_headers"))
 
 
 # ---------------------------------------------------------------------------

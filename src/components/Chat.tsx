@@ -22,6 +22,7 @@ import {
   bumpToolRunning,
   dropToolRunning,
   isToolRunning,
+  shouldShowWaitingForModel,
 } from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
 import { bareModelId } from "../lib/provider-fetch";
@@ -1655,6 +1656,7 @@ export function ChatPanel() {
     // Turn-local watchdog clock/counters: locals (not shared refs) so two
     // chats streaming at once never overwrite each other's timers.
     let lastEventAtMs = Date.now();
+    let lastContentAtMs = Date.now();
     let stalledSinceMs: number | null = null;
     let watchdogAborted = false;
     let watchdogAutoRetried = 0;
@@ -1747,20 +1749,28 @@ export function ChatPanel() {
       // work, not stalled on the provider.
       const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
       const elapsed = Date.now() - lastEventAtMs;
-      // Early feedback (not a retry): after 25s of total silence the Working
-      // pill explains the wait instead of looking frozen. Cleared by any real
-      // event via statusText: undefined in text/tool/thinking handlers.
-      if (elapsed > 25_000 && elapsed <= limit) {
+      const contentElapsed = Date.now() - lastContentAtMs;
+      // Early feedback (not a retry): after 25s without REAL content the Working
+      // pill explains the wait instead of looking frozen. Keepalives refresh
+      // only the socket clock, so long silent thinking still shows the pill.
+      // Cleared by any real event via statusText: undefined in handlers.
+      // Include elapsed seconds and refresh it so a multi-minute model wait
+      // visibly ticks instead of looking stuck.
+      if (shouldShowWaitingForModel(contentElapsed, elapsed, limit)) {
         const cur = useStore
           .getState()
           .chats.find((c) => c.id === chat.id)
           ?.messages.find((m) => m.id === assistantMsg.id);
-        if (cur && !cur.statusText && !cur.retry) {
-          useStore.getState().updateMessage(assistantMsg.id, {
-            statusText: isToolRunning(toolRunning)
-              ? "tool running"
-              : "waiting for model",
-          });
+        if (cur && !cur.retry) {
+          const secs = Math.floor(contentElapsed / 1000);
+          const label = isToolRunning(toolRunning)
+            ? `tool running (${secs}s)`
+            : `waiting for model (${secs}s)`;
+          if (cur.statusText !== label) {
+            useStore.getState().updateMessage(assistantMsg.id, {
+              statusText: label,
+            });
+          }
         }
         return;
       }
@@ -1913,15 +1923,17 @@ export function ChatPanel() {
 
     const handleEvent = (event: SidecarEvent) => {
       // Heartbeat from the backend: it arrives every ~15s while the agent is
-      // legitimately silent (running a tool / thinking). Refresh the watchdog
+      // legitimately silent (running a tool / thinking). Refresh only the socket
       // clock so a long-running tool is NOT mistaken for a dead connection —
       // only a socket that stops emitting keepalives (a genuinely dead one)
-      // should trip the stall watchdog. No UI work needed.
+      // should trip the stall watchdog. The content clock is untouched so the
+      // "waiting for model" pill still appears during long silent thinking.
       if (event.kind === "keepalive") {
         lastEventAtMs = Date.now();
         return;
       }
       lastEventAtMs = Date.now();
+      lastContentAtMs = Date.now();
       // Live reads: `useStore.getState()` on every event. A snapshot captured
       // once per turn goes stale after the first updateMessage, and the second
       // event then overwrites the first one's segments (steer segment lost when
@@ -2427,6 +2439,7 @@ export function ChatPanel() {
         // model, retrying). Shown in the Working pill so a slow turn does not
         // look frozen. Cleared on first real text/tool/thinking content.
         lastEventAtMs = Date.now();
+        lastContentAtMs = Date.now();
         ensureLiveBubble();
         const label =
           typeof event.content === "string" && event.content.trim()
@@ -2515,6 +2528,7 @@ export function ChatPanel() {
         // Refresh the watchdog clock so a queued stall-timer callback can't
         // re-set it after the stream closes.
         lastEventAtMs = Date.now();
+        lastContentAtMs = Date.now();
         resolveStuckCards();
         useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined });
         // Backend reports steers it discarded without injecting
@@ -2667,6 +2681,7 @@ export function ChatPanel() {
       // its 180s check can't fire and re-show "Still waiting" after the stream
       // has actually ended.
       lastEventAtMs = Date.now();
+      lastContentAtMs = Date.now();
       stalledSinceMs = null;
       toolRunning.current = 0;
       setBusyFor(chat.id, false);
@@ -4450,6 +4465,8 @@ export function ChatPanel() {
               <div
                 className="ask-card plan-approval"
                 dir="ltr"
+                role="dialog"
+                aria-label="Implementation plan approval"
                 onKeyDown={(e) => {
                   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                     e.preventDefault();
@@ -4469,7 +4486,7 @@ export function ChatPanel() {
                 }}
               >
                 <div className="ask-card-head plan-approval-head">
-                  <span className="ask-card-icon plan-approval-icon">
+                  <span className="ask-card-icon plan-approval-icon" aria-hidden="true">
                     <svg
                       width="14"
                       height="14"
@@ -4494,10 +4511,11 @@ export function ChatPanel() {
                         key={i}
                         type="button"
                         autoFocus={i === 0}
+                        aria-pressed={i === sel}
                         className={`plan-approval-option${i === sel ? " selected" : ""}`}
                         onClick={() => answerOption(i)}
                       >
-                        <span className="plan-approval-num" dir="ltr">{i + 1}</span>
+                        <span className="plan-approval-num" dir="ltr" aria-hidden="true">{i + 1}</span>
                         <span className="plan-approval-opt-text" dir="auto">
                           <span className="plan-approval-opt-head">{head}</span>
                           {desc ? (
@@ -4515,8 +4533,11 @@ export function ChatPanel() {
                     className="ask-input"
                     rows={2}
                     dir="auto"
+                    spellCheck={false}
+                    autoComplete="off"
+                    aria-label="Plan feedback"
                     value={askFreeText}
-                    placeholder="Enter your answer…"
+                    placeholder="Suggest changes or type feedback…"
                     onChange={(e) => setAskFreeText(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey && askFreeText.trim()) {
@@ -4528,7 +4549,7 @@ export function ChatPanel() {
                 </div>
                 <div className="plan-approval-footer">
                   <span className="plan-approval-hint">
-                    Tab / ↑↓ to choose · Enter to select
+                    <kbd>Tab</kbd> / <kbd>↑↓</kbd> to choose · <kbd>Enter</kbd> to select
                   </span>
                   <span className="plan-approval-actions">
                   <button

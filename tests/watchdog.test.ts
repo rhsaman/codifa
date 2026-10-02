@@ -3,7 +3,7 @@
 // longer leash until ALL of them finish — a single early result must not clear
 // the "a tool is still running" flag.
 // Run: node tests/watchdog.test.ts
-import { bumpToolRunning, dropToolRunning, isToolRunning } from '../src/lib/watchdog.ts'
+import { bumpToolRunning, contentElapsedMs, dropToolRunning, isToolRunning, shouldShowWaitingForModel } from '../src/lib/watchdog.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -54,6 +54,14 @@ console.log('3) bump/drop تکی رفتار boolean قدیم را حفظ می‌
   check('بعد از ۱ bump → true', isToolRunning(ref) === true)
   dropToolRunning(ref)
   check('بعد از ۱ drop → false', isToolRunning(ref) === false)
+}
+
+console.log('4) کیپ‌الایو سوکت را تازه نگه می‌دارد ولی محتوا کهنه است -> pill نمایش داده شود:')
+{
+  check('محتوای 60 ثانیه‌ای با سوکت زنده -> نمایش', shouldShowWaitingForModel(60_000, 5_000, 300_000) === true)
+  check('محتوای تازه -> عدم نمایش', shouldShowWaitingForModel(5_000, 5_000, 300_000) === false)
+  check('سوکت مرده -> pill زودهنگام نه (مسیر stall)', shouldShowWaitingForModel(400_000, 400_000, 300_000) === false)
+  check('contentElapsedMs تفریق خالص است', contentElapsedMs(1000, 26000) === 25000)
 }
 
 if (failed > 0) {

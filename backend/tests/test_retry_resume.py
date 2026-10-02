@@ -465,3 +465,23 @@ async def test_client_abort_stops_cleanly_no_error_event(mock_server, workspace)
         pass
     assert not any(e.get("kind") == "error" for e in remaining), \
         f"client abort must not emit an error event, got: {remaining}"
+
+
+def test_retry_delay_zero_base_returns_zero(monkeypatch):
+    """When base is 0 (tests), delay is 0 with no jitter."""
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 0)
+    assert agents._retry_delay(1) == 0.0
+    assert agents._retry_delay(5) == 0.0
+
+
+def test_retry_delay_capped_and_grows(monkeypatch):
+    """Backoff grows exponentially but never exceeds the cap."""
+    monkeypatch.setattr(agents, "_RETRY_BASE_SECONDS", 30)
+    monkeypatch.setattr(agents, "_RETRY_MAX_DELAY_SECONDS", 60)
+    d1 = agents._retry_delay(1)
+    d2 = agents._retry_delay(2)
+    d10 = agents._retry_delay(10)
+    assert 30.0 <= d1 <= 31.5
+    assert 55.0 <= d2 <= 66.0
+    assert d10 <= 61.5
+    assert d2 >= d1

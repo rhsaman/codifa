@@ -18,6 +18,64 @@ function chatTitle(chat: { title: string; messages: Array<{ role: string; conten
   return firstUser ? firstUser.content.slice(0, 32) || "New chat" : "New chat";
 }
 
+export type TabPendingPermission = { action: string; path?: string } | null;
+export type TabPendingAsk = { question: string } | null;
+
+/** Ask/permission badges for a chat tab — the same shield/? language as the
+ *  sidebar's `.chat-item-pending` spans, so a chat waiting on the user stays
+ *  visible while the sidebar is closed. Pure props so it stays SSR-testable. */
+export function TabPendingBadges({
+  pendingPermission,
+  pendingAsk,
+}: {
+  pendingPermission: TabPendingPermission;
+  pendingAsk: TabPendingAsk;
+}) {
+  return (
+    <>
+      {pendingPermission && (
+        <span
+          className="chat-item-pending permission"
+          title={`Needs permission: ${pendingPermission.action}${pendingPermission.path ? ` · ${pendingPermission.path}` : ""}`}
+        >
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+        </span>
+      )}
+      {pendingAsk && (
+        <span className="chat-item-pending ask" title={`Asks you: ${pendingAsk.question}`}>
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="10" />
+            <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
+            <path d="M12 17h.01" />
+          </svg>
+        </span>
+      )}
+    </>
+  );
+}
+
 /** VSCode-style tab bar for the left editor group (chats only). Tabs can be
  *  reordered with drag & drop; order persists across restarts. */
 export function ChatTabBar() {
@@ -34,7 +92,13 @@ export function ChatTabBar() {
         .slice(0, 1)
         .map((m) => ({ role: m.role, content: m.content })),
       streaming: c.messages.some((m) => m.streaming || m.retry?.reconnecting === true),
-      pending: Boolean(c.pendingAsk || c.pendingPermission),
+      pendingPermission: c.pendingPermission
+        ? {
+            action: c.pendingPermission.action,
+            path: c.pendingPermission.path,
+          }
+        : null,
+      pendingAsk: c.pendingAsk ? { question: c.pendingAsk.question } : null,
       unread: s.unreadChats.includes(c.id),
     })),
   );
@@ -106,13 +170,21 @@ export function ChatTabBar() {
             }}
             onDragEnd={clearDrag}
           >
-            {meta?.streaming ? (
+            {meta?.streaming && (
               <span className="editor-tab-dot busy" aria-hidden="true" />
-            ) : meta?.pending ? (
-              <span className="editor-tab-dot pending" aria-hidden="true" />
-            ) : meta?.unread ? (
-              <span className="editor-tab-dot unread" aria-hidden="true" />
-            ) : null}
+            )}
+            {(meta?.pendingPermission || meta?.pendingAsk) && (
+              <TabPendingBadges
+                pendingPermission={meta.pendingPermission}
+                pendingAsk={meta.pendingAsk}
+              />
+            )}
+            {!meta?.streaming &&
+              !meta?.pendingPermission &&
+              !meta?.pendingAsk &&
+              meta?.unread && (
+                <span className="editor-tab-dot unread" aria-hidden="true" />
+              )}
             <span className="editor-tab-label" dir={dir}>{title}</span>
             <button
               type="button"

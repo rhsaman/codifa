@@ -268,7 +268,19 @@ async def _save_turn_checkpoint_valid(
         ToolMessage(content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"])
         for tc in _unanswered_tool_calls(msgs, pending_calls)
     ]
+    _ckpt_t0 = time.monotonic()
     await _save_turn_checkpoint(thread_id, list(msgs) + patch, mode=mode, plan=plan)
+    try:
+        _ckpt_dt = time.monotonic() - _ckpt_t0
+        if _ckpt_dt > 1.0:
+            logger.warning(
+                "[ckpt-timing] thread=%s slow_save=%.1fs msgs=%d",
+                str(thread_id or "")[:16],
+                _ckpt_dt,
+                len(msgs),
+            )
+    except Exception:  # noqa: BLE001, S110 — timing never breaks save
+        pass
 
 
 def _sanitize_trailing_tool_calls(msgs: list) -> list:
@@ -520,6 +532,58 @@ async def clear_chat_resume_checkpoint(chat_id: str) -> None:
             _resume_checkpoint_path()
         ) as saver:
             await saver.adelete_thread(_resume_thread_id({"chat_id": chat_id}))
+
+
+_checkpoint_janitor_state: dict[str, float] = {}
+
+
+async def _checkpoint_janitor() -> None:
+    """Log resume-checkpoint DB size and VACUUM when bloated.
+
+    The DB grows per chat thread and deleted threads leave free pages behind.
+    A 50MB+ file slows every per-step save, so vacuum at most once per hour.
+    Best-effort only; failures never break the turn.
+    """
+    try:
+        now = time.monotonic()
+        last = float(_checkpoint_janitor_state.get("last", 0.0))
+        if now - last < 3600:
+            return
+        _checkpoint_janitor_state["last"] = now
+        path = _resume_checkpoint_path()
+
+        def _size_mb() -> float:
+            try:
+                return os.path.getsize(path) / (1024 * 1024)
+            except OSError:
+                return 0.0
+
+        size = await asyncio.to_thread(_size_mb)
+        if size <= 0:
+            return
+        logger.info("[ckpt-janitor] resume_db=%.1fMB path=%s", size, path)
+        if size < 50:
+            return
+
+        def _vacuum() -> None:
+            import sqlite3
+
+            con = sqlite3.connect(path, timeout=10)
+            try:
+                con.execute("VACUUM")
+                con.commit()
+            finally:
+                con.close()
+
+        await asyncio.to_thread(_vacuum)
+        new_size = await asyncio.to_thread(_size_mb)
+        logger.warning(
+            "[ckpt-janitor] vacuumed resume_db %.1fMB -> %.1fMB",
+            size,
+            new_size,
+        )
+    except Exception:  # noqa: BLE001, S110 — janitor never breaks the turn
+        pass
 
 
 async def prune_stale_resume_checkpoints(ttl_hours: int = 24) -> None:
@@ -1401,6 +1465,12 @@ def _is_transient_error(exc: Exception) -> bool:
     on OpenRouter) return 400 for transient conditions that resolve on retry.
     Other 4xx errors are NOT transient — retrying them just wastes time and hides
     a real config problem."""
+    msg = str(exc).lower()
+    # Gateway/proxy hiccup without a usable status code (e.g. OpenRouter
+    # "upstream connection lost") is transient even when the wrapper carries
+    # a non-retryable status — the connection itself dropped, not the request.
+    if "upstream" in msg or "connection lost" in msg:
+        return True
     status = getattr(exc, "status_code", None)
     if status is None:
         resp = getattr(exc, "response", None)
@@ -1408,7 +1478,6 @@ def _is_transient_error(exc: Exception) -> bool:
     if status is not None:
         return status in (400, 429) or 500 <= status < 600
     # No status code -> treat as a network/timeout blip (retryable).
-    msg = str(exc).lower()
     return any(
         k in msg
         for k in ("timeout", "timed out", "connection", "reset", "eof", "broken pipe")
@@ -1498,7 +1567,26 @@ def _rank_candidates(
 # those turns get zero skill tokens: no rank call, no auto-inlined body, no
 # catalog. Explicitly @mentioned skills are unaffected (their bodies inline
 # via manual_names regardless of this gate).
+# Task-signal gate: decides whether this turn could plausibly need skills,
+# tools or code symbols. English code/file tokens match the generic pattern
+# below; Persian action verbs and task nouns need their own pattern because
+# short Persian requests (e.g. "ui ...") carry no 3+ letter English token
+# and would otherwise look like chit-chat with zero skill tokens.
 _TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}"
+
+# General Persian task hints: action verbs (build/fix/add/review/guide and
+# family) plus common task nouns across skills. UI is only one row of the
+# fallback table below, so this pattern stays generic on purpose. Greetings
+# (salam/chetori/merci/...) are deliberately absent and stay chit-chat.
+_FA_TASK_SIGNAL_RE = (
+    r"بساز|بسازم|بسازد|بسازید|بسازی|ساخته|اصلاح|اضافه|افزود|بررسی|راهنما|"
+    r"بهتر|بهبود|بهینه|طراحی|بازنویسی|ترجمه|خلاصه|تست|آزمون|دیباگ|اشکال|"
+    r"رفع|رفکتور|تحلیل|بنویس|بخوان|اجرا|نصب|منتشر|دیپلوی|کامیت|پوش|مرج|"
+    r"شاخه|سئو|لندینگ|داشبورد|فرم|لاگین|کامپوننت|استایل|یوآی|رابط|ظاهر|"
+    r"دیزاین|فونت|رنگ|چیدمان|ریسپانسیو|انیمیشن|فرانت|بک‌اند|سرور|دیتابیس|"
+    r"داکیومنت|مستند|برنامه|اپلیکیشن|سایت|صفحه|پروژه|فایل|کد|گزارش|نمودار|"
+    r"\bui\b|\bux\b"
+)
 
 
 def _turn_task_signal(prompt: str, history: list) -> bool:
@@ -1509,6 +1597,8 @@ def _turn_task_signal(prompt: str, history: list) -> bool:
             return True
         if p and re.search(_TASK_SIGNAL_RE, p):
             return True
+        if p and re.search(_FA_TASK_SIGNAL_RE, p, re.IGNORECASE):
+            return True
         for turn in history or []:
             if not isinstance(turn, dict):
                 continue
@@ -1516,6 +1606,8 @@ def _turn_task_signal(prompt: str, history: list) -> bool:
                 return True
             c = turn.get("content") or ""
             if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
+                return True
+            if isinstance(c, str) and re.search(_FA_TASK_SIGNAL_RE, c, re.IGNORECASE):
                 return True
         return False
     except Exception:  # noqa: BLE001 — doubt keeps the skills path
@@ -1526,8 +1618,11 @@ def _turn_task_signal(prompt: str, history: list) -> bool:
 # body the model never asked for. Embedding scores on chit-chat are flat
 # noise (everything ~0.7): without a margin any greeting "matches" some
 # skill and injects a ~10k-char body. A genuine match stands out instead.
-_SKILL_AUTO_CONF = 0.7
-_SKILL_AUTO_MARGIN = 0.05
+# Persian short prompts score in the same compressed band, so the bar is
+# slightly lower for a real Persian task match but the margin still blocks
+# greetings.
+_SKILL_AUTO_CONF = 0.65
+_SKILL_AUTO_MARGIN = 0.04
 
 
 def _skill_auto_pick(ranked: list[dict], task_signal: bool) -> str:
@@ -1575,6 +1670,8 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
             return False
         if re.search(_TASK_SIGNAL_RE, p):
             return False
+        if re.search(_FA_TASK_SIGNAL_RE, p, re.IGNORECASE):
+            return False
         for turn in history or []:
             if not isinstance(turn, dict):
                 continue
@@ -1583,9 +1680,64 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
             c = turn.get("content") or ""
             if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
                 return False
+            if isinstance(c, str) and re.search(_FA_TASK_SIGNAL_RE, c, re.IGNORECASE):
+                return False
         return True
     except Exception:  # noqa: BLE001 — doubt sends the map
         return False
+
+
+# Extensible Persian keyword -> skill hint table. Each row pairs Persian
+# task keywords (matched against the user prompt) with English hints matched
+# against a skill's name + description. UI is only one row here on purpose:
+# add new rows to cover more skills without touching the matching logic.
+# Hints are lowercase substrings, not exact names, so renames keep working.
+_FA_SKILL_FALLBACK: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("یوآی", "رابط", "ظاهر", "دیزاین", "استایل", "چیدمان", "ریسپانسیو",
+      "انیمیشن", "فونت", "رنگ", "کامپوننت", "لندینگ", "داشبورد", "فرم",
+      "لاگین", "فرانت", "ui", "ux", "design", "frontend", "landing",
+      "component", "style"),
+     ("ui", "ux", "design", "frontend", "landing", "component", "style")),
+    (("ترجمه", "translate"), ("translat",)),
+    (("خلاصه",), ("summar",)),
+    (("تست", "آزمون"), ("test",)),
+    (("سئو",), ("seo",)),
+    (("کامیت", "پوش", "مرج", "شاخه", "گیت"), ("git",)),
+    (("دیباگ", "اشکال", "رفع", "رفکتور", "بازنویسی", "بنویس", "کد",
+      "برنامه", "اپلیکیشن", "سرور", "دیتابیس", "بک‌اند"),
+     ("code", "debug", "refactor", "review")),
+    (("داکیومنت", "مستند", "راهنما", "آموزش", "یادگیری"),
+     ("learn", "docs", "explain", "research")),
+    (("پروژه", "برنامه‌ریزی", "پلن"), ("plan",)),
+    (("نوشتن", "متن", "گزارش"), ("writing", "report", "article")),
+)
+
+
+def _fa_skill_fallback(prompt: str, skills: list[dict]) -> str:
+    """Best-effort Persian keyword fallback: skill name or "".
+
+    Used when embedding ranks are flat/empty on a Persian task turn.
+    Matches when a Persian keyword hits the prompt AND an English hint hits
+    the skill's name/description. First table row wins; never raises.
+    """
+    try:
+        p = (prompt or "").strip().lower()
+        if not p or not skills:
+            return ""
+        for fa_keys, en_hints in _FA_SKILL_FALLBACK:
+            if not any(k.lower() in p for k in fa_keys):
+                continue
+            for s in skills:
+                if not isinstance(s, dict):
+                    continue
+                hay = f"{s.get('name') or ''} {s.get('description') or ''}".lower()
+                if any(h in hay for h in en_hints):
+                    name = str(s.get("name") or "").strip()
+                    if name:
+                        return name
+        return ""
+    except Exception:  # noqa: BLE001 — fallback never breaks the turn
+        return ""
 
 
 def _build_skills_section(
@@ -2226,8 +2378,20 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _skill_ranked = []
     # Auto-inline: only a strong, distinctive top-1 on a task-signal turn —
     # never noise (flat ~0.7 scores on greetings must not load bodies).
+    # Persian fallback: embedding ranks on short Persian prompts are flat
+    # too, so a keyword fallback covers what laya cannot distinguish.
     try:
         _auto_name = _skill_auto_pick(_skill_ranked, _task_signal)
+        if not _auto_name and _task_signal and prompt:
+            try:
+                _fb_pool = (
+                    _rank_skills
+                    if "_rank_skills" in locals() and _rank_skills
+                    else (_agents._load_skills(root) or [])
+                )
+            except Exception:  # noqa: BLE001 — fallback loads best-effort
+                _fb_pool = []
+            _auto_name = _fa_skill_fallback(prompt, _fb_pool)
         if _auto_name:
             _picked = list(skills or [])
             if not any(str(n or "").strip().casefold() == _auto_name.casefold() for n in _picked):
@@ -3997,6 +4161,10 @@ async def _run_mode_turn(
         _compact_count = 0
         while steps < MAX_STEPS:
             steps += 1
+            _step_t0 = time.monotonic()
+            _llm_wait_s = 0.0
+            _tool_exec_s = 0.0
+            _ckpt_save_s = 0.0
             # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
             # final allowed step, force the model to stop tool-calling and
             # summarize instead of burning more reads/searches. Without this the
@@ -4166,7 +4334,11 @@ async def _run_mode_turn(
                 request_messages = project_tool_results(_stable_tool_order(msgs))
                 if _transient_msgs:
                     request_messages = [*request_messages, *_transient_msgs]
+                _llm_t0 = time.monotonic()
+                _first_chunk_t = 0.0
                 async for chunk in bound.astream(request_messages):
+                    if not _first_chunk_t:
+                        _first_chunk_t = time.monotonic() - _llm_t0
                     # Check for cancellation at each chunk so the Stop button
                     # properly interrupts the provider call (llama.cpp / local servers).
                     if asyncio.current_task().cancelled():
@@ -4292,7 +4464,16 @@ async def _run_mode_turn(
                                 # doubling every tool row in the UI.
                                 pass
                 if ai is None:
+                    _llm_wait_s = time.monotonic() - _llm_t0
+                    logger.warning(
+                        "[step-timing] chat=%s step=%s llm_empty=%.1fs model=%s",
+                        str(chat_id or "")[:8],
+                        steps,
+                        _llm_wait_s,
+                        model_id,
+                    )
                     break
+                _llm_wait_s = time.monotonic() - _llm_t0
                 # Safety net for models that only reason and emit no text: make
                 # sure the thinking window is always closed at stream end.
                 if _thinking_active:
@@ -4762,6 +4943,7 @@ async def _run_mode_turn(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
                 )
 
+            _tool_t0 = time.monotonic()
             _results = await execute_readonly_calls(_exec_calls, _run_readonly, query=state.get("request") or "")
             _expanded = _expand_merged(_results)
             for tc, result in zip(_parallel, _expanded):
@@ -4883,12 +5065,30 @@ async def _run_mode_turn(
             # This step completed (the model responded and any tool calls
             # ran) — record the progress so the retry wrapper can tell a
             # mid-work failure from an idle one.
+            _tool_exec_s = time.monotonic() - _tool_t0
+            _step_total_s = time.monotonic() - _step_t0
+            try:
+                _first_s = _first_chunk_t if _first_chunk_t else _llm_wait_s
+                logger.info(
+                    "[step-timing] chat=%s step=%s total=%.1fs llm=%.1fs first_chunk=%.1fs tools=%.1fs n_tools=%s model=%s",
+                    str(chat_id or "")[:8],
+                    steps,
+                    _step_total_s,
+                    _llm_wait_s,
+                    _first_s,
+                    _tool_exec_s,
+                    len(_pending or []),
+                    model_id,
+                )
+            except Exception:  # noqa: BLE001, S110 — timing never breaks turn
+                pass
             _step_progress += 1
         return reply
 
     # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
-    # network blip) is retried up to the budget, 30s apart, so the turn keeps
-    # trying to continue instead of giving up on the first blip. Hard failures
+    # network blip) is retried up to the budget with capped exponential backoff
+    # (see agents._retry_delay), so the turn keeps trying to continue instead
+    # of giving up on the first blip. Hard failures
     # (bad request / quota exhausted / auth) surface as a fatal error event
     # without burning the retry budget.
     # Subagent runs use mode "explore"/"general"; the main turn uses
@@ -5044,9 +5244,12 @@ async def _run_mode_turn(
                         with contextlib.suppress(Exception):
                             run_flags["error"] = True
                     break
-                delay = _agents._RETRY_BASE_SECONDS
+                try:
+                    delay = _agents._retry_delay(attempt)
+                except Exception:  # noqa: BLE001 — backoff never breaks retry
+                    delay = 30.0
                 if not isinstance(delay, (int, float)) or delay < 0:
-                    delay = 30
+                    delay = 30.0
                 # Log each retry to codifa.log so a "no network entries in
                 # DevTools" symptom is diagnosable. The retry's provider
                 # HTTP request fires from the sidecar subprocess, which the
@@ -5120,6 +5323,8 @@ async def _run_mode_turn(
     _rf = run_flags or {}
     if not (_rf.get("error") or _rf.get("hard_error") or _rf.get("cancelled")):
         await _clear_turn_checkpoint(_resume_thread)
+        with contextlib.suppress(Exception):
+            await _checkpoint_janitor()
     return reply
 
 

@@ -1409,10 +1409,42 @@ def _is_quota_exhausted(exc: BaseException) -> bool:
 
 # Unified retry budget for ALL transient provider failures (throttle 429, 5xx,
 # timeout, network blip). The graph's retry loop uses these so any transient
-# failure recovers automatically — up to this many attempts, 30s apart — instead
-# of giving up on the first blip. Configurable so tests can zero the backoff.
+# failure recovers automatically instead of giving up on the first blip.
+# Configurable so tests can zero the backoff. Base can be overridden via
+# CODIFA_RETRY_BASE_SECONDS env for slow/free-tier providers.
 _RETRY_MAX_ATTEMPTS = 10
-_RETRY_BASE_SECONDS = 30
+_RETRY_BASE_SECONDS = int(os.environ.get("CODIFA_RETRY_BASE_SECONDS", "30"))
+_RETRY_MAX_DELAY_SECONDS = int(os.environ.get("CODIFA_RETRY_MAX_DELAY", "60"))
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff delay before retry attempt N (1-based).
+
+    Exponential starting at _RETRY_BASE_SECONDS, capped at
+    _RETRY_MAX_DELAY_SECONDS, with small jitter so concurrent turns do not
+    retry in lockstep. Returns 0 immediately when base is 0 (tests).
+    """
+    try:
+        base = float(_RETRY_BASE_SECONDS)
+    except (TypeError, ValueError):
+        base = 30.0
+    if base <= 0:
+        return 0.0
+    try:
+        cap = float(_RETRY_MAX_DELAY_SECONDS)
+    except (TypeError, ValueError):
+        cap = 60.0
+    if cap <= 0:
+        cap = 60.0
+    delay = base * (2.0 ** max(0, int(attempt) - 1))
+    delay = min(delay, cap)
+    try:
+        import random as _random
+
+        delay = delay + _random.uniform(0.0, min(1.0, delay * 0.1))
+    except Exception:  # noqa: BLE001, S110 — jitter never breaks retry
+        pass
+    return float(delay)
 
 
 def _is_image_rejection(exc: BaseException) -> bool:

@@ -15,3 +15,18 @@ export function dropToolRunning(ref: { current: number }): void {
 export function isToolRunning(ref: { current: number }): boolean {
   return ref.current > 0
 }
+
+/** Time since last real content (non-keepalive event). Pure for testing. */
+export function contentElapsedMs(lastContentAtMs: number, nowMs: number): number {
+  return nowMs - lastContentAtMs
+}
+
+/** Show "waiting for model" pill when content is stale but socket is alive. */
+export function shouldShowWaitingForModel(
+  contentElapsed: number,
+  socketElapsed: number,
+  limitMs: number,
+  earlyMs = 25_000,
+): boolean {
+  return contentElapsed > earlyMs && socketElapsed <= limitMs
+}

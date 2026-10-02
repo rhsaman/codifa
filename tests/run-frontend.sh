@@ -128,6 +128,7 @@ fetchModels|src/components/SettingsModal.fetchModels.test.tsx|--jsx=automatic --
 chatLag|tests/chatLag.test.ts|--packages=external --external:electron
 diffResponsive|tests/diffResponsive.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chatLoad|tests/chatLoad.test.ts|--packages=external --external:electron
+chatTabAskBadge|tests/chatTabAskBadge.test.ts|--jsx=automatic --packages=external --external:electron
 time|tests/time.test.ts|-
 EOF
 

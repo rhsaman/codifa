@@ -4380,7 +4380,7 @@ def make_tool_callbacks(
         )
 
     async def load_skill_tool(name: str) -> str:
-        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
+        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. This also applies to short non-English requests: e.g. Persian 'یوآی رو بهتر کن' means an interface-design task, so load the matching UI/design skill FIRST and follow its instructions. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
         emit({"kind": "tool", "tool": "load_skill", "args": {"name": name}})
         wanted = (name or "").strip().casefold()
         skills: list[dict] = []
@@ -6481,7 +6481,25 @@ When you need to read several files, read multiple independent files in parallel
                     break
                 if _attempts < _SUBAGENT_MAX_ATTEMPTS:
                     # Transient blip on the explore model: retry on the same
-                    # model before falling back to the main model.
+                    # model before falling back to the main model. Emit a
+                    # retry event so the UI shows a banner instead of silence
+                    # during the backoff sleep.
+                    try:
+                        emit(
+                            {
+                                "kind": "retry",
+                                "attempt": _attempts,
+                                "max_attempts": _SUBAGENT_MAX_ATTEMPTS,
+                                "delay": _SUBAGENT_RETRY_SECONDS,
+                                "reason": f"explore model ({_model_name}) failed: {exc} — retrying",
+                                "model": _model_name,
+                                "agent": "explore",
+                                "fallback": False,
+                                "reconnecting": True,
+                            }
+                        )
+                    except Exception:  # noqa: BLE001, S110 — cosmetic only
+                        pass
                     await asyncio.sleep(_SUBAGENT_RETRY_SECONDS)
                     continue
                 # Retries on the explore model are exhausted: fall back to the

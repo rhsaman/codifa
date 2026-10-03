@@ -53,6 +53,7 @@ import {
   gitAutoCommit,
   gitDiscard,
   type CompactResult,
+  type CompactUsage,
   type StreamParams,
 } from "../lib/api";
 
@@ -76,6 +77,8 @@ import {
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
 import { fmtClock } from "../lib/time";
 import { isAtBottom, distanceFromBottom, classifyScrollEvent } from "../lib/scroll";
+import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget } from "../lib/messageWindow";
+import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
 import {
   GLOBAL_SHORTCUTS,
   PREFIX_LABEL,
@@ -110,6 +113,7 @@ import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
+import { useViewerTabs } from "../lib/viewerTabs";
 
 // Sentinels the plan-approval card sends as the ask answer — must match
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
@@ -394,7 +398,22 @@ export function ChatPanel() {
     setSkillMentionQuery("");
     setAskFreeText("");
     setNvimMentioned(false);
-    setMsgLimit(MSG_PAGE);
+    // Render enough history so the saved anchor exists on the first paint of
+    // the incoming chat (same buffer logic as the mount initializer). Without
+    // this, switching back to a scrolled-up chat renders only the last
+    // MSG_PAGE messages and the restore lands on a wrong viewport.
+    const incomingPos = chat?.scrollPos;
+    if (incomingPos && !incomingPos.atBottom && chat) {
+      const anchorIdx = chat.messages.findIndex((m) => m.id === incomingPos.id);
+      if (anchorIdx >= 0) {
+        const start = Math.max(0, anchorIdx - SCROLL_RESTORE_BUFFER);
+        setMsgLimit(Math.max(MSG_PAGE, chat.messages.length - start));
+      } else {
+        setMsgLimit(MSG_PAGE);
+      }
+    } else {
+      setMsgLimit(MSG_PAGE);
+    }
     stickToBottom.current = !chat?.scrollPos || chat.scrollPos.atBottom;
     restoredRef.current = false;
     // The restore layout effect below must re-run for the NEW chat with the
@@ -407,6 +426,25 @@ export function ChatPanel() {
     restoreTargetRef.current = null;
     lastScrollPosRef.current = null;
     chatIdRef.current = id;
+    // Gated switch-to-paint probe (zero cost unless enabled): set
+    // localStorage 'coder:perf' to '1', reload, switch chats, and read the
+    // [perf] line in devtools console. Measures effect → second paint frame,
+    // i.e. mount + layout of the incoming transcript window.
+    if (
+      typeof window !== "undefined" &&
+      window.localStorage?.getItem("coder:perf") === "1"
+    ) {
+      const t0 = performance.now();
+      const switchedId = id;
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          // eslint-disable-next-line no-console
+          console.debug(
+            `[perf] chat switch → paint: ${(performance.now() - t0).toFixed(0)}ms (${switchedId})`,
+          );
+        }),
+      );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id]);
   // Per-chat isolation: the panel stays mounted across switches (no
@@ -990,9 +1028,24 @@ export function ChatPanel() {
     setShowJump((prev) => (prev === jumpVisible ? prev : jumpVisible));
     // Reached the top with older messages still unrendered → load the previous
     // page. Anchored via prependAnchorRef so the viewport doesn't jump.
-    if (el.scrollTop < 40 && chat && chat.messages.length > msgLimit) {
-      prependAnchorRef.current = el.scrollHeight;
-      setMsgLimit((n) => Math.min(chat.messages.length, n + MSG_PAGE));
+    // NOTE: the trigger is the actually-rendered window (count page AND char
+    // budget), never `messages.length > msgLimit`: msgLimit is intentionally
+    // uncapped (it also scales the char budget), so that comparison goes
+    // permanently false on giant chats and scroll-loading silently dies.
+    if (el.scrollTop < 200 && chat) {
+      const visible = visibleChatMessages(chat.messages);
+      const budget = windowBudget(msgLimit, MSG_PAGE);
+      const rendered = sliceWindow(
+        visible,
+        msgLimit,
+        budget,
+        MSG_WINDOW_MIN_KEEP,
+        (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+      ).length;
+      if (rendered < visible.length) {
+        prependAnchorRef.current = el.scrollHeight;
+        setMsgLimit((n) => n + MSG_PAGE);
+      }
     }
     // Remember where the user left this chat — in-memory only. The cheap parts
     // run here; the DOM scan is deferred to the next frame (and flushed
@@ -1161,6 +1214,18 @@ export function ChatPanel() {
       const msgs = chat?.messages ?? [];
       const idx = msgs.findIndex((m) => m.id === pos.id);
       if (idx >= 0) {
+        // The anchor still exists but is paged out (not rendered) → expand the
+        // rendered window to include it (plus a buffer above for exact
+        // positioning) and retry after render, instead of landing on a nearby
+        // message or the bottom (wrong viewport after a chat switch).
+        if (!rendered.has(pos.id)) {
+          const start = Math.max(0, idx - SCROLL_RESTORE_BUFFER);
+          const needed = Math.max(MSG_PAGE, msgs.length - start);
+          if (needed > msgLimit) {
+            setMsgLimit(needed);
+            return;
+          }
+        }
         // The anchor still exists but isn't rendered → nearest rendered message above it.
         for (let i = idx - 1; i >= 0; i--) {
           if (rendered.has(msgs[i].id)) {
@@ -1207,20 +1272,32 @@ export function ChatPanel() {
     // `coder:flush-ui` event (dispatched by the store right before any flush,
     // including the main process's `flush-persist` on quit — which runs before
     // this component's beforeunload handler) so the snapshot always includes it.
-    const pushToStore = () => {
+    const pushToStore = (isChatSwitch = false) => {
       if (!cid) return;
-      // If a scroll happened in the last frame, its rAF capture may not have
-      // fired yet — compute synchronously so the position saved is exactly the
-      // viewport at flush time (cheap: no-op unless a capture is pending).
-      syncScrollPos();
+      if (isChatSwitch) {
+        // Chat switch: the DOM already shows the INCOMING chat, so a synchronous
+        // recompute would capture the new transcript and save it under the OLD
+        // chat id (wrong viewport on return). Keep the last position captured
+        // while the old chat was mounted; just drop the pending frame.
+        if (scrollRafRef.current != null) {
+          cancelAnimationFrame(scrollRafRef.current);
+          scrollRafRef.current = null;
+        }
+      } else {
+        // If a scroll happened in the last frame, its rAF capture may not have
+        // fired yet — compute synchronously so the position saved is exactly the
+        // viewport at flush time (cheap: no-op unless a capture is pending).
+        syncScrollPos();
+      }
       if (lastScrollPosRef.current) {
         useStore.getState().setChatScrollPosMem(cid, lastScrollPosRef.current);
       }
     };
+    const onFlushUi = () => pushToStore(false);
     // Unmount (chat switch): push + flushNow so the position survives even
     // mid-stream (persist() is deferred while streaming, so it could be lost).
     const flush = () => {
-      pushToStore();
+      pushToStore(true);
       if (cid && lastScrollPosRef.current) {
         useStore.getState().flushNow();
       }
@@ -1228,14 +1305,14 @@ export function ChatPanel() {
     // App close: push the position into the store AND force an immediate write,
     // so it survives even if the store's own beforeunload flush already ran.
     const flushOnClose = () => {
-      pushToStore();
+      pushToStore(false);
       useStore.getState().flushNow();
     };
-    window.addEventListener("coder:flush-ui", pushToStore);
+    window.addEventListener("coder:flush-ui", onFlushUi);
     window.addEventListener("pagehide", flushOnClose);
     window.addEventListener("beforeunload", flushOnClose);
     return () => {
-      window.removeEventListener("coder:flush-ui", pushToStore);
+      window.removeEventListener("coder:flush-ui", onFlushUi);
       window.removeEventListener("pagehide", flushOnClose);
       window.removeEventListener("beforeunload", flushOnClose);
       flush();
@@ -2310,6 +2387,13 @@ export function ChatPanel() {
             },
             statusText: undefined,
           });
+          // Auto-open the docked Plan viewer tab on create and on every
+          // revision so the newest plan replaces the previous one on the right.
+          try {
+            useViewerTabs.getState().openPlan();
+          } catch {
+            // Viewer open must never break the stream.
+          }
         }
       } else if (event.kind === "mode_changed") {
         // Backend switched the workflow mode mid-run (plan approval → coder).
@@ -3391,9 +3475,18 @@ export function ChatPanel() {
   // handler.
   const onComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if ((e.clipboardData.files?.length ?? 0) > 0) return;
-    const text = e.clipboardData.getData("text/plain");
-    if (!text || !isCollapsibleText(text)) return;
+    const raw = e.clipboardData.getData("text/plain");
+    if (!raw || !isCollapsibleText(raw)) return;
     e.preventDefault();
+    // Pasted dumps reach megabytes (log/trace output) and would then be
+    // re-sent to the model EVERY turn plus parsed on every chat switch.
+    // Truncate at entry with a visible marker (attach the file with @ for the
+    // full content instead). The marker travels into the prompt so the model
+    // knows the text is incomplete instead of silently reasoning on a cut.
+    const text =
+      raw.length > PASTE_MAX
+        ? `${raw.slice(0, PASTE_MAX)}\n\n[…pasted text truncated: ${fmtSize(raw.length - PASTE_MAX)} omitted — attach the file with @ instead of pasting dumps]`
+        : raw;
     setPastedBlocks((blocks) => [
       ...blocks,
       { id: uid2(), text: text.replace(/^\n+|\n+$/g, ""), createdAt: Date.now() },
@@ -4073,28 +4166,44 @@ export function ChatPanel() {
           )}
           {(() => {
             const visible = visibleChatMessages(chat.messages);
+            // Char budget scales with the count limit so "load older" (which
+            // raises msgLimit) always reveals more — the button never stalls.
+            // Lengths are render-capped: a 1.5MB paste renders ≤100KB, so the
+            // budget measures actual parse work, not stored size.
+            const budget = windowBudget(msgLimit, MSG_PAGE);
+            const windowed = sliceWindow(
+              visible,
+              msgLimit,
+              budget,
+              MSG_WINDOW_MIN_KEEP,
+              (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
+            );
+            const hidden = visible.length - windowed.length;
             return (
               <>
-                {msgLimit < visible.length && (
+                {hidden > 0 && (
                   <div className="load-older-row">
                     <button
                       className="load-older-btn"
                       onClick={() => {
                         prependAnchorRef.current =
                           scrollRef.current?.scrollHeight ?? null;
-                        setMsgLimit((n) =>
-                          Math.min(visible.length, n + MSG_PAGE),
-                        );
+                        // Deliberately NOT capped at visible.length: the char
+                        // budget scales with msgLimit, so capping would freeze
+                        // the budget on giant chats (each message over budget)
+                        // and make further clicks reveal nothing. An oversized
+                        // msgLimit is harmless — countStart floors at 0 and the
+                        // restore/auto-load comparisons still behave.
+                        setMsgLimit((n) => n + MSG_PAGE);
                       }}
                     >
-                      Load {Math.min(MSG_PAGE, visible.length - msgLimit)}{" "}
+                      Load {Math.min(MSG_PAGE, hidden)}{" "}
                       earlier message
-                      {visible.length - msgLimit === 1 ? "" : "s"}…
+                      {hidden === 1 ? "" : "s"}…
                     </button>
                   </div>
                 )}
-                {visible
-                  .slice(Math.max(0, visible.length - msgLimit))
+                {windowed
                   .map((m: ChatMessage) => (
                     <Fragment key={m.id}>
                       <ChatMessageView message={m} onRetry={onRetry} />
@@ -4842,15 +4951,71 @@ export function ChatPanel() {
             void (async () => {
               setBusyFor(chatId, true);
               try {
+                // Commit messages run on the "compact" tool model
+                // (Settings → Tools → Compact model): a one-line message needs
+                // a small fast model, not the main chat model. Empty or the
+                // "main model" sentinel falls back to the active provider.
+                // Mirrors the compact-path resolution above (provider id first,
+                // then kind for legacy "custom/…" values).
+                const st = useStore.getState();
+                const compactEntry = (st.subagentModels?.compact || "").trim();
+                let commitProvider = provider;
+                let commitModel = activeModel;
+                if (
+                  compactEntry &&
+                  compactEntry !== "main model" &&
+                  compactEntry !== "main_model" &&
+                  compactEntry !== "main"
+                ) {
+                  const slash = compactEntry.indexOf("/");
+                  const prefix = slash > 0 ? compactEntry.slice(0, slash) : "";
+                  const modelName =
+                    slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
+                  const explicitProvider = prefix
+                    ? st.settings.providers.find(
+                        (p) => p.id === prefix || p.kind === prefix,
+                      )
+                    : undefined;
+                  if (explicitProvider) {
+                    commitProvider = explicitProvider;
+                    commitModel = modelName;
+                  } else if (!prefix && modelName) {
+                    commitModel = modelName;
+                  }
+                }
                 const res = await gitAutoCommit(wroot, {
-                  kind: provider.kind,
-                  model: activeModel,
-                  baseUrl: provider.baseUrl,
-                  apiKeys: providerApiKeys(provider),
-                  id: provider.id,
+                  kind: commitProvider.kind,
+                  model: commitModel,
+                  baseUrl: commitProvider.baseUrl,
+                  apiKeys: providerApiKeys(commitProvider),
+                  id: commitProvider.id,
                 });
                 if ("error" in res) {
                   useStore.getState().setChatCmdError(chatId, res.error);
+                } else if (res.usage) {
+                  // Accrue the commit-message call into the chat's cumulative
+                  // usage so the sidebar's Model usage panel bills it —
+                  // grouped under the provider that ACTUALLY ran it
+                  // (provider_id > kind > commit provider), mirroring the
+                  // compact path. No usage on the heuristic fallback path
+                  // (there was no model call to bill).
+                  const cu: CompactUsage = res.usage;
+                  const pid =
+                    cu.provider_id ||
+                    cu.provider ||
+                    commitProvider.id ||
+                    provider.id;
+                  useStore.getState().accrueChatUsage(
+                    chatId,
+                    pid,
+                    cu.model || commitModel,
+                    {
+                      input: cu.input_tokens ?? 0,
+                      output: cu.output_tokens ?? 0,
+                      cacheRead: cu.cache_read_tokens ?? 0,
+                      cacheWrite: cu.cache_write_tokens ?? 0,
+                    },
+                  );
                 }
               } finally {
                 setBusyFor(chatId, false);

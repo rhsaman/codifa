@@ -1,7 +1,6 @@
 ---
 name: Frontend Design Principles
 description: Intentional, precise frontend design principles (joshuadavidthomas/agent-skills) — for building and reviewing dashboards, admin panels, landing pages and web apps; domain-specific design decisions instead of generic AI defaults; routes to app.md or marketing.md by context.
-fa_keywords: یوآی, دیزاین, ظاهر, استایل, فرانت, داشبورد
 ---
 
 # Frontend Design Principles

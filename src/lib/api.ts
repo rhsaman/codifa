@@ -1516,6 +1516,8 @@ export interface GitAutoCommitResult {
   commit: string
   summary: string
   message: string
+  /** Token usage of the commit-message call, for the sidebar Model usage panel. */
+  usage?: CompactUsage
 }
 
 /** Generate a commit message with one LLM call and commit, without touching chat. */

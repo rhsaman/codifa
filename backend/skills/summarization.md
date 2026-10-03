@@ -1,7 +1,6 @@
 ---
 name: summarization
 description: Condense long content into clear, faithful summaries — executive briefs, TL;DRs, meeting notes, and key takeaways.
-fa_keywords: خلاصه
 ---
 
 # summarization

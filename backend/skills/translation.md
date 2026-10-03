@@ -1,7 +1,6 @@
 ---
 name: translation
 description: Translate accurately and naturally between languages, preserving meaning, tone, and cultural context.
-fa_keywords: ترجمه
 ---
 
 # translation

@@ -18,6 +18,7 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
+import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
 import { friendlyTtsError, useTtsPlayback } from "../lib/tts";
@@ -75,6 +76,20 @@ function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
 function cachedPrepareText(text: string, dir?: "rtl" | "ltr"): string {
   if (!text) return text;
   return computePrepared(`t:${text}`, text, dir);
+}
+
+// Never render more than RENDER_CAP chars of ONE message without an explicit
+// click: pasted log/trace dumps reach megabytes, and parsing + laying out
+// that text on EVERY chat switch (plus re-sending it to the model every turn)
+// is the main cost on giant histories. History on disk, copy-to-clipboard
+// and the model context always keep the FULL text — only the paint is capped.
+// Live (streaming) messages are never capped: truncating a reply mid-stream
+// would flicker and hide the newest tokens.
+function useCapped(id: string, text: string, live: boolean) {
+  const over = !live && text.length > RENDER_CAP;
+  const [showAll, setShowAll] = useState(false);
+  const shown = over && !showAll ? text.slice(0, RENDER_CAP) : text;
+  return { shown, over, cut: text.length - shown.length, showAll, setShowAll };
 }
 
 /** Collapsed implementation-plan card on a Plan-mode reply (kind:"plan_card").
@@ -1038,6 +1053,15 @@ function UserMessageBubble({
   const isLong =
     content.length > USER_COLLAPSE_CHARS ||
     content.split("\n").length > USER_COLLAPSE_LINES;
+  // Two-stage expand: the existing 600-char fold for normal long texts, plus
+  // a render cap for megabyte pastes (collapsed paint stays cheap; "Show all"
+  // is an explicit, informed read of the full text).
+  const cap = useCapped(message.id, content, !!message.streaming);
+  const body = !isLong
+    ? content
+    : !expanded
+      ? content.slice(0, USER_COLLAPSE_CHARS)
+      : cap.shown;
   const clamped = isLong && !expanded;
 
   const copy = async () => {
@@ -1057,15 +1081,37 @@ function UserMessageBubble({
           className={`chat-message user-text${clamped ? " clamped" : ""}`}
           dir={dir}
         >
-          {cachedPrepare(message.id, message.content, dir) || "(empty)"}
+          {cachedPrepare(message.id, body, dir) || "(empty)"}
         </div>
-        {isLong && (
+        {isLong && !expanded && (
           <button
             className="msg-expand"
-            onClick={() => setExpanded((e) => !e)}
-            aria-expanded={expanded}
+            onClick={() => setExpanded(true)}
+            aria-expanded={false}
           >
-            {expanded ? "Show less" : "Show more"}
+            Show more
+          </button>
+        )}
+        {isLong && expanded && cap.over && !cap.showAll && (
+          <button
+            className="msg-expand"
+            onClick={() => cap.setShowAll(true)}
+            aria-expanded={false}
+            title={`Full message is ${fmtSize(content.length)}`}
+          >
+            Show all ({fmtSize(cap.cut)} more)
+          </button>
+        )}
+        {isLong && expanded && (!cap.over || cap.showAll) && (
+          <button
+            className="msg-expand"
+            onClick={() => {
+              setExpanded(false);
+              cap.setShowAll(false);
+            }}
+            aria-expanded={true}
+          >
+            Show less
           </button>
         )}
         {message.attachments && message.attachments.length > 0 && (
@@ -1108,6 +1154,7 @@ function UserMessageBubble({
             className={`msg-copy ${copied ? "copied" : ""}`}
             onClick={copy}
             title="Copy message"
+            aria-label="Copy message"
           >
             {copied ? (
               <svg
@@ -1137,7 +1184,29 @@ function UserMessageBubble({
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
               </svg>
             )}
-            {copied ? "Copied" : "Copy"}
+          </button>
+          <button
+            className="msg-copy msg-fork"
+            onClick={() => useStore.getState().forkChatFromMessage(message.id)}
+            title="Fork chat from here"
+            aria-label="Fork chat from here"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="6" cy="6" r="2.5" />
+              <circle cx="6" cy="18" r="2.5" />
+              <circle cx="18" cy="8" r="2.5" />
+              <path d="M6 8.5v7" />
+              <path d="M18 10.5c0 4-5 3.5-8.5 5" />
+            </svg>
           </button>
         </div>
       )}
@@ -1222,6 +1291,7 @@ function SegSteerBubble({
 function SummaryBlock({ message }: { message: ChatMessage }) {
   const dir = useStore((s) => s.dir);
   const [collapsed, setCollapsed] = useState(true);
+  const cap = useCapped(message.id, message.content || "", false);
   return (
     <div className={`summary-block${collapsed ? " collapsed" : ""}`}>
       <div
@@ -1246,15 +1316,28 @@ function SummaryBlock({ message }: { message: ChatMessage }) {
         </span>
       </div>
       {!collapsed && (
-        <div className="summary-body chat-message markdown-body" dir="auto">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-            {cachedPrepare(
-              `${message.id}:summary`,
-              message.content || "(empty summary)",
-              dir,
-            )}
-          </ReactMarkdown>
-        </div>
+        <>
+          <div className="summary-body chat-message markdown-body" dir="auto">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              {cachedPrepare(
+                `${message.id}:summary`,
+                cap.shown || "(empty summary)",
+                dir,
+              )}
+            </ReactMarkdown>
+          </div>
+          {cap.over && (
+            <button
+              className="msg-expand"
+              onClick={() => cap.setShowAll((v) => !v)}
+              aria-expanded={cap.showAll}
+            >
+              {cap.showAll
+                ? "Show less"
+                : `Show all (${fmtSize(cap.cut)} more)`}
+            </button>
+          )}
+        </>
       )}
     </div>
   );
@@ -1649,6 +1732,10 @@ export const ChatMessageView = memo(
   const display = planDisplay(message);
   const displayContent = display.content;
   const displaySegments = display.segments;
+  // Render cap for the plain (non-segmented) assistant reply. Segmented
+  // replies render caption slices around tool cards (small by construction);
+  // the full text stays in history/copy regardless.
+  const cap = useCapped(message.id, displayContent ?? "", !!message.streaming);
 
   // Reading mode: only assistant replies with ≥2 headed sections get the
   // "مطالعه" button — short answers don't need a two-pane viewer.
@@ -1846,16 +1933,30 @@ export const ChatMessageView = memo(
              the rendered bubble identical to what the user typed. */
           <UserMessageBubble message={message} onRetry={onRetry} />
         ) : (
-          <div className="msg-bubble">
-            <div className="chat-message markdown-body" dir="auto">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={mdComponents}
-              >
-                {cachedPrepare(message.id, displayContent, dir)}
-              </ReactMarkdown>
+          <>
+            <div className="msg-bubble">
+              <div className="chat-message markdown-body" dir="auto">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={mdComponents}
+                >
+                  {cachedPrepare(message.id, cap.shown, dir)}
+                </ReactMarkdown>
+              </div>
             </div>
-          </div>
+            {cap.over && (
+              <button
+                className="msg-expand"
+                onClick={() => cap.setShowAll((v) => !v)}
+                aria-expanded={cap.showAll}
+                title={`Full reply is ${fmtSize((displayContent ?? "").length)}`}
+              >
+                {cap.showAll
+                  ? "Show less"
+                  : `Show all (${fmtSize(cap.cut)} more)`}
+              </button>
+            )}
+          </>
         ))}
 
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
@@ -1891,7 +1992,8 @@ export const ChatMessageView = memo(
               <button
                 className={`msg-copy ${copied ? "copied" : ""}`}
                 onClick={copyMessage}
-                title="Copy message"
+                title={copied ? "Copied" : "Copy message"}
+                aria-label={copied ? "Copied" : "Copy message"}
               >
                 {copied ? (
                   <svg
@@ -1921,7 +2023,29 @@ export const ChatMessageView = memo(
                     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
                   </svg>
                 )}
-                {copied ? "Copied" : "Copy"}
+              </button>
+              <button
+                className="msg-copy msg-fork"
+                onClick={() => useStore.getState().forkChatFromMessage(message.id)}
+                title="Fork chat from here"
+                aria-label="Fork chat from here"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="6" cy="6" r="2.5" />
+                  <circle cx="6" cy="18" r="2.5" />
+                  <circle cx="18" cy="8" r="2.5" />
+                  <path d="M6 8.5v7" />
+                  <path d="M18 10.5c0 4-5 3.5-8.5 5" />
+                </svg>
               </button>
               {!isUser && !message.streaming && (
                 <button

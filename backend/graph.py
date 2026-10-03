@@ -1593,99 +1593,67 @@ def _rank_candidates(
     return out
 
 
-# A prompt/history shows task signal when a skill, tool, or code symbol could
-# plausibly be needed this turn: a long enough prompt, a code/file token in
-# the prompt, or earlier tool activity / code tokens in the history. Short
-# chit-chat ("hi", greetings, thanks) with no code anywhere returns False —
-# those turns get zero skill tokens: no rank call, no auto-inlined body, no
-# catalog. Explicitly @mentioned skills are unaffected (their bodies inline
-# via manual_names regardless of this gate).
-# Task-signal gate: decides whether this turn could plausibly need skills,
-# tools or code symbols. English code/file tokens match the generic pattern
-# below; Persian action verbs and task nouns need their own pattern because
-# short Persian requests (e.g. "ui ...") carry no 3+ letter English token
-# and would otherwise look like chit-chat with zero skill tokens.
+# Code/file token pattern: an English identifier, path or filename means the
+# turn plausibly needs code tools/symbols. Used by ``_obvious_non_code_turn``
+# to fast-skip the symbol map on obvious chit-chat. Skill selection does NOT
+# key on it: the AVAILABLE SKILLS catalog is always present and laya
+# re-ranks it every turn, so short non-English task prompts are covered
+# without any hard-coded keyword list.
 _TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}"
 
-# General Persian task hints: action verbs (build/fix/add/review/guide and
-# family) plus common task nouns across skills. UI is only one row of the
-# fallback table below, so this pattern stays generic on purpose. Greetings
-# (salam/chetori/merci/...) are deliberately absent and stay chit-chat.
-_FA_TASK_SIGNAL_RE = (
-    r"بساز|بسازم|بسازد|بسازید|بسازی|ساخته|اصلاح|اضافه|افزود|بررسی|راهنما|"
-    r"بهتر|بهبود|بهینه|طراحی|بازنویسی|ترجمه|خلاصه|تست|آزمون|دیباگ|اشکال|"
-    r"رفع|رفکتور|تحلیل|بنویس|بخوان|اجرا|نصب|منتشر|دیپلوی|کامیت|پوش|مرج|"
-    r"شاخه|سئو|لندینگ|داشبورد|فرم|لاگین|کامپوننت|استایل|یوآی|رابط|ظاهر|"
-    r"دیزاین|فونت|رنگ|چیدمان|ریسپانسیو|انیمیشن|فرانت|بک‌اند|سرور|دیتابیس|"
-    r"داکیومنت|مستند|برنامه|اپلیکیشن|سایت|صفحه|پروژه|فایل|کد|گزارش|نمودار|"
-    r"\bui\b|\bux\b"
-)
+
+# Auto-inline bar: minimum laya confidence for a skill body the model never
+# asked for, how much the best pick must stand out over the strongest
+# non-pick (flat chit-chat noise scores everything ~0.7x — without a margin
+# any greeting "matches" some skill), and how many bodies one turn may
+# inline (a task can legitimately need several skills at once).
+_SKILL_AUTO_CONF = 0.7
+_SKILL_AUTO_MARGIN = 0.05
+_SKILL_AUTO_MAX = 3
 
 
-def _turn_task_signal(prompt: str, history: list) -> bool:
-    """Pure predicate: could this turn need skills/tools/code symbols?"""
-    try:
-        p = (prompt or "").strip()
-        if len(p) >= 32:
-            return True
-        if p and re.search(_TASK_SIGNAL_RE, p):
-            return True
-        if p and re.search(_FA_TASK_SIGNAL_RE, p, re.IGNORECASE):
-            return True
-        for turn in history or []:
-            if not isinstance(turn, dict):
-                continue
-            if turn.get("toolActivity") or turn.get("plan"):
-                return True
-            c = turn.get("content") or ""
-            if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
-                return True
-            if isinstance(c, str) and re.search(_FA_TASK_SIGNAL_RE, c, re.IGNORECASE):
-                return True
-        return False
-    except Exception:  # noqa: BLE001 — doubt keeps the skills path
-        return True
+def _skill_auto_picks(ranked: list[dict]) -> list[str]:
+    """Pure predicate: names of skill bodies to auto-inline this turn (0..N).
 
-
-# Minimum confidence and top-1/runner-up margin for auto-inlining a skill
-# body the model never asked for. Embedding scores on chit-chat are flat
-# noise (everything ~0.7): without a margin any greeting "matches" some
-# skill and injects a ~10k-char body. A genuine match stands out instead.
-# Persian short prompts score in the same compressed band, so the bar is
-# slightly lower for a real Persian task match but the margin still blocks
-# greetings.
-_SKILL_AUTO_CONF = 0.65
-_SKILL_AUTO_MARGIN = 0.04
-
-
-def _skill_auto_pick(ranked: list[dict], task_signal: bool) -> str:
-    """Pure predicate: name of the skill body to auto-inline, or "".
-
-    Only a strong, distinctive top-1 on a task-signal turn qualifies. All
-    other cases return "" and the model self-serves via load_skill + catalog.
+    Every ranked skill whose laya confidence clears ``_SKILL_AUTO_CONF`` is
+    picked, up to ``_SKILL_AUTO_MAX`` — one turn may legitimately need
+    several skills. Flat noise (a greeting scoring everything ~0.7x) fails
+    the distinctiveness margin and picks nothing; the model still
+    self-serves via load_skill + the always-present catalog.
     """
     try:
-        if not task_signal or not ranked:
-            return ""
-        top = ranked[0] if isinstance(ranked[0], dict) else {}
-        try:
-            top_conf = float(top.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return ""
-        name = str(top.get("name") or "").strip()
-        if not name or top_conf < _SKILL_AUTO_CONF:
-            return ""
-        second_conf = 0.0
-        if len(ranked) > 1 and isinstance(ranked[1], dict):
+        scored: list[tuple[float, str]] = []
+        for r in ranked or []:
+            if not isinstance(r, dict):
+                continue
             try:
-                second_conf = float(ranked[1].get("confidence", 0.0) or 0.0)
+                conf = float(r.get("confidence", 0.0) or 0.0)
             except (TypeError, ValueError):
-                second_conf = 0.0
-        if top_conf - second_conf < _SKILL_AUTO_MARGIN:
-            return ""
-        return name
+                continue
+            name = str(r.get("name") or "").strip()
+            if name:
+                scored.append((conf, name))
+        if not scored:
+            return []
+        above = sorted((p for p in scored if p[0] >= _SKILL_AUTO_CONF), reverse=True)
+        if not above:
+            return []
+        # Distinctiveness: the best pick must stand out over the strongest
+        # non-pick. When every skill clears the bar (small catalog), the
+        # weakest pick plays the background role so an all-flat ~0.7x rank
+        # still inlines nothing; a lone pick has nothing to stand out over.
+        below = [c for c, _ in scored if c < _SKILL_AUTO_CONF]
+        if below:
+            background = max(below)
+        elif len(above) > 1:
+            background = min(c for c, _ in above)
+        else:
+            background = 0.0
+        if above[0][0] - background < _SKILL_AUTO_MARGIN:
+            return []
+        return [name for _, name in above[:_SKILL_AUTO_MAX]]
     except Exception:  # noqa: BLE001 — doubt inlines nothing
-        return ""
+        return []
 
 
 def _obvious_non_code_turn(prompt: str, history: list) -> bool:
@@ -1703,8 +1671,6 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
             return False
         if re.search(_TASK_SIGNAL_RE, p):
             return False
-        if re.search(_FA_TASK_SIGNAL_RE, p, re.IGNORECASE):
-            return False
         for turn in history or []:
             if not isinstance(turn, dict):
                 continue
@@ -1713,59 +1679,9 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
             c = turn.get("content") or ""
             if isinstance(c, str) and re.search(r"[A-Za-z_][A-Za-z0-9_]{2,}", c):
                 return False
-            if isinstance(c, str) and re.search(_FA_TASK_SIGNAL_RE, c, re.IGNORECASE):
-                return False
         return True
     except Exception:  # noqa: BLE001 — doubt sends the map
         return False
-
-
-def _fa_skill_fallback(
-    prompt: str,
-    skills: list[dict],
-    rank_order: list[str] | None = None,
-) -> str:
-    """Scored, data-driven Persian fallback: best skill name or "".
-
-    Every skill is scored against the prompt using its OWN frontmatter
-    ``fa_keywords`` (2 points per hit) plus English name/description token
-    overlap (1 point per token, covers code-switched prompts like
-    "ui رو بهتر کن"). The highest score wins; ties break by the laya
-    ``rank_order`` (embedding relevance first, then list order) so semantic
-    relevance decides between equally-matching skills. No per-skill logic
-    lives here — new skills need no code change. Zero score returns "".
-    """
-    try:
-        p = (prompt or "").strip().lower()
-        if not p or not skills:
-            return ""
-        pos = {str(n or "").casefold(): i for i, n in enumerate(rank_order or [])}
-        best: tuple[int, int, str] | None = None  # (score, -rank_pos, name)
-        for idx, s in enumerate(skills):
-            if not isinstance(s, dict):
-                continue
-            score = 0
-            for kw in s.get("fa_keywords") or []:
-                kw = str(kw or "").strip().lower()
-                if kw and kw in p:
-                    score += 2
-            hay = f"{s.get('name') or ''} {s.get('description') or ''}".lower()
-            for tok in set(re.findall(r"[a-z0-9]+", hay)):
-                if len(tok) >= 2 and tok in p:
-                    score += 1
-            if score <= 0:
-                continue
-            name = str(s.get("name") or "").strip()
-            if not name:
-                continue
-            # Bigger score wins; on ties the earlier laya rank (then the
-            # earlier list position) wins; the name is a stable final key.
-            key = (score, -pos.get(name.casefold(), len(pos) + idx), name)
-            if best is None or key > best:
-                best = key
-        return best[2] if best else ""
-    except Exception:  # noqa: BLE001 — fallback never breaks the turn
-        return ""
 
 
 def _build_skills_section(
@@ -2372,18 +2288,16 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         system_final += project_memory
 
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
-    # (name + description) is in the prompt (except small-context models)
-    # so the model can auto-trigger a skill via load_skill; @mentioned bodies
-    # are inlined in full. Laya pre-ranks the catalog by relevance
-    # (reorder-only, full fallback) so the model sees relevant skills first.
-    # Chit-chat turns (no task signal) get ZERO skill tokens: no rank call,
-    # no auto-inlined body, no catalog — a greeting must never inject a
-    # ~10k-char skill body. @mentioned skills still inline (manual_names path
-    # ignores the catalog flag).
+    # (name + description) is ALWAYS in the prompt (except small-context
+    # models) so the model can auto-trigger skills via load_skill; @mentioned
+    # bodies are inlined in full. Laya re-ranks the catalog by relevance on
+    # EVERY turn (reorder-only, full fallback) so the most relevant skills
+    # come first whatever language the prompt is in — no keyword gates.
+    # Every distinctive match above the confidence bar auto-inlines: zero
+    # bodies on a greeting's flat scores, several when the task needs them.
     _skill_rank_order: list[str] | None = None
     _skill_ranked: list[dict] = []
-    _task_signal = _turn_task_signal(prompt, state.get("history") or [])
-    if prompt and _task_signal:
+    if prompt:
         try:
             _rank_skills = _agents._load_skills(root) or []
             if len(_rank_skills) > 1:
@@ -2413,28 +2327,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001 — ranking is best-effort
             _skill_rank_order = None
             _skill_ranked = []
-    # Auto-inline: only a strong, distinctive top-1 on a task-signal turn —
-    # never noise (flat ~0.7 scores on greetings must not load bodies).
-    # Persian fallback: embedding ranks on short Persian prompts are flat
-    # too, so a keyword fallback covers what laya cannot distinguish.
+    # Auto-inline: every distinctive laya match above the bar (0..N bodies);
+    # flat chit-chat noise inlines nothing.
     try:
-        _auto_name = _skill_auto_pick(_skill_ranked, _task_signal)
-        if not _auto_name and _task_signal and prompt:
-            try:
-                _fb_pool = (
-                    _rank_skills
-                    if "_rank_skills" in locals() and _rank_skills
-                    else (_agents._load_skills(root) or [])
-                )
-            except Exception:  # noqa: BLE001 — fallback loads best-effort
-                _fb_pool = []
-            _auto_name = _fa_skill_fallback(prompt, _fb_pool, _skill_rank_order)
-        if _auto_name:
+        for _auto_name in _skill_auto_picks(_skill_ranked):
             _picked = list(skills or [])
             if not any(str(n or "").strip().casefold() == _auto_name.casefold() for n in _picked):
                 _picked.append(_auto_name)
                 skills = _picked
-    except Exception:  # noqa: BLE001, S110 — auto-pick never breaks the turn
+    except Exception:  # noqa: BLE001, S110 — auto-picks never break the turn
         pass
     if small_ctx:
         _skill_rank_order = None
@@ -2442,7 +2343,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
-        catalog=not small_ctx and _task_signal,
+        catalog=not small_ctx,
         rank_order=_skill_rank_order,
     )
 
@@ -7050,6 +6951,38 @@ def _normalize_plan_reply(reply: str) -> str:
     return _split_plan_reply(reply)[1]
 
 
+def _plan_items_from_body(plan_body: str) -> list[dict]:
+    """Derive checklist items from a plan body so todos stay in sync.
+
+    Parses numbered/bullet steps (e.g. ``1. do X``, ``- [ ] do X``) while
+    skipping the ``## Plan`` header and the trailing ``Files:`` line. Every
+    item starts as ``pending`` — a revised plan is a fresh deliverable, not
+    an execution update. Returns [] when no steps are found so callers keep
+    the existing checklist instead of wiping it.
+    """
+    import re
+
+    items: list[dict] = []
+    for line in (plan_body or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r"^#{1,6}\s*plan\b", s, re.IGNORECASE):
+            continue
+        if re.match(r"^files?\s*:", s, re.IGNORECASE):
+            continue
+        m = re.match(r"^(?:\d+[.)]|[-*])\s+(?:\[[ xX]\]\s+)?(.+)$", s)
+        if not m:
+            continue
+        content = m.group(1).strip().strip("*").strip()
+        if not content:
+            continue
+        items.append({"content": content[:200], "status": "pending"})
+        if len(items) >= 20:
+            break
+    return items
+
+
 def _plan_title(plan_body: str) -> str:
     """Human title for the Plan card: the first markdown heading if the planner
     wrote a custom one (``## Plan: auth refactor``), else the generic label."""
@@ -7134,6 +7067,15 @@ async def plan_build(state: AgentState) -> dict:
                 }
             )
         except Exception:  # noqa: BLE001, S110 — the card must never break the run
+            pass
+        # Keep todos in sync with the plan document: a revised plan replaces
+        # the previous checklist so the right panel never shows stale steps.
+        # Skipped when no steps parse so an empty parse never wipes todos.
+        try:
+            derived = _plan_items_from_body(plan_body)
+            if derived:
+                queue.put_nowait({"kind": "plan", "items": derived})
+        except Exception:  # noqa: BLE001, S110 — todos sync never breaks the run
             pass
         return plan_body
 

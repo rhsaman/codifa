@@ -251,13 +251,16 @@ textarea {
   right: 2px;
   width: 2px;
   height: 100%;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.sidebar-resize-handle:hover::after,
+.sidebar-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .sidebar-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .sidebar {
@@ -418,6 +421,50 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* Scrollbar on the outer (left) edge, away from the chat content: the bar
+     side follows the container direction, so rtl parks it left. Children are
+     reset to ltr below so rows lay out exactly as before — inner text keeps
+     its own dir attributes. scrollbar-gutter avoids a width jump when the
+     bar appears. */
+  direction: rtl;
+  scrollbar-gutter: stable;
+}
+
+.sidebar-list > * {
+  direction: ltr;
+}
+
+/* Hover-only scrollbars for the sidebar chat list and the side panel: the
+   bars stay invisible until the pointer is over the surface (keyboard and
+   touch scrolling still work while hidden). */
+.sidebar-list,
+.right-panel-body,
+.diff-side,
+.schedule-inbox-list,
+.trace-panel-list {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.sidebar-list:hover,
+.right-panel-body:hover,
+.diff-side:hover,
+.schedule-inbox-list:hover,
+.trace-panel-list:hover {
+  scrollbar-color: var(--border) transparent;
+}
+.sidebar-list::-webkit-scrollbar-thumb,
+.right-panel-body::-webkit-scrollbar-thumb,
+.diff-side::-webkit-scrollbar-thumb,
+.schedule-inbox-list::-webkit-scrollbar-thumb,
+.trace-panel-list::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.sidebar-list:hover::-webkit-scrollbar-thumb,
+.right-panel-body:hover::-webkit-scrollbar-thumb,
+.diff-side:hover::-webkit-scrollbar-thumb,
+.schedule-inbox-list:hover::-webkit-scrollbar-thumb,
+.trace-panel-list:hover::-webkit-scrollbar-thumb {
+  background: var(--border);
 }
 
 .sidebar-empty {
@@ -10474,7 +10521,7 @@ textarea {
   max-height: 360px;
   overflow: auto;
   scrollbar-width: thin;
-  scrollbar-color: var(--text-dim) transparent;
+  scrollbar-color: transparent transparent;
   /* Two independent columns (before | after) laid out side-by-side with flex.
      Each column is its own block context, so selecting text in one can never
      drag the other along. `min-width: max-content` lets a column grow to fit
@@ -10497,9 +10544,13 @@ textarea {
 }
 
 .diff-side::-webkit-scrollbar-thumb {
-  background: var(--text-dim);
+  background: transparent;
   border-radius: 5px;
   border: 2px solid var(--bg-raised);
+}
+
+.diff-side:hover::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
 }
 
 .diff-side::-webkit-scrollbar-thumb:hover {
@@ -11766,6 +11817,22 @@ textarea {
   letter-spacing: 0.04em;
 }
 
+/* Plan panel has no header row (the viewer tab already labels it): the copy
+   action floats at the top-right corner instead. Triple-class selector beats
+   the docked `position: static` reset. */
+.review-panel.review-docked-panel.plan-panel {
+  position: relative;
+}
+
+.plan-panel-float-copy {
+  position: absolute;
+  top: 8px;
+  inset-inline-end: 8px;
+  z-index: 2;
+  background: color-mix(in srgb, var(--bg-alt) 88%, transparent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
 .plan-panel-body {
   flex: 1 1 auto;
   min-width: 0;
@@ -11776,7 +11843,9 @@ textarea {
      wide tokens wrap instead. */
   overflow-x: hidden;
   overflow-wrap: anywhere;
-  padding: 14px 18px 24px;
+  /* Top padding clears the floating copy button (30px tall at top:8px, so
+     content starts below its 38px zone instead of running underneath it). */
+  padding: 44px 18px 24px;
   /* Keep the scrollbar on the right edge (away from the chat scrollbar):
      the outer scroll container stays LTR while the inner content keeps
      the app direction. */
@@ -12549,13 +12618,16 @@ textarea {
   right: 2px;
   width: 2px;
   height: 100%;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.reading-mode-resize-handle:hover::after,
+.reading-mode-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .reading-mode-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* ---- Header ---- */
@@ -14428,13 +14500,16 @@ textarea {
   left: 2px;
   width: 2px;
   height: 100%;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.review-resize-handle:hover::after,
+.review-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .review-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* فیلتر منبع دیف: Last Turn / Uncommitted / Committed */
@@ -14845,7 +14920,7 @@ textarea {
   max-width: 680px;
   min-width: 0;
   margin: 0 auto 8px;
-  padding: 6px 12px;
+  padding: 3px 8px 3px 6px;
   font-size: 12px;
   font-family: var(--font-mono);
   color: var(--text-dim);
@@ -14866,15 +14941,6 @@ textarea {
   background: color-mix(in srgb, var(--bg-panel) 95%, transparent);
 }
 
-.composer-diff-dot {
-  flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--success) 60%, transparent);
-}
-
 .composer-diff-text {
   flex: 1 1 auto;
   min-width: 0;
@@ -14889,12 +14955,6 @@ textarea {
   gap: 6px;
   font-weight: 600;
   white-space: nowrap;
-}
-
-.composer-diff-open {
-  margin-left: auto;
-  color: var(--text-dim);
-  font-size: 12px;
 }
 
 /* Commit/undo actions pinned to the composer diff bar. The bar itself is now
@@ -14932,7 +14992,7 @@ textarea {
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
-  padding: 4px 10px;
+  padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: transparent;
@@ -14964,24 +15024,59 @@ textarea {
   border-color: #f85149;
 }
 
-.composer-diff-branch {
+.composer-diff-branch-wrap {
   flex: 0 0 auto;
-  max-width: 160px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 180px;
+  padding: 1px 4px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.composer-diff-branch-wrap:hover {
+  color: var(--text);
+  border-color: var(--accent-dim);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.composer-diff-branch-wrap:hover .composer-diff-git-icon {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.composer-diff-git-icon {
+  flex: 0 0 auto;
+  opacity: 0.75;
+  transition: color 0.15s ease, opacity 0.15s ease;
+}
+
+.composer-diff-branch {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 140px;
+  border: none;
+  outline: none;
+  background: transparent;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-dim);
+  line-height: 1.2;
+  padding: 0;
+  color: inherit;
   cursor: pointer;
-}
-
-.composer-diff-branch:hover:not(:disabled) {
-  color: var(--text);
-  border-color: var(--text-dim);
+  text-align: center;
+  text-align-last: center;
+  text-overflow: ellipsis;
 }
 
 .composer-diff-branch:disabled {
@@ -15110,13 +15205,16 @@ mark.diff-hit-active {
   bottom: 0;
   inset-inline-start: 2px;
   width: 2px;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.right-panel-resize-handle:hover::after,
+.right-panel-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .right-panel-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .right-panel-body {
@@ -15467,13 +15565,17 @@ mark.diff-hit-active {
   left: 2px;
   width: 2px;
   height: 100%;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
 .schedule-inbox-resize-handle:hover::after,
+.viewer-inbox-wrap .schedule-inbox-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .schedule-inbox-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .schedule-inbox-head {
@@ -16463,13 +16565,16 @@ mark.trace-hit-active {
   right: 2px;
   width: 2px;
   height: 100%;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.review-overlay-resize-handle:hover::after,
+.review-overlay-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .review-overlay-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .review-panel.review-floating-panel {
@@ -16811,13 +16916,16 @@ mark.trace-hit-active {
   bottom: 0;
   left: 2px;
   width: 2px;
+  border-radius: 2px;
   background: transparent;
   transition: background 0.13s;
 }
 
-.dock-resize-handle:hover::after,
+.dock-resize-handle:hover::after {
+  background: color-mix(in srgb, var(--text) 16%, transparent);
+}
 .dock-resize-handle:active::after {
-  background: var(--accent);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* Viewer fullscreen toggle: chat group hides, viewer takes the full width. */
@@ -16962,7 +17070,7 @@ mark.trace-hit-active {
   letter-spacing: 0.01em;
   color: var(--text-dim);
   background: color-mix(in srgb, var(--group) 5%, transparent);
-  cursor: grab;
+  cursor: default;
   white-space: nowrap;
   user-select: none;
   transition:
@@ -17369,7 +17477,7 @@ mark.trace-hit-active {
 /* Drag & drop reorder states. */
 .editor-tab.dragging {
   opacity: 0.5;
-  cursor: grabbing;
+  cursor: default;
   transform: scale(0.96);
   box-shadow: 0 8px 22px -10px rgba(0, 0, 0, 0.5);
 }
@@ -17496,6 +17604,17 @@ mark.trace-hit-active {
   margin-left: auto;
 }
 
+/* Plan header is a single short title + copy: keep both on ONE row instead
+   of the narrow-header full-width source that drops actions underneath.
+   Also drop the tab-switcher pill backdrop — with a single static title it
+   reads as a stray border around the word Plan. */
+.review-header .plan-panel-source {
+  flex: 1 1 auto;
+  max-width: none;
+  background: transparent;
+  padding: 0;
+}
+
 /* Docked two-column mode: cap the task list so the message column always
    keeps the majority of the width. */
 .viewer-inbox-wrap .schedule-inbox-list {
@@ -17551,10 +17670,11 @@ mark.trace-hit-active {
   }
 }
 
-/* Narrow viewer: keep breathing room so plan/diff text never glues to the edge. */
+/* Narrow viewer: keep breathing room so plan/diff text never glues to the edge.
+   Top padding still clears the floating plan copy button. */
 @container viewer (max-width: 420px) {
   .plan-panel-body {
-    padding: 12px 12px 20px;
+    padding: 44px 12px 20px;
   }
 
   .review-header {

@@ -2,7 +2,6 @@
 name: Movie Finder
 slug: movie-finder
 description:
-fa_keywords: فیلم, سینما, سریال
 ---
 
 # Movie-Finder

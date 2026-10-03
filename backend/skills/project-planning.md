@@ -1,7 +1,6 @@
 ---
 name: project-planning
 description: Turn a goal into a realistic plan: objectives, milestones, tasks, owners, timeline, and risks.
-fa_keywords: پروژه, برنامه‌ریزی, پلن
 ---
 
 # project-planning

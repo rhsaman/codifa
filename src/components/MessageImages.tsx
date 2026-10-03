@@ -64,7 +64,12 @@ export function MessageImages({
             }
           >
             {img.dataUrl ? (
-              <img src={img.dataUrl} alt={img.name} />
+              <img
+                src={img.dataUrl}
+                alt={img.name}
+                loading="lazy"
+                decoding="async"
+              />
             ) : (
               <span className="msg-image-ph">{img.name}</span>
             )}
@@ -78,7 +83,7 @@ export function MessageImages({
           title={modalTitle ?? current.name}
         >
           <div className="image-fullscreen">
-            <img src={current.dataUrl} alt={current.name} />
+            <img src={current.dataUrl} alt={current.name} decoding="async" />
           </div>
         </FullscreenModal>
       )}

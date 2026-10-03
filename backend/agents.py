@@ -3640,7 +3640,7 @@ def _load_skills(root: str) -> list[dict]:
     Skills are stored as ``skills/<slug>/skill.md`` files in the user data
     folder (managed in-app via Settings or the ``/skill`` tool) and shared
     across all workspaces. Each result is ``{"name", "slug", "description",
-    "path", "content", "fa_keywords"}`` where ``path`` is the on-disk ``skill.md``
+    "path", "content"}`` where ``path`` is the on-disk ``skill.md``
     location. The ``root`` argument is kept for API compatibility.
     """
     skills: list[dict] = []
@@ -3666,7 +3666,6 @@ def _load_skills(root: str) -> list[dict]:
                 "description": str(row.get("description") or "").strip(),
                 "path": str(row.get("path") or ""),
                 "content": body or content,
-                "fa_keywords": list(row.get("fa_keywords") or []),
             }
         )
     return skills

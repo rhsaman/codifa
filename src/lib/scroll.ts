@@ -40,11 +40,11 @@ export function classifyScrollEvent(
   restoreTarget: RestoreTarget | null,
   programmatic: boolean,
 ): { cancelRestore: boolean; fromReanchor: boolean } {
-  if (!restoreTarget) {
-    return { cancelRestore: false, fromReanchor: false };
-  }
   if (programmatic) {
     return { cancelRestore: false, fromReanchor: true };
+  }
+  if (!restoreTarget) {
+    return { cancelRestore: false, fromReanchor: false };
   }
   return { cancelRestore: true, fromReanchor: false };
 }

@@ -157,7 +157,9 @@ function SidebarContent() {
   // record but leave the summary identical, so the sidebar list does not
   // re-render on every streamed token or composer keystroke.
   const chats = useStore((s) =>
-    s.chats.map((c) => ({
+    // Empty (message-less) chats are in-memory tabs only until the first
+    // message is sent — never sidebar rows, never files on disk.
+    s.chats.filter((c) => (c.messages?.length ?? 0) > 0).map((c) => ({
       id: c.id,
       title: c.title,
       root: c.root ?? "",

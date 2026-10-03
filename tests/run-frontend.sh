@@ -96,6 +96,9 @@ streamChatReconnect|tests/streamChatReconnect.test.ts|--packages=external --exte
 thinkingIndicator|tests/thinkingIndicator.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 contextBudget|tests/contextBudget.test.ts|--packages=external --external:electron
 compactChat|tests/compactChat.test.ts|--packages=external --external:electron
+emptyChats|tests/emptyChats.test.ts|--packages=external --external:electron
+messageWindow|tests/messageWindow.test.ts|-
+renderCap|tests/renderCap.test.ts|-
 queue-during-compact|tests/queue-during-compact.test.ts|--packages=external --external:electron
 compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electron
 sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron

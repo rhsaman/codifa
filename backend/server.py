@@ -1309,7 +1309,17 @@ async def git_checkout(req: GitCheckoutRequest) -> dict:
 
 @app.post("/git/autocommit")
 async def git_autocommit(req: GitAutoCommitRequest) -> dict:
-    """Generate a commit message with one LLM call and commit (no chat)."""
+    """Generate a commit message with one LLM call and commit (no chat).
+
+    The frontend routes this through the "compact" tool model (Settings →
+    Tools → Compact model), so this endpoint assumes a small fast model: the
+    input is kept tiny (file list + a ~4KB diff excerpt, not the full diff)
+    and the output is capped at 64 tokens. Total worst case is ~30s.
+
+    The commit never fails because of the model: a timeout, error, or empty
+    reply falls back to a heuristic "Update N files: …" message built from
+    git status, so the button always commits.
+    """
     import git_tools
     from llm import build_chat_model, llm_complete
 
@@ -1320,8 +1330,19 @@ async def git_autocommit(req: GitAutoCommitRequest) -> dict:
     status = git_tools.git_status(req.root)
     if "error" in status:
         raise HTTPException(status_code=400, detail=status["error"])
-    if not status.get("entries"):
+    entries = status.get("entries") or []
+    if not entries:
         raise HTTPException(status_code=400, detail="nothing to commit")
+    paths = [str(e.get("path") or "") for e in entries if e.get("path")]
+
+    def _fallback_message() -> str:
+        shown = ", ".join(paths[:3]) + ("…" if len(paths) > 3 else "")
+        codes = {(str(e.get("st") or "").strip() or str(e.get("wt") or "").strip()) for e in entries}
+        verb = "Add" if codes and codes <= {"?", "A"} else "Update"
+        if len(paths) == 1:
+            return f"{verb} {paths[0]}"
+        return f"{verb} {len(paths)} files: {shown}"
+
     diff = git_tools.git_diff(req.root)
     if "error" in diff:
         raise HTTPException(status_code=400, detail=diff["error"])
@@ -1329,8 +1350,12 @@ async def git_autocommit(req: GitAutoCommitRequest) -> dict:
     diff_text = (diff.get("diff") or "") + ("\n" + staged.get("diff") if staged.get("diff") else "")
     if not diff_text.strip():
         raise HTTPException(status_code=400, detail="nothing to commit")
-    if len(diff_text) > 20000:
-        diff_text = diff_text[:20000]
+    # Token diet: the model only needs the file list + a small excerpt to
+    # name a one-line message — a full 20KB diff just burns input tokens and
+    # slows the call on big repos.
+    if len(diff_text) > 4000:
+        diff_text = diff_text[:4000] + "\n…(truncated)"
+    file_list = ", ".join(paths[:20]) + ("…" if len(paths) > 20 else "")
     try:
         mo = build_chat_model(
             req.provider,
@@ -1340,32 +1365,44 @@ async def git_autocommit(req: GitAutoCommitRequest) -> dict:
             req.env_var,
             req.api_keys,
             temperature=0.0,
+            max_tokens=64,
             thinking_level="off",
-            timeout=60,
+            timeout=30,
             provider_id=req.provider_id,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:  # noqa: BLE001 — any build failure falls back to heuristic commit
+        message = _fallback_message()
+        out = git_tools.git_commit(req.root, message, True)
+        if "error" in out:
+            raise HTTPException(status_code=400, detail=out["error"])
+        return {**out, "message": message}
     try:
-        text, _usage = await asyncio.wait_for(
+        text, usage = await asyncio.wait_for(
             llm_complete(
                 mo,
                 system="You write concise git commit messages. Reply with ONLY the commit message, one line, no quotes, no prefix.",
-                user=f"Write a short commit message for these changes:\n\n{diff_text}",
+                user=f"Files: {file_list}\n\nWrite a short commit message for these changes:\n\n{diff_text}",
             ),
-            timeout=90,
+            timeout=30,
         )
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(status_code=400, detail="model timed out generating commit message") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001 — any model failure falls back to heuristic commit
+        text, usage = "", None
     message = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
     if not message:
-        raise HTTPException(status_code=400, detail="model returned an empty commit message")
+        # Never block the commit on the model ("model timed out generating
+        # commit message" used to leave the button dead) — fall back to a
+        # plain file-list message and commit anyway.
+        message = _fallback_message()[:120]
     out = git_tools.git_commit(req.root, message, True)
     if "error" in out:
         raise HTTPException(status_code=400, detail=out["error"])
-    return {**out, "message": message}
+    # Surface the call's token usage so the frontend can accrue it into the
+    # sidebar's Model usage panel (grouped under the compact model that ran).
+    # None on the heuristic path — there was no model call to bill.
+    resp: dict = {**out, "message": message}
+    if usage:
+        resp["usage"] = usage
+    return resp
 
 
 class OAuthStartRequest(BaseModel):

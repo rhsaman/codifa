@@ -1,7 +1,6 @@
 ---
 name: decision-making
 description: Make tough choices systematically: clarify criteria, weigh options, test assumptions, and commit.
-fa_keywords: تصمیم, مقایسه, انتخاب
 ---
 
 # decision-making

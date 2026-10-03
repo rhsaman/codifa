@@ -47,52 +47,29 @@ def test_code_map_gate_sends_on_malformed_decision():
     assert graph._code_map_gate_skips(set(), set(), object()) is False
 
 
-# --- task-signal / skill auto-pick / map fast path ---------------------------
+# --- skill auto-picks / map fast path -----------------------------------------
 
 
 def _ranked(*pairs):
     return [{"name": n, "confidence": c} for n, c in pairs]
 
 
-def test_task_signal_greeting_fresh_is_false():
-    assert graph._turn_task_signal("سلام", []) is False
-    assert graph._turn_task_signal("چطوری؟", []) is False
+def test_skill_auto_picks_reject_flat_noise():
+    # Greeting-like scores: everything ~0.7x, no distinctive winner.
+    assert graph._skill_auto_picks(_ranked(("impeccable", 0.74), ("caveman", 0.72))) == []
+    assert graph._skill_auto_picks(_ranked(("movie-finder", 0.77), ("translation", 0.75))) == []
 
 
-def test_task_signal_greeting_with_greeting_history_is_false():
-    history = [
-        {"role": "user", "content": "سلام"},
-        {"role": "assistant", "content": "سلام! چطور می‌تونم کمکتون کنم؟"},
-    ]
-    assert graph._turn_task_signal("چطوری؟", history) is False
-
-
-def test_task_signal_true_cases():
-    assert graph._turn_task_signal("یه دکمه لاگین به فرم اضافه کن که وسط‌چین باشه", []) is True
-    assert graph._turn_task_signal("fix it", []) is True  # latin token: fail-open
-    assert graph._turn_task_signal("fix build_graph", []) is True
-    assert graph._turn_task_signal("look at backend/graph.py", []) is True
-    hist = [{"role": "assistant", "toolActivity": [{"tool": "read"}]}]
-    assert graph._turn_task_signal("thanks", hist) is True
-
-
-def test_skill_auto_pick_rejects_flat_noise():
-    # Greeting-like scores: everything ~0.7, no distinctive winner.
-    assert graph._skill_auto_pick(_ranked(("impeccable", 0.74), ("caveman", 0.72)), True) == ""
-    assert graph._skill_auto_pick(_ranked(("movie-finder", 0.77), ("translation", 0.75)), True) == ""
-
-
-def test_skill_auto_pick_accepts_strong_match():
+def test_skill_auto_picks_accept_strong_match():
     assert (
-        graph._skill_auto_pick(_ranked(("landing-page-design", 0.92), ("other", 0.5)), True)
-        == "landing-page-design"
+        graph._skill_auto_picks(_ranked(("landing-page-design", 0.92), ("other", 0.5)))
+        == ["landing-page-design"]
     )
 
 
-def test_skill_auto_pick_no_signal_or_weak():
-    assert graph._skill_auto_pick(_ranked(("a", 0.95), ("b", 0.4)), False) == ""
-    assert graph._skill_auto_pick(_ranked(("a", 0.6), ("b", 0.4)), True) == ""
-    assert graph._skill_auto_pick([], True) == ""
+def test_skill_auto_picks_weak_or_empty_pick_nothing():
+    assert graph._skill_auto_picks(_ranked(("a", 0.6), ("b", 0.4))) == []
+    assert graph._skill_auto_picks([]) == []
 
 
 def test_obvious_non_code_turn():

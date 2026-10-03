@@ -1695,15 +1695,12 @@ def persist_skill(
     raw: str,
     fallback_name: str = "",
     previous_name: str = "",
-    fa_keywords: str | list = "",
 ) -> dict:
     """Persist a skill as ``skills/<slug>/skill.md`` in the user data folder.
 
     ``raw`` is the full skill markdown (frontmatter + body); the name and
     description are parsed from the frontmatter. The name must be English
-    (ASCII) — it becomes the storage folder slug. ``fa_keywords`` (or an
-    ``fa_keywords:`` frontmatter line in ``raw``) stores Persian match
-    keywords; empty preserves the existing skill's keywords. Returns
+    (ASCII) — it becomes the storage folder slug. Returns
     ``{"ok", "name", "slug", "path", "note"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
@@ -1717,11 +1714,8 @@ def persist_skill(
     slug = slugify(name)
     if not body:
         body = f"Write step-by-step instructions for {name}."
-    kws = _state_db._normalize_fa_keywords(fa_keywords)
-    if not kws:
-        kws = _state_db._normalize_fa_keywords(_state_db._parse_skill_fa_keywords(raw))
     try:
-        _state_db.save_skill(name, slug, description, raw or body, fa_keywords=kws)
+        _state_db.save_skill(name, slug, description, raw or body)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
@@ -1773,17 +1767,14 @@ def sync_builtin_skills() -> list[str]:
         existing = []
     existing_slugs = {s.get("slug") for s in existing}
     existing_names = {s.get("name") for s in existing}
-    # Map name/slug -> (description, body, fa_keywords) — the stored content
-    # is frontmatter-stripped by list_skills — so a shipped change to the
-    # body OR any frontmatter key (description, fa_keywords) triggers a
-    # re-sync below. Without fa_keywords here, shipped Persian keyword
-    # updates would never reach the user's stored skills.
-    existing_meta: dict[str, tuple[str, str, tuple[str, ...]]] = {}
+    # Map name/slug -> (description, body) — the stored content is
+    # frontmatter-stripped by list_skills — so a shipped change to the body
+    # OR the description triggers a re-sync below.
+    existing_meta: dict[str, tuple[str, str]] = {}
     for s in existing:
         meta = (
             (s.get("description") or "").strip(),
             (s.get("content") or "").strip(),
-            tuple(str(k) for k in (s.get("fa_keywords") or [])),
         )
         if s.get("name"):
             existing_meta[s["name"]] = meta
@@ -1807,7 +1798,6 @@ def sync_builtin_skills() -> list[str]:
             if stored == (
                 description.strip(),
                 body.strip(),
-                tuple(_state_db._parse_skill_fa_keywords(raw)),
             ):
                 continue
         result = persist_skill(raw, fallback_name=name)
@@ -1906,36 +1896,17 @@ def search_web_docs(
     return store.search(query, KIND_WEB, top_k=max_results, min_score=min_score)
 
 
-def _normalize_fa_keywords(value) -> list[str]:
-    """Normalize Persian skill match keywords to a deduped lowercase list."""
-    if isinstance(value, str):
-        parts = value.split(",")
-    else:
-        parts = list(value or [])
-    seen: list[str] = []
-    for p in parts:
-        p = str(p or "").strip().lower()
-        if p and p not in seen:
-            seen.append(p)
-    return seen
-
-
 def create_skill(
     root: str,
     name: str,
     description: str,
     content: str,
-    fa_keywords: str | list = "",
 ) -> dict:
     """Create or edit (overwrite) a user skill (global, shared across workspaces).
 
     ``name`` is the display name — it must be English (ASCII) because the
     storage folder slug is derived from it. ``description`` is indexed for
-    the system prompt, and ``content`` is the full markdown body. ``fa_keywords``
-    are Persian match keywords (comma-separated string or list) stored as an
-    ``fa_keywords:`` frontmatter line so Persian prompts can match this skill;
-    when empty, keywords embedded in ``content`` frontmatter win, otherwise the
-    existing skill's keywords are preserved (edit flow). The skill
+    the system prompt, and ``content`` is the full markdown body. The skill
     is stored as ``skills/<slug>/skill.md`` in the user data folder. Calling
     with an existing skill's SAME ``name`` overwrites it (edit flow). The
     ``root`` argument is kept for API compatibility and is not used.
@@ -1943,9 +1914,6 @@ def create_skill(
     body = content.strip()
     if not body:
         body = f"Write step-by-step instructions for {name}."
-    kws = _state_db._normalize_fa_keywords(fa_keywords)
-    if not kws:
-        kws = _state_db._normalize_fa_keywords(_state_db._parse_skill_fa_keywords(body))
     markdown = (
         "---\n"
         f"name: {name}\n"
@@ -1953,7 +1921,7 @@ def create_skill(
         "---\n\n"
         f"# {name}\n\n{body}\n"
     )
-    result = persist_skill(markdown, fallback_name=name, fa_keywords=kws)
+    result = persist_skill(markdown, fallback_name=name)
     if not result.get("ok"):
         return {"error": result.get("note", "save failed")}
     return {
@@ -4263,9 +4231,8 @@ def make_tool_callbacks(
         content: str = "",
         source_url: str = "",
         source_query: str = "",
-        fa_keywords: str = "",
     ) -> str:
-        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). `fa_keywords` optional comma-separated Persian match keywords (e.g. "یوآی, رابط, ظاهر") stored as skill metadata so Persian prompts match this skill — NOT prose, only keywords; always resend the full list when editing a skill that has them (see them via `load_skill`). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",
@@ -4423,7 +4390,7 @@ def make_tool_callbacks(
             emit(_error_result("create_skill", c_err))
             return f"ERROR creating skill {name!r}: {c_err}"
         try:
-            result = create_skill(root, name, description, body, fa_keywords=fa_keywords)
+            result = create_skill(root, name, description, body)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("create_skill", msg))
@@ -4448,7 +4415,7 @@ def make_tool_callbacks(
         )
 
     async def load_skill_tool(name: str) -> str:
-        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill. This also applies to short non-English requests: e.g. Persian 'یوآی رو بهتر کن' means an interface-design task, so load the matching UI/design skill FIRST and follow its instructions. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
+        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill — including short or non-English requests: judge by the task's meaning, not its wording. Load EVERY skill the task needs (one call each) and follow their instructions; when nothing matches, load none. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
         emit({"kind": "tool", "tool": "load_skill", "args": {"name": name}})
         wanted = (name or "").strip().casefold()
         skills: list[dict] = []

@@ -145,7 +145,7 @@ async function copyTreeAsync(
  * then removed from the old one — nothing stays behind. Copy-then-delete keeps
  * the data safe: the old root is only cleaned up after a successful copy.
  */
-export function moveDataRootAsync(
+export async function moveDataRootAsync(
   newRootRaw: string,
   onProgress: (label: string, pct: number) => void,
 ): Promise<string> {
@@ -159,13 +159,21 @@ export function moveDataRootAsync(
   }
   const items = getRootItems(from)
   onProgress('Preparing', 0)
-  return copyAllAsync(from, target, items, onProgress)
-    .then(() => onProgress('Cleaning up old location', 90))
-    .then(() => removeAllAsync(from, items))
-    .then(() => {
-      onProgress('Done', 100)
-      return target
-    })
+  const failed = await copyAllAsync(from, target, items, onProgress)
+  if (failed.length > 0) {
+    // Copy-then-delete keeps the data safe ONLY if delete never follows a
+    // failed copy: abort here so the source stays intact and the caller
+    // surfaces an error instead of reporting a successful move.
+    throw new Error(
+      `data move aborted: ${failed.length} item(s) could not be copied ` +
+        `(${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', …' : ''}); ` +
+        `source left untouched at ${from}`,
+    )
+  }
+  onProgress('Cleaning up old location', 90)
+  await removeAllAsync(from, items)
+  onProgress('Done', 100)
+  return target
 }
 
 /** Top-level files + dirs that exist under a data root. */
@@ -180,9 +188,10 @@ async function copyAllAsync(
   target: string,
   items: string[],
   onProgress: (label: string, pct: number) => void,
-): Promise<void> {
+): Promise<string[]> {
   await fsp.mkdir(target, { recursive: true })
   const total = items.length
+  const failed: string[] = []
   let done = 0
   for (const name of items) {
     const src = path.join(from, name)
@@ -194,12 +203,28 @@ async function copyAllAsync(
       } else if (st.isFile()) {
         await fsp.copyFile(src, dest)
       }
+      // Verify the copy landed before trusting it: a failed/partial copy
+      // must never be followed by deleting the source.
+      if (!verifyCopied(src, dest)) failed.push(name)
     } catch {
-      /* best effort — skip unreadable item */
+      failed.push(name)
     }
     done++
     onProgress(`Copying ${name}`, Math.round((done / total) * 85))
     await new Promise((r) => setImmediate(r))
+  }
+  return failed
+}
+
+function verifyCopied(src: string, dest: string): boolean {
+  try {
+    const s = fs.statSync(src)
+    const d = fs.statSync(dest)
+    if (s.isDirectory() !== d.isDirectory()) return false
+    if (s.isFile() && s.size !== d.size) return false
+    return true
+  } catch {
+    return false
   }
 }
 

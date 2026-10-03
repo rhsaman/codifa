@@ -128,24 +128,46 @@ export function ComposerDiffBar({
   return (
     <div className="composer-diff-bar" dir="ltr">
       {branches.length > 0 && (
-        <select
-          className="composer-diff-branch"
-          value={branches.includes(current) ? current : ""}
-          disabled={disabled || switching}
-          title="Current branch — click to switch"
+        <span
+          className="composer-diff-branch-wrap"
           onClick={(e) => e.stopPropagation()}
-          onChange={(e) => {
-            e.stopPropagation();
-            void handleBranchChange(e.target.value);
-          }}
         >
-          {branches.map((b) => (
-            <option key={b} value={b}>
-              {b}
-            </option>
-          ))}
-          <option value="__new__">+ New branch…</option>
-        </select>
+          <svg
+            className="composer-diff-git-icon"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <line x1="6" y1="3" x2="6" y2="15" />
+            <circle cx="18" cy="6" r="3" />
+            <circle cx="6" cy="18" r="3" />
+            <path d="M18 9a9 9 0 0 1-9 9" />
+          </svg>
+          <select
+            className="composer-diff-branch"
+            value={branches.includes(current) ? current : ""}
+            disabled={disabled || switching}
+            title="Current branch — click to switch"
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              e.stopPropagation();
+              void handleBranchChange(e.target.value);
+            }}
+          >
+            {branches.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+            <option value="__new__">+ New branch…</option>
+          </select>
+        </span>
       )}
       {files > 0 && (
       <button
@@ -154,16 +176,12 @@ export function ComposerDiffBar({
         title="Show all uncommitted changes"
         onClick={openGitDiff}
       >
-        <span className="composer-diff-dot" aria-hidden="true" />
         <span className="composer-diff-text">
           {files} file{files > 1 ? "s" : ""} changed
         </span>
         <span className="composer-diff-counts">
           <span className="review-count-add">+{adds}</span>
           <span className="review-count-del">-{dels}</span>
-        </span>
-        <span className="composer-diff-open" aria-hidden="true">
-          ▸
         </span>
       </button>
       )}

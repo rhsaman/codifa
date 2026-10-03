@@ -1,7 +1,6 @@
 ---
 name: UI/UX Pro Max
 description: UI/UX design intelligence for web, mobile and desktop (nextlevelbuilder/ui-ux-pro-max-skill) — design, build, review and fix interfaces: styles, palettes, typography, accessibility, responsive layout, charts and stack-specific implementation.
-fa_keywords: یوآی, رابط, ظاهر, دیزاین, استایل, چیدمان, ریسپانسیو, انیمیشن, فونت, رنگ, کامپوننت, لندینگ, داشبورد, فرم, لاگین, فرانت
 ---
 
 # UI/UX Pro Max

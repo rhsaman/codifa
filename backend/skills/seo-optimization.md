@@ -1,7 +1,6 @@
 ---
 name: seo-optimization
 description: Improve search visibility: keyword research, meta tags, URL structure, structured data, and content optimization.
-fa_keywords: سئو
 ---
 
 # seo-optimization

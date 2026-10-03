@@ -547,43 +547,6 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
     return name, slug, description
 
 
-def _normalize_fa_keywords(value) -> list[str]:
-    """Normalize Persian skill match keywords to a deduped lowercase list."""
-    if isinstance(value, str):
-        parts = value.split(",")
-    else:
-        parts = list(value or [])
-    seen: list[str] = []
-    for p in parts:
-        p = str(p or "").strip().lower()
-        if p and p not in seen:
-            seen.append(p)
-    return seen
-
-
-def _parse_skill_fa_keywords(raw: str) -> list[str]:
-    """Return the skill's Persian match keywords from frontmatter.
-
-    Reads the optional ``fa_keywords:`` frontmatter key (comma-separated).
-    Empty when absent. Matching logic stays fixed in code; per-skill data
-    lives here so new skills need no code change.
-    """
-    if not raw.startswith("---"):
-        return []
-    end = raw.find("\n---", 3)
-    if end == -1:
-        return []
-    for line in raw[3:end].strip("\n").splitlines():
-        if ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        if key.strip().lower() != "fa_keywords":
-            continue
-        val = val.strip().strip('"').strip("'").strip("[]")
-        return [k.strip().lower() for k in val.split(",") if k.strip()]
-    return []
-
-
 def _find_skill_dir(name_or_slug: str) -> str | None:
     """Locate a skill's directory by name or slug. Returns None when missing."""
     name_or_slug = str(name_or_slug or "").strip()
@@ -619,16 +582,12 @@ def save_skill(
     slug: str,
     description: str,
     content: str,
-    fa_keywords: list | str = (),
 ) -> None:
     """Persist a skill as ``skills/<slug>/skill.md`` with YAML frontmatter.
 
-    The frontmatter carries ``name``/``slug``/``description`` plus an optional
-    ``fa_keywords`` line (Persian match keywords for the generic skill
-    matcher). The rest of the file is the skill body. An empty ``slug`` falls
-    back to the slugified name and then to a stable hash, so distinct names
-    never share a folder. Empty ``fa_keywords`` preserve the existing file's
-    keywords so an edit never silently drops Persian matching.
+    The frontmatter carries ``name``/``slug``/``description``. The rest of
+    the file is the skill body. An empty ``slug`` falls back to the slugified
+    name and then to a stable hash, so distinct names never share a folder.
     """
     with _LOCK:
         _migrate_legacy_db()
@@ -642,19 +601,11 @@ def save_skill(
             end = content.find("\n---", 3)
             if end != -1:
                 content = content[end + 4:].lstrip("\n")
-        kws = _normalize_fa_keywords(fa_keywords)
-        if not kws:
-            try:
-                kws = _parse_skill_fa_keywords(_read_text(os.path.join(d, "skill.md")))
-            except OSError:
-                kws = []
-        fa_line = f"fa_keywords: {', '.join(kws)}\n" if kws else ""
         front = (
             "---\n"
             f"name: {name}\n"
             f"slug: {slug}\n"
             f"description: {str(description or '').strip()}\n"
-            f"{fa_line}"
             "---\n\n"
         )
         _atomic_write(os.path.join(d, "skill.md"), front + content)
@@ -690,7 +641,7 @@ def invalidate_skills_cache() -> None:
 
 
 def list_skills() -> list[dict]:
-    """Return all skills as ``{name, slug, description, path, content, fa_keywords}``.
+    """Return all skills as ``{name, slug, description, path, content}``.
 
     Cached until the skills folder fingerprint changes; internal writers
     (save_skill/delete_skill) invalidate the cache so changes appear at once."""
@@ -731,7 +682,6 @@ def _list_skills_uncached() -> list[dict]:
                     "description": description,
                     "path": f"file://{md}",
                     "content": body,
-                    "fa_keywords": _parse_skill_fa_keywords(raw),
                 }
             )
     return out

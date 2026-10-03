@@ -72,8 +72,10 @@ const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(3
 // Strip transient, in-memory-only fields from messages AND chats before
 // persisting so they never reappear after a restart (e.g. the rate-limit retry
 // banner, or a stale ask/permission popup whose agent is long gone).
-function sanitizeChats(chats: Chat[]): Chat[] {
-  return chats.map((c) => {
+// Chats with zero messages are dropped entirely: a fresh "new chat" tab only
+// becomes real (sidebar row + file on disk) once the first message is sent.
+export function sanitizeChats(chats: Chat[]): Chat[] {
+  return chats.filter((c) => (c.messages?.length ?? 0) > 0).map((c) => {
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
@@ -763,6 +765,10 @@ interface State {
    *  user can ask follow-up questions about that section in isolation (reading
    *  mode → "سوال از این بخش"). Inherits the source chat's root/mode/provider. */
   forkSection: (messageId: string, sectionTitle: string, sectionContent: string) => void
+  /** Fork a chat from a message: create a new chat with history up to and
+   *  including the given message, inheriting root/mode/provider, and switch
+   *  to it so the user can continue there. Returns the new chat id. */
+  forkChatFromMessage: (messageId: string) => string | null
   /** Transient flag: focus the composer on the next ChatPanel mount (set by
    *  forkSection so the user can immediately type their question). */
   focusComposer: boolean
@@ -1368,6 +1374,18 @@ export const useStore = create<State>((set, get) => ({
       chats: loadedChats,
       activeChatId: activeId,
       openChatIds,
+      // Self-clean pre-existing empty chats left on disk by older builds (a
+      // fresh tab used to persist immediately). They stay usable in-memory
+      // but are queued for file deletion on the next persist; live chats that
+      // already have messages are untouched. In-memory-only empty tabs can
+      // never appear here (they are filtered from disk writes), so this only
+      // ever matches stale files.
+      deletedChatIds: [
+        ...new Set([
+          ...get().deletedChatIds,
+          ...loadedChats.filter((c) => (c.messages?.length ?? 0) === 0).map((c) => c.id),
+        ]),
+      ],
     })
   },
 
@@ -2383,6 +2401,39 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setFocusComposer: (v) => set({ focusComposer: v }),
+
+  forkChatFromMessage: (messageId) => {
+    const src = get().chats.find((c) => c.messages.some((m) => m.id === messageId))
+    if (!src) return null
+    const idx = src.messages.findIndex((m) => m.id === messageId)
+    if (idx < 0) return null
+    // Same workspace + mode + provider as the source chat, so the fork
+    // behaves identically and lives next to the original conversation.
+    const chatId = get().newChatInRoot(src.root ?? '', src.mode)
+    if (src.providerId) {
+      get().setChatProvider(chatId, src.providerId, src.model ?? '')
+    }
+    // Copy the history up to and including the fork point (fresh objects so
+    // edits in one chat never leak into the other via shared references).
+    const cut = src.messages.slice(0, idx + 1).map((m) => ({ ...m }))
+    set((st) => ({
+      chats: st.chats.map((c) =>
+        c.id === chatId
+          ? {
+              ...c,
+              messages: cut,
+              title: `${src.title} (fork)`.slice(0, 80),
+              thinkingLevel: src.thinkingLevel,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+      activeChatId: chatId,
+    }))
+    get().persist()
+    get().setFocusComposer(true)
+    return chatId
+  },
 
   addMessage: (chatId, message) => {
     const id = uid()

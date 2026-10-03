@@ -48,7 +48,6 @@ export function ViewerContent() {
     return (
       <PlanPanel
         key={active.id}
-        onClose={() => useViewerTabs.getState().closeViewer(active.id)}
       />
     );
   }

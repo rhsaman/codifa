@@ -251,20 +251,6 @@ def test_sync_retires_renamed_builtin_relic(skill_env):
     assert "یادگیری زبان از روی داکیومنت" not in names, "relic باید پاک شود"
 
 
-def test_sync_reseeds_when_fa_keywords_change(skill_env):
-    """A shipped fa_keywords change must propagate to the stored skill."""
-    tools.sync_builtin_skills()
-    changed = BUILTIN_V1.replace(
-        "description: a test skill",
-        "description: a test skill\nfa_keywords: یوآی, رابط",
-    )
-    (skill_env / "test-skill.md").write_text(changed, encoding="utf-8")
-    seeded = tools.sync_builtin_skills()
-    assert "Test Skill" in seeded
-    skill = next(s for s in state_db.list_skills() if s["name"] == "Test Skill")
-    assert skill["fa_keywords"] == ["یوآی", "رابط"]
-
-
 def test_sync_reseeds_when_description_changes(skill_env):
     """تغییر توصیف shipped (حتی بدون تغییر بدنه) باید re-sync شود."""
     tools.sync_builtin_skills()
@@ -276,19 +262,3 @@ def test_sync_reseeds_when_description_changes(skill_env):
     assert "Test Skill" in seeded
     skill = next(s for s in state_db.list_skills() if s["name"] == "Test Skill")
     assert skill["description"] == "a NEW description"
-
-
-def test_create_skill_stores_fa_keywords(skill_env):
-    """fa_keywords passed to create_skill are stored and listed back."""
-    tools.create_skill("", "Key Skill", "a test skill", "Body.", fa_keywords="یوآی, رابط")
-    skill = next(s for s in state_db.list_skills() if s["name"] == "Key Skill")
-    assert skill["fa_keywords"] == ["یوآی", "رابط"]
-
-
-def test_edit_skill_without_keywords_preserves_them(skill_env):
-    """Overwriting a skill without fa_keywords keeps the existing ones."""
-    tools.create_skill("", "Key Skill", "a test skill", "Body.", fa_keywords="یوآی, رابط")
-    tools.create_skill("", "Key Skill", "a test skill", "Body v2.")
-    skill = next(s for s in state_db.list_skills() if s["name"] == "Key Skill")
-    assert skill["fa_keywords"] == ["یوآی", "رابط"]
-    assert skill["content"].strip().endswith("Body v2.")

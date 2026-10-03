@@ -1,7 +1,6 @@
 ---
 name: deep-research
 description: Conduct thorough research on a topic: plan queries, gather sources, evaluate credibility, and synthesize findings.
-fa_keywords: تحقیق, پژوهش, ریسرچ, بررسی
 ---
 
 # deep-research

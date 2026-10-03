@@ -14,6 +14,7 @@ call pays the load cost and every later one is instant.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 from collections.abc import Sequence
@@ -60,6 +61,18 @@ _MAX_LEN = 512
 
 _CACHE: dict = {}
 _LOCK = threading.Lock()
+
+# Passage vector cache: exact description text -> L2-normalized vector.
+# The codemap rerank re-embeds the same file descriptions on every turn while
+# only the query changes. Caching per-text vectors turns repeat turns into a
+# single query embed + cosine, with bit-identical results (same model, same
+# prefix, same text). Bounded LRU so vector-store callers with many distinct
+# texts cannot grow memory without limit. Queries are NOT cached (each prompt
+# is effectively unique).
+_PASSAGE_VEC_CACHE: dict[str, object] = {}
+_PASSAGE_VEC_ORDER: list[str] = []
+_PASSAGE_VEC_LOCK = threading.Lock()
+_PASSAGE_VEC_MAX = 5000
 
 
 class EmbedderUnavailableError(RuntimeError):
@@ -174,8 +187,19 @@ def _load() -> None:
             )
         try:
             _CACHE["tokenizer"] = Tokenizer.from_file(tok_path)
+            # Tight arena: the default strategy over-reserves past the 1.1 GB
+            # weights during big batches (hundreds of MB held). kSameAsRequested
+            # only reserves what each run asks for. Numerics (and ranking
+            # quality) are unaffected — allocator choice only, not math.
+            _sess_opts = onnxruntime.SessionOptions()
+            with contextlib.suppress(Exception):
+                _sess_opts.add_session_config_entry(
+                    "arena_extend_strategy", "kSameAsRequested"
+                )
             _CACHE["session"] = onnxruntime.InferenceSession(
-                onnx_path, providers=["CPUExecutionProvider"]
+                onnx_path,
+                sess_options=_sess_opts,
+                providers=["CPUExecutionProvider"],
             )
             # Detect the real vector width from the model itself.
             dim: np.ndarray = _embed(["fallback"], _PASSAGE_PREFIX)
@@ -215,11 +239,64 @@ def _embed(texts: Sequence[str], prefix: str) -> np.ndarray:
 
 
 def _embed_batch(texts: Sequence[str], prefix: str) -> np.ndarray:
-    """Batch the real model to bound peak memory on long lists."""
+    """Batch the real model to bound peak memory on long lists.
+
+    Texts are sorted by length before chunking so each ONNX batch pads to a
+    similar row length instead of the single longest row. Per-row results are
+    independent (padding is masked), so restoring the original order yields
+    the same vectors as naive chunking — only with less wasted matmul.
+    """
+    lst = list(texts)
+    n = len(lst)
+    if n <= 1:
+        return _embed(lst, prefix)
+    order = sorted(range(n), key=lambda i: len(lst[i]))
+    sorted_texts = [lst[i] for i in order]
     rows: list[np.ndarray] = []
-    for i in range(0, len(texts), _BATCH):
-        rows.append(_embed(texts[i : i + _BATCH], prefix))
-    return np.concatenate(rows, axis=0)
+    for i in range(0, n, _BATCH):
+        rows.append(_embed(sorted_texts[i : i + _BATCH], prefix))
+    concat = np.concatenate(rows, axis=0)
+    result = np.empty_like(concat)
+    for sorted_pos, orig_idx in enumerate(order):
+        result[orig_idx] = concat[sorted_pos]
+    return result
+
+
+def _embed_passages_cached(texts: Sequence[str]) -> np.ndarray:
+    """Embed passages with a per-text vector cache (order-preserving).
+
+    Cache key is the exact prefixed string, so hits are identical vectors by
+    construction. Misses are embedded with the length-sorted batcher above.
+    """
+    lst = list(texts)
+    if not lst:
+        return np.zeros((0, 0), dtype=np.float32)
+    keys = [f"{_PASSAGE_PREFIX}{t}" for t in lst]
+    with _PASSAGE_VEC_LOCK:
+        cached = [_PASSAGE_VEC_CACHE.get(k) for k in keys]
+    missing_idx = [i for i, v in enumerate(cached) if v is None]
+    if missing_idx:
+        missing_texts = [lst[i] for i in missing_idx]
+        order = sorted(range(len(missing_texts)), key=lambda j: len(missing_texts[j]))
+        sorted_miss = [missing_texts[j] for j in order]
+        rows: list[np.ndarray] = []
+        for i in range(0, len(sorted_miss), _BATCH):
+            rows.append(_embed(sorted_miss[i : i + _BATCH], _PASSAGE_PREFIX))
+        concat = np.concatenate(rows, axis=0)
+        miss_vecs = [None] * len(missing_texts)
+        for sorted_pos, j in enumerate(order):
+            miss_vecs[j] = concat[sorted_pos]
+        with _PASSAGE_VEC_LOCK:
+            for j, i in enumerate(missing_idx):
+                vec = np.array(miss_vecs[j], dtype=np.float32, copy=True)
+                if keys[i] not in _PASSAGE_VEC_CACHE:
+                    _PASSAGE_VEC_CACHE[keys[i]] = vec
+                    _PASSAGE_VEC_ORDER.append(keys[i])
+                    while len(_PASSAGE_VEC_ORDER) > _PASSAGE_VEC_MAX:
+                        _PASSAGE_VEC_CACHE.pop(_PASSAGE_VEC_ORDER.pop(0), None)
+                cached[i] = _PASSAGE_VEC_CACHE[keys[i]]
+    mat = np.stack([np.asarray(v, dtype=np.float32) for v in cached], axis=0)
+    return mat
 
 
 def embed_dim() -> int:
@@ -240,7 +317,7 @@ def embed_passages(texts: Sequence[str]) -> list[list[float]]:
     lst = [t for t in texts]
     if not lst:
         return []
-    return _embed_batch(lst, _PASSAGE_PREFIX).tolist()
+    return _embed_passages_cached(lst).tolist()
 
 
 def embed_queries(texts: Sequence[str]) -> list[list[float]]:

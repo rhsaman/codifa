@@ -68,6 +68,10 @@ def rank_with_laya(query: str, candidates: list[dict] | list[str], top_k: int | 
 _RERANK_CACHE: dict[tuple[str, tuple], tuple[float, list[str]]] = {}
 _RERANK_CACHE_LOCK = threading.Lock()
 _RERANK_CACHE_TTL = 120.0
+# The TTL alone cannot bound size: a days-long sidecar serving many distinct
+# queries would grow this dict without limit. Cap entries (oldest-first
+# eviction); a miss only recomputes the ranking, never changes it.
+_RERANK_CACHE_MAX = 100
 
 
 def _apply_laya_rerank(
@@ -87,8 +91,12 @@ def _apply_laya_rerank(
     if not query or not str(query).strip() or not ranked_tags:
         return ranked_tags
     # Bound embedding work: rerank at most this many top files, keep the tail
-    # in PageRank order. 120 files ≈ 4 ONNX batches — ~1s on CPU instead of 10s+.
-    _RERANK_MAX_FILES = 120
+    # in PageRank order. 80 files ≈ 3 ONNX batches; the visible map holds ~60
+    # files at most (1024-token budget), so 80 covers every promotion candidate
+    # with margin — ranking deeper only burns CPU for files that never display.
+    # Measured on CPU: 120 descs ≈ 5s, 80 ≈ 1.2s (short descs; real tag lists
+    # with long names cost more via batch padding, so the saving is larger).
+    _RERANK_MAX_FILES = 80
     try:
         by_file: dict[str, list[Tag]] = defaultdict(list)
         for t in ranked_tags:
@@ -100,7 +108,10 @@ def _apply_laya_rerank(
         candidates: list[dict] = []
         for rel in head_rels:
             tags = by_file[rel]
-            desc = " ".join(t.name for t in tags[:20])
+            # Keep the head names only (capped chars): batch inference pads every
+            # row to the longest description, so one symbol-heavy file (900+
+            # chars here) slows the whole batch. Head names carry the signal.
+            desc = " ".join(t.name for t in tags[:12])[:300]
             candidates.append({"name": rel, "description": desc})
         _fingerprint = (str(query), tuple(sorted((r, len(by_file[r])) for r in all_rels)))
         with _RERANK_CACHE_LOCK:
@@ -124,6 +135,9 @@ def _apply_laya_rerank(
                         time.monotonic(),
                         [str(r.get("name") or "") for r in ranked],
                     )
+                    while len(_RERANK_CACHE) > _RERANK_CACHE_MAX:
+                        _oldest = min(_RERANK_CACHE, key=lambda k: _RERANK_CACHE[k][0])
+                        _RERANK_CACHE.pop(_oldest, None)
         if rank_info is not None:
             try:
                 rank_info["ranked"] = ranked

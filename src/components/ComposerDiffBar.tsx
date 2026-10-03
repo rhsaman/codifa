@@ -3,10 +3,20 @@ import { gitDiff, gitStatus } from "../lib/api";
 import { buildUncommittedFiles, sumDiffStats } from "../lib/uncommitted";
 import { useViewerTabs } from "../lib/viewerTabs";
 
-/** نوار تغییرات بالای اینپوت به سبک کدکس: «N files changed +A -D».
- *  با کلیک، پنل گیت‌دیف (کل تغییرات uncommitted) باز می‌شود.
- *  وقتی تغییری نیست هیچ‌چیز رندر نمی‌کند. */
-export function ComposerDiffBar({ root }: { root: string | null }) {
+/** Uncommitted-changes bar above the composer input, Codex style: "N files changed +A -D".
+ *  Clicking the summary opens the git-diff panel for all uncommitted changes.
+ *  Renders nothing when there are no changes. */
+export function ComposerDiffBar({
+  root,
+  onCommit,
+  onUndo,
+  disabled,
+}: {
+  root: string | null;
+  onCommit?: () => void;
+  onUndo?: () => void;
+  disabled?: boolean;
+}) {
   const openGitDiff = useViewerTabs((s) => s.openGitDiff);
   const [files, setFiles] = useState(0);
   const [adds, setAdds] = useState(0);
@@ -58,24 +68,57 @@ export function ComposerDiffBar({ root }: { root: string | null }) {
 
   if (!root || files === 0) return null;
   return (
-    <button
-      type="button"
-      className="composer-diff-bar"
-      dir="ltr"
-      title="Show all uncommitted changes"
-      onClick={openGitDiff}
-    >
-      <span className="composer-diff-dot" aria-hidden="true" />
-      <span className="composer-diff-text">
-        {files} file{files > 1 ? "s" : ""} changed
-      </span>
-      <span className="composer-diff-counts">
-        <span className="review-count-add">+{adds}</span>
-        <span className="review-count-del">-{dels}</span>
-      </span>
-      <span className="composer-diff-open" aria-hidden="true">
-        ▸
-      </span>
-    </button>
+    <div className="composer-diff-bar" dir="ltr">
+      <button
+        type="button"
+        className="composer-diff-main"
+        title="Show all uncommitted changes"
+        onClick={openGitDiff}
+      >
+        <span className="composer-diff-dot" aria-hidden="true" />
+        <span className="composer-diff-text">
+          {files} file{files > 1 ? "s" : ""} changed
+        </span>
+        <span className="composer-diff-counts">
+          <span className="review-count-add">+{adds}</span>
+          <span className="review-count-del">-{dels}</span>
+        </span>
+        <span className="composer-diff-open" aria-hidden="true">
+          ▸
+        </span>
+      </button>
+      {(onCommit || onUndo) && (
+        <span className="composer-diff-actions">
+          {onCommit && (
+            <button
+              type="button"
+              className="composer-diff-btn commit"
+              disabled={disabled}
+              title="Commit via agent"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCommit();
+              }}
+            >
+              Commit
+            </button>
+          )}
+          {onUndo && (
+            <button
+              type="button"
+              className="composer-diff-btn undo"
+              disabled={disabled}
+              title="Discard uncommitted changes"
+              onClick={(e) => {
+                e.stopPropagation();
+                onUndo();
+              }}
+            >
+              Undo
+            </button>
+          )}
+        </span>
+      )}
+    </div>
   );
 }

@@ -110,6 +110,19 @@ def git_commit(root: str, message: str, add_all: bool = False) -> dict:
     }
 
 
+def git_discard(root: str) -> dict:
+    """Discard all uncommitted changes, restoring the tree to HEAD."""
+    if not _is_repo(root):
+        return {"error": "not a git repository"}
+    reset = _run_git(root, ["reset", "--hard", "HEAD"])
+    if not reset.get("ok"):
+        return {"error": reset.get("error") or reset.get("err") or "git reset failed"}
+    clean = _run_git(root, ["clean", "-fd"])
+    if not clean.get("ok"):
+        return {"error": clean.get("error") or clean.get("err") or "git clean failed"}
+    return {"discarded": True}
+
+
 def git_log(root: str, limit: int = 20) -> dict:
     """Recent commits: hash, author date, subject — newest first."""
     if not _is_repo(root):

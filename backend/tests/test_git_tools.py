@@ -137,3 +137,33 @@ def test_show_not_a_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
     out = git_tools.git_show(str(tmp_path))
     assert "error" in out
+
+
+def test_discard_restores_tracked_and_removes_untracked(repo):
+    # Commit .gitignore first so clean -fd keeps the ignored file afterwards.
+    with open(os.path.join(repo, ".gitignore"), "w") as f:
+        f.write("ignored.log\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "ignore log"], cwd=repo, check=True, capture_output=True
+    )
+    with open(os.path.join(repo, "a.txt"), "a") as f:
+        f.write("dirty\n")
+    with open(os.path.join(repo, "b.txt"), "w") as f:
+        f.write("untracked\n")
+    with open(os.path.join(repo, "ignored.log"), "w") as f:
+        f.write("keep me\n")
+    out = git_tools.git_discard(repo)
+    assert out.get("discarded") is True
+    with open(os.path.join(repo, "a.txt")) as f:
+        assert f.read() == "hello\n"
+    assert not os.path.exists(os.path.join(repo, "b.txt"))
+    # Ignored files are kept (clean without -x).
+    assert os.path.exists(os.path.join(repo, "ignored.log"))
+    assert git_tools.git_status(repo)["entries"] == []
+
+
+def test_discard_not_a_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
+    out = git_tools.git_discard(str(tmp_path))
+    assert "error" in out

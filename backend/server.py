@@ -1257,6 +1257,18 @@ async def git_commit(req: GitCommitRequest) -> dict:
     return out
 
 
+@app.post("/git/discard")
+async def git_discard(req: GitRootRequest) -> dict:
+    import git_tools
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    out = git_tools.git_discard(req.root)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
 class OAuthStartRequest(BaseModel):
     client_id: str = ""
     client_secret: str = ""

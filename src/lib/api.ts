@@ -1455,6 +1455,31 @@ export async function gitCommit(
   }
 }
 
+export interface GitDiscardResult {
+  discarded: boolean
+}
+
+/** Discard all uncommitted changes (tracked + untracked, keeps ignored files). */
+export async function gitDiscard(
+  root: string,
+): Promise<GitDiscardResult | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/git/discard`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root }),
+    })
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok)
+      return { error: (body.detail as string) || `discard failed (${res.status})` }
+    return body as unknown as GitDiscardResult
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 // --- زمان‌بندی تسک‌ها (مثل Codex) -------------------------------------------
 
 export interface ScheduleUpsert {

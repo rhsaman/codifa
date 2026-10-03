@@ -50,6 +50,7 @@ import {
   listSkills,
   listMcp,
   triggerCompact,
+  gitDiscard,
   type CompactResult,
   type StreamParams,
 } from "../lib/api";
@@ -4831,7 +4832,32 @@ export function ChatPanel() {
               </div>
             );
           })()}
-        <ComposerDiffBar root={wroot} />
+        <ComposerDiffBar
+          root={wroot}
+          disabled={busy}
+          onCommit={() => {
+            if (!wroot || busy) return;
+            void send(
+              "Commit all uncommitted changes in the workspace using the git_commit tool (stage everything needed and commit).",
+              [],
+              [],
+              false,
+              undefined,
+              undefined,
+              true,
+            );
+          }}
+          onUndo={() => {
+            if (!wroot || busy) return;
+            if (
+              !window.confirm(
+                "Discard all uncommitted changes? This cannot be undone.",
+              )
+            )
+              return;
+            void gitDiscard(wroot);
+          }}
+        />
         <div className="composer-inner">
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>

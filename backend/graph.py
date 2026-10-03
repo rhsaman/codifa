@@ -1924,6 +1924,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         except Exception:  # noqa: BLE001, S110 — timing never breaks the turn
             pass
 
+    def _tctx_status(stage: str, content: str) -> None:
+        try:
+            queue.put_nowait({"kind": "status", "stage": stage, "content": content})
+        except Exception:  # noqa: BLE001, S110 — progress never breaks the turn
+            pass
+
     root = state["root"]
     mode = state["mode"]
     prompt = (state.get("request") or "").strip()
@@ -2435,6 +2441,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 options=list(_CODE_MAP_GATE_OPTIONS),
             )
     if mode in ("coder", "plan", "ask") and not _map_fast_skip:
+        _tctx_status("codemap", "Building code map")
         try:
             from symbol_index import _looks_like_code_ident, format_symbol_map
 
@@ -2808,6 +2815,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # در صف رویداد منتشر می‌شود تا در جمع چت ثبت شود و بج پیام به‌هم نریزد.
     # نکته FAST ROUTE فقط وقتی به پرامپت اضافه می‌شود که ابزار مقصد واقعاً زنده باشد.
     _computer_live = filtered.get("computer") is not None
+    _tctx_status("laya", "Deciding route")
     try:
         import time as _laya_time
 
@@ -4320,6 +4328,16 @@ async def _run_mode_turn(
                     request_messages = [*request_messages, *_transient_msgs]
                 _llm_t0 = time.monotonic()
                 _first_chunk_t = 0.0
+                try:
+                    queue.put_nowait(
+                        {
+                            "kind": "status",
+                            "stage": "waiting-model",
+                            "content": f"Waiting for model (step {steps})",
+                        }
+                    )
+                except Exception:  # noqa: BLE001, S110 — progress never breaks turn
+                    pass
                 async for chunk in bound.astream(request_messages):
                     if not _first_chunk_t:
                         _first_chunk_t = time.monotonic() - _llm_t0
@@ -5270,7 +5288,22 @@ async def _run_mode_turn(
                         "reconnecting": True,
                     }
                 )
-                await asyncio.sleep(delay)
+                # Heartbeat during backoff so a 30-60s wait stays visible
+                # in trace/chat instead of looking like a dead turn.
+                _remaining = float(delay or 0)
+                while _remaining > 0:
+                    _chunk = min(10.0, _remaining)
+                    await asyncio.sleep(_chunk)
+                    _remaining -= _chunk
+                    if _remaining > 0:
+                        with contextlib.suppress(Exception):
+                            queue.put_nowait(
+                                {
+                                    "kind": "status",
+                                    "stage": "retry-wait",
+                                    "content": f"Retrying in {int(_remaining)}s (attempt {attempt}/{_agents._RETRY_MAX_ATTEMPTS})",
+                                }
+                            )
                 continue
     finally:
         # Close every opened MCP session so stdio subprocesses / HTTP

@@ -74,6 +74,11 @@ def _apply_laya_rerank(
     """
     if not query or not str(query).strip() or not ranked_tags:
         return ranked_tags
+    # Fast path: very short prompts (e.g. "continue") carry no ranking signal.
+    # Embedding 120 files through ONNX on CPU for these costs seconds (15s seen
+    # in traces) while the order stays flat — keep PageRank order instead.
+    if len(str(query).strip()) < 12:
+        return ranked_tags
     # Bound embedding work: rerank at most this many top files, keep the tail
     # in PageRank order. 120 files ≈ 4 ONNX batches — ~1s on CPU instead of 10s+.
     _RERANK_MAX_FILES = 120

@@ -169,10 +169,18 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
   const [reverting, setReverting] = useState<number | null>(null);
   const running = activities.some((a) => a.activity.status === "running");
   const { adds, dels } = editGroupStats(activities);
-  const totalMs = activities.reduce(
-    (sum, a) => sum + (a.activity.elapsedMs || 0),
-    0,
-  );
+  // Live clock so the group total ticks while any file edit is still running.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [running]);
+  const totalMs = activities.reduce((sum, a) => {
+    const act = a.activity;
+    if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
+    return sum + (act.elapsedMs || 0);
+  }, 0);
 
   const revertOne = async (entry: { activity: ToolActivity; index: number }) => {
     if (!root) return;
@@ -245,6 +253,11 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   {entry.activity.reverted && (
                     <span className="reverted-tag">reverted</span>
                   )}
+                  {(() => {
+                    const act = entry.activity;
+                    const ms = act.status === "running" && act.startedAt ? Math.max(0, now - act.startedAt) : act.elapsedMs;
+                    return ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null;
+                  })()}
                   {messageId && entry.activity.diff && (
                     <span className="trace-row-review" aria-hidden="true">Review ↗</span>
                   )}
@@ -983,10 +996,18 @@ export const ToolGroupView = memo(function ToolGroupView({
 }) {
   const [open, setOpen] = useState(false);
   const running = activities.some((a) => a.activity.status === "running");
-  const totalMs = activities.reduce(
-    (sum, a) => sum + (a.activity.elapsedMs || 0),
-    0,
-  );
+  // Live clock so the group total ticks while any call is still running.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [running]);
+  const totalMs = activities.reduce((sum, a) => {
+    const act = a.activity;
+    if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
+    return sum + (act.elapsedMs || 0);
+  }, 0);
   // Always show tool names + counts as the main status text. The narration
   // line (if any) rides along as the caption — always in the head, plus the
   // first row of the expanded panel (see renderSegments in ChatMessage.tsx).
@@ -1860,7 +1881,7 @@ export const ToolCallView = memo(function ToolCallView({
           <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>
         )}
         {activity.args && <ToolArgs args={activity.args} />}
-        <span className="tool-ms">{fmtTime(ms)}</span>
+        {ms ? <span className="tool-ms">{fmtTime(ms)}</span> : null}
         {isWrite &&
           activity.diff &&
           (() => {

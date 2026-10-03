@@ -1222,10 +1222,28 @@ def _read_lines_excerpts(path: str, windows: list[tuple[int, int]]) -> list[dict
     caps = [max(1, int(limit or 0)) for _, limit in windows]
     sizes = [0] * len(windows)
     total = 0
+    # Upper bound of lines any window can need. Once past it every window is
+    # either full (more) or byte-capped (cut), so collecting can stop and the
+    # remaining line count is done with a fast C-level count instead of a
+    # per-line Python loop over the whole file.
+    try:
+        max_need = max(r["start"] + caps[i] for i, r in enumerate(results))
+    except ValueError:
+        max_need = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for lineno, raw in enumerate(fh, 1):
                 total = lineno
+                if lineno > max_need and all(
+                    r["cut"] or r["more"] or len(r["lines"]) >= caps[i]
+                    for i, r in enumerate(results)
+                ):
+                    rest = fh.read()
+                    if rest:
+                        total += rest.count("\n")
+                        if not rest.endswith("\n"):
+                            total += 1
+                    break
                 active = [
                     i for i, result in enumerate(results)
                     if lineno >= result["start"] and not result["cut"] and not result["more"]

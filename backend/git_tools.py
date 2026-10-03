@@ -123,6 +123,46 @@ def git_discard(root: str) -> dict:
     return {"discarded": True}
 
 
+def git_branches(root: str) -> dict:
+    """List local branches plus the current one."""
+    if not _is_repo(root):
+        return {"error": "not a git repository"}
+    cur = _run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    current = cur["out"].strip() if cur.get("ok") else ""
+    res = _run_git(root, ["branch", "--format=%(refname:short)"])
+    if not res.get("ok"):
+        return {"error": res.get("error") or res.get("err") or "git branch failed"}
+    branches = [ln.strip() for ln in res["out"].splitlines() if ln.strip()]
+    return {"current": current, "branches": branches}
+
+
+def _valid_branch(name: str) -> bool:
+    """Conservative branch-name check (single argv, never a flag)."""
+    import re
+
+    if not name or name.startswith(("-", ".")):
+        return False
+    if ".." in name or "~" in name or "^" in name or ":" in name:
+        return False
+    if any(c in name for c in (" ", "?", "*", "[", "\\", "'", '"', ";", "&", "|")):
+        return False
+    return re.match(r"^[A-Za-z0-9._/\-]+$", name) is not None
+
+
+def git_checkout(root: str, branch: str, create: bool = False) -> dict:
+    """Checkout an existing branch, or create+checkout when ``create``."""
+    if not _is_repo(root):
+        return {"error": "not a git repository"}
+    name = (branch or "").strip()
+    if not _valid_branch(name):
+        return {"error": f"invalid branch name: {branch!r}"}
+    args = ["checkout", "-b", name] if create else ["checkout", name]
+    res = _run_git(root, args)
+    if not res.get("ok"):
+        return {"error": res.get("error") or res.get("err") or "git checkout failed"}
+    return {"current": name}
+
+
 def git_log(root: str, limit: int = 20) -> dict:
     """Recent commits: hash, author date, subject — newest first."""
     if not _is_repo(root):

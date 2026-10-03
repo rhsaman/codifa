@@ -24,12 +24,16 @@ This file never auto-downloads — models are fetched only when the user asks.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import shutil
 import threading
 import time
 from collections import deque
+
+logger = logging.getLogger("models")
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = _MODULE_DIR
@@ -253,6 +257,14 @@ def _migrate_legacy_models(target_root: str | None = None) -> None:
 #  "percent": float, "speed_bps": float, "updated_at": float}
 _STATES: dict[str, dict] = {}
 _LOCK = threading.RLock()
+# Tripwire for external deletion of model dirs (e.g. a system cleaner wiping
+# the data-root models folder). status() records ready dirs in the persistent
+# witness file models-watch.json (sibling of models/, never inside it); a dir
+# that was ready before but is gone now WITHOUT going through remove() gets
+# one WARNING in codifa.log with its last-seen timestamp. Codifa itself never
+# deletes model dirs except via remove(), so a warning here points outside
+# the app. _REMOVED_BY_APP suppresses the warning for explicit user deletes.
+_REMOVED_BY_APP: set[str] = set()
 # کنترل مکث/توقف هر دانلود: pause ست یعنی مکث، cancel ست یعنی توقف.
 _CONTROLS: dict[str, dict[str, threading.Event]] = {}
 # نمونه‌های سرعت (زمان، بایت تجمعی) برای هر kind — میانگین ۵ ثانیه اخیر.
@@ -704,7 +716,11 @@ def remove(kind: str, repo: str) -> bool:
     _clear_state(kind)
     try:
         shutil.rmtree(target, ignore_errors=True)
-        return not os.path.isdir(target)
+        if not os.path.isdir(target):
+            _REMOVED_BY_APP.add(os.path.basename(os.path.normpath(target)))
+            logger.warning("model removed by user request kind=%s repo=%s", kind, repo)
+            return True
+        return False
     except OSError:  # pragma: no cover - best effort
         return False
 
@@ -850,4 +866,86 @@ def status() -> dict:
     laya: dict = {"dirs": laya_dirs()}
     if download_state(KIND_LAYA):
         laya["running"] = download_state(KIND_LAYA)
-    return {"whisper": whisper, "embedding": embed, "laya": laya}
+    out = {"whisper": whisper, "embedding": embed, "laya": laya}
+    try:
+        _tripwire_external_deletion(out)
+    except Exception:  # noqa: BLE001, S110 — diagnostics never break status
+        pass
+    return out
+
+
+def _witness_path() -> str:
+    """Sidecar-persistent witness file (sibling of models/, never inside it)."""
+    try:
+        root = _raw_models_root()
+    except Exception:  # noqa: BLE001 — witness is optional
+        return ""
+    if not root:
+        return ""
+    return os.path.join(os.path.dirname(root), "models-watch.json")
+
+
+def _tripwire_external_deletion(status_out: dict) -> None:
+    """Warn once when a previously-ready model dir vanishes on its own.
+
+    State persists in models-watch.json so disappearances survive sidecar
+    restarts: each status() records which dirs are ready now, and a dir that
+    was ready before but is gone now (without a remove() call) gets one
+    WARNING in codifa.log with its last-seen timestamp. Codifa itself never
+    deletes model dirs except via remove(), so a warning here points outside
+    the app (system cleaner, another process, manual delete).
+    """
+    ready_now: set[str] = set()
+    for _section in (status_out.get("embedding") or {}, status_out.get("laya") or {}):
+        for _d in (_section.get("dirs") or []):
+            _name = str((_d or {}).get("dir") or "")
+            if _name and (_d or {}).get("ready"):
+                ready_now.add(_name)
+    for _w in (status_out.get("whisper", {}) or {}).get("dirs", []) or []:
+        _name = str((_w or {}).get("dir") or "")
+        if _name and (_w or {}).get("ready"):
+            ready_now.add(_name)
+
+    _path = _witness_path()
+    _witness: dict = {}
+    if _path:
+        try:
+            if os.path.isfile(_path):
+                with open(_path, encoding="utf-8") as _fh:
+                    _loaded = json.load(_fh)
+                if isinstance(_loaded, dict):
+                    _witness = _loaded
+        except Exception:  # noqa: BLE001 — corrupt witness starts over
+            _witness = {}
+    _prev_ready = _witness.get("ready") or {}
+    if not isinstance(_prev_ready, dict):
+        _prev_ready = {}
+    _warned = set(_witness.get("warned") or [])
+    _now = time.time()
+    for _name in sorted(set(_prev_ready) - ready_now - _REMOVED_BY_APP):
+        if _name in _warned:
+            continue
+        _warned.add(_name)
+        _last = _prev_ready.get(_name)
+        try:
+            _when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(_last)))
+        except Exception:  # noqa: BLE001
+            _when = "unknown time"
+        logger.warning(
+            "model dir '%s' vanished WITHOUT a Codifa remove call "
+            "(last seen ready %s; external deletion suspected — "
+            "check system cleaners / manual deletes)",
+            _name,
+            _when,
+        )
+    # A re-downloaded dir leaves the warned set so a later disappearance warns again.
+    _warned.intersection_update(set(_prev_ready) - ready_now)
+    if _path:
+        try:
+            # Gone dirs stay recorded with their last-seen timestamp (the
+            # evidence); warned entries never re-warn for the same absence.
+            _merged = {**_prev_ready, **{n: _now for n in ready_now}}
+            with open(_path, "w", encoding="utf-8") as _fh:
+                json.dump({"ready": _merged, "warned": sorted(_warned)}, _fh)
+        except Exception:  # noqa: BLE001, S110 — witness is best-effort
+            pass

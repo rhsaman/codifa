@@ -1773,14 +1773,17 @@ def sync_builtin_skills() -> list[str]:
         existing = []
     existing_slugs = {s.get("slug") for s in existing}
     existing_names = {s.get("name") for s in existing}
-    # Map name/slug -> (description, body) — the stored content is frontmatter-
-    # stripped by list_skills — so a shipped change to EITHER the body or the
-    # frontmatter (e.g. description) triggers a re-sync below.
-    existing_meta: dict[str, tuple[str, str]] = {}
+    # Map name/slug -> (description, body, fa_keywords) — the stored content
+    # is frontmatter-stripped by list_skills — so a shipped change to the
+    # body OR any frontmatter key (description, fa_keywords) triggers a
+    # re-sync below. Without fa_keywords here, shipped Persian keyword
+    # updates would never reach the user's stored skills.
+    existing_meta: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     for s in existing:
         meta = (
             (s.get("description") or "").strip(),
             (s.get("content") or "").strip(),
+            tuple(str(k) for k in (s.get("fa_keywords") or [])),
         )
         if s.get("name"):
             existing_meta[s["name"]] = meta
@@ -1801,7 +1804,11 @@ def sync_builtin_skills() -> list[str]:
             # changed, so official updates take effect. Identical copies are
             # left untouched.
             stored = existing_meta.get(name) or existing_meta.get(slugify(name))
-            if stored == (description.strip(), body.strip()):
+            if stored == (
+                description.strip(),
+                body.strip(),
+                tuple(_state_db._parse_skill_fa_keywords(raw)),
+            ):
                 continue
         result = persist_skill(raw, fallback_name=name)
         if result.get("ok"):

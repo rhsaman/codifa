@@ -167,3 +167,20 @@ def test_discard_not_a_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
     out = git_tools.git_discard(str(tmp_path))
     assert "error" in out
+
+
+def test_branches_lists_current(repo):
+    out = git_tools.git_branches(repo)
+    assert "error" not in out, out
+    assert out["branches"]
+    assert out["current"] in out["branches"]
+
+
+def test_checkout_create_and_switch(repo):
+    out = git_tools.git_checkout(repo, "feature/x", create=True)
+    assert out.get("current") == "feature/x"
+    st = git_tools.git_branches(repo)
+    assert st["current"] == "feature/x"
+    assert "feature/x" in st["branches"]
+    out = git_tools.git_checkout(repo, "--bad")
+    assert "error" in out

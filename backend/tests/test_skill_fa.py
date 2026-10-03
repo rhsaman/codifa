@@ -93,6 +93,19 @@ def test_fa_skill_fallback_matches_english_tokens_without_keywords():
     assert graph._fa_skill_fallback("seo سایت رو درست کن", pool) == "seo-optimization"
 
 
+def test_fa_skill_fallback_rank_order_breaks_ties():
+    """Equal keyword scores: the laya embedding rank decides, not list order."""
+    pool = [
+        _skill("Alpha UI", "UI design", ["یوآی"]),
+        _skill("Beta UI", "UI design", ["یوآی"]),
+    ]
+    assert graph._fa_skill_fallback("یوآی رو بهتر کن", pool) == "Alpha UI"
+    assert (
+        graph._fa_skill_fallback("یوآی رو بهتر کن", pool, ["Beta UI", "Alpha UI"])
+        == "Beta UI"
+    )
+
+
 def test_skill_auto_pick_relaxed_threshold_still_blocks_flat_noise():
     ranked = [
         {"name": "a", "confidence": 0.74},

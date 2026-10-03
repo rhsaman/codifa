@@ -1480,6 +1480,72 @@ export async function gitDiscard(
   }
 }
 
+export interface GitBranches {
+  current: string
+  branches: string[]
+}
+
+/** List local git branches plus the current one. */
+export async function gitBranches(root: string): Promise<GitBranches | { error: string }> {
+  return sidecarGet<GitBranches>(`/git/branches?root=${encodeURIComponent(root)}`)
+}
+
+/** Checkout an existing branch, or create+checkout when create is true. */
+export async function gitCheckout(
+  root: string,
+  branch: string,
+  create = false,
+): Promise<{ current: string } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/git/checkout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, branch, create }),
+    })
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok) return { error: (body.detail as string) || `checkout failed (${res.status})` }
+    return body as unknown as { current: string }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+export interface GitAutoCommitResult {
+  commit: string
+  summary: string
+  message: string
+}
+
+/** Generate a commit message with one LLM call and commit, without touching chat. */
+export async function gitAutoCommit(
+  root: string,
+  provider: { kind: string; model: string; baseUrl: string; apiKeys: string[]; id?: string },
+): Promise<GitAutoCommitResult | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/git/autocommit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        root,
+        provider: provider.kind,
+        model: provider.model,
+        base_url: provider.baseUrl,
+        api_keys: provider.apiKeys,
+        provider_id: provider.id ?? "",
+      }),
+    })
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok) return { error: (body.detail as string) || `autocommit failed (${res.status})` }
+    return body as unknown as GitAutoCommitResult
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 // --- زمان‌بندی تسک‌ها (مثل Codex) -------------------------------------------
 
 export interface ScheduleUpsert {

@@ -1158,12 +1158,36 @@ function subArgSummary(activity: ToolActivity): string {
   const engine = String(args.engine ?? "");
   if (engine) parts.push(engine);
 
+  // explore fan-out: parallel read args (filePaths / paths / ranges).
+  // Prefer ranges (already "file:offset:limit") over raw filePaths to
+  // avoid the duplicated "filePaths:a,b ranges:a:1:200,b:350:70" line.
+  const rangesRaw = (args as Record<string, unknown>).ranges;
+  if (Array.isArray(rangesRaw) && rangesRaw.length > 0) {
+    const rs = rangesRaw.map((r) => String(r)).filter(Boolean);
+    if (rs.length > 0) parts.push(rs.length > 2 ? `${rs.slice(0, 2).join(", ")} +${rs.length - 2} more` : rs.join(", "));
+  } else if (typeof rangesRaw === "string" && rangesRaw) {
+    parts.push(rangesRaw);
+  } else {
+    const listRaw =
+      (args as Record<string, unknown>).filePaths ??
+      (args as Record<string, unknown>).paths;
+    if (Array.isArray(listRaw) && listRaw.length > 0) {
+      const ps = listRaw.map((p) => String(p)).filter(Boolean);
+      if (ps.length > 0) parts.push(ps.length > 2 ? `${ps.slice(0, 2).join(", ")} +${ps.length - 2} more` : ps.join(", "));
+    }
+  }
+
   // Fallback: any remaining args as `key:value` chips (same as ToolArgs in the
   // card head) so no tool ever collapses to an empty row.
   const covered = new Set([
     "command",
     "path",
     "filePath",
+    "filePaths",
+    "paths",
+    "ranges",
+    "include",
+    "includes",
     "offset",
     "limit",
     "start",

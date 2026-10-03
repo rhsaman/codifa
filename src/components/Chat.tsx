@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, getChatProvider, useStore } from "../lib/store";
+import { getActiveProvider, getChatProvider, providerApiKeys, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { resetStreamForRetry, isKeepTextRetry, planRetry } from "../lib/retry";
 import {
@@ -50,6 +50,7 @@ import {
   listSkills,
   listMcp,
   triggerCompact,
+  gitAutoCommit,
   gitDiscard,
   type CompactResult,
   type StreamParams,
@@ -4836,16 +4837,25 @@ export function ChatPanel() {
           root={wroot}
           disabled={busy}
           onCommit={() => {
-            if (!wroot || busy) return;
-            void send(
-              "Commit all uncommitted changes in the workspace using the git_commit tool (stage everything needed and commit).",
-              [],
-              [],
-              false,
-              undefined,
-              undefined,
-              true,
-            );
+            if (!wroot || busy || !chat) return;
+            const chatId = chat.id;
+            void (async () => {
+              setBusyFor(chatId, true);
+              try {
+                const res = await gitAutoCommit(wroot, {
+                  kind: provider.kind,
+                  model: activeModel,
+                  baseUrl: provider.baseUrl,
+                  apiKeys: providerApiKeys(provider),
+                  id: provider.id,
+                });
+                if ("error" in res) {
+                  useStore.getState().setChatCmdError(chatId, res.error);
+                }
+              } finally {
+                setBusyFor(chatId, false);
+              }
+            })();
           }}
           onUndo={() => {
             if (!wroot || busy) return;

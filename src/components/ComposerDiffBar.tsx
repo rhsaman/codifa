@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { gitDiff, gitStatus } from "../lib/api";
+import { gitBranches, gitCheckout, gitDiff, gitStatus } from "../lib/api";
 import { buildUncommittedFiles, sumDiffStats } from "../lib/uncommitted";
 import { useViewerTabs } from "../lib/viewerTabs";
 
@@ -21,6 +21,9 @@ export function ComposerDiffBar({
   const [files, setFiles] = useState(0);
   const [adds, setAdds] = useState(0);
   const [dels, setDels] = useState(0);
+  const [branches, setBranches] = useState<string[]>([]);
+  const [current, setCurrent] = useState("");
+  const [switching, setSwitching] = useState(false);
 
   useEffect(() => {
     if (!root) {
@@ -66,9 +69,85 @@ export function ComposerDiffBar({
     };
   }, [root]);
 
-  if (!root || files === 0) return null;
+  useEffect(() => {
+    if (!root) {
+      setBranches([]);
+      setCurrent("");
+      return;
+    }
+    let cancelled = false;
+    const loadBranches = async () => {
+      try {
+        const res = await gitBranches(root);
+        if (cancelled || "error" in res) return;
+        setBranches(res.branches);
+        setCurrent(res.current);
+      } catch {
+        /* branch list is non-critical — bar still shows diff counts */
+      }
+    };
+    void loadBranches();
+    const timer = setInterval(() => void loadBranches(), 10000);
+    const onFocus = () => void loadBranches();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [root]);
+
+  const handleBranchChange = async (name: string) => {
+    if (!root || !name || name === current || switching || disabled) return;
+    if (name === "__new__") {
+      const next = window.prompt("New branch name:");
+      if (!next || !next.trim()) return;
+      setSwitching(true);
+      try {
+        const res = await gitCheckout(root, next.trim(), true);
+        if (!( "error" in res)) {
+          setCurrent(res.current);
+          setBranches((b) => (b.includes(res.current) ? b : [...b, res.current]));
+        }
+      } finally {
+        setSwitching(false);
+      }
+      return;
+    }
+    setSwitching(true);
+    try {
+      const res = await gitCheckout(root, name);
+      if (!("error" in res)) setCurrent(res.current);
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  if (!root) return null;
+  if (files === 0 && branches.length === 0) return null;
   return (
     <div className="composer-diff-bar" dir="ltr">
+      {branches.length > 0 && (
+        <select
+          className="composer-diff-branch"
+          value={branches.includes(current) ? current : ""}
+          disabled={disabled || switching}
+          title="Current branch — click to switch"
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => {
+            e.stopPropagation();
+            void handleBranchChange(e.target.value);
+          }}
+        >
+          {branches.map((b) => (
+            <option key={b} value={b}>
+              {b}
+            </option>
+          ))}
+          <option value="__new__">+ New branch…</option>
+        </select>
+      )}
+      {files > 0 && (
       <button
         type="button"
         className="composer-diff-main"
@@ -87,14 +166,15 @@ export function ComposerDiffBar({
           ▸
         </span>
       </button>
-      {(onCommit || onUndo) && (
+      )}
+      {files > 0 && (onCommit || onUndo) && (
         <span className="composer-diff-actions">
           {onCommit && (
             <button
               type="button"
               className="composer-diff-btn commit"
               disabled={disabled}
-              title="Commit via agent"
+              title="Generate commit message and commit"
               onClick={(e) => {
                 e.stopPropagation();
                 onCommit();

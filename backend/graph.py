@@ -1720,39 +1720,50 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
         return False
 
 
-def _fa_skill_fallback(prompt: str, skills: list[dict]) -> str:
-    """Best-effort Persian keyword fallback: skill name or "".
+def _fa_skill_fallback(
+    prompt: str,
+    skills: list[dict],
+    rank_order: list[str] | None = None,
+) -> str:
+    """Scored, data-driven Persian fallback: best skill name or "".
 
-    Generic: matches the prompt against each skill's own ``fa_keywords``
-    frontmatter metadata first, then against English tokens from the skill's
-    name/description (covers code-switched prompts like "ui رو بهتر کن").
-    Used when embedding ranks are flat/empty on a Persian task turn.
-    Matching logic is fixed; per-skill data lives in the skill files, so new
-    skills need no code change. First skill in list order wins; never raises.
+    Every skill is scored against the prompt using its OWN frontmatter
+    ``fa_keywords`` (2 points per hit) plus English name/description token
+    overlap (1 point per token, covers code-switched prompts like
+    "ui رو بهتر کن"). The highest score wins; ties break by the laya
+    ``rank_order`` (embedding relevance first, then list order) so semantic
+    relevance decides between equally-matching skills. No per-skill logic
+    lives here — new skills need no code change. Zero score returns "".
     """
     try:
         p = (prompt or "").strip().lower()
         if not p or not skills:
             return ""
-        for s in skills:
+        pos = {str(n or "").casefold(): i for i, n in enumerate(rank_order or [])}
+        best: tuple[int, int, str] | None = None  # (score, -rank_pos, name)
+        for idx, s in enumerate(skills):
             if not isinstance(s, dict):
                 continue
+            score = 0
             for kw in s.get("fa_keywords") or []:
                 kw = str(kw or "").strip().lower()
                 if kw and kw in p:
-                    name = str(s.get("name") or "").strip()
-                    if name:
-                        return name
-        for s in skills:
-            if not isinstance(s, dict):
-                continue
+                    score += 2
             hay = f"{s.get('name') or ''} {s.get('description') or ''}".lower()
             for tok in set(re.findall(r"[a-z0-9]+", hay)):
                 if len(tok) >= 2 and tok in p:
-                    name = str(s.get("name") or "").strip()
-                    if name:
-                        return name
-        return ""
+                    score += 1
+            if score <= 0:
+                continue
+            name = str(s.get("name") or "").strip()
+            if not name:
+                continue
+            # Bigger score wins; on ties the earlier laya rank (then the
+            # earlier list position) wins; the name is a stable final key.
+            key = (score, -pos.get(name.casefold(), len(pos) + idx), name)
+            if best is None or key > best:
+                best = key
+        return best[2] if best else ""
     except Exception:  # noqa: BLE001 — fallback never breaks the turn
         return ""
 
@@ -2417,7 +2428,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 )
             except Exception:  # noqa: BLE001 — fallback loads best-effort
                 _fb_pool = []
-            _auto_name = _fa_skill_fallback(prompt, _fb_pool)
+            _auto_name = _fa_skill_fallback(prompt, _fb_pool, _skill_rank_order)
         if _auto_name:
             _picked = list(skills or [])
             if not any(str(n or "").strip().casefold() == _auto_name.casefold() for n in _picked):

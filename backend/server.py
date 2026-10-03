@@ -1201,6 +1201,23 @@ class GitCommitRequest(BaseModel):
     add_all: bool = False
 
 
+class GitCheckoutRequest(BaseModel):
+    root: str
+    branch: str = ""
+    create: bool = False
+
+
+class GitAutoCommitRequest(BaseModel):
+    root: str
+    provider: str = "custom"
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    env_var: str = ""
+    api_keys: list[str] = []
+    provider_id: str = ""
+
+
 @app.get("/git/status")
 async def git_status(root: Annotated[str, Query(min_length=1)] = "") -> dict:
     import git_tools
@@ -1267,6 +1284,88 @@ async def git_discard(req: GitRootRequest) -> dict:
     if "error" in out:
         raise HTTPException(status_code=400, detail=out["error"])
     return out
+
+
+@app.get("/git/branches")
+async def git_branches(root: Annotated[str, Query(min_length=1)] = "") -> dict:
+    import git_tools
+
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    return git_tools.git_branches(root)
+
+
+@app.post("/git/checkout")
+async def git_checkout(req: GitCheckoutRequest) -> dict:
+    import git_tools
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    out = git_tools.git_checkout(req.root, req.branch, req.create)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
+@app.post("/git/autocommit")
+async def git_autocommit(req: GitAutoCommitRequest) -> dict:
+    """Generate a commit message with one LLM call and commit (no chat)."""
+    import git_tools
+    from llm import build_chat_model, llm_complete
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    if not req.model:
+        raise HTTPException(status_code=400, detail="no model selected")
+    status = git_tools.git_status(req.root)
+    if "error" in status:
+        raise HTTPException(status_code=400, detail=status["error"])
+    if not status.get("entries"):
+        raise HTTPException(status_code=400, detail="nothing to commit")
+    diff = git_tools.git_diff(req.root)
+    if "error" in diff:
+        raise HTTPException(status_code=400, detail=diff["error"])
+    staged = git_tools.git_diff(req.root, staged=True)
+    diff_text = (diff.get("diff") or "") + ("\n" + staged.get("diff") if staged.get("diff") else "")
+    if not diff_text.strip():
+        raise HTTPException(status_code=400, detail="nothing to commit")
+    if len(diff_text) > 20000:
+        diff_text = diff_text[:20000]
+    try:
+        mo = build_chat_model(
+            req.provider,
+            req.model,
+            req.base_url,
+            req.api_key,
+            req.env_var,
+            req.api_keys,
+            temperature=0.0,
+            thinking_level="off",
+            timeout=60,
+            provider_id=req.provider_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        text, _usage = await asyncio.wait_for(
+            llm_complete(
+                mo,
+                system="You write concise git commit messages. Reply with ONLY the commit message, one line, no quotes, no prefix.",
+                user=f"Write a short commit message for these changes:\n\n{diff_text}",
+            ),
+            timeout=90,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=400, detail="model timed out generating commit message") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    message = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    if not message:
+        raise HTTPException(status_code=400, detail="model returned an empty commit message")
+    out = git_tools.git_commit(req.root, message, True)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return {**out, "message": message}
 
 
 class OAuthStartRequest(BaseModel):

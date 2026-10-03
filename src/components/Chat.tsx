@@ -1703,6 +1703,7 @@ export function ChatPanel() {
             : {}),
         });
       }
+      const turnStart = prev?.workingStartedAt ?? Date.now();
       assistantMsg = s.addMessage(chat.id, {
         role: "assistant",
         content: "",
@@ -1710,7 +1711,7 @@ export function ChatPanel() {
         toolActivity: [],
         segments: [],
         streaming: true,
-        workingStartedAt: Date.now(),
+        workingStartedAt: turnStart,
       });
       bubbleSealed = false;
     };

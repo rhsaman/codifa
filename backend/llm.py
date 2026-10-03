@@ -49,6 +49,7 @@ from providers import (
     UA_LADDER,
     _provider_meta,
     env_key,
+    is_opencode,
     model_timeout,
     normalize_base_url,
     qualify_model_id,
@@ -222,7 +223,7 @@ def resolve_key(
 def _extra_headers(
     provider: str, base_url: str, cache: bool, session_id: str = ""
 ) -> dict[str, str]:
-    """Best-effort request headers (UA spoof + OpenRouter cache/session)."""
+    """Best-effort request headers (UA spoof + cache/session stickiness)."""
     headers: dict[str, str] = {}
     if provider == "custom" and base_url and not _is_local_provider(provider, base_url):
         # Custom OpenAI-compatible gateways may block "unknown" HTTP clients by
@@ -234,12 +235,25 @@ def _extra_headers(
         # OpenRouter honours cache breakpoints via Anthropic-style headers; we
         # ask it to cache the system prompt + tool definitions + last message.
         headers["x-openrouter-cache"] = "true"
-    if session_id and _provider_meta(provider).get("model_class") == "openrouter":
+    if session_id and (
+        _provider_meta(provider).get("model_class") == "openrouter"
+        or _provider_meta(provider).get("session_stickiness")
+        or is_opencode(provider, base_url)
+        or (
+            base_url
+            and not _is_local_provider(provider, base_url)
+            and _provider_meta(provider).get("model_class") in (None, "openai")
+        )
+    ):
         # Sticky routing: OpenRouter derives the cache key from the FIRST
         # system+user messages by default; agent loops mutate the transcript
         # every step, so that hash drifts and cache hits vanish. A stable
         # per-chat session id keeps the prompt cache warm across the whole
-        # conversation (docs: "For agent loops, set session_id").
+        # conversation (docs: "For agent loops, set session_id"). The opencode
+        # zen gateway gets the same header so sticky sessions land on warm
+        # backends there too, as do router gateways (9router-style custom
+        # entries) and any remote OpenAI-compatible endpoint; gateways that
+        # do not recognize it ignore it. Local servers are excluded.
         headers["x-session-id"] = session_id
     return headers
 

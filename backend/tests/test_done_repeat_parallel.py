@@ -109,10 +109,12 @@ async def test_repetition_warn_not_emitted_on_first_occurrence():
     ``_repeat_count >= 1`` so it only fires when there's an actual repeat."""
     events = await _run_with_model(_RepeatModel())
 
-    # The model loops on the same tool call 3 times → hard stop fires
-    # ("repetition loop" error event). The "Repetition detected" warn should
-    # appear for the 1st and 2nd repeat (counts 1 and 2), NOT for the
-    # 0-time initial occurrence.
+    # The model loops on the same tool call → nudges, then a firm stop order,
+    # then a graceful finish with warns (never an error banner). The
+    # "Repetition detected" warn should appear for the 1st and 2nd repeat
+    # (counts 1 and 2), NOT for the 0-time initial occurrence.
+    errors = [e for e in events if e.get("kind") == "error"]
+    assert not errors, f"loop recovery must not emit an error banner: {errors}"
     warns = [e for e in events if e.get("kind") == "warn" and "Repetition detected" in e.get("content", "")]
     assert warns, "expected at least one 'Repetition detected' warn before the hard stop"
     # CRITICAL: no warn may carry "0 time(s) in a row" — that's the bug.

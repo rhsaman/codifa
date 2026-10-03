@@ -5964,6 +5964,20 @@ When you need to read several files, read multiple independent files in parallel
                 )
                 emit(
                     {
+                        "kind": "tool",
+                        "tool": "read",
+                        "args": {
+                            "filePaths": base_paths,
+                            "offset": offset,
+                            "limit": limit,
+                            **({"ranges": list(ranges)} if ranges else {}),
+                            **({"symbols": list(symbols)} if symbols else {}),
+                        },
+                        "model": _main_name,
+                    }
+                )
+                emit(
+                    {
                         "kind": "tool_result",
                         "tool": "read",
                         "summary": "skipped (already in context)",

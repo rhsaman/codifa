@@ -114,3 +114,56 @@ async def test_thinking_signal_closes_on_first_text(run_events, mock_server, wor
         f"thinking window stayed open through text generation "
         f"(close@{close_index}, last text@{text_indices[-1]})"
     )
+
+
+async def test_long_silent_reasoning_stream_signals_thinking(run_events, mock_server, workspace, monkeypatch):
+    """A reasoning model whose pre-answer content streams for a long time with
+    no dedicated reasoning field must light the thinking indicator (delayed)
+    instead of leaving the UI on a frozen 'waiting for model' pill — while a
+    fast straight-to-text answer stays signal-free (see the test above). The
+    full answer must still arrive at stream end via the re-emit path."""
+    import graph as _graph
+
+    # Fake clock: every monotonic() call advances 1s, so a multi-chunk dropped
+    # stream spans well over the 5s signal delay without any real sleeping.
+    _tick = [1000.0]
+
+    def _fake_monotonic():
+        _tick[0] += 1.0
+        return _tick[0]
+
+    monkeypatch.setattr(_graph.time, "monotonic", _fake_monotonic)
+    base, mock = mock_server
+    pieces = [f"w{i} " for i in range(8)]
+    mock.script = [
+        [
+            {"id": f"c-{i}", "object": "chat.completion.chunk", "created": 0,
+             "model": "mock-model",
+             "choices": [{"index": 0, "delta": {"content": t}, "finish_reason": None}]}
+            for i, t in enumerate(pieces)
+        ]
+        + [{"id": "c-end", "object": "chat.completion.chunk", "created": 0,
+            "model": "mock-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}],
+    ]
+    events = []
+    async for ev in run_agent(
+        provider="custom",
+        model_name="mock-model",
+        base_url=base,
+        api_key="test",
+        root=str(workspace),
+        mode="coder",
+        prompt="سلام",
+        history=[],
+        chat_id="pytest-think-delayed",
+        model_reasoning=True,
+    ):
+        events.append(ev)
+
+    thinking = [e for e in events if e.get("kind") == "thinking"]
+    assert thinking and thinking[0] == {"kind": "thinking", "active": True}
+    assert {"kind": "thinking", "active": False} in thinking
+    text = "".join(e.get("content", "") for e in events if e.get("kind") == "text")
+    for p in pieces:
+        assert p in text, f"dropped answer piece missing from re-emit: {p!r}"

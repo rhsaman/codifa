@@ -58,6 +58,18 @@ def rank_with_laya(query: str, candidates: list[dict] | list[str], top_k: int | 
         return []
 
 
+# Rerank result cache: (query, files fingerprint) -> (timestamp, file order).
+# Repeat turns ("continue", retries) re-rank the same files with the same
+# query — without this every one of those turns pays the full ONNX embedding
+# cost again (~15s seen in traces). Nothing is ever hidden by the cache: on a
+# miss the ranking is recomputed exactly as before. Staleness is bounded by
+# _RERANK_CACHE_TTL and by the fingerprint (file add/remove or symbol-count
+# changes miss immediately).
+_RERANK_CACHE: dict[tuple[str, tuple], tuple[float, list[str]]] = {}
+_RERANK_CACHE_LOCK = threading.Lock()
+_RERANK_CACHE_TTL = 120.0
+
+
 def _apply_laya_rerank(
     query: str,
     ranked_tags: list[Tag],
@@ -73,11 +85,6 @@ def _apply_laya_rerank(
     made the first token take 10s+ on large workspaces.
     """
     if not query or not str(query).strip() or not ranked_tags:
-        return ranked_tags
-    # Fast path: very short prompts (e.g. "continue") carry no ranking signal.
-    # Embedding 120 files through ONNX on CPU for these costs seconds (15s seen
-    # in traces) while the order stays flat — keep PageRank order instead.
-    if len(str(query).strip()) < 12:
         return ranked_tags
     # Bound embedding work: rerank at most this many top files, keep the tail
     # in PageRank order. 120 files ≈ 4 ONNX batches — ~1s on CPU instead of 10s+.
@@ -95,12 +102,28 @@ def _apply_laya_rerank(
             tags = by_file[rel]
             desc = " ".join(t.name for t in tags[:20])
             candidates.append({"name": rel, "description": desc})
-        _start = time.monotonic()
-        ranked = rank_with_laya(str(query), candidates, top_k=len(candidates))
-        try:
-            _elapsed = int((time.monotonic() - _start) * 1000)
-        except Exception:  # noqa: BLE001
-            _elapsed = 0
+        _fingerprint = (str(query), tuple(sorted((r, len(by_file[r])) for r in all_rels)))
+        with _RERANK_CACHE_LOCK:
+            _cached = _RERANK_CACHE.get(_fingerprint)
+            if _cached is not None and (time.monotonic() - _cached[0]) < _RERANK_CACHE_TTL:
+                _order_names = _cached[1]
+                _elapsed = 0
+                ranked = [{"name": _n} for _n in _order_names]
+            else:
+                _cached = None
+        if _cached is None:
+            _start = time.monotonic()
+            ranked = rank_with_laya(str(query), candidates, top_k=len(candidates))
+            try:
+                _elapsed = int((time.monotonic() - _start) * 1000)
+            except Exception:  # noqa: BLE001
+                _elapsed = 0
+            if ranked:
+                with _RERANK_CACHE_LOCK:
+                    _RERANK_CACHE[_fingerprint] = (
+                        time.monotonic(),
+                        [str(r.get("name") or "") for r in ranked],
+                    )
         if rank_info is not None:
             try:
                 rank_info["ranked"] = ranked
@@ -242,11 +265,12 @@ _GENERIC_PATTERNS = [
     (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?interface\s+([A-Za-z_]\w*)"), "interface"),
 ]
 
-# کش: root -> (timestamp, map, signature)
+# Cache: root -> (timestamp, map, signature)
 _CACHE: dict[str, tuple[float, dict, tuple[float, int]]] = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_TTL = 60.0  # بودن ۱۰ ثانیه باعث miss مدام توی مکالمه‌های عادی می‌شد؛
-                   # invalidation بر اساس signature هست پس بالا بردنش امنه.
+_CACHE_TTL = 300.0  # Signature-based invalidation (mtime + file count) keeps
+# raising this safe: slow multi-minute turns reuse a warm map instead of
+# paying a full walk + parse + PageRank rebuild on every turn. Was 60s.
 
 # Symbol name + location (aider.Tag-like). ``end_line`` is the 0-indexed
 # closing line of the definition (-1 when unknown); ``top_level`` marks

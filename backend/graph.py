@@ -49,6 +49,39 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+def _env_timeout(name: str, default_s: float) -> float:
+    """Read a timeout budget from the environment with a safe fallback."""
+    try:
+        value = float(os.environ.get(name, "") or default_s)
+    except (TypeError, ValueError):
+        return default_s
+    return value if value > 0 else default_s
+
+
+async def _bounded_to_thread(
+    label: str, chat_id: str, timeout_s: float, func, /, *args, **kwargs
+):
+    """Run sync ``func`` off the event loop with a fail-open timeout.
+
+    Returns ``func``'s result, or raises ``asyncio.TimeoutError`` after
+    ``timeout_s`` (callers fall back to continuing without that input, so a
+    wedged worker can never freeze a turn). The orphaned worker thread keeps
+    running detached and its late result is discarded.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs), timeout_s
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[turn-ctx] %s timed out after %.0fs, continuing without it (chat=%s)",
+            label,
+            timeout_s,
+            str(chat_id or "")[:8],
+        )
+        raise
+
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -2343,7 +2376,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         try:
             _rank_skills = _agents._load_skills(root) or []
             if len(_rank_skills) > 1:
-                _skill_ranked = await asyncio.to_thread(
+                _skill_ranked = await _bounded_to_thread(
+                    "skill-rank",
+                    str(chat_id or ""),
+                    _env_timeout("CODIFA_SKILL_RANK_TIMEOUT", 60.0),
                     _rank_candidates,
                     prompt,
                     [
@@ -2451,6 +2487,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # personalization) بدون اینکه فایلی کلاً حذف بشه.
             _mentioned_fnames: set[str] = set()
             _mentioned_idents: set[str] = set()
+            _hist_chars_for_map = 0
             _hist_for_map = state.get("history") or []
             for _turn in _hist_for_map:
                 for _ta in _turn.get("toolActivity") or []:
@@ -2461,6 +2498,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         _mentioned_fnames.add(os.path.relpath(_p, root))
                 _content = _turn.get("content") or ""
                 if isinstance(_content, str):
+                    _hist_chars_for_map += len(_content)
                     for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
                         if _looks_like_code_ident(_m):
                             _mentioned_idents.add(_m)
@@ -2468,6 +2506,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # ask توکن‌حساس‌تره → بودجه کمتر.
             if small_ctx:
                 max_map_tokens = _agents._SMALL_CTX_CODE_MAP_TOKENS  # 256
+            elif _hist_chars_for_map > 400_000:
+                # Huge history already shows the model the files it touched; a
+                # tighter map avoids re-sending kilobytes it has just seen.
+                # Ranking still puts mentioned/chat files first, so the logic
+                # is unchanged — only the low-rank tail is trimmed.
+                max_map_tokens = 512
             else:
                 max_map_tokens = 512 if mode == "ask" else 1024
             # نقشه کامل فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
@@ -2524,7 +2568,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     _skip_code_map = False
             _map_rank_info: dict = {}
             code_map_block = (
-                await asyncio.to_thread(
+                await _bounded_to_thread(
+                    "codemap",
+                    str(chat_id or ""),
+                    _env_timeout("CODIFA_CODEMAP_TIMEOUT", 120.0),
                     format_symbol_map,
                     root,
                     max_map_tokens=max_map_tokens,
@@ -3090,7 +3137,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             _v = float(_tctx_marks.get(_k, 0.0))
             _tctx_parts.append(f"{_k}={_v - _tctx_prev:.1f}s")
             _tctx_prev = _v
-        logger.info(
+        (logger.warning if _tctx_total > 5.0 else logger.info)(
             "[turn-ctx] total=%.1fs %s mode=%s chat=%s",
             _tctx_total,
             " ".join(_tctx_parts),
@@ -4117,6 +4164,10 @@ async def _run_mode_turn(
         _last_tool_sig = ""
         _repeat_count = 0
         _MAX_REPEAT = 3
+        # Give-up ceiling for the graceful recovery below: the model ignored
+        # the firm "stop tools, summarize" nudge twice more. The turn then ends
+        # with a warn (never an error) and whatever was produced so far.
+        _MAX_REPEAT_GRACE = 5
         # Cross-step batching tracker: catches the model firing ONE batchable
         # call per step (the common case when parallel_tool_calls is not
         # sent) and reminds it to batch after a few consecutive same-scope
@@ -4135,6 +4186,10 @@ async def _run_mode_turn(
         # transcript valid: a tool_calls AIMessage must be followed by its
         # ToolMessages before any new HumanMessage).
         _nudge_pending = False
+        # Firm-recovery flag (see the graceful stop below): a stronger transient
+        # "stop calling tools, summarize now" message for a loop that survived
+        # the regular nudge. Same transient channel as _nudge_pending.
+        _final_nudge_pending = False
         # Batching / repetition reminders are TRANSIENT: sent with the very next
         # request only, never stored in msgs. Stored copies were re-sent on every
         # later step (and saved into the turn history) with no added value.
@@ -4278,6 +4333,11 @@ async def _run_mode_turn(
                 # may span multiple streamed deltas.
                 _in_think = False
                 _think_buf = ""
+                # When pre-answer content is dropped as suspected-CoT (see the
+                # two drop sites below), remember when the dropping started so
+                # the thinking window is signalled only if the silence lasts —
+                # a fast straight-to-text answer must stay signal-free.
+                _drop_t0 = 0.0
                 # Degenerate text-loop guard: accumulate the visible reply in a
                 # buffer and check on every chunk whether the model has started
                 # repeating itself verbatim (e.g. "Let me check. Let me check."
@@ -4328,16 +4388,6 @@ async def _run_mode_turn(
                     request_messages = [*request_messages, *_transient_msgs]
                 _llm_t0 = time.monotonic()
                 _first_chunk_t = 0.0
-                try:
-                    queue.put_nowait(
-                        {
-                            "kind": "status",
-                            "stage": "waiting-model",
-                            "content": f"Waiting for model (step {steps})",
-                        }
-                    )
-                except Exception:  # noqa: BLE001, S110 — progress never breaks turn
-                    pass
                 async for chunk in bound.astream(request_messages):
                     if not _first_chunk_t:
                         _first_chunk_t = time.monotonic() - _llm_t0
@@ -4401,7 +4451,18 @@ async def _run_mode_turn(
                         # plain content before the real answer: while reasoning is
                         # enabled and we haven't seen a genuine reasoning field,
                         # treat this pre-answer content as thinking and drop it.
+                        # Signal the thinking window only if the silence lasts, so
+                        # the UI shows "Thinking" instead of a frozen "waiting
+                        # for model" pill while the model reasons (closed at
+                        # stream end / first real text). Fast answers stay
+                        # signal-free.
                         if _model_reasoning and not _saw_real_reasoning:
+                            _now = time.monotonic()
+                            if not _drop_t0:
+                                _drop_t0 = _now
+                            if not _thinking_active and _now - _drop_t0 > 5.0:
+                                _thinking_active = True
+                                queue.put_nowait({"kind": "thinking", "active": True})
                             continue
                         queue.put_nowait({"kind": "text", "content": content})
                         _emitted_text_len[0] += len(content)
@@ -4453,6 +4514,12 @@ async def _run_mode_turn(
                                     )
                                     break
                                 if _model_reasoning and not _saw_real_reasoning:
+                                    _now = time.monotonic()
+                                    if not _drop_t0:
+                                        _drop_t0 = _now
+                                    if not _thinking_active and _now - _drop_t0 > 5.0:
+                                        _thinking_active = True
+                                        queue.put_nowait({"kind": "thinking", "active": True})
                                     continue
                                 queue.put_nowait({"kind": "text", "content": t})
                                 _emitted_text_len[0] += len(t)
@@ -4796,25 +4863,40 @@ async def _run_mode_turn(
             else:
                 _repeat_count = 0
             _last_tool_sig = _tool_sig
-            if _repeat_count >= _MAX_REPEAT:
+            if _repeat_count >= _MAX_REPEAT_GRACE:
+                # Give-up ceiling: the model ignored the firm nudge twice more.
+                # End the turn GRACEFULLY with whatever was produced so far — a
+                # warn, never an error. There is nothing to retry (retrying the
+                # identical transcript would loop again), and the next turn
+                # starts fresh from history instead of replaying this loop, so
+                # run_flags is deliberately left untouched.
                 queue.put_nowait(
                     {
-                        "kind": "error",
+                        "kind": "warn",
                         "content": (
-                            "The model entered a repetition loop (it kept calling the "
-                            "same tool with identical arguments on every step). "
-                            "Stopping to avoid an endless, duplicated response. Try "
-                            "rephrasing your request or breaking it into smaller steps."
+                            "Stopped repeating the same tool call — showing "
+                            "results so far. Rephrase the request or break it "
+                            "into smaller steps to continue."
                         ),
                     }
                 )
-                # Mark the turn as failed so run_graph._drive leaves the durable
-                # resume file behind (a reconnect/retry can replay the already-done
-                # tool work instead of re-running it from zero).
-                if run_flags is not None:
-                    with contextlib.suppress(Exception):
-                        run_flags["error"] = True
                 break
+            elif _repeat_count >= _MAX_REPEAT:
+                # Firm recovery instead of a hard error: tell the model plainly
+                # to stop calling tools and summarize, then let it continue.
+                # The message rides the transient channel (next request only).
+                queue.put_nowait(
+                    {
+                        "kind": "warn",
+                        "content": (
+                            "Repetition detected: the same tool call was issued "
+                            f"{_repeat_count} time(s) in a row with identical "
+                            "arguments. STOP calling tools and write a summary "
+                            "of what you found so far instead."
+                        ),
+                    }
+                )
+                _final_nudge_pending = True
             elif _tool_sig and _repeat_count >= 1:
                 # Recoverable repetition: the SAME tool call with IDENTICAL
                 # arguments just repeated, but we haven't hit the hard-stop yet.
@@ -5044,6 +5126,21 @@ async def _run_mode_turn(
                         )
                     )
                 )
+            # Firm-recovery nudge (see the graceful stop above): after the loop
+            # survived the regular nudge, order the model to stop tool-calling
+            # and summarize. Same transient channel — next request only.
+            if _final_nudge_pending:
+                _final_nudge_pending = False
+                _transient_msgs.append(
+                    HumanMessage(
+                        content=(
+                            "FINAL WARNING: you repeated the same tool call with "
+                            "identical arguments on consecutive steps. Do NOT "
+                            "call any tool on the next step — write a text "
+                            "summary of your findings so far instead."
+                        )
+                    )
+                )
             # In-turn context management: single entry-point driven by the
             # user's compact_at_percent setting.  _maybe_auto_compact handles
             # BOTH cheap truncation (old ToolMessage placeholders) AND heavier
@@ -5071,7 +5168,10 @@ async def _run_mode_turn(
             _step_total_s = time.monotonic() - _step_t0
             try:
                 _first_s = _first_chunk_t if _first_chunk_t else _llm_wait_s
-                logger.info(
+                _slow_step = (
+                    _step_total_s > 15.0 or _llm_wait_s > 30.0 or _tool_exec_s > 10.0
+                )
+                (logger.warning if _slow_step else logger.info)(
                     "[step-timing] chat=%s step=%s total=%.1fs llm=%.1fs first_chunk=%.1fs tools=%.1fs n_tools=%s model=%s",
                     str(chat_id or "")[:8],
                     steps,

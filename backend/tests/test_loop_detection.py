@@ -1,15 +1,17 @@
-"""Live test: the agentic tool-loop detects and stops a repetition loop.
+"""Live test: the agentic tool-loop detects and recovers from a repetition loop.
 
 A real repetition loop repeats the SAME tool call with IDENTICAL arguments on
 every step. Genuine multi-step work varies the args (e.g. reading different
 files), so it must NOT trip the guard. The guard in graph._inner is based on
 the tool-call signature (name + args), not emitted text -- matching opencode's
-doom-loop detection. It must stop after a few identical-signature steps and
-emit a single friendly error event instead of looping up to MAX_STEPS.
+doom-loop detection. It nudges the model to vary (twice), then orders it to
+stop tool-calling and summarize, and finally ends the turn gracefully with a
+warn (never an error banner) instead of looping up to MAX_STEPS.
 
 Guards:
 1. A model that calls the SAME tool with IDENTICAL args every step (even with
-   identical text) is stopped and a "repetition loop" error event is emitted.
+   identical text) is stopped after a bounded number of steps with warns and
+   NO error event -- the turn ends gracefully with results so far.
 2. A model that emits identical TEXT but calls DIFFERENT tools (different args)
    each step is NOT flagged -- that is genuine multi-step work.
 3. A normal text-only reply (no tool calls) is NOT flagged as a loop.
@@ -126,15 +128,17 @@ async def _run_loop_detection_cases() -> None:
         "request": "x",
     }
 
-    # --- Case 1: repetition loop (same tool + identical args) is detected. -----
+    # --- Case 1: repetition loop (same tool + identical args) is recovered. -----
     loop_events = await _run_with(_LoopModel(), state)
     errors = [e for e in loop_events if e.get("kind") == "error"]
-    assert errors, "expected a repetition-loop error event"
-    assert "repetition loop" in errors[0].get("content", ""), errors[0]
+    assert not errors, f"loop must end gracefully without an error banner: {errors}"
+    warns = [e for e in loop_events if e.get("kind") == "warn"]
+    assert warns, "expected recovery warns while the loop persists"
     text_events = [e for e in loop_events if e.get("kind") == "text"]
-    # Bounded: the guard trips after _MAX_REPEAT identical steps, NOT at MAX_STEPS.
+    # Bounded: the guard gives up after _MAX_REPEAT_GRACE identical steps
+    # (nudges + firm stop order), NOT at MAX_STEPS.
     assert len(text_events) <= 10, f"too many duplicated text events: {len(text_events)}"
-    print(f"  repetition loop stopped after {len(text_events)} text events")
+    print(f"  repetition loop recovered after {len(text_events)} text events")
 
     # --- Case 2: identical text but DIFFERENT tools is NOT a loop. -------------
     diff_events = await _run_with(_SameTextDiffToolsModel(), state)

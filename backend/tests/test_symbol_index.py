@@ -146,3 +146,49 @@ def test_rank_with_laya_reorders(monkeypatch):
         _write(d, "b.py", "def bar():\n    pass\n")
         out = format_symbol_map(d, query="bar feature")
         assert out.find("b.py") < out.find("a.py")
+
+
+def test_rerank_cache_reuses_result_for_repeat_query(monkeypatch):
+    # Repeat turns with the same query over unchanged files must reuse the
+    # cached order instead of paying the embedding cost again.
+    import symbol_index
+
+    calls: list[str] = []
+
+    def fake_rank(query, candidates, top_k=None):
+        calls.append(query)
+        ordered = sorted(candidates, key=lambda c: 0 if c["name"] == "b.py" else 1)
+        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in ordered]
+
+    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
+    symbol_index._RERANK_CACHE.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    pass\n")
+        out1 = format_symbol_map(d, query="repeat-query-cache-probe-xyz")
+        out2 = format_symbol_map(d, query="repeat-query-cache-probe-xyz")
+    assert len(calls) == 1
+    assert out1 == out2
+    assert out1.find("b.py") < out1.find("a.py")
+
+
+def test_rerank_cache_miss_on_new_query_or_new_file(monkeypatch):
+    import symbol_index
+
+    calls: list[str] = []
+
+    def fake_rank(query, candidates, top_k=None):
+        calls.append(query)
+        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in candidates]
+
+    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
+    symbol_index._RERANK_CACHE.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "a.py", "def foo():\n    pass\n")
+        _write(d, "b.py", "def bar():\n    pass\n")
+        format_symbol_map(d, query="first-cache-miss-probe-xyz")
+        format_symbol_map(d, query="second-cache-miss-probe-xyz")
+        assert len(calls) == 2
+        _write(d, "c.py", "def baz():\n    pass\n")
+        format_symbol_map(d, query="second-cache-miss-probe-xyz")
+        assert len(calls) == 3

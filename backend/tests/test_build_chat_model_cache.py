@@ -38,9 +38,40 @@ def test_extra_headers_session_id_openrouter():
 
 
 def test_extra_headers_session_id_other_providers_omitted():
-    # Sticky routing is an OpenRouter feature; other providers must not see it.
+    # Sticky routing is an OpenRouter/opencode-gateway feature; other providers
+    # must not see it.
     for provider in ("google", "ollama", "custom"):
         headers = _extra_headers(provider, "", True, session_id="chat-42")
+        assert "x-session-id" not in headers
+
+
+def test_extra_headers_session_id_opencode_gateway():
+    # Any provider pointed at the opencode zen gateway gets sticky routing so
+    # repeated full-context steps land on a warm backend. Unknown headers are
+    # ignored elsewhere, so this is safe for custom "oc"-style entries too.
+    for provider in ("custom", "oc"):
+        headers = _extra_headers(
+            provider, "https://opencode.ai/zen/v1", False, session_id="chat-42"
+        )
+        assert headers.get("x-session-id") == "chat-42"
+    # Same provider id against a non-opencode gateway stays untouched.
+    headers = _extra_headers(
+        "custom", "https://some-gateway.example.com/v1", False, session_id="chat-42"
+    )
+    assert headers.get("x-session-id") == "chat-42"
+
+
+def test_extra_headers_session_id_router_gateway():
+    # Router gateways (9router-style entries, tokenrouter) get sticky routing
+    # too; local servers never do.
+    headers = _extra_headers("tokenrouter", "", False, session_id="chat-42")
+    assert headers.get("x-session-id") == "chat-42"
+    headers = _extra_headers(
+        "oc", "https://api.9router.example.com/v1", False, session_id="chat-42"
+    )
+    assert headers.get("x-session-id") == "chat-42"
+    for base in ("http://localhost:8080/v1", "http://127.0.0.1:11434/v1"):
+        headers = _extra_headers("custom", base, False, session_id="chat-42")
         assert "x-session-id" not in headers
 
 

@@ -237,6 +237,10 @@ _PROVIDERS: dict[str, dict] = {
         "models_query": "?limit=200",  # gateway 400s on /models without any arg
         "auto_think": True,
         "parallel_calls": True,
+        # Sticky sessions keep repeated full-context agent steps on a warm
+        # backend (x-session-id in llm._extra_headers); gateways that do not
+        # recognize the header ignore it.
+        "session_stickiness": True,
     },
 }
 

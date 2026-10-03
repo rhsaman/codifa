@@ -11,6 +11,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import asyncio
+import threading
+
+import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import graph as _graph
@@ -73,3 +77,37 @@ def test_per_chat_isolation():
     # chatA دومین بار با همون هش → marker می‌فرسته (مستقل از chatB)
     a2 = _graph._dedup_code_map(_FULL_MAP, "h1", "chatA", _history_with_full_map())
     assert a2 == _UNCHANGED
+
+
+def test_bounded_to_thread_returns_fast_result():
+    async def _run():
+        return await _graph._bounded_to_thread(
+            "probe", "chatX", 5.0, lambda a, b=0: a + b, 2, b=3
+        )
+
+    assert asyncio.run(_run()) == 5
+
+
+def test_bounded_to_thread_timeout_raises_for_fail_open():
+    # A wedged worker must surface as TimeoutError (callers fall back to
+    # continuing without that input) instead of freezing the turn. The event
+    # lets the orphaned thread exit right after instead of lingering.
+    done = threading.Event()
+
+    async def _run():
+        with pytest.raises(asyncio.TimeoutError):
+            await _graph._bounded_to_thread(
+                "probe", "chatX", 0.05, lambda: done.wait(10)
+            )
+        done.set()
+
+    asyncio.run(_run())
+
+
+def test_env_timeout_falls_back_to_default():
+    assert _graph._env_timeout("CODIFA_TEST_MISSING_TIMEOUT", 42.0) == 42.0
+    os.environ["CODIFA_TEST_TIMEOUT"] = "not-a-number"
+    try:
+        assert _graph._env_timeout("CODIFA_TEST_TIMEOUT", 42.0) == 42.0
+    finally:
+        del os.environ["CODIFA_TEST_TIMEOUT"]

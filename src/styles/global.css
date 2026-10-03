@@ -9587,14 +9587,7 @@ textarea {
   opacity: 0.55;
 }
 
-/* Once a call finishes, the row settles to plain text + chevron (Claude.ai
-   style) — no ms badge, no success check. Both still show WHILE running (a
-   live signal that something's happening), and duration reappears as a
-   "Duration" line in the expand panel so it isn't actually lost, just moved
-   out of the resting view. */
-.trace-row.done .trace-row-ms {
-  display: none;
-}
+/* Elapsed time stays visible after a call finishes, left of the chevron. */
 
 /* Status icons: check/x use SVG, styled inline */
 .status-ok {

@@ -91,6 +91,25 @@ async def test_subagent_readonly_tools_run_concurrently():
     assert len(peaks) == 3, f"expected 3 tool executions, got {len(peaks)}"
 
 
+async def test_subagent_emits_status_progress_per_step():
+    """Explore must emit a visible status event each step so long runs do not
+    look frozen on Working between tool results."""
+    events: list[dict] = []
+    model = _RecordingModel(
+        tool_calls=[{"name": "tool_a", "args": {}, "id": "c1"}],
+    )
+    result = await langchain_tool_loop(
+        model,
+        tools={"tool_a": _make_slow_tool([], [])},
+        user="search everything",
+        emit=events.append,
+        max_steps=3,
+    )
+    assert result == "done"
+    kinds = [e.get("kind") for e in events]
+    assert "status" in kinds, f"expected per-step status events, got {kinds}"
+
+
 async def test_subagent_single_toolcall_still_sequential_path():
     """One tool call at a time takes the (equivalent) sequential branch safely."""
     active: list[int] = []

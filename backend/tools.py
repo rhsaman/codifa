@@ -13,6 +13,7 @@ import contextvars
 import difflib
 import glob as _pyglob
 import json
+import logging
 import os
 import posixpath
 import re
@@ -27,6 +28,8 @@ import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 import checkpoints as _checkpoints
 import git_tools as _git
@@ -6417,6 +6420,7 @@ When you need to read several files, read multiple independent files in parallel
                                         _mentioned_idents.add(_m)
 
                         _map_rank_info: dict = {}
+                        _codemap_t0 = time.monotonic()
                         _code_map = (
                             await asyncio.to_thread(
                                 format_symbol_map,
@@ -6430,6 +6434,16 @@ When you need to read several files, read multiple independent files in parallel
                             if root
                             else ""
                         )
+                        try:
+                            _codemap_dt = time.monotonic() - _codemap_t0
+                            if _codemap_dt > 5.0:
+                                logger.warning(
+                                    "[explore-timing] codemap slow codemap=%.1fs root=%s",
+                                    _codemap_dt,
+                                    str(root or "")[:80],
+                                )
+                        except Exception:  # noqa: BLE001, S110 — timing never breaks explore
+                            pass
                         try:
                             import laya_decide as _laya_mod
 
@@ -6462,6 +6476,17 @@ When you need to read several files, read multiple independent files in parallel
                         # می‌شه؛ اگه بره تو system، prefix cache هیچ‌وقت hit
                         # نمی‌خورد. این دقیقاً همون الگوی main agent تو graph.py هست.
                         prompt = prompt + _code_map_block
+                try:
+                    emit(
+                        {
+                            "kind": "status",
+                            "stage": "explore",
+                            "content": f"explore started: {str(description or '')[:80]}",
+                        }
+                    )
+                except Exception:  # noqa: BLE001, S110 — progress never breaks explore
+                    pass
+                _explore_t0 = time.monotonic()
                 _output = await langchain_tool_loop(
                     _model,
                     system=_sys,
@@ -6473,6 +6498,14 @@ When you need to read several files, read multiple independent files in parallel
                     reserved=reserved if reserved is not None else 20_000,
                     emit=emit,
                 )
+                try:
+                    logger.info(
+                        "[explore-timing] done explore=%.1fs desc=%s",
+                        time.monotonic() - _explore_t0,
+                        str(description or "")[:80],
+                    )
+                except Exception:  # noqa: BLE001, S110 — timing never breaks explore
+                    pass
                 break
             except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
                 _last_exc = exc

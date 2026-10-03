@@ -96,11 +96,13 @@ export function PlanPanel({ onClose }: { onClose?: () => void }) {
         // title node, or every plan would render its heading twice. Bidi +
         // block direction follow the app setting (dir="auto" would resolve
         // LTR for every plan: the document always opens with "## Plan").
-        <div className="plan-panel-body" dir={dir}>
-          <div className="chat-message markdown-body">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {prepareContent(planDoc.body, dir)}
-            </ReactMarkdown>
+        <div className="plan-panel-body" dir="ltr">
+          <div className="plan-panel-content" dir={dir}>
+            <div className="chat-message markdown-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {prepareContent(planDoc.body, dir)}
+              </ReactMarkdown>
+            </div>
           </div>
         </div>
       ) : (

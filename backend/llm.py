@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 _logger = logging.getLogger(__name__)
@@ -2480,6 +2481,18 @@ async def langchain_tool_loop(
     _transient: list[Any] = []
     while steps < max_steps:
         steps += 1
+        _step_t0 = time.monotonic()
+        if emit is not None:
+            try:
+                emit(
+                    {
+                        "kind": "status",
+                        "stage": "explore",
+                        "content": f"explore step {steps}/{max_steps}",
+                    }
+                )
+            except Exception:  # noqa: BLE001, S110 — progress never breaks loop
+                pass
         # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
         # final allowed step, force the sub-agent to stop tool-calling and
         # summarize instead of burning more reads/searches.
@@ -2494,6 +2507,7 @@ async def langchain_tool_loop(
         # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
         normalize_tool_transcript(msgs, _logger)
         _req = [*project_tool_results(_stable_tool_order(msgs)), *_transient]
+        _llm_t0 = time.monotonic()
         try:
             ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
         except Exception as _pc_exc:
@@ -2503,6 +2517,17 @@ async def langchain_tool_loop(
                 raise
             _no_pc = True
             ai = await bind_tools_parallel(model, lc_tools, False).ainvoke(_req)
+        _llm_wait_s = time.monotonic() - _llm_t0
+        try:
+            _logger.info(
+                "[step-timing] subagent step=%s/%s llm=%.1fs tools_pending=%s",
+                steps,
+                max_steps,
+                _llm_wait_s,
+                len(getattr(ai, "tool_calls", None) or []),
+            )
+        except Exception:  # noqa: BLE001, S110 — timing never breaks loop
+            pass
         # Surface the sub-agent's own token usage so the frontend can accrue it
         # into the chat-wide session totals (the "Model usage" sidebar). The
         # main-agent loop emits usage from agents.py; sub-agents run through this

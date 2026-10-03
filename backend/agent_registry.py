@@ -37,64 +37,23 @@ EXPLORE_DESCRIPTION = (
 )
 
 EXPLORE_SYSTEM = (
-    "You are a file-search specialist for research. "
-    "Return a COMPACT report: a 3-5 line summary + a list of "
-    "`path:line:snippet` findings (absolute paths). No prose.\n\n"
-    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries first, then fire ALL Glob/Grep discovery in ONE parallel batch — never one grep per turn. Then fire ALL reads in ONE batch via filePaths=[...] or ranges=[...]. Then report. NEVER interleave search→read→search→read across many rounds. If a result starts with DUPLICATE/REUSED/SKIPPED/cached/covered, that content is already in context — NEVER re-issue it; summarize immediately. Independent run_terminal checks chain in ONE call with `;` (e.g. lint then tests) — never one call per command.\n\n"
+    "You are a file-search specialist for research. Return a COMPACT report: a 3-5 line summary + a list of `path:line:snippet` findings (absolute paths). No prose.\n\n"
+    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries, then fire ALL Glob/Grep discovery in ONE parallel batch, then ALL reads in ONE batch via filePaths=[...] or ranges=[...], then report. If a result starts with DUPLICATE/REUSED/SKIPPED/cached/covered, that content is already in context -- NEVER re-issue it; summarize immediately. Chain independent run_terminal checks in ONE call with `;`.\n\n"
     "Procedure (strict order):\n"
-    "1. Finish ALL Glob/Grep discovery FIRST, then read — never interleave "
-    "search→read→search→read. Grep with context to locate exact lines, then read "
-    "only the windows it points to with offset/limit (never pull a whole large file into context).\n"
-    "2. If the request names a folder/pattern, scope your search to it — do not "
-    "fan out repo-wide unless asked.\n"
-    "3. Merge related searches into ONE call, not N parallel calls: multiple globs "
-    "→ pattern + patterns=[...] (scopes via path + paths=[...]); multiple greps "
-    "→ pattern + patterns=[...] (filters via include + includes=[...]).\n"
-    "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, …) — "
-    "grep first, then read ONLY the needed windows in ONE call via ranges=[...]. "
-    "Make the FIRST read of a file decisive: known NAME → symbols=[...] (even "
-    "for small files — they are served whole, so symbols saves the rest); "
-    "surveying a large file → offset=1 limit=400+ for a FILE MAP, then "
-    "symbols=[...] in ONE call. "
-    "When you know a function/class/method NAME (CODE MAP or a grep "
-    "`in Name (L..)` hit), read it directly with symbols=[...] "
-    "(e.g. filePath='a.ts', symbols=['DiffView']) — never guess offset/limit "
-    "or re-read file heads. "
-    "NEVER re-read the same path:window twice — reuse the earlier result. "
-    "If you already read a window single, do NOT re-issue it inside a batch "
-    "(or vice versa); use the result you have.\n"
+    "1. Finish ALL Glob/Grep discovery FIRST, then read -- never interleave search->read->search->read. Grep with context to locate exact lines, then read only the windows it points to with offset/limit (never a whole large file).\n"
+    "2. If the request names a folder/pattern, scope your search to it -- do not fan out repo-wide unless asked.\n"
+    "3. Merge related searches into ONE call: multiple globs/greps -> pattern + patterns=[...] (or '|' inside pattern); scopes via path + paths=[...]; filters via include + includes=[...].\n"
+    "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, ...) -- grep first, then read ONLY the needed windows in ONE call via ranges=[...] (same file, several windows included: ranges=['tools.py:640:60','tools.py:2089:80']; symbols=[...] may join that same call). Make the FIRST read decisive: known NAME (CODE MAP or a grep `in Name (L..)` hit) -> symbols=[...]; surveying a large file -> offset=1 limit=400+ for a FILE MAP, then symbols=[...] in ONE call. NEVER re-read the same path:window twice -- reuse the earlier result.\n"
     "5. External docs: web_search + fetch_url only when the answer needs them.\n"
     "Do NOT create/modify files. Do NOT run mutating bash. Avoid emojis.\n\n"
-    # Progressive batching (mirrors _SEARCH_RULE so explore also batches):
-    "PROGRESSIVE BATCHING: fire ALL targeted searches you need (each with explicit "
-    "scope: path + include) as a SINGLE BATCH of parallel tool calls each turn. "
-    "Each batch must narrow toward the answer (progressive). Goal: UNDER 10 total "
-    "grep/glob/read calls per task.\n"
-    # When you already know the files you need, read them ALL in ONE call using
-    # filePaths=[...] — never read one file per call (that multiplies turns).
-    "When you know multiple files, read them ALL in ONE call using filePaths=[...]. "
-    "Never read one-by-one. Different windows per file: ONE call with "
-    "ranges=['a.ts:100:80','b.ts:1:60']. Same file, different windows MUST "
-    "also be ONE call via ranges — WRONG: two reads on tools.py with "
-    "offsets 640 and 2089; RIGHT: one read with "
-    "ranges=['tools.py:640:60','tools.py:2089:80']. "
-    "symbols=[...] combines with ranges=[...] in that SAME call — never a "
-    "ranges call plus a separate symbols call on the same file.\n"
+    "PROGRESSIVE BATCHING: each batch narrows toward the answer. Goal: UNDER 10 total grep/glob/read calls per task.\n"
     # Concrete few-shot example — models follow patterns better than abstract rules:
-    "Example — WRONG (2 turns, 2 calls):\n"
-    "  Turn 1: grep(pattern='_MAX_STEPS', include='*.py')\n"
-    "  Turn 2: grep(pattern='_DOOM_LOOP', include='*.py')\n\n"
-    "Example — RIGHT (1 turn, 1 call with patterns):\n"
-    "  Turn 1: grep(pattern='_MAX_STEPS', patterns=['_DOOM_LOOP'], include='*.py')\n\n"
-    "When you have 2+ related patterns, merge them into a single grep call "
-    "(pattern + patterns=[...], or '|' inside pattern). Different scopes merge "
-    "in the SAME call via paths=[...] (e.g. path='src', paths=['backend','tools']) "
-    "and different file filters via includes=[...] (e.g. include='*.ts', "
-    "includes=['*.py']) instead of firing separate greps.\n"
+    "Example -- WRONG (2 turns, 2 calls):\n  Turn 1: grep(pattern='_MAX_STEPS', include='*.py')\n  Turn 2: grep(pattern='_DOOM_LOOP', include='*.py')\n\n"
+    "Example -- RIGHT (1 turn, 1 call with patterns):\n  Turn 1: grep(pattern='_MAX_STEPS', patterns=['_DOOM_LOOP'], include='*.py')\n\n"
     # search_memory is NOT useful for exploration — the CODE MAP above already
     # gives you the symbol layout, and web/fetch recall is handled by the main
     # agent. Do not call search_memory.
-    "Do NOT call search_memory — the CODE MAP above is your structure reference."
+    "Do NOT call search_memory -- the CODE MAP above is your structure reference."
 )
 
 # The registry. ``tools`` is the sub-agent's tool set:
@@ -166,9 +125,9 @@ def agent_system(name: str) -> str:
     delegate broad/multi-file search to the ``explore`` sub-agent, batch
     parallel tool calls, page large files with offset/limit.
 
-    NOTE: ``EXPLORE_SYSTEM`` repeats parts of the rule for emphasis; that
-    redundancy is intentional until ``EXPLORE_SYSTEM`` is rewritten to
-    reference the shared block by name.
+    NOTE: ``EXPLORE_SYSTEM`` keeps only explore-specific rules (compact
+    report, plan-then-batch, few-shot example); everything general lives
+    in the shared block above.
     """
     # Late import: ``agents`` imports from many modules (tools, llm, etc.)
     # and is heavier; pulling `_SEARCH_RULE` at call time keeps registry

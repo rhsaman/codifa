@@ -1,6 +1,7 @@
 ---
 name: threejs-scroll-storytelling
 description: Build scroll-driven 3D storytelling pages with Three.js (React Three Fiber).
+fa_keywords: سه‌بعدی, تری‌دی, اسکرول, انیمیشن
 ---
 
 # threejs-scroll-storytelling

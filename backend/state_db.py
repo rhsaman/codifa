@@ -395,10 +395,24 @@ def _backup_then_save_settings(settings: dict) -> None:
 # -- chats ------------------------------------------------------------------ #
 
 
+def workspace_slug_for_root(root: str) -> str:
+    """Unique workspace slug for a project root.
+
+    Basename plus an 8-char sha1 of the resolved absolute path, so two
+    workspaces with the same folder name never share chats, plans, or vectors.
+    """
+    real = os.path.realpath(str(root or "").strip()).rstrip(os.sep)
+    if not real:
+        return "workspace"
+    base = _slugify(os.path.basename(real)) or "workspace"
+    digest = hashlib.sha1(real.encode("utf-8")).hexdigest()[:8]
+    return f"{base}-{digest}"
+
+
 def _chat_workspace(chat: dict) -> str:
     root = str(chat.get("root") or "").strip()
     if root:
-        return _slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+        return workspace_slug_for_root(root)
     return "workspace"
 
 
@@ -439,10 +453,7 @@ def _delete_chat_by_id(cid: str) -> None:
             except OSError:
                 pass
             # cascade: drop this chat's plan folder so it doesn't orphan on disk
-            try:
-                delete_plan(_chat_workspace(obj), chat_id=str(obj.get("id")))
-            except OSError:
-                pass
+            delete_plan(_chat_workspace(obj), chat_id=str(obj.get("id")))
             return
 
 
@@ -451,7 +462,7 @@ def remove_workspace_vectors(roots: list) -> None:
 
     Keeps memory/search space in sync when a whole workspace is deleted from
     the sidebar. ``roots`` are the absolute project paths that were removed;
-    the vector file is named after the slugified basename.
+    the vector file uses the hashed workspace slug.
     """
     import shutil
 
@@ -459,19 +470,24 @@ def remove_workspace_vectors(roots: list) -> None:
     for r in roots or []:
         if not r or not isinstance(r, str):
             continue
-        slug = (
-            re.sub(r"[^A-Za-z0-9_.-]+", "-", os.path.basename(os.path.realpath(r)).rstrip(os.sep)).strip("-")
-            or "workspace"
-        )
+        slug = workspace_slug_for_root(r)
+        real = os.path.realpath(r).rstrip(os.sep)
+        legacy_slug = _slugify(os.path.basename(real)) or "workspace"
+        # Backward compat: also remove the legacy file without hash if present.
         for suffix in (".vectors.sqlite", ".vectors.sqlite-wal", ".vectors.sqlite-shm"):
-            try:
-                os.remove(os.path.join(vdir, f"{slug}{suffix}"))
-            except OSError:
-                pass
+            for cand in (slug, legacy_slug):
+                try:
+                    os.remove(os.path.join(vdir, f"{cand}{suffix}"))
+                except OSError:
+                    pass
         # cascade: drop the whole workspace plan folder so it doesn't orphan
-        plan_ws = os.path.join(plans_dir(), slug)
-        if os.path.isdir(plan_ws):
-            shutil.rmtree(plan_ws, ignore_errors=True)
+        for cand in (slug, legacy_slug):
+            plan_ws = os.path.join(plans_dir(), cand)
+            if os.path.isdir(plan_ws):
+                try:
+                    shutil.rmtree(plan_ws)
+                except OSError:
+                    pass
     try:
         if os.path.isdir(vdir) and not os.listdir(vdir):
             shutil.rmtree(vdir, ignore_errors=True)
@@ -531,6 +547,43 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
     return name, slug, description
 
 
+def _normalize_fa_keywords(value) -> list[str]:
+    """Normalize Persian skill match keywords to a deduped lowercase list."""
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = list(value or [])
+    seen: list[str] = []
+    for p in parts:
+        p = str(p or "").strip().lower()
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _parse_skill_fa_keywords(raw: str) -> list[str]:
+    """Return the skill's Persian match keywords from frontmatter.
+
+    Reads the optional ``fa_keywords:`` frontmatter key (comma-separated).
+    Empty when absent. Matching logic stays fixed in code; per-skill data
+    lives here so new skills need no code change.
+    """
+    if not raw.startswith("---"):
+        return []
+    end = raw.find("\n---", 3)
+    if end == -1:
+        return []
+    for line in raw[3:end].strip("\n").splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        if key.strip().lower() != "fa_keywords":
+            continue
+        val = val.strip().strip('"').strip("'").strip("[]")
+        return [k.strip().lower() for k in val.split(",") if k.strip()]
+    return []
+
+
 def _find_skill_dir(name_or_slug: str) -> str | None:
     """Locate a skill's directory by name or slug. Returns None when missing."""
     name_or_slug = str(name_or_slug or "").strip()
@@ -561,12 +614,21 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
     return None
 
 
-def save_skill(name: str, slug: str, description: str, content: str) -> None:
+def save_skill(
+    name: str,
+    slug: str,
+    description: str,
+    content: str,
+    fa_keywords: list | str = (),
+) -> None:
     """Persist a skill as ``skills/<slug>/skill.md`` with YAML frontmatter.
 
-    The frontmatter carries ``name``/``slug``/``description``; the rest of the
-    file is the skill body. An empty ``slug`` falls back to the slugified
-    name and then to a stable hash, so distinct names never share a folder.
+    The frontmatter carries ``name``/``slug``/``description`` plus an optional
+    ``fa_keywords`` line (Persian match keywords for the generic skill
+    matcher). The rest of the file is the skill body. An empty ``slug`` falls
+    back to the slugified name and then to a stable hash, so distinct names
+    never share a folder. Empty ``fa_keywords`` preserve the existing file's
+    keywords so an edit never silently drops Persian matching.
     """
     with _LOCK:
         _migrate_legacy_db()
@@ -580,11 +642,19 @@ def save_skill(name: str, slug: str, description: str, content: str) -> None:
             end = content.find("\n---", 3)
             if end != -1:
                 content = content[end + 4:].lstrip("\n")
+        kws = _normalize_fa_keywords(fa_keywords)
+        if not kws:
+            try:
+                kws = _parse_skill_fa_keywords(_read_text(os.path.join(d, "skill.md")))
+            except OSError:
+                kws = []
+        fa_line = f"fa_keywords: {', '.join(kws)}\n" if kws else ""
         front = (
             "---\n"
             f"name: {name}\n"
             f"slug: {slug}\n"
             f"description: {str(description or '').strip()}\n"
+            f"{fa_line}"
             "---\n\n"
         )
         _atomic_write(os.path.join(d, "skill.md"), front + content)
@@ -592,14 +662,13 @@ def save_skill(name: str, slug: str, description: str, content: str) -> None:
 
 
 def _skills_fingerprint() -> tuple:
-    """اثر انگشت ارزان پوشهٔ skills: (mtime پوشه، تعداد entryها).
+    """Cheap fingerprint of the skills folder: (dir mtime, entry count).
 
-    mtime دایرکتوری روی هر ایجاد/حذف/تغییر نام entry به‌روز می‌شود و تعداد
-    entryها تغییر محتوای فایل داخل دایرکتوری بدون تغییر تعداد را پوشش
-    نمی‌دهد — برای آن مورد، نویسنده‌ها (save_skill/delete_skill) خودشان کش
-    را invalidate می‌کنند. این فقط گاردِ تغییرات بیرونی (ویرایش دستی فایل)
-    است، پس دقت کامل لازم نیست؛ ارزان بودنش مهم است چون هر turn صدا زده
-    می‌شود."""
+    Directory mtime updates on entry create/delete/rename, and the count
+    covers content edits that do not change the count — writers
+    (save_skill/delete_skill) invalidate the cache themselves. This only
+    guards external edits (manual file changes), so it favors cheapness over
+    exactness; it runs every turn."""
     base = skills_dir()
     try:
         st = os.stat(base)
@@ -608,24 +677,23 @@ def _skills_fingerprint() -> tuple:
         return (0, -1)
 
 
-# کش list_skills: خروجی + اثر انگشتی که اعتبارش را می‌سنجد. هر turn چند
-# بار (build_turn_context، _skill_names_to_strip، sync_builtin_skills) به
-# این لیست نیاز است و هر بار خواندن همهٔ skill.mdها لازم نیست.
+# list_skills cache: output plus the fingerprint that validates it. Needed
+# several times per turn (build_turn_context, _skill_names_to_strip,
+# sync_builtin_skills) without re-reading every skill.md.
 _skills_cache: tuple[tuple, list[dict]] | None = None
 
 
 def invalidate_skills_cache() -> None:
-    """کش list_skills را خالی می‌کند — بعد از هر نوشتن/حذف skill."""
+    """Clear the list_skills cache — after every skill write/delete."""
     global _skills_cache
     _skills_cache = None
 
 
 def list_skills() -> list[dict]:
-    """Return all skills as ``{name, slug, description, path, content}``.
+    """Return all skills as ``{name, slug, description, path, content, fa_keywords}``.
 
-    نتیجه تا وقتی اثر انگشت پوشهٔ skills تغییر نکرده کش می‌شود؛ نویسنده‌های
-    داخلی (save_skill/delete_skill) کش را invalidate می‌کنند تا تغییرات
-    بلافاصله دیده شوند."""
+    Cached until the skills folder fingerprint changes; internal writers
+    (save_skill/delete_skill) invalidate the cache so changes appear at once."""
     global _skills_cache
     fp = _skills_fingerprint()
     if _skills_cache is not None and _skills_cache[0] == fp:
@@ -636,7 +704,7 @@ def list_skills() -> list[dict]:
 
 
 def _list_skills_uncached() -> list[dict]:
-    """خواندن واقعی همهٔ skill.mdها از دیسک (بدون کش)."""
+    """Read all skill.md files from disk (no cache)."""
     base = skills_dir()
     if not os.path.isdir(base):
         return []
@@ -663,6 +731,7 @@ def _list_skills_uncached() -> list[dict]:
                     "description": description,
                     "path": f"file://{md}",
                     "content": body,
+                    "fa_keywords": _parse_skill_fa_keywords(raw),
                 }
             )
     return out
@@ -677,11 +746,14 @@ def delete_skill(name: str) -> bool:
         try:
             import shutil
 
-            shutil.rmtree(d, ignore_errors=True)
-            invalidate_skills_cache()
-            return True
+            shutil.rmtree(d)
         except OSError:
             return False
+        # rmtree succeeded — verify removal before reporting success
+        if os.path.exists(d):
+            return False
+        invalidate_skills_cache()
+        return True
 
 
 # -- MCP connectors --------------------------------------------------------- #
@@ -700,11 +772,13 @@ def save_mcp(name: str, config: str) -> None:
             return
         try:
             parsed = json.loads(config) if isinstance(config, str) else config
-        except (ValueError, TypeError):
-            parsed = {}
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid MCP config JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("MCP config must be a JSON object")  # noqa: TRY004
         _atomic_write_json(
             _mcp_file(name),
-            {"name": name, "config": parsed if isinstance(parsed, dict) else {}},
+            {"name": name, "config": parsed},
         )
 
 
@@ -861,10 +935,10 @@ def delete_plan(workspace: str, chat_id: str = "") -> bool:
         if not os.path.isdir(target):
             return False
         try:
-            shutil.rmtree(target, ignore_errors=True)
-            return True
+            shutil.rmtree(target)
         except OSError:
             return False
+        return not os.path.exists(target)
 
 
 def prune_orphan_plans() -> int:
@@ -899,8 +973,9 @@ def prune_orphan_plans() -> int:
             if not live_cids:
                 # whole workspace is gone — drop its plan folder entirely
                 try:
-                    shutil.rmtree(ws_dir, ignore_errors=True)
-                    removed += 1
+                    shutil.rmtree(ws_dir)
+                    if not os.path.exists(ws_dir):
+                        removed += 1
                 except OSError:
                     pass
                 continue
@@ -910,8 +985,9 @@ def prune_orphan_plans() -> int:
                     continue
                 if cid not in live_cids:
                     try:
-                        shutil.rmtree(d, ignore_errors=True)
-                        removed += 1
+                        shutil.rmtree(d)
+                        if not os.path.exists(d):
+                            removed += 1
                     except OSError:
                         pass
         return removed
@@ -919,10 +995,10 @@ def prune_orphan_plans() -> int:
         return 0
 
 
-# -- schedules (زمان‌بندی خودکار تسک‌ها، مثل Codex) ------------------------ #
-# هر تسک یک فایل ``schedules/<id>.json`` است؛ تاریخچه اجراها در
-# ``schedules/runs/<run-id>.json`` با فیلد ``schedule_id`` ذخیره می‌شود.
-# همه نوشتن‌ها اتمیک (tmp + os.replace) و زیر قفل ماژول هستند.
+# -- schedules (automatic task scheduling, Codex-style) ------------------------ #
+# Each task is a ``schedules/<id>.json`` file; run history lives in
+# ``schedules/runs/<run-id>.json`` with a ``schedule_id`` field.
+# All writes are atomic (tmp + os.replace) under the module lock.
 
 
 def _schedule_file(schedule_id: str) -> str:
@@ -930,7 +1006,7 @@ def _schedule_file(schedule_id: str) -> str:
 
 
 def list_schedules() -> list[dict]:
-    """همه تسک‌های زمان‌بندی‌شده را برگردان (مرتب بر اساس created_at)."""
+    """Return all scheduled tasks (sorted by created_at)."""
     base = schedules_dir()
     if not os.path.isdir(base):
         return []
@@ -947,7 +1023,7 @@ def list_schedules() -> list[dict]:
 
 
 def get_schedule(schedule_id: str) -> dict | None:
-    """یک تسک را با id بخوان؛ None وقتی وجود ندارد."""
+    """Read one task by id; None when missing."""
     if not schedule_id:
         return None
     obj = _read_json(_schedule_file(str(schedule_id)))
@@ -955,7 +1031,7 @@ def get_schedule(schedule_id: str) -> dict | None:
 
 
 def save_schedule(task: dict) -> dict:
-    """ایجاد/به‌روزرسانی یک تسک زمان‌بندی (اتمیک). id می‌سازد اگر خالی باشد."""
+    """Create/update a scheduled task (atomic). Generates an id when empty."""
     import uuid
 
     with _LOCK:

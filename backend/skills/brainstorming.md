@@ -1,6 +1,7 @@
 ---
 name: brainstorming
 description: Generate and refine creative ideas: diverge widely first, then converge on the strongest candidates.
+fa_keywords: طوفان فکری, ایده, برین‌استورم
 ---
 
 # brainstorming

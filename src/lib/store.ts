@@ -313,8 +313,7 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } = s
-    void chats
+    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } = s
     const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
@@ -378,10 +377,15 @@ if (typeof window !== 'undefined') {
   // a write (e.g. a subagent model picked while streaming) arrived after the
   // main flush had already run and was silently dropped.
   api.onFlushPersist(() => {
-    flushPendingPersist()
+    Promise.resolve()
+      .then(() => flushPendingPersist())
       .catch((err) => console.error('state flush on quit failed:', err))
       .finally(() => {
-        api.flushPersistDone()
+        try {
+          api.flushPersistDone()
+        } catch (e) {
+          console.error('flushPersistDone failed:', e)
+        }
       })
   })
 }
@@ -398,7 +402,10 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
   const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
-    api.storeSet('chats', sanitizeChats(chats)),
+    (async () => {
+      if (seq !== persistSeq) return
+      await api.storeSet('chats', sanitizeChats(chats))
+    })(),
   ]
   // Skip persisting settings while the store still holds cold-start defaults
   // (sidecar returned null on load, e.g. an external data volume that mounted

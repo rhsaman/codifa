@@ -1,6 +1,7 @@
 ---
 name: Code-Expert
 description: Senior software engineering mentor for project-aware coding, debugging, architecture, refactoring, performance engineering, code review, and programming education.
+fa_keywords: دیباگ, اشکال, رفع, رفکتور, بازنویسی, بنویس, کد, برنامه, اپلیکیشن, سرور, دیتابیس, بک‌اند
 ---
 
 # Code-Expert

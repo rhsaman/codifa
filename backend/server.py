@@ -230,10 +230,10 @@ def _oauth_redirect_uri() -> str:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """پیش‌بارگذاری کاتالوگ models.dev + حلقه زمان‌بند تسک‌ها در هنگام راه‌اندازی.
+    """Preload models.dev catalog and start the schedule loop at startup.
 
-    کاتالوگ فقط یک‌بار از اینترنت دریافت و در حافظه cache می‌شود. حلقه زمان‌بند
-    هر ۳۰ ثانیه تسک‌های سررسیده را اجرا می‌کند (پس‌زمینه، headless).
+    The catalog is fetched once and cached in memory. The schedule loop
+    runs due tasks every 30 seconds (background, headless).
     """
 
     async def _bg() -> None:
@@ -246,9 +246,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 "models.dev catalog preload failed (non-fatal)", exc_info=True
             )
 
-    asyncio.create_task(_bg())
+    _spawn_tracked(_bg(), "models-dev-preload")
     _stop = await _start_schedule_loop()
-    # پیش‌گرم‌کردن روتر laya خارج از حلقه چت تا ساخت اول‌باره بلوکه نکند.
+    # Warm up the laya router outside the chat loop to avoid first-build block.
     try:
         import laya_decide
 
@@ -271,17 +271,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             from embeddings import _load as _embed_load
 
             await _aio.to_thread(_embed_load)
-        except Exception:  # noqa: BLE001, S110 — warmup اختیاری است
+        except Exception:  # noqa: BLE001, S110 — optional warmup
             pass
 
-    asyncio.create_task(_bg_embed())
+    _spawn_tracked(_bg_embed(), "embedding-warmup")
     yield
     try:
         _stop.set()
     except Exception:
         pass
 
-    # بستن تمام sessionهای MCP cached در هنگام خروج
+    # Close all cached MCP sessions on exit.
     try:
         from mcp_bridge import shutdown_mcp_sessions
 
@@ -307,18 +307,38 @@ app.add_middleware(
 
 SCHEDULE_POLL_SECONDS = 30
 _SCHEDULE_RUNNING: set[str] = set()
-# پنجره‌ای که یک ران «running» تازه محسوب می‌شود (ثانیه). اگر برای یک تسک
-# رانی با وضعیت running و شروع‌شده داخل این پنجره وجود داشته باشد، اجرای
-# جدید شروع نمی‌شود — این گارد روی دیسک است و بین چند پردازه/ری‌استارت هم
-# کار می‌کند (برخلاف _SCHEDULE_RUNNING که فقط حافظه است).
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_tracked(coro, name: str) -> asyncio.Task:
+    """Track a fire-and-forget task so it is not GC-collected and failures log."""
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning("background task %s failed: %s", name, exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
+# Time window (seconds) during which a run counts as fresh "running".
+# A task with a running run started inside this window does not start again.
+# Disk-backed guard, works across processes and restarts
+# (unlike _SCHEDULE_RUNNING which is memory-only).
 _SCHEDULE_RUNNING_WINDOW = 15 * 60
-# ران‌های running قدیمی‌تر از این (ثانیه) در استارت‌آپ یتیم محسوب و error
-# می‌شوند (سایدکار قبلی وسط اجرا مرده است).
+# Runs older than this (seconds) count as orphaned at startup and turn to error
+# (previous sidecar died mid-run).
 _SCHEDULE_ORPHAN_AFTER = 60 * 60
 
 
 def _has_recent_running(schedule_id: str, now: float) -> bool:
-    """True اگر برای این تسک یک ران running تازه (داخل پنجره) روی دیسک باشد."""
+    """True when a fresh running run for this task exists on disk."""
     import state_db
 
     try:
@@ -370,17 +390,17 @@ async def _mark_orphaned_running() -> int:
 
 
 async def _start_schedule_loop() -> asyncio.Event:
-    """حلقه بررسی سررسید تسک‌ها را روشن کن؛ Event توقف را برگردان."""
+    """Start the schedule due-check loop; return the stop event."""
     stop = asyncio.Event()
 
     async def _loop() -> None:
-        # کمی صبر اول تا startup کامل شود
+        # Small initial delay so startup can finish.
         try:
             await asyncio.wait_for(stop.wait(), timeout=10)
             return
         except asyncio.TimeoutError:
             pass
-        # ران‌های running یتیمِ پردازه قبلی را ببند تا برای همیشه Running نمانند.
+        # Close orphaned running runs from the previous process.
         try:
             await _mark_orphaned_running()
         except Exception:
@@ -395,16 +415,16 @@ async def _start_schedule_loop() -> asyncio.Event:
             except asyncio.TimeoutError:
                 continue
 
-    asyncio.create_task(_loop())
+    _spawn_tracked(_loop(), "schedule-loop")
     return stop
 
 
 async def _run_due_schedules(now: float | None = None) -> int:
-    """تسک‌های سررسیده را اجرا کن؛ تعداد اجراهای شروع‌شده را برگردان.
+    """Run due tasks; return the number of started runs.
 
-    گارد چندگانه: هر تسک هم‌زمان فقط یک اجرا دارد (``_SCHEDULE_RUNNING``) و
-    ``is_due`` خودش ران‌های missed دوران مکث را نادیده می‌گیرد، پس پس از
-    resume فقط یک اجرای تازه شروع می‌شود — بدون burst تکراری.
+    Multi-guard: each task has at most one concurrent run (``_SCHEDULE_RUNNING``)
+    and ``is_due`` ignores missed runs from paused periods, so after resume only
+    one fresh run starts — no repeat burst.
     """
     import scheduler
     import state_db
@@ -424,6 +444,7 @@ async def _run_due_schedules(now: float | None = None) -> int:
         try:
             due = scheduler.is_due(task, now)
         except Exception:
+            logger.debug("schedule is_due failed for %s", sid, exc_info=True)
             continue
         if not due:
             # heal: next_run گم‌شده یا stale (قدیمی‌تر از grace) را تازه کن تا
@@ -443,21 +464,26 @@ async def _run_due_schedules(now: float | None = None) -> int:
                     pass
             continue
         _SCHEDULE_RUNNING.add(sid)
-        # next_run را همین‌جا جلو ببر تا تیک بعدی حلقه (۳۰ ثانیه بعد) همان
-        # تسک را دوباره due نبیند — حتی اگر اجرای فعلی هنوز تمام نشده باشد.
         try:
-            fresh = state_db.get_schedule(sid) or task
-            fresh["next_run"] = scheduler.compute_next_run(fresh, now)
-            state_db.save_schedule(fresh)
+            # Advance next_run here so the next loop tick (30s later) does not
+            # see the same task as due again — even if the run is still going.
+            try:
+                fresh = state_db.get_schedule(sid) or task
+                fresh["next_run"] = scheduler.compute_next_run(fresh, now)
+                state_db.save_schedule(fresh)
+            except Exception:
+                pass
+            _spawn_tracked(_execute_schedule(sid), f"schedule-{sid}")
+            started += 1
         except Exception:
-            pass
-        asyncio.create_task(_execute_schedule(sid))
-        started += 1
+            _SCHEDULE_RUNNING.discard(sid)
+            logger.warning("failed to schedule task %s", sid, exc_info=True)
+            continue
     return started
 
 
 async def _execute_schedule(schedule_id: str, run_id: str | None = None) -> None:
-    """اجرای headless یک تسک: run_agent بدون گیت تعاملی + ثبت run."""
+    """Headless task run: run_agent without interactive gates + run record."""
     import scheduler
     import state_db
 
@@ -773,8 +799,8 @@ async def schedules_run_now(schedule_id: str) -> dict:
         except Exception:  # noqa: BLE001, S110 — بدون run_id هم پاسخ معتبر است
             pass
         return {"ok": True, "running": True}
-    # رکورد running را همین‌جا (همگام) بساز تا شناسه‌اش را به فرانت برگردانیم؛
-    # پولینگ دقیق همان اجرا جای حدس «آخرین ران» را می‌گیرد و لودینگ کاذب می‌رود.
+    # Create the running record synchronously so its id can be returned;
+    # polling follows that exact run instead of guessing the latest one.
     run = state_db.save_schedule_run({
         "schedule_id": schedule_id,
         "status": "running",
@@ -782,13 +808,17 @@ async def schedules_run_now(schedule_id: str) -> dict:
     })
     new_run_id = str(run.get("id"))
     _SCHEDULE_RUNNING.add(schedule_id)
-    asyncio.create_task(_execute_schedule(schedule_id, new_run_id))
+    try:
+        _spawn_tracked(_execute_schedule(schedule_id, new_run_id), f"schedule-{schedule_id}")
+    except Exception:
+        _SCHEDULE_RUNNING.discard(schedule_id)
+        raise
     return {"ok": True, "running": True, "run_id": new_run_id}
 
 
 @app.get("/schedules/{schedule_id}/runs")
 async def schedules_runs(schedule_id: str, limit: int = 20) -> dict:
-    """تاریخچه اجراهای یک تسک (جدیدترین اول)."""
+    """Run history for one task (newest first)."""
     import state_db
 
     return {"runs": state_db.list_schedule_runs(schedule_id, limit=limit)}
@@ -1875,33 +1905,36 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     if m:
         try:
             body = ast.literal_eval(m.group(1))
-            detail = body.get("message") or body.get("error") or ""
-            if isinstance(detail, dict):
-                detail = str(detail)
-            # OpenRouter / ai-gateway-style wrappers bury the REAL upstream
-            # error inside `metadata.raw` as an escaped JSON string. When the
-            # outer message is the generic "Provider returned error" (their
-            # default wrapper), dig one level deeper to surface the actual
-            # failure — otherwise the user sees a useless "Provider returned
-            # error" with no clue what went wrong.
-            meta = body.get("metadata") if isinstance(body, dict) else None
-            raw = meta.get("raw") if isinstance(meta, dict) else None
-            if (
-                isinstance(raw, str)
-                and (detail or "").strip().lower() in ("provider returned error", "")
-            ):
-                try:
-                    inner = ast.literal_eval(raw)
-                    inner_msg = (
-                        inner.get("message")
-                        if isinstance(inner, dict)
-                        else None
-                    )
-                    if isinstance(inner_msg, str) and inner_msg.strip():
-                        detail = inner_msg
-                except (ValueError, SyntaxError, TypeError):
-                    pass
-        except (ValueError, SyntaxError, TypeError):
+            if not isinstance(body, dict):
+                detail = ""
+            else:
+                detail = body.get("message") or body.get("error") or ""
+                if isinstance(detail, dict):
+                    detail = str(detail)
+                # OpenRouter / ai-gateway-style wrappers bury the REAL upstream
+                # error inside `metadata.raw` as an escaped JSON string. When the
+                # outer message is the generic "Provider returned error" (their
+                # default wrapper), dig one level deeper to surface the actual
+                # failure — otherwise the user sees a useless "Provider returned
+                # error" with no clue what went wrong.
+                meta = body.get("metadata") if isinstance(body, dict) else None
+                raw = meta.get("raw") if isinstance(meta, dict) else None
+                if (
+                    isinstance(raw, str)
+                    and (detail or "").strip().lower() in ("provider returned error", "")
+                ):
+                    try:
+                        inner = ast.literal_eval(raw)
+                        inner_msg = (
+                            inner.get("message")
+                            if isinstance(inner, dict)
+                            else None
+                        )
+                        if isinstance(inner_msg, str) and inner_msg.strip():
+                            detail = inner_msg
+                    except (ValueError, SyntaxError, TypeError, AttributeError):
+                        pass
+        except (ValueError, SyntaxError, TypeError, AttributeError):
             detail = ""
     if not detail:
         # Array form: body: [{'error': {'code': ..., 'message': ..., 'status': ...}}]

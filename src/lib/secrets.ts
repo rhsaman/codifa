@@ -15,16 +15,25 @@ const PREFIX = 'enc:v1:'
 let keyPromise: Promise<CryptoKey | null> | null = null
 
 function getKey(): Promise<CryptoKey | null> {
-  keyPromise ??= (async () => {
-    try {
-      const b64 = await window.coder.secretsGetKey()
-      if (!b64) return null
-      const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
-      return await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
-    } catch {
-      return null
-    }
-  })()
+  if (!keyPromise) {
+    const p = (async () => {
+      try {
+        const b64 = await window.coder.secretsGetKey()
+        if (!b64) return null
+        const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+        return await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt'])
+      } catch {
+        return null
+      }
+    })()
+    // شکست موقت (null) را کش نکن تا تلاش بعدی دوباره کلید را بگیرد
+    p.then((k) => {
+      if (!k) keyPromise = null
+    }).catch(() => {
+      keyPromise = null
+    })
+    keyPromise = p
+  }
   return keyPromise
 }
 
@@ -44,18 +53,14 @@ function fromB64(s: string): Uint8Array<ArrayBuffer> {
   return out
 }
 
-/** Encrypt a secret for storage. Empty strings and failures pass through. */
+/** Encrypt a secret for storage. Empty strings pass through; failures throw. */
 export async function encryptSecret(plain: string): Promise<string> {
   if (!plain) return ''
   const k = await getKey()
-  if (!k) return plain
-  try {
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, new Uint8Array(enc.encode(plain))))
-    return `${PREFIX}${toB64(iv)}.${toB64(ct)}`
-  } catch {
-    return plain
-  }
+  if (!k) throw new Error('encryption key unavailable — refusing to store secret in plaintext')
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, new Uint8Array(enc.encode(plain))))
+  return `${PREFIX}${toB64(iv)}.${toB64(ct)}`
 }
 
 /** Decrypt a stored secret. Legacy plaintext passes through untouched. */

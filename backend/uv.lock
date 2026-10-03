@@ -474,7 +474,7 @@ wheels = [
 
 [[package]]
 name = "codifa"
-version = "1.5.4"
+version = "1.8.3"
 source = { virtual = "." }
 dependencies = [
     { name = "cryptography" },
@@ -483,6 +483,7 @@ dependencies = [
     { name = "faster-whisper" },
     { name = "grep-ast" },
     { name = "hf-transfer" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "langchain-anthropic" },
     { name = "langchain-core" },
@@ -503,7 +504,6 @@ dependencies = [
     { name = "pillow" },
     { name = "pydantic" },
     { name = "python-multipart" },
-    { name = "ruff" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -533,6 +533,7 @@ requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.1" },
     { name = "grep-ast", specifier = ">=0.9.0" },
     { name = "hf-transfer", specifier = ">=0.1.8" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "langchain-anthropic" },
     { name = "langchain-core", specifier = ">=1.6.0" },
@@ -549,7 +550,6 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-multipart", specifier = ">=0.0.32" },
-    { name = "ruff", specifier = ">=0.16.2" },
     { name = "scipy", specifier = ">=1.15.3" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "tokenizers", specifier = ">=0.19" },

@@ -1553,9 +1553,18 @@ def _skill_content_error(description: str, content: str) -> str:
     """HARD English-only for skills: reject Persian script in description/content.
 
     Skills are always English, even when the chat is Persian — this is the
-    runtime enforcement behind the prompt hard rule.
+    runtime enforcement behind the prompt hard rule. The ``fa_keywords:``
+    frontmatter metadata line is exempt: it carries Persian match keywords
+    (data for the generic skill matcher), not prose.
     """
     for label, text in (("description", description), ("content", content)):
+        if not text:
+            continue
+        if label == "content":
+            text = "\n".join(
+                line for line in text.splitlines()
+                if not line.strip().lower().startswith("fa_keywords:")
+            )
         if text and _HAS_PERSIAN_RE.search(text):
             return (
                 f"skill {label} must be English — Persian script detected. "
@@ -1590,10 +1599,7 @@ def open_vector_store(
     base_dir = base_dir or _state_db.vector_db_dir()
     try:
         os.makedirs(base_dir, exist_ok=True)
-        slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
+        slug = _state_db.workspace_slug_for_root(root)
         db_path = db_path_for(base_dir, slug)
         return VectorStore(db_path, StoreConfig.from_dict(config))
     except Exception as exc:  # noqa: BLE001
@@ -1671,12 +1677,15 @@ def persist_skill(
     raw: str,
     fallback_name: str = "",
     previous_name: str = "",
+    fa_keywords: str | list = "",
 ) -> dict:
     """Persist a skill as ``skills/<slug>/skill.md`` in the user data folder.
 
     ``raw`` is the full skill markdown (frontmatter + body); the name and
     description are parsed from the frontmatter. The name must be English
-    (ASCII) — it becomes the storage folder slug. Returns
+    (ASCII) — it becomes the storage folder slug. ``fa_keywords`` (or an
+    ``fa_keywords:`` frontmatter line in ``raw``) stores Persian match
+    keywords; empty preserves the existing skill's keywords. Returns
     ``{"ok", "name", "slug", "path", "note"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
@@ -1690,8 +1699,11 @@ def persist_skill(
     slug = slugify(name)
     if not body:
         body = f"Write step-by-step instructions for {name}."
+    kws = _state_db._normalize_fa_keywords(fa_keywords)
+    if not kws:
+        kws = _state_db._normalize_fa_keywords(_state_db._parse_skill_fa_keywords(raw))
     try:
-        _state_db.save_skill(name, slug, description, raw or body)
+        _state_db.save_skill(name, slug, description, raw or body, fa_keywords=kws)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
@@ -1869,12 +1881,36 @@ def search_web_docs(
     return store.search(query, KIND_WEB, top_k=max_results, min_score=min_score)
 
 
-def create_skill(root: str, name: str, description: str, content: str) -> dict:
+def _normalize_fa_keywords(value) -> list[str]:
+    """Normalize Persian skill match keywords to a deduped lowercase list."""
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = list(value or [])
+    seen: list[str] = []
+    for p in parts:
+        p = str(p or "").strip().lower()
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def create_skill(
+    root: str,
+    name: str,
+    description: str,
+    content: str,
+    fa_keywords: str | list = "",
+) -> dict:
     """Create or edit (overwrite) a user skill (global, shared across workspaces).
 
     ``name`` is the display name — it must be English (ASCII) because the
     storage folder slug is derived from it. ``description`` is indexed for
-    the system prompt, and ``content`` is the full markdown body. The skill
+    the system prompt, and ``content`` is the full markdown body. ``fa_keywords``
+    are Persian match keywords (comma-separated string or list) stored as an
+    ``fa_keywords:`` frontmatter line so Persian prompts can match this skill;
+    when empty, keywords embedded in ``content`` frontmatter win, otherwise the
+    existing skill's keywords are preserved (edit flow). The skill
     is stored as ``skills/<slug>/skill.md`` in the user data folder. Calling
     with an existing skill's SAME ``name`` overwrites it (edit flow). The
     ``root`` argument is kept for API compatibility and is not used.
@@ -1882,6 +1918,9 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
     body = content.strip()
     if not body:
         body = f"Write step-by-step instructions for {name}."
+    kws = _state_db._normalize_fa_keywords(fa_keywords)
+    if not kws:
+        kws = _state_db._normalize_fa_keywords(_state_db._parse_skill_fa_keywords(body))
     markdown = (
         "---\n"
         f"name: {name}\n"
@@ -1889,7 +1928,7 @@ def create_skill(root: str, name: str, description: str, content: str) -> dict:
         "---\n\n"
         f"# {name}\n\n{body}\n"
     )
-    result = persist_skill(markdown, fallback_name=name)
+    result = persist_skill(markdown, fallback_name=name, fa_keywords=kws)
     if not result.get("ok"):
         return {"error": result.get("note", "save failed")}
     return {
@@ -4199,8 +4238,9 @@ def make_tool_callbacks(
         content: str = "",
         source_url: str = "",
         source_query: str = "",
+        fa_keywords: str = "",
     ) -> str:
-        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). `fa_keywords` optional comma-separated Persian match keywords (e.g. "یوآی, رابط, ظاهر") stored as skill metadata so Persian prompts match this skill — NOT prose, only keywords; always resend the full list when editing a skill that has them (see them via `load_skill`). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
         emit(
             {
                 "kind": "tool",
@@ -4358,7 +4398,7 @@ def make_tool_callbacks(
             emit(_error_result("create_skill", c_err))
             return f"ERROR creating skill {name!r}: {c_err}"
         try:
-            result = create_skill(root, name, description, body)
+            result = create_skill(root, name, description, body, fa_keywords=fa_keywords)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("create_skill", msg))
@@ -4414,6 +4454,7 @@ def make_tool_callbacks(
             return f"ERROR: skill {name!r} not found. Available skills: {available}"
         desc = (match.get("description") or "").strip()
         body = (match.get("content") or "").strip()
+        fa = [str(k or "").strip() for k in (match.get("fa_keywords") or []) if str(k or "").strip()]
         summary = f"loaded skill {match['name']!r}"
         emit(
             {
@@ -4425,6 +4466,8 @@ def make_tool_callbacks(
         out = f"===== SKILL: {match['name']} =====\n"
         if desc:
             out += f"Description: {desc}\n"
+        if fa:
+            out += f"Persian match keywords (resend as fa_keywords when editing): {', '.join(fa)}\n"
         out += f"\n{body}\n===== END SKILL: {match['name']} ====="
         return out
 

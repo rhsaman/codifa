@@ -262,3 +262,19 @@ def test_sync_reseeds_when_description_changes(skill_env):
     assert "Test Skill" in seeded
     skill = next(s for s in state_db.list_skills() if s["name"] == "Test Skill")
     assert skill["description"] == "a NEW description"
+
+
+def test_create_skill_stores_fa_keywords(skill_env):
+    """fa_keywords passed to create_skill are stored and listed back."""
+    tools.create_skill("", "Key Skill", "a test skill", "Body.", fa_keywords="یوآی, رابط")
+    skill = next(s for s in state_db.list_skills() if s["name"] == "Key Skill")
+    assert skill["fa_keywords"] == ["یوآی", "رابط"]
+
+
+def test_edit_skill_without_keywords_preserves_them(skill_env):
+    """Overwriting a skill without fa_keywords keeps the existing ones."""
+    tools.create_skill("", "Key Skill", "a test skill", "Body.", fa_keywords="یوآی, رابط")
+    tools.create_skill("", "Key Skill", "a test skill", "Body v2.")
+    skill = next(s for s in state_db.list_skills() if s["name"] == "Key Skill")
+    assert skill["fa_keywords"] == ["یوآی", "رابط"]
+    assert skill["content"].strip().endswith("Body v2.")

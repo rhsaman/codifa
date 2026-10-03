@@ -1,6 +1,7 @@
 ---
 name: learning-explainer
 description: Explain programming and technical concepts simply, with examples and analogies, for fast understanding.
+fa_keywords: آموزش, توضیح, یادگیری, مستند
 ---
 
 # learning-explainer

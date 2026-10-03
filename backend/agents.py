@@ -879,7 +879,12 @@ _UNIVERSAL_RULES = (
     "(`name`, `description`, `content`) must ALWAYS be written entirely in "
     "English, regardless of the user's chat language. Never create Persian "
     "skills — this hard rule overrides the language-matching rules above for "
-    "skills only."
+    "skills only.\n"
+    "8. CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): docstrings and "
+    "comments in any code you write must be entirely in English, regardless of "
+    "the user's chat language. Never write Persian docstrings or comments — "
+    "this hard rule overrides the language-matching rules above for code "
+    "docstrings and comments."
 )
 
 # Length rule for plan/coder ONLY — these modes need full, complete deliverables
@@ -3757,8 +3762,8 @@ def _load_skills(root: str) -> list[dict]:
     Skills are stored as ``skills/<slug>/skill.md`` files in the user data
     folder (managed in-app via Settings or the ``/skill`` tool) and shared
     across all workspaces. Each result is ``{"name", "slug", "description",
-    "path", "content"}`` where ``path`` is the on-disk ``skill.md`` location. The
-    ``root`` argument is kept for API compatibility.
+    "path", "content", "fa_keywords"}`` where ``path`` is the on-disk ``skill.md``
+    location. The ``root`` argument is kept for API compatibility.
     """
     skills: list[dict] = []
     try:
@@ -3783,6 +3788,7 @@ def _load_skills(root: str) -> list[dict]:
                 "description": str(row.get("description") or "").strip(),
                 "path": str(row.get("path") or ""),
                 "content": body or content,
+                "fa_keywords": list(row.get("fa_keywords") or []),
             }
         )
     return skills
@@ -3799,10 +3805,7 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
     string when no plan is saved. Never raises.
     """
     try:
-        workspace_slug = (
-            slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep)))
-            or "workspace"
-        )
+        workspace_slug = state_db.workspace_slug_for_root(root)
         plan = state_db.get_plan(workspace_slug, chat_id=chat_id)
     except Exception:  # noqa: BLE001
         return ""
@@ -3993,19 +3996,26 @@ def _language_directive(text: str) -> str:
         return (
             "\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply "
             "ENTIRELY in Persian — every message, todo/checklist item, plan content, "
-            "summary, ask_user question and options, and any comment or text inside "
-            "generated code/files. Never reply in English when the user writes Persian. "
+            "summary, and ask_user question and options. Never reply in English "
+            "when the user writes Persian. "
             "EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via "
             "create_skill, its `name`, `description` and `content` (full markdown body) "
             "MUST be entirely in English, even though the chat is Persian. Never create "
-            "Persian skills. This hard rule overrides the Persian reply rule for skills."
+            "Persian skills. "
+            "EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): "
+            "docstrings and comments in any code you write MUST be entirely in "
+            "English, even though the chat is Persian. Never write Persian docstrings "
+            "or comments. These hard rules override the Persian reply rule for skills "
+            "and code docstrings/comments."
         )
     return (
         "\nLANGUAGE RULE (always follow): Reply entirely in the same language the user "
         "writes in — Persian → Persian, English → English, etc. Never switch languages "
         "for todo lists, plans or summaries. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): "
         "skill `name`/`description`/`content` via create_skill must always be English, "
-        "regardless of chat language."
+        "regardless of chat language. EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE "
+        "ALWAYS ENGLISH (HARD): docstrings and comments in any code you write "
+        "must always be English, regardless of chat language."
     )
 
 

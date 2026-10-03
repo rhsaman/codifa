@@ -7,21 +7,30 @@ UI is only one parametrized row here on purpose.
 import graph
 
 
-def _skill(name, desc=""):
-    return {"name": name, "description": desc, "content": "BODY-" + name}
+def _skill(name, desc="", fa=()):
+    return {"name": name, "description": desc, "content": "BODY-" + name, "fa_keywords": list(fa)}
 
 
 _POOL = [
-    _skill("UI/UX Pro Max", "UI/UX design intelligence for web interfaces"),
-    _skill("translation", "Translate accurately between languages"),
-    _skill("summarization", "Condense long content into summaries"),
-    _skill("Test UI", "Live-test UI in a browser via playwright"),
-    _skill("seo-optimization", "SEO optimization for pages"),
-    _skill("git-workflow", "Clean safe git workflow"),
-    _skill("Code-Expert", "Senior software engineering mentor for coding and debugging"),
-    _skill("Learn from Docs", "Learn from documentation with research"),
-    _skill("project-planning", "Plan projects step by step"),
-    _skill("professional-writing", "Professional writing for reports"),
+    _skill("UI/UX Pro Max", "UI/UX design intelligence for web interfaces",
+           ["یوآی", "رابط", "ظاهر", "دیزاین", "استایل", "چیدمان", "ریسپانسیو",
+            "انیمیشن", "فونت", "رنگ", "کامپوننت", "لندینگ", "داشبورد", "فرم",
+            "لاگین", "فرانت"]),
+    _skill("translation", "Translate accurately between languages", ["ترجمه"]),
+    _skill("summarization", "Condense long content into summaries", ["خلاصه"]),
+    _skill("Test UI", "Live-test UI in a browser via playwright", ["تست", "آزمون"]),
+    _skill("seo-optimization", "SEO optimization for pages", ["سئو"]),
+    _skill("git-workflow", "Clean safe git workflow",
+           ["کامیت", "پوش", "مرج", "شاخه", "گیت"]),
+    _skill("Code-Expert", "Senior software engineering mentor for coding and debugging",
+           ["دیباگ", "اشکال", "رفع", "رفکتور", "بازنویسی", "بنویس", "کد",
+            "برنامه", "اپلیکیشن", "سرور", "دیتابیس", "بک‌اند"]),
+    _skill("Learn from Docs", "Learn from documentation with research",
+           ["داکیومنت", "مستند", "راهنما", "آموزش", "یادگیری"]),
+    _skill("project-planning", "Plan projects step by step",
+           ["پروژه", "برنامه‌ریزی", "پلن"]),
+    _skill("professional-writing", "Professional writing for reports",
+           ["نوشتن", "متن", "گزارش"]),
 ]
 
 
@@ -70,6 +79,18 @@ def test_fa_skill_fallback_empty_on_greeting_or_no_pool():
     assert graph._fa_skill_fallback("سلام", _POOL) == ""
     assert graph._fa_skill_fallback("یوآی رو بهتر کن", []) == ""
     assert graph._fa_skill_fallback("", _POOL) == ""
+
+
+def test_fa_skill_fallback_matches_brand_new_skill_without_code_change():
+    """Generic matcher: a skill added later with its own fa_keywords matches."""
+    pool = [_skill("astro-deploy", "Deploy sites to the edge", ["استقرار", "دیپلوی"])]
+    assert graph._fa_skill_fallback("سایت رو استقرار بده", pool) == "astro-deploy"
+
+
+def test_fa_skill_fallback_matches_english_tokens_without_keywords():
+    """Code-switched prompts match skill name tokens with no fa_keywords set."""
+    pool = [_skill("seo-optimization", "SEO optimization for pages")]
+    assert graph._fa_skill_fallback("seo سایت رو درست کن", pool) == "seo-optimization"
 
 
 def test_skill_auto_pick_relaxed_threshold_still_blocks_flat_noise():

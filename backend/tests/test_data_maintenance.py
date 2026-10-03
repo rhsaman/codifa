@@ -214,3 +214,33 @@ def test_run_cleanup_cache_purge_never_raises(monkeypatch):
     monkeypatch.setattr("cache.Cache", _boom, raising=False)
     report = cleanup.run_cleanup(store=None, root="")
     assert report["cache_purged"] == 0
+
+
+def test_workspace_slug_unique_for_same_basename():
+    """Two roots with the same folder name must not share a slug."""
+    slug_a = state_db.workspace_slug_for_root("/tmp/parent-a/proj")
+    slug_b = state_db.workspace_slug_for_root("/tmp/parent-b/proj")
+    assert slug_a != slug_b
+    assert slug_a.startswith("proj-") and slug_b.startswith("proj-")
+
+
+def test_remove_one_workspace_keeps_other_same_name_plan(monkeypatch):
+    """Removing one same-name workspace must keep the other's plan folder."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("CODER_DATA_DIR", tmp)
+        monkeypatch.setattr(state_db, "_root_cache", None, raising=False)
+        state_db.bootstrap()
+
+        root_a = os.path.join(tmp, "parent-a", "proj")
+        root_b = os.path.join(tmp, "parent-b", "proj")
+        os.makedirs(root_a, exist_ok=True)
+        os.makedirs(root_b, exist_ok=True)
+        ws_a = state_db.workspace_slug_for_root(root_a)
+        ws_b = state_db.workspace_slug_for_root(root_b)
+        assert ws_a != ws_b
+        state_db.save_plan(ws_a, "plan", "## Plan\na", chat_id="chat-a")
+        state_db.save_plan(ws_b, "plan", "## Plan\nb", chat_id="chat-b")
+
+        state_db.remove_workspace_vectors([root_a])
+        assert not os.path.isdir(os.path.join(state_db.plans_dir(), ws_a))
+        assert os.path.isdir(state_db._plan_dir(ws_b, "chat-b"))

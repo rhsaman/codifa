@@ -663,25 +663,35 @@ export function TracePanel(props?: {
   };
 
   // گرفتن همه لاگ‌ها یک‌جا + پولینگ زنده تا لاگ‌های جدید خودکار بیایند.
+  const fetchSeqRef = useRef(0);
   const fetchAll = useCallback(async (silent: boolean) => {
     if (!activeChatId) {
       setEntries([]);
       return;
     }
+    const mySeq = ++fetchSeqRef.current;
     if (!silent) {
       setLoading(true);
       setError(null);
     }
     try {
       const out = await getChatTraces(activeChatId);
+      if (mySeq !== fetchSeqRef.current) return;
       if (Array.isArray(out)) {
         setEntries(out);
         if (!silent) setError(null);
       } else if (!silent) {
         setEntries([]);
-        setError(out.error ?? "trace request failed");
+        setError((out as { error?: string })?.error ?? "trace request failed");
+      }
+    } catch (e) {
+      if (mySeq !== fetchSeqRef.current) return;
+      if (!silent) {
+        setEntries([]);
+        setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
+      if (mySeq !== fetchSeqRef.current) return;
       if (!silent) setLoading(false);
     }
   }, [activeChatId]);
@@ -692,16 +702,15 @@ export function TracePanel(props?: {
       return;
     }
     let cancelled = false;
-    void (async () => {
-      if (cancelled) return;
-      await fetchAll(false);
-    })();
+    void fetchAll(false).catch(() => {});
     // پولینگ زنده هر ۲ ثانیه تا حین اجرای چت، لاگ‌ها لایو اضافه شوند.
     const timer = window.setInterval(() => {
-      if (!cancelled) void fetchAll(true);
+      if (!cancelled) void fetchAll(true).catch(() => {});
     }, 2000);
     return () => {
       cancelled = true;
+      // درخواست قدیمی اگر بعداً برگردد نادیده گرفته می‌شود (fetchSeqRef)
+      fetchSeqRef.current++;
       window.clearInterval(timer);
     };
   }, [activeChatId, fetchAll]);

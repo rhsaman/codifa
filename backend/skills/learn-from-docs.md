@@ -2,6 +2,7 @@
 name: Learn from Docs
 slug: learn-from-docs
 description: When the user wants to learn a programming language (or framework/tool) directly from its official documentation; provides a structured learning path, hands-on exercises, and spaced-repetition flashcards. Triggered with @learn-from-docs.
+fa_keywords: داکیومنت, مستند, راهنما, آموزش, یادگیری
 ---
 
 # Learn a Language from Official Documentation

@@ -10,6 +10,7 @@ from agents import (
     _DISCOVERY_BLOCK,
     _LENGTH_RULE,
     _UNIVERSAL_RULES,
+    _language_directive,
     SYSTEM_PROMPTS,
 )
 
@@ -73,6 +74,16 @@ def test_ask_mode_answers_general_questions():
     from agents import _MODE_CAPS
     assert "everyday questions" in _MODE_CAPS["ask"]
     assert "project/code questions" in _MODE_CAPS["ask"]
+
+
+def test_code_always_english_in_universal_rules():
+    assert "CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH" in _UNIVERSAL_RULES
+
+
+def test_language_directive_keeps_code_english_for_persian():
+    directive = _language_directive("سلام")
+    assert "CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH" in directive
+    assert "comment or text inside generated code/files" not in directive
 
 
 if __name__ == "__main__":

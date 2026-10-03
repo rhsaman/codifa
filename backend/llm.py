@@ -980,8 +980,13 @@ def _parse_allowed_efforts(exc: Exception) -> set[str] | None:
         bad = rejected.group(1) if rejected else None
         allowed = {w for w in words if w in _EFFORT_LADDER and w != bad}
         return allowed or None
-    # Chinese 「请使用 low、high 或 max」 — list the bare ladder words.
-    allowed = {w for w in _EFFORT_LADDER if w in low}
+    # Chinese "please use low, high or max" — list the bare ladder words.
+    # Exclude the REJECTED value like the English branch to avoid max->max loop.
+    rejected_zh = re.search(r"does not support\s*'(\w+)'", low) or re.search(
+        r"unsupported value\s*:\s*'(\w+)'", low
+    )
+    bad_zh = rejected_zh.group(1) if rejected_zh else None
+    allowed = {w for w in _EFFORT_LADDER if w in low and w != bad_zh}
     if allowed:
         return allowed
     return None
@@ -1083,17 +1088,20 @@ def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
         clone = model.model_copy(deep=False)
     except Exception:  # noqa: BLE001
         return model
+    assigned = False
     try:
         clone.reasoning_effort = target
-    except Exception:  # noqa: BLE001, S110
-        pass
+        assigned = True
+    except Exception as exc2:  # noqa: BLE001
+        _logger.warning("reasoning_effort assignment failed for %s: %s", target, exc2)
     mk = dict(getattr(clone, "model_kwargs", None) or {})
-    if "reasoning_effort" in mk:
+    # If direct assignment failed or the value is still stale, try model_kwargs.
+    if not assigned or "reasoning_effort" in mk or getattr(clone, "reasoning_effort", None) != target:
         mk["reasoning_effort"] = target
         try:
             clone.model_kwargs = mk
-        except Exception:  # noqa: BLE001, S110
-            pass
+        except Exception as exc2:  # noqa: BLE001
+            _logger.warning("model_kwargs reasoning_effort assignment failed: %s", exc2)
     return clone
 
 

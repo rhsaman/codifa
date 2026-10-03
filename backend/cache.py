@@ -26,7 +26,19 @@ class Cache:
     def __init__(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._path = path
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS cache ("
             "  key TEXT PRIMARY KEY,"
@@ -38,40 +50,57 @@ class Cache:
         self._conn.commit()
 
     def get(self, key: str) -> str | None:
-        with _LOCK:
-            row = self._conn.execute(
-                "SELECT value, expires_at FROM cache WHERE key = ?", (key,)
-            ).fetchone()
-            if not row:
-                return None
-            if row[1] < time.time():
-                self._conn.execute("DELETE FROM cache WHERE key = ?", (key,))
-                self._conn.commit()
-                return None
-            return str(row[0])
+        try:
+            with _LOCK:
+                row = self._conn.execute(
+                    "SELECT value, expires_at FROM cache WHERE key = ?", (key,)
+                ).fetchone()
+                if not row:
+                    return None
+                if row[1] < time.time():
+                    try:
+                        self._conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                        self._conn.commit()
+                    except sqlite3.Error:
+                        pass
+                    return None
+                return str(row[0])
+        except (sqlite3.Error, AttributeError):
+            return None
 
     def set(self, key: str, value: str, ttl_seconds: float = 3600.0) -> None:
-        now = time.time()
-        with _LOCK:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO cache(key, value, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                (key, value, now, now + ttl_seconds),
-            )
-            self._conn.commit()
+        try:
+            now = time.time()
+            with _LOCK:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO cache(key, value, created_at, expires_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key, value, now, now + ttl_seconds),
+                )
+                self._conn.commit()
+        except (sqlite3.Error, AttributeError):
+            pass
 
     def purge_expired(self) -> int:
-        with _LOCK:
-            cur = self._conn.execute("DELETE FROM cache WHERE expires_at < ?", (time.time(),))
-            self._conn.commit()
-            return cur.rowcount
+        try:
+            with _LOCK:
+                cur = self._conn.execute("DELETE FROM cache WHERE expires_at < ?", (time.time(),))
+                self._conn.commit()
+                return cur.rowcount
+        except (sqlite3.Error, AttributeError):
+            return 0
 
     def close(self) -> None:
         with _LOCK:
             try:
+                # Mark as closed so later get/set calls stay silent.
+                if getattr(self, "_conn", None) is None:
+                    return
                 self._conn.close()
             except sqlite3.Error:
                 pass
+            finally:
+                self._conn = None  # type: ignore[assignment]
 
 
 def cache_path_for(data_root: str) -> str:

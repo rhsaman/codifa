@@ -110,11 +110,11 @@ WEB_RAG_FILENAME_STEM = "web-rag"
 
 
 def web_rag_path_for(base_dir: str) -> str:
-    """مسیر store سراسری RAG وب/فچ.
+    """Path of the global web/fetch RAG store.
 
-    یک فایل sqlite ثابت برای همهٔ ورک‌اسپیس‌ها — چون RAG وب ذاتاً
-    سراسریه (یه React doc یه بار فچ شد، همه جا recall می‌شه).
-    از همون suffix ``_VEC_SUFFIX`` برای سازگاری با migration استفاده می‌کنه.
+    One fixed sqlite file for all workspaces — web RAG is global by nature
+    (a fetched React doc is recalled everywhere). Uses the same
+    ``_VEC_SUFFIX`` for migration compat.
     """
     base_dir = os.path.expanduser(base_dir or "")
     if not base_dir:
@@ -542,10 +542,13 @@ class VectorStore:
             )
         except sqlite3.Error as exc:
             logger.debug("vector_store: vec_chunks insert failed for chunk %s: %s", cid, exc)
-        self._conn.execute(
-            "INSERT INTO fts_chunks(rowid, txt, kind, doc_id) VALUES (?,?,?,?)",
-            (cid, txt, kind, doc_id),
-        )
+        try:
+            self._conn.execute(
+                "INSERT INTO fts_chunks(rowid, txt, kind, doc_id) VALUES (?,?,?,?)",
+                (cid, txt, kind, doc_id),
+            )
+        except sqlite3.Error as exc:
+            logger.debug("vector_store: fts_chunks insert failed for chunk %s: %s", cid, exc)
 
     def remove(self, key: str) -> bool:
         """Remove a document (and its chunks + index rows). True when removed."""
@@ -572,22 +575,24 @@ class VectorStore:
         return int(row[0] or 0)
 
     def has_kind(self, kind: str) -> bool:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM docs WHERE kind = ?", (kind,)
-        ).fetchone()
+        with _DB_LOCK:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM docs WHERE kind = ?", (kind,)
+            ).fetchone()
         return int(row[0] or 0) > 0
 
     def doc_texts(self, kind: str) -> list[dict]:
         """All docs of ``kind`` with their (key, title, full text)."""
-        rows = self._conn.execute(
-            """
-            SELECT d.key, d.title, c.txt
-            FROM chunks c JOIN docs d ON d.id = c.doc_id
-            WHERE d.kind = ?
-            ORDER BY d.fetched_at
-            """,
-            (kind,),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = self._conn.execute(
+                """
+                SELECT d.key, d.title, c.txt
+                FROM chunks c JOIN docs d ON d.id = c.doc_id
+                WHERE d.kind = ?
+                ORDER BY d.fetched_at
+                """,
+                (kind,),
+            ).fetchall()
         docs: dict[str, dict] = {}
         for key, title, txt in rows:
             entry = docs.setdefault(key, {"key": key, "title": title, "text": ""})
@@ -596,9 +601,10 @@ class VectorStore:
 
     def doc_meta(self, key: str) -> dict | None:
         """Return a doc's metadata row (or None)."""
-        row = self._conn.execute(
-            "SELECT * FROM docs WHERE key = ?", (key,)
-        ).fetchone()
+        with _DB_LOCK:
+            row = self._conn.execute(
+                "SELECT * FROM docs WHERE key = ?", (key,)
+            ).fetchone()
         return dict(row) if row else None
 
     def all_doc_meta(self, kind: str | None = None) -> dict[str, dict]:
@@ -714,14 +720,15 @@ class VectorStore:
         self, q: np.ndarray, kind: str | None, top_k: int
     ) -> list[dict]:
         """Numpy cosine fallback (used when the vec0 table is unavailable)."""
-        rows = self._conn.execute(
-            """
-            SELECT c.id AS cid, d.key, d.kind, d.title, d.fetched_at, c.txt, c.vec
-            FROM chunks c JOIN docs d ON d.id = c.doc_id
-            """
-            + (" WHERE d.kind = ?" if kind else ""),
-            (kind,) if kind else (),
-        ).fetchall()
+        with _DB_LOCK:
+            rows = self._conn.execute(
+                """
+                SELECT c.id AS cid, d.key, d.kind, d.title, d.fetched_at, c.txt, c.vec
+                FROM chunks c JOIN docs d ON d.id = c.doc_id
+                """
+                + (" WHERE d.kind = ?" if kind else ""),
+                (kind,) if kind else (),
+            ).fetchall()
         scored: list[tuple[float, dict]] = []
         for cid, key, doc_kind, title, fetched_at, txt, blob in rows:
             try:

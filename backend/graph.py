@@ -1687,51 +1687,35 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
         return False
 
 
-# Extensible Persian keyword -> skill hint table. Each row pairs Persian
-# task keywords (matched against the user prompt) with English hints matched
-# against a skill's name + description. UI is only one row here on purpose:
-# add new rows to cover more skills without touching the matching logic.
-# Hints are lowercase substrings, not exact names, so renames keep working.
-_FA_SKILL_FALLBACK: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("یوآی", "رابط", "ظاهر", "دیزاین", "استایل", "چیدمان", "ریسپانسیو",
-      "انیمیشن", "فونت", "رنگ", "کامپوننت", "لندینگ", "داشبورد", "فرم",
-      "لاگین", "فرانت", "ui", "ux", "design", "frontend", "landing",
-      "component", "style"),
-     ("ui", "ux", "design", "frontend", "landing", "component", "style")),
-    (("ترجمه", "translate"), ("translat",)),
-    (("خلاصه",), ("summar",)),
-    (("تست", "آزمون"), ("test",)),
-    (("سئو",), ("seo",)),
-    (("کامیت", "پوش", "مرج", "شاخه", "گیت"), ("git",)),
-    (("دیباگ", "اشکال", "رفع", "رفکتور", "بازنویسی", "بنویس", "کد",
-      "برنامه", "اپلیکیشن", "سرور", "دیتابیس", "بک‌اند"),
-     ("code", "debug", "refactor", "review")),
-    (("داکیومنت", "مستند", "راهنما", "آموزش", "یادگیری"),
-     ("learn", "docs", "explain", "research")),
-    (("پروژه", "برنامه‌ریزی", "پلن"), ("plan",)),
-    (("نوشتن", "متن", "گزارش"), ("writing", "report", "article")),
-)
-
-
 def _fa_skill_fallback(prompt: str, skills: list[dict]) -> str:
     """Best-effort Persian keyword fallback: skill name or "".
 
+    Generic: matches the prompt against each skill's own ``fa_keywords``
+    frontmatter metadata first, then against English tokens from the skill's
+    name/description (covers code-switched prompts like "ui رو بهتر کن").
     Used when embedding ranks are flat/empty on a Persian task turn.
-    Matches when a Persian keyword hits the prompt AND an English hint hits
-    the skill's name/description. First table row wins; never raises.
+    Matching logic is fixed; per-skill data lives in the skill files, so new
+    skills need no code change. First skill in list order wins; never raises.
     """
     try:
         p = (prompt or "").strip().lower()
         if not p or not skills:
             return ""
-        for fa_keys, en_hints in _FA_SKILL_FALLBACK:
-            if not any(k.lower() in p for k in fa_keys):
+        for s in skills:
+            if not isinstance(s, dict):
                 continue
-            for s in skills:
-                if not isinstance(s, dict):
-                    continue
-                hay = f"{s.get('name') or ''} {s.get('description') or ''}".lower()
-                if any(h in hay for h in en_hints):
+            for kw in s.get("fa_keywords") or []:
+                kw = str(kw or "").strip().lower()
+                if kw and kw in p:
+                    name = str(s.get("name") or "").strip()
+                    if name:
+                        return name
+        for s in skills:
+            if not isinstance(s, dict):
+                continue
+            hay = f"{s.get('name') or ''} {s.get('description') or ''}".lower()
+            for tok in set(re.findall(r"[a-z0-9]+", hay)):
+                if len(tok) >= 2 and tok in p:
                     name = str(s.get("name") or "").strip()
                     if name:
                         return name

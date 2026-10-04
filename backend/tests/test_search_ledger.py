@@ -31,13 +31,17 @@ _GLOB_HIT = "GLOB MATCHES for '*.py'\na.py\nb.py\n(12 matches found, showing the
 _GLOB_MISS = "No files match '*.zzz' under src."
 
 
-def test_search_ledger_silent_until_two_searches():
+def test_search_ledger_fires_on_first_search():
     assert search_ledger_line([]) == ""
     msgs = [
         _ai(_call("g1", "grep", {"pattern": "foo", "path": "backend"})),
         _tm(_GREP_HIT, "g1"),
     ]
-    assert search_ledger_line(msgs) == ""
+    # A single search is listed too: a repeat of the ONLY search used to get
+    # no warning and burned a full round-trip for a stub.
+    assert search_ledger_line(msgs) == (
+        "[already searched \u2014 do NOT re-search: grep 'foo|bar' in backend: 53 hits]"
+    )
 
 
 def test_search_ledger_exact_line():

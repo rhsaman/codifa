@@ -247,20 +247,22 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                 >
                   <StatusIcon status={entry.activity.status} />
                   <span className="edit-group-file" dir="auto">{base}</span>
-                  {stats && (
-                    <span className="trace-row-diff-stats" dir="ltr">{stats}</span>
-                  )}
-                  {entry.activity.reverted && (
-                    <span className="reverted-tag">reverted</span>
-                  )}
-                  {(() => {
-                    const act = entry.activity;
-                    const ms = act.status === "running" && act.startedAt ? Math.max(0, now - act.startedAt) : act.elapsedMs;
-                    return ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null;
-                  })()}
-                  {messageId && entry.activity.diff && (
-                    <span className="trace-row-review" aria-hidden="true">Review ↗</span>
-                  )}
+                  <span className="edit-group-row-end">
+                    {stats && (
+                      <span className="trace-row-diff-stats" dir="ltr">{stats}</span>
+                    )}
+                    {entry.activity.reverted && (
+                      <span className="reverted-tag">reverted</span>
+                    )}
+                    {(() => {
+                      const act = entry.activity;
+                      const ms = act.status === "running" && act.startedAt ? Math.max(0, now - act.startedAt) : act.elapsedMs;
+                      return ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null;
+                    })()}
+                    {messageId && entry.activity.diff && (
+                      <span className="trace-row-review" aria-hidden="true">Review ↗</span>
+                    )}
+                  </span>
                 </button>
               </div>
             );
@@ -1905,37 +1907,42 @@ export const ToolCallView = memo(function ToolCallView({
           <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>
         )}
         {activity.args && <ToolArgs args={activity.args} />}
-        {ms ? <span className="tool-ms">{fmtTime(ms)}</span> : null}
-        {isWrite &&
-          activity.diff &&
-          (() => {
-            const adds = (activity.diff.match(/^\+[^+]/gm) || []).length;
-            const dels = (activity.diff.match(/^-[^-]/gm) || []).length;
-            return adds + dels > 0 ? (
-              <span className="tool-diff-stats">
-                <span className="review-count-add">+{adds}</span>{" "}
-                <span className="review-count-del">-{dels}</span>
-              </span>
-            ) : null;
-          })()}
-        {isWrite && activity.diff && messageId && (
-          <button
-            className="tool-review-btn"
-            title="Open in Review panel"
-            onClick={(e) => {
-              e.stopPropagation();
-              openReview(messageId, writePath);
-            }}
-          >
-            Review ↗
-          </button>
-        )}
-        {isWrite && activity.reverted && (
-          <span className="reverted-tag">reverted</span>
-        )}
-        {collapsible && (
-          <span className={`chev${collapsed ? "" : " open"}`}>▾</span>
-        )}
+        {/* Trailing meta in ONE group pinned to the right edge by a single
+            auto margin — without this the row only reached the right edge
+            when the timer happened to render (write cards have no timer). */}
+        <span className="tool-card-head-end">
+          {ms ? <span className="tool-ms">{fmtTime(ms)}</span> : null}
+          {isWrite &&
+            activity.diff &&
+            (() => {
+              const adds = (activity.diff.match(/^\+[^+]/gm) || []).length;
+              const dels = (activity.diff.match(/^-[^-]/gm) || []).length;
+              return adds + dels > 0 ? (
+                <span className="tool-diff-stats">
+                  <span className="review-count-add">+{adds}</span>{" "}
+                  <span className="review-count-del">-{dels}</span>
+                </span>
+              ) : null;
+            })()}
+          {isWrite && activity.diff && messageId && (
+            <button
+              className="tool-review-btn"
+              title="Open in Review panel"
+              onClick={(e) => {
+                e.stopPropagation();
+                openReview(messageId, writePath);
+              }}
+            >
+              Review ↗
+            </button>
+          )}
+          {isWrite && activity.reverted && (
+            <span className="reverted-tag">reverted</span>
+          )}
+          {collapsible && (
+            <span className={`chev${collapsed ? "" : " open"}`}>▾</span>
+          )}
+        </span>
       </div>
 
       {collapsed &&

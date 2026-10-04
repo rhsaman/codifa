@@ -127,6 +127,36 @@ console.log("۶) planDisplay — بدون مقدمه و بدون متن، حبا
   check("فقط سگمنت ابزار", d.segments?.length === 1 && d.segments[0].kind === "tool")
 }
 
+console.log("۶-ب) planDisplay — متن پلن بین دو ابزار (update_plan بعد از پلن) حذف می‌شود:")
+{
+  // Plan mode writes the plan text and THEN calls update_plan, so the plan
+  // segment sits between tool segments — it must not render in the tool group.
+  const msg = {
+    planDoc: { title: "", body: BODY },
+    content: "scouting…" + BODY + "…",
+    segments: [
+      { kind: "tool", index: 0 },
+      { kind: "text", text: "scouting…" + BODY },
+      { kind: "tool", index: 1 },
+    ],
+  } as any
+  const d = planDisplay(msg)
+  check(
+    "متن پلن از بین ابزارها حذف شد",
+    !(d.segments ?? []).some((s) => s.kind === "text" && s.text.includes("do the thing")),
+    d.segments,
+  )
+  check(
+    "متنِ قبل از پلن و هر دو ردیف ابزار ماند",
+    d.segments?.length === 3 &&
+      d.segments[1].kind === "text" &&
+      (d.segments[1] as any).text === "scouting…" &&
+      d.segments[0].kind === "tool" &&
+      d.segments[2].kind === "tool",
+    d.segments,
+  )
+}
+
 const { useViewerTabs } = await import("../src/lib/viewerTabs")
 
 console.log("۷) تب Plan — openPlan تب plan می‌سازد و فعال می‌کند:")
@@ -143,6 +173,50 @@ console.log("۷) تب Plan — openPlan تب plan می‌سازد و فعال م
   check("تب تکراری ساخته نمی‌شود", useViewerTabs.getState().tabs.filter((t) => t.kind === "plan").length === 1)
   useViewerTabs.getState().closeViewer("plan")
   check("closeViewer حذف می‌کند", !useViewerTabs.getState().tabs.some((t) => t.kind === "plan"))
+}
+
+console.log("۷-ب) تب Browser — openBrowser تب browser را می‌سازد و فعال می‌کند:")
+{
+  useViewerTabs.getState().closeViewer("browser")
+  useViewerTabs.getState().openBrowser()
+  const s = useViewerTabs.getState()
+  const tab = s.tabs.find((t) => t.kind === "browser")
+  check("تب browser وجود دارد", !!tab)
+  check("تب browser فعال است", s.activeId === "browser")
+  check("عنوان Browser است", tab?.title === "Browser")
+  // Reopening only focuses the single tab — no duplicate is created.
+  useViewerTabs.getState().openBrowser()
+  check(
+    "تب تکراری ساخته نمی‌شود",
+    useViewerTabs.getState().tabs.filter((t) => t.kind === "browser").length === 1,
+  )
+  useViewerTabs.getState().closeViewer("browser")
+  check("closeViewer حذف می‌کند", !useViewerTabs.getState().tabs.some((t) => t.kind === "browser"))
+}
+
+console.log("۷-ج) presetForViewport — پریست‌ها دقیقاً مثل لیست دستگاه‌های کروم:")
+{
+  const { VIEWPORT_PRESETS, PRESET_GROUP_ORDER, presetForViewport } = await import("../src/lib/browserViewport")
+  check("۴۷ پریست دارد (۴۶ دستگاه کروم + دسکتاپ پیش‌فرض)", VIEWPORT_PRESETS.length === 47, VIEWPORT_PRESETS.length)
+  check("دسکتاپ ۱۲۸۰×۸۰۰", presetForViewport(1280, 800)?.id === "desktop")
+  check("iPhone 12 Pro دقیق کروم ۳۹۰×۸۴۴", presetForViewport(390, 844)?.id === "iphone-12-pro")
+  check("Laptop HiDPI دقیق کروم ۱۴۴۰×۹۰۰", VIEWPORT_PRESETS.some((p) => p.id === "laptop-hidpi" && p.width === 1440 && p.height === 900))
+  check("Nest Hub Max در گروه Smart Displays", VIEWPORT_PRESETS.some((p) => p.id === "nest-hub-max" && p.group === "smart_display" && p.width === 1280 && p.height === 800))
+  check("Moto G4 دقیق کروم ۳۶۰×۶۴۰", VIEWPORT_PRESETS.some((p) => p.id === "moto-g4" && p.width === 360 && p.height === 640))
+  check("ترتیب گروه‌ها مثل کروم است", JSON.stringify(PRESET_GROUP_ORDER) === JSON.stringify(["mobile", "foldable", "tablet_desktop", "smart_display"]))
+  check("سایز دلخواه null برمی‌گرداند", presetForViewport(1024, 700) === null)
+}
+
+console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپوت پایینی):")
+{
+  const React = (await import("react")).default
+  const { renderToString } = await import("react-dom/server")
+  const { BrowserPanel } = await import("../src/components/BrowserPanel")
+  const html = renderToString(React.createElement(BrowserPanel))
+  const inputs = html.match(/<input/g) ?? []
+  check("فقط یک اینپوت (omnibox) دارد", inputs.length === 1, inputs)
+  check("اینپوت پایینی Type حذف شد", !html.includes("Type into the page"))
+  check("استیج فوکوس‌پذیر است (کیبورد صفحه)", html.includes('tabindex="0"'))
 }
 
 const { useStore } = await import("../src/lib/store")

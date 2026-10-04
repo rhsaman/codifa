@@ -33,9 +33,11 @@ for _p in (_HERE, os.path.dirname(_HERE)):
         sys.path.insert(0, _p)
 
 # Hermetic data root BEFORE importing anything that binds state_db.
-_CODER_DATA_DIR = os.environ.setdefault(
-    "CODER_DATA_DIR", tempfile.mkdtemp(prefix="coder-pytest-data-")
-)
+# Always force a fresh temp dir: the app's sidecar exports CODER_DATA_DIR=~/.codifa
+# to its children (terminal tool), so setdefault() would keep the REAL path and
+# the atexit rmtree below would wipe the user's real data.
+_CODER_DATA_DIR = tempfile.mkdtemp(prefix="coder-pytest-data-")
+os.environ["CODER_DATA_DIR"] = _CODER_DATA_DIR
 atexit.register(shutil.rmtree, _CODER_DATA_DIR, ignore_errors=True)
 
 from mock_openai import mock, start_server, stop_server

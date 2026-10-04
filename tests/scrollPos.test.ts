@@ -158,6 +158,48 @@ console.log('6) classifyScrollEvent (تفکیک re-anchor برنامه‌ای ا
   check('clamp شدنِ re-anchor به انتها همچنان نادیده گرفته میشود', clamped.fromReanchor === true && clamped.cancelRestore === false, clamped)
 }
 
+console.log('7) scrollPosForFlush (a pin outranks a stale/absent capture on leave):')
+{
+  const { scrollPosForFlush, atBottomScrollPos } = await import('../src/lib/scroll.ts')
+  const anchor = { id: 'm9', offset: -34, atBottom: false }
+
+  // Pinned but the capture never happened (chat entry / jump-button arrival):
+  check('pinned + no capture → the bottom is saved', scrollPosForFlush(null, true)?.atBottom === true)
+
+  // Pinned but the capture is a stale scrolled-up anchor (rAF cancelled by the
+  // switch flush) — the reported "left at the bottom, came back off it" bug:
+  check('pinned + stale anchor → the bottom wins', scrollPosForFlush(anchor, true)?.atBottom === true)
+
+  // Not pinned: the captured anchor passes through untouched:
+  const kept = scrollPosForFlush(anchor, false)
+  check('not pinned → captured anchor is kept', kept?.id === 'm9' && kept?.offset === -34 && kept?.atBottom === false)
+
+  // Not pinned and nothing captured → caller skips the store write:
+  check('not pinned + no capture → null (no write)', scrollPosForFlush(null, false) === null)
+
+  check('atBottomScrollPos uses an unused empty anchor id', atBottomScrollPos().id === '' && atBottomScrollPos().offset === 0)
+}
+
+console.log('8) shouldLandOnLatest (returning to a chat follows live/new messages):')
+{
+  const { shouldLandOnLatest } = await import('../src/lib/scroll.ts')
+
+  // Agent still streaming in that chat → follow the live turn:
+  check('streaming → land on the newest message', shouldLandOnLatest({ streaming: true, lastMessageId: 'm5', seenLastMessageId: 'm4' }))
+
+  // Agent posted a new message while the user was away:
+  check('new message while away → follow it', shouldLandOnLatest({ streaming: false, lastMessageId: 'm9', seenLastMessageId: 'm4' }))
+
+  // Nothing new happened → restore the saved anchor:
+  check('no new message → keep the saved anchor', shouldLandOnLatest({ streaming: false, lastMessageId: 'm4', seenLastMessageId: 'm4' }) === false)
+
+  // Never viewed this session → keep the persisted anchor:
+  check('no leave record → keep the persisted anchor', shouldLandOnLatest({ streaming: false, lastMessageId: 'm9', seenLastMessageId: undefined }) === false)
+
+  // Empty chat → nothing to follow:
+  check('empty chat → keep the saved anchor', shouldLandOnLatest({ streaming: false, lastMessageId: '', seenLastMessageId: 'm4' }) === false)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست ناموفق`)
   process.exit(1)

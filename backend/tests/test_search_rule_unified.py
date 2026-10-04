@@ -79,7 +79,7 @@ def test_tool_docstrings_reference_explore_delegation():
 
     src = pathlib.Path(__file__).resolve().parent.parent / "tools.py"
     text = src.read_text(encoding="utf-8")
-    assert "subagent_type='explore'" in text
+    assert "subagent_type='subagent'" in text
 
 
 def test_read_docstring_encourages_parallel_reads():

@@ -37,6 +37,22 @@ def _clear_session_cache():
     mcp_bridge._session_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_browser(monkeypatch):
+    """Never launch a real Chromium from the tests.
+
+    ``_connect_stdio`` routes Playwright MCP configs through
+    ``_ensure_playwright_in_app``, which would otherwise spawn a real headless
+    browser on every connect/reconnect in this file. Tests that exercise the
+    shared-session wiring override this to simulate a successful launch.
+    """
+
+    async def _launch(url: str = "about:blank"):
+        return {"ok": False, "error": "browser launch disabled in tests"}
+
+    monkeypatch.setattr("browser_session.launch", _launch)
+
+
 def _fake_tool(name: str, description: str = "", schema: dict | None = None):
     """Build a fake MCP tool definition object."""
     t = MagicMock()
@@ -1025,6 +1041,59 @@ async def test_vision_analyzer_failure_does_not_break_tool(monkeypatch):
 
     assert "vision analysis of the image(s) failed" in out
     assert "Screenshot saved" in out
+    await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_ensure_playwright_in_app_uses_shared_browser(monkeypatch):
+    """Playwright MCP configs attach over CDP to the shared in-app browser.
+
+    The injected endpoint is what keeps the agent's browser inside the app (no
+    window outside); non-Playwright configs and user-pinned endpoints pass
+    through untouched, and the input dict stays immutable because the session
+    cache hashes it.
+    """
+    import browser_session
+
+    async def _launch(url: str = "about:blank"):
+        return {"ok": True}
+
+    monkeypatch.setattr(browser_session, "launch", _launch)
+    monkeypatch.setattr(browser_session, "cdp_endpoint", lambda: "http://127.0.0.1:9333")
+
+    cfg = {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
+    out = await mcp_bridge._ensure_playwright_in_app(cfg)
+    assert "--cdp-endpoint" in out["args"]
+    assert "http://127.0.0.1:9333" in out["args"]
+    assert cfg["args"] == ["-y", "@playwright/mcp@latest"]  # input untouched
+
+    pinned = {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint=http://x:1"],
+    }
+    assert await mcp_bridge._ensure_playwright_in_app(pinned) is pinned
+
+    other = {"command": "docker", "args": ["mcp", "gateway", "run"]}
+    assert await mcp_bridge._ensure_playwright_in_app(other) is other
+
+
+@pytest.mark.asyncio
+async def test_tool_events_carry_short_name(monkeypatch):
+    """`tool` and `tool_result` events use the short tool name (e.g.
+    ``browser_navigate``), never the qualified ``mcp__playwright__...`` form —
+    the chat timeline and trace labels render the short name."""
+    tool = _fake_tool("browser_navigate", "Navigate somewhere")
+    session = _fake_session([tool])
+    _wire(monkeypatch, session)
+
+    events = []
+    servers = {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}
+    tools, cleanup = await build_mcp_tools(servers, events.append)
+    await tools[0].ainvoke({"url": "https://example.com"})
+
+    names = [e.get("tool") for e in events if e.get("kind") in ("tool", "tool_result")]
+    assert "browser_navigate" in names
+    assert not any(str(n).startswith("mcp__") for n in names)
     await cleanup()
 
 

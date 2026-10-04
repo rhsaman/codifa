@@ -610,6 +610,34 @@ async def test_edit_file_batch_applies_all_edits_atomically(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_edit_file_batch_accepts_json_string_edits(tmp_path):
+    """مدل گاهی edits را به‌صورت رشته‌ی JSON (نه لیست واقعی) می‌فرستد —
+    بدون coerce شدن، رشته به کاراکترها شکسته می‌شد و خطای گمراه‌کننده‌ی
+    «edit 1/N: must be an object» (با N برابر طول رشته!) برمی‌گشت."""
+    import json
+
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    root = str(tmp_path)
+    cbs = tools.make_tool_callbacks(root, lambda event: None)
+    payload = json.dumps([
+        {"old_string": "alpha", "new_string": "ALPHA"},
+        {"old_string": "gamma", "new_string": "GAMMA"},
+    ])
+    # کل لیست به‌صورت یک رشته‌ی JSON
+    out = await cbs["edit_file"](path="a.py", edits=payload)
+    assert "2 edits" in out
+    assert (tmp_path / "a.py").read_text() == "ALPHA\nbeta\nGAMMA\n"
+    # آیتم‌هایی که خودشان رشته‌ی JSON‌اند
+    (tmp_path / "b.py").write_text("one\ntwo\n")
+    out2 = await cbs["edit_file"](
+        path="b.py",
+        edits=[json.dumps({"old_string": "one", "new_string": "ONE"})],
+    )
+    assert "Successfully edited" in out2
+    assert (tmp_path / "b.py").read_text() == "ONE\ntwo\n"
+
+
+@pytest.mark.asyncio
 async def test_read_batch_partial_failure_footer(tmp_path):
     """رگرسیون «خواندن دسته‌ای خطا داد»: یک فایل خطادار در batch نباید کل
     نتیجه را ERROR جلوه دهد — فایل‌های سالم عادی خوانده می‌شوند و خطاها

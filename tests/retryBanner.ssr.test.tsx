@@ -90,6 +90,24 @@ console.log('3) حالت gave-up → بدون spinner و بدون دکمه Retry
   check('دکمه Cancel (✕) دارد', html.includes('retry-cancel'))
 }
 
+console.log('4) float delay (backoff jitter) → whole seconds, no decimals:')
+{
+  const html = renderToString(
+    <RetryBanner
+      attempt={1}
+      maxAttempts={10}
+      delay={16.827721066797587}
+      reason="upstream connection lost"
+      gaveUp={false}
+      stalled={false}
+      onRetry={() => {}}
+      onCancel={() => {}}
+    />,
+  )
+  check('retry in 17s (rounded up)', html.includes('retry in 17s'), html.slice(0, 400))
+  check('no fractional seconds shown', !html.includes('16.82'), html.slice(0, 400))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

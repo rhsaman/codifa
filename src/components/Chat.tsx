@@ -39,6 +39,10 @@ import {
   modelReasoning,
   priceForModel,
   computeUsageCost,
+  buildContextBreakdown,
+  isContextPopoverOpen,
+  formatBreakdownPercent,
+  CONTEXT_BREAKDOWN_COLORS,
 } from "../lib/context";
 import {
   steerChat,
@@ -48,6 +52,7 @@ import {
   respondPermission,
   respondAsk,
   listSkills,
+  fetchSystemPrompts,
   listMcp,
   triggerCompact,
   gitAutoCommit,
@@ -76,7 +81,14 @@ import {
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
 import { fmtClock } from "../lib/time";
-import { isAtBottom, distanceFromBottom, classifyScrollEvent } from "../lib/scroll";
+import {
+  isAtBottom,
+  distanceFromBottom,
+  classifyScrollEvent,
+  atBottomScrollPos,
+  scrollPosForFlush,
+  shouldLandOnLatest,
+} from "../lib/scroll";
 import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget } from "../lib/messageWindow";
 import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
 import {
@@ -215,6 +227,34 @@ function relFromRoot(root: string, p: string): string | null {
   return rel || null;
 }
 
+/** Fixed width of the context-breakdown popover (also used to clamp its
+ *  horizontal anchor so it never overflows the viewport). */
+const CTX_POPOVER_WIDTH = 300;
+
+/** Circular context-usage indicator rendered in the composer next to Send. */
+function ContextRing({ pct }: { pct: number | null }) {
+  if (pct === null)
+    return <span className="ctx-ring-empty" aria-hidden="true" />;
+  const clamped = Math.min(100, Math.max(0, pct)) / 100;
+  const radius = 6;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <span className="context-meter-ring" aria-hidden="true">
+      <svg viewBox="0 0 16 16" width="16" height="16">
+        <circle cx="8" cy="8" r={radius} className="context-meter-ring-track" />
+        <circle
+          cx="8"
+          cy="8"
+          r={radius}
+          className="context-meter-ring-fill"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - clamped)}
+        />
+      </svg>
+    </span>
+  );
+}
+
 export function ChatPanel() {
   // Subscribe by id first: the active chat object identity only changes when
   // THAT chat's own record changes (message/stream/draft), so typing a draft
@@ -351,9 +391,26 @@ export function ChatPanel() {
       .split(/[\\/]/)
       .pop() || nvimLabel
     : null;
-  const systemPrompt = useStore((s) =>
+  const userSystemPrompt = useStore((s) =>
     chat ? (s.settings.systemPrompts?.[chat.mode] ?? "") : "",
   );
+  // The REAL system prompt sent this turn: the user's per-mode override when
+  // set, otherwise the backend's built-in prompt for this mode (fetched once).
+  // The context popover must show what is actually sent, not just the override.
+  const [builtinPrompts, setBuiltinPrompts] = useState<Record<string, string>>(
+    {},
+  );
+  useEffect(() => {
+    let alive = true;
+    void fetchSystemPrompts().then((p) => {
+      if (alive) setBuiltinPrompts(p);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const systemPrompt =
+    userSystemPrompt || builtinPrompts[chat?.mode ?? ""] || "";
 
   // The panel now stays mounted across chat switches (no key={activeChatId}),
   // so per-chat UI state must reset explicitly when the active chat changes.
@@ -403,7 +460,20 @@ export function ChatPanel() {
     // this, switching back to a scrolled-up chat renders only the last
     // MSG_PAGE messages and the restore lands on a wrong viewport.
     const incomingPos = chat?.scrollPos;
-    if (incomingPos && !incomingPos.atBottom && chat) {
+    // Returning to a chat: follow the newest messages when the agent is live
+    // in it or posted a new message while the user was away — restoring the
+    // old anchor there would hide exactly the reply the user came back to read.
+    const landLatest = shouldLandOnLatest({
+      streaming:
+        chat?.messages.some((m) => m.streaming || m.retry?.reconnecting === true) ??
+        false,
+      lastMessageId: chat?.messages.length
+        ? chat.messages[chat.messages.length - 1].id
+        : "",
+      seenLastMessageId: lastSeenMsgIdRef.current.get(id),
+    });
+    const restoredPos = landLatest ? atBottomScrollPos() : incomingPos;
+    if (incomingPos && !incomingPos.atBottom && chat && !landLatest) {
       const anchorIdx = chat.messages.findIndex((m) => m.id === incomingPos.id);
       if (anchorIdx >= 0) {
         const start = Math.max(0, anchorIdx - SCROLL_RESTORE_BUFFER);
@@ -414,17 +484,22 @@ export function ChatPanel() {
     } else {
       setMsgLimit(MSG_PAGE);
     }
-    stickToBottom.current = !chat?.scrollPos || chat.scrollPos.atBottom;
+    stickToBottom.current =
+      landLatest || !chat?.scrollPos || chat.scrollPos.atBottom;
     restoredRef.current = false;
     // The restore layout effect below must re-run for the NEW chat with the
     // NEW chat's saved position (not the mount-time one): refresh the anchor
     // and bump a tick so the effect fires even when every other state setter
     // bails out identical. Without this, switching to a scrolled-up chat can
     // land on a stale anchor — or the oldest-message fallback, i.e. the top.
-    initialScrollPosRef.current = chat?.scrollPos ?? null;
+    initialScrollPosRef.current = restoredPos ?? null;
     setRestoreTick((t) => t + 1);
     restoreTargetRef.current = null;
-    lastScrollPosRef.current = null;
+    // Seed the capture with the position being RESTORED (the bottom when
+    // following a live/new turn, otherwise the saved anchor): until the user
+    // scrolls this is where they are, and a switch-away flush with a null
+    // capture skips the write entirely — resurrecting an older position.
+    lastScrollPosRef.current = restoredPos ?? null;
     chatIdRef.current = id;
     // Gated switch-to-paint probe (zero cost unless enabled): set
     // localStorage 'coder:perf' to '1', reload, switch chats, and read the
@@ -501,6 +576,10 @@ export function ChatPanel() {
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  // "+" action menu (files / screenshot / skills / MCP) — the single entry
+  // point that keeps the bottom toolbar minimal.
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  const plusMenuRef = useRef<HTMLDivElement>(null);
   const [noRootHint, setNoRootHint] = useState("");
   const [skillOpen, setSkillOpen] = useState(false);
   const [skillQuery, setSkillQuery] = useState("");
@@ -570,6 +649,11 @@ export function ChatPanel() {
   // chat scrolled up, don't auto-pin to the bottom on return.
   const initialScrollPosRef = useRef(chat?.scrollPos ?? null);
   const stickToBottom = useRef(!initialScrollPosRef.current || initialScrollPosRef.current.atBottom);
+  // Newest message id per chat as of the last time the user LEFT it (recorded
+  // in the scroll-flush cleanup below). On return, a different id means the
+  // agent posted while the user was away → land on the newest message instead
+  // of the saved anchor (shouldLandOnLatest in the switch effect).
+  const lastSeenMsgIdRef = useRef<Map<string, string>>(new Map());
   // A jump-to-bottom smooth scroll started by the scroll-jump button is still
   // in flight: while set, onChatScroll ignores the animation's intermediate
   // scroll events so they can't unpin the view or pop the button back.
@@ -987,6 +1071,18 @@ export function ChatPanel() {
     });
   };
 
+  /** Pin the viewport to the newest messages AND record that as the saved
+   *  scroll position. Every path that sticks to the bottom must go through
+   *  this: the chat-switch flush only persists what's in `lastScrollPosRef`
+   *  (plus the pin flag), so a pin that skips the record leaves a stale anchor
+   *  behind — and the chat then reopens NOT at the bottom after a switch. At
+   *  the bottom the anchor id/offset are unused, so no DOM scan is needed. */
+  const recordAtBottom = () => {
+    stickToBottom.current = true;
+    setShowJump(false);
+    lastScrollPosRef.current = atBottomScrollPos();
+  };
+
   const onChatScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1012,13 +1108,22 @@ export function ChatPanel() {
     if (jumpScrollingRef.current) {
       if (isAtBottom(el)) {
         jumpScrollingRef.current = false;
-        stickToBottom.current = true;
-        setShowJump(false);
+        // Arrival at the bottom: record it — this branch returns early, so the
+        // capture below never runs, and without a record the leave-flush would
+        // save the pre-jump anchor (chat reopens off the bottom after a switch).
+        recordAtBottom();
       }
       return;
     }
     const atBottom = isAtBottom(el);
-    stickToBottom.current = atBottom;
+    if (atBottom) {
+      // Record synchronously: at the bottom there is nothing to scan, and the
+      // rAF capture below can be cancelled by a chat switch — losing the
+      // atBottom flag is what made a chat reopen off the bottom.
+      recordAtBottom();
+    } else {
+      stickToBottom.current = false;
+    }
     // Bail out when unchanged so scrolling doesn't re-render the whole panel on
     // every tick — the jump button only flips once per boundary crossing.
     // آستانهٔ نمایش: محتوا باید واقعاً پشت کامپوزر پنهان شده باشد، نه فقط
@@ -1058,23 +1163,20 @@ export function ChatPanel() {
   /** Force the transcript to the bottom regardless of where the user scrolled
    *  (used when the user sends / queues / steers a message). */
   const forceScrollToBottom = () => {
-    stickToBottom.current = true;
-    setShowJump(false);
+    recordAtBottom();
     setScrollTick((t) => t + 1);
-    // The user is pinned to the newest messages — record it so a later chat
-    // switch / restart restores the bottom instead of a stale scrolled-up spot.
-    // The id is unused for atBottom restores, so no DOM scan is needed here.
-    if (chat?.id) {
-      const lastId = chat.messages.length
-        ? (chat.messages[chat.messages.length - 1].id ?? "")
-        : "";
-      lastScrollPosRef.current = { id: lastId, offset: 0, atBottom: true };
+    // Persist immediately: send/queue is an explicit user action and the app
+    // may close before any flush picks the position up from the ref.
+    if (chat?.id && lastScrollPosRef.current) {
       useStore.getState().setChatScrollPos(chat.id, lastScrollPosRef.current);
     }
   };
 
   useEffect(() => {
     if (!stickToBottom.current) return;
+    // Keep the saved position pinned too: this scrollTo may fire no scroll
+    // event (already at max), and a chat switch flushes the ref as-is.
+    recordAtBottom();
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [chat?.messages, scrollTick]);
 
@@ -1112,7 +1214,8 @@ export function ChatPanel() {
         // بدون این همگام‌سازی فلش تا اولین اسکرولِ کاربر مخفی می‌ماند.
         restoreTargetRef.current = null;
         const atBottom = isAtBottom(el);
-        stickToBottom.current = atBottom;
+        if (atBottom) recordAtBottom();
+        else stickToBottom.current = false;
         const jumpVisible = distanceFromBottom(el) > jumpThresholdRef.current;
         setShowJump((prev) => (prev === jumpVisible ? prev : jumpVisible));
         return;
@@ -1195,7 +1298,7 @@ export function ChatPanel() {
       // کاربر در پایین بود (یا موقعیتی ذخیره نشده) → مستقیماً به پایین اسکرول کن.
       // حین استریم محتوا رشد می‌کند و reconcile/auto-scroll پین را حفظ می‌کنند.
       restoredRef.current = true;
-      stickToBottom.current = true;
+      recordAtBottom();
       el.scrollTop = el.scrollHeight;
       return;
     }
@@ -1245,7 +1348,7 @@ export function ChatPanel() {
     if (!anchor) {
       // Nothing left to anchor to → fall back to the newest messages.
       restoredRef.current = true;
-      stickToBottom.current = true;
+      recordAtBottom();
       el.scrollTop = el.scrollHeight;
       return;
     }
@@ -1289,8 +1392,15 @@ export function ChatPanel() {
         // viewport at flush time (cheap: no-op unless a capture is pending).
         syncScrollPos();
       }
-      if (lastScrollPosRef.current) {
-        useStore.getState().setChatScrollPosMem(cid, lastScrollPosRef.current);
+      // A pin to the bottom outranks the raw capture: the capture can be stale
+      // (its rAF was just cancelled above) or never have happened (entering a
+      // chat and the jump-button arrival don't schedule one), so persisting it
+      // as-is would resurrect an old scrolled-up anchor and the chat would not
+      // reopen at the bottom after a switch.
+      const pos = scrollPosForFlush(lastScrollPosRef.current, stickToBottom.current);
+      if (pos) {
+        lastScrollPosRef.current = pos;
+        useStore.getState().setChatScrollPosMem(cid, pos);
       }
     };
     const onFlushUi = () => pushToStore(false);
@@ -1300,6 +1410,18 @@ export function ChatPanel() {
       pushToStore(true);
       if (cid && lastScrollPosRef.current) {
         useStore.getState().flushNow();
+      }
+      // Record the newest message this chat had as the user left it: on the
+      // next return, a different id means the agent posted while they were
+      // away → land on the newest message instead of the saved anchor
+      // (shouldLandOnLatest). Read fresh from the store — the closure's `chat`
+      // is from the render that last changed chat?.id, so it can be stale.
+      if (cid) {
+        const cur = useStore.getState().chats.find((c) => c.id === cid);
+        const lastId = cur?.messages.length
+          ? cur.messages[cur.messages.length - 1].id
+          : "";
+        if (lastId) lastSeenMsgIdRef.current.set(cid, lastId);
       }
     };
     // App close: push the position into the store AND force an immediate write,
@@ -1397,6 +1519,83 @@ export function ChatPanel() {
   const compactAtPercent = settings.compactAtPercent ?? 80;
   const usable =
     ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null;
+
+  // ---- Context-breakdown popover (hover the ring next to Send) ----
+  const [ctxPopoverChatId, setCtxPopoverChatId] = useState<string | null>(null);
+  const [ctxPopoverPos, setCtxPopoverPos] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const ctxRingWrapRef = useRef<HTMLDivElement | null>(null);
+  const ctxPopoverCloseTimer = useRef<number | null>(null);
+  const cancelCtxPopoverClose = () => {
+    if (ctxPopoverCloseTimer.current != null) {
+      window.clearTimeout(ctxPopoverCloseTimer.current);
+      ctxPopoverCloseTimer.current = null;
+    }
+  };
+  const scheduleCtxPopoverClose = () => {
+    cancelCtxPopoverClose();
+    // Grace period so the pointer can cross the gap into the popover itself.
+    ctxPopoverCloseTimer.current = window.setTimeout(
+      () => setCtxPopoverChatId(null),
+      180,
+    );
+  };
+  const openCtxPopover = () => {
+    cancelCtxPopoverClose();
+    const el = ctxRingWrapRef.current;
+    if (el && typeof window !== "undefined") {
+      const r = el.getBoundingClientRect();
+      setCtxPopoverPos({
+        top: r.top - 6,
+        left: Math.max(
+          8,
+          Math.min(
+            r.right - CTX_POPOVER_WIDTH,
+            window.innerWidth - CTX_POPOVER_WIDTH - 8,
+          ),
+        ),
+      });
+    }
+    setCtxPopoverChatId(activeChatId);
+  };
+  useEffect(() => cancelCtxPopoverClose, []);
+  const ctxPopoverOpen = isContextPopoverOpen(
+    ctxPopoverChatId,
+    activeChatId,
+    contextUsed,
+  );
+  const ctxBreakdown = useMemo(() => {
+    if (!ctxPopoverOpen) return null;
+    // Mentioned skills and enabled MCP connectors are part of this turn's
+    // context — derive their footprint from the real configs (no fixed size).
+    const mentioned = extractMentionSkills(input, skillsList).skills;
+    let skillsChars = 0;
+    for (const name of mentioned) {
+      const row = skillsList.find((s) => s.name === name || s.slug === name);
+      if (row) skillsChars += row.content.length;
+    }
+    const mcpCfg = settings.mcpServers ?? {};
+    let mcpChars = 0;
+    for (const name of mcpEnabled) {
+      const cfg = mcpCfg[name];
+      if (cfg) mcpChars += JSON.stringify(cfg).length;
+    }
+    return buildContextBreakdown(chat, systemPrompt, ctxWindow, {
+      skillsChars,
+      mcpChars,
+    });
+  }, [
+    ctxPopoverOpen,
+    chat,
+    systemPrompt,
+    ctxWindow,
+    input,
+    skillsList,
+    mcpEnabled,
+    settings.mcpServers,
+  ]);
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
   // compact / vision sub-agents). Tracked in the chat record itself so it
@@ -2134,6 +2333,12 @@ export function ChatPanel() {
         // A create_mcp call this turn means the connector list in the store is
         // stale — flag it so the `done` handler re-fetches from the sidecar.
         if (event.tool === "create_mcp") mcpChanged = true;
+        // Codex-style: the first browser tool call of a turn docks the Browser
+        // viewer tab on the right so the user watches the shared session live.
+        if ((event.tool ?? "").startsWith("browser_")) {
+          const browserVt = useViewerTabs.getState();
+          if (!browserVt.tabs.some((t) => t.kind === "browser")) browserVt.openBrowser();
+        }
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
         // the running task card, not as top-level cards — so a task turn shows
@@ -3779,6 +3984,38 @@ export function ChatPanel() {
     setSkillIdx(0);
   };
 
+  // Close the "+" menu on outside pointer-down or on Escape. The listeners are
+  // bound lazily (only while the menu is open) so they never fight other
+  // popups' own key handling.
+  useEffect(() => {
+    if (!plusMenuOpen) return;
+    const onPointerDown = (ev: PointerEvent) => {
+      if (ev.target instanceof Node && plusMenuRef.current?.contains(ev.target))
+        return;
+      setPlusMenuOpen(false);
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setPlusMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [plusMenuOpen]);
+
+  // "Skills" row of the "+" menu: mirrors what typing "@" does, so the existing
+  // skill mention popup opens (and the list starts loading) without a separate
+  // toolbar button.
+  const openSkillsFromPlusMenu = () => {
+    setPlusMenuOpen(false);
+    const at = input ? input.length + 1 : 0;
+    setInput((prev) => (prev ? `${prev} @` : "@"));
+    startSkillMention(at);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
   const onInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const v = e.target.value;
     const prev = input;
@@ -4061,52 +4298,6 @@ export function ChatPanel() {
           {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
         </span>
         {activeModel || "no model"}
-      </span>
-      <span
-        className={`badge context-meter${contextWarn(contextUsed, usable) ? " warn" : ""}`}
-        title={
-          ctxWindow != null
-            ? `Context used: real tokens of the last completed reply, relative to the model's raw ${formatTokens(ctxWindow)} window (like opencode — no headroom subtracted). The meter turns yellow exactly when usage reaches the auto-compaction threshold (${formatTokens(usable ?? 0)} tokens = ${compactAtPercent}% of the window) — the same point where auto-compaction fires.`
-            : "Context used: real tokens of the last completed reply, relative to the raw model window (like opencode — no headroom subtracted)."
-        }
-        dir="ltr"
-      >
-        {ctxPct !== null && contextUsed > 0 && (() => {
-          const clamped = Math.min(100, Math.max(0, ctxPct)) / 100;
-          const radius = 6;
-          const circumference = 2 * Math.PI * radius;
-          return (
-            <span className="context-meter-ring" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="16" height="16">
-                <circle
-                  cx="8"
-                  cy="8"
-                  r={radius}
-                  className="context-meter-ring-track"
-                />
-                <circle
-                  cx="8"
-                  cy="8"
-                  r={radius}
-                  className="context-meter-ring-fill"
-                  strokeDasharray={circumference}
-                  strokeDashoffset={circumference * (1 - clamped)}
-                />
-              </svg>
-            </span>
-          );
-        })()}
-        <span className="context-meter-text">
-          {contextUsed > 0 ? (
-            <>
-              {formatTokens(contextUsed)}
-              {ctxWindow != null ? ` / ${formatTokens(ctxWindow)}` : ""}
-              {ctxPct !== null ? ` (${ctxPct}%)` : ""}
-            </>
-          ) : (
-            "—"
-          )}
-        </span>
       </span>
       <BalanceChip
         providerName={
@@ -4522,9 +4713,8 @@ export function ChatPanel() {
               // The user explicitly asked for the bottom: drop any in-progress
               // viewport restore so it can't fight the jump, then smooth-scroll.
               restoreTargetRef.current = null;
-              stickToBottom.current = true;
+              recordAtBottom();
               jumpScrollingRef.current = true;
-              setShowJump(false);
               programmaticScrollRef.current = true;
               el.scrollTo({
                 top: el.scrollHeight,
@@ -5304,12 +5494,14 @@ export function ChatPanel() {
                 onPaste={onComposerPaste}
               />
               <div className="composer-bottom-row">
-                <div className="composer-left-actions">
+                <div className="composer-left-actions" ref={plusMenuRef}>
                   <button
                     className="icon-btn plus-btn"
-                    onClick={attachFile}
-                    title="Attach files or images"
-                    aria-label="Attach"
+                    onClick={() => setPlusMenuOpen((o) => !o)}
+                    title="Add files, screenshot, skills or MCP tools"
+                    aria-label="Add"
+                    aria-haspopup="menu"
+                    aria-expanded={plusMenuOpen}
                   >
                     <svg
                       viewBox="0 0 24 24"
@@ -5324,23 +5516,106 @@ export function ChatPanel() {
                       <path d="M12 8v8M8 12h8" />
                     </svg>
                   </button>
-                  <button
-                    className="icon-btn attach-btn"
-                    onClick={captureRegion}
-                    title="Capture a region of the screen"
-                  >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-                      <circle cx="12" cy="13" r="4" />
-                    </svg>
-                  </button>
+                  {plusMenuOpen && (
+                    <div className="plus-menu" role="menu" dir="ltr">
+                      <button
+                        type="button"
+                        className="plus-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setPlusMenuOpen(false);
+                          void attachFile();
+                        }}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                        </svg>
+                        <span>Add files or photos</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="plus-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setPlusMenuOpen(false);
+                          void captureRegion();
+                        }}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                          <circle cx="12" cy="13" r="4" />
+                        </svg>
+                        <span>Screenshot</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="plus-menu-item"
+                        role="menuitem"
+                        onClick={openSkillsFromPlusMenu}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M12 3l2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3z" />
+                        </svg>
+                        <span>Skills</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="plus-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setPlusMenuOpen(false);
+                          if (!skillOpen) openSkillPicker();
+                        }}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M9 2v6" />
+                          <path d="M15 2v6" />
+                          <path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
+                          <path d="M12 17v5" />
+                        </svg>
+                        <span>MCP connectors</span>
+                        {mcpEnabled.length > 0 && (
+                          <span className="plus-menu-badge">
+                            {mcpEnabled.length}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="composer-right-actions">
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onClick={toggleRecording}
@@ -5390,57 +5665,150 @@ export function ChatPanel() {
                       </svg>
                     )}
                   </button>
-                  <button
-                    className={`icon-btn attach-btn${mcpEnabled.length > 0 ? " has-chips" : ""}`}
-                    onClick={() => void openSkillPicker()}
-                    title="Add MCP tools to this message"
+                  <div
+                    className="ctx-ring-wrap"
+                    ref={ctxRingWrapRef}
+                    onMouseEnter={openCtxPopover}
+                    onMouseLeave={scheduleCtxPopoverClose}
                   >
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
+                    <button
+                      type="button"
+                      className={`ctx-ring-btn${contextWarn(contextUsed, usable) ? " warn" : ""}`}
+                      aria-label="Context windows"
+                      aria-haspopup="dialog"
+                      aria-expanded={ctxPopoverOpen}
+                      onClick={() =>
+                        ctxPopoverOpen
+                          ? setCtxPopoverChatId(null)
+                          : openCtxPopover()
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setCtxPopoverChatId(null);
+                      }}
                     >
-                      <path d="M9 2v6" />
-                      <path d="M15 2v6" />
-                      <path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
-                      <path d="M12 17v5" />
-                    </svg>
-                    {mcpEnabled.length > 0 && (
-                      <span className="attach-count">{mcpEnabled.length}</span>
+                      <ContextRing pct={ctxPct} />
+                    </button>
+                  </div>
+                  {ctxPopoverOpen &&
+                    ctxBreakdown &&
+                    ctxPopoverPos &&
+                    typeof document !== "undefined" &&
+                    createPortal(
+                      <div
+                        className="context-popover"
+                        dir="ltr"
+                        role="dialog"
+                        aria-label="Context windows"
+                        style={{
+                          position: "fixed",
+                          top: ctxPopoverPos.top,
+                          left: ctxPopoverPos.left,
+                          width: CTX_POPOVER_WIDTH,
+                          transform: "translateY(-100%)",
+                        }}
+                        onMouseEnter={cancelCtxPopoverClose}
+                        onMouseLeave={scheduleCtxPopoverClose}
+                      >
+                        <div className="ctx-pop-title">Context windows</div>
+                        <div className="ctx-pop-total">
+                          {formatTokens(ctxBreakdown.total)}
+                          {ctxBreakdown.window
+                            ? `/${formatTokensK(ctxBreakdown.window)} (${(
+                                (ctxBreakdown.total / ctxBreakdown.window) *
+                                100
+                              ).toFixed(1)}%)`
+                            : ""}
+                        </div>
+                        <div className="ctx-pop-bar">
+                          {ctxBreakdown.rows.map((row) => (
+                            <span
+                              key={row.key}
+                              style={{
+                                width: `${
+                                  ctxBreakdown.total > 0
+                                    ? (row.tokens / ctxBreakdown.total) *
+                                      100
+                                    : 0
+                                }%`,
+                                backgroundColor:
+                                  CONTEXT_BREAKDOWN_COLORS[row.key],
+                              }}
+                            />
+                          ))}
+                        </div>
+                        <div className="ctx-pop-rows">
+                          {ctxBreakdown.rows.map((row) => (
+                            <div className="ctx-pop-row" key={row.key}>
+                              <span
+                                className="ctx-pop-dot"
+                                style={{
+                                  backgroundColor:
+                                    CONTEXT_BREAKDOWN_COLORS[row.key],
+                                }}
+                              />
+                              <span className="ctx-pop-label">{row.label}</span>
+                              <span className="ctx-pop-tok">
+                                {formatTokens(row.tokens)}
+                              </span>
+                              <span className="ctx-pop-pct">
+                                {formatBreakdownPercent(row.percent)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="ctx-pop-foot">
+                          <span>Average cache hit rate</span>
+                          <span>
+                            {ctxBreakdown.cacheHitRate != null
+                              ? formatBreakdownPercent(
+                                  ctxBreakdown.cacheHitRate,
+                                )
+                              : "—"}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="ctx-pop-compact"
+                          disabled={compacting || busy}
+                          onClick={() => {
+                            setCtxPopoverChatId(null);
+                            void compactContext();
+                          }}
+                        >
+                          {compacting ? "Compacting…" : "Compact context"}
+                        </button>
+                      </div>,
+                      document.body,
                     )}
-                  </button>
+                  {busy ? (
+                    <button
+                      className="send-circle-btn stop-btn"
+                      onClick={stop}
+                      title="Stop"
+                    >
+                      <svg viewBox="0 0 24 24" fill="currentColor">
+                        <rect x="6" y="6" width="12" height="12" rx="2" />
+                      </svg>
+                    </button>
+                  ) : (
+                    <button
+                      className="send-circle-btn"
+                      disabled={
+                        !input.trim() &&
+                        pastedBlocks.length === 0 &&
+                        images.length === 0
+                      }
+                      onClick={submit}
+                      title="Send"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M19 7v4a2 2 0 01-2 2H5" />
+                        <polyline points="9 17 5 13 9 9" />
+                        <line x1="5" y1="13" x2="14" y2="13" />
+                      </svg>
+                    </button>
+                  )}
                 </div>
-                {busy ? (
-                  <button
-                    className="send-circle-btn stop-btn"
-                    onClick={stop}
-                    title="Stop"
-                  >
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
-                    </svg>
-                  </button>
-                ) : (
-                  <button
-                    className="send-circle-btn"
-                    disabled={
-                      !input.trim() &&
-                      pastedBlocks.length === 0 &&
-                      images.length === 0
-                    }
-                    onClick={submit}
-                    title="Send"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M19 7v4a2 2 0 01-2 2H5" />
-                      <polyline points="9 17 5 13 9 9" />
-                      <line x1="5" y1="13" x2="14" y2="13" />
-                    </svg>
-                  </button>
-                )}
               </div>
             </div>
           </div>

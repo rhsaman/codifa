@@ -1810,7 +1810,7 @@ textarea {
 .usage-row,
 .usage-row-head {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto;
   align-items: center;
   gap: 8px;
   font-size: 11px;
@@ -1840,9 +1840,7 @@ textarea {
 }
 
 .usage-row-head span:nth-child(2),
-.usage-row span:nth-child(2),
-.usage-row-head span:nth-child(3),
-.usage-row span:nth-child(3) {
+.usage-row span:nth-child(2) {
   text-align: right;
 }
 
@@ -1901,20 +1899,6 @@ textarea {
   font-weight: 600;
   font-size: 0.82em;
   white-space: nowrap;
-}
-
-.usage-cost {
-  font-variant-numeric: tabular-nums;
-  min-width: 0;
-  color: var(--success);
-  font-weight: 600;
-  opacity: 0.9;
-}
-
-.usage-cost.no-price {
-  color: var(--text-dim);
-  font-weight: 400;
-  opacity: 0.55;
 }
 
 .sidebar-foot-btn {
@@ -3073,6 +3057,7 @@ textarea {
   color: color-mix(in srgb, var(--accent) 78%, var(--text-dim));
   opacity: 0.85;
   white-space: nowrap;
+  margin-inline-end: 10px;
 }
 
 .msg-usage.live {
@@ -3084,7 +3069,7 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 8px;
+  padding: 5px 6px;
   border-radius: 7px;
   color: var(--text-dim);
   font-size: 11px;
@@ -3103,6 +3088,13 @@ textarea {
 .msg-copy:hover {
   background: var(--bg-input);
   color: var(--text);
+}
+
+.msg-actions .msg-copy svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
 }
 
 .msg-copy.copied {
@@ -3148,17 +3140,7 @@ textarea {
   cursor: default;
 }
 
-/* "Read" button — accent-tinted so it reads as a distinct action next to
-   Copy, not just another ghost icon. */
-.msg-read {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-.msg-read:hover {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
-}
+/* "Read" button — plain ghost icon like the other footer buttons. */
 
 /* "Speak" button — same hover reveal as Copy, accent-tinted while speaking. */
 .msg-speak.speaking {
@@ -3522,15 +3504,23 @@ textarea {
 }
 
 .composer-left-actions {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 2px;
 }
 
-.plus-btn {
-  width: 28px;
-  height: 28px;
-  min-width: 28px;
+/* Voice + send cluster pinned to the right edge of the composer row. */
+.composer-right-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.icon-btn.plus-btn {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
   border-radius: 50%;
   flex: 0 0 auto;
   color: var(--text-dim);
@@ -3540,9 +3530,94 @@ textarea {
   margin-bottom: 2px;
 }
 
-.plus-btn:not(:disabled):hover {
-  background: color-mix(in srgb, var(--text) 6%, transparent);
+.icon-btn.plus-btn svg {
+  width: 17px;
+  height: 17px;
+}
+
+.icon-btn.plus-btn:not(:disabled):hover,
+.icon-btn.plus-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
   color: var(--text);
+}
+
+/* ---- "+" action menu: files / screenshot / skills / MCP ---- */
+.plus-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  min-width: 236px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-pop);
+  z-index: 40;
+  backdrop-filter: blur(24px) saturate(1.2);
+  transform-origin: bottom left;
+  animation: plus-menu-in 0.14s ease-out;
+}
+
+@keyframes plus-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.plus-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.plus-menu-item svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+
+.plus-menu-item:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.plus-menu-item:hover svg {
+  color: var(--text);
+}
+
+.plus-menu-badge {
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  box-sizing: border-box;
 }
 
 /* Composer footer: sits BELOW the composer card — mode, thinking, model cluster */
@@ -3679,29 +3754,6 @@ textarea {
 .attach-btn:not(:disabled):hover {
   color: var(--text);
   background: var(--accent-dim);
-}
-
-.attach-btn.has-chips {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 14%, transparent);
-}
-
-.attach-count {
-  position: absolute;
-  top: -2px;
-  right: -2px;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 4px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--on-accent);
-  font-size: 9px;
-  font-weight: 700;
-  line-height: 15px;
-  text-align: center;
-  box-sizing: border-box;
 }
 
 .mic-btn.recording {
@@ -7281,12 +7333,6 @@ textarea {
   }
 }
 
-.context-meter {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
 .context-meter-ring {
   display: inline-flex;
   align-items: center;
@@ -7315,13 +7361,6 @@ textarea {
   stroke-width: 2.5;
   stroke-linecap: round;
   transition: stroke-dashoffset 0.3s ease;
-}
-
-.context-meter-text {
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-  font-size: 12px;
-  font-weight: 600;
 }
 
 .context-meter-cost {
@@ -7355,6 +7394,194 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---- composer context ring + "Context windows" breakdown popover ---- */
+.ctx-ring-wrap {
+  position: relative;
+  display: inline-flex;
+  margin-inline-start: auto;
+  margin-inline-end: 6px;
+}
+
+.ctx-ring-btn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.ctx-ring-btn:hover,
+.ctx-ring-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+}
+
+.ctx-ring-btn.warn .context-meter-ring-fill {
+  stroke: var(--thinking, #e2b93d);
+}
+
+.ctx-ring-empty {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 16%, transparent);
+}
+
+.context-popover {
+  z-index: var(--z-usage-popover);
+  min-width: 260px;
+  max-width: 340px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+  animation: ctx-pop-in 0.16s ease-out;
+  -webkit-app-region: no-drag;
+  direction: ltr;
+  text-align: left;
+}
+
+/* Slides up from the ring: keeps the -100% lift during the whole
+ * animation so the popover never flashes below the circle first. */
+@keyframes ctx-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-100% + 10px));
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(-100%);
+  }
+}
+
+.ctx-pop-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.ctx-pop-total {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.ctx-pop-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.ctx-pop-bar span {
+  display: block;
+  height: 100%;
+  transition: width 0.2s ease;
+}
+
+.ctx-pop-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ctx-pop-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px 10px;
+  font-size: 12px;
+}
+
+.ctx-pop-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.ctx-pop-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim);
+}
+
+.ctx-pop-pct {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+  text-align: right;
+  /* Fixed track so percentages line up as their own column. */
+  min-width: 44px;
+}
+
+.ctx-pop-tok {
+  color: var(--text-dim);
+  font-weight: 400;
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctx-pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Manual compact button inside the context popover. */
+.ctx-pop-compact {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.ctx-pop-compact:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.ctx-pop-compact:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .mention-hint {
@@ -8770,6 +8997,26 @@ textarea {
   margin-inline-start: auto;
 }
 
+/* Footer duration/clock pair — a small glyph in front of each readout so the
+   two mono strings don't blur into one. The time keeps extra breathing room
+   only when it is NOT the far item (the auto margin covers that case). */
+.msg-elapsed,
+.msg-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.msg-elapsed svg,
+.msg-time svg {
+  flex-shrink: 0;
+  opacity: 0.65;
+}
+
+.msg-time:not(.msg-time-far) {
+  margin-inline-start: 10px;
+}
+
 /* ۳ نقطه لودینگ — از سمت راست شروع می‌کنند به پر شدن (نقطهٔ اول = سمت راست
    زودتر روشن می‌شود) تا هر ۳ تا پر شوند، سپس چرخه از اول تکرار می‌شود.
    ترتیب بچه‌ها در TSX به‌صورت ltr ثابت است (نقطهٔ اول همیشه سمت راست)،
@@ -9071,6 +9318,8 @@ textarea {
   background: color-mix(in srgb, var(--tool-color) 10%, transparent);
 }
 
+/* Tool heads keep LTR item order (status/meta on the right) in every chat
+   direction — same convention as .trace-row-head and .edit-group-row. */
 .tool-card-head {
   display: flex;
   align-items: center;
@@ -9081,7 +9330,19 @@ textarea {
   color: var(--text-dim);
   cursor: default;
   text-align: left;
+  direction: ltr;
   user-select: none;
+}
+
+/* Trailing meta (timer, diff stats, Review, chevron) as one group pinned to
+   the right edge — a lone auto margin on the group, so the pin holds even
+   when the timer is absent (write cards render no elapsed time). */
+.tool-card-head-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 /* Explore cards are collapsible (start collapsed): the head becomes a
@@ -14405,6 +14666,9 @@ textarea {
 }
 
 .edit-group-row-main {
+  /* Chat containers are RTL — force this row LTR (mirrors .edit-group-head)
+     so the growing filename pushes stats + Review to the right edge. */
+  direction: ltr;
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
@@ -14432,6 +14696,14 @@ textarea {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-dim);
+}
+
+.edit-group-row-end {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
 }
 
 .edit-group-row .tool-revert-inline {
@@ -15028,9 +15300,9 @@ textarea {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 2px;
   max-width: 180px;
-  padding: 1px 4px;
+  padding: 1px 6px 1px 4px;
   border-radius: 999px;
   border: 1px solid transparent;
   background: transparent;
@@ -15061,7 +15333,8 @@ textarea {
 .composer-diff-branch {
   appearance: none;
   -webkit-appearance: none;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  width: auto;
   min-width: 0;
   max-width: 140px;
   border: none;
@@ -15074,8 +15347,11 @@ textarea {
   padding: 0;
   color: inherit;
   cursor: pointer;
-  text-align: center;
-  text-align-last: center;
+  /* Shrink to the selected option so the git icon sits right beside the
+     branch name; text-align keeps it left-anchored on older engines. */
+  field-sizing: content;
+  text-align: left;
+  text-align-last: left;
   text-overflow: ellipsis;
 }
 
@@ -17030,7 +17306,10 @@ mark.trace-hit-active {
   gap: 6px;
   padding: 10px 12px 0;
   overflow-x: auto;
-  scrollbar-width: none;
+  /* Thumb stays hidden until the bar is hovered (revealed below); the gutter
+     is still reserved so hovering never shifts the layout. */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
   border-bottom: 1px solid color-mix(in srgb, var(--group) 32%, var(--border));
   background:
     linear-gradient(180deg,
@@ -17042,8 +17321,27 @@ mark.trace-hit-active {
   mask-image: linear-gradient(90deg, #000 96%, transparent);
 }
 
+/* Slim horizontal scrollbar: thumb revealed only while the bar is hovered
+   (or its thumb is hovered), so overflowing tabs stay discoverable without
+   permanent chrome. The scrollbar itself only exists when tabs overflow. */
+.tab-bar:hover {
+  scrollbar-color: color-mix(in srgb, var(--group) 32%, transparent) transparent;
+}
 .tab-bar::-webkit-scrollbar {
-  display: none;
+  height: 6px;
+}
+.tab-bar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.tab-bar::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+.tab-bar:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--group) 32%, transparent);
+}
+.tab-bar:hover::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--group) 55%, transparent);
 }
 
 .tab-bar.chat-tabs {
@@ -17057,15 +17355,18 @@ mark.trace-hit-active {
 .editor-tab {
   position: relative;
   display: inline-flex;
+  /* Tabs keep their content width: with many tabs the bar scrolls instead of
+     squeezing titles into nothing. */
+  flex: 0 0 auto;
   align-items: center;
   gap: 8px;
   max-width: 220px;
   min-width: 0;
-  padding: 8px 8px 9px 12px;
+  padding: 4px 8px 5px 12px;
   border: 1px solid color-mix(in srgb, var(--group) 14%, transparent);
   border-bottom: 0;
   border-radius: 12px 12px 0 0;
-  font-size: 12.5px;
+  font-size: 11.5px;
   font-weight: 500;
   letter-spacing: 0.01em;
   color: var(--text-dim);
@@ -17273,7 +17574,7 @@ mark.trace-hit-active {
 /* Chat tabs: flat floating pills, no shadow. */
 .tab-bar.chat-tabs {
   gap: 6px;
-  padding: 8px 12px;
+  padding: 6px 12px;
   align-items: center;
   background: transparent;
   border-bottom: 1px solid var(--hairline);
@@ -17281,14 +17582,13 @@ mark.trace-hit-active {
 }
 
 .tab-bar.chat-tabs .editor-tab.chat-tab {
-  min-height: 32px;
+  min-height: 26px;
   max-width: 210px;
   gap: 7px;
   border: 1px solid transparent;
   border-radius: 11px;
-  padding: 7px 8px;
+  padding: 4px 8px;
   padding-inline-start: 11px;
-  font-size: 12.5px;
   background: transparent;
   box-shadow: none;
   transform: none;
@@ -17384,7 +17684,7 @@ mark.trace-hit-active {
 /* Viewer tabs: same flat pill shape as chat tabs, no shadow. */
 .tab-bar.viewer-tabs {
   gap: 6px;
-  padding: 8px 12px;
+  padding: 6px 12px;
   align-items: center;
   background: transparent;
   border-bottom: 1px solid var(--hairline);
@@ -17401,14 +17701,13 @@ mark.trace-hit-active {
 .tab-bar.viewer-tabs .editor-tab.viewer-tab {
   flex: 0 0 auto;
   min-width: 0;
-  min-height: 32px;
+  min-height: 26px;
   max-width: 210px;
   gap: 7px;
   border: 1px solid transparent;
   border-radius: 11px;
-  padding: 7px 8px;
+  padding: 4px 8px;
   padding-inline-start: 11px;
-  font-size: 12.5px;
   background: transparent;
   box-shadow: none;
   transform: none;
@@ -17684,4 +17983,192 @@ mark.trace-hit-active {
   .review-file-row {
     padding: 6px 8px;
   }
+}
+
+/* ——— In-app virtual browser (Chrome-style shell) ——— */
+.browser-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg, #141519);
+  color: var(--text, #e8e8ea);
+}
+
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+}
+
+.browser-tool-btn {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim, #9aa0a6);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.browser-tool-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text, #e8e8ea) 10%, transparent);
+  color: var(--text, #e8e8ea);
+}
+
+.browser-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.browser-omnibox {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text, #e8e8ea) 7%, transparent);
+  color: var(--text, #e8e8ea);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.browser-omnibox:focus {
+  border-color: var(--link, #6ea8fe);
+  background: color-mix(in srgb, var(--link, #6ea8fe) 12%, transparent);
+}
+
+.browser-subbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  font-size: 11px;
+  color: var(--text-dim, #9aa0a6);
+}
+
+.browser-device-select {
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.14));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text, #e8e8ea) 6%, transparent);
+  color: var(--text, #e8e8ea);
+  font-size: 11px;
+  outline: none;
+}
+
+.browser-device-select option,
+.browser-device-select optgroup {
+  background: #1b1d22;
+  color: #e8e8ea;
+}
+
+.browser-size {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.browser-stage {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12px;
+  background: #0e0f12;
+  outline: none;
+}
+
+.browser-stage:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--link, #6ea8fe);
+}
+
+.browser-stage-inner {
+  position: relative;
+  width: 100%;
+}
+
+.browser-stage-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  cursor: crosshair;
+  user-select: none;
+}
+
+.browser-status {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border-top: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  font-size: 11px;
+  color: var(--text-dim, #9aa0a6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-status--error {
+  color: var(--error, #e5484d);
+}
+
+/* Chrome-like polish: single omnibox, tidy device row, clean stage. */
+.browser-panel {
+  gap: 0;
+}
+
+.browser-toolbar {
+  gap: 6px;
+}
+
+.browser-omnibox {
+  flex: 1;
+}
+
+.browser-omnibox::placeholder {
+  color: var(--text-dim, #9aa0a6);
+  opacity: 0.8;
+}
+
+.browser-subbar-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.browser-stage {
+  position: relative;
+}
+
+.browser-stage:focus {
+  outline: 1px solid var(--link, #6ea8fe);
+  outline-offset: -1px;
+}
+
+.browser-stage-inner {
+  position: relative;
+  width: 100%;
+}
+
+.browser-stage-img {
+  display: block;
+}
+
+.browser-panel .viewer-empty {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
 }

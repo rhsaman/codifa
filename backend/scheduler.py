@@ -187,7 +187,7 @@ def compute_next_run(task: dict, now: float | None = None) -> float | None:
         return float(now) if not last_f else None
     # لنگر از max(last_run, now): اگر last_run قدیمی (قبل از مکث) باشد،
     # نوبت بعدی از اکنون حساب می‌شود نه از گذشته — بدون catch-up burst.
-    anchor = last_f if last_f > now else now
+    anchor = max(now, last_f)
     return next_run_after(cron, anchor)
 
 
@@ -232,9 +232,7 @@ def is_due(task: dict, now: float | None = None, grace: float | None = None) -> 
         # (stale) همچنان اجرا می‌شود — برخلاف تکراری‌ها catch-up دارد.
         if last_f:
             return False
-        if nxt_f is not None and nxt_f > now:
-            return False
-        return True
+        return not (nxt_f is not None and nxt_f > now)
     if nxt_f is None:
         return False
     if nxt_f > now:

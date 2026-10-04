@@ -77,6 +77,7 @@ retry|tests/retry.test.ts|-
 retryStore|tests/retryStore.test.ts|--packages=external --external:electron
 retryStream|tests/retryStream.test.ts|--packages=external --external:electron
 contextWindow|tests/contextWindow.test.ts|--packages=external --external:electron
+contextBreakdown|tests/contextBreakdown.test.ts|--packages=external --external:electron
 persistHeartbeat|tests/persistHeartbeat.test.ts|--packages=external --external:electron
 scrollPos|tests/scrollPos.test.ts|--packages=external --external:electron
 scrollPadding|tests/scrollPadding.test.ts|--packages=external --external:electron
@@ -104,6 +105,7 @@ compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electro
 sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron
 usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
+tabBar|src/lib/tabBar.test.ts|
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolNesting|tests/toolNesting.test.ts|

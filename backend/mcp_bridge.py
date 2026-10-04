@@ -332,7 +332,7 @@ async def _call_mcp_tool(
     session is transparently reconnected and the call retried once — so the
     model never sees a synthetic failure for a recoverable condition.
     """
-    emit({"kind": "tool", "tool": qualified, "args": kwargs, "mcp_server": server_name})
+    emit({"kind": "tool", "tool": tool_name, "args": kwargs, "mcp_server": server_name})
     try:
         result = await session.call_tool(tool_name, arguments=kwargs or {})
     except Exception as exc:  # noqa: BLE001
@@ -553,7 +553,12 @@ def _flatten_tool_result(
             summary = compact_browser_snapshot(summary, task=turn_task)
     except Exception:  # noqa: BLE001, S110 — فشرده‌سازی اختیاری است
         pass
-    emit({"kind": "tool_result", "tool": qualified, "summary": summary[:500], "status": "ok"})
+    # `tool_result` must carry the same short name as the paired `tool` event
+    # (_call_mcp_tool emits tool_name) so the timeline can pair them — strip
+    # the `mcp__<server>__` prefix when present.
+    qparts = qualified.split("__", 2)
+    display_name = qparts[2] if len(qparts) == 3 and qparts[0] == "mcp" else qualified
+    emit({"kind": "tool_result", "tool": display_name, "summary": summary[:500], "status": "ok"})
     return summary, image_uris
 
 
@@ -725,6 +730,45 @@ def _make_tool(
     return st
 
 
+async def _ensure_playwright_in_app(cfg: dict) -> dict:
+    """Keep Playwright MCP browsers inside the app (shared in-app session).
+
+    ``@playwright/mcp`` normally launches a visible browser window of its
+    own. The sidecar already owns a headless Chromium with a remote-debugging
+    port (``browser_session``), so when this is a Playwright MCP server the
+    config is augmented with ``--cdp-endpoint`` and the server attaches to
+    that session instead — the Browser panel and the agent then drive the
+    SAME browser, and nothing opens outside the app.
+
+    If the shared session cannot start, fall back to ``--headless`` so at
+    least no window appears outside the app. Returns the config to connect
+    with; every other server's config is returned unchanged.
+    """
+    args = [str(a) for a in (cfg.get("args") or []) if isinstance(a, (str, int))]
+    if not any("playwright/mcp" in a for a in args):
+        return cfg
+    if any(a.startswith(("--cdp-endpoint", "--endpoint")) for a in args):
+        return cfg  # the user pinned their own endpoint — respect it
+    endpoint = ""
+    try:
+        import browser_session
+
+        result = await browser_session.launch()
+        if isinstance(result, dict) and result.get("ok"):
+            endpoint = str(browser_session.cdp_endpoint())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[coder] in-app browser unavailable for Playwright MCP: {exc}", flush=True)
+    out = dict(cfg)
+    if endpoint:
+        out["args"] = [*args, "--cdp-endpoint", endpoint]
+        print(f"[coder] Playwright MCP -> in-app browser ({endpoint})", flush=True)
+    else:
+        # Never let the MCP server pop a window outside the app.
+        out["args"] = [*args, "--headless"]
+        print("[coder] Playwright MCP: no in-app browser, forcing --headless", flush=True)
+    return out
+
+
 async def _connect_stdio(
     name: str,
     cfg: dict,
@@ -741,6 +785,10 @@ async def _connect_stdio(
     command = cfg.get("command")
     if not command:
         raise ValueError(f"MCP server {name!r}: no command specified")
+
+    # Shared in-app browser: attach Playwright MCP to browser_session's
+    # headless Chromium instead of letting it open a window outside the app.
+    cfg = await _ensure_playwright_in_app(cfg)
 
     params = StdioServerParameters(
         command=str(command),

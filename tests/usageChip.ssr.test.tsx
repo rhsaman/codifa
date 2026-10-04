@@ -131,21 +131,19 @@ console.log("۳) UsagePopover رندر SSR با view seed شده:")
   check("نشان کش (SVG رعد) وجود دارد", html.includes("M13 2 3 14h7l-1 8 10-12h-7l1-8z"))
   check("نام پروایدر نمایش داده می‌شود", html.includes("Provider One") && html.includes("Provider Two"))
   check("نام مدل نمایش داده می‌شود", html.includes("model-a") && html.includes("model-c"))
-  check("هزینه مدل قیمت‌دار نمایش داده می‌شود", html.includes("$0.0014"), html)
-  check("مدل بدون قیمت «—» نشان می‌دهد", html.includes("—"))
+  check("هزینه در پاپ‌اور نمایش داده نمی‌شود", !html.includes("$0.0014") && !html.includes("Cost") && !html.includes("usage-cost"), html.slice(0, 500))
   check("دکمه reset داخل پاپ‌اور نیست", !html.includes("usage-reset"))
   check("dir=ltr روی پاپ‌اور", html.includes('dir="ltr"'))
 }
 
-console.log("۴) ردیف laya لوکال/خارجی:")
+console.log("۴) ردیف صفرتوکنی (از جمله laya لوکال) نمایش داده نمی‌شود:")
 {
-  // ردیف صفرتوکنی laya (لوکال) نگه داشته می‌شود تا در model usage دیده شود.
+  // ردیف صفرتوکنی laya (لوکال) حذف می‌شود — مدل بدون مصرف توکن دیده نمی‌شود.
   const localView = buildUsageView(
     { entries: [{ providerId: "local", model: "convaiinnovations/laya", input: 0, output: 0, laya: true, lastUsed: 3 }] },
     providers,
   )
-  check("ردیف صفرتوکنی laya حذف نمی‌شود", localView.groups.length === 1, localView.groups.length)
-  check("مدل لوکال laya نمایش داده می‌شود", localView.groups[0]?.entries[0]?.model === "convaiinnovations/laya")
+  check("ردیف صفرتوکنی laya حذف می‌شود", localView.groups.length === 0, localView.groups.length)
   // مصرف واقعی پروایدر خارجی laya مثل tools ثبت می‌شود.
   const extView = buildUsageView(
     { entries: [{ providerId: "p1", model: "model-a", input: 10, output: 5, laya: true, lastUsed: 4 }] },

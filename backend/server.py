@@ -1187,6 +1187,149 @@ async def chat_traces_clear(chat_id: str) -> dict:
     return {"ok": True, "removed": trace_store.clear(cid)}
 
 
+# --- virtual browser (Playwright) ------------------------------------------ #
+# Isolated headless Chromium for the Browser viewer tab. Screenshots and
+# clicks go through this session only, so the user's real mouse/keyboard are
+# never touched (backend/browser_session.py holds the actual page).
+
+class BrowserLaunchRequest(BaseModel):
+    url: str = "about:blank"
+
+
+class BrowserClickRequest(BaseModel):
+    x: int
+    y: int
+
+
+class BrowserTypeRequest(BaseModel):
+    text: str
+
+
+class BrowserKeyRequest(BaseModel):
+    key: str
+
+
+class BrowserNavigateRequest(BaseModel):
+    url: str
+
+
+class BrowserScrollRequest(BaseModel):
+    dx: int = 0
+    dy: int = 0
+
+
+class BrowserViewportRequest(BaseModel):
+    width: int
+    height: int
+
+
+class BrowserMoveRequest(BaseModel):
+    x: int
+    y: int
+
+
+@app.post("/browser/viewport")
+async def browser_viewport(req: BrowserViewportRequest) -> dict:
+    """Resize the virtual browser viewport (responsive device presets)."""
+    import browser_session
+
+    return await browser_session.set_viewport(req.width, req.height)
+
+
+@app.post("/browser/move")
+async def browser_move(req: BrowserMoveRequest) -> dict:
+    """Move the virtual cursor (hover) inside the browser — no real mouse."""
+    import browser_session
+
+    return await browser_session.move(req.x, req.y)
+
+
+@app.get("/browser/status")
+async def browser_status() -> dict:
+    """Whether a virtual browser session is currently alive."""
+    import browser_session
+
+    return browser_session.status()
+
+
+@app.post("/browser/launch")
+async def browser_launch(req: BrowserLaunchRequest) -> dict:
+    """Start the virtual browser (or navigate it when already running)."""
+    import browser_session
+
+    return await browser_session.launch(req.url.strip() or "about:blank")
+
+
+@app.get("/browser/screenshot")
+async def browser_screenshot() -> dict:
+    """Latest JPEG frame of the virtual browser viewport (base64)."""
+    import browser_session
+
+    return await browser_session.screenshot()
+
+
+@app.post("/browser/click")
+async def browser_click(req: BrowserClickRequest) -> dict:
+    """Virtual click at viewport pixel coordinates — no real mouse involved."""
+    import browser_session
+
+    return await browser_session.click(req.x, req.y)
+
+
+@app.post("/browser/type")
+async def browser_type(req: BrowserTypeRequest) -> dict:
+    """Type text into the focused element inside the virtual browser."""
+    import browser_session
+
+    return await browser_session.type_text(req.text)
+
+
+@app.post("/browser/key")
+async def browser_key(req: BrowserKeyRequest) -> dict:
+    """Press a key (Enter, Tab, Escape, ...) inside the virtual browser."""
+    import browser_session
+
+    return await browser_session.press_key(req.key)
+
+
+@app.post("/browser/navigate")
+async def browser_navigate(req: BrowserNavigateRequest) -> dict:
+    """Navigate the virtual browser to a URL."""
+    import browser_session
+
+    return await browser_session.navigate(req.url.strip())
+
+
+@app.post("/browser/scroll")
+async def browser_scroll(req: BrowserScrollRequest) -> dict:
+    """Scroll the virtual browser viewport."""
+    import browser_session
+
+    return await browser_session.scroll(req.dx, req.dy)
+
+
+class BrowserHistoryRequest(BaseModel):
+    """History control for the virtual browser (back / forward / reload)."""
+
+    action: str
+
+
+@app.post("/browser/history")
+async def browser_history(req: BrowserHistoryRequest) -> dict:
+    """Run a history action (back, forward, reload) in the virtual browser."""
+    import browser_session
+
+    return await browser_session.history(req.action.strip().lower())
+
+
+@app.post("/browser/close")
+async def browser_close() -> dict:
+    """Shut down the virtual browser session."""
+    import browser_session
+
+    return await browser_session.close()
+
+
 # --- git ------------------------------------------------------------------- #
 # ابزارهای git برای پنل فرانت‌اند (GitPanel) — همان توابع امنِ
 # backend/git_tools.py که ابزارهای مدل هم استفاده می‌کنند.
@@ -1689,10 +1832,13 @@ async def models_laya_status() -> dict:
 async def system_prompts() -> dict:
     from agents import MODE_ALIASES, SYSTEM_PROMPTS
 
-    # The frontend requests legacy keys ("chat", "codewriter"); map them back to
-    # the canonical prompts via MODE_ALIASES so this endpoint never raises
-    # KeyError and stays in sync with the single source of truth.
-    return {key: SYSTEM_PROMPTS[canonical] for key, canonical in MODE_ALIASES.items()}
+    # The frontend looks up canonical mode keys ("ask", "coder", "plan") for the
+    # context popover, while legacy clients may still ask for "chat"/
+    # "codewriter". Return canonical keys first, then append the aliases so both
+    # spellings resolve to the same prompt without raising KeyError.
+    out = dict(SYSTEM_PROMPTS)
+    out.update({key: SYSTEM_PROMPTS[canonical] for key, canonical in MODE_ALIASES.items()})
+    return out
 
 
 # --- skills (file-based store in the user data folder) ---------------------- #
@@ -1795,9 +1941,47 @@ async def mcp_delete(req: McpDeleteRequest) -> dict:
 # Lazy-loaded faster-whisper model (the CTranslate2 model downloaded into
 # backend/whisper/, see Settings → Models). Loaded once on first transcription
 # and cached, so the first request pays the load cost but every later one is
-# fast and fully local+offline.
+# fast and fully local+offline. The cached model is EVICTED after an idle
+# window (it holds 1.5-3 GB of RAM in a long-lived sidecar); the next
+# transcription simply reloads it lazily.
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
+_WHISPER_IDLE_EVICT_S = 10 * 60
+_whisper_last_used = 0.0
+_whisper_evict_timer: asyncio.TimerHandle | None = None
+
+
+def _schedule_whisper_evict() -> None:
+    """Record activity and (re)arm the idle-eviction timer on the event loop."""
+    global _whisper_last_used, _whisper_evict_timer
+    _whisper_last_used = time.monotonic()
+    if _whisper_evict_timer is not None:
+        _whisper_evict_timer.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # no running loop (e.g. tests) — eviction stays off
+        _whisper_evict_timer = None
+        return
+    _whisper_evict_timer = loop.call_later(_WHISPER_IDLE_EVICT_S, _evict_whisper_if_idle)
+
+
+def _evict_whisper_if_idle() -> None:
+    """Drop the cached Whisper model when it has been idle for the whole window.
+
+    A model used within the window is left alone — the use already re-armed
+    the timer, so touching the clock here would wrongly restart the idle
+    window. Evicting mid-transcription is safe: the in-flight handler holds
+    its own local reference, only the module cache is cleared.
+    """
+    global _whisper_model
+    if _whisper_model is None:
+        return
+    if time.monotonic() - _whisper_last_used < _WHISPER_IDLE_EVICT_S:
+        return
+    _whisper_model = None
+    import gc
+
+    gc.collect()
 
 
 async def _get_whisper_model():
@@ -1821,6 +2005,7 @@ async def _get_whisper_model():
                 _whisper_model = WhisperModel(
                     model_dir, device="auto", compute_type="auto"
                 )
+    _schedule_whisper_evict()
     return _whisper_model
 
 
@@ -1993,7 +2178,7 @@ async def text_to_speech(req: TtsRequest) -> Response:
     if upstream.status_code >= 400:
         try:
             err_body = (await upstream.aread()).decode("utf-8", errors="replace").strip()[:500]
-        except Exception:  # noqa: BLE001, S110 — error body is best-effort
+        except Exception:  # noqa: BLE001 — error body is best-effort
             err_body = ""
         try:
             await upstream.aclose()
@@ -2405,6 +2590,15 @@ async def chat_compact(req: CompactRequest, request: Request):
         _log("empty summary after success", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "empty summary"}
     _log(f"success: keep={keep} summary_len={len(summary)}")
+    # Manual compact folded old turns away: cross-turn reuse still points at
+    # content no longer in history. Clear it so the next repeat re-serves
+    # instead of stubbing "already in context" with nothing to show.
+    try:
+        from tool_batching import reset_cross_turn as _reset_cross
+
+        _reset_cross()
+    except Exception:  # noqa: BLE001, S110 — reuse reset never breaks compact
+        pass
     return {"summary": summary, "keep": int(keep), "usage": compact_usage}
 
 

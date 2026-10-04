@@ -347,3 +347,245 @@ export function computeUsageCostBreakdown(
     (cacheWrite / 1_000_000) * (price.cacheWrite ?? price.input)
   return { total: fresh + cached, fresh, cached }
 }
+
+export type ContextBreakdownKey =
+  | 'messages'
+  | 'systemTools'
+  | 'systemPrompt'
+  | 'skills'
+  | 'mcpTools'
+  | 'meta'
+
+export interface ContextBreakdownRow {
+  key: ContextBreakdownKey
+  label: string
+  tokens: number
+  percent: number
+}
+
+export interface ContextBreakdownResult {
+  total: number
+  window: number | null
+  percent: number | null
+  rows: ContextBreakdownRow[]
+  cacheHitRate: number | null
+}
+
+export const CONTEXT_BREAKDOWN_LABELS: Record<ContextBreakdownKey, string> = {
+  messages: 'Messages',
+  systemTools: 'System tools',
+  systemPrompt: 'System prompt',
+  skills: 'Skills',
+  mcpTools: 'MCP tools',
+  meta: 'Meta context',
+}
+
+/** Distinct segment/dot color per breakdown row (used by the popover bar). */
+export const CONTEXT_BREAKDOWN_COLORS: Record<ContextBreakdownKey, string> = {
+  messages: '#4f8cff',
+  systemTools: '#b57bff',
+  systemPrompt: '#ffb224',
+  skills: '#34d399',
+  mcpTools: '#f472b6',
+  meta: '#9aa4b2',
+}
+
+const CONTEXT_BREAKDOWN_ORDER: ContextBreakdownKey[] = [
+  'messages',
+  'systemTools',
+  'systemPrompt',
+  'skills',
+  'mcpTools',
+  'meta',
+]
+
+/** Weighted average prompt-cache hit rate (0-100) across per-turn usages.
+ *  Each turn contributes cache / denominator where denominator is the input
+ *  footprint: subset-convention providers fold cache into input, so the
+ *  denominator is input; additive providers keep cache outside input, so the
+ *  denominator is input + cache. Distinguish by whether input covers cache. */
+export function averageCacheHitRate(usages: TokenUsage[]): number | null {
+  let hit = 0
+  let denom = 0
+  for (const u of usages) {
+    const cache = (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+    const input = u.inputTokens ?? 0
+    if (input <= 0 && cache <= 0) continue
+    const base = input >= cache ? Math.max(0, input) : input + cache
+    if (base <= 0) continue
+    hit += cache
+    denom += base
+  }
+  if (denom <= 0) return null
+  return Math.min(100, Math.max(0, (hit / denom) * 100))
+}
+
+/** Split an estimated total into labeled rows with percentages summing to 100.
+ *  Pure and testable: callers estimate per-part tokens, this normalizes. */
+export function computeContextBreakdown(
+  total: number,
+  parts: Record<ContextBreakdownKey, number>,
+  window: number | null,
+  cacheHitRate: number | null,
+): ContextBreakdownResult {
+  const safeTotal = Math.max(0, Math.round(total))
+  const rows: ContextBreakdownRow[] = CONTEXT_BREAKDOWN_ORDER.map((key) => {
+    const tokens = Math.max(0, Math.round(parts[key] ?? 0))
+    return {
+      key,
+      label: CONTEXT_BREAKDOWN_LABELS[key],
+      tokens,
+      percent: safeTotal > 0 ? (tokens / safeTotal) * 100 : 0,
+    }
+  })
+  // Sort heaviest-first so the popup reads like a ranked breakdown.
+  rows.sort((a, b) => b.tokens - a.tokens)
+  return {
+    total: safeTotal,
+    window,
+    percent: contextPercent(safeTotal, window),
+    rows,
+    cacheHitRate,
+  }
+}
+
+export interface BreakdownEstimateOptions {
+  skillsChars?: number
+  mcpChars?: number
+  systemToolsChars?: number
+  metaChars?: number
+}
+
+/** Estimate per-part token counts for the breakdown popup.
+ *  Messages cover settled + live TALK content (compacted summaries excluded);
+ *  meta is those compacted summaries themselves (they stay in the transcript
+ *  but are no longer resent as messages); skills/MCP come from the real
+ *  configs the caller passes in. No fixed floors — the uncovered remainder is
+ *  attributed to systemTools by buildContextBreakdown. */
+export function estimateBreakdownParts(
+  chat: Chat | null,
+  systemPrompt: string,
+  opts: BreakdownEstimateOptions = {},
+): Record<ContextBreakdownKey, number> {
+  const msgs = chat?.messages ?? []
+  let msgChars = 0
+  // Compacted summaries are meta context, not messages: measure them from the
+  // real stored content instead of a fixed floor.
+  let metaChars = 0
+  for (const m of msgs) {
+    if (!m.compacted) continue
+    metaChars += m.content.length
+    if (m.thinking) metaChars += m.thinking.length
+  }
+  if (opts.metaChars != null) metaChars = opts.metaChars
+  const active = msgs.filter((m) => !m.compacted)
+  const talk = active.filter(
+    (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
+  )
+  const { settled, live } = budgetedSettledHistory(talk)
+  for (const m of settled) {
+    msgChars += m.content.length
+    if (m.thinking) msgChars += m.thinking.length
+  }
+  if (live) {
+    msgChars += live.content.length
+    if (live.thinking) msgChars += live.thinking.length
+    for (const act of live.toolActivity ?? []) {
+      msgChars += act.tool.length
+      if (act.args) msgChars += JSON.stringify(act.args).length
+      if (act.summary) msgChars += act.summary.length
+      if (act.diff) msgChars += act.diff.length
+    }
+  }
+  const messages = Math.round(msgChars / CHARS_PER_TOKEN)
+  const systemPromptTokens = Math.round(systemPrompt.length / CHARS_PER_TOKEN)
+  const systemToolsTokens =
+    opts.systemToolsChars != null
+      ? Math.round(opts.systemToolsChars / CHARS_PER_TOKEN)
+      : 0
+  const metaTokens = Math.round(metaChars / CHARS_PER_TOKEN)
+  const skillsTokens = Math.round((opts.skillsChars ?? 0) / CHARS_PER_TOKEN)
+  const mcpTokens = Math.round((opts.mcpChars ?? 0) / CHARS_PER_TOKEN)
+  return {
+    messages,
+    systemTools: systemToolsTokens,
+    systemPrompt: systemPromptTokens,
+    skills: skillsTokens,
+    mcpTools: mcpTokens,
+    meta: metaTokens,
+  }
+}
+
+/** Full breakdown for the composer popup: estimated parts reconciled against
+ *  the real meter total (provider total when available). The gap the frontend
+ *  cannot measure (built-in prompt tail + tool schemas) is attributed to
+ *  System tools; a too-big local estimate is shrunk proportionally. */
+export function buildContextBreakdown(
+  chat: Chat | null,
+  systemPrompt: string,
+  window: number | null,
+  opts: BreakdownEstimateOptions = {},
+): ContextBreakdownResult {
+  const parts = estimateBreakdownParts(chat, systemPrompt, opts)
+  const actual = Math.max(
+    0,
+    computeContextUsed(chat, systemPrompt, window ?? undefined),
+  )
+  const known =
+    parts.messages +
+    parts.systemTools +
+    parts.systemPrompt +
+    parts.skills +
+    parts.mcpTools +
+    parts.meta
+  let scaled = parts
+  if (actual > 0 && known !== actual) {
+    if (known <= 0) {
+      // Nothing measurable: the whole total is built-in prompt/tool schemas.
+      scaled = { ...parts, systemTools: actual }
+    } else if (known < actual) {
+      // The gap is the built-in prompt / tool schemas the frontend cannot
+      // see: attribute it to System tools so rows add up to the real total.
+      scaled = { ...parts, systemTools: parts.systemTools + (actual - known) }
+    } else {
+      // The local estimate overshoots the provider total (cache/history diff):
+      // shrink every part proportionally so rows still sum to the real total.
+      const k = actual / known
+      scaled = {
+        messages: Math.round(parts.messages * k),
+        systemTools: Math.round(parts.systemTools * k),
+        systemPrompt: Math.round(parts.systemPrompt * k),
+        skills: Math.round(parts.skills * k),
+        mcpTools: Math.round(parts.mcpTools * k),
+        meta: Math.round(parts.meta * k),
+      }
+      // Fix rounding drift so rows sum exactly to the meter total.
+      const sum = Object.values(scaled).reduce((s, v) => s + v, 0)
+      const drift = actual - sum
+      if (drift !== 0) {
+        scaled = { ...scaled, systemTools: Math.max(0, scaled.systemTools + drift) }
+      }
+    }
+  }
+  const total = actual
+  const usages: TokenUsage[] = (chat?.messages ?? [])
+    .filter((m) => !m.compacted && m.role === 'assistant' && m.usage)
+    .map((m) => m.usage as TokenUsage)
+  return computeContextBreakdown(total, scaled, window, averageCacheHitRate(usages))
+}
+
+/** Whether the composer context popover may render (pure so it is testable). */
+export function isContextPopoverOpen(
+  openForChatId: string | null,
+  activeChatId: string | null,
+  total: number,
+): boolean {
+  return openForChatId !== null && openForChatId === activeChatId && total > 0
+}
+
+/** Format a 0-100 value for the context popover: at most one decimal place
+ *  (0 -> "0%", 2.76 -> "2.8%", 96.8 -> "96.8%", 98.7 -> "98.7%"). */
+export function formatBreakdownPercent(pct: number): string {
+  const v = Math.round(Math.max(0, pct) * 10) / 10
+  return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}%`
+}

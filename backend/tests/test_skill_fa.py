@@ -33,9 +33,9 @@ def test_auto_picks_single_strong_match():
 
 def test_auto_picks_several_skills_same_turn():
     ranked = _ranked(
-        ("ui-design", 0.93),
-        ("frontend-principles", 0.88),
-        ("threejs-storytelling", 0.71),
+        ("ui-design", 0.95),
+        ("frontend-principles", 0.93),
+        ("threejs-storytelling", 0.91),
         ("other", 0.4),
     )
     assert graph._skill_auto_picks(ranked) == [
@@ -43,6 +43,13 @@ def test_auto_picks_several_skills_same_turn():
         "frontend-principles",
         "threejs-storytelling",
     ]
+
+
+def test_auto_picks_require_above_90_percent():
+    # The bar is 0.9: a 0.88 pick (the old Movie-Finder-style false positive
+    # range) must NOT inline; an exact-strength pick must.
+    assert graph._skill_auto_picks(_ranked(("a", 0.88), ("b", 0.4))) == []
+    assert graph._skill_auto_picks(_ranked(("a", 0.9), ("b", 0.4))) == ["a"]
 
 
 def test_auto_picks_cap_bodies_per_turn():

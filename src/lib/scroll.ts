@@ -48,3 +48,47 @@ export function classifyScrollEvent(
   }
   return { cancelRestore: true, fromReanchor: false };
 }
+
+/** Saved scroll position of a chat (structural mirror of `Chat.scrollPos`). */
+export type ScrollPos = { id: string; offset: number; atBottom: boolean }
+
+/** Saved position for a chat pinned to the newest messages: the anchor id and
+ *  offset are unused for `atBottom` restores, so no DOM scan is needed. */
+export function atBottomScrollPos(): ScrollPos {
+  return { id: '', offset: 0, atBottom: true }
+}
+
+/** Saved position to persist when leaving a chat: a pin to the bottom
+ *  outranks the raw capture — the capture can be stale (its rAF may have been
+ *  cancelled by the switch flush) or never have happened (entering a chat and
+ *  the jump-button arrival don't schedule one), so persisting it as-is would
+ *  resurrect an old scrolled-up anchor and the chat would not reopen at the
+ *  bottom. Unpinned → the captured position passes through unchanged
+ *  (null = nothing captured → caller skips the write). */
+export function scrollPosForFlush(
+  captured: ScrollPos | null,
+  pinned: boolean,
+): ScrollPos | null {
+  return pinned ? atBottomScrollPos() : captured
+}
+
+/** Should opening a chat land on the NEWEST messages instead of restoring
+ *  the saved scroll anchor?
+ *  - `streaming` — the agent is live in this chat: the user comes back to
+ *    watch the turn, so the view must follow it, not a position saved before
+ *    they left.
+ *  - a `lastMessageId` different from `seenLastMessageId` (recorded when the
+ *    user last LEFT this chat) — the agent posted while they were away, and
+ *    restoring the old anchor would hide exactly the reply they came back to
+ *    read.
+ *  No leave record (never viewed this session) or an empty chat → keep the
+ *  persisted anchor. */
+export function shouldLandOnLatest(input: {
+  streaming: boolean
+  lastMessageId: string
+  seenLastMessageId: string | undefined
+}): boolean {
+  if (input.streaming) return true
+  if (!input.lastMessageId || input.seenLastMessageId === undefined) return false
+  return input.seenLastMessageId !== input.lastMessageId
+}

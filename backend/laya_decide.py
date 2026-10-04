@@ -887,6 +887,17 @@ def score(state: dict, candidate: Any, threshold: float = DEFAULT_CONFIDENCE_THR
     return out
 
 
+# Embedding-rank confidence floor + distinctiveness margin. e5 cosine scores
+# are compressed: unrelated text still lands around 0.7+, so a "high" score on
+# a FLAT list is noise, not signal (reported bug: Movie Finder at 75% for an
+# edit-error question, an unrelated test file at 78% for a TS edit). Below the
+# floor — or with no clear winner over the runner-up — the embedding path
+# abstains and the caller falls back to the keyword path / its previous
+# behaviour instead of acting on a fabricated top pick.
+_EMBED_RANK_MIN_CONF = 0.85
+_EMBED_RANK_MIN_MARGIN = 0.03
+
+
 def rank(
     text: str,
     candidates: Any,
@@ -940,10 +951,22 @@ def rank(
                 conf = max(0.0, min(1.0, cos))
                 scored.append((name, conf, float(cos)))
             scored.sort(key=lambda item: item[2], reverse=True)
-            return [
-                {"name": n, "confidence": c, "score": s, "reason": "embedding-rank"}
-                for n, c, s in scored[:limit]
-            ]
+            top_conf = scored[0][1] if scored else 0.0
+            runner_up = scored[1][1] if len(scored) > 1 else 0.0
+            if top_conf >= _EMBED_RANK_MIN_CONF and (
+                len(scored) == 1 or top_conf - runner_up >= _EMBED_RANK_MIN_MARGIN
+            ):
+                return [
+                    {"name": n, "confidence": c, "score": s, "reason": "embedding-rank"}
+                    for n, c, s in scored[:limit]
+                ]
+            # Flat/noisy scores: no signal — fall through to the keyword path
+            # (which itself returns [] when there is no token overlap).
+            logger.debug(
+                "laya rank embedding path weak: top=%.3f margin=%.3f -> keyword fallback",
+                top_conf,
+                top_conf - runner_up,
+            )
     except Exception as exc:  # noqa: BLE001 — fall through to keyword path
         logger.debug("laya rank embedding path failed: %s", exc)
     # Fallback: token-overlap ranking (no model needed, modest confidence).

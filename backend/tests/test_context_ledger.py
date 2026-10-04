@@ -28,9 +28,13 @@ def test_ledger_empty_without_reads():
     assert context_ledger_line([HumanMessage(content="hello")]) == ""
 
 
-def test_ledger_silent_for_single_file_single_window():
+def test_ledger_warns_for_single_file_single_window():
+    # A single covered window must warn too: the observed regression re-read
+    # one already-served file twice because single-file coverage stayed silent.
     msgs = [_tm(_block("a.py", [(1, "x"), (2, "y")]), "c1")]
-    assert context_ledger_line(msgs) == ""
+    assert context_ledger_line(msgs) == (
+        "[already in context \u2014 do NOT re-read: a.py 1-2]"
+    )
 
 
 def test_ledger_multi_file_exact_line():

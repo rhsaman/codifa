@@ -15,8 +15,10 @@ call pays the load cost and every later one is instant.
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import threading
+import time
 from collections.abc import Sequence
 
 import numpy as np
@@ -60,7 +62,49 @@ _BATCH = 32
 _MAX_LEN = 512
 
 _CACHE: dict = {}
-_LOCK = threading.Lock()
+# RLock: _embed() re-enters _load() for the dim probe while _load already
+# holds this lock during the initial model fill — a plain Lock would deadlock.
+_LOCK = threading.RLock()
+
+# Idle eviction: the ONNX session holds ~1.1 GB of weights plus arena buffers,
+# so keeping it resident forever in a long-lived sidecar dominates the app's
+# RAM. After this many seconds without an embed call the model is dropped;
+# the next call simply reloads it lazily (a few seconds, same vectors).
+_IDLE_EVICT_S = 15 * 60
+_last_used = 0.0
+_active_embeds = 0
+_evict_timer: threading.Timer | None = None
+
+
+def _touch() -> None:
+    """Record activity and (re)arm the idle-eviction timer. Caller holds _LOCK."""
+    global _last_used, _evict_timer
+    _last_used = time.monotonic()
+    if _evict_timer is not None:
+        _evict_timer.cancel()
+    _evict_timer = threading.Timer(_IDLE_EVICT_S, _evict_if_idle)
+    _evict_timer.daemon = True
+    _evict_timer.start()
+
+
+def _evict_if_idle() -> None:
+    """Drop the cached model when it has been idle for the whole window.
+
+    Never evicts while an embed is in flight (the session would be freed
+    mid-inference); a busy model re-arms the timer for another window. A model
+    used within the window is left alone — a concurrent ``_touch`` already
+    re-armed the timer, so touching here would wrongly restart the idle clock.
+    """
+    with _LOCK:
+        if not _CACHE:
+            return
+        if time.monotonic() - _last_used < _IDLE_EVICT_S:
+            return
+        if _active_embeds > 0:
+            _touch()
+            return
+        _CACHE.clear()
+    gc.collect()
 
 # Passage vector cache: exact description text -> L2-normalized vector.
 # The codemap rerank re-embeds the same file descriptions on every turn while
@@ -165,9 +209,13 @@ def status() -> dict:
 def _load() -> None:
     """Load (once) the tokenizer + ONNX session into the module cache."""
     if _CACHE:
+        with _LOCK:
+            if _CACHE:
+                _touch()
         return
     with _LOCK:
         if _CACHE:
+            _touch()
             return
         import onnxruntime
         from tokenizers import Tokenizer
@@ -204,6 +252,7 @@ def _load() -> None:
             # Detect the real vector width from the model itself.
             dim: np.ndarray = _embed(["fallback"], _PASSAGE_PREFIX)
             _CACHE["dim"] = int(dim.shape[1])
+            _touch()
         except Exception:
             # Leave the cache empty so a later call retries cleanly instead of
             # short-circuiting on a half-initialized (tokenizer/session set, no
@@ -214,9 +263,22 @@ def _load() -> None:
 
 def _embed(texts: Sequence[str], prefix: str) -> np.ndarray:
     """Mean-pool + L2-normalize a batch with the real ONNX model."""
+    global _active_embeds
     _load()
-    tokenizer = _CACHE["tokenizer"]
-    session = _CACHE["session"]
+    with _LOCK:
+        _active_embeds += 1
+        _touch()
+        tokenizer = _CACHE["tokenizer"]
+        session = _CACHE["session"]
+    try:
+        return _embed_with(texts, prefix, tokenizer, session)
+    finally:
+        with _LOCK:
+            _active_embeds -= 1
+
+
+def _embed_with(texts: Sequence[str], prefix: str, tokenizer, session) -> np.ndarray:
+    """Run one inference batch on an already-loaded tokenizer/session."""
     enc = tokenizer.encode_batch([f"{prefix}{t}" for t in texts])
     max_len = max((len(e.ids) for e in enc), default=0)
     max_len = min(max_len, _MAX_LEN)

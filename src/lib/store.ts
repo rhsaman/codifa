@@ -69,6 +69,31 @@ import { normalizeUsageEntry } from './usage'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
+/** Cap on persisted `compacted` summary messages kept per chat (newest kept).
+ *  Compacted messages are excluded from the history sent to the model
+ *  (`!m.compacted` in Chat.tsx), so beyond the newest few they are dead weight
+ *  in renderer memory and in every persisted snapshot. Active history (the
+ *  messages actually sent to the agent) is never touched by this cap. */
+export const MAX_COMPACTED_PER_CHAT = 50
+
+/** Drop the OLDEST compacted messages beyond the cap (pure, for test).
+ *  Returns the input array unchanged when the cap is not exceeded. */
+export function capCompactedMessages(messages: ChatMessage[]): ChatMessage[] {
+  let overflow = 0
+  for (const m of messages) if (m.compacted) overflow++
+  if (overflow <= MAX_COMPACTED_PER_CHAT) return messages
+  overflow -= MAX_COMPACTED_PER_CHAT
+  const out: ChatMessage[] = []
+  for (const m of messages) {
+    if (m.compacted && overflow > 0) {
+      overflow--
+      continue
+    }
+    out.push(m)
+  }
+  return out
+}
+
 // Strip transient, in-memory-only fields from messages AND chats before
 // persisting so they never reappear after a restart (e.g. the rate-limit retry
 // banner, or a stale ask/permission popup whose agent is long gone).
@@ -84,7 +109,7 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
     return {
       ...clean,
       ...(layaRuns !== undefined ? { layaRuns } : {}),
-      messages: c.messages.map((m) => {
+      messages: capCompactedMessages(c.messages.map((m) => {
         const msg = { ...m } as Record<string, unknown>
         delete msg.retry
         // A message persisted mid-stream (heartbeat snapshot) is marked so the
@@ -101,7 +126,7 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
           msg.toolActivity = trimToolActivity(msg.toolActivity as ToolActivity[])
         }
         return msg as unknown as ChatMessage
-      }),
+      })),
     }
   })
 }

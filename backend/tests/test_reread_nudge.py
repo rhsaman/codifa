@@ -84,12 +84,16 @@ def test_hint_at_threshold():
     assert "REREAD" in hint
 
 
-def test_each_window_nudged_once():
+def test_each_window_keeps_nudging_while_covered():
     t = _SeenWindows()
     t.observe([_tc("read", {"filePath": "a.py", "offset": 1, "limit": 2000})])
     args = {"filePath": "a.py", "offset": 640, "limit": 220}
     assert t.observe([_tc("read", args)]) != ""
-    assert t.observe([_tc("read", args)]) == ""
+    # Ignoring the hint must not be free: the repeat warns again on every
+    # later step while the coverage still holds (the old once-per-turn
+    # silence let the model learn that re-reading had no cost).
+    assert t.observe([_tc("read", args)]) != ""
+    assert t.observe([_tc("read", args)]) != ""
 
 
 def test_edit_invalidates():

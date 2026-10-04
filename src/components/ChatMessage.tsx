@@ -761,9 +761,11 @@ export function ThinkingBlock({ text }: { text: string }) {
 // `useState` initializer AND from the effect that resets `left` when
 // `startedAt` changes mid-mount.
 function computeLeft(delay: number, startedAt: number | undefined): number {
-  if (!startedAt || delay <= 0) return delay;
+  // Backend backoff carries jitter as a float (e.g. 16.8277s) — ceil once
+  // here so the banner never renders a fractional "retry in 16.82…s".
+  if (!startedAt || delay <= 0) return Math.ceil(delay);
   const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-  return Math.max(0, delay - elapsed);
+  return Math.max(0, Math.ceil(delay) - elapsed);
 }
 
 export function RetryBanner({
@@ -1136,8 +1138,8 @@ function UserMessageBubble({
               title="Retry"
             >
               <svg
-                width="13"
-                height="13"
+                width="16"
+                height="16"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -1158,8 +1160,8 @@ function UserMessageBubble({
           >
             {copied ? (
               <svg
-                width="13"
-                height="13"
+                width="16"
+                height="16"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -1171,8 +1173,8 @@ function UserMessageBubble({
               </svg>
             ) : (
               <svg
-                width="13"
-                height="13"
+                width="16"
+                height="16"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -1192,8 +1194,8 @@ function UserMessageBubble({
             aria-label="Fork chat from here"
           >
             <svg
-              width="13"
-              height="13"
+              width="16"
+              height="16"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
@@ -1201,11 +1203,11 @@ function UserMessageBubble({
               strokeLinecap="round"
               strokeLinejoin="round"
             >
-              <circle cx="6" cy="6" r="2.5" />
-              <circle cx="6" cy="18" r="2.5" />
-              <circle cx="18" cy="8" r="2.5" />
-              <path d="M6 8.5v7" />
-              <path d="M18 10.5c0 4-5 3.5-8.5 5" />
+              <circle cx="12" cy="18" r="3" />
+              <circle cx="6" cy="6" r="3" />
+              <circle cx="18" cy="6" r="3" />
+              <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+              <path d="M12 12v3" />
             </svg>
           </button>
         </div>
@@ -1977,16 +1979,6 @@ export const ChatMessageView = memo(
               total={message.usage.totalTokens}
             />
           )}
-          {/* مدت نهایی ترن کنار بج usage — همیشه قابل مشاهده. */}
-          {!message.streaming && message.turnElapsedMs != null && (
-            <span
-              className="msg-elapsed"
-              title={`Working time for this turn: ${fmtElapsed(message.turnElapsedMs)}`}
-              dir="ltr"
-            >
-              {fmtElapsed(message.turnElapsedMs)}
-            </span>
-          )}
           {message.content && (
             <>
               <button
@@ -1997,8 +1989,8 @@ export const ChatMessageView = memo(
               >
                 {copied ? (
                   <svg
-                    width="13"
-                    height="13"
+                    width="16"
+                    height="16"
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
@@ -2010,8 +2002,8 @@ export const ChatMessageView = memo(
                   </svg>
                 ) : (
                   <svg
-                    width="13"
-                    height="13"
+                    width="16"
+                    height="16"
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
@@ -2031,8 +2023,8 @@ export const ChatMessageView = memo(
                 aria-label="Fork chat from here"
               >
                 <svg
-                  width="13"
-                  height="13"
+                  width="16"
+                  height="16"
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="currentColor"
@@ -2040,11 +2032,11 @@ export const ChatMessageView = memo(
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 >
-                  <circle cx="6" cy="6" r="2.5" />
-                  <circle cx="6" cy="18" r="2.5" />
-                  <circle cx="18" cy="8" r="2.5" />
-                  <path d="M6 8.5v7" />
-                  <path d="M18 10.5c0 4-5 3.5-8.5 5" />
+                  <circle cx="12" cy="18" r="3" />
+                  <circle cx="6" cy="6" r="3" />
+                  <circle cx="18" cy="6" r="3" />
+                  <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+                  <path d="M12 12v3" />
                 </svg>
               </button>
               {!isUser && !message.streaming && (
@@ -2052,11 +2044,12 @@ export const ChatMessageView = memo(
                   className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""}`}
                   onClick={toggleSpeak}
                   title={ttsError ?? "خواندن با صدا"}
+                  aria-label={ttsStatus === "speaking" ? "Stop" : "Speak"}
                 >
                   {ttsStatus === "speaking" ? (
                     <svg
-                      width="13"
-                      height="13"
+                      width="16"
+                      height="16"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
@@ -2064,12 +2057,12 @@ export const ChatMessageView = memo(
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
                     </svg>
                   ) : (
                     <svg
-                      width="13"
-                      height="13"
+                      width="16"
+                      height="16"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
@@ -2077,11 +2070,10 @@ export const ChatMessageView = memo(
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <path d="M11 5 6 9H2v6h4l5 4V5z" />
-                      <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+                      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                      <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
                     </svg>
                   )}
-                  {ttsStatus === "loading" ? "…" : ttsStatus === "speaking" ? "Stop" : "Speak"}
                 </button>
               )}
               {ttsError && !isUser && !message.streaming && (
@@ -2102,13 +2094,14 @@ export const ChatMessageView = memo(
                 !message.streaming &&
                 sections.length >= 2 && (
                   <button
-                    className="msg-copy msg-read"
+                    className="msg-copy"
                     onClick={() => setReading(true)}
                     title="Reading mode — study each section separately and ask about it"
+                    aria-label="Read"
                   >
                     <svg
-                      width="13"
-                      height="13"
+                      width="16"
+                      height="16"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
@@ -2116,10 +2109,9 @@ export const ChatMessageView = memo(
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-                      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+                      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
                     </svg>
-                    Read
                   </button>
                 )}
             </>
@@ -2133,32 +2125,57 @@ export const ChatMessageView = memo(
                 startedAt={message.workingStartedAt}
               />
             ))}
-          {/* Finished turn without usage: the live indicator above unmounts, so
-              the stamped duration takes its place (same side of the footer). */}
-          {!message.streaming && message.turnElapsedMs != null && !message.usage && (
+          {/* Turn duration + send clock share the far end of the footer,
+              opposite the usage/buttons cluster (same spot the live Working
+              indicator occupied while streaming). One auto margin on the
+              first item only — two autos would split the free space.
+              NOTE: no dir on the outer spans — margin-inline-start must
+              resolve against the row direction (a dir="ltr" here would flip
+              the margin side in RTL and glue the pair to the buttons). The
+              inner spans keep the digits LTR. */}
+          {!message.streaming && message.turnElapsedMs != null && (
             <span
               className="msg-elapsed msg-elapsed-far"
               title={`Working time for this turn: ${fmtElapsed(message.turnElapsedMs)}`}
             >
               <span dir="ltr">{fmtElapsed(message.turnElapsedMs)}</span>
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <line x1="10" x2="14" y1="2" y2="2" />
+                <line x1="12" x2="15" y1="14" y2="11" />
+                <circle cx="12" cy="14" r="8" />
+              </svg>
             </span>
           )}
-          {/* Send time of this turn — far end of the footer, opposite the
-              usage/duration/buttons cluster (same spot the live Working
-              indicator occupied while streaming). Rendered only AFTER the turn
-              ends, and carrying the row's single auto margin only when the far
-              duration above is absent: two auto margins in one row would split
-              the free space and push the indicator/duration to the middle.
-              NOTE: no dir on the outer span — margin-inline-start must resolve
-              against the row direction (a dir="ltr" here would flip the margin
-              side in RTL and glue the time to the buttons). The inner span
-              keeps the digits LTR. */}
           {!message.streaming && (
             <span
-              className={`msg-time${message.usage || message.turnElapsedMs == null ? " msg-time-far" : ""}`}
+              className={`msg-time${message.turnElapsedMs == null ? " msg-time-far" : ""}`}
               title={fmtClockFull(message.createdAt)}
             >
               <span dir="ltr">{fmtClock(message.createdAt)}</span>
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
             </span>
           )}
         </div>

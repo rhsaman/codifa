@@ -10,8 +10,11 @@ falls back to the 32k default, and the UI context meter shows no capacity.
 import asyncio
 import os
 import sys
+import tempfile
 
-os.environ.setdefault("CODER_DATA_DIR", "/tmp/codefa-test")
+# Always a fresh temp dir: an inherited CODER_DATA_DIR (the app exports the real
+# ~/.codifa to its terminal) must never be reused by a test.
+os.environ["CODER_DATA_DIR"] = tempfile.mkdtemp(prefix="codefa-test-")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from providers import (  # noqa: E402

@@ -158,6 +158,8 @@ export function deleteSafe(root: string, relPath: string): boolean {
   const rel = relPath.replace(/\\/g, '/').trim().replace(/^\/+/, '')
   if (!rel) return false
   const target = resolveSafe(root, rel)
+  // Never delete the root itself: "." or "a/.." normalizes to the root.
+  if (target === fs.realpathSync(root)) return false
   fs.rmSync(target, { recursive: true, force: true })
   return true
 }
@@ -421,6 +423,10 @@ export function coderDirDelete(relPath: string): boolean {
   const rel = relPath.replace(/\\/g, '/').trim().replace(/^\/+/, '')
   if (!rel) return false
   const target = resolveCoderSafe(rel)
+  // Never delete the data root itself: "." or "a/.." normalizes to the root.
+  const base = getDataRoot()
+  const baseReal = fs.existsSync(base) ? fs.realpathSync(base) : base
+  if (target === base || target === baseReal) return false
   fs.rmSync(target, { recursive: true, force: true })
   return true
 }

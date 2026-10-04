@@ -966,10 +966,10 @@ def history_to_langchain_messages(
 
 _COMPUTER_INTENT_HINTS = (
     "computer", "desktop", "application", "windows", "macos", "linux",
-    "chrome", "tab", "window", "chart",
+    "chrome", "tab", "window",
     "screenshot", "screen", "click", "keyboard", "mouse",
     "اپ دسکتاپ", "دسکتاپ", "ویندوز", "لینوکس", "صفحه", "کلیک",
-    "کروم", "کامپیوتر", "پنجره", "تب", "چارت",
+    "کروم", "کامپیوتر", "پنجره", "تب",
 )
 
 
@@ -1606,8 +1606,10 @@ _TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5
 # asked for, how much the best pick must stand out over the strongest
 # non-pick (flat chit-chat noise scores everything ~0.7x — without a margin
 # any greeting "matches" some skill), and how many bodies one turn may
-# inline (a task can legitimately need several skills at once).
-_SKILL_AUTO_CONF = 0.7
+# inline (a task can legitimately need several skills at once). The bar is
+# deliberately 0.9: only a very strong match is inlined uninvited; anything
+# weaker stays in the catalog for the model to self-serve via load_skill.
+_SKILL_AUTO_CONF = 0.9
 _SKILL_AUTO_MARGIN = 0.05
 _SKILL_AUTO_MAX = 3
 
@@ -3559,6 +3561,7 @@ async def _maybe_auto_compact(
     # would rewrite the prefix each step and force full-price reprocessing).
     _cheap_pct = _pct // 2  # e.g. 80 → 40
     cheap_threshold = int(ctx * _cheap_pct / 100)
+    _truncated_any = False
     if total >= cheap_threshold:
         _last_cheap = state.get("_cheap_truncated_at")
         _regrow = max(10_000, int(ctx * 5 / 100))
@@ -3664,7 +3667,11 @@ async def _maybe_auto_compact(
                     state["_cheap_truncated_at"] = total
     # --- end cheap truncation -------------------------------------------
     if total < threshold:
-        return 0
+        # Cheap truncation discarded old tool contents but left the turn
+        # ledgers claiming coverage. Signal a compaction so the caller
+        # clears seen-windows/cross-turn reuse; otherwise the next repeat
+        # stubs with "already in context" while the content is gone.
+        return 1 if _truncated_any else 0
     # opencode prune: clear old tool outputs (not the whole turn) before the
     # heavier summarization pass, so a large-but-not-overflowing transcript
     # still sheds context. Runs in place on the serialized history.
@@ -4091,6 +4098,14 @@ async def _run_mode_turn(
         reset_read_ledger()
         # Revisit streak: same file/scope re-touched step after step.
         _revisit = _RevisitStreakTracker()
+        # Ignored-coverage hard stop: a covered read or a duplicate/reused
+        # search stub still burns a full round-trip (the stub comes back AFTER
+        # the call). Warning every time is not enough — after N such steps the
+        # turn must stop read/grep-calling and summarize, like the doom-loop
+        # guard below. Mirrors llm.py's _COVER_IGNORE_LIMIT so both loops
+        # escalate the same way.
+        _COVER_IGNORE_LIMIT = 3
+        _cover_ignore_count = 0
         reset_turn_seen_calls()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
@@ -4942,11 +4957,18 @@ async def _run_mode_turn(
             _tool_t0 = time.monotonic()
             _results = await execute_readonly_calls(_exec_calls, _run_readonly, query=state.get("request") or "")
             _expanded = _expand_merged(_results)
+            # A stubbed (covered) read OR a duplicate/reused search means this
+            # step re-requested content the model already holds — count it for
+            # the ignored-coverage escalation below.
+            _coverage_stub_step = bool(_cover_stubs)
             for tc, result in zip(_parallel, _expanded):
                 _cid = tc.get("id", "")
                 if _cid in _cover_stubs:
                     result = _cover_stubs[_cid]
-                append_tool_result(msgs, str(result), _cid)
+                _res_txt = str(result)
+                if _res_txt.startswith(("DUPLICATE ", "REUSED ", "SKIPPED ")):
+                    _coverage_stub_step = True
+                append_tool_result(msgs, _res_txt, _cid)
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
             # half-finished checkpoint that orphans tool_calls on resume.
@@ -4968,7 +4990,10 @@ async def _run_mode_turn(
                 _cid = tc.get("id", "")
                 if _cid in _cover_stubs:
                     result = _cover_stubs[_cid]
-                append_tool_result(msgs, str(result), _cid)
+                _res_txt = str(result)
+                if _res_txt.startswith(("DUPLICATE ", "REUSED ", "SKIPPED ")):
+                    _coverage_stub_step = True
+                append_tool_result(msgs, _res_txt, _cid)
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
                 # Force the save on the LAST sequential call so the turn-end
@@ -5011,6 +5036,49 @@ async def _run_mode_turn(
                 _transient_msgs.append(HumanMessage(content=_reread_hint.strip()))
             if _revisit_hint:
                 _transient_msgs.append(HumanMessage(content=_revisit_hint.strip()))
+            # Ignored-coverage escalation: a covered read (stub) or a
+            # duplicate/reused search stub means the model re-requested content
+            # it already holds — the round-trip is already burned, so warn the
+            # user once and put the stop order on the TRANSIENT channel (a
+            # message appended right before a break is never delivered to the
+            # model). A further ignored step hard-stops the loop.
+            if _coverage_stub_step:
+                _cover_ignore_count += 1
+                if _cover_ignore_count == _COVER_IGNORE_LIMIT:
+                    _transient_msgs.append(
+                        HumanMessage(
+                            content=(
+                                "[steering] You re-requested content already in "
+                                f"context {_cover_ignore_count} times in a row "
+                                "(covered or duplicate reads/searches return a "
+                                "stub AFTER burning a round-trip). Do NOT call "
+                                "read/grep again — write a text summary of what "
+                                "you already know."
+                            )
+                        )
+                    )
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                "The model requested content that is ALREADY in "
+                                "context (covered or duplicate read/search) — the "
+                                "stub saves tokens but the round-trip is spent, so "
+                                "the stop order was sent."
+                            ),
+                        }
+                    )
+                elif _cover_ignore_count > _COVER_IGNORE_LIMIT:
+                    queue.put_nowait(
+                        {
+                            "kind": "warn",
+                            "content": (
+                                f"Stopped {_cover_ignore_count} covered/duplicate "
+                                "tool calls — reuse the content already in context."
+                            ),
+                        }
+                    )
+                    break
             if _is_plan_only_step(_pending):
                 # Plan mode's required checklist call and any tick that marks
                 # step(s) completed (final tick has no following work by
@@ -6600,7 +6668,7 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 _TREE_CACHE: dict[str, tuple[str, str]] = {}
-_TREE_CACHE_MAX_ROOTS = 500
+_TREE_CACHE_MAX_ROOTS = 50
 
 _MTIME_SIG_SKIP_DIRS = {
     ".git",

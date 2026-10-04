@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
+import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 
@@ -104,6 +105,14 @@ export function ChatTabBar() {
   );
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+
+  // Keep the active tab visible when the bar overflows (many open tabs).
+  useEffect(() => {
+    barRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [activeChatId]);
 
   const clearDrag = () => {
     setDragId(null);
@@ -113,7 +122,35 @@ export function ChatTabBar() {
   if (openChatIds.length === 0) return null;
 
   return (
-    <div className="tab-bar chat-tabs" role="tablist" aria-label="Open chats">
+    <div
+      ref={barRef}
+      className="tab-bar chat-tabs"
+      role="tablist"
+      aria-label="Open chats"
+      onDragOver={(e) => {
+        if (!dragId) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        // Dragging near a bar edge scrolls it, so off-screen tabs stay reachable.
+        const bar = barRef.current;
+        if (!bar) return;
+        const delta = edgeScroll(e.clientX, bar.getBoundingClientRect());
+        if (delta) bar.scrollLeft += delta;
+      }}
+      onDrop={(e) => {
+        // Tabs handle their own drop; empty space past the last tab drops at the end.
+        if (e.target !== e.currentTarget || !dragId) return;
+        const els = barRef.current?.querySelectorAll<HTMLElement>('[role="tab"]');
+        const lastEl = els && els.length > 0 ? els[els.length - 1] : null;
+        const lastId = openChatIds[openChatIds.length - 1];
+        if (!lastEl || !lastId || e.clientX <= lastEl.getBoundingClientRect().right) return;
+        const from = e.dataTransfer.getData("text/plain") || dragId;
+        if (!from || from === lastId) return;
+        e.preventDefault();
+        useStore.getState().moveChatTab(from, lastId, true);
+        clearDrag();
+      }}
+    >
       {openChatIds.map((id) => {
         const meta = chats.find((c) => c.id === id);
         const rawTitle = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
@@ -135,7 +172,13 @@ export function ChatTabBar() {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 useStore.getState().openChat(id);
+                return;
               }
+              // Alt+Arrow moves the focused tab without dragging the mouse.
+              const target = tabMove(openChatIds, id, e.key, e.altKey);
+              if (!target) return;
+              e.preventDefault();
+              useStore.getState().moveChatTab(id, target.toId, target.after);
             }}
             onAuxClick={(e) => {
               if (e.button === 1) useStore.getState().closeChatTab(id);
@@ -150,7 +193,7 @@ export function ChatTabBar() {
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = e.clientX - rect.left > rect.width / 2;
+              const after = dropSide(e.clientX, rect) === "after";
               setDropTarget((prev) =>
                 prev?.id === id && prev.after === after ? prev : { id, after },
               );
@@ -163,7 +206,7 @@ export function ChatTabBar() {
               const from = e.dataTransfer.getData("text/plain") || dragId;
               if (from && from !== id) {
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = e.clientX - rect.left > rect.width / 2;
+                const after = dropSide(e.clientX, rect) === "after";
                 useStore.getState().moveChatTab(from, id, after);
               }
               clearDrag();

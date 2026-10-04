@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
+import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { useViewerTabs, type ViewerKind } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 
@@ -42,11 +43,21 @@ function PlanIcon() {
   );
 }
 
+function BrowserIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" />
+    </svg>
+  );
+}
+
 const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   review: ReviewIcon,
   trace: TraceIcon,
   inbox: InboxIcon,
   plan: PlanIcon,
+  browser: BrowserIcon,
 };
 
 const KIND_LABEL: Record<ViewerKind, string> = {
@@ -54,6 +65,7 @@ const KIND_LABEL: Record<ViewerKind, string> = {
   trace: 'Trace',
   inbox: 'Inbox',
   plan: 'Plan',
+  browser: 'Browser',
 };
 
 function CloseIcon() {
@@ -72,6 +84,14 @@ export function ViewerTabBar() {
   const viewerFull = useViewerTabs((s) => s.fullscreen);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+
+  // Keep the active tab visible when the bar overflows.
+  useEffect(() => {
+    barRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [activeId]);
 
   const clearDrag = () => {
     setDragId(null);
@@ -81,7 +101,35 @@ export function ViewerTabBar() {
   if (tabs.length === 0) return null;
 
   return (
-    <div className="tab-bar viewer-tabs" role="tablist" aria-label="Viewers">
+    <div
+      ref={barRef}
+      className="tab-bar viewer-tabs"
+      role="tablist"
+      aria-label="Viewers"
+      onDragOver={(e) => {
+        if (!dragId) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        // Dragging near a bar edge scrolls it, so off-screen tabs stay reachable.
+        const bar = barRef.current;
+        if (!bar) return;
+        const delta = edgeScroll(e.clientX, bar.getBoundingClientRect());
+        if (delta) bar.scrollLeft += delta;
+      }}
+      onDrop={(e) => {
+        // Tabs handle their own drop; empty space past the last tab drops at the end.
+        if (e.target !== e.currentTarget || !dragId) return;
+        const els = barRef.current?.querySelectorAll<HTMLElement>('[role="tab"]');
+        const lastEl = els && els.length > 0 ? els[els.length - 1] : null;
+        const lastTab = tabs[tabs.length - 1];
+        if (!lastEl || !lastTab || e.clientX <= lastEl.getBoundingClientRect().right) return;
+        const from = e.dataTransfer.getData("text/plain") || dragId;
+        if (!from || from === lastTab.id) return;
+        e.preventDefault();
+        useViewerTabs.getState().moveViewerTab(from, lastTab.id, true);
+        clearDrag();
+      }}
+    >
       {tabs.map((t) => {
         const active = t.id === activeId;
         const title = prepareContent(KIND_LABEL[t.kind] ?? t.title, "ltr");
@@ -102,7 +150,13 @@ export function ViewerTabBar() {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 useViewerTabs.getState().setActiveViewer(t.id);
+                return;
               }
+              // Alt+Arrow moves the focused tab without dragging the mouse.
+              const target = tabMove(tabs.map((x) => x.id), t.id, e.key, e.altKey);
+              if (!target) return;
+              e.preventDefault();
+              useViewerTabs.getState().moveViewerTab(t.id, target.toId, target.after);
             }}
             onAuxClick={(e) => {
               if (e.button === 1) useViewerTabs.getState().closeViewer(t.id);
@@ -117,7 +171,7 @@ export function ViewerTabBar() {
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = e.clientX - rect.left > rect.width / 2;
+              const after = dropSide(e.clientX, rect) === "after";
               setDropTarget((prev) =>
                 prev?.id === t.id && prev.after === after ? prev : { id: t.id, after },
               );
@@ -130,7 +184,7 @@ export function ViewerTabBar() {
               const from = e.dataTransfer.getData("text/plain") || dragId;
               if (from && from !== t.id) {
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = e.clientX - rect.left > rect.width / 2;
+                const after = dropSide(e.clientX, rect) === "after";
                 useViewerTabs.getState().moveViewerTab(from, t.id, after);
               }
               clearDrag();

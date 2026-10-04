@@ -4,6 +4,7 @@ import { ReviewPanel } from "./ReviewPanel";
 import { TracePanel } from "./TracePanel";
 import { ScheduleInboxDocked } from "./ScheduleInbox";
 import { PlanPanel } from "./PlanPanel";
+import { BrowserPanel } from "./BrowserPanel";
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
@@ -12,7 +13,7 @@ export function ViewerContent() {
   const active = tabs.find((t) => t.id === activeId) ?? null;
 
   if (!active) {
-    return <div className="viewer-empty">No viewer open — open a diff, trace or inbox.</div>;
+    return <div className="viewer-empty">No viewer open — open a diff, trace, inbox or browser.</div>;
   }
 
   if (active.kind === "review") {
@@ -48,6 +49,15 @@ export function ViewerContent() {
     return (
       <PlanPanel
         key={active.id}
+      />
+    );
+  }
+
+  if (active.kind === "browser") {
+    return (
+      <BrowserPanel
+        key={active.id}
+        onClose={() => useViewerTabs.getState().closeViewer(active.id)}
       />
     );
   }

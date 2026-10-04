@@ -27,15 +27,51 @@ export function planDisplay(message: ChatMessage): PlanDisplay {
   if (!planDoc) return { content: message.content, segments: message.segments };
   let segments = message.segments;
   if (segments && segments.length > 0) {
-    let lastTool = -1;
-    for (let i = 0; i < segments.length; i++) {
-      if (segments[i].kind !== "text") lastTool = i;
+    // Find where the plan body starts inside a text segment. It is NOT
+    // necessarily trailing: plan mode calls update_plan AFTER writing the
+    // plan, so the plan text sits BETWEEN tool segments (read group → plan
+    // text → update_plan row) and must still be cut out — otherwise it
+    // renders inside the tool group's card instead of as the Plan card.
+    const planStart = (text: string): number => {
+      const idx = planDoc.body ? text.lastIndexOf(planDoc.body) : -1;
+      if (idx >= 0) return idx;
+      const m = text.match(/^#{1,3}\s*plan\b/im);
+      return m && m.index != null ? m.index : -1;
+    };
+    const kept: MessageSegment[] = [];
+    let planStarted = false;
+    for (const seg of segments) {
+      if (seg.kind !== "text") {
+        // Tool rows (read/edit/update_plan…) stay visible — only prose is
+        // filtered, the card below carries the plan itself.
+        kept.push(seg);
+        continue;
+      }
+      if (planStarted) continue; // text after the plan start belongs to the card
+      const start = planStart(seg.text);
+      if (start >= 0) {
+        planStarted = true;
+        const before = seg.text.slice(0, start).trimEnd();
+        if (before) kept.push({ kind: "text" as const, text: before });
+      } else {
+        kept.push(seg);
+      }
     }
-    const kept = lastTool >= 0 ? segments.slice(0, lastTool + 1) : [];
+    if (!planStarted) {
+      // Plan body not found in any segment (truncated/edited stream): fall
+      // back to dropping prose after the last tool card.
+      let lastTool = -1;
+      for (let i = 0; i < kept.length; i++) {
+        if (kept[i].kind !== "text") lastTool = i;
+      }
+      segments = lastTool >= 0 ? kept.slice(0, lastTool + 1) : [];
+    } else {
+      segments = kept;
+    }
     segments =
-      planDoc.preamble && !kept.some((s) => s.kind === "text")
-        ? [{ kind: "text" as const, text: planDoc.preamble }, ...kept]
-        : kept;
+      planDoc.preamble && !segments.some((s) => s.kind === "text")
+        ? [{ kind: "text" as const, text: planDoc.preamble }, ...segments]
+        : segments;
   }
   let content = message.content;
   if (content) {

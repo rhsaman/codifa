@@ -100,3 +100,45 @@ def test_laya_tool_rank_operation(monkeypatch):
     assert payload["operation"] == "rank"
     assert payload["handled"] is True
     assert payload["ranked"][0]["name"] == "label-a"
+
+
+def test_rank_embedding_flat_scores_mean_no_signal(monkeypatch):
+    """Reported bug: unrelated candidates still scored 0.75-0.78 on the e5
+    cosine path and were returned as confident top picks. Flat/weak embedding
+    scores must abstain so callers keep their previous behaviour."""
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "model_dir", lambda: "/fake-model-dir")
+    monkeypatch.setattr(embeddings, "embed_queries", lambda texts: [[1.0, 0.0]])
+    # Flat: every candidate lands ~0.75 cosine with no real winner.
+    monkeypatch.setattr(
+        embeddings, "embed_passages", lambda texts: [[0.75, 0.661] for _ in texts]
+    )
+    out = laya_decide.rank(
+        "why does this edit error happen",
+        [
+            {"name": "Movie Finder", "description": "movies"},
+            {"name": "git-workflow", "description": "commits"},
+        ],
+        top_k=2,
+    )
+    assert out == [], out
+
+
+def test_rank_embedding_strong_match_is_returned(monkeypatch):
+    """A clear winner above the floor (and with margin) still ranks."""
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "model_dir", lambda: "/fake-model-dir")
+    monkeypatch.setattr(embeddings, "embed_queries", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr(
+        embeddings, "embed_passages", lambda texts: [[1.0, 0.0], [0.0, 1.0]]
+    )
+    out = laya_decide.rank(
+        "landing page pricing",
+        [{"name": "a"}, {"name": "b"}],
+        top_k=2,
+    )
+    assert out and out[0]["name"] == "a", out
+    assert out[0]["reason"] == "embedding-rank"
+    assert out[0]["confidence"] >= 0.85

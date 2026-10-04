@@ -202,9 +202,21 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     activeUrl = url
     const audio = new Audio(url)
     activeAudio = audio
-    const onAbort = () => {
+    // Free this sentence's ObjectURL + audio element as soon as playback
+    // finishes (end/error/abort). A finished Audio keeps its decoded buffer and
+    // the blob URL keeps the whole clip alive, so holding both until the next
+    // sentence (or the end of the queue) accumulates RAM on long reads.
+    // stopTtsGlobal's later revoke is a safe no-op: the shared refs are cleared
+    // here whenever they still point at this chunk.
+    const release = () => {
       audio.onended = null
       audio.onerror = null
+      if (activeAudio === audio) activeAudio = null
+      if (activeUrl === url) activeUrl = null
+      URL.revokeObjectURL(url)
+    }
+    const onAbort = () => {
+      release()
       try {
         audio.pause()
       } catch {
@@ -214,10 +226,12 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     }
     controller.signal.addEventListener('abort', onAbort, { once: true })
     audio.onended = () => {
+      release()
       controller.signal.removeEventListener('abort', onAbort)
       resolve()
     }
     audio.onerror = () => {
+      release()
       controller.signal.removeEventListener('abort', onAbort)
       // خطای پخش جمله میانی نباید کل صف را بکشد — فقط رد شو.
       resolve()

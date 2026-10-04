@@ -3,7 +3,6 @@ import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import {
   formatTokens,
-  formatCost,
   priceForModel,
   computeUsageCost,
   computeUsageCostBreakdown,
@@ -53,11 +52,9 @@ export interface UsageView {
  * "Model usage" panel had, extracted as a pure function so it is testable
  * without mounting any component.
  *
- * - Entries with all-zero token fields are dropped (but cache-only entries
- *   with input=0/output=0 and cacheRead/cacheWrite>0 are KEPT, so the cached
- *   portion is never silently dropped from the totals).
- * - ردیف صفرتوکنی laya (تصمیم لوکال بدون توکن با پرچم laya) نگه داشته می‌شود
- *   تا لوکال هم در model usage قابل‌مشاهده بماند — مثل مدل‌های tools.
+ * - Entries with all-zero token fields are dropped — including laya rows:
+ *   a model with zero token consumption is not shown in Model usage.
+ * - Cache-only entries (input=0/output=0 but cacheRead/cacheWrite>0) are
  * - providerId + model are stored explicitly on each entry — no key parsing.
  *   Legacy chats are migrated to this shape on load (normalizeUsageEntry).
  * - Cost bills cache-read/cache-write at their own (cheaper) rate when the
@@ -70,9 +67,7 @@ export function buildUsageView(
   const byProvider = new Map<string, UsageModelRow[]>();
   if (usage) {
     for (const u of usage.entries) {
-      const isLayaRow = Boolean((u as { laya?: boolean }).laya)
       if (
-        !isLayaRow &&
         (u.input || 0) +
         (u.output || 0) +
         (u.cacheRead || 0) +
@@ -186,19 +181,10 @@ export function buildUsageView(
 }
 
 /** Tooltip text for a fresh/cached split, e.g. "Fresh: 1.2K · Cached: 300". */
-function splitTooltip(
-  fresh: number,
-  cached: number,
-  costFresh: number | null,
-  costCached: number | null,
-): string {
+function splitTooltip(fresh: number, cached: number): string {
   return [
-    fresh > 0
-      ? `Fresh (non-cached): ${formatTokens(fresh)} tokens${costFresh !== null ? ` · ${formatCost(costFresh)}` : ""}`
-      : "",
-    cached > 0
-      ? `Cached: ${formatTokens(cached)} tokens${costCached !== null ? ` · ${formatCost(costCached)}` : ""}`
-      : "",
+    fresh > 0 ? `Fresh (non-cached): ${formatTokens(fresh)} tokens` : "",
+    cached > 0 ? `Cached: ${formatTokens(cached)} tokens` : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -246,7 +232,7 @@ export interface UsagePopoverProps {
 
 /**
  * The hover popover: one section per provider with a per-model table (model,
- * tokens with 🔥/⚡ breakdown, cost). Pure presentational so it renders under SSR
+ * tokens with 🔥/⚡ breakdown). Pure presentational so it renders under SSR
  * with a seeded view — no store access. The reset button lives inside the
  * titlebar chip pill (see UsageChip), not here.
  */
@@ -270,7 +256,7 @@ function UsagePopoverImpl({ view, style, onMouseEnter, onMouseLeave }: UsagePopo
           >
             <div
               className="usage-group-head"
-              title={splitTooltip(g.fresh, g.cached, g.costFresh, g.costCached)}
+              title={splitTooltip(g.fresh, g.cached)}
             >
               <span className="usage-group-dot" aria-hidden />
               <span className="usage-group-name">{g.name}</span>
@@ -296,27 +282,18 @@ function UsagePopoverImpl({ view, style, onMouseEnter, onMouseLeave }: UsagePopo
                     {formatTokens(g.cached)}
                   </span>
                 )}
-                {g.cost !== null && (
-                  <span className="usage-cost"> · {formatCost(g.cost)}</span>
-                )}
               </span>
             </div>
             <ul className="usage-list">
               <li className="usage-row usage-row-head" aria-hidden>
                 <span>Model</span>
                 <span>Tokens</span>
-                <span>Cost</span>
               </li>
               {g.entries.map((e) => {
                 const cached = e.cacheRead + e.cacheWrite;
                 const total = e.input + e.output;
                 const fresh = Math.max(0, total - cached);
-                const itemTitle = splitTooltip(
-                  fresh,
-                  cached,
-                  e.costFresh,
-                  e.costCached,
-                );
+                const itemTitle = splitTooltip(fresh, cached);
                 return (
                   <li key={e.model} className="usage-row">
                     <span className="usage-model" title={e.model}>
@@ -350,12 +327,6 @@ function UsagePopoverImpl({ view, style, onMouseEnter, onMouseLeave }: UsagePopo
                           </span>
                         </span>
                       )}
-                    </span>
-                    <span
-                      className={`usage-cost${e.cost === null ? " no-price" : ""}`}
-                      title={itemTitle || undefined}
-                    >
-                      {e.cost !== null ? formatCost(e.cost) : "—"}
                     </span>
                   </li>
                 );
@@ -554,7 +525,7 @@ export function UsageChip() {
         onClick={() => {
           if (
             window.confirm(
-              "Reset token usage and cost for all models in this chat?",
+              "Reset token usage for all models in this chat?",
             )
           ) {
             useStore.getState().resetChatUsage(activeChatId);

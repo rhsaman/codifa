@@ -23,7 +23,7 @@
 }
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 
-const { dedupeChats } = await import('./store')
+const { dedupeChats, capCompactedMessages, MAX_COMPACTED_PER_CHAT } = await import('./store')
 
 export {}
 
@@ -80,6 +80,20 @@ console.log('۴) آرایهٔ خالی آرایهٔ خالی برمی‌گردا
 {
   const out = dedupeChats([])
   check('طول صفر است', out.length === 0, out.length)
+}
+
+console.log('۵) capCompactedMessages فقط پیام‌های compacted فراتر از سقف را حذف می‌کند:')
+{
+  const mk = (id: number, compacted: boolean) =>
+    ({ id: `m${id}`, role: 'assistant', content: `c${id}`, ...(compacted ? { compacted: true } : {}) }) as any
+  const active = [mk(0, false), mk(1, false)]
+  const comp = Array.from({ length: MAX_COMPACTED_PER_CHAT + 10 }, (_, i) => mk(100 + i, true))
+  const out = capCompactedMessages([...active, ...comp])
+  const kept = out.filter((m) => m.compacted)
+  check('تعداد compactedها به سقف می‌رسد', kept.length === MAX_COMPACTED_PER_CHAT, kept.length)
+  check('جدیدترین compactedها نگه داشته می‌شوند', kept[kept.length - 1]?.id === `m${100 + comp.length - 1}`)
+  check('پیام‌های فعال دست نمی‌خورند و اول می‌مانند', out.slice(0, 2).every((m, i) => m.id === active[i].id))
+  check('زیر سقف تغییری نمی‌کند', capCompactedMessages([mk(9, false), mk(10, true)]).length === 2)
 }
 
 if (failed > 0) {

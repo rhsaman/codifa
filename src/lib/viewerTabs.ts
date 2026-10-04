@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser'
 
 export interface ViewerTab {
   id: string
@@ -28,6 +28,8 @@ interface ViewerTabsState {
   /** Open the implementation-plan document of the active chat (Plan card's
    *  "View full plan"). Follows the active chat like the trace tab. */
   openPlan: () => void
+  /** Open the in-app virtual browser (shared Playwright session). */
+  openBrowser: () => void
   closeViewer: (id: string) => void
   setActiveViewer: (id: string) => void
   /** VSCode-style drag reorder: move the dragged tab to the drop position. */
@@ -47,7 +49,7 @@ function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
     if (!raw) return { tabs: [], activeId: null }
     const parsed = JSON.parse(raw) as { tabs?: ViewerTab[]; activeId?: string | null }
     const valid = Array.isArray(parsed.tabs)
-      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan'))
+      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser'))
       : []
     // Single tab per kind: collapse legacy multiples (e.g. review-turn-xxx,
     // trace-<chatId>) into one tab per kind, keeping the first of each.
@@ -195,6 +197,22 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         id,
         kind: 'plan',
         title: 'Plan',
+        createdAt: Date.now(),
+      }
+      const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const next = { tabs, activeId: id }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openBrowser: () =>
+    set((s) => {
+      // Single browser tab: the panel shows the shared in-app Playwright
+      // session, so reopening only focuses it.
+      const id = 'browser'
+      const entry: ViewerTab = {
+        id,
+        kind: 'browser',
+        title: 'Browser',
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]

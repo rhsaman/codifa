@@ -10,8 +10,8 @@ from agents import (
     _DISCOVERY_BLOCK,
     _LENGTH_RULE,
     _UNIVERSAL_RULES,
-    _language_directive,
     SYSTEM_PROMPTS,
+    _language_directive,
 )
 
 

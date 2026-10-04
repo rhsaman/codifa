@@ -78,6 +78,11 @@ const sleepAbort = (ms: number, signal?: AbortSignal) =>
 // سیگنال لغو احترام می‌گذارد. سیگنال‌ها نگه داشته می‌شوند تا abort شدنشان بررسی شود.
 let ttsCall = 0
 let firstTtsSlow = false
+// NOTE: playTts prefetches sentence N+1 BEFORE awaiting sentence N's own
+// fetch, so the first /tts call of a queue is the NEXT sentence's download.
+// This flag delays call 1 = sentence 2's prefetch, keeping the queue open
+// while sentence 1 plays and ends.
+let sentenceTwoSlow = false
 const seenSignals: AbortSignal[] = []
 ;(globalThis as any).fetch = async (url: string, init?: { signal?: AbortSignal }) => {
   if (url.endsWith('/health')) return new Response('', { status: 200 })
@@ -87,6 +92,7 @@ const seenSignals: AbortSignal[] = []
     const signal = init?.signal
     if (signal) seenSignals.push(signal)
     if (firstTtsSlow && myCall === 1) await sleepAbort(60, signal)
+    if (sentenceTwoSlow && myCall === 1) await sleepAbort(120, signal)
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     return {
       ok: true,
@@ -263,6 +269,24 @@ console.log('۱۰) خطای TTS فارسی و قابل‌فهم است + دکم�
     friendlyTtsError(new Error('x'.repeat(500))).length <= 301,
     friendlyTtsError(new Error('x'.repeat(500))).length,
   )
+}
+
+console.log('۱۱) پایان هر جمله بلافاصله ObjectURL آن را آزاد می‌کند (قبل از پایان صف):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  sentenceTwoSlow = true
+  const before = revoked
+  const p = playTts('Hello world. Second sentence here.', opts, 80)
+  // جملهٔ اول سریع می‌آید و ~۳۰ms پخش و تمام می‌شود؛ دانلود جملهٔ دوم تا
+  // ~۱۲۰ms طول می‌کشد. URL جملهٔ اول باید همین‌جا آزاد شود، نه تا پایان صف.
+  await sleep(70)
+  check('URL جملهٔ اول زودتر از پایان صف آزاد شد', revoked > before, { revoked, before })
+  check('فقط جملهٔ اول پخش شده', MockAudio.instances.length === 1, MockAudio.instances.length)
+  sentenceTwoSlow = false
+  await p
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+  stopTts()
 }
 
 if (failed > 0) {

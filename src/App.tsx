@@ -37,6 +37,7 @@ export default function App() {
   const chatFull = useStore((s) => s.chatFullscreen)
   const viewerHasGit = viewerTabs.some((t) => t.kind === 'review')
   const viewerHasTrace = viewerTabs.some((t) => t.kind === 'trace')
+  const viewerHasBrowser = viewerTabs.some((t) => t.kind === 'browser')
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
@@ -359,6 +360,23 @@ export default function App() {
               <circle cx="6" cy="18" r="2.4" />
               <circle cx="18" cy="8" r="2.4" />
               <path d="M6 8.4v7.2M18 10.4c0 4.2-4.5 3.6-8.6 3.6" />
+            </svg>
+          </button>
+          <button
+            className="titlebar-icon-btn"
+            title="Browser — in-app virtual Chrome"
+            aria-label="Browser — in-app virtual Chrome"
+            aria-pressed={viewerHasBrowser}
+            onClick={() => {
+              const vt = useViewerTabs.getState();
+              const existing = vt.tabs.find((t) => t.kind === 'browser');
+              if (existing) vt.closeViewer(existing.id);
+              else vt.openBrowser();
+            }}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" />
             </svg>
           </button>
           <span className="titlebar-divider" aria-hidden="true" />

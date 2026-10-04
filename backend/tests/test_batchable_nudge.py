@@ -549,6 +549,86 @@ def test_loop_nudges_one_at_a_time_greps_different_scopes():
     )
 
 
+class _CoveredReadLoopModel:
+    """The reported regression: the model keeps paging a file it already
+    holds on every step. Each page overlaps the fetched window (>=80%), so
+    each repeat returns a stub AFTER burning the round-trip — the loop must
+    warn on every repeat and hard-stop at the ignore limit. Offsets vary on
+    purpose so the identical-args doom-loop guard cannot mask the coverage
+    guard being tested here."""
+
+    model_name = "fake-covered-read-loop"
+
+    def __init__(self, steps: int = 8):
+        self._step = 0
+        self._max = steps
+        self.saw_stop = False
+
+    def bind_tools(self, tools):
+        class _Bound:
+            def __init__(self, model):
+                self._model = model
+
+            async def ainvoke(self, msgs):
+                m = self._model
+                m._step += 1
+                for msg in msgs:
+                    if isinstance(msg, HumanMessage) and "Do NOT call read/grep" in str(
+                        getattr(msg, "content", "")
+                    ):
+                        m.saw_stop = True
+                if m._step <= m._max:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "read",
+                                "args": {
+                                    "filePath": "a.py",
+                                    "offset": m._step,
+                                    "limit": 100,
+                                },
+                                "id": f"call_{m._step}",
+                            }
+                        ],
+                    )
+                return AIMessage(content="done")
+
+        return _Bound(self)
+
+
+def test_loop_hard_stops_after_ignored_coverage():
+    """Regression lock for the reported repeat: a covered read must warn on
+    every step (no once-per-turn silence) and the loop must hard-stop once
+    the ignore limit is passed instead of burning round-trips forever."""
+    model = _CoveredReadLoopModel(steps=8)
+    reads: list[dict] = []
+
+    async def _counting_read(**kwargs):
+        reads.append(kwargs)
+        return "file body"
+
+    asyncio.run(
+        _tool_loop(
+            model,
+            system="",
+            user="read a.py repeatedly",
+            tools={"read": _counting_read},
+            max_steps=20,
+            ctx=0,
+            emit=None,
+        )
+    )
+    assert model.saw_stop, "the stop order must reach the model"
+    # Stop order goes out on the 3rd ignored step, then ONE further step is
+    # allowed to comply before the hard break — anything more means the
+    # guard never fired (the model would have run to its own 8-step budget).
+    assert len(reads) <= 6, (
+        f"the ignore limit must hard-stop the loop, but it ran {len(reads)} reads"
+    )
+    assert len(reads) < model._max
+
+
 class _TwoThenOneGrepModel:
     """Step 1: TWO mergeable greps (the per-step detector fires — the old
     ``or`` short-circuit skipped observe() on such steps). Step 2: ONE grep.
@@ -688,9 +768,10 @@ async def test_scoped_read_batch_partial_scope():
     assert out2.startswith("ERROR")
 
 
-def test_revisit_read_fires_on_nth_touch_once():
+def test_revisit_read_reminds_on_every_later_touch():
     """Same file re-touched step after step: silent until the Nth touch,
-    then one transient reminder (once per key per turn). symbols= reads
+    then a reminder on EVERY later touch (the old once-per-key silence let
+    the model learn that ignoring the note cost nothing). symbols= reads
     count as touches too (still a round-trip)."""
     t = _RevisitStreakTracker(threshold=2)
     w1 = [{"name": "read", "args": {"filePath": "a.py", "offset": 1, "limit": 50}, "id": "c1"}]
@@ -700,8 +781,11 @@ def test_revisit_read_fires_on_nth_touch_once():
     )
     assert "REPEAT NOTE" in out and "a.py" in out and "2nd" in out
     assert "ONE call" in out
-    # Further touches stay silent (once per key).
-    assert t.observe(w1) == ""
+    # Further touches keep reminding while the file keeps getting re-touched.
+    assert "REPEAT NOTE" in t.observe(w1)
+    assert "REPEAT NOTE" in t.observe(
+        [{"name": "read", "args": {"filePath": "a.py", "offset": 101, "limit": 50}, "id": "c4"}]
+    )
     # symbols-only steps touch the file too.
     t2 = _RevisitStreakTracker(threshold=2)
     s = lambda i: [
@@ -709,6 +793,7 @@ def test_revisit_read_fires_on_nth_touch_once():
     ]
     assert t2.observe(s(1)) == ""
     assert "m.py" in t2.observe(s(2))
+    assert "REPEAT NOTE" in t2.observe(s(3))
 
 
 def test_streak_survives_read_grep_terminal_interleave():
@@ -833,8 +918,8 @@ if __name__ == "__main__":
     print("  ✅ loop nudges one-at-a-time greps (different scopes)")
     test_loop_streak_counts_through_per_step_nudge_step()
     print("  ✅ streak counts through per-step-nudge steps")
-    test_revisit_read_fires_on_nth_touch_once()
-    print("  ✅ revisit read fires once")
+    test_revisit_read_reminds_on_every_later_touch()
+    print("  ✅ revisit read keeps reminding")
     test_revisit_grep_scope_patterns_and_merged_skip()
     print("  ✅ revisit grep scope + merged skip")
     test_streak_survives_read_grep_terminal_interleave()

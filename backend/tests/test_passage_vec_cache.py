@@ -12,6 +12,8 @@ ranking quality:
 3. Real-model determinism: two identical calls return (near-)identical floats.
 """
 
+import time
+
 import numpy as np
 
 import embeddings as _emb
@@ -67,3 +69,28 @@ def test_passage_cache_bounded(monkeypatch):
     _emb.embed_passages([f"text-{i}" for i in range(10)])
     assert len(_emb._PASSAGE_VEC_CACHE) <= 4
     assert len(_emb._PASSAGE_VEC_ORDER) <= 4
+
+
+def test_idle_eviction_drops_model_and_respects_inflight(monkeypatch):
+    """Idle > window evicts the ~1.1 GB session; in-flight embeds block it."""
+    monkeypatch.setattr(_emb, "_evict_timer", None)
+    stale = time.monotonic() - _emb._IDLE_EVICT_S - 1
+
+    _emb._CACHE.clear()
+    _emb._CACHE["session"] = object()  # fake loaded model
+    monkeypatch.setattr(_emb, "_last_used", stale)
+    monkeypatch.setattr(_emb, "_active_embeds", 0)
+    _emb._evict_if_idle()
+    assert not _emb._CACHE, "idle model must be evicted"
+
+    _emb._CACHE["session"] = object()
+    monkeypatch.setattr(_emb, "_active_embeds", 1)  # embed in flight
+    _emb._evict_if_idle()
+    assert _emb._CACHE, "in-flight embed must keep the session alive"
+
+    # The busy path re-armed a 15-min timer — cancel so no stray thread outlives
+    # the test (monkeypatch restores the attribute but cannot cancel a Timer).
+    if _emb._evict_timer is not None:
+        _emb._evict_timer.cancel()
+        _emb._evict_timer = None
+    _emb._CACHE.clear()

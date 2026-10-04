@@ -3,7 +3,7 @@
 Guards the two changes that cut explore token use and stop the Main Agent from
 reading the whole codebase by hand when explore fails:
 
-1. EXPLORE_SYSTEM is a tight, grep-first, compact-output prompt (so the explore
+1. SUBAGENT_SYSTEM is a tight, grep-first, compact-output prompt (so the explore
    sub-agent finds answers faster and cheaper).
 2. _run_subagent_task retries a transient explore-model failure, then falls back
    to the main model for one final attempt, and on total failure returns a
@@ -25,7 +25,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
 
 import llm as llm_mod
 import tools as tools_mod
-from agent_registry import EXPLORE_SYSTEM
+from agent_registry import SUBAGENT_SYSTEM
 from agents import _is_retryable
 from tools import _explore_fail_note, make_tool_callbacks
 
@@ -33,7 +33,7 @@ from tools import _explore_fail_note, make_tool_callbacks
 async def test_explore_system_prompt_is_compact_and_grep_first():
     """The explore system prompt must instruct grep-first + compact output so
     the sub-agent is cheap and fast."""
-    text = EXPLORE_SYSTEM
+    text = SUBAGENT_SYSTEM
     assert "COMPACT" in text, "explore prompt must demand a compact report"
     assert "offset" in text and "limit" in text, (
         "explore prompt must tell it to read with offset/limit, not whole files"
@@ -48,7 +48,7 @@ async def test_explore_system_batches_searches_and_bans_chunk_walking():
     """پرامپت explore باید ادغام سرچ‌ها، منع تکه‌خوانی ترتیبی و منع خوانش
     تکراری را صریح بگوید — رگرسیون لاگ explore review CSS layout با ۱۹ فراخوانی
     (سرچ‌های جدا، تکه‌خوانی global.css، خوانش تکراری Chat.tsx و global.css)."""
-    text = EXPLORE_SYSTEM
+    text = SUBAGENT_SYSTEM
     assert "patterns=[...]" in text, "باید ادغام چند grep/glob در یک فراخوانی را بگوید"
     assert "ranges=[" in text, "باید خوانش چندپنجره‌ای با ranges را بگوید"
     assert "NEVER walk a large file chunk-by-chunk" in text, (
@@ -68,7 +68,7 @@ async def test_explore_fail_note_steers_to_narrower_scope():
     note = _explore_fail_note("explore", "explore-model", RuntimeError("boom"))
     assert "explore" in note
     assert "NARROWER" in note, "note must steer to a narrower scope"
-    assert "task(subagent_type='explore')" in note, (
+    assert "task(subagent_type='subagent')" in note, (
         "note must tell it to re-delegate via the explore task tool"
     )
     assert "Do NOT read the whole codebase manually" in note

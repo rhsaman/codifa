@@ -35,7 +35,7 @@ import checkpoints as _checkpoints
 import git_tools as _git
 import providers as _providers
 import state_db as _state_db
-from agent_registry import AGENTS, agent_system, agent_tools
+from agent_registry import AGENTS, agent_system, agent_tools, resolve_agent
 from cache import Cache, cache_path_for
 from secret_utils import decrypt_secret
 from tool_batching import (
@@ -516,7 +516,7 @@ def _explore_fail_note(agent: str, model: str, exc: Exception) -> str:
     return (
         f"ERROR: the {agent} sub-agent failed ({model}): {text}. "
         "Do NOT read the whole codebase manually. Re-delegate with a NARROWER "
-        "scope (name the folder/pattern/symbol) via task(subagent_type='explore')."
+        "scope (name the folder/pattern/symbol) via task(subagent_type='subagent')."
     )
 
 
@@ -768,6 +768,10 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
     this file (MCP probe, tsc, rg) passes an argument list with no shell.
     """
     try:
+        # The sidecar inherits CODER_DATA_DIR (the real user data root) from
+        # Electron. Agent-run commands (pytest, scripts) must not see it, or a
+        # test/cleanup run could read or wipe the user's real ~/.codifa.
+        term_env = {k: v for k, v in os.environ.items() if k != "CODER_DATA_DIR"}
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -777,7 +781,7 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
             text=True,
             errors="replace",  # tolerate non-UTF-8 bytes in terminal output
             start_new_session=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**term_env, "PYTHONUNBUFFERED": "1"},
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -2121,7 +2125,7 @@ def edit_file(
 def edit_file_batch(
     root: str,
     path: str,
-    edits: list[dict],
+    edits: list[dict] | str,
     permit: dict | None = None,
 ) -> dict:
     """Apply several old_string->new_string replacements to ``path`` atomically.
@@ -2132,6 +2136,32 @@ def edit_file_batch(
     cycles. Either every edit applies or nothing is written (atomic).
     Each item is ``{"old_string": ..., "new_string": ..., "replace_all": bool}``.
     """
+    # The model sometimes sends `edits` as a JSON-encoded STRING
+    # ('[{...}, {...}]') instead of a real list — calling list() on that
+    # would split it into characters and every item would fail with
+    # "edit N/M: must be an object" (M = string length). Parse it first;
+    # likewise an item that is itself a JSON-encoded object string. (Same
+    # stringification the grep args already guard with `_coerce_str_list`.)
+    # Unparseable values pass through untouched so the validators below
+    # still report exactly which item is bad.
+    if isinstance(edits, str):
+        try:
+            _parsed = json.loads(edits.strip())
+        except ValueError:
+            _parsed = None
+        edits = _parsed if isinstance(_parsed, list) else []
+    if isinstance(edits, (list, tuple)):
+        _items: list = []
+        for _item in edits:
+            if isinstance(_item, str):
+                try:
+                    _obj = json.loads(_item.strip())
+                except ValueError:
+                    _obj = None
+                _items.append(_obj if isinstance(_obj, dict) else _item)
+            else:
+                _items.append(_item)
+        edits = _items
     target = resolve_safe(root, path, permit=permit)
     if _is_workspace_coder_dir(root, target):
         return {
@@ -4549,7 +4579,7 @@ def make_tool_callbacks(
         )
         try:
             if edits:
-                result = edit_file_batch(root, path, list(edits), permit)
+                result = edit_file_batch(root, path, edits, permit)
             else:
                 result = edit_file(root, path, old_string, new_string, replace_all, permit)
         except PathEscapeError as exc:
@@ -4702,7 +4732,7 @@ def make_tool_callbacks(
     ) -> str:
         """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
 
-Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='subagent') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Batch args sometimes arrive as JSON-encoded strings — coerce first
         # so nothing downstream iterates a string character-by-character.
@@ -5218,7 +5248,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         paths: list[str] | None = None,
         max_results: int = 100,
     ) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='explore') instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='subagent') instead of doing it inline."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         patterns = _coerce_str_list(patterns)
         paths = _coerce_str_list(paths)
@@ -6235,7 +6265,7 @@ When you need to read several files, read multiple independent files in parallel
     async def task_tool(
         description: str, prompt: str, subagent_type: str, task_id: str = ""
     ) -> str:
-        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks) or 'explore' (broad, read-only repository research that returns a compact summary of relevant files + findings). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks) or 'subagent' (broad, read-only repository research that returns a compact summary of relevant files + findings). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same
@@ -6248,6 +6278,7 @@ When you need to read several files, read multiple independent files in parallel
         _task_call_seq = _ecall
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
+        subagent_type = resolve_agent(subagent_type)  # legacy 'explore' alias
         if subagent_type not in AGENTS:
             emit(
                 {
@@ -6337,7 +6368,7 @@ When you need to read several files, read multiple independent files in parallel
         from llm import langchain_tool_loop
 
         _model = main_model
-        if subagent_type == "explore" and explore_model is not None:
+        if resolve_agent(subagent_type) == "subagent" and explore_model is not None:
             _model = explore_model
         if _model is None:
             emit(
@@ -6388,7 +6419,7 @@ When you need to read several files, read multiple independent files in parallel
         # Keep the explore sub-agent strictly read-only: wrap run_terminal so any
         # command that would mutate the filesystem / system state is rejected
         # before it runs (opencode's explore agent is bash-read-only).
-        if subagent_type == "explore" and "run_terminal" in _sub_tools:
+        if resolve_agent(subagent_type) == "subagent" and "run_terminal" in _sub_tools:
             _orig_terminal = _tool_source.get("run_terminal")
 
             async def _readonly_terminal(
@@ -6447,7 +6478,7 @@ When you need to read several files, read multiple independent files in parallel
                     "your tools, then reply with a concise final result. Do not ask the "
                     "user questions; do not call the task tool."
                 )
-                if subagent_type == "explore":
+                if resolve_agent(subagent_type) == "subagent":
                     try:
                         from symbol_index import (
                             _looks_like_code_ident,
@@ -8042,6 +8073,23 @@ When you need to read several files, read multiple independent files in parallel
              by selector too, not just the control that opened them.
         """
         import computer_use as cu
+
+        # The model sometimes serializes `steps` as a JSON string instead of a
+        # list (the same coercion grep/glob list args already have). Parse it
+        # BEFORE the emit payload and the dispatch iterate it — iterating the
+        # raw string splits it into chars and `s.get(...)` raises AttributeError
+        # on each of them. Unparseable/non-list input degrades to None so the
+        # dispatch returns its friendly "non-empty steps list" error instead.
+        if isinstance(steps, str):
+            try:
+                parsed = json.loads(steps)
+            except (TypeError, ValueError):
+                parsed = None
+            steps = (
+                [s for s in parsed if isinstance(s, dict)]
+                if isinstance(parsed, list)
+                else None
+            )
 
         emit(
             {

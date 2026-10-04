@@ -414,8 +414,9 @@ def context_ledger_line(messages: Sequence[BaseMessage]) -> str:
 
     Built from live messages only: files whose content was compacted away
     are simply absent, so the line never claims coverage it cannot show.
-    Returns "" when there is nothing worth saying (no reads, or a single
-    file with a single window — that result speaks for itself).
+    Returns "" when there are no reads. Single-file single-window coverage
+    is included on purpose: without it a repeat of the only read gets no
+    warning and burns a round-trip for a stub.
     """
     covered: dict[str, list[list[int]]] = {}
     order: list[str] = []
@@ -450,8 +451,6 @@ def context_ledger_line(messages: Sequence[BaseMessage]) -> str:
                 else:
                     bucket.append([n, n])
     if len(order) < 1:
-        return ""
-    if len(order) == 1 and len(covered[order[0]]) == 1:
         return ""
     prefix = "[already in context \u2014 do NOT re-read: "
     suffix = "]"
@@ -506,8 +505,8 @@ def search_ledger_line(messages: Sequence[BaseMessage]) -> str:
     The model re-searches patterns it already ran (results seen, then
     forgotten two steps later). Live messages only: a search whose result
     was compacted away is simply absent, so the line never claims results
-    it cannot show. Silent until at least two searches ran — a single
-    search followed by action is the normal flow, not waste.
+    it cannot show. Even a single search is listed: without it a repeat of
+    the only search gets no warning and burns a round-trip for a stub.
     """
     calls: dict[str, tuple[str, dict]] = {}
     for message in messages or []:
@@ -517,7 +516,7 @@ def search_ledger_line(messages: Sequence[BaseMessage]) -> str:
             name = call.get("name")
             if name in ("grep", "glob") and call.get("id"):
                 calls[call["id"]] = (name, call.get("args") or {})
-    if len(calls) < 2:
+    if len(calls) < 1:
         return ""
     items: list[str] = []
     seen: set[str] = set()

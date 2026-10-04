@@ -2049,19 +2049,18 @@ class _RevisitStreakTracker:
     """Nudge when one file/scope is re-touched step after step in a turn.
 
     Counts touches per read path / grep scope (already-merged batch greps
-    don't count — they are the desired shape). On the Nth touch it returns a
-    transient reminder naming the file/scope and what was seen so far,
-    telling the model to fetch everything still needed in ONE call and stop
-    re-touching it. Advisory only, once per key per turn, never blocks a
-    call. Steps without the key do NOT reset others (real turns interleave
+    don't count — they are the desired shape). On the Nth touch and every
+    later touch it returns a reminder naming the file/scope and what was
+    seen so far, telling the model to fetch everything still needed in ONE
+    call and stop re-touching it. Advisory only, never blocks a call.
+    Steps without the key do NOT reset others (real turns interleave
     files, searches and commands).
     """
 
-    __slots__ = ("_nudged", "_recent", "_threshold", "_touches")
+    __slots__ = ("_recent", "_threshold", "_touches")
 
     def __init__(self, threshold: int = _REVISIT_STREAK_TOUCHES) -> None:
         self._touches: dict[str, int] = {}
-        self._nudged: set[str] = set()
         self._recent: dict[str, list[str]] = {}
         self._threshold = max(2, threshold)
 
@@ -2108,8 +2107,7 @@ class _RevisitStreakTracker:
             key = f"{kind}:{label}"
             n = self._touches.get(key, 0) + 1
             self._touches[key] = n
-            if n == self._threshold and key not in self._nudged:
-                self._nudged.add(key)
+            if n >= self._threshold:
                 notes.append((kind, label))
         if not notes:
             return ""
@@ -2208,20 +2206,19 @@ class _SeenWindows:
 
     edit_file/write_file invalidate a path's record (post-edit re-reads are
     legitimate). clear() drops everything (compaction may have discarded
-    the content). Each nudged window fires once per turn.
+    the content). Every repeat warns while coverage holds, so ignoring the
+    hint is never free.
     """
 
-    __slots__ = ("_adjacent_nudged", "_edited", "_nudged", "_seen")
+    __slots__ = ("_adjacent_nudged", "_edited", "_seen")
 
     def __init__(self) -> None:
         self._seen: dict[str, list[tuple[int, int]]] = {}
-        self._nudged: set[tuple[str, int, int]] = set()
         self._adjacent_nudged: set[str] = set()
         self._edited: set[str] = set()
 
     def clear(self) -> None:
         self._seen.clear()
-        self._nudged.clear()
         self._adjacent_nudged.clear()
         self._edited.clear()
         reset_read_ledger()
@@ -2326,12 +2323,7 @@ class _SeenWindows:
                     self._overlap(start, end, s0, s1) for s0, s1 in have
                 )
                 total = max(1, end - start + 1)
-                if (
-                    have
-                    and covered / total >= _READ_WINDOW_OVERLAP_MIN
-                    and key not in self._nudged
-                ):
-                    self._nudged.add(key)
+                if have and covered / total >= _READ_WINDOW_OVERLAP_MIN:
                     lo = min([s0 for s0, _ in have] + [start])
                     hi = max([s1 for _, s1 in have] + [end])
                     notes.append(
@@ -2484,6 +2476,12 @@ async def langchain_tool_loop(
     _DOOM_LOOP_LIMIT = 3
     _TOOL_CALL_SOFT_LIMIT = 8
     _tool_call_count = 0
+    # Ignored-coverage hard stop: a fully covered read still burns a full
+    # round-trip (the stub comes back AFTER the call). Warning every time
+    # is not enough — after N ignored coverage warnings the turn must stop
+    # calling tools and summarize, like the doom-loop guard above.
+    _COVER_IGNORE_LIMIT = 3
+    _cover_ignore_count = 0
     # Cross-step batching tracker: catches the model firing ONE batchable
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
@@ -2703,6 +2701,28 @@ async def langchain_tool_loop(
             _transient.append(HumanMessage(content=_reread_hint.strip()))
         if _revisit_hint:
             _transient.append(HumanMessage(content=_revisit_hint.strip()))
+        # Ignored-coverage escalation: a covered read still burns a full
+        # round-trip (stub comes back AFTER the call). After N ignored
+        # coverage warnings the stop order rides the TRANSIENT channel so the
+        # model actually sees it on the next request (a message appended to
+        # msgs right before a break is never delivered). If it re-requests
+        # covered content once more, the loop hard-stops like the doom-loop
+        # guard below instead of burning further round-trips.
+        if _cover_stubs:
+            _cover_ignore_count += 1
+            if _cover_ignore_count == _COVER_IGNORE_LIMIT:
+                _transient.append(
+                    HumanMessage(
+                        content=(
+                            "[steering] You re-requested content already in context "
+                            f"{_cover_ignore_count} times in a row (covered reads "
+                            "return a stub AFTER burning a round-trip). Do NOT call "
+                            "read/grep again — report your findings in text now."
+                        )
+                    )
+                )
+            elif _cover_ignore_count > _COVER_IGNORE_LIMIT:
+                break
         if _is_plan_only_step(tcs) and not _plan_only_step_marks_progress(tcs):
             _transient.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
         # --- soft tool-call budget nudge ---

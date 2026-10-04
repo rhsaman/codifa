@@ -7,6 +7,7 @@ the remote HTTP call (httpx.AsyncClient.post) is patched.
 from __future__ import annotations
 
 import io
+import time
 import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -91,6 +92,21 @@ def test_remote_env_var_key_fallback(monkeypatch):
     assert captured["headers"] == {"Authorization": "Bearer env-secret"}
     # Trailing slash on base_url must not double up.
     assert captured["url"] == "http://localhost:20128/v1/audio/transcriptions"
+
+
+def test_whisper_idle_eviction(monkeypatch):
+    """Idle > window drops the cached multi-GB Whisper model; fresh use keeps it."""
+    stale = time.monotonic() - server._WHISPER_IDLE_EVICT_S - 1
+
+    monkeypatch.setattr(server, "_whisper_model", object())
+    monkeypatch.setattr(server, "_whisper_last_used", stale)
+    server._evict_whisper_if_idle()
+    assert server._whisper_model is None, "idle model must be evicted"
+
+    monkeypatch.setattr(server, "_whisper_model", object())
+    monkeypatch.setattr(server, "_whisper_last_used", time.monotonic())
+    server._evict_whisper_if_idle()
+    assert server._whisper_model is not None, "recently used model must stay"
 
 
 def test_no_provider_field_uses_local():

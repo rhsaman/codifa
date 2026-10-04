@@ -1146,6 +1146,22 @@ export async function listSkills(): Promise<SkillRow[]> {
   }
 }
 
+/** Fetch the backend's built-in system prompt for each chat mode so the
+ *  context popover can show what is actually sent (the user's per-mode
+ *  override, when set, takes precedence upstream). */
+export async function fetchSystemPrompts(): Promise<Record<string, string>> {
+  const url = await ensureSidecar()
+  if (!url) return {}
+  try {
+    const res = await fetch(`${url}/system-prompts`)
+    if (!res.ok) return {}
+    return (await res.json()) as Record<string, string>
+  } catch (err) {
+    console.error("[prompts] fetchSystemPrompts: fetch failed", err)
+    return {}
+  }
+}
+
 /** Create/update/delete a skill (file-based storage in the sidecar's skill dir). */
 export async function syncSkill(params: {
   name: string

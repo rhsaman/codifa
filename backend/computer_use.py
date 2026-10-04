@@ -1086,20 +1086,30 @@ def open_app(app_name: str) -> dict[str, Any]:
     canonical = _canonical_app_name(app_name)
     try:
         if system == "Darwin":
-            # برای نام کوتاه chrome هم باید Google Chrome فعال شود — و برای هر اپ
-            # case-insensitive (Finder/finder) هم پوشش داده شود
+            # `open -a` both activates the app and creates a window when it is
+            # running with none (a bare `activate` AppleEvent left Chrome
+            # windowless in the field: foreground never became true, so input
+            # went nowhere). `open` fails for unknown bundles -> fall back to
+            # an `activate` AppleEvent with the canonical, then the raw name.
             try:
                 subprocess.run(
-                    ["osascript", "-e", f'tell application "{canonical}" to activate'],
+                    ["open", "-a", canonical],
                     check=True,
                     timeout=10,
                 )
-            except Exception:  # noqa: BLE001 — fallback به نام اصلی (مثلاً Finder با حروف کوچک)
-                subprocess.run(
-                    ["osascript", "-e", f'tell application "{app_name.strip()}" to activate'],
-                    check=True,
-                    timeout=10,
-                )
+            except Exception:  # noqa: BLE001
+                try:
+                    subprocess.run(
+                        ["osascript", "-e", f'tell application "{canonical}" to activate'],
+                        check=True,
+                        timeout=10,
+                    )
+                except Exception:  # noqa: BLE001 — raw name fallback (e.g. Finder)
+                    subprocess.run(
+                        ["osascript", "-e", f'tell application "{app_name.strip()}" to activate'],
+                        check=True,
+                        timeout=10,
+                    )
         elif system == "Linux":
             # wmctrl فعال‌سازی پنجرهٔ اپ را می‌دهد؛ اگر نصب نبود خطا می‌دهد
             # برای chrome هم canonical را امتحان کن

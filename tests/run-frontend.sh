@@ -107,6 +107,7 @@ usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
 fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
+chatTree|src/lib/chatTree.test.ts|
 viewerTabs|src/lib/viewerTabs.test.ts|--packages=external --external:electron
 fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
@@ -143,6 +144,7 @@ chatTabAskBadge|tests/chatTabAskBadge.test.ts|--jsx=automatic --packages=externa
 time|tests/time.test.ts|-
 fileSuggest|tests/fileSuggest.test.ts|--packages=external --external:electron
 textViewer|tests/textViewer.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+composerLayout|tests/composerLayout.test.ts|-
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

@@ -95,6 +95,11 @@ import {
   uid2,
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
+import {
+  compactInputWidth,
+  composerHeight,
+  shouldExpandComposer,
+} from "../lib/composerLayout";
 import { fmtClock } from "../lib/time";
 import { buildResumeNote } from "../lib/resumeNote";
 import {
@@ -272,13 +277,16 @@ function ContextRing({ pct }: { pct: number | null }) {
   );
 }
 
-export function ChatPanel() {
-  // Subscribe by id first: the active chat object identity only changes when
-  // THAT chat's own record changes (message/stream/draft), so typing a draft
-  // in another chat or streaming elsewhere never re-renders this panel.
-  const activeChatId = useStore((s) => s.activeChatId);
+export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
+  // Multi-window: each stacked window mounts its own ChatPanel with an
+  // explicit chatId. Single-window callers omit it and follow the focused
+  // (active) chat. Each instance owns its scroll/draft/msgLimit state, so
+  // two visible windows keep independent viewports and composers.
+  const storeActiveChatId = useStore((s) => s.activeChatId);
+  const activeChatId = props?.chatId ?? storeActiveChatId;
+  const dimmed = props?.dimmed ?? false;
   const chat = useStore((s) => {
-    const id = s.activeChatId;
+    const id = props?.chatId ?? s.activeChatId;
     for (const c of s.chats) if (c.id === id) return c;
     return null;
   });
@@ -287,9 +295,10 @@ export function ChatPanel() {
     // the composer runs on that, falling back to the global active provider.
     // Read the override id without subscribing to the whole chats array: only
     // the override + provider list participate in the result.
+    const targetId = props?.chatId ?? s.activeChatId;
     let overrideId: string | undefined;
     for (const c of s.chats) {
-      if (c.id === s.activeChatId) {
+      if (c.id === targetId) {
         overrideId = c.providerId;
         break;
       }
@@ -300,7 +309,6 @@ export function ChatPanel() {
       ) ?? s.settings.providers[0]
     );
   });
-  void activeChatId;
   const activeModel = chat?.model ?? provider.model;
   const allProviders = useStore((s) => s.settings.providers);
 
@@ -431,6 +439,12 @@ export function ChatPanel() {
   // The panel now stays mounted across chat switches (no key={activeChatId}),
   // so per-chat UI state must reset explicitly when the active chat changes.
   const [input, setInput] = useState(chat?.draft?.input ?? "");
+  // Compact while the draft fits on one visual line; expanded (input on its
+  // own full-width row) once it wraps to several visual lines.
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  // Bumped on window resize so the compact-width line measurement below
+  // re-runs (the composer width changes with the window).
+  const [composerMeasureTick, setComposerMeasureTick] = useState(0);
   const [attachments, setAttachments] = useState<string[]>(
     chat?.draft?.attachments ?? [],
   );
@@ -459,8 +473,6 @@ export function ChatPanel() {
       clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
     }
-    const prevId = useStore.getState().activeChatId;
-    void prevId;
     setInput(chat?.draft?.input ?? "");
     setAttachments(chat?.draft?.attachments ?? []);
     setImages(chat?.draft?.images ?? []);
@@ -800,6 +812,17 @@ export function ChatPanel() {
   const stoppedMapRef = useRef<Map<string, boolean>>(new Map());
   const stoppedRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Hidden mirror + row/action widths used to count visual lines at the
+  // compact input width (layout-independent, so no compact/expanded flip
+  // loop). The single-line mirror height is cached (font never changes).
+  const composerRowRef = useRef<HTMLDivElement>(null);
+  const composerMeasureRef = useRef<HTMLDivElement>(null);
+  const composerRightRef = useRef<HTMLDivElement>(null);
+  // Action widths are fixed-size buttons: cache the first non-zero read so
+  // the mirror width never depends on the live mode (expanded vs compact).
+  const composerLeftWRef = useRef<number | null>(null);
+  const composerRightWRef = useRef<number | null>(null);
+  const composerSingleLineHRef = useRef<number | null>(null);
   const skillPopupRef = useRef<HTMLDivElement>(null);
   // Container for the @skill mention popup, so the highlighted row can be
   // scrolled into view on Ctrl+J/K / arrow navigation (the list scrolls
@@ -1551,13 +1574,65 @@ export function ChatPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id]);
 
-  useEffect(() => {
+  // Expanded when the draft needs more than one visual line at the COMPACT
+  // input width (explicit newline or wrapping). Measured with a hidden mirror
+  // sized to the compact width, so the result does not depend on the current
+  // layout: no expand/collapse oscillation for borderline lengths.
+  useLayoutEffect(() => {
+    const row = composerRowRef.current;
+    const mirror = composerMeasureRef.current;
+    const el = textareaRef.current;
+    if (!row || !mirror || !el) return;
+    const leftLive = plusMenuRef.current?.offsetWidth ?? 0;
+    const rightLive = composerRightRef.current?.offsetWidth ?? 0;
+    if (leftLive > 0) composerLeftWRef.current = leftLive;
+    if (rightLive > 0) composerRightWRef.current = rightLive;
+    const leftW = composerLeftWRef.current ?? leftLive;
+    const rightW = composerRightWRef.current ?? rightLive;
+    // Widths not laid out yet: keep the current mode instead of deciding on
+    // zeros (a zero-width mirror would wrongly collapse a multi-line draft).
+    if (!row.clientWidth || (leftW <= 0 && rightW <= 0)) return;
+    // Layout-independent: always measure at the compact input width using
+    // fixed compact metrics. Reading live padding/gap here would oscillate
+    // because they change with the expanded class.
+    mirror.style.width = `${compactInputWidth(row.clientWidth, leftW, rightW)}px`;
+    if (composerSingleLineHRef.current == null) {
+      mirror.textContent = "x";
+      composerSingleLineHRef.current = mirror.scrollHeight;
+    }
+    const singleH = composerSingleLineHRef.current || mirror.scrollHeight;
+    mirror.textContent = `${input}\u200b`;
+    const expanded = shouldExpandComposer(input, mirror.scrollHeight, singleH, composerExpanded);
+    setComposerExpanded(expanded);
+    if (expanded) {
+      el.style.height = "auto";
+      const fit = composerHeight(el.scrollHeight);
+      el.style.height = `${fit.height}px`;
+      el.style.overflowY = fit.overflowY;
+    } else {
+      el.style.height = "";
+      el.style.overflowY = "hidden";
+    }
+    syncBackdropScroll();
+  }, [input, composerExpanded, composerMeasureTick, syncBackdropScroll]);
+
+  // The compact/expanded class flip changes the textarea width, so re-fit
+  // its height once under the new width.
+  useLayoutEffect(() => {
+    if (!composerExpanded) return;
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-    syncBackdropScroll();
-  }, [input, syncBackdropScroll]);
+    const fit = composerHeight(el.scrollHeight);
+    el.style.height = `${fit.height}px`;
+    el.style.overflowY = fit.overflowY;
+  }, [composerExpanded]);
+
+  useEffect(() => {
+    const onResize = () => setComposerMeasureTick((t) => t + 1);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // forkSection (reading mode → "سوال از این بخش") sets this flag so the
   // freshly-created chat's composer is focused on mount, letting the user type
@@ -4520,10 +4595,19 @@ export function ChatPanel() {
     />
   );
 
+  const isFocused = !dimmed;
   return (
-    <div className="chat-panel">
-      {titlebarEl && toolbar ? createPortal(toolbar, titlebarEl) : toolbar}
-      {titlebarRightEl && createPortal(balanceChip, titlebarRightEl)}
+    <div
+      className={"chat-panel" + (dimmed ? " chat-window-dimmed" : "")}
+      data-chat-id={chat?.id ?? activeChatId}
+      data-focused={isFocused ? "true" : "false"}
+      onPointerDown={() => {
+        const id = chat?.id ?? (props?.chatId ?? null);
+        if (id && useStore.getState().activeChatId !== id) useStore.getState().focusWindow(id);
+      }}
+    >
+      {titlebarEl && toolbar ? (isFocused ? createPortal(toolbar, titlebarEl) : toolbar) : toolbar}
+      {titlebarRightEl && isFocused && createPortal(balanceChip, titlebarRightEl)}
       <div
         className="chat-scroll"
         ref={scrollRef}
@@ -5807,7 +5891,16 @@ export function ChatPanel() {
                 ))}
               </div>
             )}
-            <div className="composer-input-row">
+            <div
+              ref={composerRowRef}
+              className={`composer-input-row${composerExpanded ? " expanded" : " compact"}`}
+            >
+              <div
+                ref={composerMeasureRef}
+                className="composer-measure"
+                aria-hidden="true"
+                dir={dir}
+              />
               <div
                 className={`composer-input-stack${slashRange ? " slash-rich" : ""}`}
               >
@@ -6003,7 +6096,7 @@ export function ChatPanel() {
                     </button>
                   </div>
                 </div>
-                <div className="composer-right-actions">
+                <div className="composer-right-actions" ref={composerRightRef}>
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onClick={toggleRecording}

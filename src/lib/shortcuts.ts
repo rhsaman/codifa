@@ -114,6 +114,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
   { keys: "Cmd/Ctrl+J", label: "Toggle the terminal panel" },
+  { keys: "Ctrl+H/J/K/L", label: "Move between chat windows vim-style (focuses the composer)" },
   {
     keys: "Cmd/Ctrl+W",
     label: "Close the active tab (terminal while it has focus, else viewer, else chat)",

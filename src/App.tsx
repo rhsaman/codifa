@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
-import { ChatPanel } from './components/Chat'
+import { ChatWindows } from './components/ChatWindows'
+
+/** Tab row visible only in single-window mode. Multi-window hides the row:
+ *  each stacked window carries its own header (title + hide button). */
+function ChatTabsRow() {
+  const visibleCount = useStore((s) => s.visibleChatIds.length)
+  if (visibleCount > 1) return null
+  return (
+    <div className="chat-tabs-row">
+      <ChatTabListButton />
+      <ChatTabBar />
+    </div>
+  )
+}
 import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
 import { ChatTabBar } from './components/ChatTabBar'
@@ -396,19 +409,15 @@ export default function App() {
                   </button>
                 )}
               </header>
-              {/* Chat tabs + the tab-list chevron: the bar never scrolls, so
-                  the chevron list keeps every chat tab reachable. */}
-              <div className="chat-tabs-row">
-                <ChatTabListButton />
-                <ChatTabBar />
-              </div>
+              {/* Single-window mode shows the tab row; multi-window hides it
+                  (each window carries its own header with title + close) and
+                  the stack below carries one ChatPanel per visible chat. */}
+              <ChatTabsRow />
               <main className="main">
-                {/* No key={activeChatId}: a full remount re-parses every markdown +
-                  highlight block and re-runs all mount effects, which is the main
-                  cost of switching chats. ChatPanel already resets its per-chat
-                  state (input/draft/scroll/msgLimit) from the chat id, so keeping
-                  the instance mounted across switches is safe and instant. */}
-                <ChatPanel />
+                {/* Each visible chat mounts its own ChatPanel (independent
+                  scroll/draft/composer); single window = one panel, same as
+                  before. No key remount: panels reset per-chat state by id. */}
+                <ChatWindows />
               </main>
             </section>
             {paneOpen && !chatFull && (

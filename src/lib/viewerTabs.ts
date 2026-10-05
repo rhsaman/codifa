@@ -102,6 +102,10 @@ interface ViewerTabsState {
   openText: (title: string, body: string, format?: 'md' | 'text') => void
   closeViewer: (id: string) => void
   setActiveViewer: (id: string) => void
+  /** Last active viewer tab per chat (chatId -> tab id). Multi-window focus
+   *  restores each chat's own tab when it becomes focused, so the right
+   *  panel (Git/Trace/...) always follows the focused chat. */
+  lastActiveByChat: Record<string, string>
   /** Recently closed viewer tabs (newest first, capped) for the tab-list
    *  menu's "Recently closed" section. */
   closedTabs: ClosedViewerTab[]
@@ -276,6 +280,7 @@ function persistPanelMode(v: boolean) {
 export const useViewerTabs = create<ViewerTabsState>((set) => ({
   tabs: initial.tabs,
   activeId: initial.activeId,
+  lastActiveByChat: {},
   closedTabs: initial.closed,
   fullscreen: typeof window !== 'undefined' ? loadFullscreen() : false,
   paneOpen: typeof window !== 'undefined' ? loadPaneOpen(initial.tabs.length) : false,
@@ -307,7 +312,10 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = exists
         ? s.tabs.map((t) => (t.id === normalized.id ? { ...t, ...normalized } : t))
         : [...s.tabs, { ...normalized, createdAt: Date.now() }]
-      const next = { tabs, activeId: tab.id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = normalized.chatId
+        ? { ...s.lastActiveByChat, [normalized.chatId]: normalized.id }
+        : s.lastActiveByChat
+      const next = { tabs, activeId: tab.id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -329,7 +337,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -350,7 +359,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -385,7 +395,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
               : t,
           )
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -421,7 +432,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -438,7 +450,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -484,7 +497,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? entry : t))
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -503,13 +517,21 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ...s.closedTabs.filter((c) => c.tab.id !== id),
       ].slice(0, CLOSED_CAP)
       persist(tabs, activeId, closedTabs)
-      return { tabs, activeId, closedTabs }
+      const lastActiveByChat = { ...s.lastActiveByChat }
+      if (removed.chatId && lastActiveByChat[removed.chatId] === id) {
+        delete lastActiveByChat[removed.chatId]
+      }
+      return { tabs, activeId, closedTabs, lastActiveByChat }
     }),
   setActiveViewer: (id) =>
     set((s) => {
-      if (!s.tabs.some((t) => t.id === id)) return {}
+      const tab = s.tabs.find((t) => t.id === id)
+      if (!tab) return {}
       persist(s.tabs, id, s.closedTabs)
-      return { activeId: id, panelMode: false }
+      const lastActiveByChat = tab.chatId
+        ? { ...s.lastActiveByChat, [tab.chatId]: id }
+        : s.lastActiveByChat
+      return { activeId: id, panelMode: false, lastActiveByChat }
     }),
   reopenClosedViewerTab: (id) =>
     set((s) => {
@@ -518,7 +540,10 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
       const exists = s.tabs.some((t) => t.id === id)
       const tabs = exists ? s.tabs : [...s.tabs, entry.tab]
-      const next = { closedTabs, tabs, activeId: id, paneOpen: true, panelMode: false }
+      const lastActiveByChat = entry.tab.chatId
+        ? { ...s.lastActiveByChat, [entry.tab.chatId]: id }
+        : s.lastActiveByChat
+      const next = { closedTabs, tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId, next.closedTabs)
       return next
     }),
@@ -543,9 +568,39 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       dest = Math.max(0, Math.min(tabs.length, dest))
       tabs.splice(dest, 0, moved)
       persist(tabs, fromId)
-      return { tabs, activeId: fromId }
+      const lastActiveByChat = moved.chatId
+        ? { ...s.lastActiveByChat, [moved.chatId]: fromId }
+        : s.lastActiveByChat
+      return { tabs, activeId: fromId, lastActiveByChat }
     }),
 }))
+
+/** Resolve which viewer tab id should be active for a chat (pure, for test).
+ *  Prefers the chat's remembered tab when it is still visible, otherwise the
+ *  first visible tab, otherwise null. */
+export function resolveViewerForChat(
+  visible: ViewerTab[],
+  lastActiveByChat: Record<string, string>,
+  chatId: string,
+): string | null {
+  if (visible.length === 0) return null
+  const remembered = lastActiveByChat[chatId]
+  if (remembered && visible.some((t) => t.id === remembered)) return remembered
+  return visible[0].id
+}
+
+/** Switch the viewer group to the tab belonging to a chat (pure helper for
+ *  multi-window focus). No-op when the chat has no visible tab or its tab is
+ *  already active. */
+export function syncViewerToChat(chatId: string): void {
+  const vt = useViewerTabs.getState()
+  const visible = visibleTabs(vt.tabs, chatId)
+  if (visible.length === 0) return
+  const target = resolveViewerForChat(visible, vt.lastActiveByChat, chatId)
+  if (target && vt.activeId !== target) {
+    vt.setActiveViewer(target)
+  }
+}
 
 /** Split width between chat group and viewer group. Default half viewport. */
 export function loadSplitWidth(fallbackRatio = 0.5): number {

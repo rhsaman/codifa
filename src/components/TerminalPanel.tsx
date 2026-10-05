@@ -13,6 +13,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
+import { focusChatInput } from '../lib/chatFocus'
 import { isApplePlatform } from '../lib/shortcuts'
 
 interface TerminalTab {
@@ -96,6 +97,25 @@ export function TerminalPanel() {
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{ startY: number; startH: number } | null>(null)
   const fitRaf = useRef<number | null>(null)
+
+  // Chat that was focused before the terminal opened; closing the panel
+  // returns the caret to its composer input.
+  const preTerminalChatRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (open) {
+      preTerminalChatRef.current = useStore.getState().activeChatId || null
+      return
+    }
+    // Only restore when the panel was actually open before; otherwise this
+    // effect would steal focus on first mount (open starts false).
+    const id = preTerminalChatRef.current
+    preTerminalChatRef.current = null
+    if (!id) return
+    const st = useStore.getState()
+    if (!st.chats.some((c) => c.id === id)) return
+    if (st.activeChatId !== id) st.focusWindow(id)
+    requestAnimationFrame(() => focusChatInput(id))
+  }, [open])
 
   const supported = hasTerminalApi()
 

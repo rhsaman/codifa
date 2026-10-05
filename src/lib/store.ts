@@ -40,6 +40,8 @@ import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry } from './usage'
+import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
+import { appendChat, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, leafCount, loadChatTree, normalizeTree, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats } from './chatTree'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -261,6 +263,118 @@ function loadActiveChat(): string {
 function persistOpenState(ids: string[], activeId: string): void {
   persistOpenChats(ids)
   persistActiveChat(activeId)
+}
+
+const VISIBLE_CHATS_KEY = 'coder:visibleChats'
+const WINDOW_SIZES_KEY = 'coder:chatWindowSizes'
+
+function loadVisibleChats(): string[] {
+  try {
+    const raw = localStorage.getItem(VISIBLE_CHATS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((v): v is string => typeof v === 'string' && v.length > 0)
+  } catch {
+    return []
+  }
+}
+
+function persistVisibleChats(ids: string[]): void {
+  try {
+    localStorage.setItem(VISIBLE_CHATS_KEY, JSON.stringify(ids))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function loadWindowSizes(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(WINDOW_SIZES_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, number> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      const n = typeof v === 'number' ? v : Number(v)
+      if (k && Number.isFinite(n) && n > 0.1 && n < 10) out[k] = n
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function persistWindowSizes(sizes: Record<string, number>): void {
+  try {
+    localStorage.setItem(WINDOW_SIZES_KEY, JSON.stringify(sizes))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Split orientation of the multi-window chat group. Pure for test. */
+export type ChatLayout = 'vertical' | 'horizontal'
+
+export function normalizeChatLayout(v: unknown): ChatLayout {
+  return v === 'horizontal' ? 'horizontal' : 'vertical'
+}
+
+const CHAT_LAYOUT_KEY = 'coder:chatLayout'
+
+function loadChatLayout(): ChatLayout {
+  try {
+    return normalizeChatLayout(localStorage.getItem(CHAT_LAYOUT_KEY))
+  } catch {
+    return 'vertical'
+  }
+}
+
+function persistChatLayout(layout: ChatLayout): void {
+  try {
+    localStorage.setItem(CHAT_LAYOUT_KEY, layout)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Normalize a visible-window list against valid chat ids (pure, for test).
+ *  Keeps order, drops unknown ids, dedupes. Falls back to [activeId] when
+ *  empty but a valid active exists, otherwise to the first valid id. */
+export function normalizeVisibleChats(visible: string[], validIds: Set<string>, activeId: string): string[] {
+  const out: string[] = []
+  for (const id of visible) {
+    if (validIds.has(id) && !out.includes(id)) out.push(id)
+  }
+  if (out.length === 0) {
+    if (activeId && validIds.has(activeId)) return [activeId]
+    const first = [...validIds][0]
+    return first ? [first] : []
+  }
+  return out
+}
+
+function treeDirFromLayout(layout: ChatLayout): ChatSplitDir {
+  return layout === 'horizontal' ? 'row' : 'col'
+}
+
+/** Persist a split tree plus its legacy mirrors (visible ids, sizes, layout). */
+function persistTreeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
+  persistChatTree(tree)
+  if (!tree) return { visibleChatIds: [], chatWindowSizes: {}, chatLayout: fallbackLayout }
+  const visibleChatIds = collectChatIds(tree)
+  const chatWindowSizes = sizesByChat(tree)
+  const chatLayout: ChatLayout = tree.kind === 'split' ? (tree.dir === 'row' ? 'horizontal' : 'vertical') : fallbackLayout
+  persistVisibleChats(visibleChatIds)
+  persistWindowSizes(chatWindowSizes)
+  persistChatLayout(chatLayout)
+  return { visibleChatIds, chatWindowSizes, chatLayout }
+}
+
+/** Ensure a tree exists from a flat visible list (migration / first split). */
+function ensureTree(tree: ChatTreeNode | null, visible: string[], layout: ChatLayout): ChatTreeNode | null {
+  if (tree && leafCount(tree) > 0) return tree
+  return buildFromList(visible, treeDirFromLayout(layout))
 }
 
 const CHAT_FULL_KEY = 'coder:chatFull'
@@ -615,6 +729,20 @@ interface State {
    *  open order. Closing a tab does NOT delete the chat (sidebar keeps it).
    *  Persisted in localStorage `coder:openChats` so tabs restore on restart. */
   openChatIds: string[]
+  /** Visible chat windows in split order (multi-window). Single
+   *  window = [activeChatId]. Persisted in localStorage `coder:visibleChats`. */
+  visibleChatIds: string[]
+  /** Relative flex size per visible window (default 1). Persisted in
+   *  localStorage `coder:chatWindowSizes`. */
+  chatWindowSizes: Record<string, number>
+  /** Split orientation of the chat group (VSCode-like). Vertical stacks
+   *  windows top-to-bottom, horizontal places them side-by-side.
+   *  Persisted in localStorage `coder:chatLayout`. */
+  chatLayout: ChatLayout
+  /** VSCode-like split tree for chat windows. Null = single focused chat.
+   *  Persisted in localStorage `coder:chatTree`; visibleChatIds /
+   *  chatWindowSizes / chatLayout mirror it for legacy readers. */
+  chatTree: ChatTreeNode | null
   /** Chat ids whose agent FINISHED a turn (sent a message) while the user was
    *  looking at another chat → steady green dot in the sidebar. Session-scoped
    *  (not persisted); cleared when the user opens the chat (setActiveChat). */
@@ -771,6 +899,24 @@ interface State {
   reopenChatTab: (id: string) => void
   /** VSCode-style drag reorder: move the dragged chat tab to the drop position. */
   moveChatTab: (fromId: string, toId: string, after?: boolean) => void
+  /** Show a chat as a stacked window (adds to visibleChatIds + focuses). */
+  openInWindow: (id: string) => void
+  /** Hide a window without deleting the chat (focus moves to neighbor). */
+  closeWindow: (id: string) => void
+  /** Focus a visible window (sets activeChatId, keeps other windows). */
+  focusWindow: (id: string) => void
+  /** Reorder stacked windows via header drag. */
+  moveWindow: (fromId: string, toId: string, after?: boolean) => void
+  /** Relative flex size of a window (resize handle). */
+  setWindowSize: (id: string, size: number) => void
+  /** Split orientation of the chat group (vertical/horizontal). */
+  setChatLayout: (layout: ChatLayout) => void
+  /** VSCode-like drop: drag chat onto target leaf edge or center. */
+  dropChatOnto: (dragChatId: string, targetChatId: string, pos: ChatDropPos) => void
+  /** Resize a split-tree node by node id. */
+  setTreeNodeSize: (nodeId: string, size: number) => void
+  /** Resize two sibling split children atomically. */
+  resizeTreePair: (parentId: string, firstId: string, secondId: string, firstSize: number, secondSize: number) => void
   /** Fullscreen toggle for the chat group (viewer group hides). Persisted in
    *  localStorage so the layout survives restarts. */
   chatFullscreen: boolean
@@ -1046,6 +1192,10 @@ export const useStore = create<State>((set, get) => ({
   deletedWorkspaceRoots: [],
   activeChatId: typeof window !== 'undefined' ? loadActiveChat() : '',
   openChatIds: typeof window !== 'undefined' ? loadOpenChats() : [],
+  visibleChatIds: typeof window !== 'undefined' ? loadVisibleChats() : [],
+  chatWindowSizes: typeof window !== 'undefined' ? loadWindowSizes() : {},
+  chatLayout: typeof window !== 'undefined' ? loadChatLayout() : 'vertical',
+  chatTree: typeof window !== 'undefined' ? loadChatTree() : null,
   recentlyClosedChatTabs: [],
   chatFullscreen: typeof window !== 'undefined' ? loadChatFullscreen() : false,
   focusComposer: false,
@@ -1149,6 +1299,7 @@ export const useStore = create<State>((set, get) => ({
     }) as Chat[]
     const prevActiveId = get().activeChatId
     const memOpen = get().openChatIds
+    const memVisible = get().visibleChatIds ?? []
     const fallbackActive =
       keptChats && prevChats.some((c) => c.id === prevActiveId)
         ? prevActiveId
@@ -1156,6 +1307,7 @@ export const useStore = create<State>((set, get) => ({
     const validIds = new Set(loadedChats.map((c) => c.id))
     let openChatIds: string[]
     let activeId: string
+    let visibleChatIds: string[]
     if (keptChats && memOpen.length > 0) {
       // Background refresh (sidecar:changed) while the app is already running:
       // keep the live tab order, just drop ids whose chats vanished.
@@ -1163,6 +1315,7 @@ export const useStore = create<State>((set, get) => ({
       activeId = validIds.has(fallbackActive) ? fallbackActive : (openChatIds[openChatIds.length - 1] ?? '')
       if (activeId && !openChatIds.includes(activeId)) openChatIds = [...openChatIds, activeId]
       if (openChatIds.length === 0 && loadedChats.length > 0 && activeId) openChatIds = [activeId]
+      visibleChatIds = normalizeVisibleChats(memVisible.length > 0 ? memVisible : [activeId], validIds, activeId)
     } else {
       // Fresh startup: restore the previous session's tabs from localStorage.
       const storedOpen = loadOpenChats().filter((id) => validIds.has(id))
@@ -1174,6 +1327,27 @@ export const useStore = create<State>((set, get) => ({
       activeId = validIds.has(candidate) ? candidate : (openChatIds[openChatIds.length - 1] ?? '')
       // Normalize storage so deleted ids never linger for the next launch.
       if (openChatIds.length > 0 || activeId) persistOpenState(openChatIds, activeId)
+      const storedVisible = loadVisibleChats().filter((id) => validIds.has(id))
+      visibleChatIds = normalizeVisibleChats(storedVisible.length > 0 ? storedVisible : (activeId ? [activeId] : []), validIds, activeId)
+      if (visibleChatIds.length > 0) persistVisibleChats(visibleChatIds)
+    }
+    // Normalize the persisted split tree (dedupe + drop deleted ids) so
+    // close/hide never sees duplicates and tree/visible never diverge.
+    // A raw persisted tree may hold stale or duplicated chat ids while
+    // visibleChatIds was already normalized above — sync them here once.
+    const storedTree = typeof window !== 'undefined' ? normalizeTree(loadChatTree(), validIds) : null
+    let chatTree: ChatTreeNode | null = storedTree
+    const treeIds = chatTree ? collectChatIds(chatTree) : []
+    if (treeIds.length === 0) {
+      chatTree = visibleChatIds.length > 0 ? buildFromList(visibleChatIds, treeDirFromLayout(loadChatLayout())) : null
+      if (chatTree) persistChatTree(chatTree)
+    } else {
+      // Tree is authoritative when it exists; mirrors follow it.
+      const synced = normalizeVisibleChats(treeIds, validIds, activeId)
+      if (JSON.stringify(synced) !== JSON.stringify(visibleChatIds)) {
+        visibleChatIds = synced
+        persistVisibleChats(visibleChatIds)
+      }
     }
     // Decrypt any secrets (API keys / OAuth creds) the settings file holds, so
     // the in-memory store always works with plaintext.
@@ -1391,6 +1565,8 @@ export const useStore = create<State>((set, get) => ({
       chats: loadedChats,
       activeChatId: activeId,
       openChatIds,
+      visibleChatIds,
+      chatTree,
       // Self-clean pre-existing empty chats left on disk by older builds (a
       // fresh tab used to persist immediately). They stay usable in-memory
       // but are queued for file deletion on the next persist; live chats that
@@ -1997,7 +2173,19 @@ export const useStore = create<State>((set, get) => ({
     set((st) => {
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
       persistOpenState(openChatIds, activeChatId)
-      return { chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
+      // New chat replaces single-window view; in multi-window it appends.
+      const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
+      if (single) {
+        persistVisibleChats([activeChatId])
+        persistChatTree(null)
+        return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
+      }
+      const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
+      // Full: show the new chat in place of the focused window instead of adding.
+      const full = base && leafCount(base) >= CHAT_WINDOW_MAX && !containsChat(base, activeChatId)
+      const chatTree = full ? (dropOnto(base, activeChatId, st.activeChatId, 'center') ?? base) : appendChat(base, activeChatId, treeDirFromLayout(st.chatLayout))
+      const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
+      return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
     get().persist()
     return activeChatId
@@ -2016,7 +2204,18 @@ export const useStore = create<State>((set, get) => ({
       }
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
       persistOpenState(openChatIds, activeChatId)
-      return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, rightPanelOpen: false }
+      const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
+      if (single) {
+        persistVisibleChats([activeChatId])
+        persistChatTree(null)
+        return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
+      }
+      const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
+      // Full: show the new chat in place of the focused window instead of adding.
+      const full = base && leafCount(base) >= CHAT_WINDOW_MAX && !containsChat(base, activeChatId)
+      const chatTree = full ? (dropOnto(base, activeChatId, st.activeChatId, 'center') ?? base) : appendChat(base, activeChatId, treeDirFromLayout(st.chatLayout))
+      const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
+      return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
     get().persist()
     return activeChatId
@@ -2061,10 +2260,21 @@ export const useStore = create<State>((set, get) => ({
       }
       const finalOpen = openChatIds.includes(activeChatId) || !activeChatId ? openChatIds : [...openChatIds, activeChatId]
       persistOpenState(finalOpen, activeChatId)
+      const validIds = new Set(chats.map((c) => c.id))
+      const baseTree = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
+      const normalized = normalizeTree(removeChat(baseTree, id), validIds)
+      const fallbackVisible = normalizeVisibleChats(s.visibleChatIds.filter((cid) => cid !== id), validIds, activeChatId)
+      const chatTree = normalized ?? (fallbackVisible.length > 0 ? buildFromList(fallbackVisible, treeDirFromLayout(s.chatLayout)) : null)
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      const visibleChatIds = mirrors.visibleChatIds.length > 0 ? mirrors.visibleChatIds : fallbackVisible
+      const chatWindowSizes = mirrors.chatWindowSizes
       return {
         chats,
         activeChatId,
         openChatIds: finalOpen,
+        visibleChatIds,
+        chatWindowSizes,
+        chatTree,
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
@@ -2090,6 +2300,15 @@ export const useStore = create<State>((set, get) => ({
       const openChatIds = s.openChatIds.filter((cid) => !doomedIds.has(cid))
       if (activeChatId && !openChatIds.includes(activeChatId)) openChatIds.push(activeChatId)
       persistOpenState(openChatIds, activeChatId)
+      const validIds = new Set(chats.map((c) => c.id))
+      const baseTreeWs = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
+      let pruned: ChatTreeNode | null = baseTreeWs
+      for (const dead of doomedIds) pruned = removeChat(pruned, dead)
+      const normalizedWs = normalizeTree(pruned, validIds)
+      const fallbackWs = normalizeVisibleChats(s.visibleChatIds.filter((cid) => !doomedIds.has(cid)), validIds, activeChatId)
+      const chatTreeWs = normalizedWs ?? (fallbackWs.length > 0 ? buildFromList(fallbackWs, treeDirFromLayout(s.chatLayout)) : null)
+      const mirrorsWs = persistTreeMirrors(chatTreeWs, s.chatLayout)
+      const visibleChatIds = mirrorsWs.visibleChatIds.length > 0 ? mirrorsWs.visibleChatIds : fallbackWs
       return {
         chats,
         workspaces,
@@ -2097,6 +2316,10 @@ export const useStore = create<State>((set, get) => ({
         pinnedChats,
         activeChatId,
         openChatIds,
+        visibleChatIds,
+        chatTree: chatTreeWs,
+        chatWindowSizes: mirrorsWs.chatWindowSizes,
+        chatLayout: mirrorsWs.chatLayout,
         unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
         deletedChatIds: [
           ...s.deletedChatIds,
@@ -2225,9 +2448,33 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
+      // Single-window navigation replaces the visible set; multi-window
+      // focus is handled by focusWindow so other windows stay open.
+      const single = leafCount(s.chatTree) <= 1 && s.visibleChatIds.length <= 1
+      let chatTree: ChatTreeNode | null = s.chatTree
+      let visibleChatIds = s.visibleChatIds
+      let chatWindowSizes = s.chatWindowSizes
+      let chatLayout = s.chatLayout
+      if (single) {
+        visibleChatIds = [id]
+        chatTree = null
+        persistVisibleChats(visibleChatIds)
+        persistChatTree(null)
+      } else if (!containsChat(chatTree, id)) {
+        const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
+        chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+        const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+        visibleChatIds = mirrors.visibleChatIds
+        chatWindowSizes = mirrors.chatWindowSizes
+        chatLayout = mirrors.chatLayout
+      }
       return {
         activeChatId: id,
         openChatIds,
+        visibleChatIds,
+        chatTree,
+        chatWindowSizes,
+        chatLayout,
         // Opening a chat clears its green "new message" dot.
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
       }
@@ -2249,9 +2496,31 @@ export const useStore = create<State>((set, get) => ({
       if (!s.chats.some((c) => c.id === id)) return {}
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
+      const single = leafCount(s.chatTree) <= 1 && s.visibleChatIds.length <= 1
+      let chatTree: ChatTreeNode | null = s.chatTree
+      let visibleChatIds = s.visibleChatIds
+      let chatWindowSizes = s.chatWindowSizes
+      let chatLayout = s.chatLayout
+      if (single) {
+        visibleChatIds = [id]
+        chatTree = null
+        persistVisibleChats(visibleChatIds)
+        persistChatTree(null)
+      } else if (!containsChat(chatTree, id)) {
+        const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
+        chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+        const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+        visibleChatIds = mirrors.visibleChatIds
+        chatWindowSizes = mirrors.chatWindowSizes
+        chatLayout = mirrors.chatLayout
+      }
       return {
         activeChatId: id,
         openChatIds,
+        visibleChatIds,
+        chatTree,
+        chatWindowSizes,
+        chatLayout,
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
       }
     })
@@ -2268,12 +2537,20 @@ export const useStore = create<State>((set, get) => ({
         activeChatId = openChatIds[Math.min(idx, openChatIds.length - 1)] ?? ''
       }
       persistOpenState(openChatIds, activeChatId)
+      // Closing a tab also hides its window; keep at least the active visible.
+      const validIds = new Set(s.chats.map((c) => c.id))
+      const baseTreeCt = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
+      const normalizedCt = normalizeTree(removeChat(baseTreeCt, id), validIds)
+      const fallbackCt = normalizeVisibleChats(s.visibleChatIds.filter((cid) => cid !== id), validIds, activeChatId)
+      const chatTreeCt = normalizedCt ?? (fallbackCt.length > 0 ? buildFromList(fallbackCt, treeDirFromLayout(s.chatLayout)) : null)
+      const mirrorsCt = persistTreeMirrors(chatTreeCt, s.chatLayout)
+      const visibleChatIds = mirrorsCt.visibleChatIds.length > 0 ? mirrorsCt.visibleChatIds : fallbackCt
       // Tab-list menu "Recently closed": keep the id while the chat itself
       // still exists (deleting the chat clears it via the chat store).
       const recentlyClosedChatTabs = s.chats.some((c) => c.id === id)
         ? [{ id, at: Date.now() }, ...s.recentlyClosedChatTabs.filter((r) => r.id !== id)].slice(0, 8)
         : s.recentlyClosedChatTabs
-      return { openChatIds, activeChatId, recentlyClosedChatTabs }
+      return { openChatIds, activeChatId, visibleChatIds, chatTree: chatTreeCt, chatWindowSizes: mirrorsCt.chatWindowSizes, chatLayout: mirrorsCt.chatLayout, recentlyClosedChatTabs }
     })
     persistSoon()
   },
@@ -2302,6 +2579,227 @@ export const useStore = create<State>((set, get) => ({
       }
     })
     persistSoon()
+  },
+
+  openInWindow: (id) => {
+    set((s) => {
+      if (!s.chats.some((c) => c.id === id)) return {}
+      const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [s.activeChatId], s.chatLayout)
+      // Full: keep the tab open but do not add another window or steal focus.
+      if (base && !containsChat(base, id) && leafCount(base) >= CHAT_WINDOW_MAX) {
+        const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
+        persistOpenState(openChatIds, s.activeChatId)
+        return { openChatIds }
+      }
+      const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
+      persistOpenState(openChatIds, id)
+      const chatTree = containsChat(base, id) ? base : appendChat(base, id, treeDirFromLayout(s.chatLayout))
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      return {
+        activeChatId: id,
+        openChatIds,
+        visibleChatIds: mirrors.visibleChatIds,
+        chatWindowSizes: mirrors.chatWindowSizes,
+        chatLayout: mirrors.chatLayout,
+        chatTree,
+        unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
+    })
+    persistSoon()
+  },
+
+  closeWindow: (id) => {
+    set((s) => {
+      const treeIds = s.chatTree ? collectChatIds(s.chatTree) : []
+      const ids = treeIds.length > 0 ? treeIds : s.visibleChatIds
+      if (!ids.includes(id) && !s.visibleChatIds.includes(id)) return {}
+      if (new Set([...treeIds, ...s.visibleChatIds]).size <= 1 && ids.length <= 1) return {}
+      const idx = ids.indexOf(id)
+      const base = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
+      const pruned = removeChat(base, id)
+      const fallbackVisible = (s.visibleChatIds.length > 0 ? s.visibleChatIds : ids).filter((cid) => cid !== id)
+      const chatTree = pruned ?? (fallbackVisible.length > 0 ? buildFromList(fallbackVisible, treeDirFromLayout(s.chatLayout)) : null)
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      const visibleChatIds = mirrors.visibleChatIds.length > 0 ? mirrors.visibleChatIds : fallbackVisible
+      let activeChatId = s.activeChatId
+      if (s.activeChatId === id) {
+        activeChatId = visibleChatIds[Math.min(Math.max(idx, 0), visibleChatIds.length - 1)] ?? ''
+      }
+      if (activeChatId !== s.activeChatId) persistOpenState(s.openChatIds, activeChatId)
+      return {
+        visibleChatIds,
+        chatWindowSizes: mirrors.chatWindowSizes,
+        chatLayout: mirrors.chatLayout,
+        chatTree,
+        activeChatId,
+        unreadChats: s.unreadChats.filter((cid) => cid !== activeChatId),
+      }
+    })
+    persistSoon()
+  },
+
+  focusWindow: (id) => {
+    set((s) => {
+      if (!s.chats.some((c) => c.id === id)) return {}
+      if (s.activeChatId === id) return {}
+      const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
+      persistOpenState(openChatIds, id)
+      // Focus never reshapes the tree; ensure the focused chat is visible.
+      let chatTree: ChatTreeNode | null = s.chatTree
+      let visibleChatIds = s.visibleChatIds
+      let chatWindowSizes = s.chatWindowSizes
+      let chatLayout = s.chatLayout
+      if (!containsChat(chatTree, id)) {
+        if (leafCount(chatTree) <= 1 && visibleChatIds.length <= 1) {
+          visibleChatIds = [id]
+          chatTree = null
+          persistVisibleChats(visibleChatIds)
+          persistChatTree(null)
+        } else if (chatTree && leafCount(chatTree) >= CHAT_WINDOW_MAX) {
+          // Full: show the focused chat in place of the previous focus.
+          const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
+          chatTree = dropOnto(base, id, s.activeChatId, 'center') ?? base
+          const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+          visibleChatIds = mirrors.visibleChatIds
+          chatWindowSizes = mirrors.chatWindowSizes
+          chatLayout = mirrors.chatLayout
+        } else {
+          const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
+          chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+          const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+          visibleChatIds = mirrors.visibleChatIds
+          chatWindowSizes = mirrors.chatWindowSizes
+          chatLayout = mirrors.chatLayout
+        }
+      }
+      return {
+        activeChatId: id,
+        openChatIds,
+        visibleChatIds,
+        chatTree,
+        chatWindowSizes,
+        chatLayout,
+        unreadChats: s.unreadChats.filter((cid) => cid !== id),
+      }
+    })
+    persistSoon()
+  },
+
+  moveWindow: (fromId, toId, after = false) => {
+    set((s) => {
+      // Legacy linear reorder kept for compat; tree-aware when possible.
+      if (s.chatTree) {
+        const base = ensureTree(s.chatTree, s.visibleChatIds, s.chatLayout)
+        if (!base) return {}
+        // Map linear before/after onto the root axis for single-level trees.
+        const flatDir = base.kind === 'split' ? base.dir : treeDirFromLayout(s.chatLayout)
+        const isFlat = base.kind !== 'split' || base.children.every((c) => c.kind === 'leaf')
+        const root = isFlat && base.kind === 'split' ? base : buildFromList(collectChatIds(base), flatDir)
+        if (!root || root.kind !== 'split') return {}
+        const ids = collectChatIds(root)
+        if (!ids.includes(fromId) || !ids.includes(toId) || fromId === toId) return {}
+        const rest = ids.filter((cid) => cid !== fromId)
+        let dest = rest.indexOf(toId) + (after ? 1 : 0)
+        dest = Math.max(0, Math.min(rest.length, dest))
+        const ordered = rest.slice()
+        ordered.splice(dest, 0, fromId)
+        const sizes = sizesByChat(base)
+        const chatTree = buildFromList(ordered, root.dir, sizes)
+        const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+        return { chatTree, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout }
+      }
+      const from = s.visibleChatIds.indexOf(fromId)
+      if (from === -1 || !s.visibleChatIds.includes(toId) || fromId === toId) return {}
+      const rest = s.visibleChatIds.filter((cid) => cid !== fromId)
+      let dest = rest.indexOf(toId) + (after ? 1 : 0)
+      dest = Math.max(0, Math.min(rest.length, dest))
+      const visibleChatIds = rest.slice()
+      visibleChatIds.splice(dest, 0, fromId)
+      persistVisibleChats(visibleChatIds)
+      return { visibleChatIds }
+    })
+    persistSoon()
+  },
+
+  setWindowSize: (id, size) => {
+    const clamped = Number.isFinite(size) ? Math.max(0.25, Math.min(4, size)) : 1
+    set((s) => {
+      const ids = s.chatTree ? collectChatIds(s.chatTree) : s.visibleChatIds
+      if (!ids.includes(id)) return {}
+      if (s.chatTree) {
+        const chatTree = setChatSize(s.chatTree, id, clamped)
+        const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+        return { chatTree, chatWindowSizes: mirrors.chatWindowSizes, visibleChatIds: mirrors.visibleChatIds, chatLayout: mirrors.chatLayout }
+      }
+      const chatWindowSizes = { ...s.chatWindowSizes, [id]: clamped }
+      persistWindowSizes(chatWindowSizes)
+      return { chatWindowSizes }
+    })
+  },
+
+  setChatLayout: (layout) => {
+    const next = normalizeChatLayout(layout)
+    set((s) => {
+      if (s.chatTree && s.chatTree.kind === 'split') {
+        const chatTree = setRootDir(s.chatTree, next === 'horizontal' ? 'row' : 'col')
+        const mirrors = persistTreeMirrors(chatTree, next)
+        return { chatLayout: mirrors.chatLayout, chatTree, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes }
+      }
+      persistChatLayout(next)
+      return { chatLayout: next }
+    })
+  },
+
+  dropChatOnto: (dragChatId, targetChatId, pos) => {
+    if (!dragChatId || !targetChatId) return
+    // Never open a duplicate window for the same chat.
+    if (dragChatId === targetChatId) return
+    set((s) => {
+      if (!s.chats.some((c) => c.id === dragChatId)) return {}
+      if (!s.chats.some((c) => c.id === targetChatId)) return {}
+      const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [targetChatId], s.chatLayout)
+      // Full: a new chat cannot split in; keep the tab open and the target focused.
+      if (base && !containsChat(base, dragChatId) && leafCount(base) >= CHAT_WINDOW_MAX) {
+        const openChatIds = s.openChatIds.includes(dragChatId) ? s.openChatIds : [...s.openChatIds, dragChatId]
+        persistOpenState(openChatIds, s.activeChatId)
+        return { openChatIds }
+      }
+      const openChatIds = s.openChatIds.includes(dragChatId) ? s.openChatIds : [...s.openChatIds, dragChatId]
+      persistOpenState(openChatIds, dragChatId)
+      const chatTree = dropOnto(base, dragChatId, targetChatId, pos)
+      if (!chatTree) return {}
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      return {
+        activeChatId: dragChatId,
+        openChatIds,
+        visibleChatIds: mirrors.visibleChatIds,
+        chatWindowSizes: mirrors.chatWindowSizes,
+        chatLayout: mirrors.chatLayout,
+        chatTree,
+        unreadChats: s.unreadChats.filter((cid) => cid !== dragChatId),
+      }
+    })
+    persistSoon()
+  },
+
+  setTreeNodeSize: (nodeId, size) => {
+    set((s) => {
+      if (!s.chatTree) return {}
+      const chatTree = setNodeSize(s.chatTree, nodeId, size)
+      if (!chatTree || chatTree === s.chatTree) return {}
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      return { chatTree, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout }
+    })
+  },
+
+  resizeTreePair: (parentId, firstId, secondId, firstSize, secondSize) => {
+    set((s) => {
+      if (!s.chatTree) return {}
+      const chatTree = resizePair(s.chatTree, parentId, firstId, secondId, firstSize, secondSize)
+      if (!chatTree || chatTree === s.chatTree) return {}
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      return { chatTree, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout }
+    })
   },
 
   setChatFullscreen: (v) => {

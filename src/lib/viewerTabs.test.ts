@@ -33,8 +33,8 @@ const memStore = new Map<string, string>()
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).document = { documentElement: { style: { setProperty: () => {} } } }
 
-const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('./viewerTabs')
-const { useStore } = await import('./store')
+const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat } = await import('./viewerTabs')
+const { useStore, normalizeVisibleChats, normalizeChatLayout } = await import('./store')
 
 export {}
 
@@ -154,6 +154,75 @@ console.log('7) viewerTabTitle — sub-agent trace keeps its own title:')
   check('main trace shows kind label', viewerTabTitle({ kind: 'trace', title: 'Trace', traceTaskId: undefined } as any) === 'Trace')
   check('sub-agent trace keeps own title', viewerTabTitle({ kind: 'trace', title: 'Trace · Fix bug', traceTaskId: 'task-abc' } as any) === 'Trace · Fix bug')
   check('file tab keeps own title', viewerTabTitle({ kind: 'file', title: 'a.ts', traceTaskId: undefined } as any) === 'a.ts')
+}
+
+console.log('8) multi-window visible list — order kept, unknown dropped, fallback to focus:')
+{
+  const valid = new Set(['c1', 'c2', 'c3'])
+  check('keeps order + dedupes', JSON.stringify(normalizeVisibleChats(['c2', 'c1', 'c2', 'zx'], valid, 'c1')) === JSON.stringify(['c2', 'c1']))
+  check('empty falls back to active', JSON.stringify(normalizeVisibleChats([], valid, 'c3')) === JSON.stringify(['c3']))
+  check('empty + bad active falls back to first', JSON.stringify(normalizeVisibleChats([], valid, 'zx')) === JSON.stringify(['c1']))
+  check('layout defaults to vertical', normalizeChatLayout('diagonal') === 'vertical')
+  check('layout keeps horizontal', normalizeChatLayout('horizontal') === 'horizontal')
+}
+
+console.log('8b) chat split tree — VSCode-like drops in any direction:')
+{
+  const { appendChat, buildFromList, collectChatIds, dropOnto, leafCount, normalizeTree } = await import('./chatTree')
+  const t0 = buildFromList(['c1'], 'col')!
+  const t1 = dropOnto(t0, 'c2', 'c1', 'right')!
+  check('right edge splits row', t1.kind === 'split' && (t1 as any).dir === 'row' && JSON.stringify(collectChatIds(t1)) === JSON.stringify(['c1', 'c2']), JSON.stringify(collectChatIds(t1)))
+  const t2 = dropOnto(t1, 'c3', 'c1', 'bottom')!
+  check('bottom edge splits col inside row', leafCount(t2) === 3 && collectChatIds(t2).includes('c3'))
+  const t3 = dropOnto(t2, 'c2', 'c3', 'center')!
+  check('center swaps windows', collectChatIds(t3).includes('c2') && leafCount(t3) === 3)
+  const t4 = dropOnto(t3, 'c2', 'c2', 'left')!
+  check('self drop is no-op', collectChatIds(t4).length === 3)
+  const flat = appendChat(null, 'c1', 'col')!
+  check('append starts a leaf', flat.kind === 'leaf' && collectChatIds(flat).join() === 'c1')
+  const norm = normalizeTree(buildFromList(['c1', 'c9', 'c1', 'c2'], 'col'), new Set(['c1', 'c2']))
+  check('normalize drops unknown + dupe', JSON.stringify(collectChatIds(norm)) === JSON.stringify(['c1', 'c2']), JSON.stringify(collectChatIds(norm)))
+}
+
+console.log('8c) chat window limits — min size constants and max windows:')
+{
+  const { appendChat, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dropOnto, leafCount } = await import('./chatTree')
+  check('min width sane', CHAT_WINDOW_MIN_W >= 200 && CHAT_WINDOW_MIN_W <= 400, CHAT_WINDOW_MIN_W)
+  check('min height sane', CHAT_WINDOW_MIN_H >= 150 && CHAT_WINDOW_MIN_H <= 400, CHAT_WINDOW_MIN_H)
+  const ids = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6'].slice(0, CHAT_WINDOW_MAX)
+  const full = buildFromList(ids, 'row')!
+  check('full tree at max', leafCount(full) === CHAT_WINDOW_MAX, leafCount(full))
+  const blocked = appendChat(full, 'cX', 'row')
+  check('append blocked when full', blocked === full && !collectChatIds(blocked).includes('cX'))
+  const blockedDrop = dropOnto(full, 'cX', ids[0], 'right')
+  check('drop blocked when full', blockedDrop === full)
+  const moved = dropOnto(full, ids[0], ids[1], 'right')
+  check('move allowed when full', moved !== full && leafCount(moved!) === CHAT_WINDOW_MAX)
+}
+
+console.log('9) resolveViewerForChat — focused chat restores its own tab:')
+{
+  const tabs = [
+    { id: 'review:c1', kind: 'review', chatId: 'c1' },
+    { id: 'review:c2', kind: 'review', chatId: 'c2' },
+  ] as any[]
+  const v2 = visibleTabs(tabs, 'c2')
+  check('remembers c2 tab', resolveViewerForChat(v2, { c2: 'review:c2' }, 'c2') === 'review:c2')
+  check('stale memory falls back to first visible', resolveViewerForChat(v2, { c2: 'review:c9' }, 'c2') === 'review:c2')
+  check('no tabs -> null', resolveViewerForChat([], {}, 'c2') === null)
+}
+
+console.log('10) pickNeighborWindow — vim-style directional move:')
+{
+  const { pickNeighborWindow } = await import('./chatTree')
+  const centers = { a: { x: 0, y: 0 }, b: { x: 100, y: 0 }, c: { x: 0, y: 100 }, d: { x: 100, y: 100 } }
+  check('right from a is b', pickNeighborWindow(centers, 'a', 'right') === 'b')
+  check('down from a is c', pickNeighborWindow(centers, 'a', 'down') === 'c')
+  check('left from b is a', pickNeighborWindow(centers, 'b', 'left') === 'a')
+  check('up from c is a', pickNeighborWindow(centers, 'c', 'up') === 'a')
+  check('right from b is null', pickNeighborWindow(centers, 'b', 'right') === null)
+  check('unknown current is null', pickNeighborWindow(centers, 'zx', 'right') === null)
+  check('off-axis excluded', pickNeighborWindow({ a: { x: 0, y: 0 }, e: { x: 10, y: 100 } }, 'a', 'right') === null)
 }
 
 if (failed > 0) {

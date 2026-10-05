@@ -262,6 +262,11 @@ export function ChatTabBar() {
               if (e.button === 1) useStore.getState().closeChatTab(id);
             }}
             onDragStart={(e) => {
+              try {
+                e.dataTransfer.setData("application/x-coder-chat-id", id);
+              } catch {
+                /* drag unsupported */
+              }
               e.dataTransfer.setData("text/plain", id);
               e.dataTransfer.effectAllowed = "move";
               setDragId(id);

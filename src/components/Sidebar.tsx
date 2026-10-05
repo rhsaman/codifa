@@ -965,6 +965,20 @@ function SidebarContent() {
                       <div
                         key={c.id}
                         className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === g.key ? " selecting" : ""}`}
+                        draggable
+                        onDragStart={(e) => {
+                          try {
+                            e.dataTransfer.setData("application/x-coder-chat-id", c.id);
+                          } catch {
+                            /* drag unsupported */
+                          }
+                          try {
+                            e.dataTransfer.setData("text/plain", c.id);
+                          } catch {
+                            /* drag unsupported */
+                          }
+                          e.dataTransfer.effectAllowed = "move";
+                        }}
                         onClick={() => useStore.getState().openChat(c.id)}
                         title={prepareContent(titleOf(c), dir)}
                       >

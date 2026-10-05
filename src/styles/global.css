@@ -2980,6 +2980,416 @@ textarea {
   background: var(--accent-dim);
 }
 
+/* ----- multi-window chat group (VSCode-like split) ----- */
+.chat-windows {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+}
+
+.chat-windows.vertical {
+  flex-direction: column;
+}
+
+.chat-windows.horizontal {
+  flex-direction: row;
+}
+
+.chat-window-slot {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-windows.vertical .chat-window-slot {
+  flex-direction: column;
+}
+
+.chat-windows.horizontal .chat-window-slot {
+  flex-direction: row;
+}
+
+.chat-windows.single .chat-window-slot {
+  flex: 1 1 auto;
+}
+
+.chat-window {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-windows.multi .chat-window {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-alt);
+}
+
+.chat-windows.multi .chat-window.focused {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+/* Cheap focus cue: opacity only (no blur/filter), so unfocused windows
+   stay readable but clearly recede. */
+.chat-windows.multi .chat-window.dimmed .chat-window-body {
+  opacity: 0.55;
+}
+
+.chat-windows.multi .chat-window.focused .chat-window-body {
+  opacity: 1;
+}
+
+.chat-panel.chat-window-dimmed .chat-scroll {
+  pointer-events: auto;
+}
+
+.chat-window-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: grab;
+  user-select: none;
+}
+
+.chat-window-head.focused {
+  color: var(--text);
+}
+
+.chat-window-head:active {
+  cursor: grabbing;
+}
+
+.chat-window-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-window-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.chat-window-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.chat-window-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-window-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.chat-window-resize.row {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.chat-window-resize.col {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.chat-window-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.chat-window-resize.row::after {
+  height: 3px;
+}
+
+.chat-window-resize.col::after {
+  width: 3px;
+  height: 100%;
+}
+
+.chat-window-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+.chat-window.drop-before {
+  box-shadow: 0 -2px 0 var(--accent);
+}
+
+.chat-window.drop-after {
+  box-shadow: 0 2px 0 var(--accent);
+}
+
+.chat-windows.horizontal .chat-window.drop-before {
+  box-shadow: -2px 0 0 var(--accent);
+}
+
+.chat-windows.horizontal .chat-window.drop-after {
+  box-shadow: 2px 0 0 var(--accent);
+}
+
+/* ----- recursive split tree (VSCode-like free layout) ----- */
+.chat-windows.tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+
+.chat-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  gap: 6px;
+}
+
+.chat-split.col {
+  flex-direction: column;
+}
+
+.chat-split.row {
+  flex-direction: row;
+}
+
+.chat-split-child {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-split.col > .chat-split-child {
+  flex-direction: column;
+}
+
+.chat-split.row > .chat-split-child {
+  flex-direction: row;
+}
+
+.chat-split-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.chat-split-resize.row-bar {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.chat-split-resize.col-bar {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.chat-split-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.chat-split-resize.row-bar::after {
+  height: 3px;
+}
+
+.chat-split-resize.col-bar::after {
+  width: 3px;
+  height: 100%;
+}
+
+.chat-split-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+/* Edge highlight: the exact zone the dragged chat will land in. */
+.chat-windows.tree .chat-window {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-alt);
+  /* Never shrink below the size where chat text and composer stay readable. */
+  min-width: 400px;
+  min-height: 320px;
+}
+
+.chat-split.row > .chat-split-child {
+  min-width: 400px;
+}
+
+.chat-split.col > .chat-split-child {
+  min-height: 320px;
+}
+
+/* Narrow panes: keep trace/edit heads on one readable row instead of
+   painting pills over stats. Pills and captions ellipsize, the trailing
+   meta cluster never overlaps them. */
+.chat-windows.tree .chat-window .trace-head,
+.chat-windows.tree .chat-window .edit-group-row-main {
+  min-width: 0;
+  overflow: hidden;
+  gap: 6px;
+}
+.chat-windows.tree .chat-window .trace-head-pills {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+.chat-windows.tree .chat-window .trace-pill,
+.chat-windows.tree .chat-window .trace-head-caption,
+.chat-windows.tree .chat-window .edit-group-file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-windows.tree .chat-window .trace-head-right,
+.chat-windows.tree .chat-window .edit-group-row-end {
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-windows.tree .chat-window.focused {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.chat-windows.tree .chat-window.drop-active {
+  border-color: var(--accent);
+}
+
+.chat-drop-preview {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  pointer-events: none;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+.chat-drop-preview.preview-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 50%;
+}
+
+.chat-drop-preview.preview-right {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  right: 0;
+}
+
+.chat-drop-preview.preview-top {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 50%;
+}
+
+.chat-drop-preview.preview-bottom {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 50%;
+}
+
+.chat-drop-preview.preview-center {
+  inset: 0;
+}
+
+.chat-drop-hint {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
+/* Single window also hosts the empty-page preview, so it needs positioning. */
+.chat-windows.single .chat-window {
+  position: relative;
+  isolation: isolate;
+}
+
+/* Empty-page ghost: the exact pane the dragged chat will occupy. */
+.chat-drop-empty-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+
+.chat-drop-empty-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ----- chat ----- */
 .chat-panel {
   display: flex;
@@ -3784,7 +4194,7 @@ textarea {
   left: 0;
   right: 0;
   z-index: 10;
-  padding: 10px 16px 16px;
+  padding: 8px 16px 12px;
   /* The composer floats over the conversation and would otherwise cover the
      bottom of the chat scrollbar. Let clicks on its empty padding (right edge
      where the scrollbar runs, bottom edge) pass through to the scroll
@@ -3843,11 +4253,10 @@ textarea {
   transition: border-color 0.18s ease;
 }
 
-.composer-inner:focus-within {
-  border-color: var(--accent);
-}
+
 
 .composer-input {
+  display: block;
   width: 100%;
   resize: none;
   background: transparent;
@@ -3858,7 +4267,7 @@ textarea {
   min-height: 40px;
   max-height: 200px;
   outline: none;
-  overflow-y: auto;
+  overflow-y: hidden;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
   transition:
@@ -3913,9 +4322,98 @@ textarea {
 /* Composer input: textarea spans full top row, action buttons below.
    CSS Grid prevents text from flowing between icons when textarea grows. */
 .composer-input-row {
+  position: relative;
   display: grid;
   grid-template-rows: 1fr auto;
   width: 100%;
+}
+
+/* Compact single-line mode: context ring + plus | input | voice + send share
+   one horizontal row so the composer stays short. Expanded multi-line mode
+   (draft wraps to several visual lines) keeps the grid above with the input
+   full-width on top and the actions below. */
+.composer-input-row.compact {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px 3px;
+}
+
+.composer-input-row.compact .composer-bottom-row {
+  display: contents;
+}
+
+.composer-input-row.compact .composer-left-actions,
+.composer-input-row.compact .composer-right-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  align-self: center;
+}
+
+.composer-input-row.compact .composer-left-actions {
+  order: 1;
+  gap: 2px;
+}
+
+.composer-input-row.compact .composer-input-stack {
+  order: 2;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: center;
+}
+
+.composer-input-row.compact .composer-right-actions {
+  order: 3;
+}
+
+.composer-input-row.compact .composer-input-stack .composer-input {
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.composer-input-row.compact .composer-input-stack .composer-backdrop {
+  padding: 4px 8px;
+}
+
+/* Keep every icon vertically centered: drop the 2px lift used in the
+   two-row layout and the extra gap between the plus button and ring. */
+.composer-input-row.compact .icon-btn.plus-btn {
+  margin-bottom: 0;
+  align-self: center;
+}
+
+.composer-input-row.compact .ctx-ring-wrap {
+  margin-inline-start: 0;
+  align-self: center;
+}
+
+.composer-input-row.compact .ctx-ring-btn,
+.composer-input-row.compact .composer-right-actions .icon-btn {
+  align-self: center;
+}
+
+/* Hidden mirror for counting visual lines at the compact input width. Same
+   typography and padding as the compact textarea; width is set from JS to the
+   compact input width so the expand decision never depends on the current
+   layout (no compact/expanded oscillation). */
+.composer-measure {
+  position: absolute;
+  top: 0;
+  inset-inline-start: 0;
+  visibility: hidden;
+  overflow: hidden;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  font-size: var(--chat-font-size);
+  font-family: var(--font-sans);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  pointer-events: none;
 }
 
 .composer-input-row .composer-input-stack {
@@ -3929,7 +4427,7 @@ textarea {
   position: relative;
   z-index: 1;
   min-width: 0;
-  min-height: 36px;
+  min-height: 32px;
   max-height: 200px;
   padding: 8px 14px 2px;
   resize: none;

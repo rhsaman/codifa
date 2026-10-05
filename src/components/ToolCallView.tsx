@@ -22,6 +22,47 @@ import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 
+/** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
+ *  dozens of tool rows; one interval driving every live clock keeps CPU and
+ *  wake-ups flat instead of one timer per row. */
+const TICK_MS = 500;
+let sharedTickId: ReturnType<typeof setInterval> | null = null;
+const tickListeners = new Set<() => void>();
+
+function ensureSharedTick(): void {
+  if (sharedTickId !== null) return;
+  sharedTickId = setInterval(() => {
+    for (const cb of tickListeners) cb();
+  }, TICK_MS);
+  const t = sharedTickId as unknown as { unref?: () => void };
+  if (typeof t.unref === "function") t.unref();
+}
+
+function releaseSharedTick(): void {
+  if (tickListeners.size === 0 && sharedTickId !== null) {
+    clearInterval(sharedTickId);
+    sharedTickId = null;
+  }
+}
+
+/** Live clock for a running tool row. Ticks every 500ms while `running`,
+ *  frozen otherwise — backed by the single shared ticker above. */
+export function useRunningClock(running: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const cb = () => setNow(Date.now());
+    tickListeners.add(cb);
+    ensureSharedTick();
+    return () => {
+      tickListeners.delete(cb);
+      releaseSharedTick();
+    };
+  }, [running]);
+  return now;
+}
+
 const TOOL_LABEL: Record<string, string> = {
   write_file: "Write File",
   edit_file: "Edit File",
@@ -175,12 +216,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
   const running = activities.some((a) => a.activity.status === "running");
   const { adds, dels } = editGroupStats(activities);
   // Live clock so the group total ticks while any file edit is still running.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!running) return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [running]);
+  const now = useRunningClock(running);
   const totalMs = activities.reduce((sum, a) => {
     const act = a.activity;
     if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
@@ -1054,12 +1090,7 @@ export const ToolGroupView = memo(function ToolGroupView({
   const [open, setOpen] = useState(false);
   const running = activities.some((a) => a.activity.status === "running");
   // Live clock so the group total ticks while any call is still running.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!running) return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [running]);
+  const now = useRunningClock(running);
   const totalMs = activities.reduce((sum, a) => {
     const act = a.activity;
     if (act.status === "running" && act.startedAt) return sum + Math.max(0, now - act.startedAt);
@@ -1895,17 +1926,8 @@ export const ToolCallView = memo(function ToolCallView({
     activity.tool === "task" &&
     ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary));
 
-  // Live elapsed time while the tool is still running.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (
-      activity.status !== "running" &&
-      !activity.children?.some((c) => c.status === "running")
-    )
-      return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [activity.status, activity.children?.some((c) => c.status === "running")]);
+  const toolRunning = activity.status === "running" || (activity.children?.some((c) => c.status === "running") ?? false);
+  const now = useRunningClock(toolRunning);
   const ms =
     activity.status === "running" && activity.startedAt
       ? now - activity.startedAt

@@ -78,6 +78,15 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
 };
 
+/** True on macOS/iOS — decides which half of the Cmd/Ctrl convention a chord
+ *  uses (Cmd on Apple platforms, Ctrl elsewhere). */
+export function isApplePlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
+  const p = nav.userAgentData?.platform ?? navigator.platform ?? navigator.userAgent;
+  return /mac|iphone|ipad|ipod/i.test(p);
+}
+
 /** Render one line of help/README for a shortcut, e.g. "Ctrl+X u — Undo…". */
 export function formatShortcut(key: string, sc: PrefixShortcut): string {
   const k = key === " " ? "Space" : key;
@@ -104,6 +113,11 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+P", label: "Quick-open / search overlay (⌘⇧F = content search)" },
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
+  { keys: "Cmd/Ctrl+J", label: "Toggle the terminal panel" },
+  {
+    keys: "Cmd/Ctrl+W",
+    label: "Close the active tab (terminal while it has focus, else viewer, else chat)",
+  },
   { keys: "Cmd/Ctrl+,", label: "Open settings" },
   { keys: "Cmd/Ctrl+O", label: "Open a workspace folder" },
 ];

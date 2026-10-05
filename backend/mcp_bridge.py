@@ -90,6 +90,23 @@ def _config_hash(cfg: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+def _is_playwright_cfg(cfg: dict) -> bool:
+    """True when this MCP server config spawns Playwright MCP."""
+    args = [str(a) for a in (cfg.get("args") or []) if isinstance(a, (str, int))]
+    return any("playwright/mcp" in a for a in args)
+
+
+def _browser_cache_key(name: str, cfg: dict, chat_id: str) -> str:
+    """Cache key for an MCP server session.
+
+    Playwright MCP attaches to a chat's isolated browser (own CDP port), so
+    each chat gets its own cached server process. Other servers stay shared.
+    """
+    if chat_id and _is_playwright_cfg(cfg):
+        return f"{name}\x00chat:{chat_id}"
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Orphan reaping — kill leftover server/browser processes before connecting
 # ---------------------------------------------------------------------------
@@ -568,6 +585,15 @@ async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> 
     تغییر، بدون تلاشِ دوباره).
     """
     cached = _session_cache.get(server_name)
+    cache_key = server_name
+    if cached is None:
+        # Per-chat Playwright sessions live under a chat-suffixed key —
+        # reconnect through whichever live session belongs to this server.
+        for k, v in _session_cache.items():
+            if k == server_name or k.startswith(server_name + "\x00"):
+                cached = v
+                cache_key = k
+                break
     if cached is None:
         return False
     cfg = dict(cached.cfg)
@@ -575,9 +601,9 @@ async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> 
 
     # بستن سشن قدیمی و کشتن یتیم‌هایش (مرورگری که از سرور جان به‌در برده). از
     # قفل سرور استفاده می‌کنیم تا دو turn هم‌زمان سشن را دوباره اسپاون نکنند.
-    async with _lock_for(server_name):
+    async with _lock_for(cache_key):
         # ممکن است در حین انتظار یک turn دیگر همین سشن را reconnect کرده باشد.
-        current = _session_cache.get(server_name)
+        current = _session_cache.get(cache_key)
         if current is not None and current.config_hash == h and current.session is not cached.session:
             # قبلاً reconnect شده — همان سشنِ تازه را نگه می‌داریم.
             return True
@@ -585,7 +611,7 @@ async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> 
             with suppress(Exception):
                 await cached.stack.aclose()
             _reap_processes(cached.cfg, protect_own=False)
-            _session_cache.pop(server_name, None)
+            _session_cache.pop(cache_key, None)
 
         try:
             if cfg.get("url"):
@@ -611,7 +637,7 @@ async def _reconnect_session(server_name: str, emit: Callable[[dict], None]) -> 
             print(f"[coder] MCP server {server_name!r}: reconnect yielded no tools", flush=True)
             return False
 
-        _session_cache[server_name] = _CachedSession(
+        _session_cache[cache_key] = _CachedSession(
             stack=stack,
             session=session,
             raw_tools=raw_tools,
@@ -725,8 +751,8 @@ def _make_tool(
     return st
 
 
-async def _ensure_playwright_in_app(cfg: dict) -> dict:
-    """Keep Playwright MCP browsers inside the app (shared in-app session).
+async def _ensure_playwright_in_app(cfg: dict, chat_id: str = "") -> dict:
+    """Keep Playwright MCP browsers inside the app (per-chat in-app session).
 
     ``@playwright/mcp`` normally launches a visible browser window of its
     own. The sidecar already owns a headless Chromium with a remote-debugging
@@ -748,9 +774,9 @@ async def _ensure_playwright_in_app(cfg: dict) -> dict:
     try:
         import browser_session
 
-        result = await browser_session.launch()
+        result = await browser_session.launch("about:blank", chat_id or "")
         if isinstance(result, dict) and result.get("ok"):
-            endpoint = str(browser_session.cdp_endpoint())
+            endpoint = str(browser_session.cdp_endpoint(chat_id or ""))
     except Exception as exc:  # noqa: BLE001
         print(f"[coder] in-app browser unavailable for Playwright MCP: {exc}", flush=True)
     out = dict(cfg)
@@ -768,6 +794,7 @@ async def _connect_stdio(
     name: str,
     cfg: dict,
     emit: Callable[[dict], None],
+    chat_id: str = "",
 ) -> tuple[AsyncExitStack, ClientSession, list[Any]]:
     """Open a stdio MCP server and return (stack, session, raw_tools).
 
@@ -781,9 +808,9 @@ async def _connect_stdio(
     if not command:
         raise ValueError(f"MCP server {name!r}: no command specified")
 
-    # Shared in-app browser: attach Playwright MCP to browser_session's
+    # Per-chat in-app browser: attach Playwright MCP to that chat's
     # headless Chromium instead of letting it open a window outside the app.
-    cfg = await _ensure_playwright_in_app(cfg)
+    cfg = await _ensure_playwright_in_app(cfg, chat_id)
 
     params = StdioServerParameters(
         command=str(command),
@@ -855,6 +882,7 @@ async def build_mcp_tools(
     reserved_names: set[str] | None = None,
     analyze_images: Callable[[list[str], str], Awaitable[str | None]] | None = None,
     task: str = "",
+    chat_id: str = "",
 ) -> tuple[list[StructuredTool], Callable[[], Awaitable[None]]]:
     """Connect to every configured MCP server and return (tools, cleanup).
 
@@ -884,7 +912,8 @@ async def build_mcp_tools(
         if not isinstance(cfg, dict):
             continue
         h = _config_hash(cfg)
-        cached = _session_cache.get(name)
+        cache_key = _browser_cache_key(name, cfg, chat_id)
+        cached = _session_cache.get(cache_key)
 
         # --- cache hit: same config → reuse live session ---
         if cached and cached.config_hash == h:
@@ -907,10 +936,10 @@ async def build_mcp_tools(
         # The per-server lock serialises concurrent turns: the second caller
         # waits for the first connect to finish and then reuses its session
         # instead of double-spawning the server (and hitting its profile lock).
-        async with _lock_for(name):
+        async with _lock_for(cache_key):
             # Re-check the cache under the lock — the first caller may have
             # connected while we were waiting.
-            cached = _session_cache.get(name)
+            cached = _session_cache.get(cache_key)
             if cached and cached.config_hash == h:
                 new_tools = [
                     _make_tool(
@@ -935,7 +964,7 @@ async def build_mcp_tools(
                 # Kill this server's leftover processes (an outlived browser
                 # keeps the profile locked) before spawning the replacement.
                 _reap_processes(cached.cfg, protect_own=False)
-                _session_cache.pop(name, None)
+                _session_cache.pop(cache_key, None)
 
             # Kill orphans from a previous run that still hold this server's
             # locks (e.g. Chrome's profile SingletonLock) — but never our own
@@ -946,10 +975,10 @@ async def build_mcp_tools(
                 if cfg.get("url"):
                     stack, session, raw_tools = await _connect_http(name, cfg, emit)
                 else:
-                    stack, session, raw_tools = await _connect_stdio(name, cfg, emit)
+                    stack, session, raw_tools = await _connect_stdio(name, cfg, emit, chat_id)
 
                 if raw_tools:
-                    _session_cache[name] = _CachedSession(
+                    _session_cache[cache_key] = _CachedSession(
                         stack=stack,
                         session=session,
                         raw_tools=raw_tools,

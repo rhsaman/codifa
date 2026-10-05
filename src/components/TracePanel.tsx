@@ -27,13 +27,13 @@ export function isSubToolTrace(entry: TraceEntry): boolean {
   return Boolean((entry.detail as Record<string, unknown> | undefined)?.sub);
 }
 
-/** Pure tab counts for tests: All counts every entry, Tools counts only top-level tool calls. */
-export function getTraceTabCounts(entries: TraceEntry[]): Record<string, number> {
+/** Pure tab counts for tests: All counts every entry, Tools counts only top-level tool calls (sub-agent trace views include their own sub tools). */
+export function getTraceTabCounts(entries: TraceEntry[], includeSub = false): Record<string, number> {
   const c: Record<string, number> = { all: entries.length, llm: 0, prompt: 0, tool: 0 };
   for (const e of entries) {
     const raw = e.kind as string;
     if (raw === "tool") {
-      if (isSubToolTrace(e)) continue;
+      if (!includeSub && isSubToolTrace(e)) continue;
       c.tool += 1;
     } else if (raw in c) {
       c[raw] += 1;
@@ -699,18 +699,19 @@ export function TracePanel(props?: {
     };
   }, [activeChatId, fetchAll]);
 
-  const counts = useMemo(() => getTraceTabCounts(entries), [entries]);
+  const counts = useMemo(() => getTraceTabCounts(entries, Boolean(taskId)), [entries, taskId]);
 
   const visible = useMemo(() => {
+    const subView = Boolean(taskId);
     const byTab =
       tab === "all"
         ? entries
         : tab === "tool"
-          ? entries.filter((e) => isToolTraceKind(e.kind as string) && !isSubToolTrace(e))
+          ? entries.filter((e) => isToolTraceKind(e.kind as string) && (subView || !isSubToolTrace(e)))
           : entries.filter((e) => e.kind === tab);
     // Chronological: oldest at top, newest at bottom (scroll up for history).
     return filterTraces(byTab, query);
-  }, [entries, tab, query]);
+  }, [entries, tab, query, taskId]);
 
   const turnGroups = useMemo(() => groupTracesByTurn(visible), [visible]);
 

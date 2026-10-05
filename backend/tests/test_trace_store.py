@@ -152,3 +152,34 @@ def test_task_id_filter_isolates_subagent_trace():
     assert only_sub[0]["summary"] == "sub call"
     assert only_sub[0]["task_id"] == "task-abc"
     assert trace_store.list_traces("c9", task_id="task-other") == []
+
+
+def test_claim_and_finish_isolate_by_task_id():
+    trace_store.clear("c10")
+    trace_store.next_turn("c10")
+    trace_store.append(
+        "c10",
+        "tool",
+        "grep · step 1",
+        detail={"name": "grep", "call_id": "lc-1", "step": 1, "status": "running", "sub": True},
+        task_id="task-aaa",
+    )
+    trace_store.append(
+        "c10",
+        "tool",
+        "grep · step 1",
+        detail={"name": "grep", "call_id": "lc-2", "step": 1, "status": "running", "sub": True},
+        task_id="task-bbb",
+    )
+    claimed = trace_store.claim_running_tool(
+        "c10", "grep", True, {"ev_call_id": "ev-1", "sub": True, "task_id": "task-bbb"}
+    )
+    assert claimed is not None
+    assert claimed["detail"]["task_id"] == "task-bbb"
+    done = trace_store.finish_tool("c10", "ev-1", "BBB", task_id="task-bbb")
+    assert done is not None
+    assert done["result"] == "BBB"
+    assert done["detail"]["task_id"] == "task-bbb"
+    other = [e for e in trace_store.list_traces("c10") if e["detail"].get("task_id") == "task-aaa"]
+    assert len(other) == 1
+    assert other[0].get("result", "") != "BBB"

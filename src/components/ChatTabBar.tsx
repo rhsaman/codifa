@@ -4,6 +4,7 @@ import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
+import { TabListButton, type TabListSection } from "./TabListMenu";
 
 function CloseIcon() {
   return (
@@ -75,6 +76,83 @@ export function TabPendingBadges({
       )}
     </>
   );
+}
+
+/** Chevron at the chat tab bar's start: searchable list of open chat tabs
+ *  (with ages + close) and recently closed ones — the bar itself stops
+ *  scrolling, so this keeps every chat tab reachable when there are many. */
+export function ChatTabListButton() {
+  const openChatIds = useStore((s) => s.openChatIds);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const recents = useStore((s) => s.recentlyClosedChatTabs);
+  // Lightweight chat summaries — same shape as the tab bar's subscription.
+  const chats = useStore((s) =>
+    s.chats.map((c) => ({
+      id: c.id,
+      title: c.title,
+      updatedAt: c.updatedAt,
+      firstUser: c.messages.find((m) => m.role === "user")?.content,
+    })),
+  );
+  const byId = new Map(chats.map((c) => [c.id, c]));
+  const titleOf = (c: { title: string; firstUser?: string }): string =>
+    c.title && c.title !== "New chat"
+      ? c.title
+      : c.firstUser
+        ? c.firstUser.slice(0, 32) || "New chat"
+        : "New chat";
+  const icon = (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+  const sections: TabListSection[] = [
+    {
+      label: "Open tabs",
+      entries: openChatIds
+        .map((id) => {
+          const c = byId.get(id);
+          if (!c) return null;
+          return {
+            key: id,
+            title: titleOf(c),
+            icon,
+            age: c.updatedAt,
+            active: id === activeChatId,
+            onOpen: () => useStore.getState().openChat(id),
+            onClose: () => useStore.getState().closeChatTab(id),
+          };
+        })
+        .filter((e): e is NonNullable<typeof e> => e !== null),
+    },
+    {
+      label: "Recently closed tabs",
+      entries: recents
+        .map((r) => {
+          const c = byId.get(r.id);
+          if (!c) return null;
+          return {
+            key: `closed-${r.id}`,
+            title: titleOf(c),
+            icon,
+            age: r.at,
+            onOpen: () => useStore.getState().reopenChatTab(r.id),
+          };
+        })
+        .filter((e): e is NonNullable<typeof e> => e !== null),
+    },
+  ];
+  return <TabListButton sections={sections} label="Chat tab list" />;
 }
 
 /** VSCode-style tab bar for the left editor group (chats only). Tabs can be

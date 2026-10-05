@@ -81,7 +81,10 @@ def test_error_results_never_shortened():
     assert tools[1].content == "ERROR: شکست"
 
 
-def test_mutating_tool_never_shortened():
+def test_mutating_tool_identical_duplicates_collapse():
+    """Identical-duplicate collapse is tool-agnostic: a byte-identical
+    (name, args, content) triple is lossless to reference even for mutating
+    tools — the full text stays in this same request under the first id."""
     msgs = [
         HumanMessage(content="x"),
         AIMessage(content="", tool_calls=[
@@ -93,7 +96,31 @@ def test_mutating_tool_never_shortened():
     ]
     out = project_tool_results(msgs)
     tools = [m for m in out if isinstance(m, ToolMessage)]
-    assert all(m.content == BODY for m in tools)
+    assert tools[0].content == BODY
+    assert "c1" in tools[1].content
+    assert len(tools[1].content) < len(BODY)
+
+
+def test_repeated_terminal_output_collapses():
+    """The headline case: re-running the same command with the same output
+    (test suite re-run, cached fetch) must not re-send the full text twice."""
+    body = "PASSED backend/tests/test_a.py\n" * 80
+    msgs = [
+        HumanMessage(content="run the tests"),
+        AIMessage(content="", tool_calls=[
+            {"name": "run_terminal", "args": {"command": "uv run pytest"}, "id": "t1"},
+        ]),
+        ToolMessage(content=body, tool_call_id="t1", name="run_terminal"),
+        AIMessage(content="", tool_calls=[
+            {"name": "run_terminal", "args": {"command": "uv run pytest"}, "id": "t2"},
+        ]),
+        ToolMessage(content=body, tool_call_id="t2", name="run_terminal"),
+    ]
+    out = project_tool_results(msgs)
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert tools[0].content == body
+    assert "t1" in tools[1].content
+    assert len(tools[1].content) < len(body)
 
 
 def test_all_tool_call_ids_preserved():

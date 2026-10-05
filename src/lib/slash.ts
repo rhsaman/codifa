@@ -11,7 +11,7 @@ export interface ParsedSlash {
 const HISTORY_KEY = 'coder:promptHistory'
 const PINS_KEY = 'coder:pinnedCommands'
 
-export const MAX_HISTORY = 50
+export const MAX_HISTORY = 10
 export const MAX_PINS = 3
 
 function storage(): Storage | null {
@@ -40,6 +40,22 @@ export function parseSlashInput(text: string): ParsedSlash | null {
     name: without.slice(0, space).toLowerCase(),
     args: without.slice(space + 1).trim(),
   }
+}
+
+/** Character range of the leading "/name" token in the raw input, so the
+ *  composer can paint only the command token in the accent color while args
+ *  and plain text keep the normal text color (Codex-style). Returns null when
+ *  there is no "/name" token (plain text, bare "/", or "/ " with no name).
+ *  Example: "  /compact foo" -> { start: 2, end: 10 } covering "/compact". */
+export function slashTokenRange(text: string): { start: number; end: number } | null {
+  const m = /^\s*\/[^\s]+/.exec(text)
+  if (!m) return null
+  const token = m[0]
+  // Bare "/" or "/ " has no command name to highlight.
+  if (/^\s*\/\s*$/.test(token)) return null
+  const start = text.indexOf('/', 0)
+  if (start === -1) return null
+  return { start, end: start + token.slice(token.indexOf('/')).length }
 }
 
 /** Pretty label for a slash command WITHOUT the leading slash.
@@ -81,7 +97,7 @@ export function loadHistory(): string[] {
     const raw = s.getItem(HISTORY_KEY)
     if (!raw) return []
     const arr = JSON.parse(raw)
-    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string').slice(0, MAX_HISTORY) : []
   } catch {
     return []
   }

@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 import numpy as np
 import sqlite_vec
 
-from embeddings import embed_dim, embed_passages, embed_queries
+from embeddings import embed_passages, embed_queries
 
 KIND_MEMORY = "memory"
 KIND_WEB = "web"
@@ -191,8 +191,33 @@ class VectorStore:
             sqlite_vec.load(self._conn)
         except Exception as exc:  # noqa: BLE001 — sqlite-vec missing → degraded (FTS only)
             logger.debug("vector_store: sqlite-vec unavailable, FTS-only mode: %s", exc)
-        self._dim = int(embed_dim() or 768)
+        # Lightweight dim: read the stored width from the DB meta so opening
+        # a store never wakes the ~1.1 GB embedding session. Falls back to
+        # the cached/fallback width when the DB is fresh or unreadable.
+        self._dim = self._read_stored_dim() or self._fallback_dim()
         self._init_schema()
+
+    def _read_stored_dim(self) -> int | None:
+        """Stored vector width from the DB meta, without loading the model."""
+        try:
+            row = self._conn.execute("SELECT v FROM meta WHERE k = 'vec_dim'").fetchone()
+        except Exception:  # noqa: BLE001 — fresh DB has no meta table yet
+            return None
+        try:
+            dim = int(row[0]) if row else 0
+        except (TypeError, ValueError):
+            return None
+        return dim if dim > 0 else None
+
+    @staticmethod
+    def _fallback_dim() -> int:
+        """Cached/fallback width, never loading the model."""
+        try:
+            from embeddings import embed_dim
+
+            return int(embed_dim() or 768)
+        except Exception:  # noqa: BLE001
+            return 768
 
     # -- schema ---------------------------------------------------------- #
 

@@ -296,7 +296,8 @@ async def test_update_plan_repeat_without_progress_nudges(tmp_path):
     # ...then the model re-sends the identical checklist: must be called out.
     r2 = await tools["update_plan"](items)
     assert "without advancing any status" in r2, r2
-    assert "solo update_plan is fine" in r2
+    assert "batch with your next tool calls" in r2, r2
+    assert "a solo update_plan is fine" not in r2, r2
     # Advancing a status clears it: real progress → no note.
     r3 = await tools["update_plan"](
         [

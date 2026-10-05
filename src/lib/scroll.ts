@@ -139,3 +139,60 @@ export function scrollMatchesPin(
   if (now - pin.at > PIN_FRESH_MS) return false
   return Math.abs(scrollTop - pin.top) <= PIN_TOP_EPS
 }
+
+/** Visible padding kept around the active popup row after scrolling. */
+export const POPUP_ROW_PAD = 8
+
+/** Pure scroll math for popup keyboard navigation: given the container's
+ *  current scrollTop/clientHeight and the active row's top/height relative
+ *  to the container, return the scrollTop that keeps the row visible.
+ *  A row above the view scrolls up, a row below scrolls down, and a
+ *  visible row keeps the current scrollTop. */
+export function popupRowScrollTop(args: {
+  scrollTop: number
+  clientHeight: number
+  rowTop: number
+  rowHeight: number
+  padding?: number
+}): number {
+  const pad = args.padding ?? POPUP_ROW_PAD
+  const rowBottom = args.rowTop + args.rowHeight
+  const viewBottom = args.scrollTop + args.clientHeight
+  if (args.rowTop < args.scrollTop) return Math.max(0, args.rowTop - pad)
+  if (rowBottom > viewBottom) return rowBottom - args.clientHeight + pad
+  return args.scrollTop
+}
+
+/** Scroll the active row of a composer popup into view by adjusting ONLY
+ *  the popup container's scrollTop (never the window). Returns true when a
+ *  row was found (whether or not scrolling was needed), false otherwise.
+ *  Uses the offsetTop chain so rows nested in section wrappers resolve
+ *  relative to the container. Falls back to scrollIntoView when layout
+ *  metrics are unavailable (zero heights in hidden containers). */
+export function scrollPopupRowIntoView(
+  container: HTMLElement | null | undefined,
+  rowSelector: string,
+  padding: number = POPUP_ROW_PAD,
+): boolean {
+  if (!container) return false
+  const row = container.querySelector<HTMLElement>(rowSelector)
+  if (!row) return false
+  let top = 0
+  let el: HTMLElement | null = row
+  while (el && el !== container) {
+    top += el.offsetTop
+    el = el.offsetParent as HTMLElement | null
+  }
+  if (container.clientHeight <= 0 || row.offsetHeight <= 0) {
+    row.scrollIntoView({ block: 'nearest' })
+    return true
+  }
+  container.scrollTop = popupRowScrollTop({
+    scrollTop: container.scrollTop,
+    clientHeight: container.clientHeight,
+    rowTop: top,
+    rowHeight: row.offsetHeight,
+    padding,
+  })
+  return true
+}

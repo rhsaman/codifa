@@ -20,6 +20,15 @@ export interface SearchMatch {
   text: string
 }
 
+/** A live pty session (in-app terminal panel), as reported by the main process. */
+export interface TerminalSessionInfo {
+  id: string
+  /** Shell binary basename (zsh, bash, …) shown in the terminal tab. */
+  shell: string
+  /** Directory the shell was spawned in. */
+  cwd: string
+}
+
 const api = {
   getSidecarUrl: (): Promise<string | null> => ipcRenderer.invoke('sidecar:url'),
   probeSidecar: (): Promise<boolean> => ipcRenderer.invoke('sidecar:probe'),
@@ -64,12 +73,35 @@ const api = {
   getDataPath: () => ipcRenderer.invoke('data:path'),
   hasSettingsFile: (): Promise<boolean> => ipcRenderer.invoke('data:has-settings'),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('open:external', url),
-  openFileExternal: (absPath: string, editor: 'nvim' | 'vscode'): Promise<{ ok: boolean; error?: string }> =>
+  openFileExternal: (
+    absPath: string,
+    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp',
+  ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('open:file-external', absPath, editor),
   openWorkspaceFolder: (dir: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('open:folder', dir),
   openWorkspaceTerminal: (dir: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('open:terminal', dir),
+  // --- in-app terminal panel ------------------------------------------------
+  terminalCreate: (cwd: string): Promise<TerminalSessionInfo> =>
+    ipcRenderer.invoke('terminal:create', cwd),
+  terminalList: (): Promise<TerminalSessionInfo[]> => ipcRenderer.invoke('terminal:list'),
+  terminalWrite: (id: string, data: string): Promise<boolean> =>
+    ipcRenderer.invoke('terminal:write', id, data),
+  terminalResize: (id: string, cols: number, rows: number): Promise<boolean> =>
+    ipcRenderer.invoke('terminal:resize', id, cols, rows),
+  terminalKill: (id: string): Promise<boolean> => ipcRenderer.invoke('terminal:kill', id),
+  onTerminalData: (cb: (id: string, data: string) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, id: string, data: string): void => cb(id, data)
+    ipcRenderer.on('terminal:data', listener)
+    return () => ipcRenderer.removeListener('terminal:data', listener)
+  },
+  onTerminalExit: (cb: (id: string, exitCode: number) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, id: string, exitCode: number): void =>
+      cb(id, exitCode)
+    ipcRenderer.on('terminal:exit', listener)
+    return () => ipcRenderer.removeListener('terminal:exit', listener)
+  },
   moveDataPath: (p: string): Promise<string> => ipcRenderer.invoke('data:move', p),
   onSidecarChanged: (cb: () => void): (() => void) => {
     const listener = (): void => cb()

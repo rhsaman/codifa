@@ -2192,17 +2192,19 @@ def _read_windows(args: dict) -> list[tuple[str, int, int]]:
 # A solo update_plan (no sibling tool call in the step) costs a full-context
 # LLM round-trip, so batching it with the step's real work is preferred.
 # But solo update_plan is LEGITIMATE when there is no next tool call to batch
-# with: plan mode's required initial checklist (all pending by contract), and
-# any tick that marks step(s) completed — especially the final tick, which by
-# definition has no following work. Scolding those cases taught the model to
-# never call update_plan at all, leaving todos/plan stale. Only a solo
-# update_plan that completes nothing is pure overhead.
+# Only a solo update_plan that completes nothing is pure overhead. Ticks that
+# mark step(s) completed (especially the final tick, which by definition has
+# no following work) and plan mode's required initial checklist stay exempt
+# from the backstop nudge — scolding those cases taught the model to never
+# call update_plan at all, leaving todos/plan stale. The instruction text
+# itself stays strict (always batch) so empty solos happen less often; the
+# backstop just avoids spending an extra round-trip nagging a legitimate
+# final tick.
 _PLAN_ONLY_NUDGE = (
-    "PLAN-ONLY STEP: that step did nothing but update_plan without marking "
-    "anything completed — a full round-trip for a checklist tick with no "
-    "progress. Batch update_plan with your next tool calls in the SAME step "
-    "(parallel calls) whenever there IS next work; solo update_plan is fine "
-    "when marking steps completed or creating the initial checklist."
+    "PLAN-ONLY STEP: that step did nothing but update_plan — a full "
+    "round-trip for a checklist tick with no progress. NEVER send update_plan "
+    "alone: always batch it with your next tool calls in the SAME step "
+    "(parallel calls)."
 )
 
 
@@ -2245,6 +2247,7 @@ async def langchain_tool_loop(
     compact_model: Any = None,
     reserved: int | None = None,
     emit: Any = None,
+    task_id: str = "",
 ) -> str:
     """Run a bounded tool-calling loop on a LangChain model.
 
@@ -2307,6 +2310,23 @@ async def langchain_tool_loop(
     if system:
         msgs.append(SystemMessage(content=system))
     msgs.append(HumanMessage(content=user))
+    _sub_tid = str(task_id or "").strip()
+    # Trace the sub-agent's own prompt so its filtered trace view shows the
+    # full request like the main chat trace (best-effort, never breaks loop).
+    if _sub_tid:
+        try:
+            import trace_store as _trace_store_prompt
+
+            _trace_store_prompt.append(
+                "",
+                "prompt",
+                f"sub-agent · {len(str(user or ''))} chars",
+                detail={"mode": "subagent", "sub": True, "task_id": _sub_tid},
+                prompt=f"[system]\n{system}\n\n[user]\n{user}" if (system or user) else "",
+                task_id=_sub_tid,
+            )
+        except Exception:  # noqa: BLE001, S110 — trace must never break the loop
+            pass
     steps = 0
     # opencode's doom-loop guard: if the model issues the SAME tool call (same
     # name + same args) N times in a row, it is stuck in a loop — stop burning
@@ -2318,6 +2338,7 @@ async def langchain_tool_loop(
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
     _streak = _BatchStreakTracker()
+    _revisit = _RevisitStreakTracker()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
     # Reminders / steering are TRANSIENT: sent with the very next request only,
     # never stored in msgs. Stored copies were re-sent on every later step (one
@@ -2413,6 +2434,39 @@ async def langchain_tool_loop(
                 )
                 if _ev:
                     emit(_ev)
+            # Trace each sub-agent model step so its filtered trace view shows
+            # LLM activity, not just tool calls (best-effort, never breaks loop).
+            if _sub_tid:
+                try:
+                    import trace_store as _trace_store_step
+
+                    _u = _um if isinstance(_um, dict) else {}
+                    _total = int(_u.get("total_tokens", 0) or 0)
+                    _trace_store_step.append(
+                        "",
+                        "llm",
+                        f"{getattr(model, 'model_name', '') or 'llm'!s} · step {steps} · {_total} tokens",
+                        detail={
+                            "provider": _u.get("provider"),
+                            "provider_id": _u.get("provider_id"),
+                            "input_tokens": int(_u.get("input_tokens", 0) or 0),
+                            "output_tokens": int(_u.get("output_tokens", 0) or 0),
+                            "total_tokens": _total,
+                            "step": int(steps or 0),
+                            "sub": True,
+                            "task_id": _sub_tid,
+                        },
+                        model=str(getattr(model, "model_name", "") or ""),
+                        tokens={
+                            "input": int(_u.get("input_tokens", 0) or 0),
+                            "output": int(_u.get("output_tokens", 0) or 0),
+                            "total": _total,
+                        },
+                        result=str(getattr(ai, "content", "") or "")[:8000],
+                        task_id=_sub_tid,
+                    )
+                except Exception:  # noqa: BLE001, S110 — trace must never break the loop
+                    pass
         tcs = getattr(ai, "tool_calls", None)
         if not tcs:
             meta = getattr(ai, "response_metadata", {}) or {}
@@ -2481,7 +2535,14 @@ async def langchain_tool_loop(
         # itself runs later on the merged call list — see below.)
         _step_hint = ""
         _streak_hint = _streak.observe(tcs)
-        _batch_hint = _step_hint or _streak_hint
+        _revisit_hint = _revisit.observe(tcs)
+        # Join, never `or`: one pattern (e.g. one read per step) trips
+        # several trackers at once and each reminder matters — `or` let the
+        # first one starve the rest, which is how file paging looped
+        # silently behind an ignored batching note.
+        _batch_hint = "\n".join(
+            h for h in (_step_hint, _streak_hint, _revisit_hint) if h
+        )
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -2500,7 +2561,9 @@ async def langchain_tool_loop(
         # the nudge reads the merged list so it never re-suggests the merge.
         _exec_calls, _expand_merged = merge_same_scope_greps(_parallel)
         _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
-        _batch_hint = _step_hint or _streak_hint
+        _batch_hint = "\n".join(
+            h for h in (_step_hint, _streak_hint, _revisit_hint) if h
+        )
         # Per-step tool activity line: the right-panel sub-agent trail tees
         # status events, so naming the tools here gives it live progress even
         # though the tools themselves emit through the parent's emit.

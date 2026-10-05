@@ -172,10 +172,15 @@ def model_dir() -> str:
 
 
 def is_available() -> bool:
-    """True when a ready ONNX model can be loaded."""
+    """True when a ready ONNX model file exists on disk.
+
+    Lightweight: checks only for the model files, never loads the ~1.1 GB
+    session and never touches the idle-eviction timer. Callers that only
+    need to gate RAG (status polling, availability probes) must use this
+    instead of loading the model.
+    """
     try:
-        _load()
-        return True
+        return bool(model_dir())
     except Exception:  # noqa: BLE001
         return False
 
@@ -185,25 +190,35 @@ embedder_available = is_available
 
 
 def status() -> dict:
-    """Diagnostic status for the RAG embedder (Settings → Models)."""
+    """Diagnostic status for the RAG embedder (Settings → Models).
+
+    Lightweight: reports file presence + cached dimension, never loads
+    the model (polling this must not keep the session resident).
+    """
     m = _preferred_model()
     try:
-        _load()
-        return {
-            "available": True,
-            "model": m,
-            "dir": model_dir(),
-            "dimension": int(_CACHE.get("dim") or 768),
-            "error": "",
-        }
-    except Exception as exc:  # noqa: BLE001
+        d = model_dir()
+    except Exception:  # noqa: BLE001
+        d = ""
+    if not d:
         return {
             "available": False,
             "model": m,
             "dir": "",
             "dimension": 0,
-            "error": str(exc),
+            "error": f"{m} not downloaded",
         }
+    try:
+        dim = int(_CACHE.get("dim") or 768)
+    except Exception:  # noqa: BLE001
+        dim = 768
+    return {
+        "available": True,
+        "model": m,
+        "dir": d,
+        "dimension": dim,
+        "error": "",
+    }
 
 
 def _load() -> None:
@@ -362,13 +377,14 @@ def _embed_passages_cached(texts: Sequence[str]) -> np.ndarray:
 
 
 def embed_dim() -> int:
-    """Vector width of the loaded model, runtime-detected.
+    """Vector width of the model, without loading it.
 
-    Returns the real output width once the model is loaded, else the current
-    module fallback (768 for the default multilingual-e5-base). Never raises.
+    Returns the cached width once the model has been loaded, else the
+    module fallback (768 for the default multilingual-e5-base). Never
+    raises and never loads the model — opening a store or probing
+    availability must not wake the ~1.1 GB session.
     """
     try:
-        _load()
         return int(_CACHE.get("dim") or 768)
     except Exception:  # noqa: BLE001 — caller handles embedder-unavailable
         return 768

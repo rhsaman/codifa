@@ -6,6 +6,12 @@ import './styles/global.css'
 
 injectThemeStyles()
 
+// macOS frameless window: the traffic lights overlay the sidebar, so CSS
+// needs a platform hook to reserve their drag strip (`.mac` selectors).
+if (/Macintosh/.test(navigator.userAgent)) {
+  document.documentElement.classList.add('mac')
+}
+
 const container = document.getElementById('root')
 if (!container) throw new Error('root element missing')
 

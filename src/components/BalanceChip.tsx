@@ -1,13 +1,12 @@
 import { memo } from "react";
 
 /**
- * Provider balance chip (the "credit" button in the chat titlebar).
+ * Provider balance chip (the wallet control on the app bar's right end).
  *
  * Behavior:
- *   - Always visible: shows a "—" placeholder when `amount` is null, so the
- *     user can ALWAYS see + click the chip from the moment the app opens
- *     (previously it was hidden until a real /credits response arrived, which
- *     made the chip effectively invisible on first launch).
+ *   - Icon-only until a real /credits response arrives: without an amount the
+ *     chip renders as a bare 20px wallet icon (sized to match the Finder
+ *     badge next to it) — no placeholder text.
  *   - Click-to-refresh: the parent calls `fetchCredits`; this chip just shows
  *     a spinner while `busy` is true and is disabled during the in-flight
  *     request to prevent double-fires.
@@ -50,9 +49,8 @@ function BalanceChipImpl({
       data-testid="balance-chip"
       data-busy={busy ? "true" : "false"}
       data-has-balance={hasBalance ? "true" : "false"}
-      className={`badge titlebar-balance titlebar-balance-clickable${
-        busy ? " refreshing" : ""
-      }`}
+      className={`badge titlebar-balance titlebar-balance-clickable${busy ? " refreshing" : ""
+        }`}
       title={tooltip}
       dir="ltr"
       disabled={disabled}
@@ -60,12 +58,12 @@ function BalanceChipImpl({
     >
       <svg
         className="titlebar-balance-icon"
-        width="14"
-        height="14"
+        width="20"
+        height="20"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="2"
+        strokeWidth="1.8"
         strokeLinecap="round"
         strokeLinejoin="round"
         aria-hidden="true"
@@ -74,9 +72,11 @@ function BalanceChipImpl({
         <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
         <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
       </svg>
-      <span className="titlebar-balance-amount">
-        {hasBalance ? `$${amount!.toFixed(2)}` : "—"}
-      </span>
+      {hasBalance && (
+        <span className="titlebar-balance-amount">
+          {`$${amount!.toFixed(2)}`}
+        </span>
+      )}
     </button>
   );
 }

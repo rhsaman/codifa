@@ -57,7 +57,7 @@ export const api = {
     window.coder.onMigrateProgress(cb),
   openFileExternal: async (
     absPath: string,
-    editor: 'nvim' | 'vscode',
+    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp',
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
       const fn = (window as unknown as { coder?: { openFileExternal?: unknown } }).coder?.openFileExternal
@@ -185,4 +185,53 @@ async function fallbackWalk(root: string): Promise<WorkspaceFile[]> {
   }
   out.sort((a, b) => a.rel.localeCompare(b.rel))
   return out
+}
+
+/** Rank workspace files that look like the closest match for a path that
+ *  failed to open — model output (plans, summaries) is full of paths that were
+ *  never created or have moved, and a bare "not found" is a dead end. Order:
+ *  the same basename elsewhere in the tree first, then files in the same
+ *  directory, then same-extension names sharing a stem prefix. Pure so
+ *  plain-node tests can cover the ranking. */
+export function suggestSimilarFiles(
+  targetRel: string,
+  files: WorkspaceFile[],
+  limit = 8,
+): WorkspaceFile[] {
+  const norm = (p: string) =>
+    p
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+      .replace(/\\/g, '/')
+      .replace(/^\.\/+/, '')
+      .trim()
+  const target = norm(targetRel)
+  if (!target) return []
+  const base = target.split('/').pop() ?? target
+  const dot = base.lastIndexOf('.')
+  const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase()
+  const ext = dot > 0 ? base.slice(dot).toLowerCase() : ''
+  const dir = target.includes('/') ? target.slice(0, target.lastIndexOf('/')) : ''
+  const scored: { file: WorkspaceFile; score: number }[] = []
+  for (const f of files) {
+    const rel = norm(f.rel)
+    if (!rel || rel === target) continue
+    const fb = rel.split('/').pop() ?? rel
+    const fdot = fb.lastIndexOf('.')
+    const fstem = (fdot > 0 ? fb.slice(0, fdot) : fb).toLowerCase()
+    const fext = fdot > 0 ? fb.slice(fdot).toLowerCase() : ''
+    const fdir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+    let score = 0
+    if (fb.toLowerCase() === base.toLowerCase()) score = 100
+    else if (fdir === dir) score = 60
+    else if (
+      ext &&
+      fext === ext &&
+      stem.length >= 3 &&
+      (fstem.startsWith(stem.slice(0, 3)) || stem.startsWith(fstem.slice(0, 3)))
+    )
+      score = 40
+    if (score > 0) scored.push({ file: { rel, name: f.name }, score })
+  }
+  scored.sort((a, b) => b.score - a.score || a.file.rel.localeCompare(b.file.rel))
+  return scored.slice(0, limit).map((s) => s.file)
 }

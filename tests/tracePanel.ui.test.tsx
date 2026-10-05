@@ -14,7 +14,7 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { TraceRow, TraceTurnGroup, groupTracesByTurn, traceStep, traceTurn, turnUserPreview, traceEntrySearchParts, formatTraceEntryAsText, formatTracesAsText, formatTurnAsText, filterTraces } = await import(
+const { TraceRow, TraceTurnGroup, getTraceTabCounts, groupTracesByTurn, traceStep, traceTurn, turnUserPreview, traceEntrySearchParts, formatTraceEntryAsText, formatTracesAsText, formatTurnAsText, filterTraces } = await import(
   '../src/components/TracePanel'
 )
 const { countTraceEntryHits, countTraceHits, stepHitIndex, locateHit } = await import(
@@ -132,6 +132,18 @@ console.log('7) whole-trace copy (filtered only when filtered):')
   const onlyTools = filterTraces(rows, 'read')
   check('filter keeps only matching row', onlyTools.length === 1 && onlyTools[0]?.id === '3')
   check('filtered text is only that row', formatTracesAsText(onlyTools).includes('read') && !formatTracesAsText(onlyTools).includes('grep'))
+}
+
+console.log('8) sub-agent trace view includes its own tools:')
+{
+  const subRows = [
+    { id: 's1', at: 1, kind: 'tool', summary: 'grep', turn: 1, detail: { name: 'grep', sub: true, task_id: 'task-abc' } },
+    { id: 's2', at: 2, kind: 'llm', summary: 'm · 5 tokens', turn: 1, detail: { sub: true } },
+  ] as any
+  const mainCounts = getTraceTabCounts(subRows)
+  check('main view hides sub tools', mainCounts.tool === 0, mainCounts)
+  const subCounts = getTraceTabCounts(subRows, true)
+  check('sub-agent view counts its tools', subCounts.tool === 1, subCounts)
 }
 
 if (failed > 0) {

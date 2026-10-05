@@ -33,7 +33,7 @@ const memStore = new Map<string, string>()
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).document = { documentElement: { style: { setProperty: () => {} } } }
 
-const { useViewerTabs, viewerTabId, visibleTabs } = await import('./viewerTabs')
+const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('./viewerTabs')
 const { useStore } = await import('./store')
 
 export {}
@@ -84,18 +84,21 @@ console.log('3) openText — one tab per chat, reopen updates in place:')
   resetViewer()
   const vt = () => useViewerTabs.getState()
   const chatId = useStore.getState().newChat('ask')
-  vt().openText('First', 'body-one')
-  vt().openText('Second', 'body-two')
+  vt().openText('First', 'body-one', 'text')
+  vt().openText('Second', 'body-two', 'md')
   const tabs = vt().tabs
   check('single text tab per chat', tabs.filter((t) => t.kind === 'text').length === 1, tabs.length)
   const tab = tabs.find((t) => t.kind === 'text')
   check('title updated', tab?.title === 'Second', tab?.title)
   check('body updated', tab?.textBody === 'body-two', tab?.textBody)
+  check('format hint updated', tab?.textFormat === 'md', tab?.textFormat)
   check('chat-scoped id', tab?.id === `text:${chatId}`, tab?.id)
   check('empty body ignored', (() => {
     vt().openText('Empty', '')
     return vt().tabs.length === 1
   })())
+  vt().openText('Raw', 'body-four', 'text')
+  check('format switches to text', useViewerTabs.getState().tabs.find((t) => t.kind === 'text')?.textFormat === 'text')
 }
 
 console.log('4) visibleTabs — file tabs are global, text tabs follow their chat:')
@@ -121,11 +124,12 @@ console.log('5) persist — text bodies are stripped from localStorage:')
   const vt = () => useViewerTabs.getState()
   useStore.getState().newChat('ask')
   vt().openFile('a.ts')
-  vt().openText('Big', 'x'.repeat(1000))
+  vt().openText('Big', 'x'.repeat(1000), 'md')
   const raw = memStore.get('coder:viewerTabs') ?? ''
-  const parsed = JSON.parse(raw) as { tabs: Array<{ kind: string; textBody?: string }> }
+  const parsed = JSON.parse(raw) as { tabs: Array<{ kind: string; textBody?: string; textFormat?: string }> }
   const text = parsed.tabs.find((t) => t.kind === 'text')
   check('persisted text tab has no body', text?.textBody === undefined, text?.textBody)
+  check('persisted text tab keeps format hint', text?.textFormat === 'md', text?.textFormat)
   check('file tab persisted', parsed.tabs.some((t) => t.kind === 'file'))
   check('in-memory body kept', vt().tabs.find((t) => t.kind === 'text')?.textBody?.length === 1000)
 }
@@ -143,6 +147,13 @@ console.log('6) openTraces — sub-agent gets its own filtered trace tab:')
   check('sub-agent tab carries task id', !!sub, tabs)
   check('sub-agent tab id is per-task', sub?.id === `trace:${chatId}:task-abc`, sub?.id)
   check('active is sub-agent tab', vt().activeId === sub?.id, vt().activeId)
+}
+
+console.log('7) viewerTabTitle — sub-agent trace keeps its own title:')
+{
+  check('main trace shows kind label', viewerTabTitle({ kind: 'trace', title: 'Trace', traceTaskId: undefined } as any) === 'Trace')
+  check('sub-agent trace keeps own title', viewerTabTitle({ kind: 'trace', title: 'Trace · Fix bug', traceTaskId: 'task-abc' } as any) === 'Trace · Fix bug')
+  check('file tab keeps own title', viewerTabTitle({ kind: 'file', title: 'a.ts', traceTaskId: undefined } as any) === 'a.ts')
 }
 
 if (failed > 0) {

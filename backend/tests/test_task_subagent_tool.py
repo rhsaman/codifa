@@ -163,3 +163,52 @@ async def test_task_depth_limit():
 
     cards = [e for e in emitted if e.get("kind") == "tool" and e.get("tool") == "task"]
     assert len(cards) == 1, f"expected 1 task card (the error), got {len(cards)}"
+
+
+async def test_task_legacy_aliases_map_to_subagent():
+    """Legacy subagent_type values still spawn a sub-agent instead of erroring.
+
+    Models trained on older prompts call task with 'general'/'explore'; after
+    the registry was unified to a single 'subagent' type those calls must keep
+    working (the reported bug: the main agent never spawned any sub-agent).
+    """
+    ws = tempfile.mkdtemp(prefix="coder-test-task-alias-ws-")
+    Path(os.path.join(ws, "app.py")).write_text("def main():\n    return 1\n")
+    for alias in ("general", "Explore", "explore"):
+        emitted: list[dict] = []
+        tools = make_tool_callbacks(
+            ws,
+            lambda ev, _buf=emitted: _buf.append(ev),
+            main_model=_FakeSubagentModel(text=f"ALIAS DONE {alias}"),
+        )
+        ack = await tools["task"](
+            description="alias check",
+            prompt="Read app.py.",
+            subagent_type=alias,
+        )
+        report = await await_task_report(ack)
+        assert "<task" in report, f"alias {alias!r} did not spawn: {report[:200]}"
+        assert "Unknown agent type" not in report, f"alias {alias!r} rejected"
+
+
+async def test_task_default_type_spawns_subagent():
+    """task() without subagent_type uses the default and spawns a sub-agent.
+
+    The type parameter is optional: omitting it must behave like
+    subagent_type='subagent' instead of raising a missing-argument error.
+    """
+    ws = tempfile.mkdtemp(prefix="coder-test-task-default-ws-")
+    Path(os.path.join(ws, "app.py")).write_text("def main():\n    return 1\n")
+    emitted: list[dict] = []
+    tools = make_tool_callbacks(
+        ws,
+        lambda ev: emitted.append(ev),
+        main_model=_FakeSubagentModel(text="DEFAULT DONE"),
+    )
+    ack = await tools["task"](
+        description="default check",
+        prompt="Read app.py.",
+    )
+    report = await await_task_report(ack)
+    assert "<task" in report, f"default type did not spawn: {report[:200]}"
+    assert "DEFAULT DONE" in report, f"sub-agent output missing: {report[:200]}"

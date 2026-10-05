@@ -116,6 +116,7 @@ from llm import (
     _is_temperature_error,
     _plan_only_step_marks_progress,
     _remap_reasoning_effort,
+    _RevisitStreakTracker,
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
@@ -754,6 +755,11 @@ class AgentState(TypedDict, total=False):
     # not replay the discarded turn. Resume (banner Retry / watchdog /
     # reconnect) leaves this False so the checkpoint is reused.
     restart: bool
+    # Previous turn's mode + whether it differs (mode-switch re-orientation).
+    # MUST be declared or LangGraph drops them before nodes run (same rule
+    # as mcp_servers / _run_flags above).
+    _prev_mode: str | None
+    _mode_changed: bool
 
 
 # ---------------------------------------------------------------------------
@@ -1528,11 +1534,91 @@ def _obvious_non_code_turn(prompt: str, history: list) -> bool:
         return False
 
 
+_SKILL_CATALOG_LINE_MAX = 200
+_SKILL_CATALOG_MAX_CHARS = 1800
+_SKILL_CATALOG_MAX_SKILLS = 30
+_SKILL_CATALOG_COMPACT_LINE_MAX = 80
+_SKILL_CATALOG_COMPACT_MAX_CHARS = 600
+_SKILL_CATALOG_COMPACT_MAX_SKILLS = 12
+
+
+def _clip_skill_desc(text: str, limit: int) -> str:
+    """Cut ``text`` to ``limit`` chars at a word boundary, ending in ``...``."""
+    if len(text) <= limit:
+        return text
+    cut = text[: max(0, limit - 3)]
+    sp = cut.rfind(" ")
+    if sp >= limit // 2:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:-—") + "..."
+
+
+def _fit_skill_catalog_lines(
+    skills: list[dict],
+    header: str,
+    total_max: int,
+    desc_max: int,
+    max_skills: int,
+) -> list[str]:
+    """One ``- name: description`` line per skill, all within ``total_max``.
+
+    A skill missing from the catalog can never auto-load, so when the budget
+    is tight the DESCRIPTIONS shrink (down to name-only) instead of whole
+    skills being cut off the end. Only a store too big even for names-only
+    keeps the head and ends with a ``+N more`` note, so the model knows
+    ``load_skill`` still resolves the rest by name or keyword.
+    """
+    all_rows: list[tuple[str, str]] = []
+    for s in skills:
+        name = str(s.get("name") or "").strip()
+        if name:
+            all_rows.append((name, str(s.get("description") or "").strip()))
+    rows = all_rows[:max_skills]
+
+    def _note(n: int) -> str:
+        return (
+            f"(+{n} more skills not listed - "
+            "load_skill finds any skill by name or keyword)"
+        )
+
+    def _render(limit: int) -> list[str]:
+        out: list[str] = []
+        for name, desc in rows:
+            ln = f"- {name}"
+            if desc and limit > 0:
+                ln += ": " + _clip_skill_desc(desc, limit)
+            out.append(ln)
+        return out
+
+    def _size(lines: list[str]) -> int:
+        return sum(len(ln) + 1 for ln in lines)
+
+    extra = len(all_rows) - len(rows)
+    room = total_max - len(header) - ((len(_note(extra)) + 1) if extra else 0)
+    limit = desc_max
+    lines = _render(limit)
+    while limit > 0 and _size(lines) > room:
+        limit = limit - 8 if limit - 8 >= 24 else 0
+        lines = _render(limit)
+    if _size(lines) > room:
+        # Even name-only overflows: keep the head, say how many were cut.
+        while lines and (
+            _size(lines) + len(_note(len(all_rows) - len(lines))) + 1
+            > total_max - len(header)
+        ):
+            lines.pop()
+        extra = len(all_rows) - len(lines)
+    if extra:
+        lines.append(_note(extra))
+    return lines
+
+
 def _build_skills_section(
     picked_names: list[str],
     root: str,
     emit: Callable[[dict], None] | None = None,
     catalog: bool = True,
+    compact: bool = False,
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
@@ -1563,29 +1649,34 @@ def _build_skills_section(
     all_skills = _agents._load_skills(root)
     out = ""
     if catalog and all_skills:
-        ordered = list(all_skills)
-        lines = [
-            f"- {s['name']}"
-            + (
-                f": {desc}"
-                if (desc := (s.get("description") or "").strip())
-                else ""
+        if compact:
+            _max_skills = _SKILL_CATALOG_COMPACT_MAX_SKILLS
+            _line_max = _SKILL_CATALOG_COMPACT_LINE_MAX
+            _total_max = _SKILL_CATALOG_COMPACT_MAX_CHARS
+            _header = (
+                "\n\n=== AVAILABLE SKILLS ===\n"
+                "Skills are reusable instruction bundles. When the task "
+                "matches a description below, call the load_skill tool "
+                "with that skill's name FIRST and follow its instructions; "
+                "when nothing matches, load none.\n"
             )
-            for s in ordered
-        ]
-        # Cap each description: a user-written essay in one skill's
-        # description must not bloat every turn's prompt (catalog is
-        # re-sent every turn; the load_skill body carries the detail).
-        lines = [ln if len(ln) <= 200 else ln[:197] + "..." for ln in lines]
-        out += (
-            "\n\n=== AVAILABLE SKILLS ===\n"
-            "Skills are reusable instruction bundles. When the user's task "
-            "matches one of the descriptions below, call the load_skill tool "
-            "with that skill's name FIRST and follow its instructions. When "
-            "the user explicitly @mentions a skill, its full body is already "
-            "inlined below — do NOT load it again.\n"
-            + "\n".join(lines)
+        else:
+            _max_skills = _SKILL_CATALOG_MAX_SKILLS
+            _line_max = _SKILL_CATALOG_LINE_MAX
+            _total_max = _SKILL_CATALOG_MAX_CHARS
+            _header = (
+                "\n\n=== AVAILABLE SKILLS ===\n"
+                "Skills are reusable instruction bundles. When the user's task "
+                "matches one of the descriptions below, call the load_skill tool "
+                "with that skill's name FIRST and follow its instructions. When "
+                "the user explicitly @mentions a skill, its full body is already "
+                "inlined below — do NOT load it again.\n"
+            )
+        lines = _fit_skill_catalog_lines(
+            all_skills, _header, _total_max, _line_max, _max_skills
         )
+        if lines:
+            out += _header + "\n".join(lines)
     if not manual_names:
         return out
     if not all_skills:
@@ -1648,9 +1739,9 @@ def skills_catalog_block(max_chars: int = 1800) -> str:
     tokens for the common no-skills case. The names+descriptions order is
     the store's.
 
-    ``max_chars`` hard-caps the whole block (catalog-only budget): the
-    newest skills win, a huge store silently truncates instead of eating
-    the delegation context.
+    ``max_chars`` hard-caps the whole block (catalog-only budget): every
+    skill keeps a line and descriptions shrink to fit, so a big store
+    never eats the delegation context nor hides a skill.
     """
     try:
         all_skills = _agents._load_skills("")
@@ -1660,31 +1751,17 @@ def skills_catalog_block(max_chars: int = 1800) -> str:
         return ""
     header = (
         "\n\n=== AVAILABLE SKILLS ===\n"
-        "When the delegated task matches one of the descriptions below, "
-        "call the load_skill tool with that skill's name and follow its "
-        "instructions; when nothing matches, load none.\n"
+        "Skills are reusable instruction bundles. When the task "
+        "matches a description below, call the load_skill tool "
+        "with that skill's name FIRST and follow its instructions; "
+        "when nothing matches, load none.\n"
     )
-    body = ""
-    for s in all_skills:
-        desc = (s.get("description") or "").strip()
-        line = f"- {s.get('name', '')}" + (f": {desc}" if desc else "")
-        if len(line) > 200:
-            line = line[:197] + "..."
-        body += line + "\n"
-    block = header + body
-    if len(block) > max_chars:
-        # Keep the header + the newest entries that fit.
-        kept = ""
-        for s in reversed(all_skills):
-            desc = (s.get("description") or "").strip()
-            line = f"- {s.get('name', '')}" + (f": {desc}" if desc else "")
-            if len(line) > 200:
-                line = line[:197] + "..."
-            if len(header) + len(line) + 1 + len(kept) > max_chars:
-                break
-            kept = line + "\n" + kept
-        block = header + kept
-    return block
+    lines = _fit_skill_catalog_lines(
+        all_skills, header, max_chars, _SKILL_CATALOG_LINE_MAX, len(all_skills)
+    )
+    if not lines:
+        return ""
+    return header + "\n".join(lines) + "\n"
 
 
 def _dedup_code_map(
@@ -1747,6 +1824,21 @@ def _slice_history_by_turns(history: list, n: int) -> list:
                 return history[i:]
     # تعداد user کمتر از n درخواستی → همهٔ history نگه داشته می‌شود.
     return list(history)
+
+
+def _today_stamp() -> str:
+    """Turn-local date stamp for the user turn.
+
+    Answers "today / recent / latest" questions with zero tool round-trips
+    (the most common avoidable ``current_time`` call). Lives in the USER turn,
+    not the system prompt, so the static prefix cache stays hit; computed per
+    turn so a multi-day session keeps the date accurate.
+    """
+    return (
+        "[Context] Today's date: "
+        + datetime.now().astimezone().strftime("%A, %Y-%m-%d")
+        + "."
+    )
 
 
 async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
@@ -1996,6 +2088,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # The turn prompt feeds snapshot compaction: browser snapshots
             # keep the lines relevant to what was actually asked.
             task=str(prompt or ""),
+            chat_id=str(chat_id or ""),
         )
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     _tctx_mark("mcp")
@@ -2090,7 +2183,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "visible file paths / filenames / code / text EXACTLY as analyzed; never "
             "invent or omit what the image shows."
         )
-    if mode in ("ask", "plan"):
+    if mode in ("ask", "plan", "coder"):
         system_final += _agents._DISCOVERY_BLOCK
     if mode == "reader":
         system_final += (
@@ -2117,20 +2210,20 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         system_final += project_memory
 
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
-    # (name + description) is ALWAYS in the prompt (except small-context
-    # models) so the model can auto-trigger skills via load_skill; @mentioned
-    # bodies are inlined in full. Every distinctive match above the
-    # confidence bar auto-inlines: zero bodies on a greeting's flat scores,
-    # several when the task needs them.
+    # (name + description) is ALWAYS in the prompt — ultra-compact for
+    # small-context models — so the model can auto-trigger skills via
+    # load_skill; @mentioned bodies are inlined in full. Bodies are never
+    # auto-inlined: the model loads anything else on demand via load_skill.
     _skill_section = _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
-        catalog=not small_ctx,
+        catalog=True,
+        compact=small_ctx,
     )
     system_final += _skill_section
 
-    if mode in ("plan", "coder"):
+    if chat_id and mode in ("plan", "coder"):
         try:
             saved = _agents._load_saved_plan(root, chat_id=chat_id)
         except Exception:  # noqa: BLE001
@@ -2308,7 +2401,23 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         #     flush=True,
         # )
 
-    if mode == "coder":
+    # Turn continuity: pin previous-turn outcome evidence at the head so a
+    # short confirmation like "done?" reports from it instead of re-running.
+    # The server prepends it as a system entry; keep it first even after
+    # historyLimit slicing/summarization trims the transcript.
+    try:
+        import trace_store as _ts
+
+        _prev = _ts.previous_turn_outcome(chat_id)
+        _note = _ts.format_turn_outcome_note(_prev)
+        if _note and not any(
+            _note[:40] in str(getattr(m, "content", "")) for m in lc_history
+        ):
+            lc_history.insert(0, HumanMessage(content=_note))
+    except Exception:  # noqa: BLE001, S110 — continuity note must never break the turn
+        pass
+    _is_status_check = _agents._is_status_check(prompt)
+    if mode == "coder" and not _is_status_check:
         reuse = _agents._plan_reuse_note(history)
         if reuse:
             lc_history.insert(0, HumanMessage(content=reuse))
@@ -2321,7 +2430,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # must write/update and run tests before finishing, even on ordinary
         # code work — but only for changes that alter behavior/logic, not pure
         # cosmetic/refactor/doc edits. The pure-logic predicates live in agents.py.
-        if _agents._is_code_task(prompt):
+        if _agents._is_code_task(prompt) and not _is_status_check:
             stack = detect_frontend_stack(root)
             fw_note = ""
             if stack:
@@ -2410,6 +2519,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # spikes and unstable input_tokens).
     if lang_directive:
         user_parts.append(lang_directive)
+    user_parts.append(_today_stamp())
     # Always-on mode anchor (recency): re-stamp the current mode in the user turn
     # every message so the agent can never "forget" or misread it from the
     # un-labelled, possibly other-mode history. On a user switch, flag it loudly.
@@ -3018,6 +3128,43 @@ _MAX_COMPACT_PER_TURN = 6
 # shrink it to milliseconds rather than sleeping on real time.
 _SUBAGENT_WAIT_TIMEOUT_S = 300.0
 
+# How many extra wait rounds the final delivery performs while sub-agents are
+# still running after a wait timeout (each round waits up to
+# _SUBAGENT_WAIT_TIMEOUT_S and emits a still-waiting status). Covers long
+# tasks instead of finalizing early; a hung job still cannot stall forever
+# because rounds are bounded and each round times out.
+_SUBAGENT_FINAL_WAIT_ROUNDS = 5
+
+
+def _plan_scout_checklist_wasteful(
+    pending: list, reply: str, msgs: list, seed_ids=None
+) -> bool:
+    """True when a plan-mode solo update_plan step wastes a round-trip.
+
+    The initial checklist AFTER ## Plan was written and any tick marking
+    progress are legitimate solo steps; a pending-only checklist DURING
+    scouting (no ## Plan yet this turn) is the scout -> tick(0/N) -> scout
+    loop. ``seed_ids`` is the turn-start identity snapshot so history plans
+    don't count.
+    """
+    if _plan_only_step_marks_progress(pending):
+        return False
+    return not _plan_draft_in_turn(reply, msgs, seed_ids)
+
+
+def _subagent_pending_count(chat_id: str) -> int:
+    """Number of still-running sub-agent jobs for a chat (0 on any error)."""
+    if not chat_id:
+        return 0
+    try:
+        import subagent_jobs
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        return len(subagent_jobs.pending_jobs(chat_id))
+    except Exception:  # noqa: BLE001
+        return 0
+
 
 def _subagent_report_text(task_id: str, report: str, status: str) -> str:
     """Format one finished background sub-agent's report for the main agent."""
@@ -3029,7 +3176,10 @@ def _subagent_report_text(task_id: str, report: str, status: str) -> str:
     body = (report or "").strip() or "(no report produced)"
     return (
         f"[background sub-agent report - task_id={task_id}, status={label}]\n"
-        f"{body}"
+        f"{body}\n"
+        "Verify the task is actually done before finalizing; if incomplete, "
+        "follow up (task_steer/task) or finish it yourself — never claim "
+        "completion without verification."
     )
 
 
@@ -3076,8 +3226,10 @@ async def _await_subagent_jobs(chat_id: str, queue: asyncio.Queue) -> bool:
     """Block until this chat's running sub-agents finish. True if it waited.
 
     Bounded by ``_SUBAGENT_WAIT_TIMEOUT_S`` so one hung sub-agent can never
-    stall the turn forever: after the timeout the turn proceeds and any report
-    that lands later is picked up by ``_drain_subagent_reports``.
+    stall the turn forever. When the timeout expires with jobs still running,
+    a still-waiting status is emitted (the UI keeps showing progress) and the
+    caller waits again on the next step instead of finalizing early; any
+    report that lands later is picked up by ``_drain_subagent_reports``.
     """
     if not chat_id:
         return False
@@ -3086,9 +3238,7 @@ async def _await_subagent_jobs(chat_id: str, queue: asyncio.Queue) -> bool:
     except Exception:  # noqa: BLE001
         return False
     try:
-        pending = [
-            j for j in subagent_jobs.pending_jobs(chat_id) if j.get("task") is not None
-        ]
+        pending = subagent_jobs.pending_jobs(chat_id)
     except Exception:  # noqa: BLE001
         return False
     if not pending:
@@ -3106,11 +3256,52 @@ async def _await_subagent_jobs(chat_id: str, queue: asyncio.Queue) -> bool:
     except Exception:  # noqa: BLE001, S110
         pass
     try:
-        await asyncio.wait(
-            [j["task"] for j in pending], timeout=_SUBAGENT_WAIT_TIMEOUT_S
-        )
+        _tasks = [j["task"] for j in pending if j.get("task") is not None]
+        if _tasks:
+            await asyncio.wait(_tasks, timeout=_SUBAGENT_WAIT_TIMEOUT_S)
+        else:
+            # Jobs registered but asyncio.Task not attached yet (race between
+            # create_job and set_task): poll briefly so the turn does not
+            # finalize while a spawn is still in flight.
+            _deadline = time.monotonic() + min(5.0, _SUBAGENT_WAIT_TIMEOUT_S)
+            while time.monotonic() < _deadline:
+                await asyncio.sleep(0.05)
+                try:
+                    _fresh = subagent_jobs.pending_jobs(chat_id)
+                except Exception:  # noqa: BLE001 — polling never breaks turn
+                    break
+                if not _fresh:
+                    break
+                _tasks = [j["task"] for j in _fresh if j.get("task") is not None]
+                if _tasks:
+                    await asyncio.wait(
+                        _tasks,
+                        timeout=max(0.0, _deadline - time.monotonic()),
+                    )
+                    break
     except Exception:  # noqa: BLE001, S110 — waiting must never break the turn
         pass
+    # Timeout path: jobs are still running, so tell the UI the manager is
+    # still waiting (instead of going silent) — the caller then waits again
+    # on the next step rather than finalizing without the reports.
+    try:
+        _still = subagent_jobs.pending_jobs(chat_id)
+    except Exception:  # noqa: BLE001
+        _still = []
+    if _still:
+        try:
+            queue.put_nowait(
+                {
+                    "kind": "status",
+                    "stage": "subagent_wait",
+                    "content": (
+                        f"Still waiting for {len(_still)} background "
+                        "sub-agent(s) to finish"
+                    ),
+                }
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
     return True
 
 
@@ -3467,11 +3658,11 @@ async def _run_mode_turn(
     if _max_steps_override > 0:
         MAX_STEPS = max(5, min(_max_steps_override, 200))
     else:
-        # Tighter auto budget: each step re-sends the full transcript, so
-        # fewer steps is the cheapest token saving. 12–40 was generous for
-        # mechanical browser/computer loops; 8–24 keeps room for real work
-        # while cutting the worst-case round-trips nearly in half.
-        MAX_STEPS = max(8, min(int(ctx) // 6000 if ctx else 16, 24))
+        # Auto budget: each step re-sends the full transcript, so fewer steps
+        # saves tokens — but too few steps forces a "continue" turn, which costs
+        # a whole extra round-trip. 12–50 finishes normal multi-file work in
+        # ONE turn (no continue needed) while still capping runaway loops.
+        MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 50))
     async def _execute_tool(name: str, args: dict, call_id: str = "", step: int = 0) -> str:
         import inspect
 
@@ -3645,6 +3836,11 @@ async def _run_mode_turn(
         # continues from what it actually did, with no synthetic replay/no
         # "learned" resume note injected.
         msgs = messages
+        # Identity snapshot of the seeded transcript (system + history): the
+        # plan-draft scans below must only see messages written THIS turn —
+        # a previous turn's "## Plan" lives in history as AIMessage and must
+        # not satisfy turn-local checks like the scouting budget.
+        _turn_seed_ids = set(map(id, msgs))
         steps = 0
         reply = ""
         _no_so = False
@@ -3676,6 +3872,15 @@ async def _run_mode_turn(
         # sent) and reminds it to batch after a few consecutive same-scope
         # steps — the per-step detector alone never sees those.
         _streak = _BatchStreakTracker()
+        # Re-touch tracker: catches paging one file window after window (or
+        # re-grepping one scope term after term) step after step — the plan
+        # scout loop shape. Implemented + tested in llm.py but previously
+        # never wired into this loop, so only identical-arg repeats were
+        # caught while near-miss repeats looped forever.
+        _revisit = _RevisitStreakTracker()
+        # Plan-mode scouting budget: tool steps used without writing ## Plan.
+        # Breaks the scout -> update_plan(0/N) -> scout cycle deterministically.
+        _plan_scout_steps = 0
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
         # the HumanMessage is appended AFTER the tool results (keeping the
@@ -3700,6 +3905,10 @@ async def _run_mode_turn(
         # generating until the answer is complete instead of ending the turn).
         _auto_cont = 0
         _MAX_AUTO_CONT = 5
+        # Plan-mode scouting budget: tool steps allowed before the loop
+        # forces ## Plan. Normal plan scouting converges in 2-4 batches;
+        # past this the turn is looping, not discovering.
+        _PLAN_SCOUT_BUDGET = 8
         _compact_count = 0
         while steps < MAX_STEPS:
             steps += 1
@@ -3740,6 +3949,7 @@ async def _run_mode_turn(
                             lambda ev: queue.put_nowait(ev),
                             reserved_names=set(filtered),
                             analyze_images=tctx.get("analyze_images"),
+                            chat_id=str(chat_id or ""),
                         )
                         if _new_tools:
                             _browser_live = merge_mcp_tools(filtered, _new_tools, cap)
@@ -3855,6 +4065,12 @@ async def _run_mode_turn(
                 request_messages = project_tool_results(_stable_tool_order(msgs))
                 if _transient_msgs:
                     request_messages = [*request_messages, *_transient_msgs]
+                    # Single-flight reminders (mirrors llm.py's _transient):
+                    # each nudge rides exactly ONE request. Without the clear,
+                    # every reminder ever raised in the turn was re-sent on
+                    # EVERY later step — re-billed each step and drifting past
+                    # the AI/tool messages it originally followed.
+                    _transient_msgs.clear()
                 _llm_t0 = time.monotonic()
                 _first_chunk_t = 0.0
                 async for chunk in bound.astream(request_messages):
@@ -4281,7 +4497,7 @@ async def _run_mode_turn(
                 if not _partial.strip() and not (reply or "").strip():
                     if _auto_cont < _MAX_AUTO_CONT:
                         _auto_cont += 1
-                        msgs.append(HumanMessage(content="ادامه بده."))
+                        msgs.append(HumanMessage(content="Continue."))
                         continue
                     queue.put_nowait(
                         {
@@ -4293,15 +4509,81 @@ async def _run_mode_turn(
                         }
                     )
                     break
-                # Hold the turn open while background sub-agents are still
-                # running: their reports must reach the main agent before it
-                # writes its final answer. Keep the partial reply in the
-                # transcript (valid - an AI message with no tool_calls), wait
-                # for the jobs, deliver their reports, then let the model
-                # continue from them on the next step.
+                # Manager gate: the main agent manages its sub-agents and must
+                # not write the final answer before their reports arrive and
+                # are verified. Drain fast-finished reports even when nothing
+                # is still running (pending empty), wait for running jobs,
+                # then continue so the model incorporates the reports instead
+                # of finalizing without them.
+                _fast_reports = await _drain_subagent_reports(msgs, chat_id, queue)
                 if await _await_subagent_jobs(chat_id, queue):
-                    msgs.append(AIMessage(content=_partial))
-                    await _drain_subagent_reports(msgs, chat_id, queue)
+                    _draft = (_partial or "").strip()
+                    if _draft:
+                        msgs.append(AIMessage(content=_partial))
+                    _delivered = await _drain_subagent_reports(msgs, chat_id, queue)
+                    if _delivered and _draft:
+                        # The draft above was written BEFORE the sub-agent
+                        # reports arrived. Force a revision pass instead of
+                        # letting the premature text stand as final.
+                        _transient_msgs.append(
+                            HumanMessage(
+                                content=(
+                                    "Your draft above was written BEFORE "
+                                    "background sub-agent reports arrived. "
+                                    "Revise it using the reports just "
+                                    "delivered; do NOT re-search the delegated "
+                                    "scopes yourself."
+                                )
+                            )
+                        )
+                    continue
+                if _fast_reports:
+                    if (_partial or "").strip():
+                        msgs.append(AIMessage(content=_partial))
+                    continue
+                # Completion gate: never end with doable checklist items left.
+                # A text-only finish while todos are pending is the classic
+                # "half done, user must say continue" symptom. Nudge once more
+                # (bounded by _MAX_AUTO_CONT) so the turn finishes the list
+                # in THIS turn instead of costing an extra continue round-trip.
+                _pending_todos = _latest_plan_from_history(state.get("history"))
+                if not _pending_todos:
+                    try:
+                        import tools as _tools_mod
+
+                        _stored = _tools_mod._PLAN_BY_CHAT.get(str(chat_id or ""), [])
+                        if any(isinstance(it, dict) and it.get("status") != "completed" for it in _stored):
+                            _pending_todos = _stored
+                    except Exception:  # noqa: BLE001, S110 — gate must never break turn
+                        pass
+                # Plan mode delivers ## Plan plus an all-pending Coder
+                # checklist: those items are never the planner's work, so a
+                # delivered plan ends the turn instead of re-looping it.
+                if (
+                    _pending_todos
+                    and _auto_cont < _MAX_AUTO_CONT
+                    and False  # TEMP-REVERT-CHECK
+                    and not (
+                        (mode or "") == "plan"
+                        and _plan_draft_in_turn(
+                            (reply or "") + (_partial or ""), msgs, _turn_seed_ids
+                        )
+                    )
+                ):
+                    _auto_cont += 1
+                    if (_partial or "").strip():
+                        msgs.append(AIMessage(content=_partial))
+                        reply = (reply or "") + _partial
+                    _transient_msgs.append(
+                        HumanMessage(
+                            content=(
+                                "You have unfinished checklist items — do NOT end "
+                                "the turn yet. Continue working through the "
+                                "pending steps with tools until every doable item "
+                                "is completed."
+                            )
+                        )
+                    )
                     continue
                 reply = (reply or "") + _partial
                 break
@@ -4474,7 +4756,30 @@ async def _run_mode_turn(
             # recorded and the cross-step count would restart from zero.
             _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
             _streak_hint = _streak.observe(_pending)
-            _batch_hint = _step_hint or _streak_hint
+            _revisit_hint = _revisit.observe(_pending)
+            # Join, never `or`: one pattern trips several trackers at once
+            # and each reminder matters (see llm.py).
+            _batch_hint = "\n".join(
+                h for h in (_step_hint, _streak_hint, _revisit_hint) if h
+            )
+            # Plan-mode scouting budget: force convergence to ## Plan instead
+            # of scouting forever. Counts tool steps taken while no ## Plan
+            # exists yet this turn; past the budget, nudge every 4th step.
+            _plan_scout_hint = ""
+            if mode == "plan" and _pending:
+                _plan_written = _plan_draft_in_turn(reply, msgs, _turn_seed_ids)
+                if not _plan_written:
+                    _plan_scout_steps += 1
+                    if _plan_scout_steps >= _PLAN_SCOUT_BUDGET and (
+                        (_plan_scout_steps - _PLAN_SCOUT_BUDGET) % 4 == 0
+                    ):
+                        _plan_scout_hint = (
+                            "SCOUTING BUDGET: you have used "
+                            f"{_plan_scout_steps} tool steps without writing "
+                            "## Plan. Write ## Plan NOW from what you hold "
+                            "(one bullet per file + test commands); do only "
+                            "targeted follow-up reads for files the plan names."
+                        )
             async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
@@ -4537,15 +4842,23 @@ async def _run_mode_turn(
                         {"kind": "warn", "content": _batch_hint.strip()}
                     )
                 _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
-            if _is_plan_only_step(_pending):
-                # Plan mode's required checklist call and any tick that marks
-                # step(s) completed (final tick has no following work by
-                # definition) are legitimate solo steps — scolding them taught
-                # the model to never call update_plan, leaving todos/plan
-                # stale. Nudge only when nothing was marked completed.
-                _wasteful = mode != "plan" and not _plan_only_step_marks_progress(
-                    _pending
+            if _plan_scout_hint:
+                queue.put_nowait(
+                    {"kind": "warn", "content": _plan_scout_hint.strip()}
                 )
+                _transient_msgs.append(HumanMessage(content=_plan_scout_hint.strip()))
+            if _is_plan_only_step(_pending):
+                # Solo update_plan costs a full round-trip. Outside plan mode,
+                # nudge unless the tick marks progress; inside plan mode the
+                # initial checklist AFTER ## Plan (and any progress tick) is
+                # legitimate, while a pending-only checklist DURING scouting
+                # is the scout -> tick(0/N) -> scout loop.
+                if (mode or "") == "plan":
+                    _wasteful = _plan_scout_checklist_wasteful(
+                        _pending, reply, msgs, _turn_seed_ids
+                    )
+                else:
+                    _wasteful = not _plan_only_step_marks_progress(_pending)
                 if _wasteful:
                     _transient_msgs.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
             # Recoverable-repetition nudge: appended AFTER the ToolMessages so the
@@ -4621,9 +4934,31 @@ async def _run_mode_turn(
             _step_progress += 1
         # Final delivery: a report that landed while the last step ran, or a
         # turn that hit MAX_STEPS with jobs still in flight, must never be
-        # silently dropped. Wait once more, then inject whatever arrived.
+        # silently dropped. Wait, then inject whatever arrived; while jobs are
+        # still running, wait again (bounded rounds, each emitting a
+        # still-waiting status) instead of finalizing early. If reports
+        # arrived after the last model step, the model never saw them — fold
+        # them into the reply so the sub-agent work is visible instead of
+        # being consumed and lost.
         await _await_subagent_jobs(chat_id, queue)
-        await _drain_subagent_reports(msgs, chat_id, queue)
+        _n_before = len(msgs)
+        _final_reports = await _drain_subagent_reports(msgs, chat_id, queue)
+        _wait_round = 0
+        while (
+            _subagent_pending_count(chat_id) > 0
+            and _wait_round < _SUBAGENT_FINAL_WAIT_ROUNDS
+        ):
+            _wait_round += 1
+            await _await_subagent_jobs(chat_id, queue)
+            _final_reports += await _drain_subagent_reports(msgs, chat_id, queue)
+        if _final_reports:
+            _tails = []
+            for _m in msgs[_n_before:]:
+                _c = getattr(_m, "content", "")
+                if isinstance(_c, str) and _c.strip():
+                    _tails.append(_c.strip())
+            if _tails:
+                reply = ((reply or "") + "\n\n" + "\n\n".join(_tails)).strip()
         return reply
 
     # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
@@ -5141,11 +5476,28 @@ async def coder_node(state: AgentState) -> dict:
     if isinstance(turn_text, str) and turn_text.strip():
         import re as _re_coder_plan
 
-        if _re_coder_plan.search(r"#{1,3}\s*plan\b", turn_text, _re_coder_plan.IGNORECASE):
+        # Line-anchored header only: a passing "C# plan" / "the plan is ..."
+        # mention in a summary must never touch the saved plan.
+        if _re_coder_plan.search(
+            r"^#{1,3}\s*plan\b",
+            turn_text,
+            _re_coder_plan.IGNORECASE | _re_coder_plan.MULTILINE,
+        ):
+            # Persist a coder-written plan only when none is saved yet
+            # (plan-then-execute when none exists): never silently overwrite
+            # an approved/saved plan with a "### Plan vs actual" section
+            # from a summary.
             try:
-                _persist_plan_text(queue, state.get("root", ""), state.get("chat_id", ""), turn_text)
-            except Exception:  # noqa: BLE001, S110 — the card must never break the run
-                pass
+                _existing = _agents._load_saved_plan(
+                    state.get("root", ""), chat_id=state.get("chat_id", "")
+                )
+            except Exception:  # noqa: BLE001 — lookup must never break coder
+                _existing = ""
+            if not (_existing or "").strip():
+                try:
+                    _persist_plan_text(queue, state.get("root", ""), state.get("chat_id", ""), turn_text)
+                except Exception:  # noqa: BLE001, S110 — the card must never break the run
+                    pass
     return {"coder_result": reply, "final_response": reply}
 
 
@@ -5703,21 +6055,6 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         chat_id=state.get("chat_id", ""),
         history=state.get("history") or [],
     )
-    # Capture ask_user answers so a clarifying reply can re-trigger planning
-    # (e.g. the planner asked "where is the current frontend?" and the user
-    # answered). Kept in a module dict keyed by chat_id and consumed by
-    # _route_plan_build.
-    base_ask = tools.get("ask_user")
-    if base_ask is not None:
-        cid = state.get("chat_id", "")
-
-        async def _ask_wrapper(question, options=None):
-            answer = await base_ask(question, options)
-            if answer:
-                _ASK_ANSWERS[cid] = answer
-            return answer
-
-        tools["ask_user"] = _ask_wrapper
     return tools
 
 
@@ -5902,12 +6239,6 @@ def _is_excluded_root_md(path: str, root: str) -> bool:
         return False
     rel = path if not os.path.isabs(path) else os.path.relpath(path, root)
     return os.path.dirname(rel) in ("", ".")
-
-
-# Captured ask_user answers, keyed by chat_id, so the search pipeline can
-# re-derive against a freshly-answered clarifying question (see repo_derive +
-# _route_plan_build). Cleared by run_graph at the start of each run.
-_ASK_ANSWERS: dict[str, str] = {}
 
 
 def _rank_files_by_prompt(files: list[str], prompt: str) -> list[str]:
@@ -6515,6 +6846,58 @@ def _normalize_plan_reply(reply: str) -> str:
     return _split_plan_reply(reply)[1]
 
 
+def _qualifying_plan_body(text: str) -> str:
+    """Return the persistable plan body, or "" when text is no plan document.
+
+    Guards every plan-persist path: without this, any prose that merely
+    mentions "plan" ("C# plan", "the plan is blocked on ...") overwrites the
+    saved plan, re-derives checklist todos from its bullets, and pops an
+    approval card for it. A line-anchored ``## Plan`` header always
+    qualifies; a mid-line header (streamed chunks concatenate without
+    newlines) only qualifies when the body is plan-shaped (steps and/or a
+    Files: line).
+    """
+    import re
+
+    _preamble, body = _split_plan_reply(text)
+    if not body.strip():
+        return ""
+    if re.search(r"^#{1,3}\s*plan\b", text, re.IGNORECASE | re.MULTILINE):
+        return body
+    if _plan_items_from_body(body):
+        return body
+    if re.search(r"^files?\s*:", body, re.IGNORECASE | re.MULTILINE):
+        return body
+    return ""
+
+
+def _plan_draft_in_turn(reply: str, msgs: list, seed_ids=None) -> bool:
+    """True when a plan header was written during THIS turn (not history).
+
+    Only line-anchored headers count (``## Plan``, ``# Plan``, ``## plan``),
+    and history-seeded messages (by id snapshot) are skipped: a previous
+    turn's plan lives in history as AIMessage and must not satisfy
+    turn-local checks like the scouting budget.
+    """
+    import re
+
+    _header = r"^#{1,3}\s*plan\b"
+    if re.search(_header, reply or "", re.IGNORECASE | re.MULTILINE):
+        return True
+    for m in msgs or []:
+        if seed_ids is not None and id(m) in seed_ids:
+            continue
+        if not isinstance(m, AIMessage):
+            continue
+        if re.search(
+            _header,
+            str(getattr(m, "content", "") or ""),
+            re.IGNORECASE | re.MULTILINE,
+        ):
+            return True
+    return False
+
+
 def _plan_items_from_body(plan_body: str) -> list[dict]:
     """Derive checklist items from a plan body so todos stay in sync.
 
@@ -6580,6 +6963,13 @@ def _persist_plan_text(queue: asyncio.Queue, root: str, chat_id: str, text: str)
         state_db.save_plan(ws, "plan", plan_body, chat_id=chat_id)
     except Exception:
         logging.getLogger(__name__).exception("persist_plan: save_plan failed")
+    else:
+        logging.getLogger(__name__).info(
+            "persist_plan: saved %d chars for chat %s in workspace %s",
+            len(plan_body),
+            chat_id,
+            ws,
+        )
     try:
         queue.put_nowait(
             {
@@ -6722,21 +7112,14 @@ async def plan_build(state: AgentState) -> dict:
     # while the '## Plan' body was written in an earlier (tool-carrying) step.
     # The trailing closing message is stripped so only scouting + plan remain.
     turn_text = _without_trailing_reply(recorder.text() or reply, reply)
-    if turn_text.strip():
+    # Only a real plan document is persisted and gated: planner prose (e.g. a
+    # follow-up answer with no ## Plan) must never overwrite the saved plan.
+    if _qualifying_plan_body(turn_text):
         reply = _save_and_emit(turn_text)
-        # Approval gate — but NOT when the planner just had a clarifying
-        # question answered mid-turn: _route_plan_build re-runs the planner
-        # against that fresh answer first, and the finalized plan gets its own
-        # gate on the next pass. Headless runs (no ask_gates) keep the old
+        # Approval gate. Headless runs (no ask_gates) keep the old
         # plan-and-stop behavior.
-        pending_answer = _ASK_ANSWERS.get(chat_id, "")
-        will_rerun = (
-            bool(pending_answer)
-            and pending_answer != state.get("_explored_ask_answer")
-            and attempts < 3
-        )
         gate = state.get("ask_gates")
-        if not will_rerun and gate is not None:
+        if gate is not None:
             # Strictly user-bounded loop: every iteration blocks on the gate
             # future, so another round only happens when the user submits
             # another edit request on the approval card.
@@ -6777,7 +7160,10 @@ async def plan_build(state: AgentState) -> dict:
                     or (revision if isinstance(revision, str) else ""),
                     revision if isinstance(revision, str) else "",
                 )
-                if not rev_text.strip():
+                if not _qualifying_plan_body(rev_text):
+                    # Revision came back without a plan document — keep the
+                    # previously saved plan instead of overwriting it with
+                    # prose, and stop asking.
                     break
                 reply = _save_and_emit(rev_text)
     return {
@@ -6792,18 +7178,6 @@ async def plan_build(state: AgentState) -> dict:
 
 
 def _route_plan_build(state: AgentState) -> str:
-    # After the planner asked a clarifying question and the user answered, the
-    # answer was captured into _ASK_ANSWERS. Re-run the planner against the new
-    # info so the plan gets UPDATED instead of looping on an empty/bad plan.
-    # Bounded by plan_attempts so a run of unhelpful answers can't loop forever.
-    if state.get("mode") == "plan":
-        ans = _ASK_ANSWERS.get(state.get("chat_id", ""), "")
-        if (
-            ans
-            and ans != state.get("_explored_ask_answer")
-            and int(state.get("plan_attempts", 0)) < 3
-        ):
-            return "plan_build"
     # Plan mode is a read-only deliverable: present the plan once and STOP, so
     # the user can review / extend it or switch to Coder manually. Other modes
     # (e.g. coder invoked with a plan in history) jump straight to coder.
@@ -6904,9 +7278,6 @@ async def run_graph(initial: AgentState) -> AsyncIterator[dict]:
     _prev_mode = await _load_prev_mode(_resume_thread_id(initial))
     initial["_prev_mode"] = _prev_mode
     initial["_mode_changed"] = bool(_prev_mode) and _prev_mode != _cur_mode
-    # Drop any stale captured ask_user answer for this chat from a previous run
-    # so Part A re-exploration only fires for answers given in THIS run.
-    _ASK_ANSWERS.pop(initial.get("chat_id", ""), None)
     if not (initial.get("request") or "").strip():
         yield {
             "kind": "error",

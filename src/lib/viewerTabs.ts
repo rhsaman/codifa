@@ -14,6 +14,26 @@ export function viewerTabId(kind: ViewerKind, chatId: string): string {
   return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
 }
 
+const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
+  review: 'Git',
+  trace: 'Trace',
+  inbox: 'Inbox',
+  plan: 'Plan',
+  browser: 'Browser',
+  // Unused: file tabs keep their per-path title (the file name).
+  file: 'File',
+  text: 'Text',
+}
+
+/** Display title for a viewer tab. File/text tabs and sub-agent trace tabs
+ *  keep their own title so a sub-agent trace never looks like the main chat
+ *  trace; every other kind shows the shared kind label. Pure, for tests. */
+export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId'>): string {
+  if (t.kind === 'file' || t.kind === 'text') return t.title
+  if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return t.title
+  return VIEWER_KIND_LABEL[t.kind] ?? t.title
+}
+
 /** Tabs visible while `chatId` is active: global tabs + that chat's own tabs. */
 export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
   return tabs.filter((t) => !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId)
@@ -45,6 +65,11 @@ export interface ViewerTab {
    *  summary, tool output). The body lives in memory only — persist() strips
    *  it so localStorage quota is never blown by a megabyte paste. */
   textBody?: string
+  /** How the text viewer renders `textBody` by default: "md" renders the
+   *  body as markdown (file paths become clickable chips, fences highlight)
+   *  and "text" keeps it verbatim in a pre. The header toggle can always
+   *  switch views. */
+  textFormat?: 'md' | 'text'
   createdAt: number
 }
 
@@ -71,10 +96,18 @@ interface ViewerTabsState {
    *  updates the target line. */
   openFile: (path: string, line?: number, root?: string) => void
   /** Open a collapsed chat text in its own viewer tab (one tab per chat).
-   *  Reopening updates the tab in place. */
-  openText: (title: string, body: string) => void
+   *  Reopening updates the tab in place. `format` sets the default render
+   *  mode: "md" renders the body as markdown (default), "text" keeps it
+   *  verbatim (terminal logs read better raw). */
+  openText: (title: string, body: string, format?: 'md' | 'text') => void
   closeViewer: (id: string) => void
   setActiveViewer: (id: string) => void
+  /** Recently closed viewer tabs (newest first, capped) for the tab-list
+   *  menu's "Recently closed" section. */
+  closedTabs: ClosedViewerTab[]
+  /** Reopen a closed tab by id: focuses it if still open, otherwise
+   *  re-opens it with its original content and activates it. */
+  reopenClosedViewerTab: (id: string) => void
   /** VSCode-style drag reorder: move the dragged tab to the drop position. */
   moveViewerTab: (fromId: string, toId: string, after?: boolean) => void
   /** Fullscreen toggle for the side-by-side viewer group (hides the chat
@@ -82,15 +115,48 @@ interface ViewerTabsState {
   fullscreen: boolean
   setFullscreen: (v: boolean) => void
   toggleFullscreen: () => void
+  /** Side pane visibility (the whole docked viewer group). The app bar's
+   *  single pane toggle flips it; every open* action forces it open so a tab
+   *  opened from anywhere becomes visible. With the pane open but no tabs,
+   *  the pane shows the "Open tab" chooser. Persisted. */
+  paneOpen: boolean
+  setPaneOpen: (v: boolean) => void
+  togglePane: () => void
+  /** Panel mode: the side pane shows the todos / sub-agents / schedules
+   *  sections INSTEAD of viewer tab content. Toggled from the button inside
+   *  the pane; activating any tab drops back to tabs mode. Persisted. */
+  panelMode: boolean
+  setPanelMode: (v: boolean) => void
+  togglePanelMode: () => void
 }
 
 const STORAGE_KEY = 'coder:viewerTabs'
 
-function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
+/** A closed viewer tab kept for the "Recently closed" list (newest first). */
+export interface ClosedViewerTab {
+  tab: ViewerTab
+  closedAt: number
+}
+
+const CLOSED_CAP = 8
+
+function slimTab(t: ViewerTab): ViewerTab {
+  return t.kind === 'text' ? { ...t, textBody: undefined } : t
+}
+
+function loadPersisted(): {
+  tabs: ViewerTab[]
+  activeId: string | null
+  closed: ClosedViewerTab[]
+} {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return { tabs: [], activeId: null }
-    const parsed = JSON.parse(raw) as { tabs?: ViewerTab[]; activeId?: string | null }
+    if (!raw) return { tabs: [], activeId: null, closed: [] }
+    const parsed = JSON.parse(raw) as {
+      tabs?: ViewerTab[]
+      activeId?: string | null
+      closed?: ClosedViewerTab[]
+    }
     const valid = Array.isArray(parsed.tabs)
       ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser' || t.kind === 'file' || t.kind === 'text'))
       : []
@@ -113,27 +179,40 @@ function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
       tabs.push({ ...t, id, title: t.kind === 'review' ? 'Git' : t.title })
     }
     const activeId = typeof parsed.activeId === 'string' && tabs.some((t) => t.id === parsed.activeId) ? parsed.activeId : (tabs[0]?.id ?? null)
-    return { tabs, activeId }
+    const closed = Array.isArray(parsed.closed)
+      ? parsed.closed
+          .filter((c) => c && typeof c.closedAt === 'number' && c.tab && typeof c.tab.id === 'string' && (c.tab.kind === 'review' || c.tab.kind === 'trace' || c.tab.kind === 'inbox' || c.tab.kind === 'plan' || c.tab.kind === 'browser' || c.tab.kind === 'file' || c.tab.kind === 'text'))
+          .slice(0, CLOSED_CAP)
+      : []
+    return { tabs, activeId, closed }
   } catch {
-    return { tabs: [], activeId: null }
+    return { tabs: [], activeId: null, closed: [] }
   }
 }
 
-function persist(tabs: ViewerTab[], activeId: string | null) {
+function persist(tabs: ViewerTab[], activeId: string | null, closed: ClosedViewerTab[] = []) {
   try {
     // Text bodies stay in memory only: a pasted log can be megabytes and
     // would blow the localStorage quota. The tab (title/owner) persists so
     // the tab bar survives a restart; the body is re-opened from the chat.
-    const slim = tabs.map((t) =>
-      t.kind === 'text' ? { ...t, textBody: undefined } : t,
+    const slim = tabs.map((t) => slimTab(t))
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        tabs: slim,
+        activeId,
+        closed: closed.map((c) => ({ tab: slimTab(c.tab), closedAt: c.closedAt })),
+      }),
     )
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs: slim, activeId }))
   } catch {
     /* storage unavailable */
   }
 }
 
-const initial = typeof window !== 'undefined' ? loadPersisted() : { tabs: [], activeId: null }
+const initial =
+  typeof window !== 'undefined'
+    ? loadPersisted()
+    : { tabs: [], activeId: null, closed: [] as ClosedViewerTab[] }
 
 const FULLSCREEN_KEY = 'coder:viewerFull'
 
@@ -153,10 +232,74 @@ function persistFullscreen(v: boolean) {
   }
 }
 
+const PANE_KEY = 'coder:viewerPane'
+
+/** No recorded choice yet → keep the pre-pane behavior: the group follows
+ *  whether any tab exists. */
+function loadPaneOpen(tabCount: number): boolean {
+  try {
+    const raw = localStorage.getItem(PANE_KEY)
+    if (raw === '1') return true
+    if (raw === '0') return false
+  } catch {
+    /* storage unavailable */
+  }
+  return tabCount > 0
+}
+
+function persistPaneOpen(v: boolean) {
+  try {
+    localStorage.setItem(PANE_KEY, v ? '1' : '0')
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const PANEL_MODE_KEY = 'coder:panelMode'
+
+function loadPanelMode(): boolean {
+  try {
+    return localStorage.getItem(PANEL_MODE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistPanelMode(v: boolean) {
+  try {
+    localStorage.setItem(PANEL_MODE_KEY, v ? '1' : '0')
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 export const useViewerTabs = create<ViewerTabsState>((set) => ({
   tabs: initial.tabs,
   activeId: initial.activeId,
+  closedTabs: initial.closed,
   fullscreen: typeof window !== 'undefined' ? loadFullscreen() : false,
+  paneOpen: typeof window !== 'undefined' ? loadPaneOpen(initial.tabs.length) : false,
+  setPaneOpen: (v) =>
+    set(() => {
+      persistPaneOpen(v)
+      return { paneOpen: v }
+    }),
+  togglePane: () =>
+    set((s) => {
+      persistPaneOpen(!s.paneOpen)
+      return { paneOpen: !s.paneOpen }
+    }),
+  panelMode: typeof window !== 'undefined' ? loadPanelMode() : false,
+  setPanelMode: (v) =>
+    set(() => {
+      persistPanelMode(v)
+      return { panelMode: v }
+    }),
+  togglePanelMode: () =>
+    set((s) => {
+      persistPanelMode(!s.panelMode)
+      return { panelMode: !s.panelMode }
+    }),
   openViewer: (tab) =>
     set((s) => {
       const normalized = tab.kind === 'review' ? { ...tab, title: 'Git' } : tab
@@ -164,7 +307,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = exists
         ? s.tabs.map((t) => (t.id === normalized.id ? { ...t, ...normalized } : t))
         : [...s.tabs, { ...normalized, createdAt: Date.now() }]
-      const next = { tabs, activeId: tab.id }
+      const next = { tabs, activeId: tab.id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -186,7 +329,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -207,7 +350,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -242,7 +385,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
               : t,
           )
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -256,8 +399,13 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
+      // Pre-open the inbox flag BEFORE the docked pane mounts: its content
+      // renders on the first paint and the docked close-watcher never sees
+      // a stale false on mount (which used to close the tab in the same
+      // tick it opened and dump the user on the previously active tab).
+      useStore.getState().setScheduleInboxOpen(true)
       return next
     }),
   openPlan: (chatId) =>
@@ -273,7 +421,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -290,7 +438,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -313,11 +461,11 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line } : t))
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
-  openText: (title, body) =>
+  openText: (title, body, format) =>
     set((s) => {
       if (!body) return {}
       // One text tab per chat: reopening updates it in place, never stacks
@@ -330,12 +478,13 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         chatId: cid,
         title: title.trim() || 'Text',
         textBody: body,
+        textFormat: format,
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? entry : t))
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id }
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -343,19 +492,35 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     set((s) => {
       const idx = s.tabs.findIndex((t) => t.id === id)
       if (idx === -1) return {}
+      const removed = s.tabs[idx]
       const tabs = s.tabs.filter((t) => t.id !== id)
       let activeId = s.activeId
       if (s.activeId === id) {
         activeId = tabs[Math.min(idx, tabs.length - 1)]?.id ?? null
       }
-      persist(tabs, activeId)
-      return { tabs, activeId }
+      const closedTabs = [
+        { tab: removed, closedAt: Date.now() },
+        ...s.closedTabs.filter((c) => c.tab.id !== id),
+      ].slice(0, CLOSED_CAP)
+      persist(tabs, activeId, closedTabs)
+      return { tabs, activeId, closedTabs }
     }),
   setActiveViewer: (id) =>
     set((s) => {
       if (!s.tabs.some((t) => t.id === id)) return {}
-      persist(s.tabs, id)
-      return { activeId: id }
+      persist(s.tabs, id, s.closedTabs)
+      return { activeId: id, panelMode: false }
+    }),
+  reopenClosedViewerTab: (id) =>
+    set((s) => {
+      const entry = s.closedTabs.find((c) => c.tab.id === id)
+      if (!entry) return {}
+      const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
+      const exists = s.tabs.some((t) => t.id === id)
+      const tabs = exists ? s.tabs : [...s.tabs, entry.tab]
+      const next = { closedTabs, tabs, activeId: id, paneOpen: true, panelMode: false }
+      persist(next.tabs, next.activeId, next.closedTabs)
+      return next
     }),
   setFullscreen: (v) =>
     set(() => {

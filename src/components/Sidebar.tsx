@@ -7,6 +7,7 @@ import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
+import { WindowStripCluster } from "./WindowStripCluster";
 
 type ChatSummary = {
   id: string;
@@ -501,6 +502,14 @@ function SidebarContent() {
         } as React.CSSProperties
       }
     >
+      {/* macOS traffic-light strip: with the native title bar hidden the
+          window buttons overlay this corner — the window-strip cluster
+          (sidebar toggle + workspace + direction) lives here so those
+          controls keep their exact position while the sidebar is open.
+          display:none off-mac and it collapses the strip entirely. */}
+      <div className="sidebar-drag" aria-hidden="false">
+        <WindowStripCluster />
+      </div>
       <div
         className="sidebar-resize-handle"
         title="Drag to resize sidebar"

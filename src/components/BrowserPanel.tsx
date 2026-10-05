@@ -2,9 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { ensureSidecar } from "../lib/api";
 import {
   DEFAULT_VIEWPORT_SIZE,
+  WIDTH_RULER_STEP,
   WIDTH_SLIDER_MAX,
   WIDTH_SLIDER_MIN,
   clampViewportSize,
+  fitWidthTarget,
+  rulerLabelForWidth,
+  rulerPctForWidth,
+  rulerWidthForPct,
+  shouldSyncViewportDrafts,
+  widthRulerTicks,
 } from "../lib/browserViewport";
 
 /** Pointer position as percentages inside a bounding box — pure so the
@@ -31,11 +38,12 @@ export function backendError(body: unknown): string | null {
 
 /** Live view of the shared in-app virtual browser (headless Chromium).
  *  Chrome-style shell: ONE omnibox (address) in the toolbar, history controls,
- *  a manual Dimensions row (numeric W/H inputs + horizontal common-width
- *  chips, no device names), and a keyboard-focusable stage that forwards
- *  typing straight to the page — so the panel never shows a second input box.
- *  The user's real mouse and keyboard are never touched. */
-export function BrowserPanel() {
+ *  a DevTools-like Dimensions bar (Responsive dropdown, numeric W/H inputs
+ *  plus a horizontal width slider), and a keyboard-focusable stage that
+ *  forwards typing straight to the page — so the panel never shows a second
+ *  input box. The virtual cursor is always live on hover, like a real
+ *  Chrome window; the user's real mouse and keyboard are never touched. */
+export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   const [image, setImage] = useState<string>("");
   const [pageUrl, setPageUrl] = useState<string>("");
   const [address, setAddress] = useState<string>("");
@@ -51,8 +59,8 @@ export function BrowserPanel() {
   // Debounced frame refresh after bursts of forwarded keystrokes.
   const keyShotTimer = useRef<number | null>(null);
   // Manual Chrome-style dimensions: numeric width/height inputs plus a
-  // horizontal row of common widths (no device names). draftW/draftH are
-  // the raw input strings so typing never fights the applied size.
+  // graduated width ruler (no device names). draftW/draftH are the raw
+  // input strings so typing never fights the applied size.
   const [draftW, setDraftW] = useState<string>(String(DEFAULT_VIEWPORT_SIZE.width));
   const [draftH, setDraftH] = useState<string>(String(DEFAULT_VIEWPORT_SIZE.height));
   // Fit-to-pane: the viewport width follows the pane width, capped at the
@@ -63,24 +71,66 @@ export function BrowserPanel() {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
   const sizeRef = useRef(viewport);
-  // Toolbar mouse toggle: hover only moves the virtual cursor while this is on.
-  const [mouseMode, setMouseMode] = useState<boolean>(false);
+  // Live mirrors for the polling interval: the interval closure is created
+  // once on mount, so reading state directly would see stale values and
+  // overwrite the omnibox while typing (or resurface errors over a frame).
+  const addressRef = useRef(address);
+  addressRef.current = address;
+  const imageRef = useRef(image);
+  imageRef.current = image;
+  // Virtual cursor is always live: hover moves the page pointer directly,
+  // no toggle needed (like a real Chrome window).
+  // Ruler hover tooltip (width under the pointer) + drag state.
+  const [rulerHover, setRulerHover] = useState<number | null>(null);
+  const rulerDragRef = useRef<boolean>(false);
+  const rulerPendingRef = useRef<number | null>(null);
+  const rulerTimerRef = useRef<number | null>(null);
 
   function syncDrafts(w: number, h: number): void {
     setDraftW(String(w));
     setDraftH(String(h));
   }
 
+  // True while the user is typing in a W/H input — incoming polls must not
+  // overwrite the drafts mid-typing.
+  function isEditingDims(): boolean {
+    if (typeof document === "undefined") return false;
+    const el = document.activeElement;
+    return el instanceof HTMLInputElement && el.classList.contains("browser-dims-input");
+  }
+
   // POST/GET helper against the sidecar. Throws on transport errors AND on
   // business errors ({ok:false}) so callers can surface a single error line.
   // `strict=false` is for polling endpoints where "not running" is an
-  // expected state, not an error to show.
+  // expected state, not an error to show. Every /browser/* call carries
+  // this tab's chat id so each chat drives its own isolated Chromium
+  // (backend _sessions key); the component remounts per chat (key=tab id)
+  // so the closure value is stable for the session lifetime.
   async function sidecarFetch(path: string, init?: RequestInit, strict = true): Promise<any> {
     const base = await ensureSidecar();
     if (!base) throw new Error("sidecar not ready");
-    const res = await fetch(`${base}${path}`, {
+    let url = `${base}${path}`;
+    let bodyInit: RequestInit | undefined = init;
+    if (path.startsWith("/browser/")) {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "GET") {
+        if (chatId) url += (path.includes("?") ? "&" : "?") + `chat_id=${encodeURIComponent(chatId)}`;
+      } else {
+        try {
+          const raw = typeof init?.body === "string" ? init.body : "{}";
+          const parsed = raw ? JSON.parse(raw) : {};
+          if (typeof parsed === "object" && parsed !== null && chatId && !parsed.chat_id) {
+            parsed.chat_id = chatId;
+            bodyInit = { ...init, body: JSON.stringify(parsed) };
+          }
+        } catch {
+          // Non-JSON body — send as-is.
+        }
+      }
+    }
+    const res = await fetch(url, {
       headers: { "Content-Type": "application/json" },
-      ...init,
+      ...bodyInit,
     });
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok) throw new Error(String(body.detail || `request failed (${res.status})`));
@@ -99,15 +149,22 @@ export function BrowserPanel() {
         // user has to delete it before typing (Chrome shows an empty box).
         const clean = st.url === "about:blank" ? "" : st.url;
         setPageUrl(clean);
-        if (!address && clean) setAddress(clean);
-        if (!clean && address === "about:blank") setAddress("");
+        if (!addressRef.current && clean) setAddress(clean);
+        if (!clean && addressRef.current === "about:blank") setAddress("");
       }
       if (st.viewport && typeof st.viewport.width === "number") {
         const w = st.viewport.width;
         const h = st.viewport.height;
-        setViewport({ w, h });
-        // Follow external resizes (agent/CDP) in the manual inputs too.
-        syncDrafts(w, h);
+        const prev = sizeRef.current;
+        if (w !== prev.w || h !== prev.h) {
+          // An external resize becomes the new fit cap, so follow mode does
+          // not shrink it back (own applies already synced sizeRef above).
+          capWRef.current = w;
+          setViewport({ w, h });
+          // Follow external resizes (agent/CDP) in the manual inputs too —
+          // but never clobber the drafts while the user is typing.
+          if (shouldSyncViewportDrafts(prev.w, prev.h, w, h, isEditingDims())) syncDrafts(w, h);
+        }
       }
       return isActive;
     } catch (err) {
@@ -122,15 +179,21 @@ export function BrowserPanel() {
       if (typeof shot.image === "string" && shot.image) {
         setImage(shot.image);
         if (typeof shot.width === "number") {
-          setViewport({ w: shot.width, h: shot.height });
-          syncDrafts(shot.width, shot.height);
+          const prev = sizeRef.current;
+          if (shot.width !== prev.w || shot.height !== prev.h) {
+            capWRef.current = shot.width;
+            setViewport({ w: shot.width, h: shot.height });
+            if (shouldSyncViewportDrafts(prev.w, prev.h, shot.width, shot.height, isEditingDims())) {
+              syncDrafts(shot.width, shot.height);
+            }
+          }
         }
         setError("");
       }
     } catch (err) {
       // Polling failures stay silent while a frame is already showing;
       // only surface them when there is nothing to display yet.
-      if (!image) setError(err instanceof Error ? err.message : String(err));
+      if (!imageRef.current) setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -165,6 +228,10 @@ export function BrowserPanel() {
       timer.current = null;
       if (keyShotTimer.current) window.clearTimeout(keyShotTimer.current);
       keyShotTimer.current = null;
+      if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
+      rulerTimerRef.current = null;
+      if (fitTimer.current) window.clearTimeout(fitTimer.current);
+      fitTimer.current = null;
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -324,9 +391,10 @@ export function BrowserPanel() {
     sizeRef.current = viewport;
   }, [viewport]);
 
-  // Resize the shared viewport to an explicit size (manual inputs / chips).
-  // The width becomes the new fit-to-pane cap.
-  async function applySize(rawW: number, rawH: number): Promise<void> {
+  // Resize the shared viewport to an explicit size (manual inputs / ruler).
+  // Manual resizes become the new fit-to-pane cap; fit-to-pane follow calls
+  // pass updateCap=false so shrinking never destroys the cap.
+  async function applySize(rawW: number, rawH: number, updateCap = true): Promise<void> {
     if (!active) return;
     const { width, height } = clampViewportSize(rawW, rawH);
     setError("");
@@ -335,7 +403,10 @@ export function BrowserPanel() {
         method: "POST",
         body: JSON.stringify({ width, height }),
       });
-      capWRef.current = width;
+      if (updateCap) capWRef.current = width;
+      // Sync the ref immediately: the viewport effect runs after render, and
+      // a poll in between would misread our own resize as an external one.
+      sizeRef.current = { w: width, h: height };
       setViewport({ w: width, h: height });
       syncDrafts(width, height);
       await refreshStatus();
@@ -345,11 +416,10 @@ export function BrowserPanel() {
     }
   }
 
-  // Slider drag: keep the current height, change only the width.
-
   // Fit-to-pane: when the pane narrows the viewport width follows it (down
   // only, capped at the last manual width); when the pane widens again the
-  // width grows back up to that cap. Height is never touched here.
+  // width grows back up to that cap. Height is never touched here. The cap
+  // itself is preserved (updateCap=false) so shrinking never destroys it.
   useEffect(() => {
     const host = stageRef.current;
     if (!host || typeof ResizeObserver === "undefined") return;
@@ -357,14 +427,14 @@ export function BrowserPanel() {
       if (!fitToPane || !active) return;
       const entry = entries[0];
       if (!entry) return;
-      const paneW = Math.round(entry.contentRect.width - 24);
+      const paneW = Math.round(entry.contentRect.width);
       if (!Number.isFinite(paneW) || paneW <= 0) return;
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
       fitTimer.current = window.setTimeout(() => {
         fitTimer.current = null;
         const cur = sizeRef.current;
-        const target = Math.max(200, Math.min(capWRef.current, paneW));
-        if (target !== cur.w) void applySize(target, cur.h);
+        const target = fitWidthTarget(paneW, capWRef.current);
+        if (target !== cur.w) void applySize(target, cur.h, false);
       }, 400);
     });
     ro.observe(host);
@@ -375,6 +445,22 @@ export function BrowserPanel() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitToPane, active]);
+
+  // End a ruler drag even when the pointer is released outside the ruler.
+  useEffect(() => {
+    const up = () => {
+      if (!rulerDragRef.current) return;
+      rulerDragRef.current = false;
+      const pending = rulerPendingRef.current;
+      rulerPendingRef.current = null;
+      if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
+      rulerTimerRef.current = null;
+      if (pending !== null) void applySize(pending, sizeRef.current.h);
+    };
+    window.addEventListener("mouseup", up);
+    return () => window.removeEventListener("mouseup", up);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
 
   // Forward hover as a virtual cursor move (throttled) and show the cursor
   // overlay: the page reacts like a real pointer, the real mouse is untouched.
@@ -465,28 +551,6 @@ export function BrowserPanel() {
         />
         <button
           type="button"
-          className={"browser-tool-btn" + (mouseMode ? " browser-tool-btn--on" : "")}
-          title={mouseMode ? "Virtual mouse on — hover to move the pointer" : "Enable virtual mouse"}
-          aria-label="Virtual mouse"
-          aria-pressed={mouseMode}
-          onClick={() => {
-            const turningOff = mouseMode;
-            setMouseMode((on) => !on);
-            if (turningOff) setCursor(null);
-          }}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
-            <path
-              d="M5 3l14 8-6.2 1.6L10 19z"
-              fill="currentColor"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
-        <button
-          type="button"
           className="browser-tool-btn"
           title="Stop the virtual browser"
           aria-label="Stop browser"
@@ -497,81 +561,109 @@ export function BrowserPanel() {
         </button>
       </div>
 
-      {/* Dimensions bar — one Chrome-style horizontal strip: manual W/H
-          inputs, horizontal width slider, fit icon and live size. */}
-      <div className="browser-sizebar" role="toolbar" aria-label="Viewport size">
-        <span className="browser-subbar-label">Dimensions</span>
-        <input
-          className="browser-dims-input"
-          aria-label="Viewport width"
-          title="Viewport width in CSS pixels"
-          inputMode="numeric"
-          value={draftW}
-          onChange={(e) => setDraftW(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void applySize(Number(draftW), Number(draftH));
-          }}
-          onBlur={() => syncDrafts(viewport.w, viewport.h)}
+      {/* Width ruler — full-width Chrome DevTools-style graduated bar below
+          the toolbar. Hover shows "Laptop - 1024px", drag/keyboard resizes. */}
+      <div
+        className="browser-width-ruler browser-width-ruler--full"
+        role="slider"
+        aria-label="Viewport width ruler"
+        aria-valuemin={WIDTH_SLIDER_MIN}
+        aria-valuemax={WIDTH_SLIDER_MAX}
+        aria-valuenow={viewport.w}
+        aria-valuetext={`${rulerLabelForWidth(viewport.w)} - ${viewport.w}px`}
+        tabIndex={active ? 0 : -1}
+        data-disabled={!active}
+        title={`${rulerLabelForWidth(viewport.w)} - ${viewport.w}px`}
+        onMouseDown={(e) => {
+          if (!active) return;
+          // Ticks handle their own click — don't start a drag for them.
+          const t = e.target as HTMLElement | null;
+          if (t?.closest?.(".browser-ruler-tick")) return;
+          rulerDragRef.current = true;
+          const rect = e.currentTarget.getBoundingClientRect();
+          const pct = rect.width ? ((e.clientX - rect.left) / rect.width) * 100 : 0;
+          const v = rulerWidthForPct(pct);
+          rulerPendingRef.current = v;
+          setDraftW(String(v));
+          setRulerHover(v);
+        }}
+        onMouseMove={(e) => {
+          if (!active) return;
+          const rect = e.currentTarget.getBoundingClientRect();
+          const pct = rect.width ? ((e.clientX - rect.left) / rect.width) * 100 : 0;
+          const v = rulerWidthForPct(pct);
+          const target = e.target as HTMLElement | null;
+          const onTick = !!target?.closest?.(".browser-ruler-tick");
+          // A tick sets its own exact hover value on enter — don't let the
+          // bubbled mousemove overwrite it with the pointer position, so the
+          // tooltip reads "Laptop - 1024px" instead of a nearby width.
+          // While dragging the tooltip follows the pointer even over ticks.
+          if (!onTick || rulerDragRef.current) setRulerHover(v);
+          if (!rulerDragRef.current) return;
+          rulerPendingRef.current = v;
+          setDraftW(String(v));
+          if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
+          rulerTimerRef.current = window.setTimeout(() => {
+            rulerTimerRef.current = null;
+            const pending = rulerPendingRef.current;
+            rulerPendingRef.current = null;
+            if (pending !== null) void applySize(pending, sizeRef.current.h);
+          }, 250);
+        }}
+        onMouseUp={() => {
+          if (!rulerDragRef.current) return;
+          rulerDragRef.current = false;
+          // Click without a move still resizes (a plain click did nothing
+          // before because apply only ran on debounced mousemove).
+          const pending = rulerPendingRef.current;
+          rulerPendingRef.current = null;
+          if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
+          rulerTimerRef.current = null;
+          if (pending !== null) void applySize(pending, sizeRef.current.h);
+        }}
+        onMouseLeave={() => {
+          // Keep the drag alive when the pointer leaves mid-drag — a
+          // window-level mouseup ends it (see effect below).
+          if (!rulerDragRef.current) setRulerHover(null);
+        }}
+        onKeyDown={(e) => {
+          if (!active) return;
+          if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            e.preventDefault();
+            const delta = e.key === "ArrowLeft" ? -WIDTH_RULER_STEP : WIDTH_RULER_STEP;
+            void applySize(viewport.w + delta, sizeRef.current.h);
+          }
+        }}
+      >
+        {widthRulerTicks().map((w) => (
+          <span
+            key={w}
+            className="browser-ruler-tick"
+            style={{ left: `${rulerPctForWidth(w)}%` }}
+            title={`${rulerLabelForWidth(w)} - ${w}px`}
+            onMouseEnter={() => setRulerHover(w)}
+            onFocus={() => setRulerHover(w)}
+            onClick={() => {
+              if (active) void applySize(w, sizeRef.current.h);
+            }}
+          >
+            <span className="browser-ruler-tick-label" aria-hidden="true">{w}</span>
+          </span>
+        ))}
+        <div
+          className="browser-ruler-thumb"
+          style={{ left: `${rulerPctForWidth(viewport.w)}%` }}
+          aria-hidden="true"
         />
-        <span aria-hidden="true">×</span>
-        <input
-          className="browser-dims-input"
-          aria-label="Viewport height"
-          title="Viewport height in CSS pixels"
-          inputMode="numeric"
-          value={draftH}
-          onChange={(e) => setDraftH(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void applySize(Number(draftW), Number(draftH));
-          }}
-          onBlur={() => syncDrafts(viewport.w, viewport.h)}
-        />
-        <button
-          type="button"
-          className="browser-tool-btn browser-apply-btn"
-          title="Apply viewport size"
-          aria-label="Apply viewport size"
-          disabled={!active}
-          onClick={() => void applySize(Number(draftW), Number(draftH))}
-        >
-          ✓
-        </button>
-        <input
-          type="range"
-          className="browser-width-slider"
-          aria-label="Viewport width slider"
-          title={`Viewport width ${viewport.w}px (drag like Chrome)`}
-          min={WIDTH_SLIDER_MIN}
-          max={WIDTH_SLIDER_MAX}
-          step={10}
-          value={Math.min(WIDTH_SLIDER_MAX, Math.max(WIDTH_SLIDER_MIN, viewport.w))}
-          disabled={!active}
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            setDraftW(String(v));
-            if (fitTimer.current) window.clearTimeout(fitTimer.current);
-            fitTimer.current = window.setTimeout(() => {
-              fitTimer.current = null;
-              void applySize(v, sizeRef.current.h);
-            }, 250);
-          }}
-        />
-        <button
-          type="button"
-          className={"browser-tool-btn browser-fit-btn" + (fitToPane ? " browser-tool-btn--on" : "")}
-          title={fitToPane ? "Fit to pane on — viewport width follows the pane, up to the applied width" : "Fit viewport width to the pane"}
-          aria-label="Fit width to pane"
-          aria-pressed={fitToPane}
-          onClick={() => setFitToPane((on) => !on)}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M4 9V4h5" />
-            <path d="M20 9V4h-5" />
-            <path d="M4 15v5h5" />
-            <path d="M20 15v5h-5" />
-          </svg>
-        </button>
-        <span className="browser-size">{viewport.w}x{viewport.h}</span>
+        {rulerHover !== null && (
+          <span
+            className="browser-ruler-tip"
+            style={{ left: `${rulerPctForWidth(rulerHover)}%` }}
+            aria-hidden="true"
+          >
+            {`${rulerLabelForWidth(rulerHover)} - ${rulerHover}px`}
+          </span>
+        )}
       </div>
 
       {/* Stage: focusable, forwards keys + virtual cursor to the page */}
@@ -593,11 +685,11 @@ export function BrowserPanel() {
               className="browser-stage-img"
               onClick={(e) => void clickAt(e)}
               onWheel={(e) => void wheel(e)}
-              onMouseMove={(e) => mouseMode && hoverAt(e)}
+              onMouseMove={(e) => hoverAt(e)}
               onMouseLeave={() => setCursor(null)}
               draggable={false}
             />
-            {mouseMode && cursor && (
+            {cursor && (
               <svg
                 width="18"
                 height="18"

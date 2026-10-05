@@ -27,6 +27,61 @@ interface GitFile extends ReviewFileItem {}
 /** آستانه‌ی پیش‌فرض عرض پنل (پیکسل) برای نمایش دوستونی دیف. */
 export const REVIEW_SIDE_BY_SIDE_THRESHOLD = 900;
 
+/** "Source preview" — open the original file, complete, in its own viewer
+ *  tab (FileViewerPanel), jumping to the first changed line of the diff. */
+function openSourcePreview(path: string, diff: string, root?: string) {
+  const hm = /^@@ -\d+(?:,\d+)? \+(\d+)/m.exec(diff);
+  const line = hm ? parseInt(hm[1], 10) : undefined;
+  useViewerTabs.getState().openFile(path, Number.isFinite(line) ? line : undefined, root);
+}
+
+/** Body of the opened file: a slim toolbar with the "Source preview" opener
+ *  (full file in its own viewer tab) above the diff. */
+function ReviewFileBody({
+  file,
+  query,
+  activeHit,
+  wide,
+  root,
+}: {
+  file: ReviewFileItem;
+  query: string;
+  activeHit: number;
+  wide: boolean;
+  root?: string;
+}) {
+  return (
+    <div className="review-file-body">
+      <div className="review-file-toolbar">
+        <button
+          type="button"
+          className="review-source-preview-btn"
+          title="Open the full file in its own tab"
+          aria-label={`Source preview — open ${file.path} in a new tab`}
+          onClick={() => openSourcePreview(file.path, file.diff, root)}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <polyline points="16 18 22 12 16 6" />
+            <polyline points="8 6 2 12 8 18" />
+          </svg>
+          Source preview
+        </button>
+      </div>
+      {file.diff ? (
+        <DiffView
+          diff={file.diff}
+          path={file.path}
+          query={query}
+          activeHit={activeHit}
+          layout={wide ? "side-by-side" : "auto"}
+        />
+      ) : (
+        <div className="review-empty">New file — no diff available yet.</div>
+      )}
+    </div>
+  );
+}
+
 /** آکاردئون خالص لیست فایل‌ها: هر ردیف فایل، دیف خودش را دقیقاً زیر همان
  *  ردیف باز می‌کند. بدون وابستگی به استور تا در SSR هم قابل تست باشد؛
  *  `selectedPath` خالی یعنی همه بسته. `query` رخدادهای جست‌وجو را هایلایت می‌کند
@@ -39,6 +94,7 @@ export function ReviewFileAccordion({
   query = "",
   activeHit = -1,
   wide = false,
+  root,
 }: {
   files: ReviewFileItem[];
   selectedPath: string;
@@ -46,6 +102,7 @@ export function ReviewFileAccordion({
   query?: string;
   activeHit?: number;
   wide?: boolean;
+  root?: string;
 }) {
   return (
     <div className="review-files">
@@ -62,7 +119,7 @@ export function ReviewFileAccordion({
               onClick={() => onSelect(isOpen ? "" : f.path)}
             >
               <span className="review-file-ext">
-                <FileIcon path={f.path} size={18} />
+                <FileIcon path={f.path} size={20} />
               </span>
               <span className="review-file-path">{f.path}</span>
               <span className="review-file-counts">
@@ -75,19 +132,13 @@ export function ReviewFileAccordion({
             </button>
             {isOpen && (
               <div className="review-diff">
-                {f.diff ? (
-                  <DiffView
-                    diff={f.diff}
-                    path={f.path}
-                    query={query}
-                    activeHit={activeHit}
-                    layout={wide ? "side-by-side" : "auto"}
-                  />
-                ) : (
-                  <div className="review-empty">
-                    New file — no diff available yet.
-                  </div>
-                )}
+                <ReviewFileBody
+                  file={f}
+                  query={query}
+                  activeHit={activeHit}
+                  wide={wide}
+                  root={root}
+                />
               </div>
             )}
           </div>
@@ -422,6 +473,7 @@ export function ReviewPanel(props?: {
         query={query}
         activeHit={openLocal}
         wide={wide}
+        root={root}
       />
     );
   };

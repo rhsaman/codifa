@@ -281,6 +281,27 @@ function persistChatFullscreen(v: boolean): void {
   }
 }
 
+// Bottom terminal panel visibility (Cmd/Ctrl+J). Session-level UI state like
+// chatFullscreen — localStorage instead of the settings payload so the
+// backend's default-skeleton detection stays untouched.
+const TERMINAL_PANEL_KEY = 'coder:terminalPanel'
+
+function loadTerminalPanel(): boolean {
+  try {
+    return localStorage.getItem(TERMINAL_PANEL_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistTerminalPanel(v: boolean): void {
+  try {
+    localStorage.setItem(TERMINAL_PANEL_KEY, v ? '1' : '0')
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 // Lightweight debounced write for panel visibility toggles (sidebar / right
 // panel / code-map). A toggle must feel instant: it only flips a boolean in
 // memory and schedules a settings-only write in the background — never the
@@ -299,8 +320,15 @@ function persistPanelsSoon(): void {
 
 // Chats-only snapshot for the mid-stream heartbeat: skips settings entirely so
 // the (async, AES) settings encryption is never re-run every 2s during a run.
+// Persists only the running chat(s) — never the whole list — so a 2s tick does
+// not deep-copy every message + tool result of idle chats in the renderer and
+// the main process. The backend upserts chat files, so a subset write is safe;
+// the next full persist rewrites everything.
 function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
-  void api.storeSet('chats', sanitizeChats(s.chats))
+  const streaming = s.chats.filter((c) => c.messages.some((m) => m.streaming))
+  const subset = streaming.length > 0 ? streaming : s.chats.filter((c) => c.id === s.activeChatId)
+  if (subset.length === 0) return
+  void api.storeSet('chats', sanitizeChats(subset))
 }
 
 // Settings-only snapshot for panel toggles: skips the chats sanitize + write
@@ -569,6 +597,9 @@ interface State {
   codeMapPanelOpen: boolean
   /** پنل راست داک‌شده (تودوها + بخش‌های آینده) — مثل sidebarOpen persisted می‌شود. */
   rightPanelOpen: boolean
+  /** Bottom terminal panel (Cmd/Ctrl+J). Persisted in localStorage like
+   *  chatFullscreen, NOT in the settings payload. Sessions survive hiding. */
+  terminalPanelOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
@@ -652,6 +683,8 @@ interface State {
   toggleCodeMapPanel: () => void
   setRightPanelOpen: (open: boolean) => void
   toggleRightPanel: () => void
+  setTerminalPanelOpen: (open: boolean) => void
+  toggleTerminalPanel: () => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
@@ -731,6 +764,11 @@ interface State {
   openChat: (id: string) => void
   /** Close a chat tab without deleting the chat data (sidebar keeps it). */
   closeChatTab: (id: string) => void
+  /** Recently closed chat tabs (newest first, capped) for the tab-list
+   *  menu's "Recently closed" section. In-memory only. */
+  recentlyClosedChatTabs: { id: string; at: number }[]
+  /** Reopen a closed chat tab: activates the chat and re-opens its tab. */
+  reopenChatTab: (id: string) => void
   /** VSCode-style drag reorder: move the dragged chat tab to the drop position. */
   moveChatTab: (fromId: string, toId: string, after?: boolean) => void
   /** Fullscreen toggle for the chat group (viewer group hides). Persisted in
@@ -997,6 +1035,7 @@ export const useStore = create<State>((set, get) => ({
   sidebarOpen: true,
   codeMapPanelOpen: false,
   rightPanelOpen: false,
+  terminalPanelOpen: typeof window !== 'undefined' ? loadTerminalPanel() : false,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -1007,6 +1046,7 @@ export const useStore = create<State>((set, get) => ({
   deletedWorkspaceRoots: [],
   activeChatId: typeof window !== 'undefined' ? loadActiveChat() : '',
   openChatIds: typeof window !== 'undefined' ? loadOpenChats() : [],
+  recentlyClosedChatTabs: [],
   chatFullscreen: typeof window !== 'undefined' ? loadChatFullscreen() : false,
   focusComposer: false,
   unreadChats: [],
@@ -1876,6 +1916,16 @@ export const useStore = create<State>((set, get) => ({
     get().setRightPanelOpen(next)
   },
 
+  setTerminalPanelOpen: (terminalPanelOpen) => {
+    set({ terminalPanelOpen })
+    persistTerminalPanel(terminalPanelOpen)
+  },
+
+  toggleTerminalPanel: () => {
+    const next = !get().terminalPanelOpen
+    get().setTerminalPanelOpen(next)
+  },
+
   setRecentModels: (recentModels) => {
     set({ recentModels })
     get().persist()
@@ -2218,9 +2268,21 @@ export const useStore = create<State>((set, get) => ({
         activeChatId = openChatIds[Math.min(idx, openChatIds.length - 1)] ?? ''
       }
       persistOpenState(openChatIds, activeChatId)
-      return { openChatIds, activeChatId }
+      // Tab-list menu "Recently closed": keep the id while the chat itself
+      // still exists (deleting the chat clears it via the chat store).
+      const recentlyClosedChatTabs = s.chats.some((c) => c.id === id)
+        ? [{ id, at: Date.now() }, ...s.recentlyClosedChatTabs.filter((r) => r.id !== id)].slice(0, 8)
+        : s.recentlyClosedChatTabs
+      return { openChatIds, activeChatId, recentlyClosedChatTabs }
     })
     persistSoon()
+  },
+
+  reopenChatTab: (id) => {
+    set((s) => ({
+      recentlyClosedChatTabs: s.recentlyClosedChatTabs.filter((r) => r.id !== id),
+    }))
+    get().openChat(id)
   },
 
   moveChatTab: (fromId, toId, after = false) => {

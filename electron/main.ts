@@ -5,6 +5,7 @@ import * as os from 'os'
 import * as fs from 'fs'
 import { getSidecarUrl, peekSidecarUrl, startSidecar, stopSidecar } from './sidecar'
 import { loadShellEnv } from './shell-env'
+import { killAllTerminalSessions, registerTerminalIpc } from './terminal'
 import { getDataRoot, moveDataRootAsync, setDataRoot } from './store-db'
 import { registerSecretsIpc } from './secrets'
 import { buildOverlayHtml } from './captureOverlay'
@@ -286,6 +287,81 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
   })
 }
 
+/** Absolute path of `bin` under the common install dirs TOOL_PATH covers, or
+ *  null. Commands handed to OTHER GUI apps (cmux `--command`, Ghostty `-e`)
+ *  run with the GUI app's minimal launchd PATH, which misses Homebrew — they
+ *  need a fully-resolved binary path. */
+function resolveToolPath(bin: string): string | null {
+  for (const d of TOOL_PATH.split(':')) {
+    if (!d) continue
+    try {
+      const p = path.join(d, bin)
+      if (fs.existsSync(p)) return p
+    } catch {
+      /* ignore */
+    }
+  }
+  return null
+}
+
+/** Spawn detached; resolves true when the child started at all (a dangling
+ *  `code` shim or missing binary resolves false). The exit code is NOT
+ *  awaited — these launches are fire-and-forget by design. */
+function spawnDetached(bin: string, args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const c = spawn(bin, args, {
+        env: { ...process.env, PATH: TOOL_PATH },
+        stdio: 'ignore',
+        detached: true,
+      })
+      c.once('spawn', () => {
+        c.unref()
+        resolve(true)
+      })
+      c.once('error', () => resolve(false))
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
+/** Run a CLI to completion and report success (exit 0). Bounded so a wedged
+ *  unix socket (cmux) or a stuck Launch Services lookup can't hang the IPC. */
+function runCli(bin: string, args: string[], timeoutMs = 10000): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: timeoutMs, env: { ...process.env, PATH: TOOL_PATH } }, (err) =>
+      resolve(!err),
+    )
+  })
+}
+
+/** First existing .app bundle among `names` in /Applications or ~/Applications. */
+function findAppBundle(names: string[]): string | null {
+  for (const base of ['/Applications', path.join(os.homedir(), 'Applications')]) {
+    for (const name of names) {
+      const bundle = path.join(base, name)
+      try {
+        if (fs.existsSync(bundle)) return bundle
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return null
+}
+
+/** `:edit` the file in the first running nvim instance over its RPC socket. */
+async function openInRunningNvim(abs: string): Promise<boolean> {
+  const expr = `execute('edit ' . fnameescape('${abs.replace(/'/g, "''")}'))`
+  const socks = await findNvimSockets().catch(() => [] as string[])
+  for (const s of socks) {
+    const { code } = await runNvimQuery(s, ['--remote-expr', expr])
+    if (code === 0) return true
+  }
+  return false
+}
+
 /** Launch a platform terminal at `cwd`, optionally running `argv` inside it
  *  (e.g. [nvim, file]). Best-effort: each candidate is tried until one spawns. */
 function launchTerminal(argv: string[], cwd: string): Promise<boolean> {
@@ -536,6 +612,12 @@ function createWindow(): void {
     title: 'Codifa',
     icon: path.join(import.meta.dirname, '../build/icon.png'),
     backgroundColor: '#1e1e1e',
+    // Frameless on macOS only: the renderer's chat app bar becomes the drag
+    // region and the traffic lights overlay the sidebar (Windows/Linux keep
+    // the native frame so their window controls stay intact).
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hidden' as const, trafficLightPosition: { x: 12, y: 13 } }
+      : {}),
     autoHideMenuBar: !isDev,
     webPreferences: {
       preload: import.meta.dirname + '/preload.cjs',
@@ -579,6 +661,9 @@ function registerIpc(): void {
   // --- secrets (API keys / OAuth creds encrypted at rest) -------------------
   registerSecretsIpc()
 
+  // --- in-app terminal panel (node-pty sessions) -----------------------------
+  registerTerminalIpc()
+
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
   // Liveness probe: returns true if the cached sidecar URL still answers
@@ -610,11 +695,14 @@ function registerIpc(): void {
     }
   })
 
-  // --- open the current file in an EXTERNAL editor (nvim / VS Code) ---------
-  // nvim: send `:edit` to the first running instance over its RPC socket
-  // (the app already discovers sockets for the "open in Neovim" label); when
-  // nothing is running, fall back to a terminal that launches nvim.
-  // vscode: try the `code` CLI first, then the registered vscode:// handler.
+  // --- open the current file in an EXTERNAL editor --------------------------
+  // nvim: send `:edit` to the first running instance over its RPC socket (the
+  // app already discovers sockets for the "open in Neovim" label); when
+  // nothing is running, fall back to a terminal that launches nvim —
+  // Terminal.app for plain nvim, or the terminal the user picked (cmux /
+  // Ghostty / Warp).
+  // vscode: `code` CLI, then the CLI inside the app bundle, then Launch
+  // Services by bundle id, then the registered vscode:// handler.
   ipcMain.handle('open:file-external', async (_e, absPath: unknown, editor: unknown) => {
     const abs = typeof absPath === 'string' ? absPath.trim() : ''
     const which = typeof editor === 'string' ? editor : ''
@@ -625,35 +713,101 @@ function registerIpc(): void {
     if (!abs || !path.isAbsolute(abs)) return { ok: false, error: 'Not an absolute path.' }
     try {
       if (which === 'vscode') {
-        const cli = spawn('code', [abs], {
-          env: { ...process.env, PATH: TOOL_PATH },
-          stdio: 'ignore',
-          detached: true,
-        })
-        const cliOk = await new Promise<boolean>((resolve) => {
-          cli.once('spawn', () => {
-            cli.unref()
-            resolve(true)
-          })
-          cli.once('error', () => resolve(false))
-        })
-        if (cliOk) return { ok: true }
-        const url = abs.startsWith('/')
-          ? `vscode://file${abs}`
-          : `vscode://file/${abs.replace(/\\/g, '/')}`
-        await shell.openExternal(url)
-        return { ok: true }
+        // 1) `code` CLI on PATH.
+        if (await spawnDetached('code', [abs])) return { ok: true }
+        // 2) The CLI inside well-known bundles — covers installs whose `code`
+        //    shim is missing or stale (e.g. an old symlink to a moved .app).
+        for (const base of ['/Applications', path.join(os.homedir(), 'Applications')]) {
+          for (const name of ['Visual Studio Code.app', 'Visual Studio Code - Insiders.app']) {
+            if (await spawnDetached(path.join(base, name, 'Contents/Resources/app/bin/code'), [abs]))
+              return { ok: true }
+          }
+        }
+        // 3) Launch Services by bundle id / name (no URL scheme needed).
+        for (const args of [
+          ['-b', 'com.microsoft.VSCode', abs],
+          ['-b', 'com.microsoft.VSCode.Insiders', abs],
+          ['-a', 'Visual Studio Code', abs],
+        ]) {
+          if (await runCli('open', args, 8000)) return { ok: true }
+        }
+        // 4) The registered vscode:// handler; if this throws too, VS Code is
+        //    not installed/registered — say so instead of the raw LS error.
+        try {
+          const url = abs.startsWith('/')
+            ? `vscode://file${abs}`
+            : `vscode://file/${abs.replace(/\\/g, '/')}`
+          await shell.openExternal(url)
+          return { ok: true }
+        } catch (err) {
+          return {
+            ok: false,
+            error: `Could not open VS Code — is it installed? (${err instanceof Error ? err.message : String(err)})`,
+          }
+        }
       }
       if (which === 'nvim') {
-        const expr = `execute('edit ' . fnameescape('${abs.replace(/'/g, "''")}'))`
-        const socks = await findNvimSockets().catch(() => [] as string[])
-        for (const s of socks) {
-          const { code } = await runNvimQuery(s, ['--remote-expr', expr])
-          if (code === 0) return { ok: true }
-        }
+        if (await openInRunningNvim(abs)) return { ok: true }
         const launched = await launchTerminal(['nvim', abs], path.dirname(abs))
         if (launched) return { ok: true }
         return { ok: false, error: 'No running Neovim instance and no terminal found.' }
+      }
+      if (which === 'cmux' || which === 'ghostty' || which === 'warp') {
+        if (process.platform !== 'darwin')
+          return { ok: false, error: `Opening nvim in ${which} is only supported on macOS.` }
+        // A running nvim instance wins, whatever terminal hosts it.
+        if (await openInRunningNvim(abs)) return { ok: true }
+        const nvimPath = resolveToolPath('nvim') ?? 'nvim'
+        const dir = path.dirname(abs)
+        if (which === 'cmux') {
+          // Best case: a new workspace whose terminal IS nvim on this file.
+          // The CLI talks to cmux over its unix socket, which by default only
+          // admits processes started inside cmux — so this succeeds when
+          // codifa itself runs in a cmux terminal (or CMUX_SOCKET_PASSWORD is
+          // set) and fails elsewhere.
+          const cli = resolveToolPath('cmux')
+          if (cli) {
+            const wsArgs = [
+              'new-workspace',
+              '--cwd',
+              dir,
+              '--command',
+              `${nvimPath} '${abs.replace(/'/g, `'"'"'`)}'`,
+              '--name',
+              path.basename(abs),
+              '--focus',
+              'true',
+            ]
+            if (await runCli(cli, wsArgs)) return { ok: true }
+          }
+          // No CLI or the socket refused us: hand the folder to cmux via the
+          // macOS document-open event (cmux declares Folder/Viewer) — no
+          // auth needed, and it launches cmux first if it isn't running.
+          // nvim then has to be started in the new workspace by hand.
+          if (await runCli('open', ['-a', 'cmux', dir], 8000)) return { ok: true }
+          return { ok: false, error: 'Could not open cmux — is cmux installed?' }
+        }
+        if (which === 'ghostty') {
+          const bundle = findAppBundle(['Ghostty.app'])
+          if (!bundle)
+            return { ok: false, error: 'Ghostty is not installed — install it from ghostty.org first.' }
+          // `open -na … --args -e` is the way to get a NEW Ghostty window
+          // running a command; without -n macOS only focuses an existing one.
+          const ok = await runCli('open', ['-na', bundle, '--args', '-e', nvimPath, abs], 8000)
+          return ok ? { ok: true } : { ok: false, error: 'Could not launch Ghostty.' }
+        }
+        // warp: the warp:// URI scheme has no "run command" action (only
+        // `path`), so this opens a new tab at the file's folder; start nvim
+        // from there.
+        try {
+          const p = dir.split('/').map(encodeURIComponent).join('/')
+          await shell.openExternal(`warp://action/new_tab?path=${p}`)
+          return { ok: true }
+        } catch {
+          /* no warp:// handler registered — try `open -a` below */
+        }
+        if (await runCli('open', ['-a', 'Warp', dir], 8000)) return { ok: true }
+        return { ok: false, error: 'Could not open Warp — is it installed?' }
       }
       return { ok: false, error: `Unknown editor: ${which}` }
     } catch (err) {
@@ -1417,6 +1571,7 @@ app.on('before-quit', (e) => {
   // queue. A hard timeout guarantees the app ALWAYS closes even if the sidecar
   // is unresponsive (a hung fetch must never block quit).
   const finish = () => {
+    killAllTerminalSessions()
     stopSidecar()
     app.quit()
   }

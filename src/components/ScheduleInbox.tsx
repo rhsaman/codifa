@@ -833,11 +833,22 @@ export function ScheduleInboxButton() {
 export function ScheduleInboxDocked({ onClose }: { onClose: () => void }) {
   const open = useStore((s) => s.scheduleInboxOpen);
   const setOpen = useStore((s) => s.setScheduleInboxOpen);
+  // Close the tab only on a true→false transition AFTER mounting: the first
+  // effect run adopts whatever the flag was when the tab opened (openInbox
+  // pre-sets it true), otherwise an unguarded `if (!open) onClose()` here
+  // closed the tab in the same tick it opened and dumped the user on the
+  // previously active tab (e.g. the git diff).
+  const prevOpenRef = useRef<boolean | null>(null);
   useEffect(() => {
     setOpen(true);
   }, [setOpen]);
   useEffect(() => {
-    if (!open) onClose();
+    if (prevOpenRef.current === null) {
+      prevOpenRef.current = open;
+      return;
+    }
+    if (prevOpenRef.current && !open) onClose();
+    prevOpenRef.current = open;
   }, [open, onClose]);
   return (
     <div className="viewer-inbox-wrap">

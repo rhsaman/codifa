@@ -502,8 +502,8 @@ def _skill_md_path(slug: str) -> str:
     return os.path.join(_skill_dir(slug), "skill.md")
 
 
-def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
-    """Return ``(name, slug, description)`` parsed from a skill markdown file.
+def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str, list[str]]:
+    """Return ``(name, slug, description, fa_keywords)`` parsed from a skill markdown file.
 
     The first ``---`` fenced block is treated as YAML frontmatter. Falls back to
     deriving the name from the first ``# Heading`` line or the first non-empty
@@ -512,6 +512,7 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
     name = ""
     slug = ""
     description = ""
+    fa_keywords: list[str] = []
     if raw.startswith("---"):
         end = raw.find("\n---", 3)
         if end != -1:
@@ -528,6 +529,8 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
                     slug = val
                 elif key == "description":
                     description = val
+                elif key == "fa_keywords":
+                    fa_keywords = [k.strip() for k in val.split(",") if k.strip()]
     if not name:
         for line in raw.splitlines():
             line = line.strip()
@@ -540,7 +543,7 @@ def _parse_skill_frontmatter(raw: str) -> tuple[str, str, str]:
             break
     if not slug and name:
         slug = _slugify(name)
-    return name, slug, description
+    return name, slug, description, fa_keywords
 
 
 def _find_skill_dir(name_or_slug: str) -> str | None:
@@ -567,7 +570,7 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
             md = os.path.join(p, "skill.md")
             if not os.path.isfile(md):
                 continue
-            name, _, _ = _parse_skill_frontmatter(_read_text(md))
+            name, _, _, _ = _parse_skill_frontmatter(_read_text(md))
             if name and name.strip() == name_or_slug:
                 return p
     return None
@@ -578,10 +581,11 @@ def save_skill(
     slug: str,
     description: str,
     content: str,
+    fa_keywords: list[str] | None = None,
 ) -> None:
     """Persist a skill as ``skills/<slug>/skill.md`` with YAML frontmatter.
 
-    The frontmatter carries ``name``/``slug``/``description``. The rest of
+    The frontmatter carries ``name``/``slug``/``description``/``fa_keywords``. The rest of
     the file is the skill body. An empty ``slug`` falls back to the slugified
     name and then to a stable hash, so distinct names never share a folder.
     """
@@ -597,12 +601,14 @@ def save_skill(
             end = content.find("\n---", 3)
             if end != -1:
                 content = content[end + 4:].lstrip("\n")
+        fa_list = [str(k or "").strip() for k in (fa_keywords or []) if str(k or "").strip()]
         front = (
             "---\n"
             f"name: {name}\n"
             f"slug: {slug}\n"
             f"description: {str(description or '').strip()}\n"
-            "---\n\n"
+            + (f"fa_keywords: {', '.join(fa_list)}\n" if fa_list else "")
+            + "---\n\n"
         )
         _atomic_write(os.path.join(d, "skill.md"), front + content)
     invalidate_skills_cache()
@@ -637,7 +643,7 @@ def invalidate_skills_cache() -> None:
 
 
 def list_skills() -> list[dict]:
-    """Return all skills as ``{name, slug, description, path, content}``.
+    """Return all skills as ``{name, slug, description, path, content, fa_keywords}``.
 
     Cached until the skills folder fingerprint changes; internal writers
     (save_skill/delete_skill) invalidate the cache so changes appear at once."""
@@ -665,7 +671,7 @@ def _list_skills_uncached() -> list[dict]:
             if not os.path.isfile(md):
                 continue
             raw = _read_text(md)
-            name, slug, description = _parse_skill_frontmatter(raw)
+            name, slug, description, fa_keywords = _parse_skill_frontmatter(raw)
             body = raw
             if body.startswith("---"):
                 end = body.find("\n---", 3)
@@ -678,6 +684,7 @@ def _list_skills_uncached() -> list[dict]:
                     "description": description,
                     "path": f"file://{md}",
                     "content": body,
+                    "fa_keywords": fa_keywords,
                 }
             )
     return out

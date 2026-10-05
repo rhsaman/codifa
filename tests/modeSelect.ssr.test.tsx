@@ -66,6 +66,18 @@ console.log('3) ساختار DOM:')
   check('mode-select-current class', html.includes('mode-select-current'))
 }
 
+console.log('4) menuModes:')
+{
+  const all = [
+    ...modes,
+    { id: 'plan' as const, label: 'Plan', icon: 'list' as const, description: 'Plan the work', capabilities: { readFiles: true, writeFiles: false, runTerminal: true, web: true } },
+  ]
+  const html = renderToString(
+    <ModeSelect modes={all} menuModes={modes} value="plan" onChange={() => {}} />
+  )
+  check('مقدار پنهان همچنان به‌عنوان جاری نمایش داده می‌شود', html.includes('Plan'))
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} test(s) failed`)
   process.exit(1)

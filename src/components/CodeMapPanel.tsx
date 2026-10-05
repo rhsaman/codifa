@@ -146,7 +146,7 @@ export function CodeMapPanel({ onJumpToFile }: Props) {
             <details key={file} open className="codemap-file">
               <summary title={file}>
                 <span className="codemap-file-icon" aria-hidden>
-                  <FileIcon path={file} size={18} />
+                  <FileIcon path={file} size={20} />
                 </span>
                 <span className="codemap-file-name">{file}</span>
                 <span className="codemap-file-count">{syms.length}</span>

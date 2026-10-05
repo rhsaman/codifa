@@ -205,10 +205,12 @@ def retrieve(
 
     # 3. semantic — ANN cosine; only when the embedder is usable.
     # اگه embedding در دسترس نباشه، semantic جستجو نمی‌کنیم (RAG اختیاری).
+    # Lightweight gate: file-presence check only, never loads the model so
+    # every retrieval does not pin the ~1.1 GB session in RAM.
     try:
-        from embeddings import embedder_available
+        from embeddings import is_available
 
-        _embedder_ok = embedder_available()
+        _embedder_ok = is_available()
     except Exception:  # noqa: BLE001
         _embedder_ok = False
     if _embedder_ok:

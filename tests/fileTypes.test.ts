@@ -5,6 +5,7 @@ import {
   FILE_BADGES,
   IMAGE_EXTS,
   extOf,
+  extractInlinePathParts,
   fileBasename,
   fileIconSpec,
   looksLikeFilePath,
@@ -106,6 +107,66 @@ console.log("5) fileIconSpec — tile mapping:");
   check("mp3 is an audio glyph", fileIconSpec("a.mp3").kind === "audio");
   check("unknown ext is neutral generic", fileIconSpec("notes.xyz123").kind === "generic");
   check("uppercase path still maps", fileIconSpec("SRC/APP.TSX").label === "TSX");
+}
+
+console.log("6) extractInlinePathParts — paths inside composite spans:");
+{
+  type Chip = { path: string; line?: number; display: string };
+  const chipParts = (parts: readonly unknown[]) =>
+    parts.filter((p): p is Chip => typeof p === "object" && p !== null);
+
+  const row = extractInlinePathParts("Edit fs.ts src/lib/ +49");
+  check(
+    "tool-row pair keeps surrounding words as text",
+    row.length === 3 && row[0] === "Edit " && row[2] === " +49",
+  );
+  const rowChip = chipParts(row)[0];
+  check(
+    "tool-row pair combines name + dir into the real path",
+    rowChip?.path === "src/lib/fs.ts" && rowChip?.display === "src/lib/fs.ts",
+  );
+
+  const read = extractInlinePathParts("Read ToolCallView.tsx src/components/");
+  check(
+    "read row pair resolves under its dir",
+    chipParts(read)[0]?.path === "src/components/ToolCallView.tsx",
+  );
+
+  const qualified = extractInlinePathParts("see src/lib/store.ts:12 here");
+  const qChip = chipParts(qualified)[0];
+  check(
+    "qualified path with line inside words",
+    qChip?.path === "src/lib/store.ts" && qChip?.line === 12,
+  );
+
+  const wrapped = extractInlinePathParts("(src/lib/store.ts)");
+  check(
+    "wrapped path keeps brackets as text",
+    wrapped[0] === "(" &&
+      chipParts(wrapped)[0]?.path === "src/lib/store.ts" &&
+      wrapped[2] === ")",
+  );
+
+  const noDir = extractInlinePathParts("edit fs.ts please");
+  check("bare filename without dir stays text", chipParts(noDir).length === 0);
+
+  const two = extractInlinePathParts("fs.ts src/lib/ and store.ts src/lib/");
+  check("multiple pairs in one span", chipParts(two).length === 2);
+
+  const untouched = [
+    "Changes +2823 −633",
+    "Working for 1m 17s",
+    "Thought · a few seconds",
+    "https://example.com/a.ts",
+    "plain words only",
+  ];
+  check(
+    "non-path spans stay untouched",
+    untouched.every((t) => {
+      const parts = extractInlinePathParts(t);
+      return chipParts(parts).length === 0 && parts.join("") === t;
+    }),
+  );
 }
 
 if (failed > 0) {

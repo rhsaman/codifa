@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
+import agents
 import graph
 
 BODY = "نتیجهٔ کامل جست‌وجو با اطلاعات لازم\n" * 200
@@ -120,3 +121,23 @@ async def test_projection_saves_request_chars(monkeypatch, scenario, expected_ex
         assert sum(len(m.content) for m in results) < len(results) * len(BODY)
     else:
         assert sum(len(m.content) for m in results) == len(results) * len(BODY)
+
+
+# --- turn-local date stamp (no current_time round-trip for dates) -----------
+
+
+def test_today_stamp_format():
+    """The user-turn date stamp must carry a full weekday + ISO date so the
+    model answers 'today/recent/latest' without a current_time tool call."""
+    import re
+
+    stamp = graph._today_stamp()
+    m = re.search(r"Today's date: [A-Za-z]+, \d{4}-\d{2}-\d{2}\.", stamp)
+    assert m, stamp
+
+
+def test_universal_rules_ground_date_in_stamp():
+    """Rule 5 must point the model at the stamp (no tool for a plain date)."""
+    rules = agents._UNIVERSAL_RULES
+    assert "Today's date" in rules
+    assert "ONLY for a clock-precision answer" in rules

@@ -175,6 +175,13 @@ _GENERIC_PATTERNS = [
 # Cache: root -> (timestamp, map, signature)
 _CACHE: dict[str, tuple[float, dict, tuple]] = {}
 
+# Bounded caches: symbol maps hold full tags (defs + refs) per file, so an
+# unbounded dict pins every opened project until process exit. Caps keep
+# sidecar RAM bounded; eviction is oldest-first (insertion order).
+_CACHE_MAX_ENTRIES = 2000
+_FILE_CACHE_MAX_FILES = 2000
+_SYMBOL_RANGE_CACHE_MAX_FILES = 2000
+
 # abs_path -> (mtime_ns, size, syms, tags): نتیجهٔ parse هر فایل. وقتی signature
 # درخت عوض می‌شه (مثلاً بعد از یک edit ایجنت) فقط فایل‌هایی که (mtime, size)
 # شون تغییر کرده دوباره parse می‌شن، نه کل پروژه.
@@ -1023,9 +1030,18 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     with _CACHE_LOCK:
         for _k in [k for k in _FILE_CACHE if k.startswith(_prefix) and k not in new_file_cache]:
             _FILE_CACHE.pop(_k, None)
-            _CACHE.pop(_k, None)  # فایل حذف‌شده: تگ‌های کهنه‌اش هم پاک بشه
+            _CACHE.pop(_k, None)
         _FILE_CACHE.update(new_file_cache)
+        while len(_FILE_CACHE) > _FILE_CACHE_MAX_FILES:
+            _FILE_CACHE.pop(next(iter(_FILE_CACHE)), None)
         _CACHE[root_real] = (time.time(), result, signature)
+        while len(_CACHE) > _CACHE_MAX_ENTRIES:
+            for _k in _CACHE:
+                if _k != root_real:
+                    _CACHE.pop(_k, None)
+                    break
+            else:
+                break
     return result
 
 
@@ -1217,6 +1233,8 @@ def get_symbol_ranges(abs_path: str) -> dict[str, tuple[int, int, str]]:
         return dict(ranges)
     with _SYMBOL_RANGE_LOCK:
         _SYMBOL_RANGE_CACHE[abs_path] = (mtime, ranges, orig)
+        while len(_SYMBOL_RANGE_CACHE) > _SYMBOL_RANGE_CACHE_MAX_FILES:
+            _SYMBOL_RANGE_CACHE.pop(next(iter(_SYMBOL_RANGE_CACHE)), None)
     return ranges
 
 
@@ -1272,6 +1290,60 @@ def resolve_symbol_ranges(
             s, e, _ = hit
             windows.append((max(1, s), max(1, e - s + 1)))
     return windows, missing
+
+
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs)(/|$)|(^|/)test_[^/]*$|\.(test|spec)\.[A-Za-z]+$"
+)
+
+
+def find_symbol_files(
+    root: str, names: list[str]
+) -> dict[str, list[tuple[str, int, str, str]]]:
+    """{name: [(rel_path, line, kind, real_name), ...]} — کجا هر نام تعریف شده.
+
+    lookup سراسری روی ایندکس نمادها (بدون grep). تطبیق نام case-insensitive؛
+    اگه تطبیق دقیق (case-sensitive) هست فقط همون‌ها می‌مونن، و اگه تعریف
+    غیر-تست هست تعریف‌های فایل‌های تست حذف می‌شن. ``A.b`` اگه پیدا نشد با ``b``
+    امتحان می‌شه. هر فایل برای هر نام حداکثر یک بار (اولین تعریف) می‌آد.
+    """
+    wanted: dict[str, list[str]] = {}
+    for n in names or []:
+        n = str(n).strip()
+        if not n:
+            continue
+        keys = [n.lower()]
+        if "." in n:
+            keys.append(n.rsplit(".", 1)[1].lower())
+        wanted[n] = [k for k in keys if k]
+    if not wanted:
+        return {}
+    smap = build_symbol_map(root)
+    index: dict[str, list[tuple[str, int, str, str]]] = defaultdict(list)
+    for rel, syms in smap.items():
+        seen: set[str] = set()
+        for name, line, kind in syms:
+            low = str(name).lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            index[low].append((rel, int(line), str(kind), str(name)))
+    out: dict[str, list[tuple[str, int, str, str]]] = {}
+    for n, keys in wanted.items():
+        hits: list[tuple[str, int, str, str]] = []
+        for k in keys:
+            hits = list(index.get(k, ()))
+            if hits:
+                break
+        exact = [h for h in hits if h[3] == n]
+        if exact:
+            hits = exact
+        non_test = [h for h in hits if not _TEST_PATH_RE.search(h[0])]
+        if non_test:
+            hits = non_test
+        hits.sort(key=lambda h: (h[0], h[1]))
+        out[n] = hits
+    return out
 
 
 def clear_symbol_cache(root: str | None = None) -> None:

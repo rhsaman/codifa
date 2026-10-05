@@ -1,4 +1,4 @@
-import { isAtBottom, distanceFromBottom, classifyScrollEvent } from "../src/lib/scroll";
+import { isAtBottom, distanceFromBottom, classifyScrollEvent, popupRowScrollTop, scrollPopupRowIntoView } from "../src/lib/scroll";
 
 let failed = 0;
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -68,6 +68,39 @@ check(
   (() => {
     const r = classifyScrollEvent({ id: "m1", offset: 10 }, true);
     return r.fromReanchor === true && r.cancelRestore === false;
+  })(),
+);
+
+console.log("popupRowScrollTop:");
+check(
+  "ردیف پایین‌تر از نما → اسکرول به پایین",
+  popupRowScrollTop({ scrollTop: 0, clientHeight: 200, rowTop: 500, rowHeight: 40 }) === 500 + 40 - 200 + 8,
+);
+check(
+  "ردیف بالاتر از نما → اسکرول به بالا",
+  popupRowScrollTop({ scrollTop: 400, clientHeight: 200, rowTop: 100, rowHeight: 40 }) === 100 - 8,
+);
+check(
+  "ردیف داخل نما → بدون تغییر",
+  popupRowScrollTop({ scrollTop: 0, clientHeight: 200, rowTop: 50, rowHeight: 40 }) === 0,
+);
+
+console.log("scrollPopupRowIntoView:");
+check(
+  "ردیف فعال پایین لیست، کانتینر را اسکرول می‌دهد (نه پنجره)",
+  (() => {
+    const row = { offsetTop: 500, offsetHeight: 40, offsetParent: null, scrollIntoView: () => {} };
+    const container = { scrollTop: 0, clientHeight: 200, querySelector: (sel: string) => (sel === ".hist-card.kbd" ? row : null) };
+    const ok = scrollPopupRowIntoView(container as unknown as HTMLElement, ".hist-card.kbd");
+    return ok && (container as { scrollTop: number }).scrollTop === 500 + 40 - 200 + 8;
+  })(),
+);
+check(
+  "بدون ردیف فعال → false و بدون اسکرول",
+  (() => {
+    const container = { scrollTop: 0, clientHeight: 200, querySelector: () => null };
+    const ok = scrollPopupRowIntoView(container as unknown as HTMLElement, ".hist-card.kbd");
+    return ok === false && (container as { scrollTop: number }).scrollTop === 0;
   })(),
 );
 

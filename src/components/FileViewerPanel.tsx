@@ -1,14 +1,69 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../lib/fs";
+import { api, suggestSimilarFiles, type WorkspaceFile } from "../lib/fs";
 import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, extOf, fileBasename } from "../lib/fileTypes";
-import { FileIcon } from "./FileIcon";
+import { FileChip, FileIcon } from "./FileIcon";
 import { getHighlightedLines } from "./ChatMessage";
 
 /** Never paint more than this many characters of ONE file: a multi-megabyte
  *  log would freeze the tab. Copy keeps the FULL text. */
 const FILE_RENDER_CAP = 400_000;
+
+/** "Open in" destinations. All of them first try a running Neovim instance;
+ *  the terminal entries then launch nvim inside that terminal (Warp's URI
+ *  scheme cannot run a command, so it opens a tab at the file's folder). */
+type OpenTargetId = "nvim" | "vscode" | "cmux" | "ghostty" | "warp";
+
+const OPEN_TARGETS: Array<{
+  id: OpenTargetId;
+  icon: string;
+  iconClass: string;
+  label: string;
+  hint: string;
+  title: string;
+}> = [
+  {
+    id: "nvim",
+    icon: "NV",
+    iconClass: "fv-open-icon-nvim",
+    label: "Neovim",
+    hint: "Running instance, else new terminal",
+    title: "Open in the running Neovim instance (or a new terminal)",
+  },
+  {
+    id: "cmux",
+    icon: "CM",
+    iconClass: "fv-open-icon-cmux",
+    label: "Neovim in cmux",
+    hint: "New cmux workspace running nvim",
+    title: "Open nvim in a new cmux workspace (opens just the folder in cmux when its CLI refuses external apps)",
+  },
+  {
+    id: "ghostty",
+    icon: "GH",
+    iconClass: "fv-open-icon-ghostty",
+    label: "Neovim in Ghostty",
+    hint: "New Ghostty window running nvim",
+    title: "Open nvim in a new Ghostty window (requires Ghostty)",
+  },
+  {
+    id: "warp",
+    icon: "WP",
+    iconClass: "fv-open-icon-warp",
+    label: "Neovim in Warp",
+    hint: "New Warp tab at the file's folder",
+    title: "Open a new Warp tab at the file's folder (Warp cannot be told to run nvim)",
+  },
+  {
+    id: "vscode",
+    icon: "VS",
+    iconClass: "fv-open-icon-vscode",
+    label: "VS Code",
+    hint: "code CLI, app bundle, or vscode:// handler",
+    title: "Open in VS Code",
+  },
+];
 
 /** Docked viewer tab for one workspace file: line-numbered, syntax
  *  highlighted, with an optional target line highlighted and scrolled into
@@ -44,8 +99,12 @@ export function FileViewerPanel({
   }>({ loading: true });
   const [copied, setCopied] = useState(false);
   const [extNote, setExtNote] = useState<string | null>(null);
+  // Close workspace matches shown when the path doesn't exist — model output
+  // (plans, summaries) references plenty of paths that were never created or
+  // have moved, and a bare "not found" is a dead end.
+  const [similar, setSimilar] = useState<WorkspaceFile[]>([]);
   const [openMenu, setOpenMenu] = useState(false);
-  const [opening, setOpening] = useState<null | "nvim" | "vscode">(null);
+  const [opening, setOpening] = useState<null | OpenTargetId>(null);
   const openMenuRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
@@ -76,7 +135,11 @@ export function FileViewerPanel({
         setState(
           res?.content != null
             ? { loading: false, content: res.content }
-            : { loading: false, error: "File not found (or unreadable) at this path." },
+            : {
+                loading: false,
+                error:
+                  "No file exists at this path — it may be planned but never created, or it has moved.",
+              },
         );
       } catch (err) {
         if (!alive) return;
@@ -90,6 +153,22 @@ export function FileViewerPanel({
       alive = false;
     };
   }, [filePath, root, isImage]);
+
+  // On a failed read, offer the closest workspace files instead of a dead
+  // end: same name elsewhere, then same directory, then similar stems.
+  useEffect(() => {
+    setSimilar([]);
+    if (!state.error || !root) return;
+    let alive = true;
+    (async () => {
+      const files = await api.fsWalk(root).catch(() => []);
+      if (!alive) return;
+      setSimilar(suggestSimilarFiles(filePath, files));
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [state.error, filePath, root]);
 
   const content = state.content ?? "";
   const binary = !state.loading && content.includes("\u0000");
@@ -124,7 +203,7 @@ export function FileViewerPanel({
     ? `${filePath.slice(0, filePath.lastIndexOf("/"))}/`
     : "";
 
-  const openExternalFile = async (editor: "nvim" | "vscode") => {
+  const openExternalFile = async (editor: OpenTargetId) => {
     setExtNote(null);
     setOpening(editor);
     try {
@@ -162,7 +241,7 @@ export function FileViewerPanel({
   return (
     <div className="file-viewer" dir="ltr">
       <div className="file-viewer-head">
-        <FileIcon path={filePath} size={18} />
+        <FileIcon path={filePath} size={20} />
         {dirPart && <span className="file-viewer-dir">{dirPart}</span>}
         <span className="file-viewer-name" title={filePath}>
           {fileBasename(filePath)}
@@ -188,34 +267,28 @@ export function FileViewerPanel({
           </button>
           {openMenu && (
             <div className="fv-open-menu" role="menu" dir="ltr">
-              <button
-                type="button"
-                className="fv-open-item"
-                role="menuitem"
-                disabled={opening !== null}
-                title="Open in the running Neovim instance (or a new terminal)"
-                onClick={() => void openExternalFile("nvim")}
-              >
-                <span className="fv-open-icon fv-open-icon-nvim" aria-hidden="true">NV</span>
-                <span className="fv-open-text">
-                  <span className="fv-open-label">Neovim{opening === "nvim" ? " — opening…" : ""}</span>
-                  <span className="fv-open-hint">Running instance, else new terminal</span>
-                </span>
-              </button>
-              <button
-                type="button"
-                className="fv-open-item"
-                role="menuitem"
-                disabled={opening !== null}
-                title="Open in VS Code"
-                onClick={() => void openExternalFile("vscode")}
-              >
-                <span className="fv-open-icon fv-open-icon-vscode" aria-hidden="true">VS</span>
-                <span className="fv-open-text">
-                  <span className="fv-open-label">VS Code{opening === "vscode" ? " — opening…" : ""}</span>
-                  <span className="fv-open-hint">code CLI, else vscode:// handler</span>
-                </span>
-              </button>
+              {OPEN_TARGETS.map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  className="fv-open-item"
+                  role="menuitem"
+                  disabled={opening !== null}
+                  title={t.title}
+                  onClick={() => void openExternalFile(t.id)}
+                >
+                  <span className={`fv-open-icon ${t.iconClass}`} aria-hidden="true">
+                    {t.icon}
+                  </span>
+                  <span className="fv-open-text">
+                    <span className="fv-open-label">
+                      {t.label}
+                      {opening === t.id ? " — opening…" : ""}
+                    </span>
+                    <span className="fv-open-hint">{t.hint}</span>
+                  </span>
+                </button>
+              ))}
             </div>
           )}
         </div>
@@ -231,6 +304,16 @@ export function FileViewerPanel({
       </div>
       {state.loading && <div className="file-viewer-note">Loading…</div>}
       {state.error && <div className="file-viewer-note">⚠ {state.error}</div>}
+      {state.error && similar.length > 0 && (
+        <div className="fv-suggest">
+          <span className="fv-suggest-label">Closest files in this workspace:</span>
+          <div className="fv-suggest-list">
+            {similar.map((f) => (
+              <FileChip key={f.rel} path={f.rel} display={f.rel} />
+            ))}
+          </div>
+        </div>
+      )}
       {extNote && <div className="file-viewer-note">⚠ {extNote}</div>}
       {binary && <div className="file-viewer-note">Binary file — no text preview.</div>}
       {capped && (

@@ -209,6 +209,8 @@ def wants_skill_or_mcp(text: str) -> bool:
     Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
     action; اسکیل/مهارت → skill target)."""
     low = text.lower()
+    if re.search(r"/\s*(skill|mcp|connector|اسکیل|مهارت)", low):
+        return True
     action = re.search(
         r"\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)",
         low,
@@ -1107,8 +1109,30 @@ async def app_save(req: StateRequest) -> dict:
         # doesn't linger in the checkpointer SQLite file.
         for cid in req.deleted_chats or []:
             await clear_chat_resume_checkpoint(str(cid))
+            try:
+                import trace_store as _ts_del
+
+                _ts_del.clear(str(cid))
+            except Exception:  # noqa: BLE001, S110 — cleanup never breaks save
+                pass
+            try:
+                import tools as _tools_del
+
+                _tools_del.clear_chat_state(str(cid))
+            except Exception:  # noqa: BLE001, S110 — cleanup never breaks save
+                pass
     if req.deleted_workspaces:
         state_db.remove_workspace_vectors(req.deleted_workspaces)
+        try:
+            from symbol_index import clear_symbol_cache
+
+            for _root in req.deleted_workspaces or []:
+                try:
+                    clear_symbol_cache(str(_root))
+                except Exception:  # noqa: BLE001, S110 — best-effort
+                    pass
+        except Exception:  # noqa: BLE001, S110 — best-effort
+            pass
     return {"ok": True}
 
 
@@ -1187,38 +1211,46 @@ async def chat_traces_clear(chat_id: str) -> dict:
 
 class BrowserLaunchRequest(BaseModel):
     url: str = "about:blank"
+    chat_id: str = ""
 
 
 class BrowserClickRequest(BaseModel):
     x: int
     y: int
+    chat_id: str = ""
 
 
 class BrowserTypeRequest(BaseModel):
     text: str
+    chat_id: str = ""
 
 
 class BrowserKeyRequest(BaseModel):
     key: str
+    chat_id: str = ""
 
 
 class BrowserNavigateRequest(BaseModel):
     url: str
+    chat_id: str = ""
 
 
 class BrowserScrollRequest(BaseModel):
     dx: int = 0
     dy: int = 0
+    chat_id: str = ""
 
 
 class BrowserViewportRequest(BaseModel):
     width: int
     height: int
+    chat_id: str = ""
 
 
 class BrowserMoveRequest(BaseModel):
     x: int
     y: int
+    chat_id: str = ""
 
 
 @app.post("/browser/viewport")
@@ -1226,7 +1258,7 @@ async def browser_viewport(req: BrowserViewportRequest) -> dict:
     """Resize the virtual browser viewport (responsive device presets)."""
     import browser_session
 
-    return await browser_session.set_viewport(req.width, req.height)
+    return await browser_session.set_viewport(req.width, req.height, req.chat_id)
 
 
 @app.post("/browser/move")
@@ -1234,15 +1266,15 @@ async def browser_move(req: BrowserMoveRequest) -> dict:
     """Move the virtual cursor (hover) inside the browser — no real mouse."""
     import browser_session
 
-    return await browser_session.move(req.x, req.y)
+    return await browser_session.move(req.x, req.y, req.chat_id)
 
 
 @app.get("/browser/status")
-async def browser_status() -> dict:
+async def browser_status(chat_id: str = "") -> dict:
     """Whether a virtual browser session is currently alive."""
     import browser_session
 
-    return browser_session.status()
+    return browser_session.status(chat_id)
 
 
 @app.post("/browser/launch")
@@ -1250,15 +1282,15 @@ async def browser_launch(req: BrowserLaunchRequest) -> dict:
     """Start the virtual browser (or navigate it when already running)."""
     import browser_session
 
-    return await browser_session.launch(req.url.strip() or "about:blank")
+    return await browser_session.launch(req.url.strip() or "about:blank", req.chat_id)
 
 
 @app.get("/browser/screenshot")
-async def browser_screenshot() -> dict:
+async def browser_screenshot(chat_id: str = "") -> dict:
     """Latest JPEG frame of the virtual browser viewport (base64)."""
     import browser_session
 
-    return await browser_session.screenshot()
+    return await browser_session.screenshot(chat_id)
 
 
 @app.post("/browser/click")
@@ -1266,7 +1298,7 @@ async def browser_click(req: BrowserClickRequest) -> dict:
     """Virtual click at viewport pixel coordinates — no real mouse involved."""
     import browser_session
 
-    return await browser_session.click(req.x, req.y)
+    return await browser_session.click(req.x, req.y, req.chat_id)
 
 
 @app.post("/browser/type")
@@ -1274,7 +1306,7 @@ async def browser_type(req: BrowserTypeRequest) -> dict:
     """Type text into the focused element inside the virtual browser."""
     import browser_session
 
-    return await browser_session.type_text(req.text)
+    return await browser_session.type_text(req.text, req.chat_id)
 
 
 @app.post("/browser/key")
@@ -1282,7 +1314,7 @@ async def browser_key(req: BrowserKeyRequest) -> dict:
     """Press a key (Enter, Tab, Escape, ...) inside the virtual browser."""
     import browser_session
 
-    return await browser_session.press_key(req.key)
+    return await browser_session.press_key(req.key, req.chat_id)
 
 
 @app.post("/browser/navigate")
@@ -1290,13 +1322,14 @@ async def browser_navigate(req: BrowserNavigateRequest) -> dict:
     """Navigate the virtual browser to a URL."""
     import browser_session
 
-    return await browser_session.navigate(req.url.strip())
+    return await browser_session.navigate(req.url.strip(), req.chat_id)
 
 
 class BrowserSearchRequest(BaseModel):
     """Omnibox query for the virtual browser (Google → Bing → DuckDuckGo)."""
 
     query: str
+    chat_id: str = ""
 
 
 @app.post("/browser/search")
@@ -1304,7 +1337,7 @@ async def browser_search(req: BrowserSearchRequest) -> dict:
     """Search the web: Google first, falling back to Bing then DuckDuckGo."""
     import browser_session
 
-    return await browser_session.search(req.query)
+    return await browser_session.search(req.query, req.chat_id)
 
 
 @app.post("/browser/scroll")
@@ -1312,13 +1345,14 @@ async def browser_scroll(req: BrowserScrollRequest) -> dict:
     """Scroll the virtual browser viewport."""
     import browser_session
 
-    return await browser_session.scroll(req.dx, req.dy)
+    return await browser_session.scroll(req.dx, req.dy, req.chat_id)
 
 
 class BrowserHistoryRequest(BaseModel):
     """History control for the virtual browser (back / forward / reload)."""
 
     action: str
+    chat_id: str = ""
 
 
 @app.post("/browser/history")
@@ -1326,15 +1360,19 @@ async def browser_history(req: BrowserHistoryRequest) -> dict:
     """Run a history action (back, forward, reload) in the virtual browser."""
     import browser_session
 
-    return await browser_session.history(req.action.strip().lower())
+    return await browser_session.history(req.action.strip().lower(), req.chat_id)
+
+
+class BrowserCloseRequest(BaseModel):
+    chat_id: str = ""
 
 
 @app.post("/browser/close")
-async def browser_close() -> dict:
+async def browser_close(req: BrowserCloseRequest | None = None) -> dict:
     """Shut down the virtual browser session."""
     import browser_session
 
-    return await browser_session.close()
+    return await browser_session.close(req.chat_id if req else "")
 
 
 # --- git ------------------------------------------------------------------- #
@@ -1833,6 +1871,7 @@ class SkillSyncRequest(BaseModel):
     previous_name: str = ""
     content: str = ""
     description: str = ""
+    fa_keywords: list[str] = []
     delete: bool = False
 
 
@@ -1860,14 +1899,19 @@ async def skills_sync(req: SkillSyncRequest) -> dict:
     if not content:
         # Rebuild a full skill from structured fields when no raw markdown came.
         name = name or (req.description or "").strip()[:60] or "skill"
+        _fa_line = ""
+        _fa_clean = [str(k or "").strip() for k in (req.fa_keywords or []) if str(k or "").strip()]
+        if _fa_clean:
+            _fa_line = f"fa_keywords: {', '.join(_fa_clean)}\n"
         content = (
             "---\n"
             f"name: {name}\n"
             f"description: {(req.description or '').strip()}\n"
+            f"{_fa_line}"
             "---\n\n"
             f"# {name}\n"
         )
-    result = persist_skill(content, fallback_name=name, previous_name=req.previous_name)
+    result = persist_skill(content, fallback_name=name, previous_name=req.previous_name, fa_keywords=req.fa_keywords or None)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("note", "save failed"))
     return result
@@ -2776,12 +2820,20 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     async def event_gen():
         # New user turn -> new trace turn so the Trace panel can group
         # each turn's llm/prompt/tool entries under one header.
+        # Carry the previous turn final status forward so a short follow-up
+        # like "done?" starts with memory instead of re-running finished work.
+        _prev_outcome_note = ""
         try:
             import trace_store as _trace_store
 
+            _prev_outcome = _trace_store.previous_turn_outcome(str(req.chat_id or ""))
+            _prev_outcome_note = _trace_store.format_turn_outcome_note(_prev_outcome)
             _trace_store.next_turn(str(req.chat_id or ""))
         except Exception:  # noqa: BLE001, S110 — trace must never break the stream
             pass
+        _effective_history = list(req.history or [])
+        if _prev_outcome_note:
+            _effective_history = [{"role": "system", "content": _prev_outcome_note}] + _effective_history
         # Create the agent generator so we can close it on disconnect
         agent_gen = run_agent(
             provider=req.provider,
@@ -2794,7 +2846,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             root=req.root,
             mode=req.mode,
             prompt=req.prompt,
-            history=req.history,
+            history=_effective_history,
             attachments=req.attachments,
             images=req.images,
             system_prompt=req.system_prompt,
@@ -3128,7 +3180,9 @@ async def index_status(
     root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
     vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
 ) -> IndexStatusResponse:
-    from embeddings import embedder_available
+    # Lightweight gate: file-presence check only, never loads the model so
+    # status polling does not pin the ~1.1 GB session in RAM.
+    from embeddings import is_available as embedder_available
     from indexer import needs_index
 
     try:

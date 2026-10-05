@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
-import { useViewerTabs, visibleTabs, type ViewerKind } from "../lib/viewerTabs";
+import { useViewerTabs, viewerTabTitle, visibleTabs, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
+import { TabListButton, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
 
 function ReviewIcon() {
@@ -65,16 +66,98 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   text: PlanIcon,
 };
 
-const KIND_LABEL: Record<ViewerKind, string> = {
-  review: 'Git',
-  trace: 'Trace',
-  inbox: 'Inbox',
-  plan: 'Plan',
-  browser: 'Browser',
-  // Unused: file tabs keep their per-path title (the file name).
-  file: 'File',
-  text: 'Text',
-};
+/** "+" button in the side pane header: dropdown that opens any pane tab
+ *  (git diff, trace, plan, inbox, browser) or flips the pane into panel
+ *  mode — the single entry point, no separate per-panel icons. */
+export function ViewerAddButton() {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (!t.closest(".viewer-add-wrap") && !t.closest(".viewer-add-menu")) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const toggle = () => {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const r = wrapRef.current?.getBoundingClientRect();
+    if (r) {
+      // Clamp inside the viewport: near the window's right edge (RTL) the
+      // dropdown must never poke out.
+      const left = Math.max(12, Math.min(r.left, window.innerWidth - 242));
+      setPos({ top: r.bottom + 6, left });
+    }
+    setOpen(true);
+  };
+
+  const items: Array<{ key: string; label: string; icon: () => React.JSX.Element; run: () => void }> = [
+    { key: "review", label: "Review — git diff", icon: ReviewIcon, run: () => useViewerTabs.getState().openGitDiff() },
+    { key: "trace", label: "Trace", icon: TraceIcon, run: () => useViewerTabs.getState().openTraces() },
+    { key: "inbox", label: "Schedule inbox", icon: InboxIcon, run: () => useViewerTabs.getState().openInbox() },
+    { key: "browser", label: "Browser", icon: BrowserIcon, run: () => useViewerTabs.getState().openBrowser() },
+  ];
+
+  return (
+    <span className="viewer-add-wrap" ref={wrapRef}>
+      <button
+        type="button"
+        className="editor-tab-new viewer-add-btn"
+        title="Open a tab in the side pane"
+        aria-label="Open a tab in the side pane"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={toggle}
+      >
+        +
+      </button>
+      {open && pos && (
+        <div
+          className="ws-menu viewer-add-menu"
+          role="menu"
+          style={{ position: "fixed", top: pos.top, left: pos.left }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {items.map((it) => {
+            const Icon = it.icon;
+            return (
+              <button
+                key={it.key}
+                type="button"
+                className="ws-menu-btn"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  it.run();
+                }}
+              >
+                <Icon />
+                {it.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </span>
+  );
+}
+
+
 
 function CloseIcon() {
   return (
@@ -82,6 +165,51 @@ function CloseIcon() {
       <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
     </svg>
   );
+}
+
+/** Chevron at the pane header's start: the searchable full tab list (open
+ *  tabs with ages + close buttons, then recently closed tabs). The bar
+ *  itself never scrolls — tabs squeeze — so this is how every tab stays
+ *  reachable when there are many. */
+export function ViewerTabListButton() {
+  const tabs = useViewerTabs((s) => s.tabs);
+  const activeId = useViewerTabs((s) => s.activeId);
+  const closed = useViewerTabs((s) => s.closedTabs);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const iconFor = (t: ViewerTab) =>
+    t.kind === "file" ? (
+      <FileIcon path={t.filePath ?? t.title} size={20} />
+    ) : (
+      (() => {
+        const Icon = KIND_ICON[t.kind];
+        return <Icon />;
+      })()
+    );
+  const sections: TabListSection[] = [
+    {
+      label: "Open tabs",
+      entries: visibleTabs(tabs, activeChatId).map((t) => ({
+        key: t.id,
+        title: viewerTabTitle(t),
+        icon: iconFor(t),
+        age: t.createdAt,
+        active: t.id === activeId,
+        onOpen: () => useViewerTabs.getState().setActiveViewer(t.id),
+        onClose: () => useViewerTabs.getState().closeViewer(t.id),
+      })),
+    },
+    {
+      label: "Recently closed tabs",
+      entries: closed.map((c) => ({
+        key: `closed-${c.tab.id}`,
+        title: viewerTabTitle(c.tab),
+        icon: iconFor(c.tab),
+        age: c.closedAt,
+        onOpen: () => useViewerTabs.getState().reopenClosedViewerTab(c.tab.id),
+      })),
+    },
+  ];
+  return <TabListButton sections={sections} label="Tab list" />;
 }
 
 /** VSCode-style tab bar for the right editor group (diff / trace / inbox).
@@ -110,7 +238,8 @@ export function ViewerTabBar() {
     setDropTarget(null);
   };
 
-  if (tabs.length === 0) return null;
+  // No early null return: with the pane open the header (and its "+" menu)
+  // must stay reachable even when every tab is closed.
 
   return (
     <div
@@ -144,12 +273,9 @@ export function ViewerTabBar() {
     >
       {tabs.map((t) => {
         const active = t.id === shownActiveId;
-        // File/text tabs show their own title (file name / message caption),
-        // not the kind label.
-        const title = prepareContent(
-          t.kind === "file" || t.kind === "text" ? t.title : (KIND_LABEL[t.kind] ?? t.title),
-          "ltr",
-        );
+        // File/text tabs show their own title; sub-agent trace tabs keep
+        // their own title so they never look like the main chat trace.
+        const title = prepareContent(viewerTabTitle(t), "ltr");
         const dropCls =
           dropTarget?.id === t.id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
         const Icon = KIND_ICON[t.kind];
@@ -210,7 +336,7 @@ export function ViewerTabBar() {
           >
             <span className="viewer-tab-icon" aria-hidden="true">
               {t.kind === "file" ? (
-                <FileIcon path={t.filePath ?? t.title} size={18} />
+                <FileIcon path={t.filePath ?? t.title} size={20} />
               ) : (
                 <Icon />
               )}
@@ -232,21 +358,33 @@ export function ViewerTabBar() {
           </div>
         );
       })}
-      <button
-        type="button"
-        className="editor-tab-full"
-        title={viewerFull ? "Exit fullscreen" : "Fullscreen viewer"}
-        aria-label={viewerFull ? "Exit viewer fullscreen" : "Fullscreen viewer"}
-        aria-pressed={viewerFull}
-        onClick={() => {
-          const vt = useViewerTabs.getState();
-          const next = !vt.fullscreen;
-          vt.setFullscreen(next);
-          if (next) useStore.getState().setChatFullscreen(false);
-        }}
-      >
-        {viewerFull ? <CompressIcon /> : <ExpandIcon />}
-      </button>
     </div>
+  );
+}
+
+/** Fullscreen toggle for the whole side pane — lives in the pane header
+ *  AFTER the "+" opener (not inside the tab bar), so the header reads
+ *  [tabs | + | fullscreen | panel | collapse]. Hidden with no tabs. */
+export function ViewerPaneFullscreenButton() {
+  const tabs = useViewerTabs((s) => s.tabs);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const viewerFull = useViewerTabs((s) => s.fullscreen);
+  if (visibleTabs(tabs, activeChatId).length === 0) return null;
+  return (
+    <button
+      type="button"
+      className="editor-tab-full viewer-pane-full"
+      title={viewerFull ? "Exit fullscreen" : "Fullscreen viewer"}
+      aria-label={viewerFull ? "Exit viewer fullscreen" : "Fullscreen viewer"}
+      aria-pressed={viewerFull}
+      onClick={() => {
+        const vt = useViewerTabs.getState();
+        const next = !vt.fullscreen;
+        vt.setFullscreen(next);
+        if (next) useStore.getState().setChatFullscreen(false);
+      }}
+    >
+      {viewerFull ? <CompressIcon /> : <ExpandIcon />}
+    </button>
   );
 }

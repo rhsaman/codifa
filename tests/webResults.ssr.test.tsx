@@ -105,19 +105,22 @@ console.log('4b) چیپ فایل: آیکن همیشه سمت چپ مسیر اس�
     nameIdx > 0 && fileHtml.indexOf('src/foo.ts', nameIdx) > nameIdx)
 }
 
-console.log('4c) آیکون فایل: تایل رنگی با مونوگرام پسوند (بدون گرادیان/متن DOM):')
+console.log('4c) آیکون فایل: نشان برند هر زبان (بدون گرادیان/متن DOM بیرون svg):')
 {
   const { FileIcon } = await import('../src/components/FileIcon')
-  const tsHtml = renderToString(<FileIcon path="src/App.tsx" size={16} />)
-  check('تایل TS رندر شد', tsHtml.includes('file-icon-svg') && tsHtml.includes('<svg'))
-  check('مونوگرام TS داخل svg است', tsHtml.includes('>TS<') || tsHtml.includes('>TSX<'), tsHtml.slice(0, 300))
-  check('بدون گرادیان defs (بدون تداخل id)', !tsHtml.includes('<linearGradient') && !tsHtml.includes('<defs'))
+  const tsxHtml = renderToString(<FileIcon path="src/App.tsx" size={16} />)
+  check('اتم React برای tsx رندر شد', tsxHtml.includes('file-icon-svg') && tsxHtml.includes('#61dafb'), tsxHtml.slice(0, 300))
+  const tsHtml = renderToString(<FileIcon path="src/lib/store.ts" size={16} />)
+  check('مونوگرام TS داخل svg است', tsHtml.includes('>TS<'), tsHtml.slice(0, 300))
+  check('بدون گرادیان defs (بدون تداخل id)', !tsxHtml.includes('<linearGradient') && !tsxHtml.includes('<defs'))
   const pyHtml = renderToString(<FileIcon path="backend/agents.py" size={16} />)
-  check('مونوگرام PY داخل svg است', pyHtml.includes('>PY<'), pyHtml.slice(0, 300))
+  check('لوگوی Python برای py رندر شد', pyHtml.includes('#3776ab') && pyHtml.includes('#ffd43b'), pyHtml.slice(0, 300))
   const imgHtml = renderToString(<FileIcon path="a/photo.png" size={16} />)
   check('آیکون تصویری تایل رنگی دارد', imgHtml.includes('#a074c4'))
-  const unknownHtml = renderToString(<FileIcon path="Makefile" size={16} />)
+  const unknownHtml = renderToString(<FileIcon path="README" size={16} />)
   check('پسوند ناشناخته: آیکون خنثی بدون تایل رنگی', !unknownHtml.includes('#a074c4') && unknownHtml.includes('<svg'))
+  const dockerHtml = renderToString(<FileIcon path="Dockerfile" size={16} />)
+  check('Dockerfile بدون پسوند: تایل DK', dockerHtml.includes('>DK<'))
 }
 
 console.log('5) FileResultLinks: آیتم glob (فقط path، بدون line/text) درست رندر می‌شود:')

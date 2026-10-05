@@ -132,3 +132,87 @@ def test_cheap_truncation_exempts_referenced_result():
     by_id = {m.tool_call_id: str(m.content) for m in msgs if isinstance(m, ToolMessage)}
     assert "backend/graph.py" in by_id["t0"], "referenced result must stay verbatim"
     assert by_id["t1"].startswith("[truncated "), "unreferenced old result still truncates"
+
+
+# --- output caps (token saver) ------------------------------------------------
+
+
+def test_terminal_cap_is_10k():
+    import tools
+
+    assert tools.MAX_TERMINAL_OUTPUT == 10_000, (
+        f"terminal cap must stay ~10K, got {tools.MAX_TERMINAL_OUTPUT}"
+    )
+
+
+def test_tool_out_chars_cap_is_8k():
+    import inspect
+
+    import tools
+
+    src = inspect.getsource(tools.make_tool_callbacks)
+    assert "8_000" in src, "tool_out_chars cap must be 8K"
+    assert "16_000" not in src, "old 16K cap must be gone"
+
+
+def test_exec_terminal_head_tail_truncation_preserves_tail(tmp_path):
+    import tools
+
+    code = "print('A' * 20000); print('TAIL_MARKER_XYZ')"
+    _, output = tools._exec_terminal(
+        f"python3 -c \"{code}\"", str(tmp_path), 30
+    )
+    assert len(output) <= tools.MAX_TERMINAL_OUTPUT + 200, len(output)
+    assert "truncated" in output, "truncation marker must be present"
+    assert "TAIL_MARKER_XYZ" in output, "tail (test summary) must survive"
+    assert output.startswith("A"), "head must survive"
+
+
+def test_terminal_tool_head_tail_truncation(tmp_path):
+    async def _run():
+        import tools
+
+        cbs = tools.make_tool_callbacks(
+            str(tmp_path), lambda ev: None, context_window=1_000_000
+        )
+        big = "y" * 50_000 + "FINAL_TAIL"
+        (tmp_path / "big.txt").write_text(big)
+        out = await cbs["run_terminal"](
+            command="python3 -c \"print(open('big.txt').read())\""
+        )
+        return out
+
+    out = asyncio.run(_run())
+    assert "truncated" in out, "terminal tool must mark truncation"
+    assert "FINAL_TAIL" in out, "tail must survive head+tail cut"
+    # Capped near 8-10K, not the full 50K.
+    assert len(out) < 20_000, len(out)
+
+
+# --- solo update_plan ban -----------------------------------------------------
+
+
+def test_update_plan_doc_bans_solo(tmp_path):
+    import tools
+
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
+    doc = cbs["update_plan"].__doc__ or ""
+    assert "NEVER send update_plan alone" in doc, doc
+    assert "a solo update_plan is fine" not in doc, doc
+
+
+def test_plan_only_nudge_bans_solo():
+    from llm import _PLAN_ONLY_NUDGE
+
+    assert "solo update_plan is fine" not in _PLAN_ONLY_NUDGE
+    assert "batch" in _PLAN_ONLY_NUDGE.lower()
+
+
+def test_plan_reuse_note_bans_solo():
+    from agents import _plan_reuse_note
+
+    history = [
+        {"mode": "coder", "plan": [{"content": "do it", "status": "pending"}]}
+    ]
+    note = _plan_reuse_note(history)
+    assert "NEVER send update_plan alone" in note, note

@@ -15,6 +15,7 @@ import {
   isSlashCommand,
   parseSlashInput,
   prettySlashLabel,
+  slashTokenRange,
   loadHistory,
   recordHistory,
   loadPins,
@@ -105,6 +106,7 @@ import {
   messageFingerprint,
   shouldLandOnLatest,
   scrollMatchesPin,
+  scrollPopupRowIntoView,
 } from "../lib/scroll";
 import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget } from "../lib/messageWindow";
 import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
@@ -152,10 +154,6 @@ import { useViewerTabs } from "../lib/viewerTabs";
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 
-const PROVIDER_LABELS: Record<string, string> = Object.fromEntries(
-  Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
-);
-
 const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
   ["none", "None"],
   ["low", "Low"],
@@ -182,6 +180,7 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "compact", hint: "Summarize & compact the chat context" },
   { name: "clear", hint: "Clear all messages in this chat" },
   { name: "new", hint: "Start a new chat" },
+  { name: "plan", hint: "Switch this chat to Plan mode (describe the work after the command to plan it)" },
   { name: "undo", hint: "Undo the last user/assistant exchange" },
   { name: "redo", hint: "Redo the last undone exchange" },
   {
@@ -374,7 +373,6 @@ export function ChatPanel() {
   const root = useStore((s) => s.root);
   const dir = useStore((s) => s.dir);
   const workspaces = useStore((s) => s.workspaces);
-  const toggleDir = useStore((s) => s.toggleDir);
   const settings = useStore((s) => s.settings);
   const modes = useStore((s) => allModes(s.settings));
   const nvimFile = useStore((s) => s.nvimFile);
@@ -603,14 +601,25 @@ export function ChatPanel() {
   const [historyIdx, setHistoryIdx] = useState(0);
   const [promptHistory, setPromptHistory] = useState<string[]>(() => loadHistory());
   const [pinnedCmds, setPinnedCmds] = useState<string[]>(() => loadPins());
-  // A typed or inserted slash command paints the composer text with the
-  // accent color (Codex-style). The raw text stays visible in a plain
-  // textarea — no chip/popup card is rendered over the input, so caret,
-  // selection and IME editing keep working. Only known commands highlight;
-  // unknown "/xxx" stays plain text until submit reports it.
+  // Codex-style slash highlight: only the leading "/name" token gets the
+  // accent color, args and plain text keep the normal color. A backdrop div
+  // mirrors the textarea text (same font/padding/wrap) and paints the token
+  // span; the textarea itself turns transparent so caret, selection and IME
+  // keep working on the real input. Only known commands highlight; unknown
+  // "/xxx" stays plain text until submit reports it.
+  const composerBackdropRef = useRef<HTMLDivElement>(null);
   const slashParsed = parseSlashInput(input);
   const slashActive =
     !!slashParsed?.name && COMMANDS.some((c) => c.name === slashParsed.name);
+  const slashRange = slashActive ? slashTokenRange(input) : null;
+  const syncBackdropScroll = useCallback(() => {
+    const el = textareaRef.current;
+    const bd = composerBackdropRef.current;
+    if (el && bd) {
+      bd.scrollTop = el.scrollTop;
+      bd.scrollLeft = el.scrollLeft;
+    }
+  }, []);
   const [dragOver, setDragOver] = useState(false);
   // "+" action menu (files / screenshot / skills / MCP) — the single entry
   // point that keeps the bottom toolbar minimal.
@@ -630,10 +639,14 @@ export function ChatPanel() {
     getSkillsList().length === 0,
   );
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
+  // Second mount point on the app bar's right end — the balance chip portals
+  // there so the wallet sits next to the workspace menu, not mid-bar.
+  const [titlebarRightEl, setTitlebarRightEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     // The titlebar mounts in the same commit as this panel, so resolve the
     // portal target only after the DOM is actually committed.
     setTitlebarEl(document.getElementById("titlebar-toolbar"));
+    setTitlebarRightEl(document.getElementById("titlebar-right"));
   }, []);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
@@ -792,6 +805,10 @@ export function ChatPanel() {
   // scrolled into view on Ctrl+J/K / arrow navigation (the list scrolls
   // internally and the highlight can move outside the visible 300px area).
   const skillMentionPopupRef = useRef<HTMLDivElement>(null);
+  // Same containers for the slash-command and history popups: keyboard
+  // navigation moves the highlight while the list scrolls independently.
+  const cmdPopupRef = useRef<HTMLDivElement>(null);
+  const historyPopupRef = useRef<HTMLDivElement>(null);
   const lastEventAt = useRef(0);
   const toolRunningRef = useRef(0);
   /** When the stall hint first turned on (see the watchdog in `send`); null
@@ -910,10 +927,14 @@ export function ChatPanel() {
     useStore.getState().setChatMode(chat.id, mode);
   };
 
-  // Cycle to the next/previous mode in the current chat (Tab / ⌘M).
+  // Cycle Ask <-> Coder in the current chat (Tab / ⌘M). Plan is entered
+  // via `/plan` (Codex-style) and never appears in the cycle or the mode
+  // menu; when the chat is already in Plan mode, Tab lands on Ask.
   const cycleMode = (dir: 1 | -1) => {
     if (!chat) return;
-    const ids = allModes(useStore.getState().settings).map((m) => m.id);
+    const ids = allModes(useStore.getState().settings)
+      .map((m) => m.id)
+      .filter((id) => id !== "plan");
     const idx = ids.indexOf(chat.mode);
     const next = ids[(idx + dir + ids.length) % ids.length] ?? "ask";
     changeMode(next);
@@ -1535,7 +1556,8 @@ export function ChatPanel() {
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [input]);
+    syncBackdropScroll();
+  }, [input, syncBackdropScroll]);
 
   // forkSection (reading mode → "سوال از این بخش") sets this flag so the
   // freshly-created chat's composer is focused on mount, letting the user type
@@ -2278,40 +2300,32 @@ export function ChatPanel() {
           ?.messages.find((m) => m.id === assistantMsg.id)?.toolActivity ?? []
       ).filter((a) => a.status !== "running");
       if (doneActs.length === 0) return;
+      // Token saver: keep this block tiny — it is re-sent on every later
+      // request. Tool outputs already live in history as ToolMessages, so only
+      // fold a short per-tool summary here (no item rows, no file bodies).
+      const MAX_ITEMS = 5;
+      const MAX_SUMMARY_CHARS = 200;
+      const MAX_BLOCK_CHARS = 2000;
       const blocks: string[] = [];
-      for (const a of doneActs.slice(0, 20)) {
-        const head = `- ${a.tool}${a.summary ? `: ${a.summary}` : ""}`;
-        // Fold the REAL tool output (not just the summary) so a reconnect does
-        // not re-execute the call and waste context. `items`/`results` carry the
-        // actual rows (grep hits, glob paths, web_search links, …); fall back to
-        // the summary only when there is no structured result.
-        const rows = (a.items ?? a.results ?? []) as unknown as Array<
-          Record<string, unknown>
-        >;
-        const body = rows.length
-          ? rows
-            .slice(0, 50)
-            .map((r) => {
-              const line =
-                (r.snippet as string) ||
-                (r.content as string) ||
-                (r.text as string) ||
-                (r.title as string) ||
-                (r.url as string) ||
-                (r.path as string) ||
-                (r.file as string) ||
-                JSON.stringify(r);
-              return `    ${line}`;
-            })
-            .join("\n")
-          : "";
-        blocks.push(body ? `${head}\n${body}` : head);
+      for (const a of doneActs.slice(0, MAX_ITEMS)) {
+        const raw = a.summary ? `: ${a.summary}` : "";
+        const clipped =
+          raw.length > MAX_SUMMARY_CHARS
+            ? `${raw.slice(0, MAX_SUMMARY_CHARS)}…`
+            : raw;
+        blocks.push(`- ${a.tool}${clipped}`);
+      }
+      if (doneActs.length > MAX_ITEMS) {
+        blocks.push(`- …and ${doneActs.length - MAX_ITEMS} more (see history)`);
       }
       // Written to a non-visible field so the model still sees what was done
       // (avoids re-executing completed tools) but the visible transcript stays
       // clean — small/free models on opencode misread the inlined warning as
       // a new instruction, which looked like an instant disconnect.
-      const summary = `[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${blocks.join("\n")}]`;
+      let summary = `[Interrupted before finishing. Already done this turn — do NOT repeat these:\n${blocks.join("\n")}]`;
+      if (summary.length > MAX_BLOCK_CHARS) {
+        summary = `${summary.slice(0, MAX_BLOCK_CHARS)}…]`;
+      }
       useStore.getState().updateMessage(assistantMsg.id, {
         preservedToolSummary: summary,
       });
@@ -3376,6 +3390,27 @@ export function ChatPanel() {
       case "/new":
         s.newChat(ch?.mode);
         break;
+      case "/plan": {
+        // Codex-style entry to Plan mode: switch the chat, then either wait
+        // for the request (`/plan` alone) or plan the given text right away.
+        if (ch) s.setChatMode(ch.id, "plan");
+        const rest = v.slice("/plan".length).trim();
+        if (!rest) {
+          s.addMessage(ch?.id ?? "", {
+            role: "assistant",
+            content:
+              "Plan mode selected — describe what to plan. I will scout the code and lay out the steps without changing anything.",
+          });
+          break;
+        }
+        const created = s.addMessage(ch?.id ?? "", {
+          role: "user",
+          content: rest,
+          ...(ch ? { mode: "plan" as AgentMode } : {}),
+        });
+        void send(rest, [], [], false, created.id);
+        break;
+      }
       case "/undo":
         if (ch && s.undoMessage()) {
           s.addMessage(ch.id, { role: "assistant", content: "↩ Undone." });
@@ -4057,13 +4092,24 @@ export function ChatPanel() {
   // keys) move `skillMentionIdx` but the popup scrolls independently
   // (max-height + overflow-y: auto), so without this the highlight can
   // move past the visible 300px and look like nothing is happening.
+  // Only the popup's own scrollTop is adjusted, so the page never jumps.
   useEffect(() => {
     if (!skillMention) return;
-    const row = skillMentionPopupRef.current?.querySelector<HTMLElement>(
-      ".mention-item.kbd",
-    );
-    row?.scrollIntoView({ block: "nearest" });
-  }, [skillMention, skillMentionIdx]);
+    scrollPopupRowIntoView(skillMentionPopupRef.current, ".mention-item.kbd");
+  }, [skillMention, skillMentionIdx, skillMentionQuery]);
+
+  // Keep the keyboard-highlighted slash-command row visible while
+  // navigating with arrows / Ctrl+J/K (same container-only scrolling).
+  useEffect(() => {
+    if (!cmdOpen) return;
+    scrollPopupRowIntoView(cmdPopupRef.current, ".hist-card.kbd");
+  }, [cmdOpen, cmdIndex, cmdQuery]);
+
+  // Keep the keyboard-highlighted history row visible while navigating.
+  useEffect(() => {
+    if (!historyOpen) return;
+    scrollPopupRowIntoView(historyPopupRef.current, ".hist-card.kbd");
+  }, [historyOpen, historyIdx, promptHistory.length, pinnedCmds.length]);
 
   const startSkillMention = (at: number) => {
     setCmdOpen(null);
@@ -4451,44 +4497,33 @@ export function ChatPanel() {
     );
   }
 
-  const toolbar = (
-    <div className="chat-toolbar titlebar-toolbar">
-      <button
-        className="titlebar-icon-btn dir-text-btn"
-        onClick={toggleDir}
-        title={
-          dir === "rtl"
-            ? "Right-to-left (فارسی) — click for LTR"
-            : "Left-to-right — click for RTL"
-        }
-      >
-        {dir === "rtl" ? "RTL" : "LTR"}
-      </button>
-      <span className="badge" title="Active model">
-        <span className="badge-provider">
-          {provider.name || PROVIDER_LABELS[provider.kind] || provider.id}
-        </span>
-        {activeModel || "no model"}
-      </span>
-      <BalanceChip
-        providerName={
-          shownBal
-            ? shownBal.provider.name || shownBal.provider.id
-            : provider
-              ? provider.name || provider.id
-              : null
-        }
-        amount={shownBal ? shownBal.amount : null}
-        busy={creditBusy}
-        disabled={!provider || creditBusy}
-        onRefresh={refreshCredits}
-      />
-    </div>
+  // The direction switch moved to the window-strip cluster (App.tsx /
+  // Sidebar.tsx) so it never moves when the sidebar toggles; the toolbar
+  // portal stays for future chat-scoped controls.
+  const toolbar = null;
+
+  // The wallet chip lives on the app bar's right end (see #titlebar-right in
+  // App.tsx), right of the static model-usage chip, not mid-bar.
+  const balanceChip = (
+    <BalanceChip
+      providerName={
+        shownBal
+          ? shownBal.provider.name || shownBal.provider.id
+          : provider
+            ? provider.name || provider.id
+            : null
+      }
+      amount={shownBal ? shownBal.amount : null}
+      busy={creditBusy}
+      disabled={!provider || creditBusy}
+      onRefresh={refreshCredits}
+    />
   );
 
   return (
     <div className="chat-panel">
-      {titlebarEl ? createPortal(toolbar, titlebarEl) : toolbar}
+      {titlebarEl && toolbar ? createPortal(toolbar, titlebarEl) : toolbar}
+      {titlebarRightEl && createPortal(balanceChip, titlebarRightEl)}
       <div
         className="chat-scroll"
         ref={scrollRef}
@@ -4519,8 +4554,9 @@ export function ChatPanel() {
                   </div>
                 ))}
                 <p className="empty-hint">
-                  Switch modes with <code>Tab</code>, <code>Cmd/Ctrl+M</code>,
-                  or the selector above — type <code>/help</code> for all
+                  Switch between Ask and Coder with <code>Tab</code>,{" "}
+                  <code>Cmd/Ctrl+M</code>, or the selector above — type{" "}
+                  <code>/plan</code> for Plan mode, <code>/help</code> for all
                   commands and shortcuts.
                 </p>
               </div>
@@ -4672,7 +4708,7 @@ export function ChatPanel() {
                             }
                           }}
                         >
-                          <FileIcon path={a} size={18} />
+                          <FileIcon path={a} size={20} />
                           {a}
                         </span>
                       ))}
@@ -5417,26 +5453,23 @@ export function ChatPanel() {
               // Codex-style history: entries render as cards split into a
               // "Pinned" section (max 3) and a "Recent" section. Click / Enter
               // inserts the row into the composer (no auto-send).
-              <div className="mention-popup history-popup" dir="ltr">
-                <div className="mention-head">
-                  <span className="mention-head-icon">↑</span>
-                  <span>History</span>
-                  <span className="mention-head-count">
-                    {historyRows(promptHistory, pinnedCmds).length}
-                  </span>
-                </div>
+              <div className="mention-popup history-popup" dir="ltr" ref={historyPopupRef}>
                 {(() => {
                   const rows = historyRows(promptHistory, pinnedCmds);
                   const pinnedRows = rows.filter((r) => pinnedCmds.includes(r));
                   const recentRows = rows.filter((r) => !pinnedCmds.includes(r));
                   const insert = (row: string) => {
                     setHistoryOpen(false);
-                    setInput(row);
+                    // Slash commands get a trailing space so args can be
+                    // typed right away (acceptCmd already does the same).
+                    const next =
+                      isSlashCommand(row) && !/\s$/.test(row) ? `${row} ` : row;
+                    setInput(next);
                     requestAnimationFrame(() => {
                       const el = textareaRef.current;
                       if (el) {
                         el.focus();
-                        el.setSelectionRange(row.length, row.length);
+                        el.setSelectionRange(next.length, next.length);
                       }
                     });
                   };
@@ -5511,7 +5544,7 @@ export function ChatPanel() {
               </div>
             )}
             {cmdOpen && (
-              <div className="mention-popup history-popup cmd-popup" dir="ltr">
+              <div className="mention-popup history-popup cmd-popup" dir="ltr" ref={cmdPopupRef}>
                 <div className="mention-head">
                   <span className="mention-head-icon">/</span>
                   <span>Commands</span>
@@ -5745,7 +5778,7 @@ export function ChatPanel() {
                   const name = idx >= 0 ? a.slice(idx + 1) : a;
                   return (
                     <span className="attachment-chip file-chip" key={a} title={a}>
-                      <FileIcon path={a} size={18} />
+                      <FileIcon path={a} size={20} />
                       <span className="chip-file-name">{name}</span>
                       <button
                         className="chip-x"
@@ -5775,23 +5808,55 @@ export function ChatPanel() {
               </div>
             )}
             <div className="composer-input-row">
-              <textarea
-                className={`composer-input${slashActive ? " slash-active" : ""}`}
-                rows={1}
-                dir={dir}
-                style={{
-                  direction: dir,
-                  textAlign: dir === "rtl" ? "right" : "left",
-                }}
-                placeholder={
-                  wroot ? "Write a message…" : "Open a project folder first (⌘O)…"
-                }
-                ref={textareaRef}
-                value={input}
-                onChange={onInputChange}
-                onKeyDown={onKeyDown}
-                onPaste={onComposerPaste}
-              />
+              <div
+                className={`composer-input-stack${slashRange ? " slash-rich" : ""}`}
+              >
+                <div
+                  className="composer-backdrop"
+                  aria-hidden="true"
+                  dir={dir}
+                  style={{
+                    direction: dir,
+                    textAlign: dir === "rtl" ? "right" : "left",
+                  }}
+                  ref={composerBackdropRef}
+                >
+                  {slashRange ? (
+                    <>
+                      <span className="backdrop-plain">
+                        {input.slice(0, slashRange.start)}
+                      </span>
+                      <span className="slash-hidden" aria-hidden="true">
+                        /
+                      </span>
+                      <span className="slash-token">
+                        {input.slice(slashRange.start + 1, slashRange.end)}
+                      </span>
+                      <span className="backdrop-plain">
+                        {input.slice(slashRange.end) || "\u200b"}
+                      </span>
+                    </>
+                  ) : null}
+                </div>
+                <textarea
+                  className={`composer-input${slashActive ? " slash-active" : ""}`}
+                  rows={1}
+                  dir={dir}
+                  style={{
+                    direction: dir,
+                    textAlign: dir === "rtl" ? "right" : "left",
+                  }}
+                  placeholder={
+                    wroot ? "Write a message…" : "Open a project folder first (⌘O)…"
+                  }
+                  ref={textareaRef}
+                  value={input}
+                  onChange={onInputChange}
+                  onKeyDown={onKeyDown}
+                  onPaste={onComposerPaste}
+                  onScroll={syncBackdropScroll}
+                />
+              </div>
               <div className="composer-bottom-row">
                 <div className="composer-left-actions" ref={plusMenuRef}>
                   <button
@@ -6238,6 +6303,7 @@ export function ChatPanel() {
             <span className="composer-mode">
               <ModeSelect
                 modes={modes}
+                menuModes={modes.filter((m) => m.id !== "plan")}
                 value={chat.mode}
                 iconOnly
                 onChange={changeMode}

@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -54,7 +55,7 @@ from vector_store import (
 MAX_READ_BYTES = 2_000_000  # 2 MB
 MAX_SEARCH_RESULTS = 200
 MAX_FILES = 10_000
-MAX_TERMINAL_OUTPUT = 30_000
+MAX_TERMINAL_OUTPUT = 10_000
 TERMINAL_TIMEOUT = 120
 TERMINAL_TIMEOUT_MAX = 300
 _LONG_RUNNING_CMD_RE = re.compile(
@@ -93,6 +94,18 @@ _PLAN_BY_CHAT: dict[str, list[dict]] = {}
 # Powers the no-progress-repeat guard in update_plan: re-sending an unchanged
 # checklist after real tool work ran means the panel is stuck.
 _PLAN_MUTATING_SINCE_UPDATE: dict[str, int] = {}
+# Last successful terminal run per chat for duplicate suppression.
+_TERMINAL_LAST_RUN: dict[str, dict] = {}
+
+
+def clear_chat_state(chat_id: str) -> None:
+    """Drop per-chat in-memory state so a deleted chat never leaks."""
+    cid = (chat_id or "").strip()
+    if not cid:
+        return
+    _PLAN_BY_CHAT.pop(cid, None)
+    _PLAN_MUTATING_SINCE_UPDATE.pop(cid, None)
+    _TERMINAL_LAST_RUN.pop(cid, None)
 
 
 async def _shared_search(
@@ -803,7 +816,13 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
     except OSError as exc:
         return -1, str(exc)
     if len(output) > MAX_TERMINAL_OUTPUT:
-        output = output[:MAX_TERMINAL_OUTPUT] + "\n... (output truncated)"
+        _head = MAX_TERMINAL_OUTPUT // 3
+        _tail = MAX_TERMINAL_OUTPUT - _head
+        output = (
+            output[:_head]
+            + f"\n...({len(output) - MAX_TERMINAL_OUTPUT} chars truncated)...\n"
+            + output[-_tail:]
+        )
     return code, output
 
 
@@ -1375,11 +1394,20 @@ def _web_search_auto_fetch() -> int:
 def _rag_web_enabled() -> bool:
     """آیا RAG برای وب/fetch فعاله؟ (مدل embedding دانلود شده باشه)."""
     try:
-        from embeddings import embedder_available
+        from embeddings import is_available
 
-        return embedder_available()
+        return is_available()
     except Exception:  # noqa: BLE001
         return False
+
+
+# Shared web RAG store: one sqlite connection reused across searches/fetches
+# so every web_search does not open a fresh VectorStore (connection + schema
+# work). Guarded by a lock; reopened when the DB path or TTL changes.
+_WEB_STORE: VectorStore | None = None
+_WEB_STORE_PATH: str | None = None
+_WEB_STORE_TTL: int | None = None
+_WEB_STORE_LOCK = threading.Lock()
 
 
 def _get_web_store(root: str = "") -> VectorStore | None:
@@ -1388,17 +1416,54 @@ def _get_web_store(root: str = "") -> VectorStore | None:
     این store بین همهٔ ورک‌اسپیس‌ها share می‌شه (فایل ``web-rag.vectors.sqlite``).
     چون RAG وب ذاتاً سراسریه — اگه React docs رو یه بار فچ کردی، همه
     ورک‌اسپیس‌ها باید بتونن recall کنن. ``root`` صرفاً برای logging نگه داشته می‌شه.
+
+    The instance is cached and reused (never closed by callers) so repeated
+    searches do not churn sqlite connections.
     """
+    global _WEB_STORE, _WEB_STORE_PATH, _WEB_STORE_TTL
     try:
         db_path = web_rag_path_for(_state_db.vector_db_dir())
         # TTL از ragWebTtlDays بیاد نه مقدار hardcode پیش‌فرض
         s = (_state_db.get_settings() or {})
-        config = {
-            "ttl_days": max(1, int(s.get("ragWebTtlDays", 90))),
-        }
-        return VectorStore(db_path, StoreConfig.from_dict(config))
+        ttl = max(1, int(s.get("ragWebTtlDays", 90)))
     except Exception:  # noqa: BLE001
         return None
+    try:
+        with _WEB_STORE_LOCK:
+            if (
+                _WEB_STORE is not None
+                and _WEB_STORE_PATH == db_path
+                and _WEB_STORE_TTL == ttl
+            ):
+                return _WEB_STORE
+            # Path/TTL changed (or first open): drop the old connection.
+            old, _WEB_STORE = _WEB_STORE, None
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:  # noqa: BLE001, S110 — best-effort
+                    pass
+            config = {"ttl_days": ttl}
+            _WEB_STORE = VectorStore(db_path, StoreConfig.from_dict(config))
+            _WEB_STORE_PATH = db_path
+            _WEB_STORE_TTL = ttl
+            return _WEB_STORE
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def close_web_store() -> None:
+    """Close the shared web store (tests / shutdown)."""
+    global _WEB_STORE, _WEB_STORE_PATH, _WEB_STORE_TTL
+    with _WEB_STORE_LOCK:
+        old, _WEB_STORE = _WEB_STORE, None
+        _WEB_STORE_PATH = None
+        _WEB_STORE_TTL = None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001, S110 — best-effort
+            pass
 
 
 async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str = "") -> str | None:
@@ -1408,14 +1473,13 @@ async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str 
     ``None`` برمی‌گردونه تا مدل بره سراغ وب/فچ واقعی. هیت‌ها رو به هم
     می‌چسبونه و برمی‌گردونه. اگه چیزی نبود یا خطا داد، ``None``.
     """
-    _local = False
     if store is None:
         if not _rag_web_enabled():
             return None
         # مسیر fallback نادر: باز کردن sqlite رو هم offload می‌کنیم تا
         # event loop اصلاً بلاک نشه (معمولاً store از قبل پاس داده می‌شه).
+        # Shared store is never closed here (reused across calls).
         store = await asyncio.to_thread(_get_web_store, root)
-        _local = store is not None
     if store is None:
         return None
     try:
@@ -1432,12 +1496,6 @@ async def _rag_web_lookup(key: str, store: VectorStore | None = None, root: str 
         return "\n\n".join(parts)
     except Exception:  # noqa: BLE001 — RAG lookup must never break the tool
         return None
-    finally:
-        # فقط وقتی خودمان store رو باز کردیم ببندیم؛ اگه از بیرون پاس داده
-        # شده باشه مالکیتش با فراخواننده‌ست و نباید اینجا بسته بشه (نشت
-        # connection sqlite + sqlite_vec توی RAM می‌مونه تا آخر عمر پروسه).
-        if _local:
-            store.close()
 
 
 def _is_workspace_coder_dir(root: str, target: str) -> bool:
@@ -1577,6 +1635,63 @@ def _parse_skill_markdown(raw: str) -> tuple[str, str, str]:
     )
 
 
+def _parse_skill_fa_keywords(raw: str) -> list[str]:
+    """Extract ``fa_keywords`` from a skill markdown frontmatter block.
+
+    Comma-separated match keywords (data for the skill matcher),
+    e.g. ``fa_keywords: film, cinema``. Returns [] when absent.
+    """
+    m = re.match(r"^---\n([\s\S]*?)\n---\n?", (raw or "").strip())
+    if not m:
+        return []
+    for line in m.group(1).splitlines():
+        if line.strip().lower().startswith("fa_keywords:"):
+            _, _, val = line.partition(":")
+            return [k.strip() for k in val.split(",") if k.strip()]
+    return []
+
+
+def _resolve_skill_match(skills: list[dict], wanted: str) -> dict | None:
+    """Staged skill matcher: exact name/slug, slugified, substring, keywords.
+
+    Cheap ordered checks so near-name or keyword requests resolve with one
+    load_skill call instead of erroring on an exact-match miss.
+    """
+    w = (wanted or "").strip().casefold()
+    if not w:
+        return None
+    for s in skills or []:
+        _name = (s.get("name") or "").strip().casefold()
+        _slug = (s.get("slug") or "").strip().casefold()
+        if _name == w or _slug == w:
+            return s
+    try:
+        sw = slugify(w)
+    except Exception:  # noqa: BLE001
+        sw = ""
+    if sw:
+        for s in skills or []:
+            if (s.get("slug") or "").strip().casefold() == sw:
+                return s
+            if slugify(s.get("name") or "") == sw:
+                return s
+    if len(w) >= 3:
+        for s in skills or []:
+            n = (s.get("name") or "").strip().casefold()
+            sl = (s.get("slug") or "").strip().casefold()
+            if (n or sl) and (w in n or w in sl or n in w or sl in w):
+                return s
+        for s in skills or []:
+            desc = (s.get("description") or "").strip().casefold()
+            if desc and (w in desc or desc in w):
+                return s
+            for kw in (s.get("fa_keywords") or []):
+                k = str(kw or "").strip().casefold()
+                if k and (w in k or k in w):
+                    return s
+    return None
+
+
 _PLACEHOLDER_SKILL_NAMES = frozenset(
     {"new-skill", "new_skill", "skill", "new skill", "untitled"}
 )
@@ -1613,6 +1728,7 @@ def persist_skill(
     raw: str,
     fallback_name: str = "",
     previous_name: str = "",
+    fa_keywords: list[str] | str | None = None,
 ) -> dict:
     """Persist a skill as ``skills/<slug>/skill.md`` in the user data folder.
 
@@ -1622,6 +1738,12 @@ def persist_skill(
     ``{"ok", "name", "slug", "path", "note"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
+    if fa_keywords is None:
+        fa_list = _parse_skill_fa_keywords(raw)
+    elif isinstance(fa_keywords, str):
+        fa_list = [k.strip() for k in fa_keywords.split(",") if k.strip()]
+    else:
+        fa_list = [str(k or "").strip() for k in fa_keywords if str(k or "").strip()]
     name = _resolve_skill_name(name, body, fallback_name)
     error = _skill_name_error(name)
     if error:
@@ -1633,7 +1755,7 @@ def persist_skill(
     if not body:
         body = f"Write step-by-step instructions for {name}."
     try:
-        _state_db.save_skill(name, slug, description, raw or body)
+        _state_db.save_skill(name, slug, description, raw or body, fa_list)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
@@ -1685,14 +1807,15 @@ def sync_builtin_skills() -> list[str]:
         existing = []
     existing_slugs = {s.get("slug") for s in existing}
     existing_names = {s.get("name") for s in existing}
-    # Map name/slug -> (description, body) — the stored content is
-    # frontmatter-stripped by list_skills — so a shipped change to the body
-    # OR the description triggers a re-sync below.
-    existing_meta: dict[str, tuple[str, str]] = {}
+    # Map name/slug -> (description, body, fa_keywords) — the stored content is
+    # frontmatter-stripped by list_skills — so a shipped change to the body,
+    # description OR keywords triggers a re-sync below.
+    existing_meta: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     for s in existing:
         meta = (
             (s.get("description") or "").strip(),
             (s.get("content") or "").strip(),
+            tuple(sorted(str(k or "").strip() for k in (s.get("fa_keywords") or []) if str(k or "").strip())),
         )
         if s.get("name"):
             existing_meta[s["name"]] = meta
@@ -1706,6 +1829,7 @@ def sync_builtin_skills() -> list[str]:
         except OSError:
             continue
         name, description, body = _parse_skill_markdown(raw)
+        fa_list = _parse_skill_fa_keywords(raw)
         if not name:
             name = os.path.splitext(os.path.basename(path))[0]
         if name in existing_names or slugify(name) in existing_slugs:
@@ -1716,6 +1840,7 @@ def sync_builtin_skills() -> list[str]:
             if stored == (
                 description.strip(),
                 body.strip(),
+                tuple(sorted(fa_list)),
             ):
                 continue
         result = persist_skill(raw, fallback_name=name)
@@ -1819,6 +1944,7 @@ def create_skill(
     name: str,
     description: str,
     content: str,
+    fa_keywords: list[str] | str | None = None,
 ) -> dict:
     """Create or edit (overwrite) a user skill (global, shared across workspaces).
 
@@ -1832,14 +1958,19 @@ def create_skill(
     body = content.strip()
     if not body:
         body = f"Write step-by-step instructions for {name}."
+    if isinstance(fa_keywords, str):
+        fa_list = [k.strip() for k in fa_keywords.split(",") if k.strip()]
+    else:
+        fa_list = [str(k or "").strip() for k in (fa_keywords or []) if str(k or "").strip()]
     markdown = (
         "---\n"
         f"name: {name}\n"
         f"description: {description or ''}\n"
-        "---\n\n"
+        + (f"fa_keywords: {', '.join(fa_list)}\n" if fa_list else "")
+        + "---\n\n"
         f"# {name}\n\n{body}\n"
     )
-    result = persist_skill(markdown, fallback_name=name)
+    result = persist_skill(markdown, fallback_name=name, fa_keywords=fa_list or None)
     if not result.get("ok"):
         return {"error": result.get("note", "save failed")}
     return {
@@ -1988,7 +2119,10 @@ _TOOL_SQUARE_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _TOOL_HISTORY_PREFIX_RE = re.compile(r"^[^\s:<>]+:\s*\d+\s*\|\s?")
-_TOOL_DUP_REF_RE = re.compile("عیناً با پاسخ ابزار|متن کامل همان پاسخ")
+_TOOL_DUP_REF_RE = re.compile(
+    "عیناً با پاسخ ابزار|متن کامل همان پاسخ"
+    "|byte-identical to tool result|use that full text"
+)
 _TOOL_HEADER_LINE_RE = re.compile(
     r"^(?:MATCHES\s+for\s+|GLOB\s+MATCHES\s+for\s+|No\s+(?:matches|files\s+match)\s+"
     r"|Found\s+\d+\s+matches?\.|Showing\s+the\s+first\s+\d+"
@@ -2006,7 +2140,7 @@ _TOOL_HEADER_LINE_RE = re.compile(
 def _undecorate_tool_text(text: str) -> str:
     """Strip read/grep tool decorations a model copied into an edit string.
 
-    Drops wrapper/note/header lines anywhere in ``text`` and removes the
+    Drops wrapper/note/header/fence lines anywhere in ``text`` and removes the
     leading ``2096 | `` / ``> 2096 | `` / ``path:2096: `` prefix (plus an
     optional grep ``in Name (L..)`` annotation) from every line carrying
     one; undecorated lines pass through untouched. Blank lines that only
@@ -2028,6 +2162,7 @@ def _undecorate_tool_text(text: str) -> str:
             or _TOOL_HEADER_LINE_RE.match(stripped)
             or _TOOL_SQUARE_MARKER_RE.match(stripped)
             or _TOOL_DUP_REF_RE.search(stripped)
+            or stripped.startswith("```")
         ):
             rows.append(None)
             continue
@@ -2095,6 +2230,168 @@ def _normalize_for_match(text: str) -> tuple[str, list[int]]:
     return "".join(norm), origin
 
 
+def _normalize_indent_insensitive(text: str) -> tuple[str, list[int]]:
+    """Comparison view ignoring leading indent as well as trailing whitespace.
+
+    Returns ``(normalized, origin)`` like ``_normalize_for_match`` but each
+    line is stripped on both sides, so an old_string copied without its
+    original leading spaces still locates. Origin maps every kept char back
+    to its original offset, so the splice preserves the file's indent prefix
+    on the first matched line."""
+    norm: list[str] = []
+    origin: list[int] = []
+    pos = 0
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            norm.append("\n")
+            origin.append(pos - 1)
+        stripped = line.strip()
+        leading = len(line) - len(line.lstrip())
+        norm.append(stripped)
+        origin.extend(range(pos + leading, pos + leading + len(stripped)))
+        pos += len(line) + 1
+    return "".join(norm), origin
+
+
+_CANONICAL_DASH_MAP = {
+    "\u2014": "--",
+    "\u2015": "--",
+    "\u2013": "-",
+    "\u2212": "-",
+    "\u2010": "-",
+    "\u2011": "-",
+}
+_CANONICAL_QUOTE_MAP = {
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u00ab": '"',
+    "\u00bb": '"',
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u2039": "'",
+    "\u203a": "'",
+    "\u02bc": "'",
+}
+_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\ufeff]")
+_CANON_WS_CHARS = (
+    " \t\x0b\x0c\r\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+)
+
+
+def _expand_unicode_char(ch: str) -> str:
+    """ASCII-tolerant expansion of a single character for matching only."""
+    if ch == "\x08":
+        # JSON "\\b" decodes to BACKSPACE (0x08) while the file holds a
+        # literal backslash + "b" (e.g. r"\\b" in a regex). Recover it so
+        # a model copy carrying the decoded control char still matches.
+        return "\\b"
+    if ch in _CANONICAL_DASH_MAP:
+        return _CANONICAL_DASH_MAP[ch]
+    if ch in _CANONICAL_QUOTE_MAP:
+        return _CANONICAL_QUOTE_MAP[ch]
+    if ch == "\u2026":
+        return "..."
+    return ch
+
+
+def _normalize_canonical(text: str) -> tuple[str, list[int]]:
+    """Line-preserving canonical view: unicode + interior-whitespace tolerant.
+
+    Each line is NFKC-normalized, zero-width chars removed, smart quotes and
+    dashes expanded to ASCII, interior horizontal-whitespace runs collapsed
+    to a single space, and leading/trailing whitespace stripped — like
+    ``_normalize_indent_insensitive`` but also tolerant to ``...`` vs
+    ``…``, ``--`` vs em-dash, smart quotes, NBSP/tabs. Origin maps every
+    kept char back to its original offset so splicing stays byte-precise.
+    """
+    norm: list[str] = []
+    origin: list[int] = []
+    pos = 0
+    for i, raw_line in enumerate(text.split("\n")):
+        if i:
+            norm.append("\n")
+            origin.append(pos - 1)
+        line = unicodedata.normalize("NFKC", raw_line)
+        line = _ZERO_WIDTH_RE.sub("", line)
+        expanded: list[str] = []
+        expanded_origin: list[int] = []
+        for idx, ch in enumerate(line):
+            for ech in _expand_unicode_char(ch):
+                expanded.append(ech)
+                expanded_origin.append(pos + idx)
+        # Collapse horizontal runs to one space, then strip both ends.
+        collapsed: list[str] = []
+        collapsed_origin: list[int] = []
+        k = 0
+        while k < len(expanded):
+            if expanded[k] in _CANON_WS_CHARS:
+                if collapsed and collapsed[-1] != " ":
+                    collapsed.append(" ")
+                    collapsed_origin.append(expanded_origin[k])
+                elif not collapsed:
+                    pass
+                while k < len(expanded) and expanded[k] in _CANON_WS_CHARS:
+                    k += 1
+                continue
+            collapsed.append(expanded[k])
+            collapsed_origin.append(expanded_origin[k])
+            k += 1
+        while collapsed and collapsed[-1] == " ":
+            collapsed.pop()
+            collapsed_origin.pop()
+        while collapsed and collapsed[0] == " ":
+            collapsed.pop(0)
+            collapsed_origin.pop(0)
+        norm.append("".join(collapsed))
+        origin.extend(collapsed_origin)
+        pos += len(raw_line) + 1
+    return "".join(norm), origin
+
+
+def _normalize_reflow(text: str) -> tuple[str, list[int]]:
+    """Whole-text reflow view: all whitespace runs collapse to one space.
+
+    Used when the model re-wrapped a block (joined lines or split one line
+    into several) — the token sequence is identical but ``\\n`` placement
+    differs. Unicode is expanded like ``_normalize_canonical``. Origin maps
+    back so the splice still covers the file's original lines.
+    """
+    flat = unicodedata.normalize("NFKC", text)
+    flat = _ZERO_WIDTH_RE.sub("", flat)
+    expanded: list[str] = []
+    expanded_origin: list[int] = []
+    for idx, ch in enumerate(flat):
+        for ech in _expand_unicode_char(ch):
+            expanded.append(ech)
+            expanded_origin.append(idx)
+    norm: list[str] = []
+    origin: list[int] = []
+    k = 0
+    ws_all = _CANON_WS_CHARS + "\n"
+    while k < len(expanded):
+        if expanded[k] in ws_all:
+            if norm and norm[-1] != " ":
+                norm.append(" ")
+                origin.append(expanded_origin[k])
+            while k < len(expanded) and expanded[k] in ws_all:
+                k += 1
+            continue
+        norm.append(expanded[k])
+        origin.append(expanded_origin[k])
+        k += 1
+    while norm and norm[-1] == " ":
+        norm.pop()
+        origin.pop()
+    while norm and norm[0] == " ":
+        norm.pop(0)
+        origin.pop(0)
+    return "".join(norm), origin
+
+
 def _at_line_start(norm: str, j: int) -> bool:
     """True when only whitespace separates position ``j`` from its line start."""
     k = j
@@ -2159,6 +2456,47 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], bo
         spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=True)
         if spans:
             return spans, True
+    # 4) leading-indent insensitive — the model often retypes a block at
+    # column 0 (or with the wrong indent) after copying it from a read
+    # excerpt. Stripping leading whitespace on both sides still locates the
+    # block; spans exclude the file's indent and the caller reindents via
+    # _splice_reindented. Line-anchored so "foo" never matches inside
+    # "xfoo".
+    c_stripped, c_stripped_origin = _normalize_indent_insensitive(content)
+    o_stripped, _ = _normalize_indent_insensitive(old)
+    spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
+    if spans:
+        return spans, False
+    if decorated != old:
+        o_stripped, _ = _normalize_indent_insensitive(decorated)
+        spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
+        if spans:
+            return spans, True
+    # 5) unicode + interior-whitespace tolerant, line-preserving.
+    c_canon, c_canon_origin = _normalize_canonical(content)
+    o_canon, _ = _normalize_canonical(old)
+    spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
+    if spans:
+        return spans, False
+    if decorated != old:
+        o_canon, _ = _normalize_canonical(decorated)
+        spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
+        if spans:
+            return spans, True
+    # 6) reflow tolerant — same tokens, different line breaks, including a
+    # multi-line block retyped as a single line (no "\n" left in old).
+    c_flow, c_flow_origin = _normalize_reflow(content)
+    o_flow, _ = _normalize_reflow(old)
+    if len(o_flow) >= 10:
+        spans = _spans_in(c_flow, c_flow_origin, o_flow, line_anchored=False)
+        if spans:
+            return spans, False
+    if decorated != old:
+        o_flow, _ = _normalize_reflow(decorated)
+        if len(o_flow) >= 10:
+            spans = _spans_in(c_flow, c_flow_origin, o_flow, line_anchored=False)
+            if spans:
+                return spans, True
     return [], False
 
 
@@ -2237,6 +2575,46 @@ def _splice_spans(content: str, spans: list[tuple[int, int]], replacement: str) 
     return content
 
 
+def _splice_reindented(
+    content: str,
+    spans: list[tuple[int, int]],
+    old_text: str,
+    replacement: str,
+) -> str:
+    """Splice ``replacement`` into each span, preserving the file's indent.
+
+    Indent-insensitive matches exclude the file's leading indent from the
+    span, so splicing verbatim would keep the first line's indent (still
+    present before the span) but de-indent every following line. When the
+    file's indent prefix is wider than the old text's base indent, expand
+    the span to the line start and shift every non-blank replacement line
+    by the difference. Exact matches are unaffected (no indent gap).
+    """
+    old_base = ""
+    for line in old_text.split("\n"):
+        if line.strip():
+            old_base = line[: len(line) - len(line.lstrip())]
+            break
+    for start, end in reversed(spans):
+        line_start = content.rfind("\n", 0, start) + 1
+        file_indent = content[line_start:start]
+        repl = replacement
+        if (
+            file_indent
+            and not file_indent.strip()
+            and file_indent.startswith(old_base)
+            and len(file_indent) > len(old_base)
+        ):
+            delta = file_indent[len(old_base) :]
+            repl = "\n".join(
+                (delta + ln) if ln.strip() else ln
+                for ln in replacement.split("\n")
+            )
+            start = line_start
+        content = content[:start] + repl + content[end:]
+    return content
+
+
 def edit_file(
     root: str,
     path: str,
@@ -2298,7 +2676,8 @@ def edit_file(
     _clean_new = _undecorate_tool_text(new_string)
     replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
     apply = spans if replace_all else spans[:1]
-    new_content = _splice_spans(content, apply, replacement)
+    old_base_text = _undecorate_tool_text(old_string) if decorated else old_string
+    new_content = _splice_reindented(content, apply, old_base_text, replacement)
     count = len(apply)
 
     try:
@@ -2419,7 +2798,8 @@ def edit_file_batch(
         _clean_new = _undecorate_tool_text(new_string)
         replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
         apply = spans if replace_all else spans[:1]
-        new_content = _splice_spans(new_content, apply, replacement)
+        old_base_text = _undecorate_tool_text(old_string) if decorated else old_string
+        new_content = _splice_reindented(new_content, apply, old_base_text, replacement)
         total_occ += len(apply)
     if new_content == content:
         return {"path": path, "error": "edits leave the file unchanged"}
@@ -3569,6 +3949,7 @@ def _tool_event(ev: dict) -> dict:
         "status",
         "model",
         "branch",
+        "task_id",
     ):
         val = ev.get(key)
         if val is not None:
@@ -3858,6 +4239,7 @@ def make_tool_callbacks(
                     ev.get("call_id") or "",
                     _res_text,
                     error=str(ev.get("summary") or _res_text)[:2000] if _is_err else "",
+                    task_id=str(ev.get("task_id") or ""),
                 )
         except Exception:  # noqa: BLE001, S110 — trace must never break tools
             pass
@@ -3959,7 +4341,7 @@ def make_tool_callbacks(
     # that prevent overflow / mid-task truncation.
     if context_window and context_window > 0:
         ctx = int(context_window)
-        tool_out_chars = max(400, min(ctx // 6, 16_000))
+        tool_out_chars = max(400, min(ctx // 6, 8_000))
         max(15, ctx // 600)
         max(10, ctx // 500)
         terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_000, tool_out_chars * 1))
@@ -4131,7 +4513,7 @@ def make_tool_callbacks(
         )
 
     async def update_plan(items: list[dict]) -> str:
-        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in. If a checklist already exists (from history or a previous update_plan), EDIT it: resend the SAME items with updated statuses, adding/removing only what the new message changed — never start a fresh duplicate list. NEVER revert a 'completed' step back to pending/in_progress. Batch update_plan with your next tool calls in the SAME step when there IS next work; a solo update_plan is fine when marking steps completed with no further tool work needed (e.g. the final tick) or creating the initial checklist."""
+        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in. If a checklist already exists (from history or a previous update_plan), EDIT it: resend the SAME items with updated statuses, adding/removing only what the new message changed — never start a fresh duplicate list. NEVER revert a 'completed' step back to pending/in_progress. NEVER send update_plan alone: always batch it with your next tool calls in the SAME step (parallel calls)."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
@@ -4222,8 +4604,24 @@ def make_tool_callbacks(
             else:
                 _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in normalized]
             if all(it.get("status") == "completed" for it in normalized):
-                _PLAN_BY_CHAT.pop(_chat_id, None)
+                # Turn continuity: keep the completed checklist as evidence so
+                # the next turn can report from it instead of re-executing.
+                # (_plan_reuse_note already returns "" for all-completed lists,
+                # so keeping it never triggers a re-run.)
                 _PLAN_MUTATING_SINCE_UPDATE.pop(_chat_id, None)
+                try:
+                    import trace_store as _ts
+
+                    if _chat_id:
+                        _done = sum(1 for i in normalized if i.get("status") == "completed")
+                        _ts.record_turn_outcome(
+                            _chat_id,
+                            "completed",
+                            evidence=f"plan {_done}/{len(normalized)} done",
+                            mode="",
+                        )
+                except Exception:  # noqa: BLE001, S110 — outcome must never break tools
+                    pass
         # Feed the plan-nudge backstop (see _format_plan_nudge_suffix): reset the
         # since-last-update counter now that the plan was just touched, and record
         # whether a step is still open so mutating tools know whether to nudge.
@@ -4251,7 +4649,8 @@ def make_tool_callbacks(
                 f" Note: you re-sent the SAME checklist without advancing any status, "
                 f"yet tool work ran since the last update — the todos panel still shows "
                 f"{done}/{len(normalized)}. Mark finished steps 'completed' and the current "
-                f"one 'in_progress' NOW (a solo update_plan is fine for this)."
+                f"one 'in_progress' NOW (batch with your next tool calls in the SAME step "
+                f"when there is next work)."
             )
         return _ret
 
@@ -4261,8 +4660,9 @@ def make_tool_callbacks(
         content: str = "",
         source_url: str = "",
         source_query: str = "",
+        fa_keywords: str = "",
     ) -> str:
-        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given."""
+        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given. `fa_keywords` is optional comma-separated match keywords so non-English requests match this skill via load_skill."""
         emit(
             {
                 "kind": "tool",
@@ -4419,8 +4819,14 @@ def make_tool_callbacks(
         if c_err:
             emit(_error_result("create_skill", c_err))
             return f"ERROR creating skill {name!r}: {c_err}"
+        if isinstance(fa_keywords, str):
+            _fa_list = [k.strip() for k in (fa_keywords or "").split(",") if k.strip()]
+        else:
+            _fa_list = [
+                str(k or "").strip() for k in (fa_keywords or []) if str(k or "").strip()
+            ]
         try:
-            result = create_skill(root, name, description, body)
+            result = create_skill(root, name, description, body, _fa_list or None)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("create_skill", msg))
@@ -4453,17 +4859,23 @@ def make_tool_callbacks(
             skills = _agents_load_skills_for_tool()
         except Exception:  # noqa: BLE001
             skills = []
-        match = next(
-            (
-                s
-                for s in skills
-                if (s.get("name") or "").strip().casefold() == wanted
-                or (s.get("slug") or "").strip().casefold() == wanted
-            ),
-            None,
-        )
+        match = _resolve_skill_match(skills, wanted)
         if match is None:
             available = ", ".join(s["name"] for s in skills) or "(none)"
+            suggestion = ""
+            try:
+                import difflib as _difflib
+
+                close = _difflib.get_close_matches(
+                    (name or "").strip(),
+                    [(s.get("name") or "") for s in skills],
+                    n=3,
+                    cutoff=0.5,
+                )
+                if close:
+                    suggestion = f" Did you mean: {', '.join(close)}?"
+            except Exception:  # noqa: BLE001 — suggestions are best-effort
+                suggestion = ""
             summary = f"skill {name!r} not found"
             emit(
                 {
@@ -4473,7 +4885,7 @@ def make_tool_callbacks(
                     "status": "error",
                 }
             )
-            return f"ERROR: skill {name!r} not found. Available skills: {available}"
+            return f"ERROR: skill {name!r} not found.{suggestion} Available skills: {available}"
         desc = (match.get("description") or "").strip()
         body = (match.get("content") or "").strip()
         fa = [str(k or "").strip() for k in (match.get("fa_keywords") or []) if str(k or "").strip()]
@@ -5018,6 +5430,36 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 return cached
 
         _is_search_cmd = _is_terminal_search(command)
+        # Duplicate suppression: a short follow-up like "done?" makes the
+        # model re-issue the exact same verification command. When the last
+        # successful run for this chat used the identical command, return the
+        # cached success instead of spending another terminal execution.
+        _cmd_key = str(command or "").strip()
+        if _cmd_key and _chat_id:
+            _last_run = _TERMINAL_LAST_RUN.get(_chat_id)
+            if _last_run and _last_run.get("command") == _cmd_key:
+                _cached_out = str(_last_run.get("output") or "")
+                emit(
+                    {
+                        "kind": "tool",
+                        "tool": "run_terminal",
+                        "args": {"command": command},
+                        "model": _main_name if _is_search_cmd else "",
+                    }
+                )
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "run_terminal",
+                        "summary": "duplicate-suppressed · already ran last turn",
+                        "results": [{"content": _cached_out[:8000]}],
+                    }
+                )
+                return (
+                    _cached_out
+                    + "\n[duplicate-suppressed: identical command already succeeded "
+                    "— reported from cached result, not re-executed]"
+                )
         emit(
             {
                 "kind": "tool",
@@ -5060,7 +5502,21 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # model never saw it in the text it actually reads, so it had to guess
         # pass/fail purely from output text. Prepending it explicitly gives the
         # model a hard, unambiguous signal to check before declaring success.
-        return f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
+        _final = f"$ {command}\nEXIT CODE: {result['exit_code']}\n{output}" + nudge
+        if _chat_id and _cmd_key and int(result.get("exit_code", -1)) == 0:
+            _TERMINAL_LAST_RUN[_chat_id] = {"command": _cmd_key, "output": _final}
+            try:
+                import trace_store as _ts
+
+                _ts.record_turn_outcome(
+                    _chat_id,
+                    "completed",
+                    evidence=f"terminal exit 0: {_cmd_key[:300]}",
+                    mode="",
+                )
+            except Exception:  # noqa: BLE001, S110 — outcome must never break tools
+                pass
+        return _final
 
     async def glob_tool(
         pattern: str,
@@ -5444,7 +5900,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
 
         BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer).
 
-SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
+SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. OMIT `filePath` and each name is looked up across the whole project: one definition is read directly (no grep needed); a name defined in several files returns the candidate list — then pass filePath. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
 WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. A head read (offset 1, limit 400+) of a file over 400 lines returns a FILE MAP (first 40 lines + definition list) instead of a bulk dump — read definitions via symbols=[...] in one call, never re-read the head for content. Make the FIRST read of a file decisive — never open with a narrow slice and page forward one window per step (read 1-200, then 217-350, …). When you need more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
 
@@ -5469,7 +5925,49 @@ When you need to read several files, read multiple independent files in parallel
         # `symbols=[...]` resolves to concrete windows on filePath via the
         # symbol index (CODE MAP) — one call instead of guessing line numbers.
         _symbol_missing: list[str] = []
-        if symbols:
+        _symbol_ambiguous: list[str] = []
+        if symbols and not str(filePath or "").strip() and not filePaths:
+            # No filePath: look each name up across the project via the symbol
+            # index. A unique definition becomes a window in ITS file (one
+            # call instead of grep + read); several definitions are listed so
+            # the model can re-ask with filePath — nothing is guessed.
+            try:
+                from symbol_index import find_symbol_files as _find_syms
+                from symbol_index import resolve_symbol_ranges as _resolve_syms_g
+            except ImportError:
+                return "ERROR reading symbols=: symbols= is unavailable (symbol index missing)"
+            _want = [str(s) for s in symbols]
+            _found = await asyncio.to_thread(_find_syms, root, _want)
+            for _nm in _want:
+                _hits = _found.get(_nm) or []
+                if not _hits:
+                    _symbol_missing.append(_nm)
+                    continue
+                if len(_hits) > 1:
+                    _symbol_ambiguous.append(
+                        f"{_nm}: " + ", ".join(f"{h[0]}:{h[1]}" for h in _hits[:6])
+                        + (f" (+{len(_hits) - 6} more)" if len(_hits) > 6 else "")
+                    )
+                    continue
+                _rel, _ln, _kd, _real = _hits[0]
+                try:
+                    _abs_hit = resolve_safe(root, _rel, allow_coder=True, permit=permit)
+                except PathEscapeError:
+                    _symbol_missing.append(_nm)
+                    continue
+                _w_hit, _ = _resolve_syms_g(_abs_hit, [_real])
+                if not _w_hit:
+                    _symbol_missing.append(_nm)
+                    continue
+                jobs.extend((_rel, _o, _l) for _o, _l in _w_hit)
+            if not jobs:
+                _msg = "ERROR reading symbols=: "
+                if _symbol_ambiguous:
+                    _msg += "defined in several files — re-call with filePath: " + "; ".join(_symbol_ambiguous) + ". "
+                if _symbol_missing:
+                    _msg += "no such symbol(s): " + ", ".join(_symbol_missing) + ". Try grep for the name."
+                return _msg
+        elif symbols:
             if not str(filePath or "").strip():
                 return "ERROR reading symbols=: symbols= needs `filePath` (the file holding the symbols) — pass filePath plus symbols=[...] in the SAME call."
             try:
@@ -5639,6 +6137,12 @@ When you need to read several files, read multiple independent files in parallel
                     + ", ".join(_symbol_missing)
                     + ". Check the CODE MAP for exact names.)"
                 )
+            if _symbol_ambiguous:
+                _out += (
+                    "\n\n(symbols defined in several files — re-call with filePath: "
+                    + "; ".join(_symbol_ambiguous)
+                    + ")"
+                )
             if tasks and len(_cache_hit_paths) == len(tasks):
                 # Everything came from cache: one "cached" card, exactly what
                 # a repeated single read used to emit (no aggregate card).
@@ -5721,9 +6225,9 @@ When you need to read several files, read multiple independent files in parallel
         return f"<path>{filePath or '/'}</path>\n<type>directory</type>\n<entries>\n{body}\n{footer}\n</entries>"
 
     async def task_tool(
-        description: str, prompt: str, subagent_type: str, task_id: str = ""
+        description: str, prompt: str, subagent_type: str = "subagent", task_id: str = ""
     ) -> str:
-        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use this for parallelizable work, research, or multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — only 'subagent' is supported. `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. For broad/multi-file exploration you MUST use this instead of reading many files yourself; use it also for parallelizable work, research, or multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same
@@ -5839,7 +6343,13 @@ When you need to read several files, read multiple independent files in parallel
             return (
                 f"Sub-agent started in background (task_id={_new_tid}, branch={_ecall}, "
                 f"type={subagent_type}): {str(description or '')[:120]}. "
-                "Continue your own work in parallel — its compact report will be "
+                "You are its manager: do NOT write the final answer until its "
+                "report arrives and you have verified the task is done — "
+                "do only UNRELATED parallel work meanwhile (never the same "
+                "scope). Do NOT repeat the "
+                "delegated work yourself (no grep/glob/read over the same scope); "
+                "trust the report and do only targeted follow-ups for files it names. "
+                "Its compact report will be "
                 "delivered automatically when it finishes. Use "
                 f"task_steer(task_id='{_new_tid}', message='...') to send a follow-up "
                 f"or task_stop(task_id='{_new_tid}') to stop it."
@@ -6021,23 +6531,18 @@ When you need to read several files, read multiple independent files in parallel
                 for name, fn in _tool_source.items()
                 if name not in ("task", "update_plan", "vision")
             }
-        # Keep the background sub-agent strictly read-only: wrap run_terminal so
-        # any command that would mutate the filesystem / system state is rejected
-        # before it runs (opencode's explore agent is bash-read-only).
+        # Keep the background sub-agent from searching via the shell: code
+        # search/inspection must go through grep/glob/read (slow + token-heavy
+        # via run_terminal). Mutating commands stay allowed here because the
+        # sub-agent already inherits exactly the parent's mode-filtered toolset
+        # (plan/ask parents have no write tools to inherit), so coder parents
+        # can delegate verifiable work (tests, terminal checks) fully.
         if resolve_agent(subagent_type) == "subagent" and "run_terminal" in _sub_tools:
             _orig_terminal = _tool_source.get("run_terminal")
 
             async def _readonly_terminal(
                 command: str, timeout: int = TERMINAL_TIMEOUT
             ) -> str:
-                if _is_terminal_write(command):
-                    return (
-                        "ERROR: the sub-agent is read-only and may not run "
-                        "commands that modify the filesystem or system state "
-                        f"(blocked: {command!r}). Use grep/glob/read for "
-                        "inspection, or delegate mutating work to the main agent "
-                        "via the task tool."
-                    )
                 # The sub-agent must search via grep/glob/read, not by
                 # shelling out through run_terminal (slow + token-heavy).
                 # git working-tree inspection stays allowed (read-only).
@@ -6186,6 +6691,7 @@ When you need to read several files, read multiple independent files in parallel
                     compact_model=_model,
                     reserved=reserved if reserved is not None else 20_000,
                     emit=_tee_emit,
+                    task_id=_tid,
                 )
                 try:
                     logger.info(
@@ -6243,6 +6749,7 @@ When you need to read several files, read multiple independent files in parallel
                         compact_model=_model,
                         reserved=reserved if reserved is not None else 20_000,
                         emit=_tee_emit,
+                        task_id=_tid,
                     )
                     _last_exc = None  # fallback succeeded — clear the prior error
                     break
@@ -6298,6 +6805,7 @@ When you need to read several files, read multiple independent files in parallel
                     compact_model=_model,
                     reserved=reserved if reserved is not None else 20_000,
                     emit=_tee_emit,
+                    task_id=_tid,
                 )
                 _extra = (_extra or "").strip()
                 if _extra:
@@ -6499,11 +7007,7 @@ When you need to read several files, read multiple independent files in parallel
         _ws_for_lookup = store
         if _ws_for_lookup is None and _rag_web_enabled():
             _ws_for_lookup = _get_web_store(root)
-        try:
-            rag_hit = await _rag_web_lookup(query, _ws_for_lookup, root)
-        finally:
-            if store is None and _ws_for_lookup is not None:
-                _ws_for_lookup.close()
+        rag_hit = await _rag_web_lookup(query, _ws_for_lookup, root)
         if rag_hit:
             emit(
                 {
@@ -6590,10 +7094,6 @@ When you need to read several files, read multiple independent files in parallel
                     )
                 except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
                     pass
-                finally:
-                    # فقط وقتی خودمان بازش کردیم ببندیم (نشت connection).
-                    if store is None:
-                        _ws.close()
         summary = f"{len(results)} results ({len(fetched_pages)} fetched)"
         fallbacks = result.get("fallbacks") or []
         engine = result.get("engine") or ""
@@ -6762,11 +7262,7 @@ When you need to read several files, read multiple independent files in parallel
         _ws_for_lookup = store
         if _ws_for_lookup is None and _rag_web_enabled():
             _ws_for_lookup = _get_web_store(root)
-        try:
-            rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
-        finally:
-            if store is None and _ws_for_lookup is not None:
-                _ws_for_lookup.close()
+        rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
         if rag_hit:
             emit(
                 {
@@ -6840,10 +7336,6 @@ When you need to read several files, read multiple independent files in parallel
                 )
             except Exception:  # noqa: BLE001, S110 — vector write must never break the tool
                 pass
-            finally:
-                # فقط وقتی خودمان بازش کردیم ببندیم (نشت connection).
-                if store is None:
-                    _ws.close()
 
         # Return the FULL page verbatim — no summarizer, no excerpt. This is the
         # opencode/codex behavior: the tool returns raw content and the model

@@ -2,11 +2,11 @@
 call for nothing. These tests pin the instruction text that steers the
 model away from them:
 
-* update_plan (tool description + checklist continuation rule) prefers
-  batching with the next tool calls, while explicitly allowing solo calls
-  that mark steps completed (final tick) or create the initial checklist —
-  an absolute solo ban taught the model to never call update_plan, leaving
-  todos/plan stale.
+* update_plan (tool description + checklist continuation rule) bans solo
+  calls when next work exists — always batch with the next tool calls.
+  The backstop nudge stays exempt for ticks that mark steps completed
+  (final tick) and plan mode's initial checklist, so the model still
+  ticks progress instead of leaving todos/plan stale.
 * repeated reads/greps always re-serve their full content — no stub
   withholds it, so a re-issued call is never a wasted no-op.
 """
@@ -18,13 +18,12 @@ def _cbs(root):
     return tools.make_tool_callbacks(root, lambda ev: None, main_model=None)
 
 
-def test_update_plan_description_prefers_batching_allows_solo_on_completion(
-    tmp_path,
-):
+def test_update_plan_description_bans_solo_prefers_batching(tmp_path):
     cbs = _cbs(str(tmp_path))
     doc = cbs["update_plan"].__doc__ or ""
-    assert "Batch update_plan with your next tool calls" in doc
-    assert "a solo update_plan is fine when marking steps completed" in doc
+    assert "NEVER send update_plan alone" in doc
+    assert "always batch it with your next tool calls" in doc
+    assert "a solo update_plan is fine" not in doc
 
 
 def test_checklist_continuation_rule_prefers_batching():
@@ -38,7 +37,8 @@ def test_checklist_continuation_rule_prefers_batching():
     ]
     note = _plan_reuse_note(history)
     assert "EXISTING CHECKLIST" in note, note
-    assert "Batch update_plan with your next tool calls" in note, note
+    assert "NEVER send update_plan alone" in note, note
+    assert "always batch it with your next tool calls" in note, note
 
 
 async def test_repeat_read_reserves_full_content(tmp_path):

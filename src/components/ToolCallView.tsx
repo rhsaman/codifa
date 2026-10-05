@@ -119,10 +119,12 @@ function groupSummary(activities: ToolActivity[]): string {
 }
 
 /** A task card running the background sub-agent (opencode-style subagent;
- *  "explore" is the legacy pre-rename type the backend still accepts). */
+ *  "explore"/"general" are legacy pre-rename types the backend still accepts). */
 export const isSubagentCard = (a: ToolActivity) =>
   a.tool === "task" &&
-  (a.args?.subagent_type === "subagent" || a.args?.subagent_type === "explore");
+  (a.args?.subagent_type === "subagent" ||
+    a.args?.subagent_type === "explore" ||
+    a.args?.subagent_type === "general");
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;
@@ -249,6 +251,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                   onClick={() => messageId && openReview(messageId, path)}
                 >
                   <StatusIcon status={entry.activity.status} />
+                  <FileIcon path={path} size={20} />
                   <span className="edit-group-file" dir="auto">{base}</span>
                   <span className="edit-group-row-end">
                     {stats && (
@@ -379,6 +382,29 @@ function StatusIcon({ status }: { status: ToolActivity["status"] }) {
   return <IconCheck className="status-ok" />;
 }
 
+/** Mini shell-prompt glyph (chevron + underscore) for terminal trace rows —
+ *  the terminal counterpart of the file squircle: one quiet theme-accent mark
+ *  that lets the eye pick command rows out of a run of calls. */
+function TerminalRowIcon() {
+  return (
+    <svg
+      className="trace-row-term-icon"
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M5 7l5 5-5 5" />
+      <path d="M13 17h6" />
+    </svg>
+  );
+}
+
 /** Extract a clean host label (e.g. "github.com") from a URL for the
  *  favicon + source chip. Falls back to the raw URL when it can't parse. */
 function hostOf(url?: string): string {
@@ -473,7 +499,8 @@ export const TerminalResultText = function TerminalResultText({
       title={long ? "Open the full output in the side panel" : undefined}
       onClick={
         long
-          ? () => useViewerTabs.getState().openText("Terminal output", text)
+          ? () =>
+              useViewerTabs.getState().openText("Terminal output", text, "text")
           : undefined
       }
     >
@@ -527,14 +554,22 @@ export const FileResultLinks = memo(function FileResultLinks({
                 .getState()
                 .openText(
                   `${tool} results`,
+                  // Markdown list so the side panel renders every path as a
+                  // clickable file chip (inline `code` -> FileChip) instead of
+                  // a wall of raw text.
                   items
                     .map((it) => {
                       const f = String(it.file ?? it.path ?? "");
                       const ln = it.line != null ? `:${String(it.line)}` : "";
-                      const tx = String(it.text ?? "");
-                      return `${f}${ln}${tx ? `  ${tx}` : ""}`;
+                      // A backtick in the matched line would end the inline
+                      // code span early — swap it so the path chip stays put.
+                      const tx = String(it.text ?? "")
+                        .replace(/`/g, "'")
+                        .slice(0, 300);
+                      return `- \`${f}${ln}\`${tx ? ` — ${tx}` : ""}`;
                     })
                     .join("\n"),
+                  "md",
                 )
             }
           >
@@ -1291,16 +1326,44 @@ export const ToolSubRow = memo(function ToolSubRow({
  *  like diff/plan on the right; short ones stay a quick inline peek. */
 const TRACE_TEXT_PANEL_MIN = 600;
 
-/** Plain-text dump of a tool row's output (summary/args/diff/terminal) — the
- *  body the side panel opens for long rows. */
+/** A code fence that can never appear inside the payload itself: one backtick
+ *  longer than the longest ` run in the text (min 3), so embedded markdown
+ *  fences or template literals never terminate the block early. */
+function fenceFor(s: string): string {
+  let max = 0;
+  let run = 0;
+  for (const ch of s) {
+    if (ch === "`") {
+      run++;
+      if (run > max) max = run;
+    } else {
+      run = 0;
+    }
+  }
+  return "`".repeat(Math.max(3, max + 1));
+}
+
+/** Markdown dump of a tool row's output (summary/args/diff/terminal) — the
+ *  body the side panel opens for long rows. Bold section labels + fenced
+ *  blocks so the markdown text view renders args/diff/output with the code
+ *  block chrome instead of collapsing the lines into paragraphs. */
 function traceRowOutputText(activity: ToolActivity, argsText: string): string {
   const parts: string[] = [];
-  if (activity.summary) parts.push(`Summary\n${fixZwsp(activity.summary)}`);
-  if (argsText) parts.push(`Args\n${argsText}`);
-  if (activity.diff) parts.push(`Diff\n${activity.diff}`);
+  if (activity.summary) parts.push(`**Summary**\n\n${fixZwsp(activity.summary)}`);
+  if (argsText) {
+    const f = fenceFor(argsText);
+    parts.push(`**Args**\n\n${f}\n${argsText}\n${f}`);
+  }
+  if (activity.diff) {
+    const f = fenceFor(activity.diff);
+    parts.push(`**Diff**\n\n${f}diff\n${activity.diff}\n${f}`);
+  }
   if (activity.tool === "run_terminal") {
     const out = terminalOutputText(activity.items ?? activity.results);
-    if (out) parts.push(`Output\n${out}`);
+    if (out) {
+      const f = fenceFor(out);
+      parts.push(`**Output**\n\n${f}\n${out}\n${f}`);
+    }
   }
   return parts.join("\n\n");
 }
@@ -1352,7 +1415,7 @@ const TraceRow = memo(function TraceRow({
   const sideTitle = `${label} — ${detail.slice(0, 40)}`;
   const onHeadClick = () => {
     if (!isEdit && outputText.length > TRACE_TEXT_PANEL_MIN) {
-      useViewerTabs.getState().openText(sideTitle, outputText);
+      useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
     }
     setExpanded((e) => !e);
@@ -1367,7 +1430,13 @@ const TraceRow = memo(function TraceRow({
         onClick={onHeadClick}
       >
         <span className="trace-row-bullet" aria-hidden="true">
-          {running ? <span className="spinner" /> : "•"}
+          {running ? (
+            <span className="spinner" />
+          ) : activity.tool === "run_terminal" ? (
+            <TerminalRowIcon />
+          ) : (
+            "•"
+          )}
         </span>
         <span className="trace-pill">{label}</span>
         {activity.tool === "web_search" && activity.engine && (
@@ -1645,7 +1714,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
       return;
     }
     if (outputText.length > TRACE_TEXT_PANEL_MIN) {
-      useViewerTabs.getState().openText(sideTitle, outputText);
+      useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
     }
     setExpanded((e) => !e);
@@ -1792,7 +1861,7 @@ function ToolPathSpan({ path }: { path: string }) {
         }
       }}
     >
-      <FileIcon path={path} size={18} />
+      <FileIcon path={path} size={20} />
       {path}
     </span>
   );
@@ -1920,7 +1989,7 @@ export const ToolCallView = memo(function ToolCallView({
                 {activity.tool === "write_file" ? "Wrote" : "Edited"}
               </span>
               <span className="tool-file" title={writePath}>
-                <FileIcon path={writePath} size={18} />
+                <FileIcon path={writePath} size={20} />
                 <span className="tool-file-name" dir="ltr">
                   {writePath.split("/").pop() ?? writePath}
                 </span>

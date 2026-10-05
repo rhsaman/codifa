@@ -279,6 +279,27 @@ textarea {
   position: relative;
 }
 
+/* macOS frameless window: empty strip under the traffic lights. Dragging it
+   moves the window; off-mac it collapses so no space is wasted. */
+.sidebar-drag {
+  display: none;
+}
+
+.mac .sidebar-drag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--titlebar-h);
+  flex: 0 0 auto;
+  padding: 0 8px 0 76px;
+  overflow: hidden;
+  -webkit-app-region: drag;
+}
+
+.mac .sidebar-drag button {
+  -webkit-app-region: no-drag;
+}
+
 .sidebar-head {
   flex: 0 0 auto;
   display: flex;
@@ -434,14 +455,25 @@ textarea {
   direction: ltr;
 }
 
-/* Hover-only scrollbars for the sidebar chat list and the side panel: the
-   bars stay invisible until the pointer is over the surface (keyboard and
-   touch scrolling still work while hidden). */
+/* Hover-only scrollbars for the sidebar chat list, the side panel and every
+   right-docked viewer pane (file/text viewer, plan, git diff, trace, browser,
+   code map, the viewer tab strip, nested trace JSON): the bars stay invisible
+   until the pointer is over the surface (keyboard and touch scrolling still
+   work while hidden). */
 .sidebar-list,
 .right-panel-body,
 .diff-side,
 .schedule-inbox-list,
-.trace-panel-list {
+.trace-panel-list,
+.file-viewer-body,
+.plan-panel-body,
+.review-files,
+.browser-stage,
+.codemap-tree,
+.tab-bar.viewer-tabs,
+.trace-detail-json,
+.panel-pane,
+.tab-list-menu {
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
 }
@@ -449,21 +481,48 @@ textarea {
 .right-panel-body:hover,
 .diff-side:hover,
 .schedule-inbox-list:hover,
-.trace-panel-list:hover {
+.trace-panel-list:hover,
+.file-viewer-body:hover,
+.plan-panel-body:hover,
+.review-files:hover,
+.browser-stage:hover,
+.codemap-tree:hover,
+.tab-bar.viewer-tabs:hover,
+.trace-detail-json:hover,
+.panel-pane:hover,
+.tab-list-menu:hover {
   scrollbar-color: var(--border) transparent;
 }
 .sidebar-list::-webkit-scrollbar-thumb,
 .right-panel-body::-webkit-scrollbar-thumb,
 .diff-side::-webkit-scrollbar-thumb,
 .schedule-inbox-list::-webkit-scrollbar-thumb,
-.trace-panel-list::-webkit-scrollbar-thumb {
+.trace-panel-list::-webkit-scrollbar-thumb,
+.file-viewer-body::-webkit-scrollbar-thumb,
+.plan-panel-body::-webkit-scrollbar-thumb,
+.review-files::-webkit-scrollbar-thumb,
+.browser-stage::-webkit-scrollbar-thumb,
+.codemap-tree::-webkit-scrollbar-thumb,
+.tab-bar.viewer-tabs::-webkit-scrollbar-thumb,
+.trace-detail-json::-webkit-scrollbar-thumb,
+.panel-pane::-webkit-scrollbar-thumb,
+.tab-list-menu::-webkit-scrollbar-thumb {
   background: transparent;
 }
 .sidebar-list:hover::-webkit-scrollbar-thumb,
 .right-panel-body:hover::-webkit-scrollbar-thumb,
 .diff-side:hover::-webkit-scrollbar-thumb,
 .schedule-inbox-list:hover::-webkit-scrollbar-thumb,
-.trace-panel-list:hover::-webkit-scrollbar-thumb {
+.trace-panel-list:hover::-webkit-scrollbar-thumb,
+.file-viewer-body:hover::-webkit-scrollbar-thumb,
+.plan-panel-body:hover::-webkit-scrollbar-thumb,
+.review-files:hover::-webkit-scrollbar-thumb,
+.browser-stage:hover::-webkit-scrollbar-thumb,
+.codemap-tree:hover::-webkit-scrollbar-thumb,
+.tab-bar.viewer-tabs:hover::-webkit-scrollbar-thumb,
+.trace-detail-json:hover::-webkit-scrollbar-thumb,
+.panel-pane:hover::-webkit-scrollbar-thumb,
+.tab-list-menu:hover::-webkit-scrollbar-thumb {
   background: var(--border);
 }
 
@@ -1572,29 +1631,68 @@ textarea {
 
 .sidebar-subagent-item.status-failed {
   color: var(--text);
-  border-color: color-mix(in srgb, var(--thinking) 35%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
-.sidebar-subagent-dot {
+/* نشان وضعیت هر job — بج دایره‌ای ۱۵px هم‌سبک با نشان تودوها:
+   تیک سبز برای completed، ✕ قرمز برای failed، ⏹ خاکسته برای stopped و
+   نقطهٔ تپندهٔ accent داخل بج برای running. برچسب متنی وضعیت فقط در
+   title/aria می‌ماند تا ردیف‌های تمام‌شده تک‌خطی و تمیز بمانند. */
+.sidebar-subagent-mark {
   flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 1;
   border-radius: 50%;
-  background: color-mix(in srgb, var(--text-dim) 55%, transparent);
+  color: var(--text-dim);
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
-.sidebar-subagent-item.status-running .sidebar-subagent-dot {
-  background: var(--accent);
+.sidebar-subagent-item.status-running .sidebar-subagent-mark {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   animation: pulse 1.2s infinite;
 }
 
-.sidebar-subagent-item.status-completed .sidebar-subagent-dot {
-  background: color-mix(in srgb, var(--accent) 75%, transparent);
+.sidebar-subagent-item.status-running .sidebar-subagent-mark::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
-.sidebar-subagent-item.status-failed .sidebar-subagent-dot,
-.sidebar-subagent-item.status-stopped .sidebar-subagent-dot {
-  background: color-mix(in srgb, var(--thinking) 70%, transparent);
+.sidebar-subagent-item.status-completed .sidebar-subagent-mark {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 40%, transparent);
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+}
+
+.sidebar-subagent-item.status-failed .sidebar-subagent-mark {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.sidebar-subagent-item.status-stopped .sidebar-subagent-mark {
+  color: color-mix(in srgb, var(--text-dim) 85%, transparent);
+  font-size: 8px;
+}
+
+/* ردیف تمام‌شده کمی ملایم‌تر از در حال اجرا دیده می‌شود؛ هاور رنگ کامل
+   برمی‌گرداند تا تمایز «نشسته/فعال» بدون از دست دادن خوانایی حفظ شود. */
+.sidebar-subagent-item.status-completed .sidebar-subagent-desc {
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+}
+
+.sidebar-subagent-item.status-completed:hover .sidebar-subagent-desc,
+.sidebar-subagent-item.status-completed .sidebar-subagent-main:hover .sidebar-subagent-desc {
+  color: var(--text);
 }
 
 .sidebar-subagent-main {
@@ -1746,22 +1844,6 @@ textarea {
   white-space: nowrap;
   opacity: 0.9;
   font-variant-numeric: tabular-nums;
-}
-
-.sidebar-subagent-open {
-  flex: 0 0 auto;
-  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
-  font-size: 14px;
-  line-height: 1;
-  padding-inline-end: 2px;
-  transition:
-    color 0.14s,
-    transform 0.14s;
-}
-
-.sidebar-subagent-item:hover .sidebar-subagent-open {
-  color: var(--text);
-  transform: translateX(1px);
 }
 
 .sidebar-subagent-stop {
@@ -2144,36 +2226,86 @@ textarea {
       var(--bg-alt));
   border-bottom: none;
   box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  /* No drag on the bar itself: its scrollbar must stay draggable when the
+     pills overflow. The trailing spacer carries the window drag region. */
+  -webkit-app-region: no-drag;
+  /* The bar spans only the chat column, so at narrow widths it scrolls
+     horizontally instead of crushing its pills — scrollbar follows the same
+     hover-only pattern as the tab bars and panel panes. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-width: 0;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.titlebar:hover {
+  scrollbar-color: var(--border) transparent;
+}
+
+.titlebar::-webkit-scrollbar {
+  height: 6px;
+}
+
+.titlebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.titlebar::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+.titlebar:hover::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+
+/* Fixed-width passengers: every pill keeps its size and lets the bar scroll;
+   only the workspace label may truncate. */
+.titlebar #titlebar-toolbar,
+.titlebar #titlebar-right,
+.titlebar .chat-toolbar,
+.titlebar .usage-chip,
+.titlebar .update-wrap {
+  flex: 0 0 auto;
+}
+
+/* Window drag surface: the empty stretch after the last pill. */
+.titlebar-drag-spacer {
+  flex: 1 1 auto;
+  align-self: stretch;
+  min-width: 12px;
   -webkit-app-region: drag;
-  overflow: hidden;
+}
+
+/* macOS frameless window with the sidebar hidden: the traffic lights now
+   overlay this bar's corner — clear their zone (three buttons + gutter) so
+   no control sits behind the window buttons. */
+/* macOS frameless window strip cluster: sidebar toggle + workspace +
+   direction live at the window's top-left (right after the traffic lights)
+   in BOTH sidebar states — inside the sidebar's drag strip while the
+   sidebar is open, inline at the app bar's solo corner when it is closed —
+   so opening the sidebar never pushes them right. */
+.window-strip-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 
-.titlebar button,
-.titlebar .app-title {
+/* While the sidebar is open the cluster renders inside the sidebar's strip;
+   the app bar copy would be a duplicate. */
+.mac .titlebar.chat-topbar:not(.solo) .window-strip-cluster {
+  display: none;
+}
+
+.mac .titlebar.chat-topbar.solo {
+  /* Clear the traffic lights; the cluster flows inline after them. */
+  padding-left: 76px;
+}
+
+.titlebar button {
   -webkit-app-region: no-drag;
-}
-
-.app-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 700;
-  font-size: 13.5px;
-  letter-spacing: 0.3px;
-  color: var(--text);
-  white-space: nowrap;
-  user-select: none;
-}
-
-.app-title::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--success)));
-  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent);
-  flex: 0 0 auto;
 }
 
 /* Titlebar icon buttons: uniform ghost buttons — no background, same size.
@@ -2221,8 +2353,9 @@ textarea {
 .titlebar .icon-btn[aria-pressed="true"],
 .titlebar-icon-btn[aria-pressed="true"] {
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+  /* Active = accent ICON only: no tinted background, no ring. */
+  background: transparent;
+  box-shadow: none;
 }
 
 .titlebar .icon-btn:focus-visible,
@@ -2240,27 +2373,102 @@ textarea {
   margin: 0 2px;
 }
 
-/* Panel toggle: visually distinct from the ghost icons — filled accent
-   surface so it reads as the panel switch at the far corner. */
-.titlebar-icon-btn.panel-toggle {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+/* Panel & pane toggles: idle = plain ghost (same color as the neighboring
+   icon); active = accent icon only via the base [aria-pressed] rule —
+   never a solid blue fill. */
+.titlebar-icon-btn.panel-toggle:not([aria-pressed="true"]),
+.titlebar-icon-btn.pane-toggle:not([aria-pressed="true"]) {
+  background: transparent;
+  color: var(--text-dim);
+  box-shadow: none;
+}
+
+.titlebar-icon-btn.panel-toggle:hover:not([aria-pressed="true"]),
+.titlebar-icon-btn.pane-toggle:hover:not([aria-pressed="true"]) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Active (pane/panel open): accent ICON only — no tinted background, no
+   ring (unlike the sidebar toggle's soft tint). */
+.titlebar-icon-btn.panel-toggle[aria-pressed="true"],
+.titlebar-icon-btn.pane-toggle[aria-pressed="true"] {
+  background: transparent;
   color: var(--accent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+  box-shadow: none;
 }
 
-.titlebar-icon-btn.panel-toggle:hover {
-  background: color-mix(in srgb, var(--accent) 24%, transparent);
-  color: var(--accent);
-}
-
-.titlebar-icon-btn.panel-toggle[aria-pressed="true"] {
-  background: var(--accent);
-  color: var(--on-accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-.titlebar-icon-btn.panel-toggle[aria-pressed="true"] .panel-toggle-fill {
+.titlebar-icon-btn.panel-toggle[aria-pressed="true"] .panel-toggle-fill,
+.titlebar-icon-btn.pane-toggle[aria-pressed="true"] .panel-toggle-fill {
   opacity: 0.85;
+}
+
+/* Workspace actions pill (Finder / terminal menu): wider than a plain icon
+   button — the macOS-style app badge plus a chevron on a soft glassy pill. */
+.titlebar-ws-menu-wrap {
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-icon-btn.workspace-menu-btn {
+  width: auto;
+  padding: 0 10px;
+  gap: 7px;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--text) 9%, transparent),
+      color-mix(in srgb, var(--text) 3%, transparent)
+    ),
+    color-mix(in srgb, var(--accent) 7%, var(--bg-alt));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 12%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--text) 9%, transparent),
+    0 2px 6px color-mix(in srgb, var(--bg) 45%, transparent);
+  color: var(--text-dim);
+}
+
+.titlebar-icon-btn.workspace-menu-btn:hover {
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--text) 13%, transparent),
+      color-mix(in srgb, var(--text) 5%, transparent)
+    ),
+    color-mix(in srgb, var(--accent) 12%, var(--bg-alt));
+  color: var(--text);
+}
+
+.titlebar-icon-btn.workspace-menu-btn:active {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-alt));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.titlebar-icon-btn.workspace-menu-btn[disabled] {
+  opacity: 0.45;
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--text) 6%, transparent),
+      transparent
+    );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.titlebar-icon-btn .mac-app-badge,
+.ws-menu-btn .mac-app-badge {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 1px 2px color-mix(in srgb, var(--bg) 55%, transparent));
+}
+
+.workspace-menu-btn svg:last-child {
+  opacity: 0.6;
 }
 
 .workspace-btn-label {
@@ -2315,14 +2523,19 @@ textarea {
 }
 
 /* خوشه‌ی آیکون‌های هدر — دکمه‌ی پنل با جداکننده در گوشه‌ی انتهایی. */
-.titlebar-workspace {
-  margin-left: auto;
+/* Panel-opening actions (inbox / traces / git / browser / workspace menu /
+   right-panel toggle) at the end of the chat tab-bar row. */
+.chat-tabs-actions {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding-left: 4px;
-  flex: 0 0 auto;
+  gap: 4px;
+  padding: 0 10px 5px;
   -webkit-app-region: no-drag;
+}
+
+.chat-tabs-actions .titlebar-divider {
+  margin: 0 4px;
 }
 
 .update-wrap {
@@ -2730,6 +2943,17 @@ textarea {
 .markdown-body :not(pre)>code {
   direction: ltr;
   unicode-bidi: isolate;
+  /* Atomic chip: it must never split across lines. A split fragment
+     re-enters the surrounding RTL line's bidi resolution on its own, so
+     numbers and connectors attach to the wrong neighbor and the sentence
+     reads scrambled. The max-width + ellipsis keeps an over-long chip
+     from overflowing the column instead of wrapping. */
+  display: inline-block;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
 }
 
 .markdown-body code {
@@ -2782,7 +3006,8 @@ textarea {
 }
 
 /* Toolbar now renders inside the titlebar via a React portal from ChatPanel */
-.titlebar #titlebar-toolbar {
+.titlebar #titlebar-toolbar,
+.titlebar #titlebar-right {
   display: contents;
 }
 
@@ -2793,14 +3018,14 @@ textarea {
   margin-left: 2px;
   align-items: center;
   min-width: 0;
-  flex: 0 1 auto;
+  flex: 0 0 auto;
 }
 
-/* Model / context / balance pills inside the appbar: one soft pill language —
-   same height, same hairline border, same translucent fill as usage-chip. */
-.titlebar .chat-toolbar .badge,
-.titlebar .chat-toolbar .titlebar-balance-clickable {
-  height: 26px;
+/* Balance pill inside the appbar: one soft pill language — same hairline
+   border, same translucent fill as usage-chip. 30px tall so the 20px wallet
+   icon matches the Finder badge beside it. */
+.titlebar #titlebar-right .titlebar-balance-clickable {
+  height: 30px;
   padding: 0 10px;
   border-radius: 999px;
   font-size: 12px;
@@ -2811,15 +3036,29 @@ textarea {
   box-shadow: none;
 }
 
-.titlebar .chat-toolbar .badge:hover,
-.titlebar .chat-toolbar .titlebar-balance-clickable:hover {
+.titlebar #titlebar-right .titlebar-balance-clickable:hover {
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   color: var(--text);
   background: color-mix(in srgb, var(--text) 9%, transparent);
 }
 
+/* No amount fetched yet: the chip is a bare ghost icon button — same 30px
+   square, transparent chrome — so it reads like the neighboring titlebar
+   icon buttons instead of an empty pill. */
+.titlebar #titlebar-right .titlebar-balance-clickable[data-has-balance="false"] {
+  width: 30px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.titlebar #titlebar-right .titlebar-balance-clickable[data-has-balance="false"]:hover {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
 /* RTL/LTR direction switch: text pill, same height as the other pills. */
-.titlebar .chat-toolbar .dir-text-btn {
+.dir-text-btn {
   width: auto;
   height: 26px;
   padding: 0 10px;
@@ -2831,7 +3070,7 @@ textarea {
   background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
-.titlebar .chat-toolbar .dir-text-btn:hover {
+.dir-text-btn:hover {
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
@@ -3679,14 +3918,72 @@ textarea {
   width: 100%;
 }
 
-.composer-input-row .composer-input {
+.composer-input-row .composer-input-stack {
   grid-row: 1;
   grid-column: 1 / -1;
+  position: relative;
+  min-width: 0;
+}
+
+.composer-input-row .composer-input-stack .composer-input {
+  position: relative;
+  z-index: 1;
   min-width: 0;
   min-height: 36px;
   max-height: 200px;
   padding: 8px 14px 2px;
   resize: none;
+}
+
+/* Codex-style slash highlight: a backdrop div mirrors the textarea text
+   (same font/padding/wrap) and paints only the leading "/name" token in
+   the accent color. The textarea itself turns transparent so the backdrop
+   shows through while caret, selection and IME keep working on real input. */
+.composer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  padding: 8px 14px 2px;
+  font-size: var(--chat-font-size);
+  font-family: var(--font-sans);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--text);
+  visibility: hidden;
+}
+
+.composer-input-stack.slash-rich .composer-backdrop {
+  visibility: visible;
+}
+
+.composer-backdrop .slash-token {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.composer-backdrop .backdrop-plain {
+  color: var(--text);
+}
+
+/* The leading "/" stays in the real value (so parsing/submit keep working)
+   but is invisible in the painted backdrop — the command reads as a clean
+   chip-like token while caret alignment is preserved. */
+.composer-backdrop .slash-hidden {
+  color: transparent;
+}
+
+.composer-input-stack.slash-rich .composer-input {
+  color: transparent;
+  caret-color: var(--accent);
+}
+
+.composer-input-stack.slash-rich .composer-input::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .composer-bottom-row {
@@ -5032,15 +5329,27 @@ textarea {
 }
 
 .markdown-body code {
-  background: var(--bg-input);
-  padding: 2px 5px;
-  border-radius: 4px;
-  font-size: 12.5px;
+  /* Theme-tinted chip: a whisper of the theme accent over --bg-alt, a
+     hairline accent border and text pulled slightly toward the accent so
+     inline code reads as a deliberate chip in every theme, not a gray box.
+     All metrics are em-based and the painted box stays inside the parent
+     line box (chat line-height 1.68), so lines with and without chips keep
+     the same vertical rhythm and chip borders never crowd neighbor lines. */
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-alt));
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  color: color-mix(in srgb, var(--accent) 35%, var(--text));
+  padding: 0.15em 0.45em;
+  border-radius: 5px;
+  font-size: 0.85em;
+  line-height: 1.35;
 }
 
 .markdown-body pre code {
   padding: 0;
   background: none;
+  border: none;
+  color: inherit;
+  line-height: inherit;
 }
 
 .code-block {
@@ -7468,10 +7777,10 @@ textarea {
   border-color: var(--success);
 }
 
-/* Provider balance chip in the chat titlebar (next to the context meter).
-   Kept self-contained: the chip may also render as a fallback outside the
-   titlebar portal (see ChatPanel), so the font-size + min-width here must NOT
-   depend on a `.titlebar` ancestor. */
+/* Provider balance chip on the app bar's right end. Kept self-contained:
+   the chip may also render as a fallback outside the titlebar portal (see
+   ChatPanel), so the font-size here must NOT depend on a `.titlebar`
+   ancestor. */
 .titlebar-balance {
   display: inline-flex;
   align-items: center;
@@ -7480,9 +7789,6 @@ textarea {
   font-weight: 600;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  /* Stable width: "—" placeholder and "$12.34" stay the same width so the
-     toolbar doesn't jitter while a refresh is in flight. */
-  min-width: 5.5ch;
   justify-content: center;
 }
 
@@ -8503,11 +8809,15 @@ textarea {
   padding: 4px 2px 2px;
 }
 
-/* A slash command typed/inserted into the composer paints its text with the
-   accent color (Codex-style) — plain text, no chip card over the input. */
+/* Legacy full-text tint is superseded by the backdrop token highlight above.
+   Kept as a no-op fallback so plain-text slash lines never go invisible if
+   the backdrop is absent. */
 .composer-input.slash-active {
-  color: var(--accent);
-  font-weight: 600;
+  font-weight: 400;
+}
+
+.composer-input-stack:not(.slash-rich) .composer-input.slash-active {
+  color: var(--text);
 }
 
 /* ---- prompt history popup (ArrowUp): Codex-style cards above the input ---- */
@@ -10006,6 +10316,13 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* Terminal trace rows swap the plain bullet for the shell-prompt glyph in
+   the theme accent, so command rows read at a glance like file rows do. */
+.trace-row-term-icon {
+  color: var(--accent);
+  opacity: 0.9;
 }
 
 /* Container for tool-name pills inside the trace head. Reserved at least
@@ -12439,8 +12756,10 @@ textarea {
    no direction override here so RTL text stays RTL while the outer
    scroll container (and its scrollbar) stays LTR on the right edge. */
 
-/* Long code chips inside the plan must wrap, not force the block wider. */
-.plan-panel-body :is(p, li, h1, h2, h3, h4) code,
+/* Code BLOCKS in the plan may wrap long lines inside narrow panels.
+   Inline chips must NOT wrap: they stay atomic via
+   .markdown-body :not(pre)>code, so a chip never splits across lines and
+   re-scrambles the RTL line it sits in. */
 .plan-panel-body pre,
 .plan-panel-body pre code {
   white-space: break-spaces;
@@ -15439,6 +15758,39 @@ textarea {
   background: color-mix(in srgb, var(--text) 3%, transparent);
 }
 
+/* Toolbar above the opened file's diff — carries the "Source preview"
+   opener (full file in its own viewer tab). */
+.review-file-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px 2px;
+}
+
+.review-source-preview-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color 0.14s ease,
+    border-color 0.14s ease,
+    background 0.14s ease;
+}
+
+.review-source-preview-btn:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
 .review-empty {
   padding: 24px;
   color: var(--text-dim);
@@ -16398,14 +16750,8 @@ mark.diff-hit-active {
 }
 
 @media (max-width: 980px) {
-  .app-title {
-    display: none;
-  }
   .workspace-btn {
     max-width: 150px;
-  }
-  .titlebar .chat-toolbar .badge .context-meter-text {
-    display: none;
   }
 }
 
@@ -17436,11 +17782,9 @@ mark.trace-hit-active {
   align-items: flex-end;
   gap: 6px;
   padding: 10px 12px 0;
-  overflow-x: auto;
-  /* Thumb stays hidden until the bar is hovered (revealed below); the gutter
-     is still reserved so hovering never shifts the layout. */
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
+  /* Tabs never scroll: they squeeze to fit and the tab-list chevron at the
+     bar's start reaches everything (searchable menu + recently closed). */
+  overflow-x: hidden;
   border-bottom: 1px solid color-mix(in srgb, var(--group) 32%, var(--border));
   background:
     linear-gradient(180deg,
@@ -17448,8 +17792,6 @@ mark.trace-hit-active {
       color-mix(in srgb, var(--group) 4%, transparent) 55%,
       transparent 100%),
     var(--bg-alt);
-  /* Soft fade at the scroll edges so overflowing tabs don't clip harshly. */
-  mask-image: linear-gradient(90deg, #000 96%, transparent);
 }
 
 /* Slim horizontal scrollbar: thumb revealed only while the bar is hovered
@@ -17483,16 +17825,53 @@ mark.trace-hit-active {
   --group: var(--link);
 }
 
+/* Row wrapper around the chat tab bar + panel actions: the border runs under
+   the whole row (bar + actions) so the actions sit on the same rule line as
+   the tabs instead of floating above it. */
+.chat-tabs-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  min-width: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  /* Frameless window: dragging from the empty stretch between tabs and the
+     actions moves the window (buttons opt out below). */
+  -webkit-app-region: drag;
+}
+
+.chat-tabs-row button {
+  -webkit-app-region: no-drag;
+}
+
+.chat-tabs-row .tab-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-bottom: none;
+}
+
+/* Same treatment for the viewer tab strip: it is the header of the viewer
+   column, so its empty stretch drags the window too. */
+.tab-bar.viewer-tabs {
+  -webkit-app-region: drag;
+}
+
+.tab-bar.viewer-tabs button {
+  -webkit-app-region: no-drag;
+}
+
 .editor-tab {
   position: relative;
   display: inline-flex;
-  /* Tabs keep their content width: with many tabs the bar scrolls instead of
-     squeezing titles into nothing. */
-  flex: 0 0 auto;
+  /* Tabs are divs (role="tab"), not buttons — without this the window drag
+     region on the tab-bar rows swallows their clicks in Electron. */
+  -webkit-app-region: no-drag;
+  /* Tabs squeeze instead of scrolling: shrink proportionally when the bar
+     runs out of room (the tab-list chevron reaches the full list). */
+  flex: 0 1 auto;
+  min-width: 44px;
   align-items: center;
   gap: 8px;
   max-width: 220px;
-  min-width: 0;
   padding: 4px 8px 5px 12px;
   border: 1px solid color-mix(in srgb, var(--group) 14%, transparent);
   border-bottom: 0;
@@ -17749,7 +18128,8 @@ mark.trace-hit-active {
 
 .tab-bar.chat-tabs .editor-tab-new,
 .tab-bar.chat-tabs .editor-tab-full,
-.tab-bar.viewer-tabs .editor-tab-full {
+.viewer-add-btn,
+.viewer-pane-full {
   margin: 0;
   width: 30px;
   height: 30px;
@@ -17765,9 +18145,16 @@ mark.trace-hit-active {
   font-size: 14px;
 }
 
+/* The pane fullscreen button sits directly in the header row (stretch would
+   grow it) — keep it centered like the + and panel buttons. */
+.viewer-pane-head > .viewer-pane-full {
+  align-self: center;
+}
+
 .tab-bar.chat-tabs .editor-tab-new:hover,
 .tab-bar.chat-tabs .editor-tab-full:hover,
-.tab-bar.viewer-tabs .editor-tab-full:hover {
+.viewer-add-btn:hover,
+.viewer-pane-full:hover {
   color: var(--text);
   background: color-mix(in srgb, var(--text) 8%, transparent);
   border-color: transparent;
@@ -17820,8 +18207,315 @@ mark.trace-hit-active {
   align-items: center;
   background: transparent;
   border-bottom: 1px solid var(--hairline);
-  mask-image: none;
-  overflow-x: auto;
+  overflow-x: hidden;
+}
+
+/* Side pane header: the viewer tab bar shares one row with the "+" opener
+   and the panel/collapse buttons. The border runs under the whole row and
+   the empty stretch drags the frameless window. */
+.viewer-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  border-bottom: 1px solid var(--hairline);
+  -webkit-app-region: drag;
+}
+
+.viewer-pane-head button,
+.viewer-pane-head .viewer-add-menu {
+  -webkit-app-region: no-drag;
+}
+
+.viewer-pane-head .tab-bar.viewer-tabs {
+  flex: 0 1 auto;
+  min-width: 0;
+  border-bottom: none;
+}
+
+.viewer-pane-spacer {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+.viewer-pane-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+}
+
+/* ---- Tab-list chevron + searchable tab menu (both tab bars) ----
+   The bars never scroll; this list is how every tab stays reachable. */
+.tab-list-wrap {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px 6px 8px;
+}
+
+.viewer-pane-head .tab-list-wrap {
+  padding: 0 4px 0 8px;
+  align-self: center;
+}
+
+.tab-list-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.tab-list-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.tab-list-menu {
+  /* Rendered inside drag-region rows — the menu (and its search input) must
+     stay interactive. */
+  -webkit-app-region: no-drag;
+  width: 400px;
+  max-width: calc(100vw - 24px);
+  max-height: min(540px, calc(100vh - 90px));
+  overflow-y: auto;
+  z-index: 80;
+  padding: 10px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 96%, var(--text) 4%);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42);
+}
+
+.tab-list-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.tab-list-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  padding: 0;
+}
+
+.tab-list-section {
+  margin-bottom: 4px;
+}
+
+.tab-list-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  padding: 8px 8px 4px;
+}
+
+.tab-list-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 9px;
+  padding: 1px 6px 1px 2px;
+  color: var(--text);
+}
+
+.tab-list-item:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.tab-list-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.tab-list-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 7px 8px;
+  border-radius: 8px;
+  text-align: start;
+}
+
+.tab-list-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-dim);
+}
+
+.tab-list-item.active .tab-list-icon {
+  color: var(--accent);
+}
+
+.tab-list-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-list-age {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  padding-right: 2px;
+}
+
+.tab-list-close {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+}
+
+.tab-list-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.tab-list-empty {
+  padding: 16px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* "+" opener for the side pane (opens the add-tab dropdown). */
+.viewer-add-wrap {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px 0 2px;
+}
+
+.viewer-add-menu {
+  min-width: 230px;
+}
+
+/* "Open tab" screen — the empty side pane (same entries as the + menu). */
+.viewer-chooser {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 24px;
+  text-align: center;
+}
+
+.viewer-chooser-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.viewer-chooser-sub {
+  margin: 0 0 16px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.viewer-chooser-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(420px, 100%);
+}
+
+.viewer-chooser-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: start;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.viewer-chooser-item svg {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+.viewer-chooser-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text);
+}
+
+.viewer-chooser-item:hover svg {
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* Panel mode body: the todos / sub-agents / schedules sections stacked in
+   the side pane. */
+.panel-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 16px;
 }
 
 .tab-bar.viewer-tabs .editor-tab-full {
@@ -17831,8 +18525,8 @@ mark.trace-hit-active {
 }
 
 .tab-bar.viewer-tabs .editor-tab.viewer-tab {
-  flex: 0 0 auto;
-  min-width: 0;
+  flex: 0 1 auto;
+  min-width: 44px;
   min-height: 26px;
   max-width: 210px;
   gap: 7px;
@@ -18175,65 +18869,115 @@ mark.trace-hit-active {
 }
 
 .browser-omnibox:focus {
-  border-color: var(--link, #6ea8fe);
-  background: color-mix(in srgb, var(--link, #6ea8fe) 12%, transparent);
+  border-color: var(--hairline, rgba(255, 255, 255, 0.12));
+  background: color-mix(in srgb, var(--text, #e8e8ea) 7%, transparent);
 }
 
-.browser-dims-input {
-  width: 52px;
+
+
+.browser-width-ruler {
+  flex: 1 1 auto;
+  min-width: 80px;
   height: 24px;
-  padding: 0 6px;
-  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.14));
+  position: relative;
+  overflow: visible;
   border-radius: 6px;
-  background: color-mix(in srgb, var(--text, #e8e8ea) 6%, transparent);
-  color: var(--text, #e8e8ea);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
+  background: #1e1f24;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  cursor: ew-resize;
   outline: none;
 }
 
-.browser-dims-input:focus {
-  border-color: var(--link, #6ea8fe);
+.browser-width-ruler--full {
+  flex: none;
+  width: 100%;
+  height: 28px;
+  border-radius: 0;
+  border: none;
+  background-color: #202124;
+  background-image: repeating-linear-gradient(to right, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px 20px);
+  background-size: 100% 5px;
+  background-repeat: no-repeat;
+  background-position: bottom;
 }
 
-.browser-apply-btn {
-  width: 24px;
-  height: 24px;
-  font-size: 12px;
+.browser-width-ruler:focus-visible {
+  outline: none;
 }
 
-.browser-sizebar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
-  font-size: 11px;
-  color: var(--text-dim, #9aa0a6);
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-
-.browser-fit-btn svg {
-  display: block;
-}
-
-.browser-width-slider {
-  flex: 1 1 auto;
-  min-width: 80px;
-  accent-color: var(--link, #6ea8fe);
-  cursor: pointer;
-}
-
-.browser-width-slider:disabled {
+.browser-width-ruler[data-disabled="true"] {
   opacity: 0.35;
   cursor: default;
 }
 
-.browser-size {
-  margin-left: auto;
-  font-variant-numeric: tabular-nums;
+.browser-ruler-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30px;
+  transform: translateX(-50%);
+  background: transparent;
+  cursor: pointer;
 }
+
+.browser-ruler-tick::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 13px;
+  bottom: 3px;
+  width: 1px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.browser-ruler-tick:hover::after {
+  background: #fff;
+}
+
+.browser-ruler-tick-label {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.65);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.browser-ruler-thumb {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.14);
+  border-left: 1px solid #fff;
+  border-right: 1px solid #fff;
+  border-radius: 1px;
+  cursor: ew-resize;
+}
+
+.browser-ruler-tip {
+  position: absolute;
+  top: -26px;
+  transform: translateX(-50%);
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #3c4043;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #e8eaed;
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  z-index: 5;
+}
+
+
 
 .browser-stage {
   flex: 1;
@@ -18248,7 +18992,7 @@ mark.trace-hit-active {
 }
 
 .browser-stage:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--link, #6ea8fe);
+  box-shadow: none;
 }
 
 .browser-stage-inner {
@@ -18301,14 +19045,7 @@ mark.trace-hit-active {
   object-fit: contain;
 }
 
-.browser-panel .browser-dims-input {
-  min-width: 0;
-}
 
-.browser-panel .browser-size {
-  flex: 0 0 auto;
-  white-space: nowrap;
-}
 
 .browser-panel .browser-tool-btn--on {
   background: color-mix(in srgb, var(--link, #6ea8fe) 22%, transparent);
@@ -18334,19 +19071,14 @@ mark.trace-hit-active {
   opacity: 0.8;
 }
 
-.browser-subbar-label {
-  flex: 0 0 auto;
-  font-size: 11px;
-  opacity: 0.7;
-}
+
 
 .browser-stage {
   position: relative;
 }
 
 .browser-stage:focus {
-  outline: 1px solid var(--link, #6ea8fe);
-  outline-offset: -1px;
+  outline: none;
 }
 
 .browser-stage-inner {
@@ -18404,7 +19136,10 @@ mark.trace-hit-active {
   opacity: 0.85;
   cursor: pointer;
   border-radius: 4px;
-  vertical-align: baseline;
+  /* inline-flex would derive its baseline from the SVG icon's margin box
+     (an SVG has no text baseline), lifting the whole chip above the text
+     line. Center on the line so icon + path sit inside the prose line. */
+  vertical-align: middle;
   text-align: start;
   max-width: 100%;
 }
@@ -18420,7 +19155,12 @@ mark.trace-hit-active {
 
 .file-chip-name {
   text-decoration: none;
-  overflow-wrap: anywhere;
+  /* One line, ellipsized at the chip's max-width — wrapping inside the
+     chip would grow it into a two-line box in the middle of a prose
+     line; the full path stays on the chip's title. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   min-width: 0;
 }
 
@@ -18556,6 +19296,68 @@ mark.trace-hit-active {
 
 .fv-copy.copied {
   color: var(--text);
+}
+
+/* MD/Raw render toggle in the text-viewer head (segmented, fv-copy family). */
+.tv-view-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.tv-view-toggle button {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+
+.tv-view-toggle button + button {
+  border-left: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.tv-view-toggle button:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.tv-view-toggle button.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Markdown render of the text-viewer body: same padding rhythm as the raw
+   pre, prose follows the shared chat markdown styles. */
+.text-viewer-md {
+  padding: 10px 14px 16px;
+}
+
+.text-viewer-md .chat-message {
+  max-width: none;
+}
+
+/* Close-match file chips under the "no file at this path" note. */
+.fv-suggest {
+  flex: 0 0 auto;
+  padding: 4px 12px 12px;
+}
+
+.fv-suggest-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.fv-suggest-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .file-viewer-note {
@@ -18773,6 +19575,21 @@ mark.trace-hit-active {
   color: var(--link);
 }
 
+.fv-open-icon-cmux {
+  background: color-mix(in srgb, var(--warning, #d9a514) 16%, transparent);
+  color: var(--warning, #d9a514);
+}
+
+.fv-open-icon-ghostty {
+  background: color-mix(in srgb, #cba6f7 16%, transparent);
+  color: #cba6f7;
+}
+
+.fv-open-icon-warp {
+  background: color-mix(in srgb, #fab387 16%, transparent);
+  color: #fab387;
+}
+
 .fv-open-text {
   display: flex;
   flex-direction: column;
@@ -18895,4 +19712,207 @@ mark.trace-hit-active {
 
 .file-viewer-pre .hljs-strong {
   font-weight: 700;
+}
+
+/* ============================================================
+   Bottom terminal panel (Cmd/Ctrl+J)
+   Docked under the whole app body. Tabs mirror the reference
+   layout: "Terminal" label, one chip per pty session, +/× on
+   the right. Sessions keep running while the panel is hidden.
+   ============================================================ */
+.terminal-panel {
+  flex: 0 0 auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  overflow: visible;
+}
+
+.terminal-panel[data-open='false'] {
+  display: none;
+}
+
+.terminal-resize-handle {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  z-index: 30;
+}
+
+.terminal-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 1px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.terminal-resize-handle:hover::after,
+.terminal-resize-handle:active::after {
+  background: var(--accent);
+}
+
+.terminal-tabbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+.terminal-tabs {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 9px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.terminal-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.terminal-tab-active {
+  background: var(--bg-panel);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.terminal-tab-shell {
+  font-weight: 600;
+}
+
+.terminal-tab-cwd {
+  opacity: 0.7;
+}
+
+.terminal-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+}
+
+.terminal-tab-close:hover {
+  opacity: 1;
+  background: var(--bg-hover);
+}
+
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.terminal-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.terminal-action-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.terminal-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.terminal-screen {
+  position: absolute;
+  inset: 4px 10px 10px;
+  display: none;
+}
+
+.terminal-screen[data-active='true'] {
+  display: block;
+}
+
+.terminal-screen .xterm {
+  height: 100%;
+}
+
+.terminal-screen .xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.terminal-screen .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--bg-raised);
+  border-radius: 4px;
+}
+
+.terminal-unsupported {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: center;
 }

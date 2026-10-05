@@ -37,7 +37,10 @@ SUBAGENT_SYSTEM = (
     "3. Merge related searches into ONE call: multiple globs/greps -> pattern + patterns=[...] (or '|' inside pattern); scopes via path + paths=[...]; filters via include + includes=[...].\n"
     "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, ...) -- grep first, then read ONLY the needed windows in ONE call via ranges=[...] (same file, several windows included: ranges=['tools.py:640:60','tools.py:2089:80']; symbols=[...] may join that same call). Make the FIRST read decisive: known NAME (CODE MAP or a grep `in Name (L..)` hit) -> symbols=[...]; surveying a large file -> offset=1 limit=400+ for a FILE MAP, then symbols=[...] in ONE call. Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n"
     "5. External docs: web_search + fetch_url only when the answer needs them.\n"
-    "You have the same tools as the main agent for your task; use mutating tools "
+    "You have the same tools as the main agent for your task; if the task "
+    "requires action (edits, verification, browser/desktop loops, terminal "
+    "checks), DO it fully and report the concrete result (files changed, test "
+    "output, verification) — do NOT return only search hits. Use mutating tools "
     "only when the delegated task requires them. Avoid emojis.\n\n"
     "PROGRESSIVE BATCHING: each batch narrows toward the answer. Batch efficiently but there is no fixed call cap — keep searching until you hold what the task needs. grep/glob/read are always available — never claim otherwise.\n"
     # Concrete few-shot example — models follow patterns better than abstract rules:
@@ -64,15 +67,25 @@ AGENTS: dict[str, dict] = {
         "tools": None,
         "system": SUBAGENT_SYSTEM,
         # Hard step budget so one delegated task cannot run away (mirrors
-        # opencode's `agent.steps`); large enough for multi-file work.
-        "steps": 100,  # sub-agent step budget
+        # opencode's `agent.steps`). Kept tight on purpose: each step is a full
+        # LLM round-trip, so 50 finishes batched multi-file work in one go
+        # while halving the worst-case requests/tokens of the old 100.
+        "steps": 50,  # sub-agent step budget
     },
 }
 
 
 def resolve_agent(name: str) -> str:
-    """Normalize a sub-agent type name to its registry key."""
-    return str(name or "").strip()
+    """Normalize a sub-agent type name to its registry key.
+
+    Legacy aliases ("general", "explore", case-insensitive, empty) map to
+    the single "subagent" type so models trained on older prompts keep
+    working after the registry was unified.
+    """
+    normalized = str(name or "").strip().lower()
+    if normalized in ("", "general", "explore", "subagent"):
+        return "subagent"
+    return normalized
 
 
 def agent_names() -> list[str]:

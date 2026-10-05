@@ -1,4 +1,11 @@
-"""Project repeated read-only results without changing the durable transcript."""
+"""Project repeated read-only results without changing the durable transcript.
+
+Request-side only: every rewrite below keeps a full reference somewhere in the
+SAME request, so the model loses nothing. Identical-duplicate collapse applies
+to EVERY tool (a byte-identical (name, args, content) triple is pure dead
+weight — re-running a test suite, a cached web fetch, a re-loaded skill); the
+read/grep row-level features stay gated on those tool names.
+"""
 
 import json
 import posixpath
@@ -6,8 +13,6 @@ import re
 from collections.abc import Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
-
-READ_ONLY_TOOLS = frozenset({"read", "grep", "glob"})
 
 # Heavy browser results (Playwright MCP). A browser session re-snapshots the
 # page after every action and each snapshot is a multi-kilobyte yml tree that
@@ -296,7 +301,6 @@ def _last_browser_result_call_id(messages: Sequence[BaseMessage]) -> str:
 def project_tool_results(
     messages: Sequence[BaseMessage],
     *,
-    read_only_tools: frozenset[str] = READ_ONLY_TOOLS,
     min_chars: int = 512,
 ) -> list[BaseMessage]:
     """Keep a full reference in this request for every shortened duplicate."""
@@ -317,8 +321,6 @@ def project_tool_results(
                 heavy = _browser_heavy_tool(str(name or ""))
                 if heavy is not None:
                     browser_calls[str(call_id)] = heavy
-                if name not in read_only_tools:
-                    continue
                 try:
                     args = json.dumps(call.get("args", {}), sort_keys=True, ensure_ascii=False)
                 except (TypeError, ValueError):
@@ -372,11 +374,14 @@ def project_tool_results(
                 key = (*signature, content)
                 original_id = originals.get(key)
                 if original_id is None:
-                    originals[key] = message.tool_call_id
+                    originals[(*signature, content)] = message.tool_call_id
                 else:
+                    # Same tool, same args, byte-identical content — the full
+                    # text is already in this request under ``original_id``.
                     reference = (
-                        f"نتیجه عیناً با پاسخ ابزار {original_id} در همین پیام‌ها یکسان است؛ "
-                        "متن کامل همان پاسخ را استفاده کن."
+                        f"[This result is byte-identical to tool result "
+                        f"{original_id} earlier in these messages — use that "
+                        f"full text.]"
                     )
                     if len(reference) < len(content):
                         message = message.model_copy(update={"content": reference})

@@ -7,20 +7,21 @@ import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerContent } from './components/ViewerContent'
 import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs, visibleTabs } from './lib/viewerTabs'
-import { RightPanel } from './components/TodosPanel'
-import { ScheduleInboxButton } from './components/ScheduleInbox'
+import { ViewerAddButton, ViewerPaneFullscreenButton, ViewerTabListButton } from './components/ViewerTabBar'
+import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePlatform } from './lib/shortcuts'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
 import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 import { openWorkspaceFile } from './components/FileIcon'
-import { api } from './lib/fs'
+import { WindowStripCluster } from './components/WindowStripCluster'
+import { TerminalPanel } from './components/TerminalPanel'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -32,16 +33,14 @@ export default function App() {
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
-  const rightPanelOpen = useStore((s) => s.rightPanelOpen)
   const viewerTabs = useViewerTabs((s) => s.tabs)
   const viewerActiveId = useViewerTabs((s) => s.activeId)
   const viewerFull = useViewerTabs((s) => s.fullscreen)
+  const paneOpen = useViewerTabs((s) => s.paneOpen)
+  const panelMode = useViewerTabs((s) => s.panelMode)
   const chatFull = useStore((s) => s.chatFullscreen)
   // Viewer tabs are chat-scoped (browser/git/trace/plan): show only this chat's set.
   const visibleViewerTabs = visibleTabs(viewerTabs, activeChatId)
-  const viewerHasGit = visibleViewerTabs.some((t) => t.kind === 'review')
-  const viewerHasTrace = visibleViewerTabs.some((t) => t.kind === 'trace')
-  const viewerHasBrowser = visibleViewerTabs.some((t) => t.kind === 'browser')
   const viewerActive =
     visibleViewerTabs.find((t) => t.id === viewerActiveId) ?? visibleViewerTabs[0] ?? null
   const [searchOpen, setSearchOpen] = useState(false)
@@ -207,7 +206,7 @@ export default function App() {
       // is already prevented.
       e.stopPropagation()
       const st = useStore.getState()
-      if (target === 'right') st.setRightPanelOpen(!st.rightPanelOpen)
+      if (target === 'right') useViewerTabs.getState().togglePane()
       else st.setSidebarOpen(!st.sidebarOpen)
       return true
     }
@@ -248,14 +247,28 @@ export default function App() {
       if (togglePanelFromKey(e)) return
       if (!(e.metaKey || e.ctrlKey)) return
       const k = physicalKey(e)
-      // VSCode-style close tab: Cmd/Ctrl+W closes the active viewer tab first,
-      // otherwise the active chat tab. Skip while typing so a stray chord never
-      // eats the draft mid-sentence.
+      // VSCode-style close tab: Cmd/Ctrl+W closes whatever is in focus —
+      // the active TERMINAL tab while the terminal panel has focus, else the
+      // active viewer tab, else the active chat tab. Skip while typing in the
+      // composer so a stray chord never eats the draft mid-sentence (the
+      // xterm textarea does NOT count as "typing" here — its chord closes the
+      // terminal tab).
       if (k === 'w' && !e.shiftKey && !e.altKey) {
         const t = e.target as HTMLElement | null
-        const typing = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+        const inTerminal = !!(
+          t?.closest?.('.terminal-panel') ||
+          document.activeElement?.closest?.('.terminal-panel')
+        )
+        const typing =
+          !inTerminal &&
+          !!t &&
+          (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
         if (!typing) {
           e.preventDefault()
+          if (inTerminal) {
+            window.dispatchEvent(new CustomEvent('coder:close-terminal-tab'))
+            return
+          }
           const vt = useViewerTabs.getState()
           if (vt.activeId) vt.closeViewer(vt.activeId)
           else {
@@ -284,6 +297,17 @@ export default function App() {
         case 'o': {
           e.preventDefault()
           useStore.getState().toggleCodeMapPanel()
+          break
+        }
+        case 'j': {
+          // Bottom terminal panel — Cmd+J on Apple platforms, Ctrl+J elsewhere
+          // (the user-facing spec, unlike the app's usual Cmd/Ctrl duality).
+          // Must also work while the terminal itself has focus: xterm's custom
+          // key handler lets this chord bubble up instead of feeding it to
+          // the shell.
+          if (isApplePlatform() ? !e.metaKey : !e.ctrlKey) break
+          e.preventDefault()
+          useStore.getState().toggleTerminalPanel()
           break
         }
         case 'm': {
@@ -318,131 +342,6 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="titlebar" role="banner">
-        <button
-          className="icon-btn titlebar-icon-btn"
-          aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-          title={sidebarOpen ? 'Hide sidebar (⌘B)' : 'Show sidebar (⌘B)'}
-          aria-pressed={sidebarOpen}
-          onClick={() => useStore.getState().toggleSidebar()}
-        >
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-            <path d="M4 6h16M4 12h16M4 18h10" />
-          </svg>
-        </button>
-        <span className="app-title">Codifa</span>
-        <button
-          className="workspace-btn"
-          aria-label="Open workspace folder"
-          title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
-          onClick={() => void window.coder.selectFolder().then((dir) => dir && openWorkspace(dir))}
-        >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
-          </svg>
-          <span className="workspace-btn-label">{activeChatRoot ? activeChatRoot.split('/').filter(Boolean).pop() : 'Open workspace'}</span>
-        </button>
-        <div id="titlebar-toolbar" />
-        <UsageChip />
-        <UpdateButton />
-        <div className="titlebar-workspace">
-          <ScheduleInboxButton />
-          <button
-            className="titlebar-icon-btn"
-            title="Chat traces — LLM / prompts"
-            aria-label="Chat traces — LLM / prompts"
-            aria-pressed={viewerHasTrace}
-            onClick={() => {
-              const vt = useViewerTabs.getState();
-              const existing = visibleViewerTabs.find((t) => t.kind === 'trace');
-              if (existing) vt.closeViewer(existing.id);
-              else vt.openTraces(activeChatId || undefined);
-            }}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M4 6h16M4 12h10M4 18h7" />
-              <path d="M17 16l3 3m0-3l-3 3" />
-            </svg>
-          </button>
-          <button
-            className="titlebar-icon-btn"
-            title="Git diff — uncommitted changes"
-            aria-label="Git diff — uncommitted changes"
-            aria-pressed={viewerHasGit}
-            onClick={() => {
-              const vt = useViewerTabs.getState();
-              const existing = visibleViewerTabs.find((t) => t.kind === 'review');
-              if (existing) vt.closeViewer(existing.id);
-              else vt.openGitDiff();
-            }}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <circle cx="6" cy="6" r="2.4" />
-              <circle cx="6" cy="18" r="2.4" />
-              <circle cx="18" cy="8" r="2.4" />
-              <path d="M6 8.4v7.2M18 10.4c0 4.2-4.5 3.6-8.6 3.6" />
-            </svg>
-          </button>
-          <button
-            className="titlebar-icon-btn"
-            title="Browser — in-app virtual Chrome"
-            aria-label="Browser — in-app virtual Chrome"
-            aria-pressed={viewerHasBrowser}
-            onClick={() => {
-              const vt = useViewerTabs.getState();
-              const existing = visibleViewerTabs.find((t) => t.kind === 'browser');
-              if (existing) vt.closeViewer(existing.id);
-              else vt.openBrowser();
-            }}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" />
-              <path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" />
-            </svg>
-          </button>
-          <button
-            className="titlebar-icon-btn"
-            aria-label="Reveal workspace in file manager"
-            title={activeChatRoot ? `Reveal ${activeChatRoot} in Finder / Explorer` : 'No workspace open — pick a folder first'}
-            disabled={!activeChatRoot}
-            onClick={() => activeChatRoot && void api.openWorkspaceFolder(activeChatRoot).then((res) => { if (!res.ok) console.warn('[workspace] reveal failed:', res.error) })}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
-              <path d="M3 13h18" opacity="0.6" />
-            </svg>
-          </button>
-          <button
-            className="titlebar-icon-btn"
-            aria-label="Open terminal in workspace"
-            title={activeChatRoot ? `Open terminal in ${activeChatRoot}` : 'No workspace open — pick a folder first'}
-            disabled={!activeChatRoot}
-            onClick={() => activeChatRoot && void api.openWorkspaceTerminal(activeChatRoot).then((res) => { if (!res.ok) console.warn('[workspace] terminal failed:', res.error) })}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="18" height="16" rx="2.5" />
-              <path d="M7 9l3 3-3 3" />
-              <path d="M12 15h5" />
-            </svg>
-          </button>
-          <span className="titlebar-divider" aria-hidden="true" />
-          <button
-            className="titlebar-icon-btn panel-toggle"
-            title={rightPanelOpen ? 'Hide right panel (⌘⇧B)' : 'Show right panel (⌘⇧B)'}
-            aria-label={rightPanelOpen ? 'Hide right panel' : 'Show right panel'}
-            aria-keyshortcuts="Control+Shift+B Meta+Shift+B"
-            aria-pressed={rightPanelOpen}
-            onClick={() => useStore.getState().toggleRightPanel()}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="18" height="16" rx="2.5" />
-              <path d="M15 4v16" />
-              <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
-            </svg>
-          </button>
-        </div>
-      </header>
-
       <div className="app-body">
         <ErrorBoundary>
           <Sidebar />
@@ -452,7 +351,57 @@ export default function App() {
             (chatFull ? " chat-full" : "")
           }>
             <section className="chat-group" aria-label="Chats">
-              <ChatTabBar />
+              {/* Chat-scoped app bar — spans ONLY the chat column, never the
+                  sidebar or the viewer panels. Keeps the `titlebar` class for
+                  the window drag region and the #titlebar-toolbar portal
+                  styles. `solo` marks the sidebar-closed state: on macOS the
+                  window-strip cluster renders inline here (the sidebar strip
+                  is gone), so the bar clears the traffic lights; while the
+                  sidebar is open the cluster lives in the sidebar's strip and
+                  this bar starts right at the chat column. */}
+              <header
+                className={`titlebar chat-topbar${sidebarOpen ? "" : " solo"}`}
+                role="banner"
+              >
+                <WindowStripCluster />
+                <div id="titlebar-toolbar" />
+                <UpdateButton />
+                {/* Empty stretch that carries the window drag region: the bar
+                    itself must stay no-drag so its horizontal scrollbar stays
+                    draggable when the pills overflow. */}
+                <span className="titlebar-drag-spacer" aria-hidden="true" />
+                {/* Right-side mount: the model-usage chip is a static child so
+                    it sits LEFT of the wallet chip (portaled here from
+                    ChatPanel right after it). */}
+                <div id="titlebar-right">
+                  <UsageChip />
+                </div>
+                {/* The single side-pane switch (like the reference app): opens
+                    the right pane when it's closed. While the pane is OPEN the
+                    switch hides — the pane header carries its own panel toggle
+                    and collapse, so the app bar would only duplicate them. */}
+                {!paneOpen && (
+                  <button
+                    className="titlebar-icon-btn pane-toggle"
+                    title="Show side pane"
+                    aria-label="Show side pane"
+                    aria-pressed={false}
+                    onClick={() => useViewerTabs.getState().togglePane()}
+                  >
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                      <path d="M15 4v16" />
+                      <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
+                    </svg>
+                  </button>
+                )}
+              </header>
+              {/* Chat tabs + the tab-list chevron: the bar never scrolls, so
+                  the chevron list keeps every chat tab reachable. */}
+              <div className="chat-tabs-row">
+                <ChatTabListButton />
+                <ChatTabBar />
+              </div>
               <main className="main">
                 {/* No key={activeChatId}: a full remount re-parses every markdown +
                   highlight block and re-runs all mount effects, which is the main
@@ -462,7 +411,7 @@ export default function App() {
                 <ChatPanel />
               </main>
             </section>
-            {visibleViewerTabs.length > 0 && !chatFull && (
+            {paneOpen && !chatFull && (
               <>
                 {!viewerFull && (
                   <div
@@ -476,8 +425,44 @@ export default function App() {
                   style={viewerFull ? undefined : ({ flexBasis: splitW, width: splitW } as React.CSSProperties)}
                   aria-label="Viewers"
                 >
-                  <ViewerTabBar />
-                  <div className="viewer-content" key={viewerActive?.id ?? 'empty'}>
+                  {/* Pane header: tab-list chevron + viewer tabs + the "+"
+                      opener on the left, the panel toggle (todos/schedules
+                      mode) and the pane collapse on the right. */}
+                  <div className="viewer-pane-head">
+                    <ViewerTabListButton />
+                    <ViewerTabBar />
+                    <ViewerAddButton />
+                    <ViewerPaneFullscreenButton />
+                    <span className="viewer-pane-spacer" aria-hidden="true" />
+                    <div className="viewer-pane-actions">
+                      <button
+                        className="titlebar-icon-btn panel-toggle"
+                        title={panelMode ? 'Show viewer tabs' : 'Show panel — todos, schedules, sub-agents'}
+                        aria-label={panelMode ? 'Show viewer tabs' : 'Show panel'}
+                        aria-pressed={panelMode}
+                        onClick={() => useViewerTabs.getState().togglePanelMode()}
+                      >
+                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                          <path d="M3 9.5h18" />
+                          <path d="M7 13.5h7M7 16.5h5" />
+                        </svg>
+                      </button>
+                      <button
+                        className="titlebar-icon-btn"
+                        title="Hide side pane"
+                        aria-label="Hide side pane"
+                        onClick={() => useViewerTabs.getState().setPaneOpen(false)}
+                      >
+                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                          <path d="M15 4v16" />
+                          <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="viewer-content" key={viewerActive?.id ?? (panelMode ? 'panel' : 'empty')}>
                     <ViewerContent />
                   </div>
                 </section>
@@ -494,9 +479,10 @@ export default function App() {
               }}
             />
           )}
-          <RightPanel />
         </ErrorBoundary>
       </div>
+
+      <TerminalPanel />
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}
       {searchOpen && <SearchOverlay onClose={() => setSearchOpen(false)} />}

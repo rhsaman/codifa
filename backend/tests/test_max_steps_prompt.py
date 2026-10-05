@@ -200,6 +200,49 @@ async def test_agent_registry_has_per_agent_steps():
     print("  registry per-agent step budgets present")
 
 
+class _CountingModel(_MaxStepsModel):
+    """Count tool steps until the MAX_STEPS_PROMPT injection (budget probe)."""
+
+    def __init__(self):
+        super().__init__()
+        self.tool_steps = 0
+
+    async def astream(self, msgs):
+        async for m in super().astream(msgs):
+            if getattr(m, "tool_calls", None):
+                self.tool_steps += 1
+            yield m
+
+
+async def test_auto_budget_finishes_in_one_turn():
+    """Auto MAX_STEPS budget stays 12-50: enough to finish without a
+    'continue' turn, capped to bound worst-case LLM round-trips."""
+    for ctx, expected in ((0, 24), (20_000, 12), (1_000_000, 50)):
+        model = _CountingModel()
+        state = {
+            "chat_id": "budget-test",
+            "context_window": ctx,
+            "model_name": "fake",
+            "mode": "ask",
+            "request": "x",
+        }
+        await _run_with(model, state)
+        # Final step injects MAX_STEPS_PROMPT so the model summarizes
+        # instead of calling a tool: tool steps = budget - 1.
+        assert model.tool_steps == expected - 1, (
+            f"ctx={ctx}: expected {expected - 1} tool steps, got {model.tool_steps}"
+        )
+    print("  auto budget 12-50 finishes without extra continue turn")
+
+
+def test_subagent_steps_capped_at_50():
+    """Sub-agent worst-case LLM requests halved (100 -> 50), still enough
+    for batched multi-file work in one go."""
+    from agent_registry import AGENTS
+
+    assert AGENTS["subagent"]["steps"] == 50
+
+
 async def main():
     await test_main_loop_injects_max_steps_prompt_on_final_step()
     await test_text_only_reply_unaffected()

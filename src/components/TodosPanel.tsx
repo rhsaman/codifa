@@ -339,16 +339,24 @@ export function SubagentsSection() {
         <ul className="sidebar-subagents-list">
           {jobs.map((j) => {
             const statusLabel = subagentStatusLabel(j.status);
-            const meta =
-              j.status === "running"
-                ? `${subagentAge(j.created_at)}${j.steering ? " · steered" : ""}`
-                : statusLabel;
             return (
               <li
                 key={j.task_id}
                 className={`sidebar-subagent-item status-${j.status}`}
               >
-                <span className="sidebar-subagent-dot" title={statusLabel} />
+                <span
+                  className="sidebar-subagent-mark"
+                  title={statusLabel}
+                  aria-label={statusLabel}
+                >
+                  {j.status === "completed"
+                    ? "✓"
+                    : j.status === "failed"
+                      ? "✕"
+                      : j.status === "stopped"
+                        ? "⏹"
+                        : ""}
+                </span>
                 <button
                   type="button"
                   className="sidebar-subagent-main"
@@ -359,7 +367,12 @@ export function SubagentsSection() {
                   <span className="sidebar-subagent-desc">
                     {prepareContent(j.description || j.task_id, dir)}
                   </span>
-                  <span className="sidebar-subagent-meta">{meta}</span>
+                  {j.status === "running" && (
+                    <span className="sidebar-subagent-meta">
+                      {subagentAge(j.created_at)}
+                      {j.steering ? " · steered" : ""}
+                    </span>
+                  )}
                 </button>
                 {j.status === "running" ? (
                   <button

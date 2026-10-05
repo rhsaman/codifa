@@ -47,7 +47,7 @@ def _no_real_browser(monkeypatch):
     shared-session wiring override this to simulate a successful launch.
     """
 
-    async def _launch(url: str = "about:blank"):
+    async def _launch(url: str = "about:blank", chat_id: str | None = None):
         return {"ok": False, "error": "browser launch disabled in tests"}
 
     monkeypatch.setattr("browser_session.launch", _launch)
@@ -1063,11 +1063,11 @@ async def test_ensure_playwright_in_app_uses_shared_browser(monkeypatch):
     """
     import browser_session
 
-    async def _launch(url: str = "about:blank"):
+    async def _launch(url: str = "about:blank", chat_id: str | None = None):
         return {"ok": True}
 
     monkeypatch.setattr(browser_session, "launch", _launch)
-    monkeypatch.setattr(browser_session, "cdp_endpoint", lambda: "http://127.0.0.1:9333")
+    monkeypatch.setattr(browser_session, "cdp_endpoint", lambda chat_id=None: "http://127.0.0.1:9333")
 
     cfg = {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
     out = await mcp_bridge._ensure_playwright_in_app(cfg)

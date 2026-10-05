@@ -30,6 +30,16 @@ _current_turn: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 _turn_counter: dict[str, int] = {}
 
+# Final status of the last finished turn per chat (turn continuity).
+# Keyed ONLY by chat id so it survives turn increments and task_id changes.
+# Shape: {"turn": int, "status": "completed"|"incomplete", "evidence": str,
+#         "mode": str, "at": float}. Evidence is a short human-readable note
+# (e.g. last test exit code + plan progress) the next turn can report from
+# instead of re-executing finished work.
+_TURN_OUTCOME: dict[str, dict] = {}
+_VALID_OUTCOMES = ("completed", "incomplete")
+_OUTCOME_EVIDENCE_LIMIT = 2000
+
 
 def _clean_text(value: object, limit: int = 20000) -> str:
     try:
@@ -106,6 +116,80 @@ def latest_turn(chat_id: str) -> int:
         return get_current_turn()
     with _lock:
         return int(_turn_counter.get(cid, 0) or 0)
+
+
+def record_turn_outcome(
+    chat_id: str,
+    status: str,
+    evidence: str = "",
+    mode: str = "",
+) -> dict | None:
+    """Record the final status of the last finished turn for a chat.
+
+    Keyed ONLY by chat id so it survives turn increments and task_id
+    changes. ``status`` is ``"completed"`` or ``"incomplete"``; anything
+    else normalizes to ``"incomplete"``. ``evidence`` is a short note
+    (e.g. last test exit code + plan progress) the next turn can report
+    from instead of re-executing finished work.
+    """
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return None
+    st = str(status or "").strip().lower()
+    if st not in _VALID_OUTCOMES:
+        st = "incomplete"
+    ev = str(evidence or "").strip()
+    if len(ev) > _OUTCOME_EVIDENCE_LIMIT:
+        ev = ev[:_OUTCOME_EVIDENCE_LIMIT] + "\n…[truncated]"
+    outcome = {
+        "turn": int(latest_turn(cid) or get_current_turn() or 0),
+        "status": st,
+        "evidence": ev,
+        "mode": str(mode or "").strip().lower()[:20],
+        "at": time.time(),
+    }
+    with _lock:
+        _TURN_OUTCOME[cid] = outcome
+    return dict(outcome)
+
+
+def previous_turn_outcome(chat_id: str) -> dict | None:
+    """Return the recorded final status of the previous turn, if any."""
+    cid = (chat_id or "").strip() or get_current_chat()
+    if not cid:
+        return None
+    with _lock:
+        outcome = _TURN_OUTCOME.get(cid)
+        return dict(outcome) if outcome else None
+
+
+def format_turn_outcome_note(outcome: dict | None) -> str:
+    """Format a prompt note carrying the previous turn outcome forward."""
+    if not isinstance(outcome, dict):
+        return ""
+    status = str(outcome.get("status") or "").strip().lower()
+    if status not in _VALID_OUTCOMES:
+        return ""
+    turn = outcome.get("turn", 0)
+    mode = str(outcome.get("mode") or "").strip()
+    evidence = str(outcome.get("evidence") or "").strip()
+    label = f"turn {turn}" if turn else "previous turn"
+    if mode:
+        label += f" ({mode})"
+    if status == "completed":
+        note = (
+            f"[Previous {label} finished: completed. "
+            "Do NOT re-execute its finished work — report from the evidence below. "
+            "Only run tools for NEW information this turn actually needs.]"
+        )
+    else:
+        note = (
+            f"[Previous {label} finished: incomplete. "
+            "Continue exactly its pending work — do NOT restart completed steps.]"
+        )
+    if evidence:
+        note += f"\nEvidence:\n{evidence}"
+    return note
 
 
 def append(
@@ -187,6 +271,7 @@ def claim_running_tool(
     if turn <= 0:
         turn = latest_turn(cid)
     extra = dict(extra_detail or {})
+    want_tid = str(extra.get("task_id") or "").strip()
     with _lock:
         items = _store.get(cid, [])
         for entry in items:
@@ -201,6 +286,10 @@ def claim_running_tool(
                 continue
             if bool(detail.get("sub")) != want_sub:
                 continue
+            if want_tid:
+                _e_tid = str(entry.get("task_id") or detail.get("task_id") or "").strip()
+                if _e_tid != want_tid:
+                    continue
             if turn and int(entry.get("turn") or 0) != int(turn):
                 continue
             detail.update(extra)
@@ -209,12 +298,19 @@ def claim_running_tool(
     return None
 
 
-def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") -> dict | None:
+def finish_tool(
+    chat_id: str,
+    call_id: object,
+    result: object,
+    error: str = "",
+    task_id: str = "",
+) -> dict | None:
     """Attach a tool result to the matching running tool entry."""
     cid = (chat_id or "").strip() or get_current_chat()
     if not cid:
         return None
     want = str(call_id or "").strip()
+    want_tid = str(task_id or "").strip()
     text = _clean_text(result, limit=20000)
     with _lock:
         items = _store.get(cid, [])
@@ -228,6 +324,10 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
                     or str(detail.get("ev_call_id") or "").strip() == want
                     or str(entry.get("id") or "") == want
                 ):
+                    if want_tid:
+                        _e_tid = str(entry.get("task_id") or detail.get("task_id") or "").strip()
+                        if _e_tid != want_tid:
+                            continue
                     entry["result"] = text
                     if error:
                         entry["error"] = str(error)[:2000]
@@ -235,6 +335,23 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
                     detail["result_chars"] = len(text)
                     entry["detail"] = detail
                     return dict(entry)
+            if want_tid:
+                for entry in reversed(items):
+                    if entry.get("kind") != "tool":
+                        continue
+                    detail = entry.get("detail") or {}
+                    if (
+                        str(detail.get("call_id") or "").strip() == want
+                        or str(detail.get("ev_call_id") or "").strip() == want
+                        or str(entry.get("id") or "") == want
+                    ):
+                        entry["result"] = text
+                        if error:
+                            entry["error"] = str(error)[:2000]
+                        detail["status"] = "error" if error else "done"
+                        detail["result_chars"] = len(text)
+                        entry["detail"] = detail
+                        return dict(entry)
         # Fallback: latest running tool entry (or latest tool entry when the
         # caller never stamped status/call_id, e.g. direct append in tests).
         for entry in reversed(items):
@@ -281,4 +398,9 @@ def clear(chat_id: str) -> int:
     with _lock:
         removed = len(_store.get(cid, []))
         _store.pop(cid, None)
+        # Turn continuity state is per-chat too: dropping only the trace
+        # entries left a stale outcome/turn counter behind, so a deleted or
+        # cleared chat could later report another chat's "previous turn".
+        _TURN_OUTCOME.pop(cid, None)
+        _turn_counter.pop(cid, None)
     return removed

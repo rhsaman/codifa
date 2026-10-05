@@ -184,6 +184,84 @@ async def test_task_subagent_gets_catalog_for_any_prompt():
     assert "Movie Finder" in user_prompt
 
 
+# ---------------------------------------------------------------------------
+# Compact catalog + staged load_skill matching (autoload hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_compact_catalog_always_present(monkeypatch):
+    """Compact catalog (small-context) still lists names and descriptions."""
+    import graph as G
+
+    monkeypatch.setattr(
+        G._agents, "_load_skills",
+        lambda _r: [
+            {"name": "Movie Finder", "description": "find good movies",
+             "content": _SKILL_BODY},
+        ],
+    )
+    out = G._build_skills_section([], "/x", catalog=True, compact=True)
+    assert "AVAILABLE SKILLS" in out
+    assert "Movie Finder" in out
+    assert _SKILL_BODY not in out
+    assert "load_skill" in out
+    assert len(out) <= 900
+
+
+def test_catalog_caps_hold_for_huge_store(monkeypatch):
+    """Full and compact catalogs both respect their total budgets."""
+    import graph as G
+
+    many = [
+        {"name": f"skill-{i}", "description": "d" * 180, "content": "x"}
+        for i in range(40)
+    ]
+    monkeypatch.setattr(G._agents, "_load_skills", lambda _r: many)
+    assert len(G._build_skills_section([], "/x", catalog=True)) <= 2200
+    assert len(G._build_skills_section([], "/x", catalog=True, compact=True)) <= 900
+    assert len(skills_catalog_block()) <= 1800
+
+
+def test_load_skill_staged_match_keyword_and_fuzzy():
+    """Keyword, substring and near-name queries resolve with one call."""
+    import asyncio
+
+    import tools as T
+    from tools import persist_skill
+
+    res = persist_skill(
+        "---\nname: Movie Finder\ndescription: find good movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\n\n" + _SKILL_BODY,
+        fallback_name="Movie Finder",
+    )
+    assert res.get("ok"), res
+    state_db.invalidate_skills_cache()
+    cbs = T.make_tool_callbacks(tempfile.mkdtemp(prefix="coder-test-skill-stage-"), lambda e: None)
+    assert "load_skill" in cbs
+    for query in ("movie finder", "movie-finder", "Movie", "cinema", "find good movies"):
+        out = asyncio.run(cbs["load_skill"](query))
+        assert not out.startswith("ERROR"), f"query {query!r}: {out[:120]!r}"
+        assert "haiku" in out
+
+
+def test_manual_persist_loads_by_same_name_and_slug():
+    """Manually persisted skills load by the same name/slug load_skill uses."""
+    import asyncio
+
+    import tools as T
+    from tools import persist_skill
+
+    res = persist_skill(
+        "---\nname: Code Review\ndescription: review code\n---\n\n# Code Review\n\nREVIEW-BODY",
+        fallback_name="Code Review",
+    )
+    assert res.get("ok"), res
+    state_db.invalidate_skills_cache()
+    cbs = T.make_tool_callbacks(tempfile.mkdtemp(prefix="coder-test-skill-manual-"), lambda e: None)
+    for query in ("Code Review", "code-review", "code review"):
+        out = asyncio.run(cbs["load_skill"](query))
+        assert "REVIEW-BODY" in out, f"query {query!r}: {out[:120]!r}"
+
+
 if __name__ == "__main__":
     asyncio.run(asyncio.gather(*[
         test_task_subagent_receives_skills_catalog_and_load_skill(),

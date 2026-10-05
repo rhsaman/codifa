@@ -91,4 +91,21 @@ def test_read_docstring_encourages_parallel_reads():
     assert "read multiple independent files in parallel" in text
 
 
+def test_coder_prompt_mentions_task_tool():
+    """Coder prompt must name the task tool so the model spawns sub-agents."""
+    assert "task(subagent_type='subagent')" in agents.SYSTEM_PROMPTS["coder"]
+    assert "task(subagent_type='subagent')" in agents._MODE_CAPS["coder"]
+
+
+def test_ask_and_plan_prompts_mention_task_tool():
+    """Ask/plan prompts must name the task tool so those modes also spawn sub-agents."""
+    for mode in ("ask", "plan"):
+        assert "task(subagent_type='subagent')" in agents.SYSTEM_PROMPTS[mode], (
+            f"{mode} prompt does not mention the task tool"
+        )
+        assert "task(subagent_type='subagent')" in agents._MODE_CAPS[mode], (
+            f"{mode} caps do not mention the task tool"
+        )
+
+
 

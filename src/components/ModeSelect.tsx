@@ -4,11 +4,15 @@ import { ModeIcon } from "./ModeIcon";
 
 export function ModeSelect({
   modes,
+  menuModes: menuModesProp,
   value,
   onChange,
   iconOnly,
 }: {
   modes: AgentModeDef[];
+  /** Menu entries; defaults to `modes`. Lets callers hide entries (e.g. Plan,
+   *  which is entered via `/plan`) while still resolving them as current. */
+  menuModes?: AgentModeDef[];
   value: AgentMode;
   onChange: (mode: AgentMode) => void;
   iconOnly?: boolean;
@@ -18,6 +22,8 @@ export function ModeSelect({
   const wrapRef = useRef<HTMLDivElement>(null);
 
   const close = useCallback(() => setOpen(false), []);
+  // Entries shown in the popup menu (defaults to every mode).
+  const menuModes = menuModesProp ?? modes;
 
   // Close on click outside
   useEffect(() => {
@@ -52,7 +58,7 @@ export function ModeSelect({
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-haspopup="listbox"
-        title={`${current.label} — applies to this chat only (Tab / ⌘M cycles modes)`}
+        title={`${current.label} — applies to this chat only (Tab / ⌘M cycles Ask and Coder, /plan enters Plan mode)`}
       >
         {!iconOnly && (
           <span className="mode-select-icon"><ModeIcon icon={current.icon} /></span>
@@ -71,7 +77,7 @@ export function ModeSelect({
       </button>
       {open && (
         <div className="mode-menu" role="listbox" aria-label="Chat mode">
-          {modes.map((m) => (
+          {menuModes.map((m) => (
             <button
               key={m.id}
               type="button"

@@ -18,7 +18,7 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
-import { looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { extractInlinePathParts, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
@@ -454,7 +454,7 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
             title={`Open ${filePath}`}
             onClick={() => openWorkspaceFile(filePath)}
           >
-            <FileIcon path={filePath} size={18} />
+            <FileIcon path={filePath} size={20} />
             {filePath}
           </span>
         )}
@@ -647,6 +647,23 @@ export const mdComponents = {
       if (looksLikeFilePath(text)) {
         const { path, line } = splitPathLine(text);
         return <FileChip path={path} line={line} display={text} />;
+      }
+      // Composite spans ("Edit fs.ts src/lib/ +49") keep their single pill:
+      // the path inside becomes a clickable FileChip while the surrounding
+      // words stay plain code text.
+      const parts = extractInlinePathParts(text);
+      if (parts.some((p) => typeof p !== "string")) {
+        return (
+          <code {...props} data-meta={meta}>
+            {parts.map((p, i) =>
+              typeof p === "string" ? (
+                p
+              ) : (
+                <FileChip key={i} path={p.path} line={p.line} display={p.display} />
+              ),
+            )}
+          </code>
+        );
       }
     }
     return (
@@ -1156,7 +1173,7 @@ function UserMessageBubble({
                   }
                 }}
               >
-                <FileIcon path={a} size={18} />{a}
+                <FileIcon path={a} size={20} />{a}
               </span>
             ))}
           </div>
@@ -1885,7 +1902,7 @@ export const ChatMessageView = memo(
                 }
               }}
             >
-              <FileIcon path={a} size={18} />{a}
+              <FileIcon path={a} size={20} />{a}
             </span>
           ))}
         </div>
@@ -1966,7 +1983,7 @@ export const ChatMessageView = memo(
                       }
                     }}
                   >
-                    <FileIcon path={a} size={18} />{a}
+                    <FileIcon path={a} size={20} />{a}
                   </span>
                 ))}
               </div>

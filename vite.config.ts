@@ -19,6 +19,17 @@ export default defineConfig(({ mode }) => {
               main: {
                 // Shortcut of `build.lib.entry`
                 entry: 'electron/main.ts',
+                vite: {
+                  build: {
+                    rollupOptions: {
+                      // node-pty ships a native .node binary + a runtime
+                      // `require()` of the prebuild — bundling it breaks the
+                      // dynamic load, so keep it a plain runtime import
+                      // resolved from node_modules at Electron startup.
+                      external: ['node-pty'],
+                    },
+                  },
+                },
               },
               preload: {
                 // Shortcut of `build.rollupOptions.input`

@@ -310,7 +310,7 @@ console.log("۲۲) ساب‌ایجنت‌ها — توابع خالص پنل و 
   const { isSubagentCard } = await import("../src/components/ToolCallView")
   check("نوع جدید subagent کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "subagent" } } as any))
   check("نوع legacy explore هم کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "explore" } } as any))
-  check("general کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "task", args: { subagent_type: "general" } } as any))
+  check("نوع legacy general هم کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "general" } } as any))
   check("ابزار غیر task کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "grep", args: { subagent_type: "subagent" } } as any))
 }
 

@@ -688,11 +688,11 @@ def test_edit_file_batch_tolerant_second_edit(tmp_path):
         # Grep symbol annotation with a single line number.
         ("a.py:1: in foo (L1):alpha", "ALPHA", "ALPHA\nbeta\ngamma\n"),
         # Duplicate-reference note above a copied window (backend emits
-        # this Persian sentence when a result repeats an earlier one).
+        # this marker when a result repeats an earlier one).
         (
             (
-                "نتیجه عیناً با پاسخ ابزار call_01abc در همین پیام‌ها یکسان است؛ "
-                "متن کامل همان پاسخ را استفاده کن.\n1 | alpha"
+                "[This result is byte-identical to tool result call_01abc "
+                "earlier in these messages — use that full text.]\n1 | alpha"
             ),
             "ALPHA",
             "ALPHA\nbeta\ngamma\n",
@@ -729,6 +729,64 @@ def test_edit_file_not_found_error_guides_copy(tmp_path, old_string, hint):
     assert hint in res["error"], res
     assert "copy verbatim" in res["error"], res
     assert "alpha" in res["error"], res
+
+
+def test_edit_file_indent_insensitive_preserves_indent(tmp_path):
+    """Retyped blocks without indent must splice with the file's indent."""
+    (tmp_path / "a.py").write_text("def f():\n  alpha = 1\n  beta = 2\n")
+    res = tools.edit_file(
+        str(tmp_path), "a.py", "alpha = 1\nbeta = 2", "alpha = 1\nbeta = 99"
+    )
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == "def f():\n  alpha = 1\n  beta = 99\n"
+
+
+@pytest.mark.parametrize(
+    "old_string,new_string",
+    [
+        # Retyped at column 0 (no leading indent).
+        (
+            "const clamped = Math.min(100, Math.max(0, pct))\nconst raw = min + 1",
+            "const clamped = Math.min(100, Math.max(0, pct))\nconst raw = min + 2",
+        ),
+        # Copied with read-tool "NNN | " prefixes.
+        (
+            (
+                "53 |   const clamped = Math.min(100, Math.max(0, pct))\n"
+                "54 |   const raw = min + 1"
+            ),
+            "  const clamped = Math.min(100, Math.max(0, pct))\n  const raw = min + 2",
+        ),
+    ],
+)
+def test_edit_file_indent_insensitive_ts_block(tmp_path, old_string, new_string):
+    """Regression for browserViewport.ts: indented TS block must match."""
+    (tmp_path / "b.ts").write_text(
+        "export function f(pct: number): number {\n"
+        "  const clamped = Math.min(100, Math.max(0, pct))\n"
+        "  const raw = min + 1\n"
+        "  return raw\n"
+        "}\n"
+    )
+    res = tools.edit_file(str(tmp_path), "b.ts", old_string, new_string)
+    assert res.get("ok"), res
+    assert "  const raw = min + 2\n  return raw" in (tmp_path / "b.ts").read_text()
+
+
+def test_edit_file_strips_code_fences(tmp_path):
+    """Fenced copies from chat snippets must edit instead of not-found."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    res = tools.edit_file(str(tmp_path), "a.py", "```python\n1 | alpha\n```", "ALPHA")
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == "ALPHA\nbeta\ngamma\n"
+
+
+def test_edit_file_reflow_single_line(tmp_path):
+    """A multi-line block retyped as one line must still match (reflow)."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    res = tools.edit_file(str(tmp_path), "a.py", "alpha beta", "ALPHA BETA")
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == "ALPHA BETA\ngamma\n"
 
 
 @pytest.mark.asyncio

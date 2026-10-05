@@ -34,7 +34,7 @@ export const FILE_BADGES: Record<string, { label: string; bg: string; fg: string
   rs: { label: "RS", bg: "#dea584", fg: "#57330f" },
   go: { label: "GO", bg: "#00add8", fg: "#ffffff" },
   rb: { label: "RB", bg: "#701516", fg: "#ffffff" },
-  java: { label: "JAVA", bg: "#b07219", fg: "#ffffff" },
+  java: { label: "JAVA", bg: "#5382a1", fg: "#ffffff" },
   kt: { label: "KT", bg: "#a97bff", fg: "#241536" },
   swift: { label: "SWIFT", bg: "#f05138", fg: "#ffffff" },
   c: { label: "C", bg: "#555555", fg: "#ffffff" },
@@ -60,6 +60,78 @@ export const FILE_BADGES: Record<string, { label: string; bg: string; fg: string
   pdf: { label: "PDF", bg: "#d0021b", fg: "#ffffff" },
   svg: { label: "SVG", bg: "#ffb13b", fg: "#57330f" },
   lock: { label: "LOCK", bg: "#7c7c7c", fg: "#ffffff" },
+  // Additional languages / formats so every whitelisted ext gets a tile.
+  vue: { label: "VUE", bg: "#41b883", fg: "#35495e" },
+  svelte: { label: "S", bg: "#ff3e00", fg: "#ffffff" },
+  astro: { label: "A", bg: "#ff5d01", fg: "#ffffff" },
+  dart: { label: "DA", bg: "#0175c8", fg: "#ffffff" },
+  ex: { label: "EX", bg: "#6e4a7e", fg: "#ffffff" },
+  exs: { label: "EX", bg: "#6e4a7e", fg: "#ffffff" },
+  erl: { label: "ER", bg: "#a90533", fg: "#ffffff" },
+  hs: { label: "HS", bg: "#5e5086", fg: "#ffffff" },
+  clj: { label: "CL", bg: "#63b132", fg: "#ffffff" },
+  cljs: { label: "CL", bg: "#63b132", fg: "#ffffff" },
+  pl: { label: "PL", bg: "#39457e", fg: "#ffffff" },
+  pm: { label: "PL", bg: "#39457e", fg: "#ffffff" },
+  r: { label: "R", bg: "#276dc3", fg: "#ffffff" },
+  jl: { label: "JL", bg: "#9558b2", fg: "#ffffff" },
+  graphql: { label: "GQL", bg: "#e10098", fg: "#ffffff" },
+  gql: { label: "GQL", bg: "#e10098", fg: "#ffffff" },
+  proto: { label: "PR", bg: "#4285f4", fg: "#ffffff" },
+  ipynb: { label: "IP", bg: "#f37726", fg: "#ffffff" },
+  csv: { label: "CSV", bg: "#0f9d58", fg: "#ffffff" },
+  tsv: { label: "TSV", bg: "#0f9d58", fg: "#ffffff" },
+  log: { label: "LOG", bg: "#8d8d8d", fg: "#26221e" },
+  diff: { label: "DIF", bg: "#4d7a3a", fg: "#ffffff" },
+  patch: { label: "DIF", bg: "#4d7a3a", fg: "#ffffff" },
+  dockerfile: { label: "DK", bg: "#2496ed", fg: "#ffffff" },
+  makefile: { label: "MK", bg: "#6a9fb5", fg: "#26221e" },
+  mk: { label: "MK", bg: "#6a9fb5", fg: "#26221e" },
+  cmake: { label: "CM", bg: "#ba1e44", fg: "#ffffff" },
+  gradle: { label: "GR", bg: "#02303a", fg: "#ffffff" },
+  tex: { label: "TEX", bg: "#008080", fg: "#ffffff" },
+  sty: { label: "TEX", bg: "#008080", fg: "#ffffff" },
+  bat: { label: "BAT", bg: "#3d3d3d", fg: "#ffffff" },
+  cmd: { label: "CMD", bg: "#3d3d3d", fg: "#ffffff" },
+  doc: { label: "W", bg: "#2b579a", fg: "#ffffff" },
+  docx: { label: "W", bg: "#2b579a", fg: "#ffffff" },
+  xls: { label: "X", bg: "#217346", fg: "#ffffff" },
+  xlsx: { label: "X", bg: "#217346", fg: "#ffffff" },
+  ppt: { label: "P", bg: "#d24726", fg: "#ffffff" },
+  pptx: { label: "P", bg: "#d24726", fg: "#ffffff" },
+  zip: { label: "ZIP", bg: "#b98a3f", fg: "#26221e" },
+  tar: { label: "TAR", bg: "#b98a3f", fg: "#26221e" },
+  gz: { label: "GZ", bg: "#b98a3f", fg: "#26221e" },
+  bz2: { label: "BZ", bg: "#b98a3f", fg: "#26221e" },
+  xz: { label: "XZ", bg: "#b98a3f", fg: "#26221e" },
+  "7z": { label: "7Z", bg: "#b98a3f", fg: "#26221e" },
+  rar: { label: "RAR", bg: "#b98a3f", fg: "#26221e" },
+  jar: { label: "JAR", bg: "#e76f00", fg: "#ffffff" },
+  war: { label: "WAR", bg: "#e76f00", fg: "#ffffff" },
+  apk: { label: "APK", bg: "#3ddc84", fg: "#1b4423" },
+  aab: { label: "AAB", bg: "#3ddc84", fg: "#1b4423" },
+  wasm: { label: "WA", bg: "#654ff0", fg: "#ffffff" },
+  ttf: { label: "TTF", bg: "#5c6bc0", fg: "#ffffff" },
+  otf: { label: "OTF", bg: "#5c6bc0", fg: "#ffffff" },
+  woff: { label: "WOFF", bg: "#5c6bc0", fg: "#ffffff" },
+  woff2: { label: "W2", bg: "#5c6bc0", fg: "#ffffff" },
+  dylib: { label: "BIN", bg: "#6b7280", fg: "#ffffff" },
+  so: { label: "BIN", bg: "#6b7280", fg: "#ffffff" },
+  dll: { label: "BIN", bg: "#6b7280", fg: "#ffffff" },
+  exe: { label: "BIN", bg: "#6b7280", fg: "#ffffff" },
+  bin: { label: "BIN", bg: "#6b7280", fg: "#ffffff" },
+  gitignore: { label: "GI", bg: "#f05033", fg: "#ffffff" },
+  gitattributes: { label: "GA", bg: "#f05033", fg: "#ffffff" },
+  editorconfig: { label: "EC", bg: "#6d8086", fg: "#ffffff" },
+  npmrc: { label: "NR", bg: "#cb3837", fg: "#ffffff" },
+  nvmrc: { label: "NV", bg: "#43853d", fg: "#ffffff" },
+  babelrc: { label: "BA", bg: "#f5da55", fg: "#3b3106" },
+  prettierrc: { label: "PT", bg: "#56b3b4", fg: "#ffffff" },
+  eslintrc: { label: "ES", bg: "#4b32c3", fg: "#ffffff" },
+  cfg: { label: "CFG", bg: "#8d8d8d", fg: "#26221e" },
+  conf: { label: "CONF", bg: "#8d8d8d", fg: "#26221e" },
+  properties: { label: "PRO", bg: "#8d8d8d", fg: "#26221e" },
+  plist: { label: "PLS", bg: "#8d8d8d", fg: "#26221e" },
 };
 
 /** Extensions that render as a small glyph instead of a letter badge. */
@@ -158,6 +230,86 @@ export function looksLikeFilePath(raw: string): boolean {
     return WHITELIST_EXTRA.has(ext) || ext in FILE_BADGES;
   }
   return ext in FILE_BADGES || WHITELIST_EXTRA.has(ext);
+}
+
+/** One segment of a parsed inline `code` span: plain text, or a detected
+ *  file reference that renders as a clickable FileChip. */
+export type InlinePathPart =
+  | string
+  | { path: string; line?: number; display: string };
+
+const BARE_NAME_RE = /^[A-Za-z0-9_][\w.-]*$/;
+const DIR_TOKEN_RE = /^(?:[A-Za-z0-9_.-]+\/)+$/;
+
+/** Split an inline code span's text into text parts and file references.
+ *  Covers the shapes a whole-span check (looksLikeFilePath) misses:
+ *  - a qualified path inside words ("see src/lib/store.ts:12 here");
+ *  - the tool-row pair "fs.ts src/lib/" — filename followed by its
+ *    directory — combined into the real path "src/lib/fs.ts".
+ *  A bare filename with no directory next to it stays plain text: without
+ *  a directory it rarely resolves against the workspace root, so chipping
+ *  it would create a dead chip. */
+export function extractInlinePathParts(raw: string): InlinePathPart[] {
+  if (!raw || !raw.includes("/")) return [raw];
+  const tokens = raw.split(/(\s+)/).filter((t) => t !== "");
+  const nextNonSep = (from: number) => {
+    let j = from;
+    while (j < tokens.length && /^\s+$/.test(tokens[j])) j++;
+    return j;
+  };
+  const parts: InlinePathPart[] = [];
+  let text = "";
+  const flushText = () => {
+    if (text) {
+      parts.push(text);
+      text = "";
+    }
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (/^\s+$/.test(tok)) {
+      text += tok;
+      continue;
+    }
+    // Strip wrapping punctuation so "(src/lib/a.ts)" still classifies as a
+    // path; the stripped brackets stay as text around the chip.
+    const lead = /^[([{'"`]+/.exec(tok)?.[0] ?? "";
+    const core = tok.slice(lead.length).replace(/[.,;:)\]}'"`]+$/, "");
+    if (!core) {
+      text += tok;
+      continue;
+    }
+    if (core.includes("/") && looksLikeFilePath(core)) {
+      flushText();
+      if (lead) parts.push(lead);
+      const { path, line } = splitPathLine(core);
+      parts.push({ path, line, display: core });
+      const tail = tok.slice(lead.length + core.length);
+      if (tail) text += tail;
+      continue;
+    }
+    if (
+      !core.includes("/") &&
+      BARE_NAME_RE.test(core) &&
+      looksLikeFilePath(core)
+    ) {
+      const j = nextNonSep(i + 1);
+      if (j < tokens.length && DIR_TOKEN_RE.test(tokens[j])) {
+        flushText();
+        if (lead) parts.push(lead);
+        const display = tokens[j] + core;
+        const { path, line } = splitPathLine(display);
+        parts.push({ path, line, display });
+        const tail = tok.slice(lead.length + core.length);
+        if (tail) text += tail;
+        i = j;
+        continue;
+      }
+    }
+    text += tok;
+  }
+  flushText();
+  return parts.length > 0 ? parts : [raw];
 }
 
 /** Basename of a path for tab/chip labels ("a/b/c.py" → "c.py"). */

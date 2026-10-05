@@ -6,6 +6,7 @@ import {
   isSlashCommand,
   parseSlashInput,
   prettySlashLabel,
+  slashTokenRange,
   recordHistory,
   togglePin,
   historyRows,
@@ -95,6 +96,21 @@ console.log("7) historyTitle/historyMeta (Codex-style card lines):")
   const long = "a fairly long prompt that should be truncated"
   check("plain title truncated with ellipsis", historyTitle(long).endsWith("…") && historyTitle(long).length <= 31, historyTitle(long))
   check("plain meta = full text", historyMeta("hello world") === "hello world")
+}
+
+console.log("8) slashTokenRange (composer token highlight):")
+{
+  const r1 = slashTokenRange("/compact foo")
+  check("token covers /compact", r1?.start === 0 && r1?.end === 8, r1)
+  const raw2 = "  /create-skill foo"
+  const r2 = slashTokenRange(raw2)
+  check(
+    "leading spaces kept",
+    r2 !== null && raw2.slice(r2.start, r2.end) === "/create-skill",
+    r2,
+  )
+  check("plain text is null", slashTokenRange("hello") === null)
+  check("bare slash is null", slashTokenRange("/") === null)
 }
 
 if (failed > 0) {

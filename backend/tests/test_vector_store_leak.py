@@ -40,9 +40,8 @@ def _build_tools_with(store, enabled=True):
     return tools, captured
 
 
-def test_rag_web_lookup_closes_store_it_opened(monkeypatch):
-    """وقتی store=None باشه و _rag_web_enabled() True باشه، _rag_web_lookup
-    خودش _get_web_store رو صدا می‌زنه و باید close() رو صدا بزنه."""
+def test_rag_web_lookup_reuses_shared_store(monkeypatch):
+    """Shared web store is reused across lookups and never closed by callers."""
     hits = [{"txt": "saved web result about X"}]
     opened = _make_store_with_hits(hits)
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: True)
@@ -52,8 +51,8 @@ def test_rag_web_lookup_closes_store_it_opened(monkeypatch):
     out = asyncio.run(tools_mod._rag_web_lookup("query about X", None, "/tmp"))
     assert out == "saved web result about X"
     opened.search.assert_called_once_with("query about X", KIND_WEB, 3, 0.6)
-    # نشت حافظه: connection باید بسته شده باشه.
-    opened.close.assert_called_once()
+    # Shared store stays open for reuse across calls.
+    opened.close.assert_not_called()
 
 
 def test_rag_web_lookup_does_not_close_external_store(monkeypatch):
@@ -67,19 +66,19 @@ def test_rag_web_lookup_does_not_close_external_store(monkeypatch):
     external.close.assert_not_called()
 
 
-def test_rag_web_lookup_closes_on_empty_hits(monkeypatch):
-    """حتی وقتی هیتی پیدا نشد، connection باز‌شده باید بسته بشه."""
+def test_rag_web_lookup_keeps_shared_store_on_empty_hits(monkeypatch):
+    """Empty hits keep the shared store open for reuse."""
     opened = _make_store_with_hits([])
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: True)
     monkeypatch.setattr(tools_mod, "_get_web_store", lambda root: opened)
 
     out = asyncio.run(tools_mod._rag_web_lookup("anything", None, "/tmp"))
     assert out is None
-    opened.close.assert_called_once()
+    opened.close.assert_not_called()
 
 
-def test_web_search_tool_closes_store_it_opened(monkeypatch):
-    """وقتی RAG فعاله و store=None، web_search_tool باید connection رو ببنده."""
+def test_web_search_tool_reuses_shared_store(monkeypatch):
+    """web_search_tool reuses the shared store without closing it."""
     store = _make_store_with_hits([{"txt": "cached web answer"}])
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: True)
     monkeypatch.setattr(tools_mod, "web_search", lambda q, mr=5: {"error": "should not be called"})
@@ -98,11 +97,11 @@ def test_web_search_tool_closes_store_it_opened(monkeypatch):
     tools, _ = _build_tools_with(None)
     out = asyncio.run(tools["web_search"](query="python asyncio"))
     assert "from saved RAG" in out
-    store.close.assert_called()
+    store.close.assert_not_called()
 
 
-def test_fetch_url_tool_closes_store_it_opened(monkeypatch):
-    """وقتی RAG فعاله و store=None، fetch_url_tool باید connection رو ببنده."""
+def test_fetch_url_tool_reuses_shared_store(monkeypatch):
+    """fetch_url_tool reuses the shared store without closing it."""
     store = _make_store_with_hits([{"txt": "cached page body"}])
     monkeypatch.setattr(tools_mod, "_rag_web_enabled", lambda: True)
     monkeypatch.setattr(tools_mod, "fetch_url", lambda u, mc=100000: {"error": "should not be called"})
@@ -120,4 +119,4 @@ def test_fetch_url_tool_closes_store_it_opened(monkeypatch):
     tools, _ = _build_tools_with(None)
     out = asyncio.run(tools["fetch_url"](url="https://example.com/page"))
     assert "from saved RAG" in out
-    store.close.assert_called()
+    store.close.assert_not_called()
